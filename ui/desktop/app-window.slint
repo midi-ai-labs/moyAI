@@ -1,0 +1,1082 @@
+import {
+    Button,
+    ComboBox,
+    HorizontalBox,
+    Slider,
+    StandardListView,
+    TextEdit,
+    VerticalBox,
+} from "std-widgets.slint";
+
+component MetaItem inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+
+    background: transparent;
+    min-height: 46px;
+
+    VerticalBox {
+        alignment: start;
+        spacing: 2px;
+
+        Text {
+            text: root.label;
+            font-size: 11px;
+            color: #94a091;
+        }
+
+        Text {
+            text: root.value;
+            font-size: 13px;
+            color: #f2f4ef;
+            wrap: word-wrap;
+        }
+    }
+}
+
+component OverlayPanel inherits Rectangle {
+    background: #151915;
+    border-width: 1px;
+    border-color: #38403a;
+    border-radius: 6px;
+}
+
+export component AppWindow inherits Window {
+    in property <string> workspace_name;
+    in property <string> workspace_path_text;
+    in property <string> session_summary_text;
+    in property <string> selection_title;
+    in property <string> current_session_title;
+    in property <string> provider_title;
+    in property <string> model_title;
+    in property <string> access_mode_title;
+    in property <string> run_status_text;
+    in property <string> progress_text;
+    in property <string> transcript_text;
+    in property <string> tool_status_text;
+    in property <string> status_banner_text;
+    in property <string> confirmation_text;
+    in property <[StandardListViewItem]> session_items;
+    in-out property <int> current_session_index: -1;
+    in-out property <string> composer_text;
+    in-out property <string> image_path_text;
+    in property <string> image_summary_text;
+    in property <bool> image_attach_enabled: false;
+    in property <bool> image_clear_enabled: false;
+    in property <bool> run_enabled: false;
+    in property <bool> review_enabled: false;
+    in property <bool> open_session_enabled: false;
+    in property <bool> history_export_enabled: false;
+    in property <bool> enhance_enabled: false;
+    in property <bool> confirmation_visible: false;
+    in property <bool> config_visible: false;
+    in property <[StandardListViewItem]> config_items;
+    in-out property <int> current_config_index: 0;
+    in property <string> config_field_title;
+    in-out property <string> config_value_text;
+    in property <string> config_feedback_text;
+    in property <bool> provider_visible: false;
+    in-out property <string> provider_base_url_text;
+    in property <[string]> provider_model_items;
+    in-out property <int> current_provider_model_index: -1;
+    in property <string> provider_feedback_text;
+    in property <string> provider_load_button_text: "Load Models";
+    in property <bool> provider_load_enabled: true;
+    in property <bool> provider_apply_enabled: false;
+    in property <bool> workspace_picker_visible: false;
+    in-out property <string> workspace_input_text;
+    in property <bool> review_visible: false;
+    in property <string> review_raw_text;
+    in-out property <string> review_draft_text;
+    in property <string> review_status_text;
+    in property <bool> send_enhanced_enabled: false;
+    in property <bool> send_raw_enabled: false;
+    in property <float> window_opacity_percent: 96;
+    in property <string> window_opacity_text: "96%";
+
+    callback session_selected(int);
+    callback composer_changed(string);
+    callback image_path_changed(string);
+    callback image_attach_requested();
+    callback image_browse_requested();
+    callback image_clear_requested();
+    callback refresh_requested();
+    callback session_reload_requested();
+    callback history_export_requested();
+    callback run_requested();
+    callback review_requested();
+    callback enhance_requested();
+    callback open_folder_requested();
+    callback config_editor_requested();
+    callback provider_editor_requested();
+    callback access_mode_toggle_requested();
+    callback config_close_requested();
+    callback config_selected(int);
+    callback config_value_changed(string);
+    callback config_apply_session_requested();
+    callback config_save_project_requested();
+    callback config_save_global_requested();
+    callback provider_close_requested();
+    callback provider_base_url_changed(string);
+    callback provider_load_requested();
+    callback provider_model_selected(string);
+    callback provider_apply_session_requested();
+    callback provider_save_project_requested();
+    callback provider_save_global_requested();
+    callback workspace_picker_requested();
+    callback workspace_close_requested();
+    callback workspace_input_changed(string);
+    callback workspace_apply_requested();
+    callback workspace_browse_requested();
+    callback open_typed_path_requested();
+    callback review_draft_changed(string);
+    callback send_enhanced_requested();
+    callback send_raw_requested();
+    callback cancel_review_requested();
+    callback confirm_accept_requested();
+    callback confirm_reject_requested();
+    callback window_opacity_changed(float);
+
+    title: "moyAI Desktop";
+    preferred-width: 1440px;
+    preferred-height: 940px;
+    min-width: 1180px;
+    min-height: 760px;
+    background: transparent;
+
+    Rectangle {
+        background: transparent;
+
+        panel := Rectangle {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            background: #121512;
+            border-width: 1px;
+            border-color: #2c332d;
+            opacity: root.window_opacity_percent / 100;
+
+            VerticalBox {
+                padding: 14px;
+                spacing: 12px;
+
+                Rectangle {
+                    height: 84px;
+                    background: #171c18;
+                    border-width: 1px;
+                    border-color: #313832;
+                    border-radius: 6px;
+
+                    HorizontalBox {
+                        padding: 12px;
+                        spacing: 12px;
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: transparent;
+
+                            VerticalBox {
+                                alignment: start;
+                                spacing: 3px;
+
+                                Text {
+                                    text: "moyAI Desktop";
+                                    font-size: 21px;
+                                    color: #f3f4ef;
+                                }
+
+                                Text {
+                                    text: root.workspace_path_text;
+                                    font-size: 12px;
+                                    color: #97a292;
+                                    wrap: word-wrap;
+                                }
+
+                                Text {
+                                    text: root.status_banner_text;
+                                    font-size: 12px;
+                                    color: #8ea18d;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            width: 214px;
+                            background: transparent;
+
+                            VerticalBox {
+                                alignment: center;
+                                spacing: 4px;
+
+                                Text {
+                                    text: "Opacity";
+                                    font-size: 11px;
+                                    color: #8ea18d;
+                                }
+
+                                HorizontalBox {
+                                    alignment: center;
+                                    spacing: 8px;
+
+                                    Slider {
+                                        width: 132px;
+                                        minimum: 55;
+                                        maximum: 100;
+                                        step: 1;
+                                        value: root.window_opacity_percent;
+                                        changed(value) => {
+                                            root.window_opacity_changed(value);
+                                        }
+                                    }
+
+                                    Text {
+                                        text: root.window_opacity_text;
+                                        min-width: 40px;
+                                        font-size: 12px;
+                                        color: #edf1ea;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+
+                                Text {
+                                    text: root.current_session_title;
+                                    font-size: 11px;
+                                    color: #8ea18d;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                HorizontalBox {
+                    spacing: 12px;
+                    vertical-stretch: 1;
+
+                    Rectangle {
+                        min-width: 310px;
+                        max-width: 340px;
+                        background: #1a1f1c;
+                        border-width: 1px;
+                        border-color: #313832;
+                        border-radius: 6px;
+
+                        VerticalBox {
+                            padding: 14px;
+                            spacing: 12px;
+
+                            Text {
+                                text: "Workspace";
+                                font-size: 15px;
+                                color: #f3f4ef;
+                            }
+
+                            Text {
+                                text: root.workspace_name;
+                                font-size: 20px;
+                                color: #f3f4ef;
+                            }
+
+                            MetaItem {
+                                label: "Path";
+                                value: root.workspace_path_text;
+                            }
+
+                            MetaItem {
+                                label: "Provider";
+                                value: root.provider_title;
+                            }
+
+                            MetaItem {
+                                label: "Model";
+                                value: root.model_title;
+                            }
+
+                            MetaItem {
+                                label: "Access";
+                                value: root.access_mode_title;
+                            }
+
+                            MetaItem {
+                                label: "Run Target";
+                                value: root.current_session_title;
+                            }
+
+                            MetaItem {
+                                label: "Current State";
+                                value: root.run_status_text;
+                            }
+
+                            MetaItem {
+                                label: "Progress";
+                                value: root.progress_text;
+                            }
+
+                            Rectangle {
+                                height: 1px;
+                                background: #2a312c;
+                            }
+
+                            HorizontalBox {
+                                spacing: 8px;
+
+                                Text {
+                                    text: "Sessions";
+                                    font-size: 15px;
+                                    color: #f3f4ef;
+                                }
+
+                                Rectangle {
+                                    background: transparent;
+                                    horizontal-stretch: 1;
+                                }
+
+                                Text {
+                                    text: root.session_summary_text;
+                                    font-size: 11px;
+                                    color: #8ea18d;
+                                }
+                            }
+
+                            StandardListView {
+                                vertical-stretch: 1;
+                                model: root.session_items;
+                                current-item: root.current_session_index;
+                                current-item-changed(index) => {
+                                    root.session_selected(index);
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        background: #1a1f1c;
+                        border-width: 1px;
+                        border-color: #313832;
+                        border-radius: 6px;
+                        horizontal-stretch: 2;
+
+                        VerticalBox {
+                            padding: 14px;
+                            spacing: 12px;
+
+                            Text {
+                                text: "Transcript";
+                                font-size: 15px;
+                                color: #f3f4ef;
+                            }
+
+                            Text {
+                                text: root.selection_title;
+                                font-size: 12px;
+                                color: #92a08f;
+                                wrap: word-wrap;
+                            }
+
+                            TextEdit {
+                                vertical-stretch: 1;
+                                read-only: true;
+                                text: root.transcript_text;
+                                font-size: 13px;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        min-width: 320px;
+                        max-width: 360px;
+                        background: #1a1f1c;
+                        border-width: 1px;
+                        border-color: #313832;
+                        border-radius: 6px;
+
+                        VerticalBox {
+                            padding: 14px;
+                            spacing: 12px;
+
+                            Text {
+                                text: "Progress";
+                                font-size: 15px;
+                                color: #f3f4ef;
+                            }
+
+                            Text {
+                                text: root.selection_title;
+                                font-size: 12px;
+                                color: #92a08f;
+                                wrap: word-wrap;
+                            }
+
+                            TextEdit {
+                                height: 168px;
+                                read-only: true;
+                                text: root.progress_text;
+                                font-size: 13px;
+                            }
+
+                            Text {
+                                text: "Activity";
+                                font-size: 15px;
+                                color: #f3f4ef;
+                            }
+
+                            TextEdit {
+                                vertical-stretch: 1;
+                                read-only: true;
+                                text: root.tool_status_text;
+                                font-size: 13px;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 310px;
+                    background: #1a1f1c;
+                    border-width: 1px;
+                    border-color: #313832;
+                    border-radius: 6px;
+
+                    VerticalBox {
+                        padding: 14px;
+                        spacing: 10px;
+
+                        HorizontalBox {
+                            spacing: 8px;
+
+                            Text {
+                                text: "Prompt";
+                                font-size: 15px;
+                                color: #f3f4ef;
+                            }
+
+                            Rectangle {
+                                background: transparent;
+                                horizontal-stretch: 1;
+                            }
+
+                            Text {
+                                text: root.current_session_title;
+                                font-size: 11px;
+                                color: #8ea18d;
+                            }
+                        }
+
+                        Text {
+                            text: root.status_banner_text;
+                            font-size: 12px;
+                            color: #97a292;
+                            wrap: word-wrap;
+                        }
+
+                        TextEdit {
+                            height: 112px;
+                            text: root.composer_text;
+                            edited(text) => {
+                                root.composer_changed(text);
+                            }
+                        }
+
+                        HorizontalBox {
+                            alignment: start;
+                            spacing: 8px;
+
+                            TextEdit {
+                                horizontal-stretch: 1;
+                                height: 36px;
+                                text: root.image_path_text;
+                                edited(text) => {
+                                    root.image_path_changed(text);
+                                }
+                            }
+
+                            Button {
+                                text: "Attach Image";
+                                width: 136px;
+                                enabled: root.image_attach_enabled;
+                                clicked => { root.image_attach_requested(); }
+                            }
+
+                            Button {
+                                text: "Browse Image";
+                                width: 136px;
+                                clicked => { root.image_browse_requested(); }
+                            }
+
+                            Button {
+                                text: "Clear Images";
+                                width: 128px;
+                                enabled: root.image_clear_enabled;
+                                clicked => { root.image_clear_requested(); }
+                            }
+                        }
+
+                        Text {
+                            text: root.image_summary_text;
+                            font-size: 12px;
+                            color: #97a292;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalBox {
+                            alignment: start;
+                            spacing: 8px;
+
+                            Button {
+                                text: "Refresh";
+                                width: 116px;
+                                clicked => { root.refresh_requested(); }
+                            }
+
+                            Button {
+                                text: "Open Session";
+                                width: 144px;
+                                enabled: root.open_session_enabled;
+                                clicked => { root.session_reload_requested(); }
+                            }
+
+                            Button {
+                                text: "Export .md";
+                                width: 124px;
+                                enabled: root.history_export_enabled;
+                                clicked => { root.history_export_requested(); }
+                            }
+
+                            Button {
+                                text: "Open Folder";
+                                width: 132px;
+                                clicked => { root.open_folder_requested(); }
+                            }
+
+                            Button {
+                                text: "Config";
+                                width: 108px;
+                                clicked => { root.config_editor_requested(); }
+                            }
+
+                            Button {
+                                text: "Provider";
+                                width: 118px;
+                                clicked => { root.provider_editor_requested(); }
+                            }
+
+                            Button {
+                                text: "Access " + root.access_mode_title;
+                                width: 148px;
+                                clicked => { root.access_mode_toggle_requested(); }
+                            }
+
+                            Button {
+                                text: "Workspace";
+                                width: 124px;
+                                clicked => { root.workspace_picker_requested(); }
+                            }
+                        }
+
+                        HorizontalBox {
+                            alignment: start;
+                            spacing: 8px;
+
+                            Button {
+                                text: "Enhance";
+                                width: 116px;
+                                enabled: root.enhance_enabled;
+                                clicked => { root.enhance_requested(); }
+                            }
+
+                            Button {
+                                text: "Review";
+                                width: 116px;
+                                enabled: root.review_enabled;
+                                clicked => { root.review_requested(); }
+                            }
+
+                            Button {
+                                text: "Run";
+                                width: 116px;
+                                primary: true;
+                                enabled: root.run_enabled;
+                                clicked => { root.run_requested(); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.config_visible : OverlayPanel {
+                x: 72px;
+                y: 88px;
+                width: parent.width - 144px;
+                height: parent.height - 164px;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 12px;
+
+                    HorizontalBox {
+                        spacing: 8px;
+
+                        Text {
+                            text: "Config Editor";
+                            font-size: 16px;
+                            color: #f3f4ef;
+                        }
+
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
+                        }
+
+                        Button {
+                            text: "Close";
+                            width: 96px;
+                            clicked => { root.config_close_requested(); }
+                        }
+                    }
+
+                    HorizontalBox {
+                        spacing: 12px;
+                        vertical-stretch: 1;
+
+                        Rectangle {
+                            background: #1b211c;
+                            border-width: 1px;
+                            border-color: #2e3630;
+                            border-radius: 6px;
+                            min-width: 420px;
+
+                            VerticalBox {
+                                padding: 10px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: "Fields";
+                                    font-size: 14px;
+                                    color: #f3f4ef;
+                                }
+
+                                StandardListView {
+                                    vertical-stretch: 1;
+                                    model: root.config_items;
+                                    current-item: root.current_config_index;
+                                    current-item-changed(index) => {
+                                        root.config_selected(index);
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            background: #1b211c;
+                            border-width: 1px;
+                            border-color: #2e3630;
+                            border-radius: 6px;
+                            horizontal-stretch: 1;
+
+                            VerticalBox {
+                                padding: 10px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: root.config_field_title;
+                                    font-size: 14px;
+                                    color: #f3f4ef;
+                                }
+
+                                Text {
+                                    text: root.config_feedback_text;
+                                    font-size: 12px;
+                                    color: #92a08f;
+                                    wrap: word-wrap;
+                                }
+
+                                TextEdit {
+                                    vertical-stretch: 1;
+                                    text: root.config_value_text;
+                                    edited(text) => {
+                                        root.config_value_changed(text);
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+
+                                    Button {
+                                        text: "Apply Session";
+                                        width: 144px;
+                                        clicked => { root.config_apply_session_requested(); }
+                                    }
+
+                                    Button {
+                                        text: "Save Project";
+                                        width: 144px;
+                                        clicked => { root.config_save_project_requested(); }
+                                    }
+
+                                    Button {
+                                        text: "Save Global";
+                                        width: 144px;
+                                        clicked => { root.config_save_global_requested(); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.workspace_picker_visible : OverlayPanel {
+                x: 172px;
+                y: 172px;
+                width: parent.width - 344px;
+                height: 238px;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 12px;
+
+                    HorizontalBox {
+                        spacing: 8px;
+
+                        Text {
+                            text: "Workspace Picker";
+                            font-size: 16px;
+                            color: #f3f4ef;
+                        }
+
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
+                        }
+
+                        Button {
+                            text: "Close";
+                            width: 96px;
+                            clicked => { root.workspace_close_requested(); }
+                        }
+                    }
+
+                    Text {
+                        text: "Type a directory path, browse for a folder, then switch the active workspace.";
+                        font-size: 12px;
+                        color: #92a08f;
+                        wrap: word-wrap;
+                    }
+
+                    TextEdit {
+                        height: 42px;
+                        text: root.workspace_input_text;
+                        edited(text) => {
+                            root.workspace_input_changed(text);
+                        }
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+
+                        Button {
+                            text: "Switch Workspace";
+                            width: 160px;
+                            clicked => { root.workspace_apply_requested(); }
+                        }
+
+                        Button {
+                            text: "Browse...";
+                            width: 116px;
+                            clicked => { root.workspace_browse_requested(); }
+                        }
+
+                        Button {
+                            text: "Open Typed Path";
+                            width: 152px;
+                            clicked => { root.open_typed_path_requested(); }
+                        }
+                    }
+                }
+            }
+
+            if root.provider_visible : OverlayPanel {
+                x: 160px;
+                y: 140px;
+                width: parent.width - 320px;
+                height: 320px;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 12px;
+
+                    HorizontalBox {
+                        spacing: 8px;
+
+                        Text {
+                            text: "Provider Settings";
+                            font-size: 16px;
+                            color: #f3f4ef;
+                        }
+
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
+                        }
+
+                        Button {
+                            text: "Close";
+                            width: 96px;
+                            clicked => { root.provider_close_requested(); }
+                        }
+                    }
+
+                    Text {
+                        text: "Enter the provider URL, load the available models, then select one model to apply or save.";
+                        font-size: 12px;
+                        color: #92a08f;
+                        wrap: word-wrap;
+                    }
+
+                    VerticalBox {
+                        spacing: 8px;
+
+                        Text {
+                            text: "Provider URL";
+                            font-size: 13px;
+                            color: #f3f4ef;
+                        }
+
+                        TextEdit {
+                            height: 42px;
+                            text: root.provider_base_url_text;
+                            edited(text) => {
+                                root.provider_base_url_changed(text);
+                            }
+                        }
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+
+                        Button {
+                            text: root.provider_load_button_text;
+                            width: 144px;
+                            enabled: root.provider_load_enabled;
+                            clicked => { root.provider_load_requested(); }
+                        }
+
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    VerticalBox {
+                        spacing: 8px;
+
+                        Text {
+                            text: "Model";
+                            font-size: 13px;
+                            color: #f3f4ef;
+                        }
+
+                        ComboBox {
+                            model: root.provider_model_items;
+                            current-index: root.current_provider_model_index;
+                            selected(value) => {
+                                root.provider_model_selected(value);
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: root.provider_feedback_text;
+                        font-size: 12px;
+                        color: #92a08f;
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+
+                        Button {
+                            text: "Apply Session";
+                            width: 144px;
+                            enabled: root.provider_apply_enabled;
+                            clicked => { root.provider_apply_session_requested(); }
+                        }
+
+                        Button {
+                            text: "Save Project";
+                            width: 144px;
+                            enabled: root.provider_apply_enabled;
+                            clicked => { root.provider_save_project_requested(); }
+                        }
+
+                        Button {
+                            text: "Save Global";
+                            width: 144px;
+                            enabled: root.provider_apply_enabled;
+                            clicked => { root.provider_save_global_requested(); }
+                        }
+                    }
+                }
+            }
+
+            if root.review_visible : OverlayPanel {
+                x: 52px;
+                y: 74px;
+                width: parent.width - 104px;
+                height: parent.height - 148px;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 12px;
+
+                    HorizontalBox {
+                        spacing: 8px;
+
+                        Text {
+                            text: "Prompt Review";
+                            font-size: 16px;
+                            color: #f3f4ef;
+                        }
+
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
+                        }
+
+                        Button {
+                            text: "Cancel";
+                            width: 96px;
+                            clicked => { root.cancel_review_requested(); }
+                        }
+                    }
+
+                    Text {
+                        text: root.review_status_text;
+                        font-size: 12px;
+                        color: #92a08f;
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalBox {
+                        spacing: 12px;
+                        vertical-stretch: 1;
+
+                        Rectangle {
+                            background: #1b211c;
+                            border-width: 1px;
+                            border-color: #2e3630;
+                            border-radius: 6px;
+                            horizontal-stretch: 1;
+
+                            VerticalBox {
+                                padding: 10px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: "Raw Prompt";
+                                    font-size: 14px;
+                                    color: #f3f4ef;
+                                }
+
+                                TextEdit {
+                                    vertical-stretch: 1;
+                                    read-only: true;
+                                    text: root.review_raw_text;
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            background: #1b211c;
+                            border-width: 1px;
+                            border-color: #2e3630;
+                            border-radius: 6px;
+                            horizontal-stretch: 1;
+
+                            VerticalBox {
+                                padding: 10px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: "Enhanced Draft";
+                                    font-size: 14px;
+                                    color: #f3f4ef;
+                                }
+
+                                TextEdit {
+                                    vertical-stretch: 1;
+                                    text: root.review_draft_text;
+                                    edited(text) => {
+                                        root.review_draft_changed(text);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+
+                        Button {
+                            text: "Send Enhanced";
+                            width: 148px;
+                            enabled: root.send_enhanced_enabled;
+                            clicked => { root.send_enhanced_requested(); }
+                        }
+
+                        Button {
+                            text: "Send Raw";
+                            width: 124px;
+                            enabled: root.send_raw_enabled;
+                            clicked => { root.send_raw_requested(); }
+                        }
+                    }
+                }
+            }
+
+            if root.confirmation_visible : OverlayPanel {
+                x: 248px;
+                y: 214px;
+                width: parent.width - 496px;
+                height: 240px;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 12px;
+
+                    Text {
+                        text: "Confirmation";
+                        font-size: 16px;
+                        color: #f3f4ef;
+                    }
+
+                    TextEdit {
+                        vertical-stretch: 1;
+                        read-only: true;
+                        text: root.confirmation_text;
+                        font-size: 13px;
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+
+                        Button {
+                            text: "Approve";
+                            width: 128px;
+                            primary: true;
+                            clicked => { root.confirm_accept_requested(); }
+                        }
+
+                        Button {
+                            text: "Reject";
+                            width: 128px;
+                            clicked => { root.confirm_reject_requested(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
