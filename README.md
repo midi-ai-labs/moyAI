@@ -32,6 +32,12 @@ moyAI was built for that environment. It focuses on local execution, explicit co
 
 moyAI is an active Rust implementation aimed at closed-network and local-LLM use. The current repository includes the core runtime, CLI, TUI, desktop app, session storage, tool execution layer, provider metadata probing, and harness/preflight infrastructure.
 
+## Current Target Environment
+
+moyAI is currently developed and tested primarily on Windows.
+
+During development, moyAI has been optimized for `qwen/qwen3.6-35b-a3b` hosted by LM Studio, specifically the `lmstudio-community` build. Other models and broader provider profiles are planned for future development.
+
 ## Requirements
 
 - Rust toolchain with the 2024 edition support.
@@ -87,6 +93,7 @@ Example:
 ```toml
 [model]
 base_url = "http://127.0.0.1:1234"
+# LM Studio-hosted qwen3.6-35b-a3b, lmstudio-community build.
 model = "qwen/qwen3.6-35b-a3b"
 context_window = 131072
 supports_tools = true
