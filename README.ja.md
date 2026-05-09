@@ -132,7 +132,9 @@ cargo run -- preflight run
 
 moyAI のアプリケーションおよびソースコード自体は MIT License です。
 
-Copyright (c) 2026 Hideyoshi Takahashi, midi-ai-labs.
+Copyright (c) 2026 Hideyoshi Takahashi.
+
+`midi-ai-labs` は、この個人開発プロジェクトの GitHub organization / project namespace です。
 
 ライセンス本文は [LICENSE](LICENSE) を参照してください。
 
@@ -141,5 +143,6 @@ Copyright (c) 2026 Hideyoshi Takahashi, midi-ai-labs.
 moyAI は third-party software を利用しており、それぞれの software は各ライセンス条件に従います。
 
 - Slint: https://slint.dev/
-  - License options: Slint Royalty-free License, GNU GPLv3, or paid commercial license.
   - This application uses Slint as a UI framework.
+  - moyAI uses Slint under the Slint Royalty-free License.
+  - Slint also offers GNU GPLv3 and paid commercial license options.
