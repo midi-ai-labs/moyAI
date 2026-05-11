@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use directories_next::UserDirs;
 
 use crate::agent::{AgentLoop, PromptBuilder};
 use crate::app::{App, RunService};
@@ -29,6 +30,7 @@ impl AppBootstrap {
         let sqlite = SqliteStore::open(&storage_paths)?;
         sqlite.migrate()?;
         let store = StoreBundle::new(sqlite);
+        ConfigLoader::ensure_default_global_config()?;
         Self::build_with_store(&start_dir, run_args, store).await
     }
 
@@ -135,7 +137,11 @@ fn command_directory(command: &CliCommand) -> Result<camino::Utf8PathBuf, AppBoo
         CliCommand::Run(args) => args.directory.clone().unwrap_or(current),
         CliCommand::SessionList(args) => args.directory.clone().unwrap_or(current),
         CliCommand::Tui(args) => args.directory.clone().unwrap_or(current),
-        CliCommand::Desktop(args) => args.directory.clone().unwrap_or(current),
+        CliCommand::Desktop(args) => args
+            .directory
+            .clone()
+            .or_else(default_desktop_workspace_directory)
+            .unwrap_or(current),
         CliCommand::SessionShow(_) => current,
         CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
@@ -146,4 +152,10 @@ fn command_directory(command: &CliCommand) -> Result<camino::Utf8PathBuf, AppBoo
         | CliCommand::ContractSnapshot(_)
         | CliCommand::ManualStRoute(_) => current,
     })
+}
+
+fn default_desktop_workspace_directory() -> Option<Utf8PathBuf> {
+    UserDirs::new()
+        .and_then(|dirs| dirs.desktop_dir().map(|path| path.to_path_buf()))
+        .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
 }

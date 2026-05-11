@@ -306,7 +306,7 @@ impl Default for ResolvedConfig {
 
         Self {
             model: ModelConfig {
-                base_url: "http://192.168.10.103:1234".to_string(),
+                base_url: "http://127.0.0.1:1234".to_string(),
                 model: "qwen/qwen3.6-35b-a3b".to_string(),
                 prompt_profile: PromptProfile::Auto,
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
@@ -412,19 +412,19 @@ impl Default for ResolvedConfig {
                 ],
             },
             docling: DoclingConfig {
-                enabled: true,
-                base_url: "http://m1macmini:8123".to_string(),
+                enabled: false,
+                base_url: "http://127.0.0.1:8123".to_string(),
                 timeout_ms: 120_000,
                 api_key_env: Some("DOCLING_API_KEY".to_string()),
                 headers: BTreeMap::new(),
             },
             mcp: McpConfig {
-                enabled: true,
+                enabled: false,
                 servers: vec![McpServerConfig {
                     id: "docling".to_string(),
-                    enabled: true,
+                    enabled: false,
                     transport: McpTransportKind::Http,
-                    base_url: "http://m1macmini:8123/mcp".to_string(),
+                    base_url: "http://127.0.0.1:8123/mcp".to_string(),
                     timeout_ms: 120_000,
                     route_allowlist: vec![
                         "ask".to_string(),

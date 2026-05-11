@@ -8,4 +8,4 @@ pub mod state;
 pub mod view_model;
 
 pub use app::run;
-pub use args::DesktopArgs;
+pub use args::{DesktopArgs, default_workspace_directory};

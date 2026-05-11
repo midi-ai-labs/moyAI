@@ -2,9 +2,9 @@
 
 このディレクトリは、manual system test の canonical spec を保管する場所である。今後の representative 実行は TUI ではなく Desktop GUI e2e を正本とする。
 
-- case の履歴、修正理由、残課題は `C:\Users\example\Desktop\CodingAgent\docs\logs\manual-st-history.md` を正本とする
-- 日次の判断記録は `C:\Users\example\Desktop\CodingAgent\docs\logs\worklog.md` を正本とする
-- current harness 実装とその境界は `C:\Users\example\Desktop\CodingAgent\docs\design\verification-harness.md` を正本とする
+- case の履歴、修正理由、残課題は repository root の `docs/logs/manual-st-history.md` を正本とする
+- 日次の判断記録は repository root の `docs/logs/worklog.md` を正本とする
+- current harness 実装とその境界は repository root の `docs/design/verification-harness.md` を正本とする
 - この README と各 `spec.md` は scenario spec / acceptance policy / rerun rule の正本とする
 - ここに置く `spec.md` は「別チャットから case 名で再実行できるようにするための実行仕様」であり、再現手順、入力、合格条件、失敗時ルールを固定する
 
@@ -26,6 +26,7 @@ Desktop GUI e2e route taxonomy:
 - rerun 開始前に configured model が OpenAI 互換 `/v1/models` と LM Studio `/api/v1/models` metadata から取得できることを確認し、失敗した場合は route を開始しない。vision route では `supports_images=true` も必須とする
 - 旧 `case1 -> case2 -> case3 -> case4 -> case5 -> case6 -> case7` の一本直列 representative route は使わない
 - Required Core Route A: `case1 -> case3`
+- Targeted Core Case1: `case1`。operator が case1 単体観測を依頼した場合の targeted run であり、Phase12 exit の Required Core Route A 代替にはしない
 - Required Vision Route B: 通常は `case2c`。Phase12 final exit、provider/model metadata、Desktop GUI image attachment、request diagnostics 変更時、または image_count / image part / vision metadata 疑いがある場合は `case2a -> case2c`
 - Targeted Support Route: `case2b`。scenario_contract、Contract Reconciliation、generated test subordinate policy 変更時、または case2c が source/test/contract/codegen mismatch で落ちた場合に実行する
 - Extended Route C/D/E: `case4`、`case5`、`case7`
@@ -49,4 +50,4 @@ Desktop GUI e2e route taxonomy:
 - residual fix は先に `Roo Code` と `opencode` の該当 runtime / prompt / tool 実装を確認してから行う
 - prompt も製品機能として扱い、仮 wording のまま放置しない
 - 各 case の合格条件は scenario / user-visible contract と harness evidence の gate として扱う。failure handling や detailed regression signal は、そのまま e2e assertion に昇格させず、Failure Registry 登録後に下位 deterministic test へ分解してから固定する
-- 今後の representative manual ST failure は `FR03-...` prefix で登録する。既存 `FR-...` / `FR2-...` は historical evidence として保持する
+- 今後の representative manual ST failure は `FR10-YYYY-MM-DD-NNN` prefix で登録する。既存 `FR-...` / `FR2-...` / `FR03-...` は historical evidence として保持する

@@ -34,6 +34,19 @@ fn manual_st_route_plan_owns_required_core_route_shape() {
 }
 
 #[test]
+fn manual_st_route_plan_supports_targeted_case1_run() {
+    let plan = manual_st_route_plan(ManualStRouteKind::TargetedCoreCase1);
+
+    assert_eq!(plan.route_id, "targeted_core_case1");
+    assert_eq!(plan.route_type, "targeted_support");
+    assert_eq!(plan.case_ids, vec!["case1"]);
+    assert!(
+        plan.required_artifacts
+            .contains(&"route_manifest.json".to_string())
+    );
+}
+
+#[test]
 fn final_assistant_with_open_obligation_is_route_failure_evidence() {
     assert!(final_assistant_open_obligation_not_clean_closeout_fixture_passes());
 }

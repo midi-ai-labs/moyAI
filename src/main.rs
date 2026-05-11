@@ -23,7 +23,7 @@ use moyai::session::EditorContext;
 use moyai::storage::{SqliteStore, StoragePaths};
 use moyai::tui;
 
-const CLI_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 fn main() -> ExitCode {
     match run() {
@@ -49,20 +49,21 @@ fn run() -> Result<(), (u8, String)> {
         | CliCommand::ModelAvailability(_)
         | CliCommand::SchemaExport(_)
         | CliCommand::ContractSnapshot(_)
-        | CliCommand::ManualStRoute(_) => run_noninteractive_with_large_stack(command),
-        CliCommand::Tui(_) | CliCommand::Desktop(_) => run_on_current_thread(command),
+        | CliCommand::ManualStRoute(_)
+        | CliCommand::Desktop(_) => run_with_large_stack(command),
+        CliCommand::Tui(_) => run_on_current_thread(command),
     }
 }
 
-fn run_noninteractive_with_large_stack(command: CliCommand) -> Result<(), (u8, String)> {
+fn run_with_large_stack(command: CliCommand) -> Result<(), (u8, String)> {
     let join_handle = std::thread::Builder::new()
-        .name("moyai-cli".to_string())
-        .stack_size(CLI_WORKER_STACK_BYTES)
+        .name("moyai-worker".to_string())
+        .stack_size(WORKER_STACK_BYTES)
         .spawn(move || run_on_current_thread(command))
-        .map_err(|error| (4, format!("failed to spawn CLI worker thread: {error}")))?;
+        .map_err(|error| (4, format!("failed to spawn worker thread: {error}")))?;
     match join_handle.join() {
         Ok(result) => result,
-        Err(_) => Err((4, "CLI worker thread panicked".to_string())),
+        Err(_) => Err((4, "worker thread panicked".to_string())),
     }
 }
 
@@ -127,10 +128,14 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
         return Ok(());
     }
     if let CliCommand::Desktop(args) = command.clone() {
+        let directory = args
+            .directory
+            .clone()
+            .or_else(desktop::default_workspace_directory);
         desktop::run(
             app,
             desktop::DesktopArgs {
-                directory: args.directory,
+                directory,
                 session_id: args.session_id,
                 continue_last: args.continue_last,
             },

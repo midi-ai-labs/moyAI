@@ -6,9 +6,17 @@ use directories_next::ProjectDirs;
 
 use crate::cli::RunArgs;
 use crate::config::merge::apply_patch;
-use crate::config::model::{AccessMode, PartialResolvedConfig, ResolvedConfig};
+use crate::config::model::{
+    AccessMode, PartialAgentConfig, PartialDoclingConfig, PartialFileGuardConfig,
+    PartialFormatConfig, PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig,
+    PartialMcpConfig, PartialModelConfig, PartialPermissionsConfig, PartialResolvedConfig,
+    PartialSessionConfig, PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig,
+    ResolvedConfig,
+};
 use crate::error::ConfigError;
 use crate::workspace::project::find_workspace_root;
+
+const GLOBAL_CONFIG_PATH_ENV: &str = "MOYAI_CONFIG_PATH";
 
 pub struct ConfigLoader;
 
@@ -47,9 +55,18 @@ impl ConfigLoader {
 
         Ok(resolved)
     }
+
+    pub fn ensure_default_global_config() -> Result<Utf8PathBuf, ConfigError> {
+        let path = global_config_path()?;
+        write_default_global_config_if_missing(&path)?;
+        Ok(path)
+    }
 }
 
 pub fn global_config_path() -> Result<Utf8PathBuf, ConfigError> {
+    if let Ok(value) = env::var(GLOBAL_CONFIG_PATH_ENV) {
+        return Ok(Utf8PathBuf::from(value));
+    }
     let dirs = ProjectDirs::from("net", "midi-ai-labs", "moyai")
         .ok_or_else(|| ConfigError::Message("failed to resolve config directory".to_string()))?;
     let config_dir = Utf8PathBuf::from_path_buf(dirs.config_dir().to_path_buf())
@@ -71,6 +88,160 @@ fn read_optional(path: Utf8PathBuf) -> Result<Option<PartialResolvedConfig>, Con
     let text = fs::read_to_string(path)?;
     let parsed = toml::from_str::<PartialResolvedConfig>(&text)?;
     Ok(Some(parsed))
+}
+
+fn write_default_global_config_if_missing(path: &Utf8Path) -> Result<(), ConfigError> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let defaults = default_config_patch(&ResolvedConfig::default());
+    let encoded = toml::to_string_pretty(&defaults)?;
+    let temp_path = path.with_extension("tmp");
+    fs::write(&temp_path, encoded)?;
+    if path.exists() {
+        let _ = fs::remove_file(&temp_path);
+        return Ok(());
+    }
+    fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
+fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
+    PartialResolvedConfig {
+        model: Some(PartialModelConfig {
+            base_url: Some(config.model.base_url.clone()),
+            model: Some(config.model.model.clone()),
+            prompt_profile: Some(config.model.prompt_profile),
+            api_key_env: Some(config.model.api_key_env.clone()),
+            extra_headers: Some(config.model.extra_headers.clone()),
+            request_timeout_ms: Some(config.model.request_timeout_ms),
+            stream_idle_timeout_ms: Some(config.model.stream_idle_timeout_ms),
+            connect_timeout_ms: Some(config.model.connect_timeout_ms),
+            max_retries: Some(config.model.max_retries),
+            stream_max_retries: Some(config.model.stream_max_retries),
+            context_window: Some(config.model.context_window),
+            max_output_tokens: Some(config.model.max_output_tokens),
+            temperature: config.model.temperature,
+            top_p: config.model.top_p,
+            top_k: config.model.top_k,
+            presence_penalty: config.model.presence_penalty,
+            frequency_penalty: config.model.frequency_penalty,
+            seed: config.model.seed,
+            stop_sequences: Some(config.model.stop_sequences.clone()),
+            supports_tools: Some(config.model.supports_tools),
+            supports_reasoning: Some(config.model.supports_reasoning),
+            supports_images: Some(config.model.supports_images),
+            parallel_tool_calls: Some(config.model.parallel_tool_calls),
+            max_parallel_predictions: Some(config.model.max_parallel_predictions),
+            extra_body_json: config.model.extra_body_json.clone(),
+        }),
+        session: Some(PartialSessionConfig {
+            default_title_max_len: Some(config.session.default_title_max_len),
+            transcript_limit_messages: Some(config.session.transcript_limit_messages),
+            auto_resume_last: Some(config.session.auto_resume_last),
+            max_steps_per_turn: Some(config.session.max_steps_per_turn),
+            overflow_margin_tokens: Some(config.session.overflow_margin_tokens),
+        }),
+        agent: Some(PartialAgentConfig {
+            duplicate_success_abort_threshold: Some(config.agent.duplicate_success_abort_threshold),
+            repetitive_text_line_threshold: Some(config.agent.repetitive_text_line_threshold),
+            readonly_stall_threshold_implementation: Some(
+                config.agent.readonly_stall_threshold_implementation,
+            ),
+            readonly_stall_threshold_general: Some(config.agent.readonly_stall_threshold_general),
+            verification_repair_grace_steps: Some(config.agent.verification_repair_grace_steps),
+            verification_failure_attempt_limit: Some(
+                config.agent.verification_failure_attempt_limit,
+            ),
+            verification_failure_repair_read_budget: Some(
+                config.agent.verification_failure_repair_read_budget,
+            ),
+            staged_task_documentation_finish_grace_steps: Some(
+                config.agent.staged_task_documentation_finish_grace_steps,
+            ),
+            staged_task_discovery_redirect_repeat_threshold: Some(
+                config.agent.staged_task_discovery_redirect_repeat_threshold,
+            ),
+            staged_task_authoring_read_limit: Some(config.agent.staged_task_authoring_read_limit),
+            staged_task_authoring_successful_read_budget_after_progress: Some(
+                config
+                    .agent
+                    .staged_task_authoring_successful_read_budget_after_progress,
+            ),
+            staged_task_audit_repair_read_budget: Some(
+                config.agent.staged_task_audit_repair_read_budget,
+            ),
+            staged_task_audit_repair_rewrite_escalation_threshold: Some(
+                config
+                    .agent
+                    .staged_task_audit_repair_rewrite_escalation_threshold,
+            ),
+            staged_task_recovery_stall_threshold: Some(
+                config.agent.staged_task_recovery_stall_threshold,
+            ),
+        }),
+        permissions: Some(PartialPermissionsConfig {
+            access_mode: Some(config.permissions.access_mode),
+            additional_read_roots: Some(config.permissions.additional_read_roots.clone()),
+            additional_write_roots: Some(config.permissions.additional_write_roots.clone()),
+        }),
+        shell: Some(PartialShellConfig {
+            program: config.shell.program.clone().map(Some),
+            family: config.shell.family.map(Some),
+            default_timeout_ms: Some(config.shell.default_timeout_ms),
+            max_timeout_ms: Some(config.shell.max_timeout_ms),
+            env_allowlist: Some(config.shell.env_allowlist.clone()),
+        }),
+        format: Some(PartialFormatConfig {
+            default_newline: Some(config.format.default_newline),
+            ensure_trailing_newline: Some(config.format.ensure_trailing_newline),
+            commands: Some(config.format.commands.clone()),
+        }),
+        instructions: Some(PartialInstructionConfig {
+            additional_files: Some(config.instructions.additional_files.clone()),
+        }),
+        workspace: Some(PartialWorkspaceConfig {
+            extra_ignore_globs: Some(config.workspace.extra_ignore_globs.clone()),
+            protected_paths: Some(config.workspace.protected_paths.clone()),
+        }),
+        inspection: Some(PartialInspectionConfig {
+            default_max_depth: Some(config.inspection.default_max_depth),
+            default_max_entries_per_dir: Some(config.inspection.default_max_entries_per_dir),
+            max_extensions_reported: Some(config.inspection.max_extensions_reported),
+            include_hidden_by_default: Some(config.inspection.include_hidden_by_default),
+        }),
+        file_guard: Some(PartialFileGuardConfig {
+            max_inline_read_bytes: Some(config.file_guard.max_inline_read_bytes),
+            large_file_warning_bytes: Some(config.file_guard.large_file_warning_bytes),
+            blocked_read_extensions: Some(config.file_guard.blocked_read_extensions.clone()),
+            structured_document_extensions: Some(
+                config.file_guard.structured_document_extensions.clone(),
+            ),
+        }),
+        docling: Some(PartialDoclingConfig {
+            enabled: Some(config.docling.enabled),
+            base_url: Some(config.docling.base_url.clone()),
+            timeout_ms: Some(config.docling.timeout_ms),
+            api_key_env: Some(config.docling.api_key_env.clone()),
+            headers: Some(config.docling.headers.clone()),
+        }),
+        mcp: Some(PartialMcpConfig {
+            enabled: Some(config.mcp.enabled),
+            servers: Some(config.mcp.servers.clone()),
+        }),
+        tool_output: Some(PartialToolOutputConfig {
+            max_lines: Some(config.tool_output.max_lines),
+            max_bytes: Some(config.tool_output.max_bytes),
+            max_results: Some(config.tool_output.max_results),
+        }),
+        logging: Some(PartialLoggingConfig {
+            verbosity: Some(config.logging.verbosity),
+            json_logs: Some(config.logging.json_logs),
+        }),
+    }
 }
 
 fn env_patch() -> PartialResolvedConfig {
@@ -324,6 +495,42 @@ fn env_patch() -> PartialResolvedConfig {
     }
 
     patch
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_global_config_is_created_with_editable_defaults() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 path");
+
+        write_default_global_config_if_missing(&path).expect("write default config");
+
+        let text = fs::read_to_string(path).expect("read config");
+        assert!(text.contains("[model]"));
+        assert!(text.contains("base_url = \"http://127.0.0.1:1234\""));
+        assert!(text.contains("model = \"qwen/qwen3.6-35b-a3b\""));
+        assert!(text.contains("[docling]"));
+        assert!(text.contains("enabled = false"));
+        assert!(text.contains("base_url = \"http://127.0.0.1:8123\""));
+        assert!(text.contains("base_url = \"http://127.0.0.1:8123/mcp\""));
+        assert!(text.contains("[permissions]"));
+        toml::from_str::<PartialResolvedConfig>(&text).expect("generated config parses");
+    }
+
+    #[test]
+    fn default_global_config_does_not_overwrite_existing_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 path");
+        fs::write(&path, "[model]\nmodel = \"custom\"\n").expect("seed config");
+
+        write_default_global_config_if_missing(&path).expect("preserve config");
+
+        let text = fs::read_to_string(path).expect("read config");
+        assert_eq!(text, "[model]\nmodel = \"custom\"\n");
+    }
 }
 
 fn parse_prompt_profile(value: &str) -> Option<crate::config::model::PromptProfile> {

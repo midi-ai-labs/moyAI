@@ -13,7 +13,7 @@ component MetaItem inherits Rectangle {
     in property <string> value;
 
     background: transparent;
-    min-height: 46px;
+    min-height: 34px;
 
     VerticalBox {
         alignment: start;
@@ -22,23 +22,72 @@ component MetaItem inherits Rectangle {
         Text {
             text: root.label;
             font-size: 11px;
-            color: #94a091;
+            color: #9aa6b2;
         }
 
         Text {
             text: root.value;
             font-size: 13px;
-            color: #f2f4ef;
+            color: #f4f7fb;
             wrap: word-wrap;
         }
     }
 }
 
 component OverlayPanel inherits Rectangle {
-    background: #151915;
+    background: #171a20;
     border-width: 1px;
-    border-color: #38403a;
+    border-color: #343b47;
     border-radius: 6px;
+}
+
+component PanelTitle inherits Text {
+    font-size: 14px;
+    font-weight: 600;
+    color: #f4f7fb;
+}
+
+component MutedText inherits Text {
+    font-size: 12px;
+    color: #9aa6b2;
+    wrap: word-wrap;
+}
+
+component Divider inherits Rectangle {
+    height: 1px;
+    background: #2b323d;
+}
+
+component ActionButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 36px;
+    background: !root.enabled ? #20242c : root.primary ? #5fc7ee : touch.pressed ? #303642 : touch.has-hover ? #343b47 : #242832;
+    border-width: 1px;
+    border-color: !root.enabled ? #2b3039 : root.primary ? #5fc7ee : #343b47;
+    border-radius: 5px;
+
+    Text {
+        x: 8px;
+        y: 0;
+        width: parent.width - 16px;
+        height: parent.height;
+        text: root.text;
+        font-size: 13px;
+        color: !root.enabled ? #7d8793 : root.primary ? #071017 : #f4f7fb;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        width: root.width;
+        height: root.height;
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
 }
 
 export component AppWindow inherits Window {
@@ -138,10 +187,11 @@ export component AppWindow inherits Window {
     callback window_opacity_changed(float);
 
     title: "moyAI Desktop";
-    preferred-width: 1440px;
-    preferred-height: 940px;
-    min-width: 1180px;
-    min-height: 760px;
+    icon: @image-url("../../logo/fabicon/android-chrome-512x512.png");
+    preferred-width: 1360px;
+    preferred-height: 900px;
+    min-width: 1040px;
+    min-height: 720px;
     background: transparent;
 
     Rectangle {
@@ -152,100 +202,164 @@ export component AppWindow inherits Window {
             y: 0;
             width: parent.width;
             height: parent.height;
-            background: #121512;
+            background: #101216;
             border-width: 1px;
-            border-color: #2c332d;
+            border-color: #2a303a;
             opacity: root.window_opacity_percent / 100;
 
             VerticalBox {
-                padding: 14px;
-                spacing: 12px;
+                padding: 12px;
+                spacing: 10px;
 
                 Rectangle {
-                    height: 84px;
-                    background: #171c18;
+                    height: 112px;
+                    background: #171a20;
                     border-width: 1px;
-                    border-color: #313832;
+                    border-color: #2d3440;
                     border-radius: 6px;
 
-                    HorizontalBox {
+                    VerticalBox {
                         padding: 12px;
-                        spacing: 12px;
+                        spacing: 8px;
 
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            background: transparent;
+                        HorizontalBox {
+                            height: 42px;
+                            spacing: 12px;
 
-                            VerticalBox {
-                                alignment: start;
-                                spacing: 3px;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                background: transparent;
 
-                                Text {
-                                    text: "moyAI Desktop";
-                                    font-size: 21px;
-                                    color: #f3f4ef;
-                                }
+                                VerticalBox {
+                                    alignment: start;
+                                    spacing: 3px;
 
-                                Text {
-                                    text: root.workspace_path_text;
-                                    font-size: 12px;
-                                    color: #97a292;
-                                    wrap: word-wrap;
-                                }
+                                    Text {
+                                        text: "moyAI Desktop";
+                                        font-size: 22px;
+                                        font-weight: 700;
+                                        color: #f3f4ef;
+                                    }
 
-                                Text {
-                                    text: root.status_banner_text;
-                                    font-size: 12px;
-                                    color: #8ea18d;
-                                    wrap: word-wrap;
+                                    Text {
+                                        text: root.workspace_path_text;
+                                        font-size: 12px;
+                                        color: #9aa6b2;
+                                        wrap: word-wrap;
+                                    }
                                 }
                             }
-                        }
 
-                        Rectangle {
-                            width: 214px;
-                            background: transparent;
+                            Rectangle {
+                                width: 240px;
+                                background: transparent;
 
-                            VerticalBox {
-                                alignment: center;
-                                spacing: 4px;
-
-                                Text {
-                                    text: "Opacity";
-                                    font-size: 11px;
-                                    color: #8ea18d;
-                                }
-
-                                HorizontalBox {
+                                VerticalBox {
                                     alignment: center;
-                                    spacing: 8px;
+                                    spacing: 4px;
 
-                                    Slider {
-                                        width: 132px;
-                                        minimum: 55;
-                                        maximum: 100;
-                                        step: 1;
-                                        value: root.window_opacity_percent;
-                                        changed(value) => {
-                                            root.window_opacity_changed(value);
+                                    Text {
+                                        text: "Opacity";
+                                        font-size: 11px;
+                                        color: #9aa6b2;
+                                    }
+
+                                    HorizontalBox {
+                                        alignment: center;
+                                        spacing: 8px;
+
+                                        Slider {
+                                            width: 120px;
+                                            minimum: 55;
+                                            maximum: 100;
+                                            step: 1;
+                                            value: root.window_opacity_percent;
+                                            changed(value) => {
+                                                root.window_opacity_changed(value);
+                                            }
+                                        }
+
+                                        Text {
+                                            text: root.window_opacity_text;
+                                            min-width: 40px;
+                                            font-size: 12px;
+                                            color: #f4f7fb;
+                                            horizontal-alignment: center;
                                         }
                                     }
 
                                     Text {
-                                        text: root.window_opacity_text;
-                                        min-width: 40px;
-                                        font-size: 12px;
-                                        color: #edf1ea;
-                                        horizontal-alignment: center;
+                                        text: root.current_session_title;
+                                        font-size: 11px;
+                                        color: #5ee6c1;
+                                        wrap: word-wrap;
                                     }
                                 }
+                            }
+                        }
 
-                                Text {
-                                    text: root.current_session_title;
-                                    font-size: 11px;
-                                    color: #8ea18d;
-                                    wrap: word-wrap;
-                                }
+                        HorizontalBox {
+                            height: 34px;
+                            spacing: 8px;
+
+                            Button {
+                                text: "Workspace";
+                                width: 108px;
+                                height: 32px;
+                                clicked => { root.workspace_picker_requested(); }
+                            }
+
+                            Button {
+                                text: "Provider";
+                                width: 104px;
+                                height: 32px;
+                                clicked => { root.provider_editor_requested(); }
+                            }
+
+                            Button {
+                                text: "Config";
+                                width: 92px;
+                                height: 32px;
+                                clicked => { root.config_editor_requested(); }
+                            }
+
+                            Button {
+                                text: "Folder";
+                                width: 92px;
+                                height: 32px;
+                                clicked => { root.open_folder_requested(); }
+                            }
+
+                            Button {
+                                text: "Access: " + root.access_mode_title;
+                                width: 146px;
+                                height: 32px;
+                                clicked => { root.access_mode_toggle_requested(); }
+                            }
+
+                            Button {
+                                text: "Open";
+                                width: 76px;
+                                height: 32px;
+                                enabled: root.open_session_enabled;
+                                clicked => { root.session_reload_requested(); }
+                            }
+
+                            Button {
+                                text: "Export";
+                                width: 76px;
+                                height: 32px;
+                                enabled: root.history_export_enabled;
+                                clicked => { root.history_export_requested(); }
+                            }
+
+                            Rectangle {
+                                background: transparent;
+                                horizontal-stretch: 1;
+                            }
+
+                            MutedText {
+                                text: root.status_banner_text;
                             }
                         }
                     }
@@ -256,27 +370,26 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
 
                     Rectangle {
-                        min-width: 310px;
-                        max-width: 340px;
-                        background: #1a1f1c;
+                        min-width: 270px;
+                        max-width: 300px;
+                        background: #171a20;
                         border-width: 1px;
-                        border-color: #313832;
+                        border-color: #2d3440;
                         border-radius: 6px;
 
                         VerticalBox {
-                            padding: 14px;
-                            spacing: 12px;
+                            padding: 12px;
+                            spacing: 9px;
 
-                            Text {
+                            PanelTitle {
                                 text: "Workspace";
-                                font-size: 15px;
-                                color: #f3f4ef;
                             }
 
                             Text {
                                 text: root.workspace_name;
-                                font-size: 20px;
-                                color: #f3f4ef;
+                                font-size: 18px;
+                                font-weight: 600;
+                                color: #f4f7fb;
                             }
 
                             MetaItem {
@@ -304,28 +417,13 @@ export component AppWindow inherits Window {
                                 value: root.current_session_title;
                             }
 
-                            MetaItem {
-                                label: "Current State";
-                                value: root.run_status_text;
-                            }
-
-                            MetaItem {
-                                label: "Progress";
-                                value: root.progress_text;
-                            }
-
-                            Rectangle {
-                                height: 1px;
-                                background: #2a312c;
-                            }
+                            Divider {}
 
                             HorizontalBox {
                                 spacing: 8px;
 
-                                Text {
+                                PanelTitle {
                                     text: "Sessions";
-                                    font-size: 15px;
-                                    color: #f3f4ef;
                                 }
 
                                 Rectangle {
@@ -336,7 +434,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: root.session_summary_text;
                                     font-size: 11px;
-                                    color: #8ea18d;
+                                    color: #9aa6b2;
                                 }
                             }
 
@@ -352,27 +450,22 @@ export component AppWindow inherits Window {
                     }
 
                     Rectangle {
-                        background: #1a1f1c;
+                        background: #171a20;
                         border-width: 1px;
-                        border-color: #313832;
+                        border-color: #2d3440;
                         border-radius: 6px;
-                        horizontal-stretch: 2;
+                        horizontal-stretch: 3;
 
                         VerticalBox {
-                            padding: 14px;
-                            spacing: 12px;
+                            padding: 12px;
+                            spacing: 9px;
 
-                            Text {
+                            PanelTitle {
                                 text: "Transcript";
-                                font-size: 15px;
-                                color: #f3f4ef;
                             }
 
-                            Text {
+                            MutedText {
                                 text: root.selection_title;
-                                font-size: 12px;
-                                color: #92a08f;
-                                wrap: word-wrap;
                             }
 
                             TextEdit {
@@ -385,41 +478,34 @@ export component AppWindow inherits Window {
                     }
 
                     Rectangle {
-                        min-width: 320px;
-                        max-width: 360px;
-                        background: #1a1f1c;
+                        min-width: 280px;
+                        max-width: 320px;
+                        background: #171a20;
                         border-width: 1px;
-                        border-color: #313832;
+                        border-color: #2d3440;
                         border-radius: 6px;
 
                         VerticalBox {
-                            padding: 14px;
-                            spacing: 12px;
+                            padding: 12px;
+                            spacing: 9px;
 
-                            Text {
+                            PanelTitle {
                                 text: "Progress";
-                                font-size: 15px;
-                                color: #f3f4ef;
                             }
 
-                            Text {
+                            MutedText {
                                 text: root.selection_title;
-                                font-size: 12px;
-                                color: #92a08f;
-                                wrap: word-wrap;
                             }
 
                             TextEdit {
-                                height: 168px;
+                                height: 136px;
                                 read-only: true;
                                 text: root.progress_text;
                                 font-size: 13px;
                             }
 
-                            Text {
+                            PanelTitle {
                                 text: "Activity";
-                                font-size: 15px;
-                                color: #f3f4ef;
                             }
 
                             TextEdit {
@@ -433,183 +519,131 @@ export component AppWindow inherits Window {
                 }
 
                 Rectangle {
-                    height: 310px;
-                    background: #1a1f1c;
+                    height: 220px;
+                    background: #171a20;
                     border-width: 1px;
-                    border-color: #313832;
+                    border-color: #2d3440;
                     border-radius: 6px;
 
-                    VerticalBox {
-                        padding: 14px;
-                        spacing: 10px;
+                    HorizontalBox {
+                        padding: 12px;
+                        spacing: 12px;
 
-                        HorizontalBox {
+                        VerticalBox {
                             spacing: 8px;
+                            horizontal-stretch: 1;
 
-                            Text {
-                                text: "Prompt";
-                                font-size: 15px;
-                                color: #f3f4ef;
-                            }
+                            HorizontalBox {
+                                spacing: 8px;
 
-                            Rectangle {
-                                background: transparent;
-                                horizontal-stretch: 1;
-                            }
+                                PanelTitle {
+                                    text: "Prompt";
+                                }
 
-                            Text {
-                                text: root.current_session_title;
-                                font-size: 11px;
-                                color: #8ea18d;
-                            }
-                        }
+                                Rectangle {
+                                    background: transparent;
+                                    horizontal-stretch: 1;
+                                }
 
-                        Text {
-                            text: root.status_banner_text;
-                            font-size: 12px;
-                            color: #97a292;
-                            wrap: word-wrap;
-                        }
-
-                        TextEdit {
-                            height: 112px;
-                            text: root.composer_text;
-                            edited(text) => {
-                                root.composer_changed(text);
-                            }
-                        }
-
-                        HorizontalBox {
-                            alignment: start;
-                            spacing: 8px;
-
-                            TextEdit {
-                                horizontal-stretch: 1;
-                                height: 36px;
-                                text: root.image_path_text;
-                                edited(text) => {
-                                    root.image_path_changed(text);
+                                Text {
+                                    text: root.current_session_title;
+                                    font-size: 11px;
+                                    color: #5ee6c1;
                                 }
                             }
 
-                            Button {
-                                text: "Attach Image";
-                                width: 136px;
-                                enabled: root.image_attach_enabled;
-                                clicked => { root.image_attach_requested(); }
+                            MutedText {
+                                text: root.status_banner_text;
                             }
 
-                            Button {
-                                text: "Browse Image";
-                                width: 136px;
-                                clicked => { root.image_browse_requested(); }
+                            TextEdit {
+                                vertical-stretch: 1;
+                                text: root.composer_text;
+                                edited(text) => {
+                                    root.composer_changed(text);
+                                }
                             }
 
-                            Button {
-                                text: "Clear Images";
-                                width: 128px;
-                                enabled: root.image_clear_enabled;
-                                clicked => { root.image_clear_requested(); }
+                            HorizontalBox {
+                                spacing: 8px;
+
+                                TextEdit {
+                                    horizontal-stretch: 1;
+                                    height: 34px;
+                                    text: root.image_path_text;
+                                    edited(text) => {
+                                        root.image_path_changed(text);
+                                    }
+                                }
+
+                                Button {
+                                    text: "Attach";
+                                    width: 92px;
+                                    enabled: root.image_attach_enabled;
+                                    clicked => { root.image_attach_requested(); }
+                                }
+
+                                Button {
+                                    text: "Browse";
+                                    width: 92px;
+                                    clicked => { root.image_browse_requested(); }
+                                }
+
+                                Button {
+                                    text: "Clear";
+                                    width: 82px;
+                                    enabled: root.image_clear_enabled;
+                                    clicked => { root.image_clear_requested(); }
+                                }
+                            }
+
+                            MutedText {
+                                text: root.image_summary_text;
                             }
                         }
 
-                        Text {
-                            text: root.image_summary_text;
-                            font-size: 12px;
-                            color: #97a292;
-                            wrap: word-wrap;
-                        }
-
-                        HorizontalBox {
-                            alignment: start;
+                        VerticalBox {
                             spacing: 8px;
+                            width: 176px;
 
                             Button {
-                                text: "Refresh";
-                                width: 116px;
-                                clicked => { root.refresh_requested(); }
+                                text: "Send";
+                                height: 42px;
+                                primary: true;
+                                enabled: root.run_enabled;
+                                clicked => { root.run_requested(); }
                             }
-
-                            Button {
-                                text: "Open Session";
-                                width: 144px;
-                                enabled: root.open_session_enabled;
-                                clicked => { root.session_reload_requested(); }
-                            }
-
-                            Button {
-                                text: "Export .md";
-                                width: 124px;
-                                enabled: root.history_export_enabled;
-                                clicked => { root.history_export_requested(); }
-                            }
-
-                            Button {
-                                text: "Open Folder";
-                                width: 132px;
-                                clicked => { root.open_folder_requested(); }
-                            }
-
-                            Button {
-                                text: "Config";
-                                width: 108px;
-                                clicked => { root.config_editor_requested(); }
-                            }
-
-                            Button {
-                                text: "Provider";
-                                width: 118px;
-                                clicked => { root.provider_editor_requested(); }
-                            }
-
-                            Button {
-                                text: "Access " + root.access_mode_title;
-                                width: 148px;
-                                clicked => { root.access_mode_toggle_requested(); }
-                            }
-
-                            Button {
-                                text: "Workspace";
-                                width: 124px;
-                                clicked => { root.workspace_picker_requested(); }
-                            }
-                        }
-
-                        HorizontalBox {
-                            alignment: start;
-                            spacing: 8px;
 
                             Button {
                                 text: "Enhance";
-                                width: 116px;
+                                height: 34px;
                                 enabled: root.enhance_enabled;
                                 clicked => { root.enhance_requested(); }
                             }
 
                             Button {
                                 text: "Review";
-                                width: 116px;
+                                height: 34px;
                                 enabled: root.review_enabled;
                                 clicked => { root.review_requested(); }
                             }
 
                             Button {
-                                text: "Run";
-                                width: 116px;
-                                primary: true;
-                                enabled: root.run_enabled;
-                                clicked => { root.run_requested(); }
+                                text: "Refresh";
+                                height: 32px;
+                                clicked => { root.refresh_requested(); }
                             }
                         }
                     }
                 }
+
             }
 
             if root.config_visible : OverlayPanel {
-                x: 72px;
-                y: 88px;
-                width: parent.width - 144px;
-                height: parent.height - 164px;
+                x: 132px;
+                y: 96px;
+                width: parent.width - 264px;
+                height: 560px;
 
                 VerticalBox {
                     padding: 14px;
@@ -628,12 +662,6 @@ export component AppWindow inherits Window {
                             background: transparent;
                             horizontal-stretch: 1;
                         }
-
-                        Button {
-                            text: "Close";
-                            width: 96px;
-                            clicked => { root.config_close_requested(); }
-                        }
                     }
 
                     HorizontalBox {
@@ -641,9 +669,9 @@ export component AppWindow inherits Window {
                         vertical-stretch: 1;
 
                         Rectangle {
-                            background: #1b211c;
+                            background: #1c2028;
                             border-width: 1px;
-                            border-color: #2e3630;
+                            border-color: #343b47;
                             border-radius: 6px;
                             min-width: 420px;
 
@@ -657,21 +685,27 @@ export component AppWindow inherits Window {
                                     color: #f3f4ef;
                                 }
 
-                                StandardListView {
+                                VerticalBox {
                                     vertical-stretch: 1;
-                                    model: root.config_items;
-                                    current-item: root.current_config_index;
-                                    current-item-changed(index) => {
-                                        root.config_selected(index);
+                                    spacing: 4px;
+
+                                    for item[index] in root.config_items : Button {
+                                        width: 384px;
+                                        height: 34px;
+                                        text: item.text;
+                                        clicked => {
+                                            root.current_config_index = index;
+                                            root.config_selected(index);
+                                        }
                                     }
                                 }
                             }
                         }
 
                         Rectangle {
-                            background: #1b211c;
+                            background: #1c2028;
                             border-width: 1px;
-                            border-color: #2e3630;
+                            border-color: #343b47;
                             border-radius: 6px;
                             horizontal-stretch: 1;
 
@@ -688,7 +722,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: root.config_feedback_text;
                                     font-size: 12px;
-                                    color: #92a08f;
+                                    color: #9aa6b2;
                                     wrap: word-wrap;
                                 }
 
@@ -699,29 +733,45 @@ export component AppWindow inherits Window {
                                         root.config_value_changed(text);
                                     }
                                 }
-
-                                HorizontalBox {
-                                    spacing: 8px;
-
-                                    Button {
-                                        text: "Apply Session";
-                                        width: 144px;
-                                        clicked => { root.config_apply_session_requested(); }
-                                    }
-
-                                    Button {
-                                        text: "Save Project";
-                                        width: 144px;
-                                        clicked => { root.config_save_project_requested(); }
-                                    }
-
-                                    Button {
-                                        text: "Save Global";
-                                        width: 144px;
-                                        clicked => { root.config_save_global_requested(); }
-                                    }
-                                }
                             }
+                        }
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
+                        }
+
+                        Button {
+                            text: "Cancel";
+                            width: 112px;
+                            height: 36px;
+                            clicked => { root.config_close_requested(); }
+                        }
+
+                        Button {
+                            text: "Apply Session";
+                            width: 144px;
+                            height: 36px;
+                            primary: true;
+                            clicked => { root.config_apply_session_requested(); }
+                        }
+
+                        Button {
+                            text: "Save Project";
+                            width: 144px;
+                            height: 36px;
+                            clicked => { root.config_save_project_requested(); }
+                        }
+
+                        Button {
+                            text: "Save Global";
+                            width: 144px;
+                            height: 36px;
+                            clicked => { root.config_save_global_requested(); }
                         }
                     }
                 }
@@ -729,9 +779,9 @@ export component AppWindow inherits Window {
 
             if root.workspace_picker_visible : OverlayPanel {
                 x: 172px;
-                y: 172px;
+                y: 148px;
                 width: parent.width - 344px;
-                height: 238px;
+                height: 306px;
 
                 VerticalBox {
                     padding: 14px;
@@ -750,18 +800,12 @@ export component AppWindow inherits Window {
                             background: transparent;
                             horizontal-stretch: 1;
                         }
-
-                        Button {
-                            text: "Close";
-                            width: 96px;
-                            clicked => { root.workspace_close_requested(); }
-                        }
                     }
 
                     Text {
                         text: "Type a directory path, browse for a folder, then switch the active workspace.";
                         font-size: 12px;
-                        color: #92a08f;
+                        color: #9aa6b2;
                         wrap: word-wrap;
                     }
 
@@ -776,32 +820,58 @@ export component AppWindow inherits Window {
                     HorizontalBox {
                         spacing: 8px;
 
-                        Button {
-                            text: "Switch Workspace";
-                            width: 160px;
-                            clicked => { root.workspace_apply_requested(); }
-                        }
-
-                        Button {
-                            text: "Browse...";
-                            width: 116px;
+                        ActionButton {
+                            text: "Browse Folder...";
+                            width: 148px;
                             clicked => { root.workspace_browse_requested(); }
                         }
 
-                        Button {
+                        ActionButton {
                             text: "Open Typed Path";
                             width: 152px;
                             clicked => { root.open_typed_path_requested(); }
+                        }
+
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    Rectangle {
+                        background: transparent;
+                        vertical-stretch: 1;
+                    }
+
+                    HorizontalBox {
+                        spacing: 8px;
+
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
+                        }
+
+                        ActionButton {
+                            text: "Cancel";
+                            width: 112px;
+                            clicked => { root.workspace_close_requested(); }
+                        }
+
+                        ActionButton {
+                            text: "Switch Workspace";
+                            width: 164px;
+                            primary: true;
+                            clicked => { root.workspace_apply_requested(); }
                         }
                     }
                 }
             }
 
             if root.provider_visible : OverlayPanel {
-                x: 160px;
-                y: 140px;
-                width: parent.width - 320px;
-                height: 320px;
+                x: 140px;
+                y: 96px;
+                width: parent.width - 280px;
+                height: 620px;
 
                 VerticalBox {
                     padding: 14px;
@@ -820,19 +890,10 @@ export component AppWindow inherits Window {
                             background: transparent;
                             horizontal-stretch: 1;
                         }
-
-                        Button {
-                            text: "Close";
-                            width: 96px;
-                            clicked => { root.provider_close_requested(); }
-                        }
                     }
 
-                    Text {
+                    MutedText {
                         text: "Enter the provider URL, load the available models, then select one model to apply or save.";
-                        font-size: 12px;
-                        color: #92a08f;
-                        wrap: word-wrap;
                     }
 
                     VerticalBox {
@@ -887,26 +948,25 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    Text {
+                    TextEdit {
+                        height: 86px;
+                        read-only: true;
                         text: root.provider_feedback_text;
                         font-size: 12px;
-                        color: #92a08f;
-                        wrap: word-wrap;
+                    }
+
+                    Rectangle {
+                        background: transparent;
+                        vertical-stretch: 1;
                     }
 
                     HorizontalBox {
                         spacing: 8px;
 
                         Button {
-                            text: "Apply Session";
-                            width: 144px;
-                            enabled: root.provider_apply_enabled;
-                            clicked => { root.provider_apply_session_requested(); }
-                        }
-
-                        Button {
                             text: "Save Project";
                             width: 144px;
+                            height: 36px;
                             enabled: root.provider_apply_enabled;
                             clicked => { root.provider_save_project_requested(); }
                         }
@@ -914,8 +974,30 @@ export component AppWindow inherits Window {
                         Button {
                             text: "Save Global";
                             width: 144px;
+                            height: 36px;
                             enabled: root.provider_apply_enabled;
                             clicked => { root.provider_save_global_requested(); }
+                        }
+
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
+                        }
+
+                        Button {
+                            text: "Cancel";
+                            width: 112px;
+                            height: 36px;
+                            clicked => { root.provider_close_requested(); }
+                        }
+
+                        Button {
+                            text: "OK - Apply Session";
+                            width: 184px;
+                            height: 36px;
+                            primary: true;
+                            enabled: root.provider_apply_enabled;
+                            clicked => { root.provider_apply_session_requested(); }
                         }
                     }
                 }
@@ -944,18 +1026,12 @@ export component AppWindow inherits Window {
                             background: transparent;
                             horizontal-stretch: 1;
                         }
-
-                        Button {
-                            text: "Cancel";
-                            width: 96px;
-                            clicked => { root.cancel_review_requested(); }
-                        }
                     }
 
                     Text {
                         text: root.review_status_text;
                         font-size: 12px;
-                        color: #92a08f;
+                        color: #9aa6b2;
                         wrap: word-wrap;
                     }
 
@@ -964,9 +1040,9 @@ export component AppWindow inherits Window {
                         vertical-stretch: 1;
 
                         Rectangle {
-                            background: #1b211c;
+                            background: #1c2028;
                             border-width: 1px;
-                            border-color: #2e3630;
+                            border-color: #343b47;
                             border-radius: 6px;
                             horizontal-stretch: 1;
 
@@ -989,9 +1065,9 @@ export component AppWindow inherits Window {
                         }
 
                         Rectangle {
-                            background: #1b211c;
+                            background: #1c2028;
                             border-width: 1px;
-                            border-color: #2e3630;
+                            border-color: #343b47;
                             border-radius: 6px;
                             horizontal-stretch: 1;
 
@@ -1019,18 +1095,33 @@ export component AppWindow inherits Window {
                     HorizontalBox {
                         spacing: 8px;
 
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
+                        }
+
                         Button {
-                            text: "Send Enhanced";
-                            width: 148px;
-                            enabled: root.send_enhanced_enabled;
-                            clicked => { root.send_enhanced_requested(); }
+                            text: "Cancel";
+                            width: 112px;
+                            height: 36px;
+                            clicked => { root.cancel_review_requested(); }
                         }
 
                         Button {
                             text: "Send Raw";
                             width: 124px;
+                            height: 36px;
                             enabled: root.send_raw_enabled;
                             clicked => { root.send_raw_requested(); }
+                        }
+
+                        Button {
+                            text: "Send Enhanced";
+                            width: 148px;
+                            height: 36px;
+                            primary: true;
+                            enabled: root.send_enhanced_enabled;
+                            clicked => { root.send_enhanced_requested(); }
                         }
                     }
                 }
@@ -1062,17 +1153,24 @@ export component AppWindow inherits Window {
                     HorizontalBox {
                         spacing: 8px;
 
-                        Button {
-                            text: "Approve";
-                            width: 128px;
-                            primary: true;
-                            clicked => { root.confirm_accept_requested(); }
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
                         }
 
                         Button {
                             text: "Reject";
                             width: 128px;
+                            height: 36px;
                             clicked => { root.confirm_reject_requested(); }
+                        }
+
+                        Button {
+                            text: "Approve";
+                            width: 128px;
+                            height: 36px;
+                            primary: true;
+                            clicked => { root.confirm_accept_requested(); }
                         }
                     }
                 }

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo/moyai_3d_logo.png" alt="moyAI logo" width="640">
+</p>
+
 # moyAI
 
 **moyAI** is a local-first coding agent for developers who need practical software engineering support in restricted, private, or offline-friendly environments.
@@ -62,12 +66,22 @@ After installing the binary:
 ```bash
 moyai run --dir /path/to/workspace "Add tests for the parser."
 moyai tui --dir /path/to/workspace
-moyai desktop --directory /path/to/workspace
+moyai desktop --dir /path/to/workspace
+moyai-desktop
 ```
+
+Release builds include `moyai.exe` for CLI/TUI workflows and `moyai-desktop.exe` for launching the desktop app directly. On Windows, double-click `moyai-desktop.exe` to open the desktop app. The desktop runtime window/taskbar icon uses `logo/fabicon/android-chrome-512x512.png`, and the Windows executable resource uses the multi-size `logo/fabicon/moyai_app_icon.ico`.
+When no workspace is specified, the desktop app opens the current Windows user's Desktop folder as the default workspace.
 
 ## Configuration
 
 moyAI reads configuration from global config, workspace config, environment variables, and CLI overrides.
+
+On first normal app startup, moyAI creates a global config file with editable default values if it does not already exist:
+
+- `%APPDATA%\midi-ai-labs\moyai\config\config.toml`
+
+The release folder does not need to contain a `.toml` file. Place the binary in a stable install directory such as `C:\tools\moyai\`; moyAI stores user configuration and session data under the Windows user profile.
 
 Workspace config files:
 
@@ -78,6 +92,7 @@ Common environment variables:
 
 - `MOYAI_BASE_URL`
 - `MOYAI_MODEL`
+- `MOYAI_CONFIG_PATH`
 - `MOYAI_DATA_DIR`
 - `MOYAI_ACCESS_MODE`
 - `MOYAI_REQUEST_TIMEOUT_MS`
@@ -101,6 +116,13 @@ supports_images = true
 
 [permissions]
 access_mode = "auto_review"
+
+[docling]
+enabled = false
+base_url = "http://127.0.0.1:8123"
+
+[mcp]
+enabled = false
 ```
 
 ## Instruction Files

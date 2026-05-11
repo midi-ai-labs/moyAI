@@ -271,3 +271,75 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
         .collect::<String>();
     format!("{prefix}…{suffix}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ResolvedConfig;
+    use crate::desktop::models::DesktopSnapshot;
+    use crate::desktop::state::DesktopState;
+
+    fn empty_state() -> DesktopState {
+        DesktopState::new(
+            DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: "provider".to_string(),
+                model_label: "model".to_string(),
+                session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            ResolvedConfig::default(),
+        )
+    }
+
+    #[test]
+    fn desktop_view_model_enables_send_when_prompt_is_ready() {
+        let mut state = empty_state();
+        assert!(!build(&state).run_enabled);
+
+        state.set_draft_prompt("summarize this repository".to_string());
+        let model = build(&state);
+
+        assert_eq!(model.composer_text.as_str(), "summarize this repository");
+        assert!(model.run_enabled);
+        assert!(model.enhance_enabled);
+    }
+
+    #[test]
+    fn desktop_slint_source_exposes_provider_apply_and_config_field_buttons() {
+        let source = include_str!("../../ui/desktop/app-window.slint");
+
+        assert!(source.contains("height: 112px"));
+        assert!(source.contains("height: 34px;\n                            spacing: 8px;"));
+        assert!(source.contains("width: 104px;"));
+        assert!(source.contains("root.provider_editor_requested()"));
+        assert!(
+            source.contains("icon: @image-url(\"../../logo/fabicon/android-chrome-512x512.png\")")
+        );
+        assert!(source.contains("width: 92px;"));
+        assert!(source.contains("root.config_editor_requested()"));
+        assert!(source.contains("root.session_reload_requested()"));
+        assert!(source.contains("root.history_export_requested()"));
+        assert!(source.contains("component ActionButton inherits Rectangle"));
+        assert!(source.contains("text: \"Browse Folder...\""));
+        assert!(source.contains("text: \"Cancel\""));
+        assert!(source.contains("primary: true;\n                            clicked => { root.workspace_apply_requested(); }"));
+        assert!(source.contains("clicked => { root.config_close_requested(); }"));
+        assert!(source.contains("primary: true;\n                            clicked => { root.config_apply_session_requested(); }"));
+        assert!(source.contains("text: \"OK - Apply Session\""));
+        assert!(source.contains("clicked => { root.provider_close_requested(); }"));
+        assert!(source.contains(
+            "primary: true;\n                            enabled: root.provider_apply_enabled;"
+        ));
+        assert!(source.contains("clicked => { root.cancel_review_requested(); }"));
+        assert!(source.contains(
+            "primary: true;\n                            enabled: root.send_enhanced_enabled;"
+        ));
+        assert!(source.contains("clicked => { root.confirm_reject_requested(); }"));
+        assert!(source.contains("primary: true;\n                            clicked => { root.confirm_accept_requested(); }"));
+        assert!(source.contains("for item[index] in root.config_items : Button"));
+        assert!(source.contains("root.current_config_index = index;"));
+        assert!(source.contains("root.config_selected(index)"));
+    }
+}

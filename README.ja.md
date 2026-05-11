@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo/moyai_3d_logo.png" alt="moyAI logo" width="640">
+</p>
+
 # moyAI
 
 **moyAI** は、閉域環境、プライベートコード、ローカル LLM 運用を前提にした Rust 製のローカルファースト coding agent です。
@@ -62,12 +66,22 @@ binary を install 済みの場合:
 ```bash
 moyai run --dir /path/to/workspace "parser のテストを追加してください。"
 moyai tui --dir /path/to/workspace
-moyai desktop --directory /path/to/workspace
+moyai desktop --dir /path/to/workspace
+moyai-desktop
 ```
+
+release build では CLI / TUI 用の `moyai.exe` と、Desktop App を直接起動する `moyai-desktop.exe` が生成されます。Windows では `moyai-desktop.exe` をダブルクリックすると Desktop App が開きます。Desktop runtime window / taskbar icon は `logo/fabicon/android-chrome-512x512.png` を使い、Windows executable resource は multi-size の `logo/fabicon/moyai_app_icon.ico` を使います。
+workspace 未指定時、Desktop App は現在の Windows user の Desktop folder を default workspace として開きます。
 
 ## 設定
 
 moyAI は global config、workspace config、environment variables、CLI overrides から設定を読みます。
+
+通常の app 初回起動時に、global config が存在しない場合は編集可能なデフォルト値入りの設定ファイルを自動生成します。
+
+- `%APPDATA%\midi-ai-labs\moyai\config\config.toml`
+
+release folder に `.toml` を同梱する必要はありません。binary は `C:\tools\moyai\` のような安定した install directory に配置し、user config と session data は Windows user profile 配下に保存します。
 
 workspace config:
 
@@ -78,6 +92,7 @@ workspace config:
 
 - `MOYAI_BASE_URL`
 - `MOYAI_MODEL`
+- `MOYAI_CONFIG_PATH`
 - `MOYAI_DATA_DIR`
 - `MOYAI_ACCESS_MODE`
 - `MOYAI_REQUEST_TIMEOUT_MS`
@@ -101,6 +116,13 @@ supports_images = true
 
 [permissions]
 access_mode = "auto_review"
+
+[docling]
+enabled = false
+base_url = "http://127.0.0.1:8123"
+
+[mcp]
+enabled = false
 ```
 
 ## Instruction Files

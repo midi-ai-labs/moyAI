@@ -892,6 +892,7 @@ impl DesktopController {
         self.persist_preferences();
         self.state
             .set_status_message("applied provider selection to this workspace session");
+        self.state.hide_overlay();
     }
 
     fn save_provider_project(&mut self) {

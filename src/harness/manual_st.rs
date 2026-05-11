@@ -14,7 +14,7 @@ use crate::agent::state::{ActiveWorkContract, active_work_contract_for_history_i
 use crate::app::{App, AppBootstrap, AppCommand, RunRequest};
 use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode};
 use crate::config::model::{PartialPermissionsConfig, PartialResolvedConfig};
-use crate::config::{AccessMode, ShellFamily};
+use crate::config::{AccessMode, ResolvedConfig, ShellFamily};
 use crate::error::{CliPromptError, CliRenderError};
 use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload, ProtocolEventStore};
 use crate::runtime::SystemClock;
@@ -26,8 +26,6 @@ use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 use crate::tool::PermissionRequest;
 
 const FIXTURE_VERSION: &str = "manual_st_route_runner.v1";
-const DEFAULT_PROVIDER_BASE_URL: &str = "http://192.168.10.103:1234";
-const DEFAULT_MODEL_ID: &str = "qwen/qwen3.6-35b-a3b";
 const MAX_CLOSEOUT_CONTINUATIONS_PER_STAGE: usize = 6;
 
 #[derive(Debug, Clone)]
@@ -45,6 +43,7 @@ pub struct ManualStRouteRunConfig {
 #[serde(rename_all = "snake_case")]
 pub enum ManualStRouteKind {
     RequiredCore,
+    TargetedCoreCase1,
     RequiredVision,
     RequiredVisionFull,
     TargetedSupport,
@@ -58,6 +57,7 @@ impl ManualStRouteKind {
     pub fn route_id(self) -> &'static str {
         match self {
             Self::RequiredCore => "required_core_route_a",
+            Self::TargetedCoreCase1 => "targeted_core_case1",
             Self::RequiredVision => "required_vision_route_b",
             Self::RequiredVisionFull => "required_vision_route_b_full",
             Self::TargetedSupport => "targeted_support_case2b",
@@ -71,6 +71,7 @@ impl ManualStRouteKind {
     pub fn route_type(self) -> &'static str {
         match self {
             Self::RequiredCore => "required_core",
+            Self::TargetedCoreCase1 => "targeted_support",
             Self::RequiredVision | Self::RequiredVisionFull => "required_vision",
             Self::TargetedSupport => "targeted_support",
             Self::ExtendedCase4 | Self::ExtendedCase5 | Self::ExtendedCase7 => "extended",
@@ -81,6 +82,7 @@ impl ManualStRouteKind {
     pub fn case_ids(self) -> Vec<&'static str> {
         match self {
             Self::RequiredCore => vec!["case1", "case3"],
+            Self::TargetedCoreCase1 => vec!["case1"],
             Self::RequiredVision => vec!["case2c"],
             Self::RequiredVisionFull => vec!["case2a", "case2c"],
             Self::TargetedSupport => vec!["case2b"],
@@ -98,6 +100,7 @@ impl FromStr for ManualStRouteKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
             "required-core" | "core" | "route-a" => Ok(Self::RequiredCore),
+            "targeted-case1" | "core-case1" | "case1" => Ok(Self::TargetedCoreCase1),
             "required-vision" | "vision" | "case2c" => Ok(Self::RequiredVision),
             "required-vision-full" | "vision-full" | "case2a-case2c" => {
                 Ok(Self::RequiredVisionFull)
@@ -323,11 +326,11 @@ async fn run_case(
                 model: config
                     .model_override
                     .clone()
-                    .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string()),
+                    .unwrap_or_else(default_model_id),
                 base_url: config
                     .base_url_override
                     .clone()
-                    .unwrap_or_else(|| DEFAULT_PROVIDER_BASE_URL.to_string()),
+                    .unwrap_or_else(default_provider_base_url),
                 config_override: Some(PartialResolvedConfig {
                     permissions: Some(PartialPermissionsConfig {
                         access_mode: Some(AccessMode::FullAccess),
@@ -1959,11 +1962,11 @@ impl ManualStRouteResult {
             model_id: config
                 .model_override
                 .clone()
-                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string()),
+                .unwrap_or_else(default_model_id),
             provider_base_url: config
                 .base_url_override
                 .clone()
-                .unwrap_or_else(|| DEFAULT_PROVIDER_BASE_URL.to_string()),
+                .unwrap_or_else(default_provider_base_url),
             provider_metadata_summary: json!({
                 "source": "configured_model_gate",
                 "preflight_report": config.preflight_report
@@ -1979,6 +1982,14 @@ impl ManualStRouteResult {
             stop_reason: None,
         }
     }
+}
+
+fn default_model_id() -> String {
+    ResolvedConfig::default().model.model
+}
+
+fn default_provider_base_url() -> String {
+    ResolvedConfig::default().model.base_url
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
