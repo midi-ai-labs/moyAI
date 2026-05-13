@@ -437,14 +437,7 @@ fn parse_lmstudio_model_infos(payload: &Value) -> Vec<ProviderModelInfo> {
                 .or_else(|| {
                     number_field_u32(
                         entry,
-                        &[
-                            "context_length",
-                            "contextLength",
-                            "max_context_length",
-                            "maxContextLength",
-                            "num_ctx",
-                            "numCtx",
-                        ],
+                        &["context_length", "contextLength", "num_ctx", "numCtx"],
                     )
                 }),
             max_output_tokens: loaded_instance
@@ -482,8 +475,7 @@ fn parse_lmstudio_model_infos(payload: &Value) -> Vec<ProviderModelInfo> {
                     loaded_instance.and_then(|loaded| {
                         number_field_u32(loaded, &["context_length", "contextLength"])
                     })
-                })
-                .or_else(|| number_field_u32(entry, &["max_context_length", "maxContextLength"])),
+                }),
             supports_images: bool_field_nested(
                 entry,
                 &[
@@ -658,5 +650,59 @@ fn summarize_body(body: &str) -> String {
     } else {
         let prefix = trimmed.chars().take(200).collect::<String>();
         format!("{prefix}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lmstudio_parser_does_not_treat_model_max_context_as_hosting_context() {
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "key": "qwen/qwen3.6-35b-a3b",
+                    "type": "llm",
+                    "loaded_instances": [],
+                    "context_length": null,
+                    "max_context_length": 262144
+                }
+            ]
+        });
+
+        let models = parse_lmstudio_model_infos(&payload);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen/qwen3.6-35b-a3b");
+        assert_eq!(models[0].context_window, None);
+        assert_eq!(models[0].max_output_tokens, None);
+        assert!(!models[0].loaded);
+    }
+
+    #[test]
+    fn lmstudio_parser_uses_loaded_instance_context_as_active_context() {
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "key": "qwen/qwen3.6-35b-a3b",
+                    "type": "llm",
+                    "loaded_instances": [
+                        {
+                            "context_length": 131072,
+                            "max_prediction_tokens": 8192
+                        }
+                    ],
+                    "max_context_length": 262144
+                }
+            ]
+        });
+
+        let models = parse_lmstudio_model_infos(&payload);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].context_window, Some(131_072));
+        assert_eq!(models[0].max_output_tokens, Some(8_192));
+        assert!(models[0].loaded);
     }
 }

@@ -219,7 +219,10 @@ impl SessionRepository for SqliteSessionRepository {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let id: Option<String> = connection
             .query_row(
-                "SELECT id FROM sessions WHERE project_id = ?1 ORDER BY updated_at_ms DESC LIMIT 1",
+                "SELECT id FROM sessions
+                 WHERE project_id = ?1
+                 ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
+                 LIMIT 1",
                 params![project_id.to_string()],
                 |row| row.get(0),
             )
@@ -245,7 +248,10 @@ impl SessionRepository for SqliteSessionRepository {
     ) -> Result<Vec<SessionRecord>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id FROM sessions WHERE project_id = ?1 ORDER BY updated_at_ms DESC LIMIT ?2",
+            "SELECT id FROM sessions
+             WHERE project_id = ?1
+             ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
+             LIMIT ?2",
         )?;
         let ids = statement
             .query_map(params![project_id.to_string(), limit as i64], |row| {
@@ -266,6 +272,109 @@ impl SessionRepository for SqliteSessionRepository {
             );
         }
         Ok(sessions)
+    }
+
+    async fn list_recent_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id FROM sessions
+             ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
+             LIMIT ?1",
+        )?;
+        let ids = statement
+            .query_map(params![limit as i64], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+        let mut sessions = Vec::new();
+        for value in ids {
+            sessions.push(
+                self.get_session(
+                    value
+                        .parse::<SessionId>()
+                        .map_err(|error| StorageError::Message(error.to_string()))?,
+                )
+                .await?,
+            );
+        }
+        Ok(sessions)
+    }
+
+    async fn delete_session(&self, id: SessionId) -> Result<(), StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let tx = connection.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM harness_replay_reports
+             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM harness_gate_results
+             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM harness_contracts
+             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM harness_artifacts
+             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM harness_events
+             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM harness_runs WHERE session_id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM protocol_turn_items WHERE session_id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM protocol_history_items WHERE session_id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM protocol_runtime_events WHERE session_id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM file_changes WHERE session_id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM tool_calls WHERE session_id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM message_parts
+             WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM session_todos WHERE session_id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM session_state WHERE session_id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     async fn set_status(&self, id: SessionId, status: SessionStatus) -> Result<(), StorageError> {

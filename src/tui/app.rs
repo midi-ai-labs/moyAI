@@ -1515,7 +1515,9 @@ fn entry_to_lines(entry: &TranscriptEntry) -> Vec<Line<'static>> {
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
         TranscriptKind::Reasoning => Style::default().fg(Color::Yellow),
+        TranscriptKind::Editing => Style::default().fg(Color::Yellow),
         TranscriptKind::Tool => Style::default().fg(Color::Magenta),
+        TranscriptKind::CommandSummary => Style::default().fg(Color::Magenta),
         TranscriptKind::Diff => Style::default().fg(Color::Blue),
         TranscriptKind::System => Style::default().fg(Color::Gray),
         TranscriptKind::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),

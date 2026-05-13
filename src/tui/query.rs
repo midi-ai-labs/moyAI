@@ -20,6 +20,13 @@ pub async fn recent_sessions(
     service.list_sessions(project_id, limit).await
 }
 
+pub async fn global_recent_sessions(
+    service: &SessionService,
+    limit: usize,
+) -> Result<Vec<SessionRecord>, SessionError> {
+    service.list_recent_sessions(limit).await
+}
+
 pub async fn latest_session(
     service: &SessionService,
     project_id: ProjectId,

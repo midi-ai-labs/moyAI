@@ -61,12 +61,8 @@ fn run_on_current_thread() -> Result<(), (u8, String)> {
         .map(str::parse)
         .transpose()
         .map_err(|error| (2, format!("invalid session id: {error}")))?;
-    let directory = args
-        .directory
-        .clone()
-        .or_else(desktop::default_workspace_directory);
     let command = CliCommand::Desktop(CliDesktopArgs {
-        directory: directory.clone(),
+        directory: args.directory.clone(),
         session_id,
         continue_last: args.continue_last,
     });
@@ -81,7 +77,7 @@ fn run_on_current_thread() -> Result<(), (u8, String)> {
         desktop::run(
             app,
             DesktopArgs {
-                directory,
+                directory: args.directory,
                 session_id,
                 continue_last: args.continue_last,
             },

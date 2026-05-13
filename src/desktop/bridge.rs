@@ -27,6 +27,111 @@ impl DesktopBridge {
         self.ui.on_session_selected(handler);
     }
 
+    pub fn on_project_selected<F>(&self, handler: F)
+    where
+        F: Fn(i32) + 'static,
+    {
+        self.ui.on_project_selected(handler);
+    }
+
+    pub fn on_project_delete_requested<F>(&self, handler: F)
+    where
+        F: Fn(i32) + 'static,
+    {
+        self.ui.on_project_delete_requested(handler);
+    }
+
+    pub fn on_session_delete_requested<F>(&self, handler: F)
+    where
+        F: Fn(i32) + 'static,
+    {
+        self.ui.on_session_delete_requested(handler);
+    }
+
+    pub fn on_artifact_selected<F>(&self, handler: F)
+    where
+        F: Fn(i32) + 'static,
+    {
+        self.ui.on_artifact_selected(handler);
+    }
+
+    pub fn on_artifact_folder_open_requested<F>(&self, handler: F)
+    where
+        F: Fn(i32) + 'static,
+    {
+        self.ui.on_artifact_folder_open_requested(handler);
+    }
+
+    pub fn on_local_search_changed<F>(&self, handler: F)
+    where
+        F: Fn(slint::SharedString) + 'static,
+    {
+        self.ui.on_local_search_changed(handler);
+    }
+
+    pub fn on_command_palette_requested<F>(&self, handler: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.ui.on_command_palette_requested(handler);
+    }
+
+    pub fn on_file_menu_requested<F>(&self, handler: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.ui.on_file_menu_requested(handler);
+    }
+
+    pub fn on_edit_menu_requested<F>(&self, handler: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.ui.on_edit_menu_requested(handler);
+    }
+
+    pub fn on_view_menu_requested<F>(&self, handler: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.ui.on_view_menu_requested(handler);
+    }
+
+    pub fn on_help_menu_requested<F>(&self, handler: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.ui.on_help_menu_requested(handler);
+    }
+
+    pub fn on_new_chat_requested<F>(&self, handler: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.ui.on_new_chat_requested(handler);
+    }
+
+    pub fn on_command_selected<F>(&self, handler: F)
+    where
+        F: Fn(i32) + 'static,
+    {
+        self.ui.on_command_selected(handler);
+    }
+
+    pub fn on_keyboard_shortcuts_requested<F>(&self, handler: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.ui.on_keyboard_shortcuts_requested(handler);
+    }
+
+    pub fn on_overlay_close_requested<F>(&self, handler: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.ui.on_overlay_close_requested(handler);
+    }
+
     pub fn on_composer_changed<F>(&self, handler: F)
     where
         F: Fn(slint::SharedString) + 'static,
@@ -60,6 +165,13 @@ impl DesktopBridge {
         F: Fn() + 'static,
     {
         self.ui.on_image_clear_requested(handler);
+    }
+
+    pub fn on_image_remove_requested<F>(&self, handler: F)
+    where
+        F: Fn(i32) + 'static,
+    {
+        self.ui.on_image_remove_requested(handler);
     }
 
     pub fn on_refresh_requested<F>(&self, handler: F)
@@ -223,6 +335,20 @@ impl DesktopBridge {
         self.ui.on_config_save_global_requested(handler);
     }
 
+    pub fn on_config_open_project_folder_requested<F>(&self, handler: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.ui.on_config_open_project_folder_requested(handler);
+    }
+
+    pub fn on_config_open_global_folder_requested<F>(&self, handler: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.ui.on_config_open_global_folder_requested(handler);
+    }
+
     pub fn on_workspace_picker_requested<F>(&self, handler: F)
     where
         F: Fn() + 'static,
@@ -336,20 +462,42 @@ pub fn render_handle(handle: &AppWindow, state: &DesktopState) {
     handle.set_run_status_text(model.run_status_text);
     handle.set_progress_text(model.progress_text);
     handle.set_transcript_text(model.transcript_text);
+    handle.set_transcript_items(model.transcript_items);
     handle.set_tool_status_text(model.tool_status_text);
     handle.set_status_banner_text(model.status_banner_text);
     handle.set_confirmation_text(model.confirmation_text);
     handle.set_confirmation_visible(model.confirmation_visible);
+    handle.set_project_items(model.project_items);
+    handle.set_current_project_index(model.current_project_index);
     handle.set_session_items(model.session_items);
     handle.set_current_session_index(model.current_session_index);
+    handle.set_artifact_items(model.artifact_items);
+    handle.set_current_artifact_index(model.current_artifact_index);
+    handle.set_artifact_preview_text(model.artifact_preview_text);
+    handle.set_file_change_summary_text(model.file_change_summary_text);
+    handle.set_local_search_text(model.local_search_text);
+    handle.set_local_search_results_text(model.local_search_results_text);
+    handle.set_command_items(model.command_items);
+    handle.set_file_menu_visible(model.file_menu_visible);
+    handle.set_edit_menu_visible(model.edit_menu_visible);
+    handle.set_view_menu_visible(model.view_menu_visible);
+    handle.set_help_menu_visible(model.help_menu_visible);
+    handle.set_command_palette_visible(model.command_palette_visible);
+    handle.set_keyboard_shortcuts_visible(model.keyboard_shortcuts_visible);
+    handle.set_keyboard_shortcuts_text(model.keyboard_shortcuts_text);
+    handle.set_image_thumbnail_items(model.image_thumbnail_items);
     handle.set_composer_text(model.composer_text);
     handle.set_image_path_text(model.image_path_text);
     handle.set_image_summary_text(model.image_summary_text);
+    handle.set_image_input_enabled(model.image_input_enabled);
     handle.set_image_attach_enabled(model.image_attach_enabled);
+    handle.set_image_browse_enabled(model.image_browse_enabled);
     handle.set_image_clear_enabled(model.image_clear_enabled);
     handle.set_run_enabled(model.run_enabled);
     handle.set_review_enabled(model.review_enabled);
     handle.set_open_session_enabled(model.open_session_enabled);
+    handle.set_delete_project_enabled(model.delete_project_enabled);
+    handle.set_delete_session_enabled(model.delete_session_enabled);
     handle.set_history_export_enabled(model.history_export_enabled);
     handle.set_enhance_enabled(model.enhance_enabled);
     handle.set_config_visible(model.config_visible);
@@ -376,4 +524,10 @@ pub fn render_handle(handle: &AppWindow, state: &DesktopState) {
     handle.set_send_raw_enabled(model.send_raw_enabled);
     handle.set_window_opacity_percent(model.window_opacity_percent);
     handle.set_window_opacity_text(model.window_opacity_text);
+}
+
+pub fn render_composer_action_state(handle: &AppWindow, state: &DesktopState) {
+    handle.set_run_enabled(state.can_submit_prompt());
+    handle.set_enhance_enabled(!state.is_busy() && !state.draft_prompt.trim().is_empty());
+    handle.set_review_enabled(!state.is_busy());
 }

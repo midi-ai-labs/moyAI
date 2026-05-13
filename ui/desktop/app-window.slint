@@ -2,36 +2,31 @@ import {
     Button,
     ComboBox,
     HorizontalBox,
+    ScrollView,
     Slider,
     StandardListView,
     TextEdit,
     VerticalBox,
 } from "std-widgets.slint";
 
-component MetaItem inherits Rectangle {
-    in property <string> label;
-    in property <string> value;
+export struct ImageAttachmentPreview {
+    label: string,
+    path: string,
+    preview: image,
+}
 
-    background: transparent;
-    min-height: 34px;
+export struct TranscriptRow {
+    kind: string,
+    step: string,
+    title: string,
+    body: string,
+}
 
-    VerticalBox {
-        alignment: start;
-        spacing: 2px;
-
-        Text {
-            text: root.label;
-            font-size: 11px;
-            color: #9aa6b2;
-        }
-
-        Text {
-            text: root.value;
-            font-size: 13px;
-            color: #f4f7fb;
-            wrap: word-wrap;
-        }
-    }
+export struct ArtifactListItem {
+    label: string,
+    path: string,
+    kind: string,
+    action: string,
 }
 
 component OverlayPanel inherits Rectangle {
@@ -56,6 +51,73 @@ component MutedText inherits Text {
 component Divider inherits Rectangle {
     height: 1px;
     background: #2b323d;
+}
+
+component TranscriptCard inherits Rectangle {
+    in property <TranscriptRow> entry;
+
+    height: max(64px, body_text.preferred-height + 48px);
+    background: root.entry.kind == "user" ? #14181d : root.entry.kind == "assistant" ? #111111 : root.entry.kind == "running" ? #161a1f : root.entry.kind == "tasks" ? #151914 : root.entry.kind == "tool" ? #131313 : root.entry.kind == "editing" ? #191714 : root.entry.kind == "summary" ? #1b1a1d : root.entry.kind == "diff" ? #1b1a1d : root.entry.kind == "error" ? #241417 : transparent;
+    border-width: root.entry.kind == "assistant" ? 0px : 1px;
+    border-color: root.entry.kind == "user" ? #303842 : root.entry.kind == "running" ? #36506b : root.entry.kind == "tasks" ? #354936 : root.entry.kind == "tool" ? #2d2d2d : root.entry.kind == "editing" ? #5d5140 : root.entry.kind == "summary" ? #34313a : root.entry.kind == "diff" ? #34313a : root.entry.kind == "error" ? #63343c : #2d3440;
+    border-radius: 6px;
+
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 4px;
+        height: parent.height;
+        background: root.entry.kind == "user" ? #5fc7ee : root.entry.kind == "running" ? #5fc7ee : root.entry.kind == "tasks" ? #80c77a : root.entry.kind == "assistant" ? #8a8f98 : root.entry.kind == "tool" ? #8a8f98 : root.entry.kind == "editing" ? #e2b96f : root.entry.kind == "summary" ? #9a8fb0 : root.entry.kind == "diff" ? #9a8fb0 : root.entry.kind == "error" ? #ff6b7a : #8a97a6;
+        border-radius: 6px;
+    }
+
+    Rectangle {
+        x: 14px;
+        y: 10px;
+        width: 40px;
+        height: 22px;
+        background: root.entry.kind == "running" ? #223042 : root.entry.kind == "tasks" ? #20301f : root.entry.kind == "diff" ? #302c34 : root.entry.kind == "summary" ? #302c34 : root.entry.kind == "tool" ? #252525 : root.entry.kind == "editing" ? #332b20 : root.entry.kind == "error" ? #4b232a : #242b35;
+        border-width: 1px;
+        border-color: root.entry.kind == "running" ? #46627e : root.entry.kind == "tasks" ? #466047 : root.entry.kind == "diff" ? #504a58 : root.entry.kind == "summary" ? #504a58 : root.entry.kind == "tool" ? #3c3c3c : root.entry.kind == "editing" ? #6a5a43 : root.entry.kind == "error" ? #7b3c45 : #3a4350;
+        border-radius: 12px;
+
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: root.entry.step;
+            font-family: "Yu Gothic UI";
+            font-size: 11px;
+            font-weight: 700;
+            color: #f4f7fb;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    Text {
+        x: 64px;
+        y: 10px;
+        width: parent.width - 82px;
+        height: 24px;
+        text: root.entry.title;
+        font-family: "Yu Gothic UI";
+        font-size: 12px;
+        font-weight: 700;
+        color: root.entry.kind == "running" ? #8bdcff : root.entry.kind == "tasks" ? #b7efb0 : root.entry.kind == "diff" ? #d6d0df : root.entry.kind == "summary" ? #d6d0df : root.entry.kind == "tool" ? #d7d7d7 : root.entry.kind == "editing" ? #f2c97c : root.entry.kind == "error" ? #ff9aa5 : root.entry.kind == "user" ? #8bdcff : #f4f7fb;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    body_text := Text {
+        x: 18px;
+        y: 40px;
+        width: parent.width - 32px;
+        text: root.entry.body;
+        font-family: "Yu Gothic UI";
+        font-size: 13px;
+        color: root.entry.kind == "system" ? #b1bbc7 : #f4f7fb;
+        wrap: word-wrap;
+    }
 }
 
 component ActionButton inherits Rectangle {
@@ -90,7 +152,302 @@ component ActionButton inherits Rectangle {
     }
 }
 
+component MenuButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active: false;
+    callback clicked();
+
+    width: 72px;
+    height: 28px;
+    background: root.active ? #2b323d : touch.pressed ? #242a34 : touch.has-hover ? #222832 : transparent;
+    border-radius: 5px;
+
+    Text {
+        x: 8px;
+        y: 0;
+        width: parent.width - 16px;
+        height: parent.height;
+        text: root.text;
+        font-size: 13px;
+        color: #f4f7fb;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        width: root.width;
+        height: root.height;
+        clicked => { root.clicked(); }
+    }
+}
+
+component MenuItem inherits Rectangle {
+    in property <string> text;
+    in property <string> shortcut: "";
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 30px;
+    background: !root.enabled ? transparent : touch.pressed ? #303642 : touch.has-hover ? #27303a : transparent;
+    border-radius: 4px;
+
+    HorizontalBox {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 12px;
+
+        Text {
+            text: root.text;
+            font-size: 13px;
+            color: root.enabled ? #f4f7fb : #67717d;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        Text {
+            text: root.shortcut;
+            font-size: 12px;
+            color: root.enabled ? #9aa6b2 : #5d6670;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        width: root.width;
+        height: root.height;
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+component NavListRow inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected: false;
+    in property <bool> menu_enabled: false;
+    in property <bool> menu_open: false;
+    in property <bool> delete_enabled: true;
+    callback clicked();
+    callback menu_clicked();
+    callback delete_clicked();
+
+    height: root.menu_open ? 74px : 38px;
+    background: transparent;
+
+    row_background := Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: 38px;
+        background: root.selected ? #242a34 : row_touch.pressed ? #242a34 : (row_touch.has-hover || menu_touch.has-hover || root.menu_open) ? #1d2530 : transparent;
+        border-radius: 5px;
+    }
+
+    Rectangle {
+        x: 0;
+        y: 4px;
+        width: 3px;
+        height: 30px;
+        background: root.selected ? #5fc7ee : transparent;
+        border-radius: 2px;
+    }
+
+    Rectangle {
+        x: 18px;
+        y: 14px;
+        width: 10px;
+        height: 10px;
+        background: root.selected ? #f4f7fb : transparent;
+        border-width: root.selected ? 0px : 1px;
+        border-color: #6f7c89;
+        border-radius: 5px;
+    }
+
+    Text {
+        x: 36px;
+        y: 0;
+        width: parent.width - 74px;
+        height: 38px;
+        text: root.text;
+        font-size: 13px;
+        color: root.selected ? #f4f7fb : #d3d8df;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    menu-button := Rectangle {
+        x: root.width - 30px;
+        y: 5px;
+        width: 24px;
+        height: 28px;
+        background: root.menu_open ? #2f3742 : menu_touch.pressed ? #2f3742 : menu_touch.has-hover ? #28313b : transparent;
+        border-radius: 5px;
+
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: "...";
+            font-size: 15px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            color: root.menu_enabled && (row_touch.has-hover || menu_touch.has-hover || root.menu_open) ? #d8dee6 : transparent;
+        }
+    }
+
+    row_touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: root.width - 34px;
+        height: 38px;
+        clicked => { root.clicked(); }
+    }
+
+    menu_touch := TouchArea {
+        x: root.width - 34px;
+        y: 0;
+        width: 34px;
+        height: 38px;
+        enabled: root.menu_enabled;
+        clicked => { root.menu_clicked(); }
+    }
+
+    if root.menu_open : Rectangle {
+        x: 36px;
+        y: 40px;
+        width: root.width - 42px;
+        height: 30px;
+        background: delete_touch.pressed ? #3a2630 : delete_touch.has-hover ? #31252d : #20252d;
+        border-width: 1px;
+        border-color: #3a424e;
+        border-radius: 5px;
+
+        Text {
+            x: 10px;
+            width: parent.width - 20px;
+            height: parent.height;
+            text: "Delete";
+            font-size: 12px;
+            color: root.delete_enabled ? #ffb3b3 : #6a737d;
+            vertical-alignment: center;
+        }
+
+        delete_touch := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            enabled: root.delete_enabled;
+            clicked => { root.delete_clicked(); }
+        }
+    }
+}
+
+component ArtifactRow inherits Rectangle {
+    in property <ArtifactListItem> item;
+    in property <bool> selected: false;
+    in property <bool> menu_open: false;
+    callback clicked();
+    callback menu_clicked();
+    callback open_folder_clicked();
+
+    height: root.menu_open ? 74px : 40px;
+    background: transparent;
+
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: 40px;
+        background: root.selected ? #2a2a2a : row_touch.pressed ? #272727 : (row_touch.has-hover || menu_touch.has-hover || root.menu_open) ? #252525 : transparent;
+        border-radius: 6px;
+    }
+
+    Text {
+        x: 10px;
+        y: 5px;
+        width: parent.width - 48px;
+        height: 18px;
+        text: root.item.label;
+        font-size: 12px;
+        font-weight: 600;
+        color: root.selected ? #f4f7fb : #e1e1e1;
+        overflow: elide;
+    }
+
+    Text {
+        x: 10px;
+        y: 22px;
+        width: parent.width - 48px;
+        height: 14px;
+        text: root.item.action + " · " + root.item.kind;
+        font-size: 10px;
+        color: #9a9a9a;
+        overflow: elide;
+    }
+
+    Rectangle {
+        x: root.width - 30px;
+        y: 6px;
+        width: 24px;
+        height: 28px;
+        background: root.menu_open ? #333333 : menu_touch.pressed ? #333333 : menu_touch.has-hover ? #2e2e2e : transparent;
+        border-radius: 5px;
+
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: "...";
+            font-size: 15px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            color: row_touch.has-hover || menu_touch.has-hover || root.menu_open ? #d8dee6 : transparent;
+        }
+    }
+
+    row_touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: root.width - 34px;
+        height: 40px;
+        clicked => { root.clicked(); }
+    }
+
+    menu_touch := TouchArea {
+        x: root.width - 34px;
+        y: 0;
+        width: 34px;
+        height: 40px;
+        clicked => { root.menu_clicked(); }
+    }
+
+    if root.menu_open : Rectangle {
+        x: 10px;
+        y: 42px;
+        width: root.width - 16px;
+        height: 28px;
+        background: folder_touch.pressed ? #303642 : folder_touch.has-hover ? #343b47 : #242832;
+        border-width: 1px;
+        border-color: #3a424e;
+        border-radius: 5px;
+
+        Text {
+            x: 10px;
+            width: parent.width - 20px;
+            height: parent.height;
+            text: "Open Folder";
+            font-size: 12px;
+            color: #f4f7fb;
+            vertical-alignment: center;
+        }
+
+        folder_touch := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.open_folder_clicked(); }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
+    default-font-family: "Yu Gothic UI";
+
     in property <string> workspace_name;
     in property <string> workspace_path_text;
     in property <string> session_summary_text;
@@ -102,22 +459,44 @@ export component AppWindow inherits Window {
     in property <string> run_status_text;
     in property <string> progress_text;
     in property <string> transcript_text;
+    in property <[TranscriptRow]> transcript_items;
     in property <string> tool_status_text;
     in property <string> status_banner_text;
     in property <string> confirmation_text;
+    in property <[StandardListViewItem]> project_items;
+    in-out property <int> current_project_index: -1;
     in property <[StandardListViewItem]> session_items;
     in-out property <int> current_session_index: -1;
     in-out property <string> composer_text;
     in-out property <string> image_path_text;
     in property <string> image_summary_text;
+    in property <bool> image_input_enabled: false;
     in property <bool> image_attach_enabled: false;
+    in property <bool> image_browse_enabled: false;
     in property <bool> image_clear_enabled: false;
     in property <bool> run_enabled: false;
     in property <bool> review_enabled: false;
     in property <bool> open_session_enabled: false;
+    in property <bool> delete_project_enabled: false;
+    in property <bool> delete_session_enabled: false;
     in property <bool> history_export_enabled: false;
     in property <bool> enhance_enabled: false;
     in property <bool> confirmation_visible: false;
+    in property <[ArtifactListItem]> artifact_items;
+    in-out property <int> current_artifact_index: -1;
+    in property <string> artifact_preview_text;
+    in property <string> file_change_summary_text;
+    in-out property <string> local_search_text;
+    in property <string> local_search_results_text;
+    in property <[StandardListViewItem]> command_items;
+    in property <bool> file_menu_visible: false;
+    in property <bool> edit_menu_visible: false;
+    in property <bool> view_menu_visible: false;
+    in property <bool> help_menu_visible: false;
+    in property <bool> command_palette_visible: false;
+    in property <bool> keyboard_shortcuts_visible: false;
+    in property <string> keyboard_shortcuts_text;
+    in property <[ImageAttachmentPreview]> image_thumbnail_items;
     in property <bool> config_visible: false;
     in property <[StandardListViewItem]> config_items;
     in-out property <int> current_config_index: 0;
@@ -142,13 +521,32 @@ export component AppWindow inherits Window {
     in property <bool> send_raw_enabled: false;
     in property <float> window_opacity_percent: 96;
     in property <string> window_opacity_text: "96%";
+    in-out property <int> project_menu_index: -1;
+    in-out property <int> session_menu_index: -1;
+    in-out property <int> artifact_menu_index: -1;
 
+    callback project_selected(int);
+    callback project_delete_requested(int);
     callback session_selected(int);
+    callback session_delete_requested(int);
+    callback artifact_selected(int);
+    callback artifact_folder_open_requested(int);
+    callback local_search_changed(string);
+    callback file_menu_requested();
+    callback edit_menu_requested();
+    callback view_menu_requested();
+    callback help_menu_requested();
+    callback new_chat_requested();
+    callback command_palette_requested();
+    callback command_selected(int);
+    callback keyboard_shortcuts_requested();
+    callback overlay_close_requested();
     callback composer_changed(string);
     callback image_path_changed(string);
     callback image_attach_requested();
     callback image_browse_requested();
     callback image_clear_requested();
+    callback image_remove_requested(int);
     callback refresh_requested();
     callback session_reload_requested();
     callback history_export_requested();
@@ -165,6 +563,8 @@ export component AppWindow inherits Window {
     callback config_apply_session_requested();
     callback config_save_project_requested();
     callback config_save_global_requested();
+    callback config_open_project_folder_requested();
+    callback config_open_global_folder_requested();
     callback provider_close_requested();
     callback provider_base_url_changed(string);
     callback provider_load_requested();
@@ -212,154 +612,153 @@ export component AppWindow inherits Window {
                 spacing: 10px;
 
                 Rectangle {
-                    height: 112px;
+                    height: 34px;
+                    background: #0d1015;
+                    border-width: 1px;
+                    border-color: #252b35;
+                    border-radius: 5px;
+
+                    HorizontalBox {
+                        padding-left: 8px;
+                        padding-right: 10px;
+                        spacing: 4px;
+
+                        MenuButton {
+                            text: "File";
+                            active: root.file_menu_visible;
+                            clicked => { root.file_menu_requested(); }
+                        }
+
+                        MenuButton {
+                            text: "Edit";
+                            active: root.edit_menu_visible;
+                            clicked => { root.edit_menu_requested(); }
+                        }
+
+                        MenuButton {
+                            text: "View";
+                            active: root.view_menu_visible;
+                            clicked => { root.view_menu_requested(); }
+                        }
+
+                        MenuButton {
+                            text: "Help";
+                            active: root.help_menu_visible;
+                            clicked => { root.help_menu_requested(); }
+                        }
+
+                        Rectangle {
+                            background: transparent;
+                            horizontal-stretch: 1;
+                        }
+
+                        MutedText {
+                            text: root.status_banner_text;
+                            horizontal-stretch: 2;
+                        }
+
+                        Text {
+                            text: "Opacity";
+                            font-size: 11px;
+                            color: #9aa6b2;
+                            vertical-alignment: center;
+                        }
+
+                        Slider {
+                            width: 120px;
+                            minimum: 55;
+                            maximum: 100;
+                            step: 1;
+                            value: root.window_opacity_percent;
+                            changed(value) => {
+                                root.window_opacity_changed(value);
+                            }
+                        }
+
+                        Text {
+                            text: root.window_opacity_text;
+                            min-width: 40px;
+                            font-size: 12px;
+                            color: #f4f7fb;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 54px;
                     background: #171a20;
                     border-width: 1px;
                     border-color: #2d3440;
                     border-radius: 6px;
 
-                    VerticalBox {
-                        padding: 12px;
-                        spacing: 8px;
+                    HorizontalBox {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 14px;
 
-                        HorizontalBox {
-                            height: 42px;
-                            spacing: 12px;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: transparent;
 
-                            Rectangle {
-                                horizontal-stretch: 1;
-                                background: transparent;
+                            HorizontalBox {
+                                alignment: start;
+                                spacing: 14px;
 
-                                VerticalBox {
-                                    alignment: start;
-                                    spacing: 3px;
-
-                                    Text {
-                                        text: "moyAI Desktop";
-                                        font-size: 22px;
-                                        font-weight: 700;
-                                        color: #f3f4ef;
-                                    }
-
-                                    Text {
-                                        text: root.workspace_path_text;
-                                        font-size: 12px;
-                                        color: #9aa6b2;
-                                        wrap: word-wrap;
-                                    }
+                                Text {
+                                    text: "moyAI Desktop";
+                                    font-size: 20px;
+                                    font-weight: 700;
+                                    color: #f3f4ef;
+                                    vertical-alignment: center;
                                 }
-                            }
 
-                            Rectangle {
-                                width: 240px;
-                                background: transparent;
-
-                                VerticalBox {
-                                    alignment: center;
-                                    spacing: 4px;
-
-                                    Text {
-                                        text: "Opacity";
-                                        font-size: 11px;
-                                        color: #9aa6b2;
-                                    }
-
-                                    HorizontalBox {
-                                        alignment: center;
-                                        spacing: 8px;
-
-                                        Slider {
-                                            width: 120px;
-                                            minimum: 55;
-                                            maximum: 100;
-                                            step: 1;
-                                            value: root.window_opacity_percent;
-                                            changed(value) => {
-                                                root.window_opacity_changed(value);
-                                            }
-                                        }
-
-                                        Text {
-                                            text: root.window_opacity_text;
-                                            min-width: 40px;
-                                            font-size: 12px;
-                                            color: #f4f7fb;
-                                            horizontal-alignment: center;
-                                        }
-                                    }
-
-                                    Text {
-                                        text: root.current_session_title;
-                                        font-size: 11px;
-                                        color: #5ee6c1;
-                                        wrap: word-wrap;
-                                    }
+                                Text {
+                                    text: root.workspace_path_text;
+                                    font-size: 12px;
+                                    color: #9aa6b2;
+                                    wrap: word-wrap;
+                                    vertical-alignment: center;
                                 }
                             }
                         }
 
-                        HorizontalBox {
-                            height: 34px;
-                            spacing: 8px;
+                        Rectangle {
+                            width: 430px;
+                            background: transparent;
 
-                            Button {
-                                text: "Workspace";
-                                width: 108px;
-                                height: 32px;
-                                clicked => { root.workspace_picker_requested(); }
-                            }
+                            HorizontalBox {
+                                alignment: center;
+                                spacing: 10px;
 
-                            Button {
-                                text: "Provider";
-                                width: 104px;
-                                height: 32px;
-                                clicked => { root.provider_editor_requested(); }
-                            }
+                                MutedText {
+                                    text: root.provider_title;
+                                    horizontal-stretch: 1;
+                                }
 
-                            Button {
-                                text: "Config";
-                                width: 92px;
-                                height: 32px;
-                                clicked => { root.config_editor_requested(); }
-                            }
+                                Text {
+                                    text: root.model_title;
+                                    font-size: 11px;
+                                    color: #5ee6c1;
+                                    wrap: word-wrap;
+                                    horizontal-stretch: 1;
+                                }
 
-                            Button {
-                                text: "Folder";
-                                width: 92px;
-                                height: 32px;
-                                clicked => { root.open_folder_requested(); }
-                            }
+                                Text {
+                                    text: root.access_mode_title;
+                                    font-size: 11px;
+                                    color: #f4f7fb;
+                                    vertical-alignment: center;
+                                }
 
-                            Button {
-                                text: "Access: " + root.access_mode_title;
-                                width: 146px;
-                                height: 32px;
-                                clicked => { root.access_mode_toggle_requested(); }
-                            }
-
-                            Button {
-                                text: "Open";
-                                width: 76px;
-                                height: 32px;
-                                enabled: root.open_session_enabled;
-                                clicked => { root.session_reload_requested(); }
-                            }
-
-                            Button {
-                                text: "Export";
-                                width: 76px;
-                                height: 32px;
-                                enabled: root.history_export_enabled;
-                                clicked => { root.history_export_requested(); }
-                            }
-
-                            Rectangle {
-                                background: transparent;
-                                horizontal-stretch: 1;
-                            }
-
-                            MutedText {
-                                text: root.status_banner_text;
+                                Text {
+                                    text: root.current_session_title;
+                                    font-size: 11px;
+                                    color: #9aa6b2;
+                                    wrap: word-wrap;
+                                    horizontal-stretch: 1;
+                                }
                             }
                         }
                     }
@@ -370,51 +769,70 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
 
                     Rectangle {
-                        min-width: 270px;
+                        min-width: 280px;
                         max-width: 300px;
-                        background: #171a20;
-                        border-width: 1px;
-                        border-color: #2d3440;
+                        background: #151c24;
+                        border-width: 0px;
                         border-radius: 6px;
 
                         VerticalBox {
                             padding: 12px;
-                            spacing: 9px;
+                            spacing: 10px;
 
-                            PanelTitle {
-                                text: "Workspace";
+                            HorizontalBox {
+                                spacing: 8px;
+
+                                Button {
+                                    text: "＋ 新しいチャット";
+                                    horizontal-stretch: 1;
+                                    height: 30px;
+                                    enabled: root.review_enabled;
+                                    clicked => { root.new_chat_requested(); }
+                                }
                             }
+
+                            Divider {}
 
                             Text {
-                                text: root.workspace_name;
-                                font-size: 18px;
+                                text: "プロジェクト";
+                                font-size: 13px;
                                 font-weight: 600;
-                                color: #f4f7fb;
+                                color: #8d98a5;
                             }
 
-                            MetaItem {
-                                label: "Path";
-                                value: root.workspace_path_text;
-                            }
+                            ScrollView {
+                                height: 118px;
+                                vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                                horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
 
-                            MetaItem {
-                                label: "Provider";
-                                value: root.provider_title;
-                            }
+                                VerticalBox {
+                                    width: 250px;
+                                    spacing: 4px;
 
-                            MetaItem {
-                                label: "Model";
-                                value: root.model_title;
-                            }
-
-                            MetaItem {
-                                label: "Access";
-                                value: root.access_mode_title;
-                            }
-
-                            MetaItem {
-                                label: "Run Target";
-                                value: root.current_session_title;
+                                    for item[index] in root.project_items : NavListRow {
+                                        width: 250px;
+                                        text: item.text;
+                                        selected: root.current_project_index == index;
+                                        menu_enabled: true;
+                                        menu_open: root.project_menu_index == index;
+                                        delete_enabled: root.delete_project_enabled;
+                                        clicked => {
+                                            root.current_project_index = index;
+                                            root.project_menu_index = -1;
+                                            root.session_menu_index = -1;
+                                            root.project_selected(index);
+                                        }
+                                        menu_clicked => {
+                                            root.project_menu_index = index;
+                                            root.session_menu_index = -1;
+                                        }
+                                        delete_clicked => {
+                                            root.project_menu_index = -1;
+                                            root.session_menu_index = -1;
+                                            root.project_delete_requested(index);
+                                        }
+                                    }
+                                }
                             }
 
                             Divider {}
@@ -422,8 +840,11 @@ export component AppWindow inherits Window {
                             HorizontalBox {
                                 spacing: 8px;
 
-                                PanelTitle {
-                                    text: "Sessions";
+                                Text {
+                                    text: "チャット";
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: #8d98a5;
                                 }
 
                                 Rectangle {
@@ -438,12 +859,38 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            StandardListView {
+                            ScrollView {
                                 vertical-stretch: 1;
-                                model: root.session_items;
-                                current-item: root.current_session_index;
-                                current-item-changed(index) => {
-                                    root.session_selected(index);
+                                vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                                horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+
+                                VerticalBox {
+                                    width: 250px;
+                                    spacing: 4px;
+
+                                    for item[index] in root.session_items : NavListRow {
+                                        width: 250px;
+                                        text: item.text;
+                                        selected: root.current_session_index == index;
+                                        menu_enabled: true;
+                                        menu_open: root.session_menu_index == index;
+                                        delete_enabled: root.delete_session_enabled;
+                                        clicked => {
+                                            root.current_session_index = index;
+                                            root.session_menu_index = -1;
+                                            root.project_menu_index = -1;
+                                            root.session_selected(index);
+                                        }
+                                        menu_clicked => {
+                                            root.session_menu_index = index;
+                                            root.project_menu_index = -1;
+                                        }
+                                        delete_clicked => {
+                                            root.session_menu_index = -1;
+                                            root.project_menu_index = -1;
+                                            root.session_delete_requested(index);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -468,58 +915,90 @@ export component AppWindow inherits Window {
                                 text: root.selection_title;
                             }
 
-                            TextEdit {
+                            ScrollView {
                                 vertical-stretch: 1;
-                                read-only: true;
-                                text: root.transcript_text;
-                                font-size: 13px;
+
+                                VerticalBox {
+                                    spacing: 8px;
+
+                                    for item[index] in root.transcript_items : TranscriptCard {
+                                        entry: item;
+                                        horizontal-stretch: 1;
+                                    }
+                                }
                             }
                         }
                     }
 
                     Rectangle {
                         min-width: 280px;
-                        max-width: 320px;
-                        background: #171a20;
+                        max-width: 330px;
+                        background: #202020;
                         border-width: 1px;
-                        border-color: #2d3440;
-                        border-radius: 6px;
+                        border-color: #383838;
+                        border-radius: 16px;
 
                         VerticalBox {
-                            padding: 12px;
-                            spacing: 9px;
+                            padding: 16px;
+                            spacing: 12px;
 
-                            PanelTitle {
-                                text: "Progress";
+                            HorizontalBox {
+                                spacing: 8px;
+
+                                Text {
+                                    text: "アーティファクト";
+                                    font-size: 14px;
+                                    font-weight: 600;
+                                    color: #a5a5a5;
+                                }
+
+                                Rectangle {
+                                    background: transparent;
+                                    horizontal-stretch: 1;
+                                }
+
+                                Text {
+                                    text: "pin";
+                                    font-size: 11px;
+                                    color: #9a9a9a;
+                                }
                             }
 
-                            MutedText {
-                                text: root.selection_title;
-                            }
-
-                            TextEdit {
-                                height: 136px;
-                                read-only: true;
-                                text: root.progress_text;
-                                font-size: 13px;
-                            }
-
-                            PanelTitle {
-                                text: "Activity";
-                            }
-
-                            TextEdit {
+                            ScrollView {
                                 vertical-stretch: 1;
-                                read-only: true;
-                                text: root.tool_status_text;
-                                font-size: 13px;
+                                vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                                horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+
+                                VerticalBox {
+                                    spacing: 4px;
+
+                                    for item[index] in root.artifact_items : ArtifactRow {
+                                        item: item;
+                                        selected: root.current_artifact_index == index;
+                                        menu_open: root.artifact_menu_index == index;
+                                        clicked => {
+                                            root.current_artifact_index = index;
+                                            root.artifact_menu_index = -1;
+                                            root.artifact_selected(index);
+                                        }
+                                        menu_clicked => {
+                                            root.artifact_menu_index = index;
+                                            root.project_menu_index = -1;
+                                            root.session_menu_index = -1;
+                                        }
+                                        open_folder_clicked => {
+                                            root.artifact_menu_index = -1;
+                                            root.artifact_folder_open_requested(index);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
                 Rectangle {
-                    height: 220px;
+                    height: 230px;
                     background: #171a20;
                     border-width: 1px;
                     border-color: #2d3440;
@@ -530,7 +1009,7 @@ export component AppWindow inherits Window {
                         spacing: 12px;
 
                         VerticalBox {
-                            spacing: 8px;
+                            spacing: 6px;
                             horizontal-stretch: 1;
 
                             HorizontalBox {
@@ -540,37 +1019,11 @@ export component AppWindow inherits Window {
                                     text: "Prompt";
                                 }
 
-                                Rectangle {
-                                    background: transparent;
-                                    horizontal-stretch: 1;
-                                }
-
-                                Text {
-                                    text: root.current_session_title;
-                                    font-size: 11px;
-                                    color: #5ee6c1;
-                                }
-                            }
-
-                            MutedText {
-                                text: root.status_banner_text;
-                            }
-
-                            TextEdit {
-                                vertical-stretch: 1;
-                                text: root.composer_text;
-                                edited(text) => {
-                                    root.composer_changed(text);
-                                }
-                            }
-
-                            HorizontalBox {
-                                spacing: 8px;
-
                                 TextEdit {
                                     horizontal-stretch: 1;
-                                    height: 34px;
-                                    text: root.image_path_text;
+                                    height: 30px;
+                                    text <=> root.image_path_text;
+                                    enabled: root.image_input_enabled;
                                     edited(text) => {
                                         root.image_path_changed(text);
                                     }
@@ -579,6 +1032,7 @@ export component AppWindow inherits Window {
                                 Button {
                                     text: "Attach";
                                     width: 92px;
+                                    height: 30px;
                                     enabled: root.image_attach_enabled;
                                     clicked => { root.image_attach_requested(); }
                                 }
@@ -586,29 +1040,103 @@ export component AppWindow inherits Window {
                                 Button {
                                     text: "Browse";
                                     width: 92px;
+                                    height: 30px;
+                                    enabled: root.image_browse_enabled;
                                     clicked => { root.image_browse_requested(); }
                                 }
 
                                 Button {
                                     text: "Clear";
                                     width: 82px;
+                                    height: 30px;
                                     enabled: root.image_clear_enabled;
                                     clicked => { root.image_clear_requested(); }
                                 }
                             }
 
-                            MutedText {
-                                text: root.image_summary_text;
+                            TextEdit {
+                                height: root.image_clear_enabled ? 54px : 64px;
+                                text <=> root.composer_text;
+                                edited(text) => {
+                                    root.composer_changed(text);
+                                }
+                            }
+
+                            if root.image_clear_enabled : HorizontalBox {
+                                height: 28px;
+                                spacing: 6px;
+
+                                MutedText {
+                                    text: root.image_summary_text;
+                                    width: 120px;
+                                }
+
+                                for attachment[index] in root.image_thumbnail_items : Rectangle {
+                                    width: 90px;
+                                    height: 26px;
+                                    background: #1c2028;
+                                    border-width: 1px;
+                                    border-color: #343b47;
+                                    border-radius: 5px;
+
+                                    Image {
+                                        x: 4px;
+                                        y: 4px;
+                                        width: 18px;
+                                        height: 18px;
+                                        source: attachment.preview;
+                                        image-fit: contain;
+                                    }
+
+                                    Text {
+                                        x: 34px;
+                                        y: 3px;
+                                        width: 38px;
+                                        height: 20px;
+                                        text: attachment.label;
+                                        font-size: 9px;
+                                        color: #f4f7fb;
+                                        wrap: word-wrap;
+                                    }
+
+                                    Rectangle {
+                                        x: 69px;
+                                        y: 4px;
+                                        width: 16px;
+                                        height: 16px;
+                                        background: root.image_clear_enabled ? #343b47 : #242832;
+                                        border-width: 1px;
+                                        border-color: #4a5361;
+                                        border-radius: 10px;
+
+                                        Text {
+                                            text: "x";
+                                            width: parent.width;
+                                            height: parent.height;
+                                            font-size: 11px;
+                                            color: root.image_clear_enabled ? #f4f7fb : #7d8793;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+
+                                        TouchArea {
+                                            width: parent.width;
+                                            height: parent.height;
+                                            enabled: root.image_clear_enabled;
+                                            clicked => { root.image_remove_requested(index); }
+                                        }
+                                    }
+                                }
                             }
                         }
 
                         VerticalBox {
-                            spacing: 8px;
+                            spacing: 6px;
                             width: 176px;
 
                             Button {
                                 text: "Send";
-                                height: 42px;
+                                height: 34px;
                                 primary: true;
                                 enabled: root.run_enabled;
                                 clicked => { root.run_requested(); }
@@ -616,27 +1144,179 @@ export component AppWindow inherits Window {
 
                             Button {
                                 text: "Enhance";
-                                height: 34px;
+                                height: 30px;
                                 enabled: root.enhance_enabled;
                                 clicked => { root.enhance_requested(); }
                             }
 
                             Button {
                                 text: "Review";
-                                height: 34px;
+                                height: 30px;
                                 enabled: root.review_enabled;
                                 clicked => { root.review_requested(); }
                             }
 
                             Button {
                                 text: "Refresh";
-                                height: 32px;
+                                height: 30px;
                                 clicked => { root.refresh_requested(); }
                             }
                         }
                     }
                 }
 
+            }
+
+            if root.file_menu_visible || root.edit_menu_visible || root.view_menu_visible || root.help_menu_visible : Rectangle {
+                x: 0;
+                y: 46px;
+                width: parent.width;
+                height: parent.height - 46px;
+                background: #00000001;
+
+                TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    clicked => { root.overlay_close_requested(); }
+                }
+            }
+
+            if root.file_menu_visible : OverlayPanel {
+                x: 22px;
+                y: 48px;
+                width: 252px;
+                height: 190px;
+
+                VerticalBox {
+                    padding: 8px;
+                    spacing: 4px;
+
+                    MenuItem {
+                        text: "New Chat";
+                        shortcut: "Ctrl+N";
+                        clicked => { root.new_chat_requested(); }
+                    }
+
+                    Divider {}
+
+                    MenuItem {
+                        text: "Open Workspace...";
+                        shortcut: "Ctrl+O";
+                        clicked => { root.workspace_picker_requested(); }
+                    }
+
+                    MenuItem {
+                        text: "Open Folder";
+                        clicked => { root.overlay_close_requested(); root.open_folder_requested(); }
+                    }
+
+                    MenuItem {
+                        text: "Open Selected Session";
+                        enabled: root.open_session_enabled;
+                        clicked => { root.overlay_close_requested(); root.session_reload_requested(); }
+                    }
+
+                    MenuItem {
+                        text: "Export History";
+                        enabled: root.history_export_enabled;
+                        clicked => { root.overlay_close_requested(); root.history_export_requested(); }
+                    }
+                }
+            }
+
+            if root.edit_menu_visible : OverlayPanel {
+                x: 98px;
+                y: 48px;
+                width: 246px;
+                height: 190px;
+
+                VerticalBox {
+                    padding: 8px;
+                    spacing: 4px;
+
+                    MenuItem {
+                        text: "Enhance Prompt";
+                        enabled: root.enhance_enabled;
+                        clicked => { root.overlay_close_requested(); root.enhance_requested(); }
+                    }
+
+                    MenuItem {
+                        text: "Prompt Review";
+                        enabled: root.review_enabled;
+                        clicked => { root.overlay_close_requested(); root.review_requested(); }
+                    }
+
+                    Divider {}
+
+                    MenuItem {
+                        text: "Command Palette";
+                        shortcut: "Ctrl+K";
+                        clicked => { root.command_palette_requested(); }
+                    }
+
+                    MenuItem {
+                        text: "Clear Image Attachments";
+                        enabled: root.image_clear_enabled;
+                        clicked => { root.overlay_close_requested(); root.image_clear_requested(); }
+                    }
+                }
+            }
+
+            if root.view_menu_visible : OverlayPanel {
+                x: 174px;
+                y: 48px;
+                width: 250px;
+                height: 222px;
+
+                VerticalBox {
+                    padding: 8px;
+                    spacing: 4px;
+
+                    MenuItem {
+                        text: "Refresh Sessions";
+                        shortcut: "Ctrl+R";
+                        clicked => { root.overlay_close_requested(); root.refresh_requested(); }
+                    }
+
+                    MenuItem {
+                        text: "Cycle Access Preset";
+                        clicked => { root.overlay_close_requested(); root.access_mode_toggle_requested(); }
+                    }
+
+                    Divider {}
+
+                    MenuItem {
+                        text: "Provider Settings";
+                        clicked => { root.provider_editor_requested(); }
+                    }
+
+                    MenuItem {
+                        text: "Config Editor";
+                        clicked => { root.config_editor_requested(); }
+                    }
+
+                    MenuItem {
+                        text: "Workspace Settings";
+                        clicked => { root.workspace_picker_requested(); }
+                    }
+                }
+            }
+
+            if root.help_menu_visible : OverlayPanel {
+                x: 250px;
+                y: 48px;
+                width: 236px;
+                height: 68px;
+
+                VerticalBox {
+                    padding: 8px;
+                    spacing: 4px;
+
+                    MenuItem {
+                        text: "Keyboard Shortcuts";
+                        clicked => { root.keyboard_shortcuts_requested(); }
+                    }
+                }
             }
 
             if root.config_visible : OverlayPanel {
@@ -739,6 +1419,20 @@ export component AppWindow inherits Window {
 
                     HorizontalBox {
                         spacing: 8px;
+
+                        Button {
+                            text: "Open Project Dir";
+                            width: 142px;
+                            height: 36px;
+                            clicked => { root.config_open_project_folder_requested(); }
+                        }
+
+                        Button {
+                            text: "Open Global Dir";
+                            width: 138px;
+                            height: 36px;
+                            clicked => { root.config_open_global_folder_requested(); }
+                        }
 
                         Rectangle {
                             background: transparent;
@@ -1123,6 +1817,79 @@ export component AppWindow inherits Window {
                             enabled: root.send_enhanced_enabled;
                             clicked => { root.send_enhanced_requested(); }
                         }
+                    }
+                }
+            }
+
+            if root.command_palette_visible : OverlayPanel {
+                x: 300px;
+                y: 120px;
+                width: parent.width - 600px;
+                height: 420px;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 12px;
+
+                    HorizontalBox {
+                        Text {
+                            text: "Command Palette";
+                            font-size: 16px;
+                            color: #f3f4ef;
+                        }
+
+                        Rectangle { background: transparent; horizontal-stretch: 1; }
+
+                        Button {
+                            text: "Close";
+                            width: 96px;
+                            clicked => { root.overlay_close_requested(); }
+                        }
+                    }
+
+                    MutedText {
+                        text: "Local .moyai/commands entries are inserted into the prompt as slash commands.";
+                    }
+
+                    StandardListView {
+                        vertical-stretch: 1;
+                        model: root.command_items;
+                        current-item-changed(index) => { root.command_selected(index); }
+                    }
+                }
+            }
+
+            if root.keyboard_shortcuts_visible : OverlayPanel {
+                x: 380px;
+                y: 160px;
+                width: parent.width - 760px;
+                height: 320px;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 12px;
+
+                    HorizontalBox {
+                        Text {
+                            text: "Keyboard Shortcuts";
+                            font-size: 16px;
+                            color: #f3f4ef;
+                        }
+
+                        Rectangle { background: transparent; horizontal-stretch: 1; }
+
+                        Button {
+                            text: "Close";
+                            width: 96px;
+                            clicked => { root.overlay_close_requested(); }
+                        }
+                    }
+
+                    TextEdit {
+                        vertical-stretch: 1;
+                        read-only: true;
+                        text: root.keyboard_shortcuts_text;
+                        font-size: 13px;
                     }
                 }
             }

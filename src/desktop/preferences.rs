@@ -14,6 +14,8 @@ pub struct DesktopPreferences {
     pub last_workspace: Option<Utf8PathBuf>,
     pub window_opacity_percent: Option<i32>,
     #[serde(default)]
+    pub deleted_project_roots: Vec<Utf8PathBuf>,
+    #[serde(default)]
     pub workspaces: BTreeMap<String, DesktopWorkspacePreferences>,
 }
 
@@ -69,6 +71,28 @@ impl DesktopPreferences {
     pub fn clear_workspace_override(&mut self, root: &Utf8Path) {
         self.workspaces.remove(root.as_str());
     }
+
+    pub fn mark_project_deleted(&mut self, root: &Utf8Path) {
+        if !self.deleted_project_roots.iter().any(|path| path == root) {
+            self.deleted_project_roots.push(root.to_path_buf());
+        }
+        if self
+            .last_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace == root)
+        {
+            self.last_workspace = None;
+        }
+        self.clear_workspace_override(root);
+    }
+
+    pub fn unmark_project_deleted(&mut self, root: &Utf8Path) {
+        self.deleted_project_roots.retain(|path| path != root);
+    }
+
+    pub fn is_project_deleted(&self, root: &Utf8Path) -> bool {
+        self.deleted_project_roots.iter().any(|path| path == root)
+    }
 }
 
 fn preferences_path() -> Result<Utf8PathBuf, String> {
@@ -80,4 +104,33 @@ fn preferences_path() -> Result<Utf8PathBuf, String> {
     let config_dir = Utf8PathBuf::from_path_buf(dirs.config_dir().to_path_buf())
         .map_err(|_| "desktop preferences directory is not valid UTF-8".to_string())?;
     Ok(config_dir.join("desktop.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_delete_tombstone_clears_restore_state_and_override() {
+        let root = Utf8Path::new("C:/workspace/deleted");
+        let mut preferences = DesktopPreferences {
+            last_workspace: Some(root.to_path_buf()),
+            window_opacity_percent: Some(95),
+            deleted_project_roots: Vec::new(),
+            workspaces: BTreeMap::new(),
+        };
+        preferences.set_workspace_override(root, PartialResolvedConfig::default());
+
+        preferences.mark_project_deleted(root);
+        preferences.mark_project_deleted(root);
+
+        assert_eq!(preferences.deleted_project_roots, vec![root.to_path_buf()]);
+        assert!(preferences.last_workspace.is_none());
+        assert!(preferences.workspace_override(root).is_none());
+        assert!(preferences.is_project_deleted(root));
+
+        preferences.unmark_project_deleted(root);
+
+        assert!(!preferences.is_project_deleted(root));
+    }
 }

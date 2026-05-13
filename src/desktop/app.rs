@@ -9,6 +9,7 @@ use slint::{Timer, TimerMode};
 
 use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest};
 use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode};
+use crate::config::loader::{global_config_path, project_config_paths};
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::{PartialModelConfig, PartialPermissionsConfig, PartialResolvedConfig};
 use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
@@ -19,14 +20,14 @@ use crate::llm::{
 };
 use crate::runtime::SystemClock;
 use crate::session::{
-    EditorContext, RunEvent, RunSummary, SessionId, SessionRecord, TodoItem,
-    history_items_to_markdown, history_markdown_file_name,
+    EditorContext, ProjectId, ProjectRecord, RunEvent, RunSummary, SessionId, SessionRecord,
+    TodoItem, history_items_to_markdown, history_markdown_file_name,
 };
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
 
 use super::args::DesktopArgs;
-use super::bridge::{DesktopBridge, render_handle};
+use super::bridge::{DesktopBridge, render_composer_action_state, render_handle};
 use super::preferences::DesktopPreferences;
 use super::query::{
     load_session_detail, load_snapshot, load_snapshot_continue_last, load_snapshot_for_selection,
@@ -49,8 +50,8 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
         let weak = bridge.as_weak();
         timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
             let mut controller = controller.borrow_mut();
-            controller.drain_runtime_messages();
-            if let Some(handle) = weak.upgrade() {
+            let changed = controller.drain_runtime_messages();
+            if changed && let Some(handle) = weak.upgrade() {
                 render_handle(&handle, &controller.state);
             }
         });
@@ -64,6 +65,21 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
 }
 
 fn bind_handlers(bridge: &DesktopBridge, controller: &Rc<RefCell<DesktopController>>) {
+    bridge.on_project_selected({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move |index| {
+            if index < 0 {
+                return;
+            }
+            let mut controller = controller.borrow_mut();
+            controller.state.select_project(index as usize);
+            controller.open_selected_project();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
     bridge.on_session_selected({
         let weak = bridge.as_weak();
         let controller = Rc::clone(controller);
@@ -73,6 +89,179 @@ fn bind_handlers(bridge: &DesktopBridge, controller: &Rc<RefCell<DesktopControll
             }
             let mut controller = controller.borrow_mut();
             controller.state.select_session(index as usize);
+            controller.open_selected_session();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_project_delete_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move |index| {
+            if index < 0 {
+                return;
+            }
+            let mut controller = controller.borrow_mut();
+            controller.state.select_project(index as usize);
+            controller.delete_selected_project();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_session_delete_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move |index| {
+            if index < 0 {
+                return;
+            }
+            let mut controller = controller.borrow_mut();
+            controller.state.select_session(index as usize);
+            controller.delete_selected_session();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_artifact_selected({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move |index| {
+            if index < 0 {
+                return;
+            }
+            let mut controller = controller.borrow_mut();
+            controller.state.select_artifact(index as usize);
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_artifact_folder_open_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move |index| {
+            if index < 0 {
+                return;
+            }
+            let mut controller = controller.borrow_mut();
+            controller.state.select_artifact(index as usize);
+            controller.open_selected_artifact_folder();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_local_search_changed({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move |text| {
+            let mut controller = controller.borrow_mut();
+            controller.state.set_local_search_text(text.to_string());
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_command_palette_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move || {
+            let mut controller = controller.borrow_mut();
+            controller.state.show_command_palette();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_file_menu_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move || {
+            let mut controller = controller.borrow_mut();
+            controller.state.show_file_menu();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_edit_menu_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move || {
+            let mut controller = controller.borrow_mut();
+            controller.state.show_edit_menu();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_view_menu_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move || {
+            let mut controller = controller.borrow_mut();
+            controller.state.show_view_menu();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_help_menu_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move || {
+            let mut controller = controller.borrow_mut();
+            controller.state.show_help_menu();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_new_chat_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move || {
+            let mut controller = controller.borrow_mut();
+            controller.state.start_new_chat();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_command_selected({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move |index| {
+            if index < 0 {
+                return;
+            }
+            let mut controller = controller.borrow_mut();
+            controller.state.insert_command_from_palette(index as usize);
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_keyboard_shortcuts_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move || {
+            let mut controller = controller.borrow_mut();
+            controller.state.show_keyboard_shortcuts();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_overlay_close_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move || {
+            let mut controller = controller.borrow_mut();
+            controller.state.hide_overlay();
             if let Some(handle) = weak.upgrade() {
                 render_handle(&handle, &controller.state);
             }
@@ -85,7 +274,7 @@ fn bind_handlers(bridge: &DesktopBridge, controller: &Rc<RefCell<DesktopControll
             let mut controller = controller.borrow_mut();
             controller.state.set_draft_prompt(text.to_string());
             if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
+                render_composer_action_state(&handle, &controller.state);
             }
         }
     });
@@ -130,6 +319,20 @@ fn bind_handlers(bridge: &DesktopBridge, controller: &Rc<RefCell<DesktopControll
         move || {
             let mut controller = controller.borrow_mut();
             controller.state.clear_image_attachments();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_image_remove_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move |index| {
+            if index < 0 {
+                return;
+            }
+            let mut controller = controller.borrow_mut();
+            controller.state.remove_image_attachment(index as usize);
             if let Some(handle) = weak.upgrade() {
                 render_handle(&handle, &controller.state);
             }
@@ -393,6 +596,28 @@ fn bind_handlers(bridge: &DesktopBridge, controller: &Rc<RefCell<DesktopControll
             }
         }
     });
+    bridge.on_config_open_project_folder_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move || {
+            let mut controller = controller.borrow_mut();
+            controller.open_project_config_folder();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
+    bridge.on_config_open_global_folder_requested({
+        let weak = bridge.as_weak();
+        let controller = Rc::clone(controller);
+        move || {
+            let mut controller = controller.borrow_mut();
+            controller.open_global_config_folder();
+            if let Some(handle) = weak.upgrade() {
+                render_handle(&handle, &controller.state);
+            }
+        }
+    });
     bridge.on_workspace_picker_requested({
         let weak = bridge.as_weak();
         let controller = Rc::clone(controller);
@@ -555,7 +780,17 @@ enum RuntimeMessage {
     SnapshotLoaded(Result<super::models::DesktopSnapshot, String>),
     SessionLoaded {
         session_id: SessionId,
+        reason: SessionLoadReason,
         result: Result<LoadedSession, String>,
+    },
+    SessionDeleted {
+        session_id: SessionId,
+        result: Result<super::models::DesktopSnapshot, String>,
+    },
+    ProjectDeleted {
+        project_id: ProjectId,
+        project_root: Utf8PathBuf,
+        result: Result<WorkspaceLoadResult, String>,
     },
     CurrentTodosLoaded {
         session_id: SessionId,
@@ -567,6 +802,12 @@ enum RuntimeMessage {
     },
     HistoryExported(Result<Utf8PathBuf, String>),
     WorkspaceSwitched(Result<WorkspaceLoadResult, String>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionLoadReason {
+    UserSelection,
+    CurrentRefresh,
 }
 
 struct LoadedSession {
@@ -612,11 +853,54 @@ impl DesktopController {
         persist_preferences_to_disk: bool,
     ) -> Result<Self, AppRunError> {
         let (runtime_tx, runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        if args.directory.is_some() {
+            preferences.unmark_project_deleted(&app.workspace.root);
+        } else {
+            purge_deleted_project_roots(&app, &preferences)
+                .await
+                .map_err(AppRunError::Message)?;
+            if preferences.is_project_deleted(&app.workspace.root) {
+                let store = app.session_service.store.clone();
+                let next_root = next_project_root_after_delete(
+                    &app,
+                    app.workspace.project_id,
+                    &preferences.deleted_project_roots,
+                    &app.workspace.root,
+                )
+                .await
+                .map_err(AppRunError::Message)?
+                .unwrap_or_else(|| {
+                    fallback_workspace_after_project_delete(
+                        &app.workspace.root,
+                        &preferences.deleted_project_roots,
+                        app.session_service.store.paths().data_dir.as_path(),
+                    )
+                });
+                std::fs::create_dir_all(next_root.as_std_path()).map_err(|error| {
+                    AppRunError::Message(format!(
+                        "failed to create fallback workspace {} after deleted project restore: {error}",
+                        next_root
+                    ))
+                })?;
+                app = AppBootstrap::rebuild_for_directory(&next_root, store)
+                    .await
+                    .map_err(|error| {
+                        AppRunError::Message(format!(
+                            "failed to open fallback workspace {} after deleted project restore: {error}",
+                            next_root
+                        ))
+                    })?;
+            }
+        }
         if args.directory.is_none() {
             if let Some(restored_workspace) = preferences.last_workspace.clone() {
-                if restored_workspace != app.workspace.root {
+                if preferences.is_project_deleted(&restored_workspace) {
+                    preferences.last_workspace = None;
+                } else if restored_workspace != app.workspace.root {
                     let store = app.session_service.store.clone();
-                    if restored_workspace.exists() {
+                    if restored_workspace.exists()
+                        && project_root_exists(&app, &restored_workspace).await?
+                    {
                         app = AppBootstrap::rebuild_for_directory(&restored_workspace, store)
                             .await
                             .map_err(|error| {
@@ -625,8 +909,24 @@ impl DesktopController {
                                     restored_workspace
                                 ))
                             })?;
+                    } else {
+                        preferences.last_workspace = None;
                     }
                 }
+            }
+        }
+        if let Some(session_id) = args.session_id {
+            let session = app.session_service.get_session(session_id).await?;
+            if session.cwd != app.workspace.cwd {
+                let store = app.session_service.store.clone();
+                app = AppBootstrap::rebuild_for_directory(&session.cwd, store)
+                    .await
+                    .map_err(|error| {
+                        AppRunError::Message(format!(
+                            "failed to open session workspace {}: {error}",
+                            session.cwd
+                        ))
+                    })?;
             }
         }
 
@@ -642,13 +942,7 @@ impl DesktopController {
         if let Some(opacity) = preferences.window_opacity_percent {
             state.set_window_opacity_percent(opacity);
         }
-        if let Some(session_id) = args.session_id.or_else(|| {
-            if args.continue_last {
-                state.selected_session_id()
-            } else {
-                None
-            }
-        }) {
+        if let Some(session_id) = args.session_id.or_else(|| state.selected_session_id()) {
             let (session, transcript, turn_items, session_state, todos) =
                 load_session_detail(&app, session_id).await?;
             state.load_open_session(&session, &transcript, &turn_items, session_state, todos);
@@ -691,8 +985,69 @@ impl DesktopController {
 
     fn open_selected_session(&mut self) {
         if let Some(session_id) = self.state.selected_session_id() {
-            self.spawn_session_load(session_id);
+            self.state
+                .set_status_message(format!("opening session {session_id}..."));
+            self.spawn_session_load(session_id, SessionLoadReason::UserSelection);
         }
+    }
+
+    fn open_selected_project(&mut self) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("project cannot change while a run is active");
+            return;
+        }
+        let Some(path) = self.state.selected_project_path().map(Utf8PathBuf::from) else {
+            self.state.set_status_message("select a project first");
+            return;
+        };
+        if path == self.app.workspace.root {
+            return;
+        }
+        self.state
+            .set_status_message(format!("opening project {}...", path));
+        self.spawn_workspace_load(path);
+    }
+
+    fn delete_selected_session(&mut self) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("chat cannot be deleted while a run is active");
+            return;
+        }
+        let Some(session_id) = self.state.selected_session_id() else {
+            self.state
+                .set_status_message("select a chat before deleting");
+            return;
+        };
+        self.state
+            .set_status_message(format!("deleting chat {}...", session_id));
+        self.spawn_session_delete(session_id);
+    }
+
+    fn delete_selected_project(&mut self) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("project cannot be deleted while a run is active");
+            return;
+        }
+        let Some(project_id) = self.state.selected_project_id() else {
+            self.state
+                .set_status_message("select a project before deleting");
+            return;
+        };
+        let Some(project_root) = self.state.selected_project_path().map(Utf8PathBuf::from) else {
+            self.state
+                .set_status_message("selected project path is not available");
+            return;
+        };
+        self.state
+            .set_status_message(format!("deleting project {}...", project_id));
+        let mut hidden_roots = self.preferences.deleted_project_roots.clone();
+        if !hidden_roots.iter().any(|root| root == &project_root) {
+            hidden_roots.push(project_root.clone());
+        }
+        self.spawn_project_delete(project_id, project_root, hidden_roots);
     }
 
     fn export_selected_history_markdown(&mut self) {
@@ -758,7 +1113,7 @@ impl DesktopController {
         });
     }
 
-    fn spawn_session_load(&self, session_id: SessionId) {
+    fn spawn_session_load(&self, session_id: SessionId, reason: SessionLoadReason) {
         let app = self.app.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
@@ -780,7 +1135,96 @@ impl DesktopController {
                     )
                     .map_err(|error| error.to_string())
             });
-            let _ = runtime_tx.send(RuntimeMessage::SessionLoaded { session_id, result });
+            let _ = runtime_tx.send(RuntimeMessage::SessionLoaded {
+                session_id,
+                reason,
+                result,
+            });
+        });
+    }
+
+    fn spawn_session_delete(&self, session_id: SessionId) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop session-delete runtime");
+            let result = runtime.block_on(async move {
+                app.session_service
+                    .delete_session(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                load_snapshot_for_selection(&app, None)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionDeleted { session_id, result });
+        });
+    }
+
+    fn spawn_project_delete(
+        &self,
+        project_id: ProjectId,
+        project_root: Utf8PathBuf,
+        hidden_roots: Vec<Utf8PathBuf>,
+    ) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        let project_root_for_thread = project_root.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop project-delete runtime");
+            let result = runtime.block_on(async move {
+                let deleted_was_current = project_id == app.workspace.project_id;
+                app.session_service
+                    .delete_project(project_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut app = app;
+                if deleted_was_current {
+                    let remaining = app
+                        .session_service
+                        .list_projects(30)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let next_root = first_restorable_project_root(
+                        &remaining,
+                        project_id,
+                        &hidden_roots,
+                        &project_root_for_thread,
+                    )
+                    .unwrap_or_else(|| {
+                        fallback_workspace_after_project_delete(
+                            &project_root_for_thread,
+                            &hidden_roots,
+                            app.session_service.store.paths().data_dir.as_path(),
+                        )
+                    });
+                    if let Some(parent) = next_root.parent() {
+                        std::fs::create_dir_all(parent.as_std_path())
+                            .map_err(|error| error.to_string())?;
+                    }
+                    std::fs::create_dir_all(next_root.as_std_path())
+                        .map_err(|error| error.to_string())?;
+                    let store = app.session_service.store.clone();
+                    app = AppBootstrap::rebuild_for_directory(&next_root, store)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                let snapshot = load_snapshot_for_selection(&app, None)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(WorkspaceLoadResult { app, snapshot })
+            });
+            let _ = runtime_tx.send(RuntimeMessage::ProjectDeleted {
+                project_id,
+                project_root,
+                result,
+            });
         });
     }
 
@@ -1041,6 +1485,10 @@ impl DesktopController {
         let Some(requested) = self.resolve_workspace_input() else {
             return;
         };
+        self.spawn_workspace_load(requested);
+    }
+
+    fn spawn_workspace_load(&self, requested: Utf8PathBuf) {
         let store = self.app.session_service.store.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
@@ -1129,10 +1577,72 @@ impl DesktopController {
         self.open_path_in_file_manager(&root);
     }
 
+    fn open_project_config_folder(&mut self) {
+        let [primary, secondary] = project_config_paths(&self.app.workspace.root);
+        let config_path = if secondary.exists() {
+            secondary
+        } else if primary.exists() {
+            primary
+        } else {
+            primary
+        };
+        let Some(folder) = config_path.parent().map(camino::Utf8Path::to_path_buf) else {
+            self.state
+                .set_status_message("project config folder could not be resolved");
+            return;
+        };
+        self.open_path_in_file_manager(&folder);
+    }
+
+    fn open_global_config_folder(&mut self) {
+        let config_path = match global_config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("global config path failed: {error}"));
+                return;
+            }
+        };
+        let Some(folder) = config_path.parent().map(camino::Utf8Path::to_path_buf) else {
+            self.state
+                .set_status_message("global config folder could not be resolved");
+            return;
+        };
+        if let Err(error) = std::fs::create_dir_all(folder.as_std_path()) {
+            self.state.set_status_message(format!(
+                "failed to create global config folder {}: {error}",
+                folder
+            ));
+            return;
+        }
+        self.open_path_in_file_manager(&folder);
+    }
+
     fn open_typed_path_in_file_manager(&mut self) {
         if let Some(path) = self.resolve_workspace_input() {
             self.open_path_in_file_manager(&path);
         }
+    }
+
+    fn open_selected_artifact_folder(&mut self) {
+        let Some(path_text) = self.state.selected_artifact_path() else {
+            self.state.set_status_message("select an artifact first");
+            return;
+        };
+        let path = Utf8PathBuf::from(path_text);
+        let absolute_path = if path.is_absolute() {
+            path
+        } else {
+            self.app.workspace.root.join(path)
+        };
+        let folder = if absolute_path.is_dir() {
+            absolute_path
+        } else if let Some(parent) = absolute_path.parent() {
+            parent.to_path_buf()
+        } else {
+            self.app.workspace.root.clone()
+        };
+        self.open_path_in_file_manager(&folder);
     }
 
     fn open_path_in_file_manager(&mut self, path: &camino::Utf8Path) {
@@ -1240,7 +1750,12 @@ impl DesktopController {
             prompt: prompt.clone(),
             session_id: self.state.app_state.current_session_id,
             continue_last: false,
-            title: None,
+            title: self
+                .state
+                .app_state
+                .current_session_id
+                .is_none()
+                .then(|| title_from_prompt(&prompt)),
             cwd: self.app.workspace.cwd.clone(),
             model: self.state.effective_config.model.model.clone(),
             base_url: self.state.effective_config.model.base_url.clone(),
@@ -1310,8 +1825,10 @@ impl DesktopController {
         }
     }
 
-    fn drain_runtime_messages(&mut self) {
+    fn drain_runtime_messages(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(message) = self.runtime_rx.try_recv() {
+            changed = true;
             match message {
                 RuntimeMessage::RunEvent(event) => {
                     self.state.apply_run_event(&event);
@@ -1326,7 +1843,7 @@ impl DesktopController {
                         self.state.app_state.set_summary(summary);
                         self.refresh_snapshot();
                         if let Some(session_id) = self.state.app_state.current_session_id {
-                            self.spawn_session_load(session_id);
+                            self.spawn_session_load(session_id, SessionLoadReason::CurrentRefresh);
                         }
                     }
                     Err(error) => {
@@ -1354,13 +1871,28 @@ impl DesktopController {
                     Ok(snapshot) => self.state.replace_snapshot(snapshot),
                     Err(error) => self.state.set_status_message(error),
                 },
-                RuntimeMessage::SessionLoaded { session_id, result } => match result {
+                RuntimeMessage::SessionLoaded {
+                    session_id,
+                    reason,
+                    result,
+                } => match result {
                     Ok(loaded) => {
                         if matches!(
                             self.state.app_state.run_status,
                             crate::tui::state::RunStatus::Running
                                 | crate::tui::state::RunStatus::Confirming
                         ) {
+                            continue;
+                        }
+                        let should_apply = match reason {
+                            SessionLoadReason::UserSelection => {
+                                self.state.selected_session_id() == Some(session_id)
+                            }
+                            SessionLoadReason::CurrentRefresh => {
+                                self.state.app_state.current_session_id == Some(session_id)
+                            }
+                        };
+                        if !should_apply {
                             continue;
                         }
                         self.state.load_open_session(
@@ -1374,6 +1906,85 @@ impl DesktopController {
                             .set_status_message(format!("opened session {}", session_id));
                     }
                     Err(error) => self.state.set_status_message(error),
+                },
+                RuntimeMessage::SessionDeleted { session_id, result } => match result {
+                    Ok(snapshot) => {
+                        let deleted_was_current =
+                            self.state.app_state.current_session_id == Some(session_id);
+                        self.state.replace_snapshot(snapshot);
+                        if deleted_was_current {
+                            if let Some(next_session_id) = self.state.selected_session_id() {
+                                self.state.set_status_message(format!(
+                                    "deleted chat {}; opening {}...",
+                                    session_id, next_session_id
+                                ));
+                                self.spawn_session_load(
+                                    next_session_id,
+                                    SessionLoadReason::UserSelection,
+                                );
+                            } else {
+                                self.state.start_new_chat();
+                                self.state
+                                    .set_status_message(format!("deleted chat {}", session_id));
+                            }
+                        } else {
+                            self.state
+                                .set_status_message(format!("deleted chat {}", session_id));
+                        }
+                    }
+                    Err(error) => self
+                        .state
+                        .set_status_message(format!("chat delete failed: {error}")),
+                },
+                RuntimeMessage::ProjectDeleted {
+                    project_id,
+                    project_root,
+                    result,
+                } => match result {
+                    Ok(loaded) => {
+                        let deleted_was_current = self.app.workspace.project_id == project_id;
+                        self.preferences.mark_project_deleted(&project_root);
+                        self.app = loaded.app.clone();
+                        self.preferences
+                            .unmark_project_deleted(&self.app.workspace.root);
+                        if deleted_was_current {
+                            let effective = apply_preferences_override(
+                                &self.preferences,
+                                &self.app.workspace.root,
+                                self.app.config.clone(),
+                            );
+                            self.state = DesktopState::new(loaded.snapshot, effective);
+                            self.state.workspace_input = self.app.workspace.cwd.to_string();
+                            if let Some(opacity) = self.preferences.window_opacity_percent {
+                                self.state.set_window_opacity_percent(opacity);
+                            }
+                            self.preferences.last_workspace = Some(self.app.workspace.root.clone());
+                            self.persist_preferences();
+                            if !self.state.provider_base_url_input.trim().is_empty() {
+                                self.load_provider_models();
+                            }
+                        } else {
+                            self.state.replace_snapshot(loaded.snapshot);
+                            self.persist_preferences();
+                        }
+                        if let Some(next_session_id) = self.state.selected_session_id() {
+                            self.state.set_status_message(format!(
+                                "deleted project {}; opening {}...",
+                                project_id, next_session_id
+                            ));
+                            self.spawn_session_load(
+                                next_session_id,
+                                SessionLoadReason::UserSelection,
+                            );
+                        } else {
+                            self.state.start_new_chat();
+                            self.state
+                                .set_status_message(format!("deleted project {}", project_id));
+                        }
+                    }
+                    Err(error) => self
+                        .state
+                        .set_status_message(format!("project delete failed: {error}")),
                 },
                 RuntimeMessage::CurrentTodosLoaded { session_id, result } => match result {
                     Ok(todos) => {
@@ -1408,6 +2019,8 @@ impl DesktopController {
                 RuntimeMessage::WorkspaceSwitched(result) => match result {
                     Ok(loaded) => {
                         self.app = loaded.app.clone();
+                        self.preferences
+                            .unmark_project_deleted(&self.app.workspace.root);
                         let effective = apply_preferences_override(
                             &self.preferences,
                             &self.app.workspace.root,
@@ -1432,6 +2045,108 @@ impl DesktopController {
                 },
             }
         }
+        changed
+    }
+}
+
+fn title_from_prompt(prompt: &str) -> String {
+    let first_line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("New Chat");
+    let mut title = first_line
+        .replace('`', "")
+        .replace('\t', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let max_chars = 42;
+    if title.chars().count() > max_chars {
+        title = title.chars().take(max_chars - 1).collect::<String>();
+        title.push('…');
+    }
+    if title.is_empty() {
+        "New Chat".to_string()
+    } else {
+        title
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        fallback_workspace_after_project_delete, first_restorable_project_root, title_from_prompt,
+    };
+    use crate::session::{ProjectId, ProjectRecord};
+    use camino::Utf8Path;
+
+    fn project_record(id: ProjectId, root_path: &str) -> ProjectRecord {
+        ProjectRecord {
+            id,
+            root_path: root_path.into(),
+            display_name: root_path.to_string(),
+            vcs_kind: "none".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn desktop_title_from_prompt_is_short_and_human_readable() {
+        let title =
+            title_from_prompt("  `calculator.py` と `test_calculator.py` を作成してください。");
+        assert!(title.starts_with("calculator.py と test_calculator.py"));
+        assert!(title.chars().count() <= 42);
+        assert_eq!(title_from_prompt("\n\n"), "New Chat");
+        assert!(title_from_prompt("a ".repeat(80).as_str()).chars().count() <= 42);
+    }
+
+    #[test]
+    fn desktop_composer_edit_does_not_rewrite_text_from_render_model() {
+        let source = include_str!("app.rs");
+        let callback = source
+            .split("bridge.on_composer_changed")
+            .nth(1)
+            .expect("composer callback exists")
+            .split("bridge.on_image_path_changed")
+            .next()
+            .expect("image path callback follows composer callback");
+        assert!(callback.contains("render_composer_action_state"));
+        assert!(!callback.contains("render_handle"));
+    }
+
+    #[test]
+    fn project_delete_selects_only_non_deleted_remaining_project() {
+        let deleted_id = ProjectId::new();
+        let hidden_id = ProjectId::new();
+        let kept_id = ProjectId::new();
+        let hidden_root = camino::Utf8PathBuf::from("C:/workspace/hidden");
+        let deleted_root = Utf8Path::new("C:/workspace/deleted");
+        let projects = vec![
+            project_record(deleted_id, "C:/workspace/deleted"),
+            project_record(hidden_id, "C:/workspace/hidden"),
+            project_record(kept_id, "C:/workspace/kept"),
+        ];
+
+        let selected =
+            first_restorable_project_root(&projects, deleted_id, &[hidden_root], deleted_root)
+                .expect("kept project should be restorable");
+
+        assert_eq!(selected, camino::Utf8PathBuf::from("C:/workspace/kept"));
+    }
+
+    #[test]
+    fn project_delete_fallback_never_returns_deleted_or_hidden_root() {
+        let deleted_root = Utf8Path::new("C:/workspace/deleted");
+        let hidden_root = camino::Utf8PathBuf::from("C:/workspace/hidden");
+        let data_dir = Utf8Path::new("C:/moyai-data");
+
+        let fallback =
+            fallback_workspace_after_project_delete(deleted_root, &[hidden_root.clone()], data_dir);
+
+        assert_ne!(fallback.as_path(), deleted_root);
+        assert_ne!(fallback, hidden_root);
     }
 }
 
@@ -1513,6 +2228,92 @@ fn apply_preferences_override(
         Some(patch) => apply_config_patch(base_config, patch),
         None => base_config,
     }
+}
+
+async fn purge_deleted_project_roots(
+    app: &App,
+    preferences: &DesktopPreferences,
+) -> Result<(), String> {
+    if preferences.deleted_project_roots.is_empty() {
+        return Ok(());
+    }
+    let projects = app
+        .session_service
+        .list_projects(200)
+        .await
+        .map_err(|error| error.to_string())?;
+    for project in projects {
+        if preferences.is_project_deleted(&project.root_path) {
+            app.session_service
+                .delete_project(project.id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+async fn project_root_exists(app: &App, root: &Utf8Path) -> Result<bool, AppRunError> {
+    let projects = app
+        .session_service
+        .list_projects(200)
+        .await
+        .map_err(|error| AppRunError::Message(error.to_string()))?;
+    Ok(projects.iter().any(|project| project.root_path == root))
+}
+
+async fn next_project_root_after_delete(
+    app: &App,
+    deleted_project_id: ProjectId,
+    hidden_roots: &[Utf8PathBuf],
+    deleted_root: &Utf8Path,
+) -> Result<Option<Utf8PathBuf>, String> {
+    let projects = app
+        .session_service
+        .list_projects(30)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(first_restorable_project_root(
+        &projects,
+        deleted_project_id,
+        hidden_roots,
+        deleted_root,
+    ))
+}
+
+fn first_restorable_project_root(
+    projects: &[ProjectRecord],
+    deleted_project_id: ProjectId,
+    hidden_roots: &[Utf8PathBuf],
+    deleted_root: &Utf8Path,
+) -> Option<Utf8PathBuf> {
+    projects
+        .iter()
+        .find(|project| {
+            project.id != deleted_project_id
+                && project.root_path != deleted_root
+                && !hidden_roots.iter().any(|root| root == &project.root_path)
+        })
+        .map(|project| project.root_path.clone())
+}
+
+fn fallback_workspace_after_project_delete(
+    deleted_root: &Utf8Path,
+    hidden_roots: &[Utf8PathBuf],
+    data_dir: &Utf8Path,
+) -> Utf8PathBuf {
+    let mut candidates = Vec::new();
+    if let Some(default_workspace) = super::default_workspace_directory() {
+        candidates.push(default_workspace);
+    }
+    candidates.push(data_dir.join("desktop-workspace"));
+    candidates.push(data_dir.join("desktop-workspace-after-delete"));
+    candidates
+        .into_iter()
+        .find(|candidate| {
+            candidate != deleted_root && !hidden_roots.iter().any(|root| root == candidate)
+        })
+        .unwrap_or_else(|| data_dir.join("desktop-workspace-after-delete-2"))
 }
 
 fn pick_workspace_directory(

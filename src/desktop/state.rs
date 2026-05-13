@@ -1,7 +1,8 @@
 use crate::config::ResolvedConfig;
 use crate::protocol::TurnItem;
 use crate::session::{
-    PromptDispatchPart, SessionId, SessionRecord, SessionStateSnapshot, TodoItem, Transcript,
+    ProjectId, PromptDispatchPart, SessionId, SessionRecord, SessionStateSnapshot, TodoItem,
+    Transcript,
 };
 use crate::tool::PermissionRequest;
 use crate::tui::config_editor::ConfigEditorState;
@@ -18,10 +19,16 @@ pub const DEFAULT_WINDOW_OPACITY_PERCENT: i32 = 96;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopOverlay {
     None,
+    FileMenu,
+    EditMenu,
+    ViewMenu,
+    HelpMenu,
     ConfigEditor,
     ProviderEditor,
     WorkspacePicker,
     PromptReview,
+    CommandPalette,
+    KeyboardShortcuts,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +52,8 @@ pub struct DesktopState {
     pub provider_status_text: String,
     pub provider_loading: bool,
     pub window_opacity_percent: i32,
+    pub artifact_selected_index: usize,
+    pub local_search_text: String,
 }
 
 impl DesktopState {
@@ -78,31 +87,61 @@ impl DesktopState {
             provider_status_text: "Enter a provider URL, then load the model list.".to_string(),
             provider_loading: false,
             window_opacity_percent: DEFAULT_WINDOW_OPACITY_PERCENT,
+            artifact_selected_index: 0,
+            local_search_text: String::new(),
         }
         .with_provider_fields()
     }
 
     pub fn replace_snapshot(&mut self, mut snapshot: DesktopSnapshot) {
-        let preferred = self
-            .selected_session_id()
-            .or(self.app_state.current_session_id)
-            .or_else(|| snapshot.selected_session_id());
-        if let Some(session_id) = preferred {
+        let preferred = [
+            self.selected_session_id(),
+            self.app_state.current_session_id,
+            snapshot.selected_session_id(),
+        ];
+        for session_id in preferred.into_iter().flatten() {
             if let Some(index) = snapshot
                 .session_rows
                 .iter()
                 .position(|row| row.session_id == session_id)
             {
                 snapshot.selected_session_index = index;
+                break;
             }
         }
         self.snapshot = snapshot;
+        self.clamp_artifact_selection();
     }
 
     pub fn select_session(&mut self, index: usize) {
         if index < self.snapshot.session_rows.len() {
             self.snapshot.selected_session_index = index;
+            self.artifact_selected_index = 0;
         }
+    }
+
+    pub fn select_project(&mut self, index: usize) {
+        if index < self.snapshot.project_rows.len() {
+            self.snapshot.selected_project_index = index;
+            self.snapshot.selected_session_index = 0;
+            self.artifact_selected_index = 0;
+        }
+    }
+
+    pub fn selected_project_index(&self) -> i32 {
+        if self.snapshot.project_rows.is_empty() {
+            -1
+        } else {
+            self.snapshot.selected_project_index as i32
+        }
+    }
+
+    pub fn selected_project_path(&self) -> Option<&str> {
+        self.snapshot.selected_project_path()
+    }
+
+    pub fn selected_project_id(&self) -> Option<ProjectId> {
+        self.snapshot.selected_project_id()
     }
 
     pub fn selected_index(&self) -> i32 {
@@ -140,7 +179,16 @@ impl DesktopState {
     pub fn selected_detail(&self) -> DesktopSessionDetail {
         if let Some(selected_id) = self.selected_session_id() {
             if self.app_state.current_session_id == Some(selected_id) {
-                return build_session_detail_from_app_state(&self.app_state);
+                let mut detail = build_session_detail_from_app_state(&self.app_state);
+                if detail.artifacts.is_empty() {
+                    if let Some(stored) = self.snapshot.detail_for(selected_id) {
+                        detail.artifacts = stored.artifacts.clone();
+                        detail.file_changes = stored.file_changes.clone();
+                        detail.file_change_summary_text = stored.file_change_summary_text.clone();
+                        detail.artifact_preview_text = stored.artifact_preview_text.clone();
+                    }
+                }
+                return detail;
             }
             if let Some(detail) = self.snapshot.detail_for(selected_id) {
                 return detail.clone();
@@ -152,12 +200,52 @@ impl DesktopState {
             DesktopSessionDetail {
                 session_id: SessionId::new(),
                 transcript_text: "No sessions available for this workspace.".to_string(),
+                transcript_rows: vec![crate::desktop::models::DesktopTranscriptRow {
+                    kind: "system".to_string(),
+                    step: "00".to_string(),
+                    title: "No sessions".to_string(),
+                    body: "No sessions available for this workspace.".to_string(),
+                }],
                 tool_status_text: "No tool activity recorded.".to_string(),
                 progress_text: "Idle\nPhase: ready\nStep: No active run".to_string(),
                 run_status_text: "Idle".to_string(),
                 confirmation_text: String::new(),
                 confirmation_visible: false,
+                artifacts: Vec::new(),
+                file_changes: Vec::new(),
+                file_change_summary_text: "No file changes recorded.".to_string(),
+                artifact_preview_text: "No artifact selected.".to_string(),
             }
+        }
+    }
+
+    pub fn selected_artifact_preview_text(&self) -> String {
+        let detail = self.selected_detail();
+        let Some(artifact) = detail.artifacts.get(self.artifact_selected_index) else {
+            return detail.artifact_preview_text;
+        };
+        super::query::format_artifact_preview(Some(artifact), &detail.file_changes)
+    }
+
+    pub fn selected_artifact_path(&self) -> Option<String> {
+        self.selected_detail()
+            .artifacts
+            .get(self.artifact_selected_index)
+            .map(|artifact| artifact.path.clone())
+    }
+
+    pub fn select_artifact(&mut self, index: usize) {
+        let detail = self.selected_detail();
+        if index < detail.artifacts.len() {
+            self.artifact_selected_index = index;
+        }
+    }
+
+    pub fn selected_artifact_index(&self) -> i32 {
+        if self.selected_detail().artifacts.is_empty() {
+            -1
+        } else {
+            self.artifact_selected_index as i32
         }
     }
 
@@ -217,6 +305,15 @@ impl DesktopState {
         self.set_status_message("Image attachments cleared.");
     }
 
+    pub fn remove_image_attachment(&mut self, index: usize) {
+        if index >= self.image_attachment_paths.len() {
+            self.set_status_message("Image attachment is no longer available.");
+            return;
+        }
+        let removed = self.image_attachment_paths.remove(index);
+        self.set_status_message(format!("Removed image attachment {}", removed));
+    }
+
     pub fn image_attachment_summary(&self) -> String {
         match self.image_attachment_paths.len() {
             0 => "No images attached".to_string(),
@@ -262,6 +359,7 @@ impl DesktopState {
             self.snapshot.selected_session_index = index;
         }
         self.overlay = DesktopOverlay::None;
+        self.artifact_selected_index = 0;
     }
 
     pub fn apply_run_event(&mut self, event: &crate::session::RunEvent) {
@@ -318,6 +416,21 @@ impl DesktopState {
         self.app_state.status_message = Some(message.into());
     }
 
+    pub fn start_new_chat(&mut self) {
+        if self.is_busy() {
+            self.set_status_message("new chat cannot start while a run is active");
+            return;
+        }
+        self.app_state = AppState::default();
+        self.draft_prompt.clear();
+        self.image_attachment_input.clear();
+        self.image_attachment_paths.clear();
+        self.review_draft_text.clear();
+        self.artifact_selected_index = 0;
+        self.overlay = DesktopOverlay::None;
+        self.set_status_message("new chat ready");
+    }
+
     pub fn reset_effective_config(&mut self, config: ResolvedConfig) {
         self.effective_config = config.clone();
         self.config_editor = ConfigEditorState::from_config(&config);
@@ -364,6 +477,22 @@ impl DesktopState {
     pub fn show_workspace_picker(&mut self, current_path: &str) {
         self.workspace_input = current_path.to_string();
         self.overlay = DesktopOverlay::WorkspacePicker;
+    }
+
+    pub fn show_file_menu(&mut self) {
+        self.overlay = DesktopOverlay::FileMenu;
+    }
+
+    pub fn show_edit_menu(&mut self) {
+        self.overlay = DesktopOverlay::EditMenu;
+    }
+
+    pub fn show_view_menu(&mut self) {
+        self.overlay = DesktopOverlay::ViewMenu;
+    }
+
+    pub fn show_help_menu(&mut self) {
+        self.overlay = DesktopOverlay::HelpMenu;
     }
 
     pub fn hide_overlay(&mut self) {
@@ -464,6 +593,74 @@ impl DesktopState {
             value.clamp(MIN_WINDOW_OPACITY_PERCENT, MAX_WINDOW_OPACITY_PERCENT);
     }
 
+    pub fn set_local_search_text(&mut self, text: String) {
+        self.local_search_text = text;
+    }
+
+    pub fn local_search_results_text(&self) -> String {
+        let needle = self.local_search_text.trim().to_lowercase();
+        if needle.is_empty() {
+            return "Type to search projects, chats, transcript, artifacts, and commands."
+                .to_string();
+        }
+        let mut lines = Vec::new();
+        for row in &self.snapshot.project_rows {
+            if row.label.to_lowercase().contains(&needle)
+                || row.path.to_lowercase().contains(&needle)
+            {
+                lines.push(format!("project: {}", row.label));
+            }
+        }
+        for row in &self.snapshot.session_rows {
+            if row.label.to_lowercase().contains(&needle) {
+                lines.push(format!("session: {}", row.label));
+            }
+        }
+        let detail = self.selected_detail();
+        for line in detail.transcript_text.lines() {
+            if line.to_lowercase().contains(&needle) {
+                lines.push(format!("transcript: {}", truncate_for_search(line, 92)));
+            }
+        }
+        for artifact in &detail.artifacts {
+            if artifact.path.to_lowercase().contains(&needle)
+                || artifact.label.to_lowercase().contains(&needle)
+            {
+                lines.push(format!("artifact: {} [{}]", artifact.path, artifact.action));
+            }
+        }
+        for command in &self.snapshot.command_rows {
+            if command.name.to_lowercase().contains(&needle)
+                || command.path.to_lowercase().contains(&needle)
+            {
+                lines.push(format!("command: {} ({})", command.label, command.path));
+            }
+        }
+        if lines.is_empty() {
+            "No local matches.".to_string()
+        } else {
+            lines.into_iter().take(24).collect::<Vec<_>>().join("\n")
+        }
+    }
+
+    pub fn show_command_palette(&mut self) {
+        self.overlay = DesktopOverlay::CommandPalette;
+    }
+
+    pub fn show_keyboard_shortcuts(&mut self) {
+        self.overlay = DesktopOverlay::KeyboardShortcuts;
+    }
+
+    pub fn insert_command_from_palette(&mut self, index: usize) {
+        let Some(command) = self.snapshot.command_rows.get(index) else {
+            self.set_status_message("command palette selection is no longer available");
+            return;
+        };
+        self.draft_prompt = format!("/{} ", command.name);
+        self.overlay = DesktopOverlay::None;
+        self.set_status_message(format!("inserted command /{}", command.name));
+    }
+
     pub fn is_busy(&self) -> bool {
         matches!(
             self.app_state.run_status,
@@ -477,6 +674,14 @@ impl DesktopState {
 
     pub fn can_open_session(&self) -> bool {
         !self.is_busy() && self.selected_session_id().is_some()
+    }
+
+    pub fn can_delete_session(&self) -> bool {
+        !self.is_busy() && self.selected_session_id().is_some()
+    }
+
+    pub fn can_delete_project(&self) -> bool {
+        !self.is_busy() && self.selected_project_id().is_some()
     }
 
     pub fn can_export_history(&self) -> bool {
@@ -498,6 +703,25 @@ impl DesktopState {
         ));
         self
     }
+
+    fn clamp_artifact_selection(&mut self) {
+        let count = self.selected_detail().artifacts.len();
+        if count == 0 {
+            self.artifact_selected_index = 0;
+        } else if self.artifact_selected_index >= count {
+            self.artifact_selected_index = count - 1;
+        }
+    }
+}
+
+fn truncate_for_search(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let shortened = value.chars().take(keep).collect::<String>();
+    format!("{shortened}…")
 }
 
 fn initial_provider_models(config: &ResolvedConfig) -> Vec<String> {
@@ -571,4 +795,66 @@ pub fn provider_model_summary(info: &ProviderModelInfo) -> String {
         parts.push(format!("parallel={parallel}"));
     }
     parts.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::desktop::models::{DesktopProjectRow, DesktopSessionRow};
+    use crate::session::ProjectId;
+
+    fn snapshot(
+        session_rows: Vec<DesktopSessionRow>,
+        selected_session_index: usize,
+    ) -> DesktopSnapshot {
+        let project_id = ProjectId::new();
+        DesktopSnapshot {
+            workspace_path: "C:/workspace".to_string(),
+            provider_label: "provider".to_string(),
+            model_label: "model".to_string(),
+            command_rows: Vec::new(),
+            project_rows: vec![DesktopProjectRow {
+                project_id,
+                label: "workspace".to_string(),
+                path: "C:/workspace".to_string(),
+            }],
+            selected_project_index: 0,
+            session_rows,
+            session_details: Vec::new(),
+            selected_session_index,
+        }
+    }
+
+    #[test]
+    fn replace_snapshot_falls_back_from_deleted_selection_to_open_session() {
+        let deleted = SessionId::new();
+        let open = SessionId::new();
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![
+                    DesktopSessionRow {
+                        session_id: deleted,
+                        label: "deleted".to_string(),
+                    },
+                    DesktopSessionRow {
+                        session_id: open,
+                        label: "open".to_string(),
+                    },
+                ],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.app_state.current_session_id = Some(open);
+
+        state.replace_snapshot(snapshot(
+            vec![DesktopSessionRow {
+                session_id: open,
+                label: "open".to_string(),
+            }],
+            0,
+        ));
+
+        assert_eq!(state.selected_session_id(), Some(open));
+    }
 }

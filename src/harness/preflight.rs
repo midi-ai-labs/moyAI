@@ -234,10 +234,11 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::agent::state::partial_requested_work_remains_authoring_phase_fixture_passes(
             )
             || !crate::agent::state::passed_verification_consumes_pending_required_commands_fixture_passes()
+            || !crate::agent::state::resumed_new_user_turn_ignores_prior_closeout_fixture_passes()
             || !crate::agent::state::partial_verification_pass_preserves_remaining_required_commands_fixture_passes())
     {
         diagnostics.push(
-            "requested-work item-stream evidence did not preserve partial authoring phase, promote completed authoring to exact verification shell authority before closeout, or consume passed verification commands before clean closeout".to_string(),
+            "requested-work item-stream evidence did not preserve partial authoring phase, promote completed authoring to exact verification shell authority before closeout, keep resumed new user turns out of prior closeout authority, or consume passed verification commands before clean closeout".to_string(),
         );
     }
 

@@ -52,7 +52,9 @@ pub enum TranscriptKind {
     User,
     Assistant,
     Reasoning,
+    Editing,
     Tool,
+    CommandSummary,
     Diff,
     System,
     Error,
@@ -341,9 +343,9 @@ impl AppState {
                     error: None,
                 });
                 self.transcript_entries.push(TranscriptEntry {
-                    kind: TranscriptKind::Tool,
-                    title: format!("Tool {}", tool),
-                    body: title.clone(),
+                    kind: transcript_kind_for_tool_pending(*tool),
+                    title: pending_tool_transcript_title(*tool).to_string(),
+                    body: format!("{}: {}", tool, title),
                     message_id: None,
                     tool_call_id: Some(*tool_call_id),
                 });
@@ -369,8 +371,8 @@ impl AppState {
                 );
                 self.transcript_entries.push(TranscriptEntry {
                     kind: TranscriptKind::Tool,
-                    title: format!("Tool {}", tool),
-                    body: format!("{title}: {summary}"),
+                    title: "実行済コマンド".to_string(),
+                    body: format!("{}: {title}\n{summary}", tool),
                     message_id: None,
                     tool_call_id: Some(*tool_call_id),
                 });
@@ -404,7 +406,7 @@ impl AppState {
             RunEvent::FileChangesRecorded { changes, .. } => {
                 self.transcript_entries.push(TranscriptEntry {
                     kind: TranscriptKind::Diff,
-                    title: "File changes".to_string(),
+                    title: format!("{}個のファイルが変更されました", changes.len()),
                     body: summarize_changes(changes),
                     message_id: None,
                     tool_call_id: None,
@@ -688,6 +690,35 @@ fn update_tool_status(
     });
 }
 
+fn transcript_kind_for_tool_pending(tool: ToolName) -> TranscriptKind {
+    if matches!(tool, ToolName::Write | ToolName::ApplyPatch) {
+        TranscriptKind::Editing
+    } else {
+        TranscriptKind::Tool
+    }
+}
+
+fn pending_tool_transcript_title(tool: ToolName) -> &'static str {
+    if matches!(tool, ToolName::Write | ToolName::ApplyPatch) {
+        "編集中"
+    } else {
+        "コマンド実行中"
+    }
+}
+
+fn tool_status_transcript_title(tool: ToolName, status: ToolLifecycleStatus) -> &'static str {
+    match status {
+        ToolLifecycleStatus::Pending | ToolLifecycleStatus::Running => {
+            pending_tool_transcript_title(tool)
+        }
+        ToolLifecycleStatus::Completed => "実行済コマンド",
+        ToolLifecycleStatus::Failed
+        | ToolLifecycleStatus::Blocked
+        | ToolLifecycleStatus::Rejected
+        | ToolLifecycleStatus::Deferred => "コマンド失敗",
+    }
+}
+
 fn progress_from_loaded_state(
     status: RunStatus,
     tools: &[ToolStatusView],
@@ -819,8 +850,8 @@ pub fn transcript_entries_from_transcript(transcript: &Transcript) -> Vec<Transc
                     tool_call_id: None,
                 }),
                 MessagePart::ToolCall(value) => entries.push(TranscriptEntry {
-                    kind: TranscriptKind::Tool,
-                    title: format!("Tool {}", value.tool_name),
+                    kind: transcript_kind_for_tool_pending(value.tool_name),
+                    title: pending_tool_transcript_title(value.tool_name).to_string(),
                     body: format!("arguments: {}", value.arguments_json),
                     message_id: Some(message.record.id),
                     tool_call_id: Some(value.tool_call_id),
@@ -831,8 +862,16 @@ pub fn transcript_entries_from_transcript(transcript: &Transcript) -> Vec<Transc
                     } else {
                         TranscriptKind::Tool
                     },
-                    title: value.title.clone(),
-                    body: value.summary.clone(),
+                    title: if value.status == ToolCallStatus::Failed {
+                        value.title.clone()
+                    } else {
+                        "実行済コマンド".to_string()
+                    },
+                    body: if value.status == ToolCallStatus::Failed {
+                        value.summary.clone()
+                    } else {
+                        format!("{}\n{}", value.title, value.summary)
+                    },
                     message_id: Some(message.record.id),
                     tool_call_id: Some(value.tool_call_id),
                 }),
@@ -845,7 +884,7 @@ pub fn transcript_entries_from_transcript(transcript: &Transcript) -> Vec<Transc
                 }),
                 MessagePart::DiffSummary(value) => entries.push(TranscriptEntry {
                     kind: TranscriptKind::Diff,
-                    title: "Diff summary".to_string(),
+                    title: "ファイルが変更されました".to_string(),
                     body: value.summary.clone(),
                     message_id: Some(message.record.id),
                     tool_call_id: None,
@@ -922,17 +961,23 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
             } => Some(TranscriptEntry {
                 kind: if *status == ToolLifecycleStatus::Failed {
                     TranscriptKind::Error
+                } else if *status == ToolLifecycleStatus::Pending
+                    || *status == ToolLifecycleStatus::Running
+                {
+                    transcript_kind_for_tool_pending(*tool)
                 } else {
                     TranscriptKind::Tool
                 },
-                title: format!("Tool {}", tool),
+                title: tool_status_transcript_title(*tool, *status).to_string(),
                 body: format!("{title} [{status:?}]"),
                 message_id: None,
                 tool_call_id: Some(*call_id),
             }),
-            TurnItemPayload::FileChange { summary, .. } => Some(TranscriptEntry {
+            TurnItemPayload::FileChange {
+                changes, summary, ..
+            } => Some(TranscriptEntry {
                 kind: TranscriptKind::Diff,
-                title: "File changes".to_string(),
+                title: format!("{}個のファイルが変更されました", changes.len()),
                 body: summary.clone(),
                 message_id: None,
                 tool_call_id: None,

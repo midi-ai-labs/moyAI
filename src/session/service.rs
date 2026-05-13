@@ -2,9 +2,10 @@ use crate::error::SessionError;
 use crate::protocol::{HistoryItem, ProtocolEventStore, TurnItem, UserTurn};
 use crate::session::{
     EditorContext, ImagePart, MessageMetadata, MessagePart, MessageRole, NewMessage, NewPart,
-    NewSession, PartKind, ProjectId, PromptDispatchPart, SessionContext, SessionId, SessionRecord,
-    SessionRepository, SessionSelector, SessionStartRequest, SessionStateSnapshot, SessionStatus,
-    Transcript, UserMessageMeta, transcript_from_history_items,
+    NewSession, PartKind, ProjectId, ProjectRecord, ProjectRepository, PromptDispatchPart,
+    SessionContext, SessionId, SessionRecord, SessionRepository, SessionSelector,
+    SessionStartRequest, SessionStateSnapshot, SessionStatus, Transcript, UserMessageMeta,
+    transcript_from_history_items,
 };
 use crate::storage::StoreBundle;
 use crate::workspace::Workspace;
@@ -243,6 +244,29 @@ impl SessionService {
             .session_repo()
             .list_sessions(project_id, limit)
             .await?)
+    }
+
+    pub async fn list_recent_sessions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SessionRecord>, SessionError> {
+        Ok(self
+            .store
+            .session_repo()
+            .list_recent_sessions(limit)
+            .await?)
+    }
+
+    pub async fn delete_session(&self, session_id: SessionId) -> Result<(), SessionError> {
+        Ok(self.store.session_repo().delete_session(session_id).await?)
+    }
+
+    pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), SessionError> {
+        Ok(self.store.project_repo().delete_project(project_id).await?)
+    }
+
+    pub async fn list_projects(&self, limit: usize) -> Result<Vec<ProjectRecord>, SessionError> {
+        Ok(self.store.project_repo().list_projects(limit).await?)
     }
 
     pub async fn transcript(&self, session_id: SessionId) -> Result<Transcript, SessionError> {

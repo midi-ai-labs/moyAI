@@ -230,6 +230,7 @@ pub fn reduce_session_state_from_history_items(
     previous: &SessionStateSnapshot,
 ) -> SessionStateSnapshot {
     let mut state = previous.clone();
+    state = reset_prior_closeout_for_new_user_turn(history_items, state);
     state = apply_typed_item_stream_authority(session, history_items, todos, state);
     state = promote_docs_route_contract_authority(session, history_items, state);
     state = promote_requested_work_authoring_authority(session, history_items, state);
@@ -299,6 +300,32 @@ pub fn reduce_session_state_from_history_items(
         "verification failed: {}",
         typed_evidence.failure.summary
     ));
+    state
+}
+
+fn reset_prior_closeout_for_new_user_turn(
+    history_items: &[HistoryItem],
+    mut state: SessionStateSnapshot,
+) -> SessionStateSnapshot {
+    if !state.completion.closeout_ready {
+        return state;
+    }
+    let Some(latest_user_index) = latest_user_turn_index(history_items) else {
+        return state;
+    };
+    if latest_user_index == 0 {
+        return state;
+    }
+    state.process_phase = ProcessPhase::Discover;
+    state.active_targets.clear();
+    state.failure = None;
+    state.verification.failing_labels.clear();
+    state.verification.failure_cluster = None;
+    state.verification.last_evidence_summary = None;
+    state.completion.closeout_ready = false;
+    state.completion.open_work_count = 0;
+    state.completion.verification_pending = false;
+    state.completion.blocked_reason = None;
     state
 }
 
@@ -488,20 +515,22 @@ fn requested_work_verification_passed(
     if explicit_required_commands.is_empty() {
         return false;
     }
-    history_items.iter().any(|item| {
-        let HistoryItemPayload::ToolOutput {
-            verification_run: Some(run),
-            ..
-        } = &item.payload
-        else {
-            return false;
-        };
-        matches!(run.status, VerificationRunStatus::Passed)
-            && explicit_required_commands.iter().any(|required| {
-                verification_command_identity_key(required)
-                    == verification_command_identity_key(&run.command)
-            })
-    })
+    history_items_since_latest_user_turn(history_items)
+        .iter()
+        .any(|item| {
+            let HistoryItemPayload::ToolOutput {
+                verification_run: Some(run),
+                ..
+            } = &item.payload
+            else {
+                return false;
+            };
+            matches!(run.status, VerificationRunStatus::Passed)
+                && explicit_required_commands.iter().any(|required| {
+                    verification_command_identity_key(required)
+                        == verification_command_identity_key(&run.command)
+                })
+        })
 }
 
 fn apply_typed_item_stream_authority(
@@ -515,7 +544,7 @@ fn apply_typed_item_stream_authority(
     let mut verification_passed = false;
     let mut passed_verification_command_keys = BTreeSet::new();
 
-    for item in history_items {
+    for item in history_items_since_latest_user_turn(history_items) {
         match &item.payload {
             HistoryItemPayload::FileChange { changes, .. } => {
                 for change in changes {
@@ -601,6 +630,24 @@ fn apply_typed_item_stream_authority(
     }
 
     state
+}
+
+fn history_items_since_latest_user_turn(history_items: &[HistoryItem]) -> &[HistoryItem] {
+    let start = latest_user_turn_index(history_items).unwrap_or(0);
+    &history_items[start..]
+}
+
+fn latest_user_turn_index(history_items: &[HistoryItem]) -> Option<usize> {
+    history_items.iter().rposition(|item| {
+        matches!(
+            item.payload,
+            HistoryItemPayload::UserTurn { .. }
+                | HistoryItemPayload::Message {
+                    role: MessageRole::User,
+                    ..
+                }
+        )
+    })
 }
 
 pub fn project_model_turn_state(
@@ -3190,6 +3237,122 @@ pub(crate) fn passed_verification_consumes_pending_required_commands_fixture_pas
             .warnings
             .iter()
             .all(|warning| warning.code != "closeout_ready_with_verification_pending")
+}
+
+pub(crate) fn resumed_new_user_turn_ignores_prior_closeout_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let first_turn_id = TurnId::new();
+    let second_turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: ProjectId::new(),
+        title: "resume new user turn".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let mut previous = SessionStateSnapshot::default();
+    previous.process_phase = ProcessPhase::Closeout;
+    previous.completion.closeout_ready = true;
+
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: first_turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create `calculator.py`, then run `python -m unittest`.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: first_turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                    kind: crate::session::ChangeKind::Add,
+                    path_before: None,
+                    path_after: Some(Utf8PathBuf::from("calculator.py")),
+                    summary: "Added calculator.py".to_string(),
+                }],
+                summary: "Added calculator.py".to_string(),
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: first_turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: ToolCallId::new(),
+                status: ToolLifecycleStatus::Completed,
+                title: "Run shell command: python -m unittest".to_string(),
+                output_text: "OK".to_string(),
+                metadata: Value::Null,
+                success: Some(true),
+                progress_effect: ToolProgressEffect::VerificationPassed,
+                blocked_action: None,
+                required_next_action: None,
+                result_hash: Some("prior-pass".to_string()),
+                verification_run: Some(VerificationRunResult {
+                    command: "python -m unittest".to_string(),
+                    status: VerificationRunStatus::Passed,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    output_summary: "OK".to_string(),
+                    failure_cluster: None,
+                    artifact_refs: Vec::new(),
+                    requirement_refs: Vec::new(),
+                }),
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: second_turn_id,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create `README.md` for the calculator app.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+    ];
+
+    let state = reduce_session_state_from_history_items(&session, &items, &[], &previous);
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+    matches!(state.process_phase, ProcessPhase::Author)
+        && !state.completion.closeout_ready
+        && state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "README.md")
+        && matches!(
+            active,
+            Some(ActiveWorkContract::RequestedWorkAuthoring { .. })
+        )
 }
 
 pub(crate) fn partial_verification_pass_preserves_remaining_required_commands_fixture_passes()

@@ -20,6 +20,8 @@ pub trait SessionRepository: Send + Sync {
         project_id: ProjectId,
         limit: usize,
     ) -> Result<Vec<SessionRecord>, StorageError>;
+    async fn list_recent_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>, StorageError>;
+    async fn delete_session(&self, id: SessionId) -> Result<(), StorageError>;
     async fn set_status(&self, id: SessionId, status: SessionStatus) -> Result<(), StorageError>;
     async fn append_message(
         &self,
@@ -56,6 +58,8 @@ pub trait ProjectRepository: Send + Sync {
         vcs_kind: &str,
     ) -> Result<ProjectRecord, StorageError>;
     async fn get_project(&self, id: ProjectId) -> Result<ProjectRecord, StorageError>;
+    async fn list_projects(&self, limit: usize) -> Result<Vec<ProjectRecord>, StorageError>;
+    async fn delete_project(&self, id: ProjectId) -> Result<(), StorageError>;
 }
 
 #[async_trait(?Send)]

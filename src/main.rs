@@ -128,14 +128,10 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
         return Ok(());
     }
     if let CliCommand::Desktop(args) = command.clone() {
-        let directory = args
-            .directory
-            .clone()
-            .or_else(desktop::default_workspace_directory);
         desktop::run(
             app,
             desktop::DesktopArgs {
-                directory,
+                directory: args.directory.clone(),
                 session_id: args.session_id,
                 continue_last: args.continue_last,
             },
