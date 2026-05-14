@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "moyAI",
+  "version": "0.1.0",
+  "identifier": "local.moyai.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev:desktop-web",
+    "beforeBuildCommand": "npm run build:desktop-web",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "ui/desktop-web/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "moyAI",
+        "width": 1560,
+        "height": 960,
+        "minWidth": 1100,
+        "minHeight": 720,
+        "resizable": true,
+        "decorations": false,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": [
+      "logo/fabicon/android-chrome-512x512.png",
+      "logo/fabicon/moyai_app_icon.ico"
+    ]
+  }
+}

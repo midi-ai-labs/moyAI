@@ -70,8 +70,14 @@ async fn build_snapshot(
     let mut session_rows = Vec::with_capacity(sessions.len());
     let mut session_details = Vec::with_capacity(sessions.len());
     let projects = app.session_service.list_projects(30).await?;
-    let (project_rows, selected_project_index) =
-        build_project_rows(&projects, app.workspace.project_id, &app.workspace.root);
+    let hidden_roots =
+        internal_desktop_project_roots(app.session_service.store.paths().data_dir.as_path());
+    let (project_rows, selected_project_index) = build_project_rows(
+        &projects,
+        app.workspace.project_id,
+        &app.workspace.root,
+        &hidden_roots,
+    );
     for session in &sessions {
         let view = session_view(&app.session_service, session.id).await?;
         session_rows.push(DesktopSessionRow {
@@ -108,15 +114,28 @@ fn build_project_rows(
     projects: &[ProjectRecord],
     current_project_id: ProjectId,
     current_path: &camino::Utf8Path,
+    hidden_roots: &[camino::Utf8PathBuf],
 ) -> (Vec<DesktopProjectRow>, usize) {
     let mut rows = projects
         .iter()
+        .filter(|project| {
+            !hidden_roots
+                .iter()
+                .any(|root| root.as_path() == project.root_path.as_path())
+        })
         .map(|project| DesktopProjectRow {
             project_id: project.id,
             label: format_project_row(project),
             path: project.root_path.to_string(),
         })
         .collect::<Vec<_>>();
+    if hidden_roots
+        .iter()
+        .any(|root| root.as_path() == current_path)
+    {
+        let selected = rows.len();
+        return (rows, selected);
+    }
     if !rows
         .iter()
         .any(|project| project.project_id == current_project_id)
@@ -136,8 +155,20 @@ fn build_project_rows(
     let selected = rows
         .iter()
         .position(|project| project.project_id == current_project_id)
-        .unwrap_or(0);
+        .unwrap_or(rows.len());
     (rows, selected)
+}
+
+fn internal_desktop_project_roots(data_dir: &camino::Utf8Path) -> Vec<camino::Utf8PathBuf> {
+    [
+        "quick-chat-workspace",
+        "desktop-workspace",
+        "desktop-workspace-after-delete",
+        "desktop-workspace-after-delete-2",
+    ]
+    .into_iter()
+    .map(|name| data_dir.join(name))
+    .collect()
 }
 
 fn format_project_row(project: &ProjectRecord) -> String {
@@ -150,12 +181,7 @@ fn format_project_row(project: &ProjectRecord) -> String {
     } else {
         project.display_name.clone()
     };
-    let path = project.root_path.to_string();
-    format!(
-        "{} · {}",
-        truncate_text(&name, 26),
-        truncate_text(&path, 42)
-    )
+    truncate_text(&name, 34)
 }
 
 pub fn select_session_index(
@@ -235,8 +261,8 @@ pub fn build_session_detail_from_app_state(state: &AppState) -> DesktopSessionDe
         confirmation_visible: state.permission.is_some(),
         artifacts: Vec::new(),
         file_changes: Vec::new(),
-        file_change_summary_text: "No file changes recorded.".to_string(),
-        artifact_preview_text: "No artifact selected.".to_string(),
+        file_change_summary_text: "ファイル変更はまだありません。".to_string(),
+        artifact_preview_text: "アーティファクトは選択されていません。".to_string(),
     }
 }
 
@@ -250,6 +276,7 @@ pub fn file_change_rows_from_turn_items(turn_items: &[TurnItem]) -> Vec<DesktopF
             rows.extend(
                 changes
                     .iter()
+                    .filter(|change| file_change_is_user_visible(change))
                     .map(|change| file_change_row(change, summary.as_str())),
             );
         }
@@ -266,6 +293,7 @@ fn file_change_rows_from_transcript(transcript: &Transcript) -> Vec<DesktopFileC
                     summary
                         .changes
                         .iter()
+                        .filter(|change| file_change_is_user_visible(change))
                         .map(|change| file_change_row(change, summary.summary.as_str())),
                 );
             }
@@ -280,7 +308,7 @@ fn file_change_row(change: &FileChangeEvidence, fallback_summary: &str) -> Deskt
         .as_ref()
         .or(change.path_before.as_ref())
         .map(|value| value.to_string())
-        .unwrap_or_else(|| "(unknown path)".to_string());
+        .unwrap_or_else(|| "(不明なパス)".to_string());
     let label = path
         .rsplit(['/', '\\'])
         .next()
@@ -300,16 +328,28 @@ fn file_change_row(change: &FileChangeEvidence, fallback_summary: &str) -> Deskt
     }
 }
 
+fn file_change_is_user_visible(change: &FileChangeEvidence) -> bool {
+    change
+        .path_after
+        .as_ref()
+        .or(change.path_before.as_ref())
+        .is_some_and(|path| is_user_visible_artifact_path(path.as_str()))
+}
+
 fn artifact_rows_from_file_changes(rows: &[DesktopFileChangeRow]) -> Vec<DesktopArtifactRow> {
-    rows.iter()
+    let mut artifacts = rows
+        .iter()
         .filter(|row| is_user_visible_artifact_path(&row.path))
         .map(|row| DesktopArtifactRow {
             label: row.label.clone(),
             path: row.path.clone(),
-            kind: "file".to_string(),
+            kind: "ファイル".to_string(),
             action: row.action.clone(),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+    artifacts.dedup_by(|left, right| left.path == right.path);
+    artifacts
 }
 
 fn is_user_visible_artifact_path(path: &str) -> bool {
@@ -338,16 +378,15 @@ fn dedupe_file_change_rows(rows: Vec<DesktopFileChangeRow>) -> Vec<DesktopFileCh
 
 fn format_file_change_summary(rows: &[DesktopFileChangeRow]) -> String {
     if rows.is_empty() {
-        return "No file changes recorded.".to_string();
+        return "ファイル変更はまだありません。".to_string();
     }
-    let added = rows.iter().filter(|row| row.action == "add").count();
-    let updated = rows.iter().filter(|row| row.action == "update").count();
-    let deleted = rows.iter().filter(|row| row.action == "delete").count();
-    let moved = rows.iter().filter(|row| row.action == "move").count();
+    let added = rows.iter().filter(|row| row.action == "追加").count();
+    let updated = rows.iter().filter(|row| row.action == "更新").count();
+    let deleted = rows.iter().filter(|row| row.action == "削除").count();
+    let moved = rows.iter().filter(|row| row.action == "移動").count();
     let mut lines = vec![format!(
-        "{} file{} changed (+{} ~{} -{} mv{})",
+        "{}件のファイル変更（追加{} / 更新{} / 削除{} / 移動{}）",
         rows.len(),
-        if rows.len() == 1 { "" } else { "s" },
         added,
         updated,
         deleted,
@@ -368,13 +407,13 @@ pub fn format_artifact_preview(
     changes: &[DesktopFileChangeRow],
 ) -> String {
     let Some(artifact) = artifact else {
-        return "No artifact selected.".to_string();
+        return "アーティファクトは選択されていません。".to_string();
     };
     let mut lines = vec![
-        format!("Artifact: {}", artifact.label),
-        format!("Path: {}", artifact.path),
-        format!("Kind: {}", artifact.kind),
-        format!("Action: {}", artifact.action),
+        format!("アーティファクト: {}", artifact.label),
+        format!("パス: {}", artifact.path),
+        format!("種別: {}", artifact.kind),
+        format!("操作: {}", artifact.action),
     ];
     if let Some(change) = changes.iter().find(|change| change.path == artifact.path) {
         if !change.summary.trim().is_empty() {
@@ -384,7 +423,7 @@ pub fn format_artifact_preview(
     }
     lines.push(String::new());
     lines.push(
-        "Open Diff uses the session history/diff view; Undo is intentionally not exposed."
+        "差分はセッション履歴のファイル変更から確認できます。Undo は安全契約を増やすため、この画面には露出していません。"
             .to_string(),
     );
     lines.join("\n")
@@ -392,10 +431,10 @@ pub fn format_artifact_preview(
 
 fn change_kind_label(kind: ChangeKind) -> &'static str {
     match kind {
-        ChangeKind::Add => "add",
-        ChangeKind::Update => "update",
-        ChangeKind::Delete => "delete",
-        ChangeKind::Move => "move",
+        ChangeKind::Add => "追加",
+        ChangeKind::Update => "更新",
+        ChangeKind::Delete => "削除",
+        ChangeKind::Move => "移動",
     }
 }
 
@@ -434,17 +473,17 @@ fn format_session_row(session: &SessionRecord) -> String {
 
 fn format_session_status(status: SessionStatus) -> &'static str {
     match status {
-        SessionStatus::Idle => "Idle",
-        SessionStatus::Running => "Running",
-        SessionStatus::Completed => "Done",
-        SessionStatus::AwaitingUser => "Waiting",
-        SessionStatus::Failed => "Failed",
+        SessionStatus::Idle => "待機中",
+        SessionStatus::Running => "実行中",
+        SessionStatus::Completed => "完了",
+        SessionStatus::AwaitingUser => "確認待ち",
+        SessionStatus::Failed => "失敗",
     }
 }
 
 fn format_transcript_text(state: &AppState) -> String {
     if state.transcript_entries.is_empty() {
-        return "No transcript recorded yet.".to_string();
+        return "履歴はまだありません。".to_string();
     }
     state
         .transcript_entries
@@ -469,8 +508,8 @@ fn transcript_rows(state: &AppState) -> Vec<DesktopTranscriptRow> {
         vec![DesktopTranscriptRow {
             kind: "system".to_string(),
             step: "00".to_string(),
-            title: "No transcript".to_string(),
-            body: "No transcript recorded yet.".to_string(),
+            title: "履歴はまだありません".to_string(),
+            body: "依頼を送信すると、ユーザー入力、ツール実行、ファイル変更、最終応答がここに並びます。".to_string(),
         }]
     } else {
         state
@@ -496,7 +535,7 @@ fn transcript_rows(state: &AppState) -> Vec<DesktopTranscriptRow> {
                 "実行中".to_string()
             },
             body: format!(
-                "{}\nphase: {}\ncommands: {} completed / {} started",
+                "{}\nフェーズ: {}\nコマンド: {}件完了 / {}件開始",
                 state.progress.active_step,
                 state.progress.current_phase,
                 state.progress.tool_calls_completed,
@@ -575,7 +614,7 @@ fn task_summary_title(todos: &[TodoItem]) -> String {
         .count();
     if blocked > 0 {
         format!(
-            "タスク進捗 {completed}/{} 完了, {blocked} blocked",
+            "タスク進捗 {completed}/{} 完了, {blocked}件ブロック",
             todos.len()
         )
     } else {
@@ -594,8 +633,10 @@ fn format_todo_rows(todos: &[TodoItem]) -> String {
                 _ => "○",
             };
             format!(
-                "{marker} {}  ({:?} / {:?})",
-                todo.content, todo.status, todo.kind
+                "{marker} {}  (状態: {} / 種別: {:?})",
+                todo.content,
+                todo_status_label(&format!("{:?}", todo.status)),
+                todo.kind
             )
         })
         .collect::<Vec<_>>()
@@ -642,9 +683,9 @@ fn format_tool_status_text(
 ) -> String {
     let mut lines = Vec::new();
     if state.tool_statuses.is_empty() {
-        lines.push("Tools: no tool activity recorded.".to_string());
+        lines.push("ツール: 実行履歴はまだありません。".to_string());
     } else {
-        lines.push("Tools:".to_string());
+        lines.push("ツール:".to_string());
         lines.extend(state.tool_statuses.iter().map(|tool| {
             let summary = tool.summary.clone().unwrap_or_default();
             if summary.is_empty() {
@@ -665,23 +706,23 @@ fn format_tool_status_text(
     }
     if !todos.is_empty() {
         lines.push(String::new());
-        lines.push("Todos:".to_string());
+        lines.push("タスク:".to_string());
         lines.extend(todos.iter().map(|todo| {
             format!(
                 "- [{}] {}",
-                format!("{:?}", todo.status).to_lowercase(),
+                todo_status_label(&format!("{:?}", todo.status)),
                 todo.content
             )
         }));
     }
     if let Some(summary) = &session_state.completion.route_contract_summary {
         lines.push(String::new());
-        lines.push(format!("Contract: {summary}"));
+        lines.push(format!("契約: {summary}"));
     }
     if let Some(handoff) = &session_state.implementation_handoff {
         if !handoff.next_actions.is_empty() {
             lines.push(String::new());
-            lines.push("Next:".to_string());
+            lines.push("次の操作:".to_string());
             lines.extend(
                 handoff
                     .next_actions
@@ -693,7 +734,7 @@ fn format_tool_status_text(
     }
     if let Some(failure) = &session_state.failure {
         lines.push(String::new());
-        lines.push(format!("Failure: {}", failure.summary));
+        lines.push(format!("失敗: {}", failure.summary));
     }
     lines.join("\n")
 }
@@ -702,41 +743,41 @@ fn append_replay_summary(tool_status_text: &mut String, report: &ReplayReport) {
     if !tool_status_text.is_empty() {
         tool_status_text.push_str("\n\n");
     }
-    tool_status_text.push_str("Replay:\n");
+    tool_status_text.push_str("リプレイ:\n");
     tool_status_text.push_str(&format!(
         "- status: {}",
         format!("{:?}", report.status).to_lowercase()
     ));
     if let Some(owner) = report.primary_owner {
         tool_status_text.push_str(&format!(
-            "\n- primary owner: {}",
+            "\n- 主担当: {}",
             format!("{:?}", owner).to_lowercase()
         ));
     }
     if !report.summary.trim().is_empty() {
-        tool_status_text.push_str(&format!("\n- summary: {}", report.summary.trim()));
+        tool_status_text.push_str(&format!("\n- サマリ: {}", report.summary.trim()));
     }
     if let Some(restart) = &report.restart_point {
-        tool_status_text.push_str(&format!("\n- restart: {restart}"));
+        tool_status_text.push_str(&format!("\n- 再開点: {restart}"));
     }
 }
 
 fn format_run_status_text(state: &AppState, session_state: &SessionStateSnapshot) -> String {
     let mut lines = vec![run_status_label(state.run_status).to_string()];
-    lines.push(format!("Route: {:?}", session_state.route).to_lowercase());
-    lines.push(format!("Phase: {:?}", session_state.process_phase).to_lowercase());
+    lines.push(format!("ルート: {:?}", session_state.route).to_lowercase());
+    lines.push(format!("フェーズ: {:?}", session_state.process_phase).to_lowercase());
     if let Some(message) = &state.status_message {
-        lines.push(format!("Status: {message}"));
+        lines.push(format!("状態: {message}"));
     }
     lines.push(format!(
-        "Open work: {}",
+        "未完了作業: {}",
         session_state.completion.open_work_count
     ));
     if session_state.completion.verification_pending {
-        lines.push("Verification: pending".to_string());
+        lines.push("検証: 未実行".to_string());
     }
     if let Some(blocked) = &session_state.completion.blocked_reason {
-        lines.push(format!("Blocked: {blocked}"));
+        lines.push(format!("ブロック: {blocked}"));
     }
     lines.join("\n")
 }
@@ -745,16 +786,16 @@ fn format_progress_text(state: &AppState) -> String {
     let progress = &state.progress;
     vec![
         progress.status.clone(),
-        format!("Phase: {}", progress.current_phase),
-        format!("Step: {}", progress.active_step),
-        format!("Model requests: {}", progress.model_requests),
+        format!("フェーズ: {}", progress.current_phase),
+        format!("手順: {}", progress.active_step),
+        format!("モデル要求: {}", progress.model_requests),
         format!(
-            "Tools: {} started / {} completed / {} failed",
+            "ツール: {}件開始 / {}件完了 / {}件失敗",
             progress.tool_calls_started, progress.tool_calls_completed, progress.tool_calls_failed
         ),
-        format!("Rejected proposals: {}", progress.rejected_tool_proposals),
-        format!("Compactions: {}", progress.compactions),
-        format!("Retries: {}", progress.retries),
+        format!("拒否した提案: {}", progress.rejected_tool_proposals),
+        format!("圧縮: {}", progress.compactions),
+        format!("再試行: {}", progress.retries),
     ]
     .join("\n")
 }
@@ -764,48 +805,57 @@ fn format_confirmation_text(state: &AppState) -> String {
         return String::new();
     };
     let targets = if permission.targets.is_empty() {
-        "(none)".to_string()
+        "(なし)".to_string()
     } else {
         permission.targets.join(", ")
     };
     let risks = if permission.risks.is_empty() {
-        "none".to_string()
+        "なし".to_string()
     } else {
         permission.risks.join(", ")
     };
     format!(
-        "{}\n\nTargets: {targets}\nOutside workspace: {}\nRisks: {risks}",
+        "{}\n\n対象: {targets}\nワークスペース外: {}\nリスク: {risks}",
         permission.summary,
         if permission.outside_workspace {
-            "yes"
+            "はい"
         } else {
-            "no"
+            "いいえ"
         }
     )
 }
 
 fn run_status_label(status: RunStatus) -> &'static str {
     match status {
-        RunStatus::Idle => "Idle",
-        RunStatus::Running => "Running",
-        RunStatus::Confirming => "Confirming",
-        RunStatus::Completed => "Completed",
-        RunStatus::AwaitingUser => "Awaiting User",
-        RunStatus::Failed => "Failed",
+        RunStatus::Idle => "待機中",
+        RunStatus::Running => "実行中",
+        RunStatus::Confirming => "確認待ち",
+        RunStatus::Completed => "完了",
+        RunStatus::AwaitingUser => "ユーザー確認待ち",
+        RunStatus::Failed => "失敗",
     }
 }
 
 fn entry_heading(kind: TranscriptKind, title: &str) -> String {
     match kind {
-        TranscriptKind::User => "USER PROMPT".to_string(),
-        TranscriptKind::Assistant => "ASSISTANT".to_string(),
-        TranscriptKind::Reasoning => "REASONING".to_string(),
+        TranscriptKind::User => "ユーザー依頼".to_string(),
+        TranscriptKind::Assistant => "応答".to_string(),
+        TranscriptKind::Reasoning => "推論".to_string(),
         TranscriptKind::Editing => "編集中".to_string(),
-        TranscriptKind::Tool => format!("COMMAND / TOOL - {title}"),
+        TranscriptKind::Tool => format!("コマンド / ツール - {title}"),
         TranscriptKind::CommandSummary => title.to_string(),
-        TranscriptKind::Diff => format!("FILE CHANGES - {title}"),
-        TranscriptKind::System => format!("SYSTEM - {title}"),
-        TranscriptKind::Error => format!("ERROR - {title}"),
+        TranscriptKind::Diff => format!("ファイル変更 - {title}"),
+        TranscriptKind::System => format!("システム - {title}"),
+        TranscriptKind::Error => format!("エラー - {title}"),
+    }
+}
+
+fn todo_status_label(status: &str) -> &'static str {
+    match status {
+        "Completed" => "完了",
+        "InProgress" => "進行中",
+        "Blocked" => "ブロック",
+        _ => "未着手",
     }
 }
 
@@ -874,10 +924,84 @@ mod tests {
             &projects,
             current_project,
             &Utf8PathBuf::from("C:/workspace/current"),
+            &[],
         );
 
         assert_eq!(rows[selected].project_id, current_project);
         assert!(rows.iter().any(|row| row.project_id == other_project));
+    }
+
+    #[test]
+    fn project_rows_hide_quick_chat_workspace() {
+        let quick_chat_project = ProjectId::new();
+        let normal_project = ProjectId::new();
+        let quick_chat_root = Utf8PathBuf::from("C:/data/quick-chat-workspace");
+        let projects = vec![
+            ProjectRecord {
+                id: quick_chat_project,
+                root_path: quick_chat_root.clone(),
+                display_name: "quick-chat-workspace".to_string(),
+                vcs_kind: "none".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            ProjectRecord {
+                id: normal_project,
+                root_path: Utf8PathBuf::from("C:/workspace/normal"),
+                display_name: "normal".to_string(),
+                vcs_kind: "none".to_string(),
+                created_at_ms: 2,
+                updated_at_ms: 2,
+            },
+        ];
+
+        let (rows, selected) = build_project_rows(
+            &projects,
+            quick_chat_project,
+            &quick_chat_root,
+            &[quick_chat_root.clone()],
+        );
+
+        assert_eq!(selected, rows.len());
+        assert!(!rows.iter().any(|row| row.project_id == quick_chat_project));
+        assert!(rows.iter().any(|row| row.project_id == normal_project));
+    }
+
+    #[test]
+    fn project_rows_hide_legacy_internal_desktop_workspaces() {
+        let internal_project = ProjectId::new();
+        let normal_project = ProjectId::new();
+        let data_dir = Utf8PathBuf::from("C:/Users/example/AppData/Roaming/moyAI");
+        let internal_root = data_dir.join("desktop-workspace-after-delete");
+        let projects = vec![
+            ProjectRecord {
+                id: internal_project,
+                root_path: internal_root,
+                display_name: "desktop-workspace-after-delete".to_string(),
+                vcs_kind: "none".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            ProjectRecord {
+                id: normal_project,
+                root_path: Utf8PathBuf::from("C:/workspace/normal"),
+                display_name: "normal".to_string(),
+                vcs_kind: "none".to_string(),
+                created_at_ms: 2,
+                updated_at_ms: 2,
+            },
+        ];
+
+        let (rows, selected) = build_project_rows(
+            &projects,
+            normal_project,
+            &Utf8PathBuf::from("C:/workspace/normal"),
+            &internal_desktop_project_roots(&data_dir),
+        );
+
+        assert_eq!(selected, 0);
+        assert!(!rows.iter().any(|row| row.project_id == internal_project));
+        assert_eq!(rows[0].project_id, normal_project);
     }
 
     #[test]
@@ -907,8 +1031,45 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label, "main.rs");
         assert_eq!(rows[0].path, "src/main.rs");
-        assert_eq!(rows[0].action, "update");
+        assert_eq!(rows[0].action, "更新");
         assert!(rows[0].summary.contains("desktop UI projection"));
+    }
+
+    #[test]
+    fn file_change_rows_hide_runtime_cache_files_from_user_history() {
+        let session_id = SessionId::new();
+        let turn_items = vec![TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id: crate::protocol::TurnId::new(),
+            source_item_id: None,
+            sequence_no: 1,
+            payload: TurnItemPayload::FileChange {
+                change_ids: vec![crate::session::ChangeId::new()],
+                changes: vec![
+                    FileChangeEvidence {
+                        change_id: crate::session::ChangeId::new(),
+                        kind: ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("__pycache__/space_invader.pyc")),
+                        path_after: Some(Utf8PathBuf::from("__pycache__/space_invader.pyc")),
+                        summary: "Updated runtime cache".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: crate::session::ChangeId::new(),
+                        kind: ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("space_invader.py")),
+                        path_after: Some(Utf8PathBuf::from("space_invader.py")),
+                        summary: "Updated game logic".to_string(),
+                    },
+                ],
+                summary: "Updated files".to_string(),
+            },
+        }];
+
+        let rows = file_change_rows_from_turn_items(&turn_items);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "space_invader.py");
     }
 
     #[test]
@@ -963,9 +1124,9 @@ mod tests {
 
         let text = format_transcript_text(&state);
 
-        assert!(text.contains("[01] USER PROMPT"));
-        assert!(text.contains("[02] COMMAND / TOOL - write"));
-        assert!(text.contains("[03] FILE CHANGES - File changes"));
+        assert!(text.contains("[01] ユーザー依頼"));
+        assert!(text.contains("[02] コマンド / ツール - write"));
+        assert!(text.contains("[03] ファイル変更 - File changes"));
         assert!(!text.contains("===="));
 
         state.tool_statuses = vec![crate::tui::state::ToolStatusView {

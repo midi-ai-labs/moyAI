@@ -20,7 +20,7 @@ moyAI was built for that environment. It focuses on local execution, explicit co
 
 - Local LLM support through OpenAI-compatible APIs.
 - LM Studio model discovery through `/v1/models` and `/api/v1/models` metadata.
-- CLI, TUI, and native Slint desktop app.
+- CLI, TUI, and Tauri desktop app.
 - Workspace search, directory inspection, file reading, diff-based editing, and shell execution.
 - Size-aware read guards for large files, binary files, model checkpoints, and structured documents.
 - Optional Docling Serve and HTTP MCP integration for closed-network document workflows.
@@ -55,6 +55,18 @@ During development, moyAI has been optimized for `qwen/qwen3.6-35b-a3b` hosted b
 cargo build
 ```
 
+The desktop UI is a Tauri + TypeScript bundle. On a build machine, install the locked npm dependencies and build the web assets before producing a desktop release:
+
+```bash
+npm install
+npm run build:desktop-web
+cargo build --release --bin moyai-desktop
+```
+
+The default Cargo feature set is Tauri-only for desktop builds and enables Tauri's production custom protocol, so a release executable loads bundled `ui/desktop-web/dist` assets instead of connecting to a local dev server.
+
+The target offline machine does not need npm, the Rust toolchain, or internet access. Move the built release executable/assets by USB and run `moyai-desktop.exe`.
+
 ## Run
 
 ```bash
@@ -70,8 +82,8 @@ moyai desktop --dir /path/to/workspace
 moyai-desktop
 ```
 
-Release builds include `moyai.exe` for CLI/TUI workflows and `moyai-desktop.exe` for launching the desktop app directly. On Windows, double-click `moyai-desktop.exe` to open the desktop app. The desktop runtime window/taskbar icon uses `logo/fabicon/android-chrome-512x512.png`, and the Windows executable resource uses the multi-size `logo/fabicon/moyai_app_icon.ico`.
-When no workspace is specified, the desktop app opens the current Windows user's Desktop folder as the default workspace.
+Release builds include `moyai.exe` for CLI/TUI workflows and `moyai-desktop.exe` for launching the desktop app directly. On Windows, double-click `moyai-desktop.exe` or run `.\target\release\moyai-desktop.exe` to open the desktop app; no `npm run dev` / `127.0.0.1` server is required for release. The desktop runtime window/taskbar icon uses `logo/fabicon/android-chrome-512x512.png`, and the Windows executable resource uses the multi-size `logo/fabicon/moyai_app_icon.ico`.
+When no workspace is specified, the desktop app opens a workspace-free Quick Chat state. Project work starts only after selecting a folder from the project add control or passing `--dir`.
 
 ## Configuration
 
@@ -159,12 +171,3 @@ Copyright (c) 2026 Hideyoshi Takahashi.
 `midi-ai-labs` is the GitHub organization / project namespace for this personal project.
 
 See [LICENSE](LICENSE) for the full license text.
-
-### Third-party Software
-
-moyAI uses third-party software that is governed by its own license terms.
-
-- Slint: https://slint.dev/
-  - This application uses Slint as a UI framework.
-  - moyAI uses Slint under the Slint Royalty-free License.
-  - Slint also offers GNU GPLv3 and paid commercial license options.

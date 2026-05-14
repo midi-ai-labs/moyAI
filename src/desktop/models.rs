@@ -1,6 +1,7 @@
 use crate::session::{ProjectId, SessionId};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopTranscriptRow {
     pub kind: String,
     pub step: String,
@@ -8,7 +9,7 @@ pub struct DesktopTranscriptRow {
     pub body: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopArtifactRow {
     pub label: String,
     pub path: String,
@@ -16,7 +17,7 @@ pub struct DesktopArtifactRow {
     pub action: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopFileChangeRow {
     pub label: String,
     pub path: String,
@@ -24,27 +25,27 @@ pub struct DesktopFileChangeRow {
     pub summary: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopCommandRow {
     pub name: String,
     pub label: String,
     pub path: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopProjectRow {
     pub project_id: ProjectId,
     pub label: String,
     pub path: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopSessionRow {
     pub session_id: SessionId,
     pub label: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopSessionDetail {
     pub session_id: SessionId,
     pub transcript_text: String,
@@ -60,7 +61,7 @@ pub struct DesktopSessionDetail {
     pub artifact_preview_text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopSnapshot {
     pub workspace_path: String,
     pub provider_label: String,

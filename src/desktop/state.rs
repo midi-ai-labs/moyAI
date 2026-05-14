@@ -23,6 +23,7 @@ pub enum DesktopOverlay {
     EditMenu,
     ViewMenu,
     HelpMenu,
+    ProjectMenu,
     ConfigEditor,
     ProviderEditor,
     WorkspacePicker,
@@ -129,7 +130,9 @@ impl DesktopState {
     }
 
     pub fn selected_project_index(&self) -> i32 {
-        if self.snapshot.project_rows.is_empty() {
+        if self.snapshot.project_rows.is_empty()
+            || self.snapshot.selected_project_index >= self.snapshot.project_rows.len()
+        {
             -1
         } else {
             self.snapshot.selected_project_index as i32
@@ -166,14 +169,14 @@ impl DesktopState {
                     .current_session_id
                     .map(|_| self.app_state.current_session_title.clone())
             })
-            .unwrap_or_else(|| "No session selected".to_string())
+            .unwrap_or_else(|| "セッション未選択".to_string())
     }
 
     pub fn current_session_label(&self) -> String {
         self.app_state
             .current_session_id
             .map(|_| self.app_state.current_session_title.clone())
-            .unwrap_or_else(|| "New Session".to_string())
+            .unwrap_or_else(|| "新規チャット".to_string())
     }
 
     pub fn selected_detail(&self) -> DesktopSessionDetail {
@@ -199,22 +202,27 @@ impl DesktopState {
         } else {
             DesktopSessionDetail {
                 session_id: SessionId::new(),
-                transcript_text: "No sessions available for this workspace.".to_string(),
+                transcript_text: "チャットはまだありません。".to_string(),
                 transcript_rows: vec![crate::desktop::models::DesktopTranscriptRow {
                     kind: "system".to_string(),
                     step: "00".to_string(),
-                    title: "No sessions".to_string(),
-                    body: "No sessions available for this workspace.".to_string(),
+                    title: "チャットはありません".to_string(),
+                    body: if self.selected_project_id().is_some() {
+                        "下の入力欄から依頼を送ると、このプロジェクトの最初のチャットが作成されます。".to_string()
+                    } else {
+                        "通常チャットとして開始できます。プロジェクト作業をする場合は、左のプロジェクト作成からフォルダを選択してください。".to_string()
+                    },
                 }],
-                tool_status_text: "No tool activity recorded.".to_string(),
-                progress_text: "Idle\nPhase: ready\nStep: No active run".to_string(),
-                run_status_text: "Idle".to_string(),
+                tool_status_text: "ツール実行はまだありません。".to_string(),
+                progress_text: "待機中\nフェーズ: 準備完了\n手順: 実行中の作業はありません"
+                    .to_string(),
+                run_status_text: "待機中".to_string(),
                 confirmation_text: String::new(),
                 confirmation_visible: false,
                 artifacts: Vec::new(),
                 file_changes: Vec::new(),
-                file_change_summary_text: "No file changes recorded.".to_string(),
-                artifact_preview_text: "No artifact selected.".to_string(),
+                file_change_summary_text: "ファイル変更はまだありません。".to_string(),
+                artifact_preview_text: "アーティファクトは選択されていません。".to_string(),
             }
         }
     }
@@ -495,6 +503,10 @@ impl DesktopState {
         self.overlay = DesktopOverlay::HelpMenu;
     }
 
+    pub fn show_project_menu(&mut self) {
+        self.overlay = DesktopOverlay::ProjectMenu;
+    }
+
     pub fn hide_overlay(&mut self) {
         self.overlay = DesktopOverlay::None;
     }
@@ -600,7 +612,7 @@ impl DesktopState {
     pub fn local_search_results_text(&self) -> String {
         let needle = self.local_search_text.trim().to_lowercase();
         if needle.is_empty() {
-            return "Type to search projects, chats, transcript, artifacts, and commands."
+            return "プロジェクト、チャット、履歴、アーティファクト、コマンドを検索できます。"
                 .to_string();
         }
         let mut lines = Vec::new();
@@ -608,36 +620,39 @@ impl DesktopState {
             if row.label.to_lowercase().contains(&needle)
                 || row.path.to_lowercase().contains(&needle)
             {
-                lines.push(format!("project: {}", row.label));
+                lines.push(format!("プロジェクト: {}", row.label));
             }
         }
         for row in &self.snapshot.session_rows {
             if row.label.to_lowercase().contains(&needle) {
-                lines.push(format!("session: {}", row.label));
+                lines.push(format!("チャット: {}", row.label));
             }
         }
         let detail = self.selected_detail();
         for line in detail.transcript_text.lines() {
             if line.to_lowercase().contains(&needle) {
-                lines.push(format!("transcript: {}", truncate_for_search(line, 92)));
+                lines.push(format!("履歴: {}", truncate_for_search(line, 92)));
             }
         }
         for artifact in &detail.artifacts {
             if artifact.path.to_lowercase().contains(&needle)
                 || artifact.label.to_lowercase().contains(&needle)
             {
-                lines.push(format!("artifact: {} [{}]", artifact.path, artifact.action));
+                lines.push(format!(
+                    "アーティファクト: {} [{}]",
+                    artifact.path, artifact.action
+                ));
             }
         }
         for command in &self.snapshot.command_rows {
             if command.name.to_lowercase().contains(&needle)
                 || command.path.to_lowercase().contains(&needle)
             {
-                lines.push(format!("command: {} ({})", command.label, command.path));
+                lines.push(format!("コマンド: {} ({})", command.label, command.path));
             }
         }
         if lines.is_empty() {
-            "No local matches.".to_string()
+            "一致する項目はありません。".to_string()
         } else {
             lines.into_iter().take(24).collect::<Vec<_>>().join("\n")
         }

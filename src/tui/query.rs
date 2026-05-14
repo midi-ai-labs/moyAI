@@ -40,7 +40,11 @@ pub async fn session_view(
 ) -> Result<SessionView, SessionError> {
     let session = service.get_session(session_id).await?;
     let turn_items = service.canonical_turn_items(session_id).await?;
-    let transcript = service.canonical_transcript(session_id).await?;
+    let transcript = if turn_items.is_empty() {
+        service.transcript(session_id).await?
+    } else {
+        service.canonical_transcript(session_id).await?
+    };
     Ok(SessionView {
         session,
         transcript,

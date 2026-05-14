@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use directories_next::UserDirs;
 
 use crate::agent::{AgentLoop, PromptBuilder};
 use crate::app::{App, RunService};
@@ -155,7 +154,9 @@ fn command_directory(command: &CliCommand) -> Result<camino::Utf8PathBuf, AppBoo
 }
 
 fn default_desktop_workspace_directory() -> Option<Utf8PathBuf> {
-    UserDirs::new()
-        .and_then(|dirs| dirs.desktop_dir().map(|path| path.to_path_buf()))
-        .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+    let path = StoragePaths::discover()
+        .ok()
+        .map(|paths| paths.data_dir.join("quick-chat-workspace"))?;
+    let _ = std::fs::create_dir_all(path.as_std_path());
+    Some(path)
 }

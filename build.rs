@@ -8,13 +8,16 @@ const APP_ICON: &str = "logo/fabicon/moyai_app_icon.ico";
 const WINDOW_ICON: &str = "logo/fabicon/android-chrome-512x512.png";
 
 fn main() {
-    println!("cargo:rerun-if-changed=ui/desktop/app-window.slint");
+    #[cfg(feature = "tauri-desktop")]
+    println!("cargo:rerun-if-changed=ui/desktop-web");
     println!("cargo:rerun-if-changed={APP_ICON}");
     println!("cargo:rerun-if-changed={WINDOW_ICON}");
 
-    slint_build::compile("ui/desktop/app-window.slint").unwrap();
+    #[cfg(feature = "tauri-desktop")]
+    tauri_build::build();
 
-    if env::var("CARGO_CFG_WINDOWS").is_ok() {
+    if env::var("CARGO_CFG_WINDOWS").is_ok() && env::var_os("CARGO_FEATURE_TAURI_DESKTOP").is_none()
+    {
         embed_windows_app_icon();
     }
 }

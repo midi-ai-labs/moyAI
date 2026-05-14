@@ -71,7 +71,7 @@ impl ProjectRepository for SqliteProjectRepository {
              FROM projects
              LEFT JOIN sessions ON sessions.project_id = projects.id
              GROUP BY projects.id
-             ORDER BY last_activity_ms DESC
+             ORDER BY projects.created_at_ms ASC, lower(projects.display_name) ASC, lower(projects.root_path) ASC
              LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as i64], |row| {

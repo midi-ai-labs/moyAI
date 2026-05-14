@@ -1,11 +1,7 @@
-use std::cell::RefCell;
 use std::process::Command as ProcessCommand;
-use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use slint::{Timer, TimerMode};
 
 use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest};
 use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode};
@@ -26,748 +22,13 @@ use crate::session::{
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
 
-use super::args::DesktopArgs;
-use super::bridge::{DesktopBridge, render_composer_action_state, render_handle};
+use super::args::{DesktopArgs, quick_chat_workspace_directory};
+use super::models::DesktopTranscriptRow;
 use super::preferences::DesktopPreferences;
 use super::query::{
     load_session_detail, load_snapshot, load_snapshot_continue_last, load_snapshot_for_selection,
 };
 use super::state::DesktopState;
-
-pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
-    let controller = Rc::new(RefCell::new(DesktopController::new(app, args).await?));
-    let bridge = DesktopBridge::new().map_err(|error| {
-        AppRunError::Message(format!("desktop ui initialization failed: {error}"))
-    })?;
-
-    bridge.render(&controller.borrow().state);
-
-    bind_handlers(&bridge, &controller);
-
-    let timer = Timer::default();
-    {
-        let controller = Rc::clone(&controller);
-        let weak = bridge.as_weak();
-        timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
-            let mut controller = controller.borrow_mut();
-            let changed = controller.drain_runtime_messages();
-            if changed && let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        });
-    }
-
-    bridge
-        .run()
-        .map_err(|error| AppRunError::Message(format!("desktop ui runtime failed: {error}")))?;
-    drop(timer);
-    Ok(())
-}
-
-fn bind_handlers(bridge: &DesktopBridge, controller: &Rc<RefCell<DesktopController>>) {
-    bridge.on_project_selected({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |index| {
-            if index < 0 {
-                return;
-            }
-            let mut controller = controller.borrow_mut();
-            controller.state.select_project(index as usize);
-            controller.open_selected_project();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_session_selected({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |index| {
-            if index < 0 {
-                return;
-            }
-            let mut controller = controller.borrow_mut();
-            controller.state.select_session(index as usize);
-            controller.open_selected_session();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_project_delete_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |index| {
-            if index < 0 {
-                return;
-            }
-            let mut controller = controller.borrow_mut();
-            controller.state.select_project(index as usize);
-            controller.delete_selected_project();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_session_delete_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |index| {
-            if index < 0 {
-                return;
-            }
-            let mut controller = controller.borrow_mut();
-            controller.state.select_session(index as usize);
-            controller.delete_selected_session();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_artifact_selected({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |index| {
-            if index < 0 {
-                return;
-            }
-            let mut controller = controller.borrow_mut();
-            controller.state.select_artifact(index as usize);
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_artifact_folder_open_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |index| {
-            if index < 0 {
-                return;
-            }
-            let mut controller = controller.borrow_mut();
-            controller.state.select_artifact(index as usize);
-            controller.open_selected_artifact_folder();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_local_search_changed({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |text| {
-            let mut controller = controller.borrow_mut();
-            controller.state.set_local_search_text(text.to_string());
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_command_palette_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.show_command_palette();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_file_menu_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.show_file_menu();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_edit_menu_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.show_edit_menu();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_view_menu_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.show_view_menu();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_help_menu_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.show_help_menu();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_new_chat_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.start_new_chat();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_command_selected({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |index| {
-            if index < 0 {
-                return;
-            }
-            let mut controller = controller.borrow_mut();
-            controller.state.insert_command_from_palette(index as usize);
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_keyboard_shortcuts_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.show_keyboard_shortcuts();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_overlay_close_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.hide_overlay();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_composer_changed({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |text| {
-            let mut controller = controller.borrow_mut();
-            controller.state.set_draft_prompt(text.to_string());
-            if let Some(handle) = weak.upgrade() {
-                render_composer_action_state(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_image_path_changed({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |text| {
-            let mut controller = controller.borrow_mut();
-            controller
-                .state
-                .set_image_attachment_input(text.to_string());
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_image_attach_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.attach_image_from_input();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_image_browse_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.browse_image_dialog();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_image_clear_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.clear_image_attachments();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_image_remove_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |index| {
-            if index < 0 {
-                return;
-            }
-            let mut controller = controller.borrow_mut();
-            controller.state.remove_image_attachment(index as usize);
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_refresh_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.refresh_snapshot();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_session_reload_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.open_selected_session();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_history_export_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.export_selected_history_markdown();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_run_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.start_run();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_review_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.start_review_uncommitted();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_enhance_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.start_prompt_enhance();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_open_folder_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.open_current_workspace_in_file_manager();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_config_editor_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.show_config_editor();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_provider_editor_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.show_provider_editor();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_access_mode_toggle_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.toggle_access_mode_session();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_config_close_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.hide_overlay();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_provider_close_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.hide_overlay();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_provider_base_url_changed({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |text| {
-            let mut controller = controller.borrow_mut();
-            controller
-                .state
-                .set_provider_base_url_input(text.to_string());
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_provider_load_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.load_provider_models();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_provider_model_selected({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |value| {
-            let mut controller = controller.borrow_mut();
-            controller.state.set_provider_model_value(value.as_str());
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_provider_apply_session_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.apply_provider_session();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_provider_save_project_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.save_provider_project();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_provider_save_global_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.save_provider_global();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_config_selected({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |index| {
-            if index < 0 {
-                return;
-            }
-            let mut controller = controller.borrow_mut();
-            controller.state.set_config_selection(index as usize);
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_config_value_changed({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |text| {
-            let mut controller = controller.borrow_mut();
-            controller.state.set_config_value(text.to_string());
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_config_apply_session_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.apply_session_config();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_config_save_project_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.save_project_config();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_config_save_global_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.save_global_config();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_config_open_project_folder_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.open_project_config_folder();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_config_open_global_folder_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.open_global_config_folder();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_workspace_picker_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            let current = controller.app.workspace.cwd.to_string();
-            controller.state.show_workspace_picker(&current);
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_workspace_close_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.hide_overlay();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_workspace_input_changed({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |text| {
-            let mut controller = controller.borrow_mut();
-            controller.state.set_workspace_input(text.to_string());
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_workspace_apply_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.switch_workspace();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_workspace_browse_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.browse_workspace_dialog();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_open_typed_path_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.open_typed_path_in_file_manager();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_review_draft_changed({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |text| {
-            let mut controller = controller.borrow_mut();
-            controller.state.set_review_draft(text.to_string());
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_send_enhanced_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.send_prompt_review(true);
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_send_raw_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.send_prompt_review(false);
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_cancel_review_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.state.cancel_prompt_review();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_confirm_accept_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.answer_permission(true);
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_confirm_reject_requested({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move || {
-            let mut controller = controller.borrow_mut();
-            controller.answer_permission(false);
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-    bridge.on_window_opacity_changed({
-        let weak = bridge.as_weak();
-        let controller = Rc::clone(controller);
-        move |value| {
-            let mut controller = controller.borrow_mut();
-            controller
-                .state
-                .set_window_opacity_percent(value.round() as i32);
-            controller.preferences.window_opacity_percent =
-                Some(controller.state.window_opacity_percent);
-            controller.persist_preferences();
-            if let Some(handle) = weak.upgrade() {
-                render_handle(&handle, &controller.state);
-            }
-        }
-    });
-}
 
 enum RuntimeMessage {
     RunEvent(RunEvent),
@@ -824,9 +85,9 @@ struct WorkspaceLoadResult {
     snapshot: super::models::DesktopSnapshot,
 }
 
-struct DesktopController {
-    app: App,
-    state: DesktopState,
+pub(crate) struct DesktopController {
+    pub(crate) app: App,
+    pub(crate) state: DesktopState,
     preferences: DesktopPreferences,
     persist_preferences_to_disk: bool,
     runtime_tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
@@ -836,7 +97,7 @@ struct DesktopController {
 }
 
 impl DesktopController {
-    async fn new(app: App, args: DesktopArgs) -> Result<Self, AppRunError> {
+    pub(crate) async fn new(app: App, args: DesktopArgs) -> Result<Self, AppRunError> {
         Self::new_with_preferences_and_persistence(
             app,
             args,
@@ -861,20 +122,26 @@ impl DesktopController {
                 .map_err(AppRunError::Message)?;
             if preferences.is_project_deleted(&app.workspace.root) {
                 let store = app.session_service.store.clone();
+                let mut hidden_roots = preferences.deleted_project_roots.clone();
+                hidden_roots.extend(internal_desktop_project_roots(
+                    app.session_service.store.paths().data_dir.as_path(),
+                ));
                 let next_root = next_project_root_after_delete(
                     &app,
                     app.workspace.project_id,
-                    &preferences.deleted_project_roots,
+                    &hidden_roots,
                     &app.workspace.root,
                 )
                 .await
                 .map_err(AppRunError::Message)?
                 .unwrap_or_else(|| {
-                    fallback_workspace_after_project_delete(
-                        &app.workspace.root,
-                        &preferences.deleted_project_roots,
-                        app.session_service.store.paths().data_dir.as_path(),
-                    )
+                    quick_chat_workspace_directory().unwrap_or_else(|| {
+                        fallback_workspace_after_project_delete(
+                            &app.workspace.root,
+                            &hidden_roots,
+                            app.session_service.store.paths().data_dir.as_path(),
+                        )
+                    })
                 });
                 std::fs::create_dir_all(next_root.as_std_path()).map_err(|error| {
                     AppRunError::Message(format!(
@@ -890,29 +157,6 @@ impl DesktopController {
                             next_root
                         ))
                     })?;
-            }
-        }
-        if args.directory.is_none() {
-            if let Some(restored_workspace) = preferences.last_workspace.clone() {
-                if preferences.is_project_deleted(&restored_workspace) {
-                    preferences.last_workspace = None;
-                } else if restored_workspace != app.workspace.root {
-                    let store = app.session_service.store.clone();
-                    if restored_workspace.exists()
-                        && project_root_exists(&app, &restored_workspace).await?
-                    {
-                        app = AppBootstrap::rebuild_for_directory(&restored_workspace, store)
-                            .await
-                            .map_err(|error| {
-                                AppRunError::Message(format!(
-                                    "failed to restore last workspace {}: {error}",
-                                    restored_workspace
-                                ))
-                            })?;
-                    } else {
-                        preferences.last_workspace = None;
-                    }
-                }
             }
         }
         if let Some(session_id) = args.session_id {
@@ -947,7 +191,6 @@ impl DesktopController {
                 load_session_detail(&app, session_id).await?;
             state.load_open_session(&session, &transcript, &turn_items, session_state, todos);
         }
-        preferences.last_workspace = Some(app.workspace.root.clone());
         let mut controller = Self {
             app,
             state,
@@ -965,7 +208,7 @@ impl DesktopController {
         Ok(controller)
     }
 
-    fn refresh_snapshot(&mut self) {
+    pub(crate) fn refresh_snapshot(&mut self) {
         let app = self.app.clone();
         let selected_session_id = self.state.selected_session_id();
         let runtime_tx = self.runtime_tx.clone();
@@ -983,7 +226,7 @@ impl DesktopController {
         });
     }
 
-    fn open_selected_session(&mut self) {
+    pub(crate) fn open_selected_session(&mut self) {
         if let Some(session_id) = self.state.selected_session_id() {
             self.state
                 .set_status_message(format!("opening session {session_id}..."));
@@ -991,7 +234,7 @@ impl DesktopController {
         }
     }
 
-    fn open_selected_project(&mut self) {
+    pub(crate) fn open_selected_project(&mut self) {
         if self.state.is_busy() {
             self.state
                 .set_status_message("project cannot change while a run is active");
@@ -1009,7 +252,7 @@ impl DesktopController {
         self.spawn_workspace_load(path);
     }
 
-    fn delete_selected_session(&mut self) {
+    pub(crate) fn delete_selected_session(&mut self) {
         if self.state.is_busy() {
             self.state
                 .set_status_message("chat cannot be deleted while a run is active");
@@ -1025,7 +268,7 @@ impl DesktopController {
         self.spawn_session_delete(session_id);
     }
 
-    fn delete_selected_project(&mut self) {
+    pub(crate) fn delete_selected_project(&mut self) {
         if self.state.is_busy() {
             self.state
                 .set_status_message("project cannot be deleted while a run is active");
@@ -1044,13 +287,16 @@ impl DesktopController {
         self.state
             .set_status_message(format!("deleting project {}...", project_id));
         let mut hidden_roots = self.preferences.deleted_project_roots.clone();
+        hidden_roots.extend(internal_desktop_project_roots(
+            self.app.session_service.store.paths().data_dir.as_path(),
+        ));
         if !hidden_roots.iter().any(|root| root == &project_root) {
             hidden_roots.push(project_root.clone());
         }
         self.spawn_project_delete(project_id, project_root, hidden_roots);
     }
 
-    fn export_selected_history_markdown(&mut self) {
+    pub(crate) fn export_selected_history_markdown_auto(&mut self) {
         let Some(session_id) = self.state.selected_session_id() else {
             self.state
                 .set_status_message("select a session before exporting history");
@@ -1058,16 +304,63 @@ impl DesktopController {
         };
         let default_file_name =
             history_markdown_file_name(&self.state.selected_session_title(), session_id);
-        match pick_history_markdown_path(&default_file_name) {
-            Ok(Some(path)) => self.export_selected_history_markdown_to_path(path),
-            Ok(None) => self
+        let export_path = self
+            .app
+            .workspace
+            .root
+            .join(".moyai")
+            .join("history-exports")
+            .join(default_file_name);
+        self.export_selected_history_markdown_to_path(export_path);
+    }
+
+    pub(crate) fn export_open_transcript_markdown_auto(&mut self) {
+        let Some(session_id) = self.state.selected_session_id() else {
+            self.state
+                .set_status_message("select a session before exporting transcript");
+            return;
+        };
+        let detail = self.state.selected_detail();
+        if detail.transcript_rows.is_empty() {
+            self.state
+                .set_status_message("open transcript has no rows to export");
+            return;
+        }
+        let file_name =
+            transcript_markdown_file_name(&self.state.selected_session_title(), session_id);
+        let export_path = self
+            .app
+            .workspace
+            .root
+            .join(".moyai")
+            .join("transcript-exports")
+            .join(file_name);
+        let markdown = open_transcript_rows_to_markdown(
+            &self.state.selected_session_title(),
+            &self.app.workspace.root,
+            session_id,
+            &self.state.effective_config.model.base_url,
+            &self.state.effective_config.model.model,
+            &detail.transcript_rows,
+            &detail.file_changes,
+        );
+        let result = (|| {
+            if let Some(parent) = export_path.parent() {
+                std::fs::create_dir_all(parent.as_std_path()).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(export_path.as_std_path(), markdown).map_err(|error| error.to_string())
+        })();
+        match result {
+            Ok(()) => self
                 .state
-                .set_status_message("history markdown export cancelled"),
-            Err(error) => self.state.set_status_message(error),
+                .set_status_message(format!("saved transcript markdown to {}", export_path)),
+            Err(error) => self
+                .state
+                .set_status_message(format!("transcript markdown export failed: {error}")),
         }
     }
 
-    fn export_selected_history_markdown_to_path(&mut self, path: Utf8PathBuf) {
+    pub(crate) fn export_selected_history_markdown_to_path(&mut self, path: Utf8PathBuf) {
         let Some(session_id) = self.state.selected_session_id() else {
             self.state
                 .set_status_message("select a session before exporting history");
@@ -1198,11 +491,13 @@ impl DesktopController {
                         &project_root_for_thread,
                     )
                     .unwrap_or_else(|| {
-                        fallback_workspace_after_project_delete(
-                            &project_root_for_thread,
-                            &hidden_roots,
-                            app.session_service.store.paths().data_dir.as_path(),
-                        )
+                        quick_chat_workspace_directory().unwrap_or_else(|| {
+                            fallback_workspace_after_project_delete(
+                                &project_root_for_thread,
+                                &hidden_roots,
+                                app.session_service.store.paths().data_dir.as_path(),
+                            )
+                        })
                     });
                     if let Some(parent) = next_root.parent() {
                         std::fs::create_dir_all(parent.as_std_path())
@@ -1246,7 +541,7 @@ impl DesktopController {
         });
     }
 
-    fn start_run(&mut self) {
+    pub(crate) fn start_run(&mut self) {
         let prompt = self.state.draft_prompt.trim().to_string();
         if prompt.is_empty() {
             return;
@@ -1255,13 +550,63 @@ impl DesktopController {
         self.launch_run_with_options(prompt, prompt_dispatch, None);
     }
 
-    fn start_review_uncommitted(&mut self) {
+    pub(crate) fn start_quick_chat(&mut self) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("new chat cannot start while a run is active");
+            return;
+        }
+        let Some(root) = quick_chat_workspace_directory() else {
+            self.state.start_new_chat();
+            self.persist_preferences();
+            return;
+        };
+        if self.is_quick_chat_workspace() {
+            self.state.start_new_chat();
+            self.persist_preferences();
+            return;
+        }
+        if let Err(error) = std::fs::create_dir_all(root.as_std_path()) {
+            self.state.set_status_message(format!(
+                "failed to prepare quick chat workspace {}: {error}",
+                root
+            ));
+            return;
+        }
+        self.state.hide_overlay();
+        self.state
+            .set_status_message("opening workspace-free quick chat...");
+        self.spawn_workspace_load(root);
+    }
+
+    pub(crate) fn create_project_from_picker(&mut self) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("project cannot change while a run is active");
+            return;
+        }
+        let start_dir = (!self.is_quick_chat_workspace()).then_some(&self.app.workspace.cwd);
+        match pick_workspace_directory(start_dir) {
+            Ok(Some(path)) => {
+                self.state.hide_overlay();
+                self.state
+                    .set_status_message(format!("opening project workspace {}...", path));
+                self.spawn_workspace_load(path);
+            }
+            Ok(None) => self.state.set_status_message("project creation cancelled"),
+            Err(error) => self
+                .state
+                .set_status_message(format!("project creation failed: {error}")),
+        }
+    }
+
+    pub(crate) fn start_review_uncommitted(&mut self) {
         let prompt = self.state.draft_prompt.trim().to_string();
         let prompt_dispatch = crate::session::PromptDispatchPart::raw(&prompt);
         self.launch_run_with_options(prompt, prompt_dispatch, Some(ReviewRequest::Uncommitted));
     }
 
-    fn start_prompt_enhance(&mut self) {
+    pub(crate) fn start_prompt_enhance(&mut self) {
         let raw_prompt = self.state.draft_prompt.trim().to_string();
         if raw_prompt.is_empty() || self.state.is_busy() {
             return;
@@ -1285,7 +630,7 @@ impl DesktopController {
         });
     }
 
-    fn send_prompt_review(&mut self, send_enhanced: bool) {
+    pub(crate) fn send_prompt_review(&mut self, send_enhanced: bool) {
         let Some(prompt_dispatch) = self.state.build_prompt_dispatch(send_enhanced) else {
             self.state
                 .set_status_message("enhanced draft is not ready yet");
@@ -1296,7 +641,7 @@ impl DesktopController {
         self.launch_run_with_options(prompt, prompt_dispatch, None);
     }
 
-    fn load_provider_models(&mut self) {
+    pub(crate) fn load_provider_models(&mut self) {
         let normalized = normalize_provider_base_url(&self.state.provider_base_url_input);
         if normalized.is_empty() {
             self.state.fail_provider_model_load("provider URL is empty");
@@ -1323,7 +668,7 @@ impl DesktopController {
         });
     }
 
-    fn apply_provider_session(&mut self) {
+    pub(crate) fn apply_provider_session(&mut self) {
         let Some(config) = self.apply_provider_selection_to_effective_config() else {
             return;
         };
@@ -1332,14 +677,13 @@ impl DesktopController {
             &self.app.workspace.root,
             full_effective_override(&self.state.effective_config),
         );
-        self.preferences.last_workspace = Some(self.app.workspace.root.clone());
         self.persist_preferences();
         self.state
             .set_status_message("applied provider selection to this workspace session");
         self.state.hide_overlay();
     }
 
-    fn save_provider_project(&mut self) {
+    pub(crate) fn save_provider_project(&mut self) {
         let Some(config) = self.apply_provider_selection_to_effective_config() else {
             return;
         };
@@ -1361,7 +705,7 @@ impl DesktopController {
         }
     }
 
-    fn save_provider_global(&mut self) {
+    pub(crate) fn save_provider_global(&mut self) {
         let Some(config) = self.apply_provider_selection_to_effective_config() else {
             return;
         };
@@ -1383,14 +727,13 @@ impl DesktopController {
         }
     }
 
-    fn apply_session_config(&mut self) {
+    pub(crate) fn apply_session_config(&mut self) {
         match self.state.config_editor.build_session_override() {
             Ok(patch) => {
                 let config = apply_config_patch(self.app.config.clone(), patch.clone());
                 self.state.reset_effective_config(config);
                 self.preferences
                     .set_workspace_override(&self.app.workspace.root, patch);
-                self.preferences.last_workspace = Some(self.app.workspace.root.clone());
                 self.persist_preferences();
                 self.state.set_status_message("applied session override");
             }
@@ -1400,7 +743,7 @@ impl DesktopController {
         }
     }
 
-    fn toggle_access_mode_session(&mut self) {
+    pub(crate) fn toggle_access_mode_session(&mut self) {
         if self.state.is_busy() {
             self.state
                 .set_status_message("access mode cannot change while a run is active");
@@ -1415,7 +758,6 @@ impl DesktopController {
             &self.app.workspace.root,
             full_effective_override(&self.state.effective_config),
         );
-        self.preferences.last_workspace = Some(self.app.workspace.root.clone());
         self.persist_preferences();
         self.state.set_status_message(format!(
             "session access mode set to {}",
@@ -1423,7 +765,7 @@ impl DesktopController {
         ));
     }
 
-    fn save_project_config(&mut self) {
+    pub(crate) fn save_project_config(&mut self) {
         match self.state.config_editor.save_scope(
             &self.app.workspace.root,
             crate::tui::config_editor::ConfigSaveScope::Project,
@@ -1441,7 +783,7 @@ impl DesktopController {
         }
     }
 
-    fn save_global_config(&mut self) {
+    pub(crate) fn save_global_config(&mut self) {
         match self.state.config_editor.save_scope(
             &self.app.workspace.root,
             crate::tui::config_editor::ConfigSaveScope::Global,
@@ -1476,7 +818,7 @@ impl DesktopController {
         }
     }
 
-    fn switch_workspace(&mut self) {
+    pub(crate) fn switch_workspace(&mut self) {
         if self.state.is_busy() {
             self.state
                 .set_status_message("workspace cannot change while a run is active");
@@ -1509,7 +851,7 @@ impl DesktopController {
         });
     }
 
-    fn browse_workspace_dialog(&mut self) {
+    pub(crate) fn browse_workspace_dialog(&mut self) {
         let start_dir = if self.state.workspace_input.trim().is_empty() {
             Some(self.app.workspace.root.clone())
         } else {
@@ -1529,7 +871,7 @@ impl DesktopController {
         }
     }
 
-    fn browse_image_dialog(&mut self) {
+    pub(crate) fn browse_image_dialog(&mut self) {
         match pick_image_file(Some(&self.app.workspace.cwd)) {
             Ok(Some(path)) => self.state.attach_image_path(path),
             Ok(None) => {}
@@ -1572,12 +914,12 @@ impl DesktopController {
         Some(requested)
     }
 
-    fn open_current_workspace_in_file_manager(&mut self) {
+    pub(crate) fn open_current_workspace_in_file_manager(&mut self) {
         let root = self.app.workspace.root.clone();
         self.open_path_in_file_manager(&root);
     }
 
-    fn open_project_config_folder(&mut self) {
+    pub(crate) fn open_project_config_folder(&mut self) {
         let [primary, secondary] = project_config_paths(&self.app.workspace.root);
         let config_path = if secondary.exists() {
             secondary
@@ -1594,7 +936,7 @@ impl DesktopController {
         self.open_path_in_file_manager(&folder);
     }
 
-    fn open_global_config_folder(&mut self) {
+    pub(crate) fn open_global_config_folder(&mut self) {
         let config_path = match global_config_path() {
             Ok(path) => path,
             Err(error) => {
@@ -1618,13 +960,13 @@ impl DesktopController {
         self.open_path_in_file_manager(&folder);
     }
 
-    fn open_typed_path_in_file_manager(&mut self) {
+    pub(crate) fn open_typed_path_in_file_manager(&mut self) {
         if let Some(path) = self.resolve_workspace_input() {
             self.open_path_in_file_manager(&path);
         }
     }
 
-    fn open_selected_artifact_folder(&mut self) {
+    pub(crate) fn open_selected_artifact_folder(&mut self) {
         let Some(path_text) = self.state.selected_artifact_path() else {
             self.state.set_status_message("select an artifact first");
             return;
@@ -1712,14 +1054,22 @@ impl DesktopController {
             return;
         }
         self.preferences.window_opacity_percent = Some(self.state.window_opacity_percent);
-        self.preferences.last_workspace = Some(self.app.workspace.root.clone());
+        if self.is_quick_chat_workspace() {
+            self.preferences.last_workspace = None;
+        } else {
+            self.preferences.last_workspace = Some(self.app.workspace.root.clone());
+        }
         if let Err(error) = self.preferences.save() {
             self.state
                 .set_status_message(format!("failed to save desktop preferences: {error}"));
         }
     }
 
-    fn answer_permission(&mut self, allow: bool) {
+    fn is_quick_chat_workspace(&self) -> bool {
+        is_quick_chat_workspace_path(&self.app.workspace.root)
+    }
+
+    pub(crate) fn answer_permission(&mut self, allow: bool) {
         if let Some(response) = self.permission_response.take() {
             if let Err(error) = response.send(allow) {
                 self.state
@@ -1825,7 +1175,7 @@ impl DesktopController {
         }
     }
 
-    fn drain_runtime_messages(&mut self) -> bool {
+    pub(crate) fn drain_runtime_messages(&mut self) -> bool {
         let mut changed = false;
         while let Ok(message) = self.runtime_rx.try_recv() {
             changed = true;
@@ -1945,8 +1295,10 @@ impl DesktopController {
                         let deleted_was_current = self.app.workspace.project_id == project_id;
                         self.preferences.mark_project_deleted(&project_root);
                         self.app = loaded.app.clone();
-                        self.preferences
-                            .unmark_project_deleted(&self.app.workspace.root);
+                        if !self.is_quick_chat_workspace() {
+                            self.preferences
+                                .unmark_project_deleted(&self.app.workspace.root);
+                        }
                         if deleted_was_current {
                             let effective = apply_preferences_override(
                                 &self.preferences,
@@ -1958,7 +1310,6 @@ impl DesktopController {
                             if let Some(opacity) = self.preferences.window_opacity_percent {
                                 self.state.set_window_opacity_percent(opacity);
                             }
-                            self.preferences.last_workspace = Some(self.app.workspace.root.clone());
                             self.persist_preferences();
                             if !self.state.provider_base_url_input.trim().is_empty() {
                                 self.load_provider_models();
@@ -2019,8 +1370,10 @@ impl DesktopController {
                 RuntimeMessage::WorkspaceSwitched(result) => match result {
                     Ok(loaded) => {
                         self.app = loaded.app.clone();
-                        self.preferences
-                            .unmark_project_deleted(&self.app.workspace.root);
+                        if !self.is_quick_chat_workspace() {
+                            self.preferences
+                                .unmark_project_deleted(&self.app.workspace.root);
+                        }
                         let effective = apply_preferences_override(
                             &self.preferences,
                             &self.app.workspace.root,
@@ -2031,10 +1384,14 @@ impl DesktopController {
                         if let Some(opacity) = self.preferences.window_opacity_percent {
                             self.state.set_window_opacity_percent(opacity);
                         }
-                        self.preferences.last_workspace = Some(self.app.workspace.root.clone());
                         self.persist_preferences();
                         if !self.state.provider_base_url_input.trim().is_empty() {
                             self.load_provider_models();
+                        }
+                        if let Some(session_id) = self.state.selected_session_id() {
+                            self.state
+                                .set_status_message(format!("opening session {session_id}..."));
+                            self.spawn_session_load(session_id, SessionLoadReason::UserSelection);
                         }
                         self.state.set_status_message(format!(
                             "workspace set to {}",
@@ -2073,13 +1430,188 @@ fn title_from_prompt(prompt: &str) -> String {
     }
 }
 
+fn transcript_markdown_file_name(title: &str, session_id: SessionId) -> String {
+    format!("{}-{}.md", markdown_file_stem(title), session_id)
+}
+
+fn markdown_file_stem(title: &str) -> String {
+    let cleaned = title
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else if ch.is_whitespace() || matches!(ch, '.' | '/' | '\\' | ':' | '*') {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let stem = cleaned.trim_matches('-');
+    if stem.is_empty() {
+        "transcript".to_string()
+    } else {
+        stem.chars().take(64).collect()
+    }
+}
+
+fn open_transcript_rows_to_markdown(
+    title: &str,
+    workspace: &Utf8Path,
+    session_id: SessionId,
+    provider_base_url: &str,
+    model: &str,
+    rows: &[DesktopTranscriptRow],
+    file_changes: &[super::models::DesktopFileChangeRow],
+) -> String {
+    let mut markdown = String::new();
+    markdown.push_str("# ");
+    markdown.push_str(&markdown_heading_text(title));
+    markdown.push_str("\n\n");
+
+    if let Some(user) = rows.iter().find(|row| row.kind == "user") {
+        markdown.push_str("> ");
+        markdown.push_str(&user.body.trim().replace('\n', "\n> "));
+        markdown.push_str("\n\n");
+    }
+
+    let final_assistant_index = rows.iter().rposition(|row| row.kind == "assistant");
+    let detail_rows = rows
+        .iter()
+        .enumerate()
+        .filter(|(index, row)| Some(*index) != final_assistant_index && row.kind != "user")
+        .collect::<Vec<_>>();
+    if !detail_rows.is_empty() {
+        markdown.push_str("<details><summary>");
+        markdown.push_str(&format!("{} previous messages", detail_rows.len()));
+        markdown.push_str("</summary>\n\n");
+        for (_, row) in detail_rows {
+            append_transcript_detail_row(&mut markdown, row);
+        }
+        markdown.push_str("</details>\n\n");
+    }
+
+    if let Some(index) = final_assistant_index {
+        let body = rows[index].body.trim();
+        if !body.is_empty() && !assistant_body_is_pseudo_tool_call_closeout(body) {
+            markdown.push_str(body);
+            markdown.push_str("\n\n");
+        }
+    }
+    if final_assistant_index
+        .and_then(|index| rows.get(index))
+        .is_some_and(|row| assistant_body_is_pseudo_tool_call_closeout(row.body.trim()))
+    {
+        markdown.push_str("完了しました。\n\n");
+    }
+
+    if !file_changes.is_empty() {
+        markdown.push_str("<details><summary>ファイル変更履歴</summary>\n\n");
+        for change in file_changes {
+            markdown.push_str("- ");
+            markdown.push_str(&markdown_heading_text(&format!(
+                "[{}] {}",
+                change.action, change.path
+            )));
+            if !change.summary.trim().is_empty() {
+                markdown.push_str(" - ");
+                markdown.push_str(&markdown_heading_text(&change.summary));
+            }
+            markdown.push('\n');
+        }
+        markdown.push_str("\n</details>\n\n");
+    }
+
+    markdown.push_str("<details><summary>実行情報</summary>\n\n");
+    markdown.push_str(&format!("- Workspace: `{}`\n", workspace));
+    markdown.push_str(&format!("- Session: `{}`\n", session_id));
+    markdown.push_str(&format!("- Provider: `{}`\n", provider_base_url));
+    markdown.push_str(&format!("- Model: `{}`\n", model));
+    markdown.push_str("</details>\n");
+    markdown
+}
+
+fn assistant_body_is_pseudo_tool_call_closeout(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("<tool_call>")
+        || lower.contains("<function=")
+        || lower.contains("<parameter=command>")
+}
+
+fn append_transcript_detail_row(markdown: &mut String, row: &DesktopTranscriptRow) {
+    match row.kind.as_str() {
+        "assistant" => {
+            let body = export_visible_body(&row.body);
+            if !body.is_empty() {
+                markdown.push_str("> ");
+                markdown.push_str(&body.replace('\n', "\n> "));
+                markdown.push_str("\n\n");
+            }
+        }
+        "tool" | "editing" | "diff" | "summary" => {
+            markdown.push_str("<details><summary>");
+            markdown.push_str(&markdown_heading_text(&row.title));
+            markdown.push_str("</summary>\n\n");
+            let body = export_visible_body(&row.body);
+            if body.is_empty() {
+                markdown.push_str("_内容はありません。_\n\n");
+            } else {
+                markdown.push_str(&body);
+                markdown.push_str("\n\n");
+            }
+            markdown.push_str("</details>\n\n");
+        }
+        _ => {
+            markdown.push_str("> ");
+            markdown.push_str(&markdown_heading_text(&row.title));
+            if !row.body.trim().is_empty() {
+                markdown.push_str("\n> ");
+                markdown.push_str(&row.body.trim().replace('\n', "\n> "));
+            }
+            markdown.push_str("\n\n");
+        }
+    }
+}
+
+fn export_visible_body(body: &str) -> String {
+    body.lines()
+        .filter(|line| !line_contains_hidden_runtime_path(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn line_contains_hidden_runtime_path(line: &str) -> bool {
+    let normalized = line.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/__pycache__/")
+        || normalized.contains("__pycache__/")
+        || normalized.contains(".pyc")
+}
+
+fn markdown_heading_text(value: &str) -> String {
+    value
+        .lines()
+        .next()
+        .unwrap_or("Transcript")
+        .replace('#', "\\#")
+        .trim()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        fallback_workspace_after_project_delete, first_restorable_project_root, title_from_prompt,
+        fallback_workspace_after_project_delete, first_restorable_project_root,
+        open_transcript_rows_to_markdown, title_from_prompt, transcript_markdown_file_name,
     };
+    use crate::desktop::models::{DesktopFileChangeRow, DesktopTranscriptRow};
     use crate::session::{ProjectId, ProjectRecord};
-    use camino::Utf8Path;
+    use camino::{Utf8Path, Utf8PathBuf};
 
     fn project_record(id: ProjectId, root_path: &str) -> ProjectRecord {
         ProjectRecord {
@@ -2100,20 +1632,6 @@ mod tests {
         assert!(title.chars().count() <= 42);
         assert_eq!(title_from_prompt("\n\n"), "New Chat");
         assert!(title_from_prompt("a ".repeat(80).as_str()).chars().count() <= 42);
-    }
-
-    #[test]
-    fn desktop_composer_edit_does_not_rewrite_text_from_render_model() {
-        let source = include_str!("app.rs");
-        let callback = source
-            .split("bridge.on_composer_changed")
-            .nth(1)
-            .expect("composer callback exists")
-            .split("bridge.on_image_path_changed")
-            .next()
-            .expect("image path callback follows composer callback");
-        assert!(callback.contains("render_composer_action_state"));
-        assert!(!callback.contains("render_handle"));
     }
 
     #[test]
@@ -2147,6 +1665,94 @@ mod tests {
 
         assert_ne!(fallback.as_path(), deleted_root);
         assert_ne!(fallback, hidden_root);
+    }
+
+    #[test]
+    fn open_transcript_markdown_keeps_visible_rows_and_metadata() {
+        let session_id = crate::session::SessionId::new();
+        let rows = vec![
+            DesktopTranscriptRow {
+                kind: "user".to_string(),
+                step: "01".to_string(),
+                title: "Prompt".to_string(),
+                body: "Create a report.".to_string(),
+            },
+            DesktopTranscriptRow {
+                kind: "assistant".to_string(),
+                step: "02".to_string(),
+                title: "Response".to_string(),
+                body: "Done.\nSaved files.".to_string(),
+            },
+        ];
+
+        let markdown = open_transcript_rows_to_markdown(
+            "Session #1",
+            &Utf8PathBuf::from("C:/workspace"),
+            session_id,
+            "http://localhost:1234",
+            "local-model",
+            &rows,
+            &[],
+        );
+
+        assert!(markdown.contains("# Session \\#1"));
+        assert!(markdown.contains("> Create a report."));
+        assert!(markdown.contains("<details><summary>実行情報</summary>"));
+        assert!(markdown.contains("- Provider: `http://localhost:1234`"));
+        assert!(markdown.contains("Done.\nSaved files."));
+        assert!(
+            transcript_markdown_file_name("Session #1", session_id).ends_with(".md"),
+            "transcript export should always use markdown extension"
+        );
+    }
+
+    #[test]
+    fn open_transcript_markdown_replaces_pseudo_tool_call_closeout() {
+        let session_id = crate::session::SessionId::new();
+        let rows = vec![
+            DesktopTranscriptRow {
+                kind: "user".to_string(),
+                step: "01".to_string(),
+                title: "Prompt".to_string(),
+                body: "Create files.".to_string(),
+            },
+            DesktopTranscriptRow {
+                kind: "assistant".to_string(),
+                step: "02".to_string(),
+                title: "Response".to_string(),
+                body: "Now run this:\n<tool_call>\n<function=shell>\n</tool_call>".to_string(),
+            },
+            DesktopTranscriptRow {
+                kind: "summary".to_string(),
+                step: "03".to_string(),
+                title: "File changes".to_string(),
+                body: "Added README.md\nAdded __pycache__\\space_invader.cpython-313.pyc"
+                    .to_string(),
+            },
+        ];
+        let changes = vec![DesktopFileChangeRow {
+            label: "README.md".to_string(),
+            path: "README.md".to_string(),
+            action: "追加".to_string(),
+            summary: "Added README.md".to_string(),
+        }];
+
+        let markdown = open_transcript_rows_to_markdown(
+            "Case2",
+            &Utf8PathBuf::from("C:/workspace"),
+            session_id,
+            "http://localhost:1234",
+            "local-model",
+            &rows,
+            &changes,
+        );
+
+        assert!(markdown.contains("完了しました。"));
+        assert!(markdown.contains("ファイル変更履歴"));
+        assert!(markdown.contains("README.md"));
+        assert!(!markdown.contains("<tool_call>"));
+        assert!(!markdown.contains("__pycache__"));
+        assert!(!markdown.contains(".pyc"));
     }
 }
 
@@ -2253,15 +1859,6 @@ async fn purge_deleted_project_roots(
     Ok(())
 }
 
-async fn project_root_exists(app: &App, root: &Utf8Path) -> Result<bool, AppRunError> {
-    let projects = app
-        .session_service
-        .list_projects(200)
-        .await
-        .map_err(|error| AppRunError::Message(error.to_string()))?;
-    Ok(projects.iter().any(|project| project.root_path == root))
-}
-
 async fn next_project_root_after_delete(
     app: &App,
     deleted_project_id: ProjectId,
@@ -2303,8 +1900,8 @@ fn fallback_workspace_after_project_delete(
     data_dir: &Utf8Path,
 ) -> Utf8PathBuf {
     let mut candidates = Vec::new();
-    if let Some(default_workspace) = super::default_workspace_directory() {
-        candidates.push(default_workspace);
+    if let Some(quick_chat_workspace) = quick_chat_workspace_directory() {
+        candidates.push(quick_chat_workspace);
     }
     candidates.push(data_dir.join("desktop-workspace"));
     candidates.push(data_dir.join("desktop-workspace-after-delete"));
@@ -2316,6 +1913,23 @@ fn fallback_workspace_after_project_delete(
         .unwrap_or_else(|| data_dir.join("desktop-workspace-after-delete-2"))
 }
 
+fn is_quick_chat_workspace_path(path: &Utf8Path) -> bool {
+    quick_chat_workspace_directory().as_deref() == Some(path)
+}
+
+fn internal_desktop_project_roots(data_dir: &Utf8Path) -> Vec<Utf8PathBuf> {
+    [
+        "quick-chat-workspace",
+        "desktop-workspace",
+        "desktop-workspace-after-delete",
+        "desktop-workspace-after-delete-2",
+    ]
+    .into_iter()
+    .map(|name| data_dir.join(name))
+    .collect()
+}
+
+#[cfg(feature = "tauri-desktop")]
 fn pick_workspace_directory(
     start_dir: Option<&camino::Utf8PathBuf>,
 ) -> Result<Option<camino::Utf8PathBuf>, String> {
@@ -2331,6 +1945,14 @@ fn pick_workspace_directory(
     }
 }
 
+#[cfg(not(feature = "tauri-desktop"))]
+fn pick_workspace_directory(
+    _start_dir: Option<&camino::Utf8PathBuf>,
+) -> Result<Option<camino::Utf8PathBuf>, String> {
+    Err("desktop folder picker requires the tauri-desktop feature".to_string())
+}
+
+#[cfg(feature = "tauri-desktop")]
 fn pick_image_file(start_dir: Option<&Utf8Path>) -> Result<Option<Utf8PathBuf>, String> {
     let mut dialog =
         rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"]);
@@ -2345,18 +1967,9 @@ fn pick_image_file(start_dir: Option<&Utf8Path>) -> Result<Option<Utf8PathBuf>, 
     }
 }
 
-fn pick_history_markdown_path(default_file_name: &str) -> Result<Option<Utf8PathBuf>, String> {
-    match rfd::FileDialog::new()
-        .add_filter("Markdown", &["md"])
-        .set_file_name(default_file_name)
-        .save_file()
-    {
-        Some(path) => Utf8PathBuf::from_path_buf(path)
-            .map(normalize_markdown_export_path)
-            .map(Some)
-            .map_err(|_| "selected history export path is not valid UTF-8".to_string()),
-        None => Ok(None),
-    }
+#[cfg(not(feature = "tauri-desktop"))]
+fn pick_image_file(_start_dir: Option<&Utf8Path>) -> Result<Option<Utf8PathBuf>, String> {
+    Err("desktop image picker requires the tauri-desktop feature".to_string())
 }
 
 fn normalize_markdown_export_path(path: Utf8PathBuf) -> Utf8PathBuf {

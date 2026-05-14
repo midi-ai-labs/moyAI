@@ -1,3 +1,6 @@
 /target/
 /moyai.toml
 /project_sandbox/
+/node_modules/
+/gen/
+/ui/desktop-web/dist/

@@ -11,6 +11,7 @@ use moyai::cli::{
     RunArgs, StdConfirmationPrompt,
 };
 use moyai::config::{ConfigLoader, ShellFamily};
+#[cfg(feature = "tauri-desktop")]
 use moyai::desktop;
 use moyai::harness::artifact::hash_file;
 use moyai::harness::{
@@ -49,9 +50,24 @@ fn run() -> Result<(), (u8, String)> {
         | CliCommand::ModelAvailability(_)
         | CliCommand::SchemaExport(_)
         | CliCommand::ContractSnapshot(_)
-        | CliCommand::ManualStRoute(_)
-        | CliCommand::Desktop(_) => run_with_large_stack(command),
+        | CliCommand::ManualStRoute(_) => run_with_large_stack(command),
+        CliCommand::Desktop(_) => run_desktop_command(command),
         CliCommand::Tui(_) => run_on_current_thread(command),
+    }
+}
+
+fn run_desktop_command(command: CliCommand) -> Result<(), (u8, String)> {
+    #[cfg(feature = "tauri-desktop")]
+    {
+        run_on_current_thread(command)
+    }
+    #[cfg(not(feature = "tauri-desktop"))]
+    {
+        let _ = command;
+        Err((
+            2,
+            "desktop command requires the tauri-desktop feature".to_string(),
+        ))
     }
 }
 
@@ -128,17 +144,28 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
         return Ok(());
     }
     if let CliCommand::Desktop(args) = command.clone() {
-        desktop::run(
-            app,
-            desktop::DesktopArgs {
-                directory: args.directory.clone(),
-                session_id: args.session_id,
-                continue_last: args.continue_last,
-            },
-        )
-        .await
-        .map_err(|error| (4, error.to_string()))?;
-        return Ok(());
+        #[cfg(feature = "tauri-desktop")]
+        {
+            desktop::run(
+                app,
+                desktop::DesktopArgs {
+                    directory: args.directory.clone(),
+                    session_id: args.session_id,
+                    continue_last: args.continue_last,
+                },
+            )
+            .await
+            .map_err(|error| (4, error.to_string()))?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "tauri-desktop"))]
+        {
+            let _ = (app, args);
+            return Err((
+                2,
+                "desktop command requires the tauri-desktop feature".to_string(),
+            ));
+        }
     }
     let app_command = to_app_command(&command, &app);
     let output_mode = command_output_mode(&command);

@@ -5,6 +5,10 @@ edition = "2024"
 build = "build.rs"
 license = "MIT"
 
+[features]
+default = ["tauri-desktop"]
+tauri-desktop = ["dep:tauri", "tauri/custom-protocol", "dep:tauri-build", "dep:rfd"]
+
 [lib]
 name = "moyai"
 path = "src/lib.rs"
@@ -22,16 +26,16 @@ futures-util = "0.3.32"
 globset = "0.4.16"
 httpdate = "1.0.3"
 ignore = "0.4.24"
-slint = "1.10.0"
 ratatui = "0.29.0"
 regex = "1.11.1"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
-rfd = "0.15.4"
+rfd = { version = "0.15.4", optional = true }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 similar = "2.7.0"
+tauri = { version = "2.9.2", optional = true }
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "process", "fs", "signal", "time", "sync", "io-util"] }
@@ -47,4 +51,4 @@ axum = { version = "0.8.6", features = ["multipart"] }
 chrono = "0.4.44"
 
 [build-dependencies]
-slint-build = "1.10.0"
+tauri-build = { version = "2.5.1", optional = true }

@@ -1,11 +1,22 @@
+#[cfg(feature = "tauri-desktop")]
 pub mod app;
 pub mod args;
-pub mod bridge;
+#[cfg(feature = "tauri-desktop")]
 pub mod models;
+#[cfg(feature = "tauri-desktop")]
 pub mod preferences;
+#[cfg(feature = "tauri-desktop")]
 pub mod query;
+#[cfg(feature = "tauri-desktop")]
 pub mod state;
-pub mod view_model;
+#[cfg(feature = "tauri-desktop")]
+pub mod tauri_app;
+#[cfg(feature = "tauri-desktop")]
+pub mod web_model;
 
-pub use app::run;
-pub use args::{DesktopArgs, default_workspace_directory};
+#[cfg(feature = "tauri-desktop")]
+pub use args::DesktopArgs;
+#[cfg(feature = "tauri-desktop")]
+pub use args::quick_chat_workspace_directory;
+#[cfg(feature = "tauri-desktop")]
+pub use tauri_app::run;

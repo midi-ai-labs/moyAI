@@ -9,6 +9,7 @@ use moyai::cli::CliCommand;
 use moyai::cli::parse::DesktopArgs as CliDesktopArgs;
 use moyai::desktop::{self, DesktopArgs};
 
+#[cfg(not(feature = "tauri-desktop"))]
 const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
@@ -26,7 +27,7 @@ struct DesktopLauncherArgs {
 }
 
 fn main() -> ExitCode {
-    match run_with_large_stack() {
+    match run_desktop_launcher() {
         Ok(()) => ExitCode::SUCCESS,
         Err((code, message)) => {
             eprintln!("{message}");
@@ -35,6 +36,18 @@ fn main() -> ExitCode {
     }
 }
 
+fn run_desktop_launcher() -> Result<(), (u8, String)> {
+    #[cfg(feature = "tauri-desktop")]
+    {
+        run_on_current_thread()
+    }
+    #[cfg(not(feature = "tauri-desktop"))]
+    {
+        run_with_large_stack()
+    }
+}
+
+#[cfg(not(feature = "tauri-desktop"))]
 fn run_with_large_stack() -> Result<(), (u8, String)> {
     let join_handle = std::thread::Builder::new()
         .name("moyai-desktop-worker".to_string())

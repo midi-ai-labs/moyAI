@@ -1,0 +1,20 @@
+{
+  "name": "moyai-desktop-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev:desktop-web": "vite --host 127.0.0.1 --port 1420",
+    "build:desktop-web": "tsc --noEmit && vite build",
+    "tauri:dev": "tauri dev --features tauri-desktop",
+    "tauri:build": "tauri build --features tauri-desktop"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.7"
+  }
+}
