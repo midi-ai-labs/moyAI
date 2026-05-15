@@ -70,6 +70,7 @@ pub struct DesktopSnapshot {
     pub project_rows: Vec<DesktopProjectRow>,
     pub selected_project_index: usize,
     pub session_rows: Vec<DesktopSessionRow>,
+    pub chat_session_rows: Vec<DesktopSessionRow>,
     pub session_details: Vec<DesktopSessionDetail>,
     pub selected_session_index: usize,
 }

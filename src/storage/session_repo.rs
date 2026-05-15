@@ -377,6 +377,16 @@ impl SessionRepository for SqliteSessionRepository {
         Ok(())
     }
 
+    async fn update_session_title(&self, id: SessionId, title: &str) -> Result<(), StorageError> {
+        let now = SystemClock.now_ms();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE sessions SET title = ?2, updated_at_ms = ?3 WHERE id = ?1",
+            params![id.to_string(), title, now],
+        )?;
+        Ok(())
+    }
+
     async fn set_status(&self, id: SessionId, status: SessionStatus) -> Result<(), StorageError> {
         let now = SystemClock.now_ms();
         let status_text = match status {
@@ -384,11 +394,15 @@ impl SessionRepository for SqliteSessionRepository {
             SessionStatus::Running => "running",
             SessionStatus::Completed => "completed",
             SessionStatus::AwaitingUser => "awaiting_user",
+            SessionStatus::Cancelled => "cancelled",
             SessionStatus::Failed => "failed",
         };
         let completed_at_ms = if matches!(
             status,
-            SessionStatus::Completed | SessionStatus::AwaitingUser | SessionStatus::Failed
+            SessionStatus::Completed
+                | SessionStatus::AwaitingUser
+                | SessionStatus::Cancelled
+                | SessionStatus::Failed
         ) {
             Some(now)
         } else {
@@ -863,6 +877,7 @@ fn parse_status(value: &str) -> SessionStatus {
         "running" => SessionStatus::Running,
         "completed" => SessionStatus::Completed,
         "awaiting_user" => SessionStatus::AwaitingUser,
+        "cancelled" => SessionStatus::Cancelled,
         "failed" => SessionStatus::Failed,
         _ => SessionStatus::Failed,
     }

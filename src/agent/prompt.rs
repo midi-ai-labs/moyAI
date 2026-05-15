@@ -3,6 +3,7 @@ use std::fs;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::prompt_assets::{
     SystemPromptInput, active_follow_up_request_reminder, ask_route_reminder,
@@ -58,6 +59,7 @@ pub struct AgentRunRequest {
     pub state: SessionStateSnapshot,
     pub config: ResolvedConfig,
     pub model: ModelProfile,
+    pub cancel: CancellationToken,
 }
 
 #[derive(Debug, Clone)]

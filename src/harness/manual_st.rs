@@ -17,7 +17,7 @@ use crate::config::model::{PartialPermissionsConfig, PartialResolvedConfig};
 use crate::config::{AccessMode, ResolvedConfig, ShellFamily};
 use crate::error::{CliPromptError, CliRenderError};
 use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload, ProtocolEventStore};
-use crate::runtime::SystemClock;
+use crate::runtime::{SystemClock, build_cancel_token};
 use crate::session::SessionRepository;
 use crate::session::{
     EditorContext, MessageRole, PromptDispatchPart, RunEvent, RunSummary, SessionId, SessionStatus,
@@ -357,6 +357,7 @@ async fn run_case(
                     &case_spec.case_id,
                     closeout_continuation_turns,
                 ),
+                cancel: build_cancel_token(),
             };
             let stage_result = tokio::time::timeout(
                 Duration::from_secs(config.max_turn_seconds),
@@ -1650,6 +1651,7 @@ fn write_stage_events(
 fn latest_session_failed_message(events: &[RunEvent]) -> Option<&str> {
     events.iter().rev().find_map(|event| match event {
         RunEvent::SessionFailed { message, .. } => Some(message.as_str()),
+        RunEvent::SessionInterrupted { reason, .. } => Some(reason.as_str()),
         _ => None,
     })
 }

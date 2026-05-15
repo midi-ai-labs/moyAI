@@ -18,6 +18,7 @@ pub enum SessionStatus {
     Running,
     Completed,
     AwaitingUser,
+    Cancelled,
     Failed,
 }
 
@@ -820,6 +821,10 @@ pub enum RunEvent {
         session_id: SessionId,
         title: String,
     },
+    SessionTitleUpdated {
+        session_id: SessionId,
+        title: String,
+    },
     UserMessageStored {
         message_id: MessageId,
     },
@@ -919,6 +924,10 @@ pub enum RunEvent {
     SessionAwaitingUser {
         session_id: SessionId,
         finish_reason: Option<FinishReason>,
+    },
+    SessionInterrupted {
+        session_id: SessionId,
+        reason: String,
     },
     SessionFailed {
         session_id: SessionId,

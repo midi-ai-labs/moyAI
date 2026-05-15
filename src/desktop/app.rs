@@ -3,6 +3,7 @@ use std::sync::mpsc;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
+use crate::app::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
 use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest};
 use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode};
 use crate::config::loader::{global_config_path, project_config_paths};
@@ -14,13 +15,14 @@ use crate::llm::{
     ProviderModelInfo, apply_provider_model_info_to_config, fetch_provider_model_infos,
     normalize_provider_base_url,
 };
-use crate::runtime::SystemClock;
+use crate::runtime::{SystemClock, build_cancel_token};
 use crate::session::{
     EditorContext, ProjectId, ProjectRecord, RunEvent, RunSummary, SessionId, SessionRecord,
-    TodoItem, history_items_to_markdown, history_markdown_file_name,
+    SessionStatus, TodoItem, history_items_to_markdown, history_markdown_file_name,
 };
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
+use tokio_util::sync::CancellationToken;
 
 use super::args::{DesktopArgs, quick_chat_workspace_directory};
 use super::models::DesktopTranscriptRow;
@@ -63,6 +65,7 @@ enum RuntimeMessage {
     },
     HistoryExported(Result<Utf8PathBuf, String>),
     WorkspaceSwitched(Result<WorkspaceLoadResult, String>),
+    WorkspaceSwitchedForNewProjectSession(Result<WorkspaceLoadResult, String>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +96,7 @@ pub(crate) struct DesktopController {
     runtime_tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
     runtime_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeMessage>,
     permission_response: Option<mpsc::Sender<bool>>,
+    active_run_cancel: Option<CancellationToken>,
     next_enhance_request_id: u64,
 }
 
@@ -199,6 +203,7 @@ impl DesktopController {
             runtime_tx,
             runtime_rx,
             permission_response: None,
+            active_run_cancel: None,
             next_enhance_request_id: 1,
         };
         controller.persist_preferences();
@@ -219,6 +224,23 @@ impl DesktopController {
                 .expect("failed to build desktop refresh runtime");
             let result = runtime.block_on(async move {
                 load_snapshot_for_selection(&app, selected_session_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            let _ = runtime_tx.send(RuntimeMessage::SnapshotLoaded(result));
+        });
+    }
+
+    fn spawn_snapshot_refresh_for_session(&mut self, session_id: SessionId) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop refresh runtime");
+            let result = runtime.block_on(async move {
+                load_snapshot_for_selection(&app, Some(session_id))
                     .await
                     .map_err(|error| error.to_string())
             });
@@ -579,6 +601,94 @@ impl DesktopController {
         self.spawn_workspace_load(root);
     }
 
+    pub(crate) fn start_project_session(&mut self, index: usize) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("development chat cannot start while a run is active");
+            return;
+        }
+        self.state.select_project(index);
+        let Some(path) = self.state.selected_project_path().map(Utf8PathBuf::from) else {
+            self.state
+                .set_status_message("select a project before starting a development chat");
+            return;
+        };
+        self.state.hide_overlay();
+        if path == self.app.workspace.root {
+            self.state.start_new_chat();
+            self.state.set_status_message("new development chat ready");
+            self.persist_preferences();
+            return;
+        }
+        self.state.set_status_message(format!(
+            "opening project {} for a new development chat...",
+            path
+        ));
+        self.spawn_workspace_load_for_new_project_session(path);
+    }
+
+    pub(crate) fn open_quick_chat_session(&mut self, index: usize) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("chat cannot change while a run is active");
+            return;
+        }
+        let Some(session_id) = self
+            .state
+            .snapshot
+            .chat_session_rows
+            .get(index)
+            .map(|row| row.session_id)
+        else {
+            self.state.set_status_message("select a chat first");
+            return;
+        };
+        let Some(root) = quick_chat_workspace_directory() else {
+            self.state
+                .set_status_message("quick chat workspace is unavailable");
+            return;
+        };
+        if self.is_quick_chat_workspace() {
+            if let Some(row_index) = self
+                .state
+                .snapshot
+                .session_rows
+                .iter()
+                .position(|row| row.session_id == session_id)
+            {
+                self.state.select_session(row_index);
+                self.open_selected_session();
+                return;
+            }
+        }
+        self.state.hide_overlay();
+        self.state
+            .set_status_message(format!("opening chat {session_id}..."));
+        self.spawn_workspace_load_for_selection(root, Some(session_id));
+    }
+
+    pub(crate) fn delete_quick_chat_session(&mut self, index: usize) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("chat cannot be deleted while a run is active");
+            return;
+        }
+        let Some(session_id) = self
+            .state
+            .snapshot
+            .chat_session_rows
+            .get(index)
+            .map(|row| row.session_id)
+        else {
+            self.state
+                .set_status_message("select a chat before deleting");
+            return;
+        };
+        self.state
+            .set_status_message(format!("deleting chat {}...", session_id));
+        self.spawn_session_delete(session_id);
+    }
+
     pub(crate) fn create_project_from_picker(&mut self) {
         if self.state.is_busy() {
             self.state
@@ -831,6 +941,10 @@ impl DesktopController {
     }
 
     fn spawn_workspace_load(&self, requested: Utf8PathBuf) {
+        self.spawn_workspace_load_for_selection(requested, None);
+    }
+
+    fn spawn_workspace_load_for_new_project_session(&self, requested: Utf8PathBuf) {
         let store = self.app.session_service.store.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
@@ -843,6 +957,33 @@ impl DesktopController {
                     .await
                     .map_err(|error| error.to_string())?;
                 let snapshot = load_snapshot_for_selection(&app, None)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(WorkspaceLoadResult { app, snapshot })
+            });
+            let _ = runtime_tx.send(RuntimeMessage::WorkspaceSwitchedForNewProjectSession(
+                result,
+            ));
+        });
+    }
+
+    fn spawn_workspace_load_for_selection(
+        &self,
+        requested: Utf8PathBuf,
+        selected_session_id: Option<SessionId>,
+    ) {
+        let store = self.app.session_service.store.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop workspace runtime");
+            let result = runtime.block_on(async move {
+                let app = AppBootstrap::rebuild_for_directory(&requested, store)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let snapshot = load_snapshot_for_selection(&app, selected_session_id)
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(WorkspaceLoadResult { app, snapshot })
@@ -1079,6 +1220,26 @@ impl DesktopController {
         self.state.clear_permission();
     }
 
+    pub(crate) fn cancel_active_run(&mut self) {
+        let mut requested = false;
+        if let Some(cancel) = &self.active_run_cancel {
+            cancel.cancel();
+            requested = true;
+        }
+        if let Some(response) = self.permission_response.take() {
+            let _ = response.send(false);
+            self.state.clear_permission();
+            requested = true;
+        }
+        if requested {
+            self.state
+                .set_status_message("実行停止を要求しました。現在の処理を中断しています。");
+        } else {
+            self.state
+                .set_status_message("停止できる実行中タスクはありません。");
+        }
+    }
+
     fn launch_run_with_options(
         &mut self,
         prompt: String,
@@ -1096,6 +1257,7 @@ impl DesktopController {
             ));
             return;
         }
+        let cancel = build_cancel_token();
         let request = RunRequest {
             prompt: prompt.clone(),
             session_id: self.state.app_state.current_session_id,
@@ -1105,7 +1267,7 @@ impl DesktopController {
                 .app_state
                 .current_session_id
                 .is_none()
-                .then(|| title_from_prompt(&prompt)),
+                .then(|| NEW_SESSION_PLACEHOLDER_TITLE.to_string()),
             cwd: self.app.workspace.cwd.clone(),
             model: self.state.effective_config.model.model.clone(),
             base_url: self.state.effective_config.model.base_url.clone(),
@@ -1116,16 +1278,24 @@ impl DesktopController {
             editor_context: Some(self.current_editor_context()),
             review_request,
             image_paths,
+            cancel: cancel.clone(),
         };
+        self.active_run_cancel = Some(cancel);
         self.state.push_local_prompt_dispatch(&prompt_dispatch);
         self.state.draft_prompt.clear();
         self.state.image_attachment_paths.clear();
         self.state.image_attachment_input.clear();
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
+        let notification_title = request
+            .title
+            .clone()
+            .unwrap_or_else(|| self.state.current_session_label());
         std::thread::spawn(move || {
             let mut renderer = DesktopRenderer {
                 tx: runtime_tx.clone(),
+                notification_title: notification_title.clone(),
+                notified_terminal: false,
             };
             let mut prompt = DesktopConfirmationPrompt {
                 tx: runtime_tx.clone(),
@@ -1139,7 +1309,14 @@ impl DesktopController {
                     .execute(AppCommand::Run(request), &mut renderer, &mut prompt)
                     .await
                 {
-                    let _ = runtime_tx.send(RuntimeMessage::Finished(Err(error.to_string())));
+                    let error = error.to_string();
+                    let notification_body = run_error_notification_body(
+                        &notification_title,
+                        &crate::tui::state::RunStatus::Failed,
+                        &error,
+                    );
+                    send_windows_desktop_notification("moyAI", &notification_body);
+                    let _ = runtime_tx.send(RuntimeMessage::Finished(Err(error)));
                 }
             });
         });
@@ -1181,15 +1358,24 @@ impl DesktopController {
             changed = true;
             match message {
                 RuntimeMessage::RunEvent(event) => {
+                    let refresh_session_id = match &event {
+                        RunEvent::SessionStarted { session_id, .. }
+                        | RunEvent::SessionTitleUpdated { session_id, .. } => Some(*session_id),
+                        _ => None,
+                    };
                     self.state.apply_run_event(&event);
                     if event_requires_todo_refresh(&event) {
                         if let Some(session_id) = self.state.app_state.current_session_id {
                             self.spawn_current_todos_refresh(session_id);
                         }
                     }
+                    if let Some(session_id) = refresh_session_id {
+                        self.spawn_snapshot_refresh_for_session(session_id);
+                    }
                 }
                 RuntimeMessage::Finished(result) => match result {
                     Ok(summary) => {
+                        self.active_run_cancel = None;
                         self.state.app_state.set_summary(summary);
                         self.refresh_snapshot();
                         if let Some(session_id) = self.state.app_state.current_session_id {
@@ -1197,7 +1383,13 @@ impl DesktopController {
                         }
                     }
                     Err(error) => {
-                        self.state.app_state.run_status = crate::tui::state::RunStatus::Failed;
+                        self.active_run_cancel = None;
+                        if !matches!(
+                            self.state.app_state.run_status,
+                            crate::tui::state::RunStatus::Cancelled
+                        ) {
+                            self.state.app_state.run_status = crate::tui::state::RunStatus::Failed;
+                        }
                         self.state.set_status_message(error);
                     }
                 },
@@ -1400,33 +1592,35 @@ impl DesktopController {
                     }
                     Err(error) => self.state.set_status_message(error),
                 },
+                RuntimeMessage::WorkspaceSwitchedForNewProjectSession(result) => match result {
+                    Ok(loaded) => {
+                        self.app = loaded.app.clone();
+                        if !self.is_quick_chat_workspace() {
+                            self.preferences
+                                .unmark_project_deleted(&self.app.workspace.root);
+                        }
+                        let effective = apply_preferences_override(
+                            &self.preferences,
+                            &self.app.workspace.root,
+                            self.app.config.clone(),
+                        );
+                        self.state = DesktopState::new(loaded.snapshot, effective);
+                        self.state.workspace_input = self.app.workspace.cwd.to_string();
+                        if let Some(opacity) = self.preferences.window_opacity_percent {
+                            self.state.set_window_opacity_percent(opacity);
+                        }
+                        self.state.start_new_chat();
+                        self.state.set_status_message("new development chat ready");
+                        self.persist_preferences();
+                        if !self.state.provider_base_url_input.trim().is_empty() {
+                            self.load_provider_models();
+                        }
+                    }
+                    Err(error) => self.state.set_status_message(error),
+                },
             }
         }
         changed
-    }
-}
-
-fn title_from_prompt(prompt: &str) -> String {
-    let first_line = prompt
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("New Chat");
-    let mut title = first_line
-        .replace('`', "")
-        .replace('\t', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let max_chars = 42;
-    if title.chars().count() > max_chars {
-        title = title.chars().take(max_chars - 1).collect::<String>();
-        title.push('…');
-    }
-    if title.is_empty() {
-        "New Chat".to_string()
-    } else {
-        title
     }
 }
 
@@ -1603,14 +1797,449 @@ fn markdown_heading_text(value: &str) -> String {
         .to_string()
 }
 
+fn run_completion_notification_body(session_title: &str, summary: &RunSummary) -> String {
+    let session_title = notification_session_title(session_title);
+    let mut body = match summary.status {
+        SessionStatus::Completed => format!("{session_title} が完了しました。"),
+        SessionStatus::AwaitingUser => format!("{session_title} が確認待ちになりました。"),
+        SessionStatus::Cancelled => format!("{session_title} を停止しました。"),
+        SessionStatus::Failed => format!("{session_title} が失敗しました。"),
+        SessionStatus::Running => format!("{session_title} は実行中です。"),
+        SessionStatus::Idle => format!("{session_title} は待機状態です。"),
+    };
+    if summary.change_count > 0 {
+        body.push_str(&format!(" 変更: {}件。", summary.change_count));
+    }
+    if summary.tool_call_count > 0 {
+        body.push_str(&format!(" ツール: {}件", summary.tool_call_count));
+        if summary.failed_tool_count > 0 {
+            body.push_str(&format!(" / 失敗 {}件", summary.failed_tool_count));
+        }
+        body.push('。');
+    }
+    body
+}
+
+fn run_error_notification_body(
+    session_title: &str,
+    run_status: &crate::tui::state::RunStatus,
+    error: &str,
+) -> String {
+    let session_title = notification_session_title(session_title);
+    if matches!(run_status, crate::tui::state::RunStatus::Cancelled) {
+        return format!("{session_title} を停止しました。");
+    }
+    let visible_error = error.lines().next().unwrap_or(error).trim();
+    if visible_error.is_empty() {
+        format!("{session_title} が失敗しました。")
+    } else {
+        format!("{session_title} が失敗しました: {visible_error}")
+    }
+}
+
+fn run_terminal_event_notification_body(session_title: &str, event: &RunEvent) -> Option<String> {
+    let session_title = notification_session_title(session_title);
+    match event {
+        RunEvent::SessionCompleted { .. } => Some(format!("{session_title} が完了しました。")),
+        RunEvent::SessionAwaitingUser { .. } => {
+            Some(format!("{session_title} が確認待ちになりました。"))
+        }
+        RunEvent::SessionInterrupted { reason, .. } => {
+            let visible_reason = reason.lines().next().unwrap_or(reason).trim();
+            if visible_reason.is_empty() {
+                Some(format!("{session_title} を停止しました。"))
+            } else {
+                Some(format!("{session_title} を停止しました: {visible_reason}"))
+            }
+        }
+        RunEvent::SessionFailed { message, .. } => {
+            let visible_error = message.lines().next().unwrap_or(message).trim();
+            if visible_error.is_empty() {
+                Some(format!("{session_title} が失敗しました。"))
+            } else {
+                Some(format!("{session_title} が失敗しました: {visible_error}"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn notification_session_title(session_title: &str) -> String {
+    let trimmed = session_title.trim();
+    if trimmed.is_empty() || trimmed == "セッション未選択" || trimmed == "新規チャット"
+    {
+        "タスク".to_string()
+    } else {
+        trimmed.chars().take(48).collect()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn send_windows_desktop_notification(title: &str, body: &str) {
+    if show_windows_notify_icon_balloon(title, body) {
+        append_notification_debug_log(&format!(
+            "native balloon queued title={title:?} body={body:?}"
+        ));
+        return;
+    }
+    append_notification_debug_log("native balloon unavailable; falling back to powershell");
+    let script = windows_toast_script(title, body);
+    let encoded = encode_powershell_command(&script);
+    let powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    let powershell = if std::path::Path::new(powershell).exists() {
+        powershell
+    } else {
+        "powershell.exe"
+    };
+    let parameters = format!(
+        "-NoProfile -Sta -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {encoded}"
+    );
+    append_notification_debug_log(&format!("launch title={title:?} body={body:?}"));
+    let launched = unsafe { shell_execute_hidden(powershell, &parameters) };
+    append_notification_debug_log(&format!("shell_execute launched={launched}"));
+    if !launched {
+        let fallback = ProcessCommand::new("cmd.exe")
+            .args([
+                "/C",
+                "start",
+                "",
+                "/MIN",
+                powershell,
+                "-NoProfile",
+                "-Sta",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-EncodedCommand",
+                &encoded,
+            ])
+            .spawn();
+        append_notification_debug_log(&format!("fallback={fallback:?}"));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn send_windows_desktop_notification(_title: &str, _body: &str) {}
+
+#[cfg(target_os = "windows")]
+fn windows_toast_script(title: &str, body: &str) -> String {
+    let title = powershell_single_quoted(title);
+    let body = powershell_single_quoted(body);
+    format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+if ($env:MOYAI_NOTIFICATION_DEBUG_LOG) {{
+  Add-Content -Encoding UTF8 -Path $env:MOYAI_NOTIFICATION_DEBUG_LOG -Value ('script-start ' + (Get-Date -Format o))
+}}
+$notify = New-Object System.Windows.Forms.NotifyIcon
+$notify.Icon = [System.Drawing.SystemIcons]::Information
+$notify.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+$notify.BalloonTipTitle = {title}
+$notify.BalloonTipText = {body}
+$notify.Visible = $true
+$notify.ShowBalloonTip(7000)
+Start-Sleep -Seconds 8
+$notify.Dispose()
+if ($env:MOYAI_NOTIFICATION_DEBUG_LOG) {{
+  Add-Content -Encoding UTF8 -Path $env:MOYAI_NOTIFICATION_DEBUG_LOG -Value ('script-end ' + (Get-Date -Format o))
+}}
+"#
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn append_notification_debug_log(message: &str) {
+    if let Ok(path) = std::env::var("MOYAI_NOTIFICATION_DEBUG_LOG") {
+        let timestamp = format!("{:?}", std::time::SystemTime::now());
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| {
+                use std::io::Write as _;
+                writeln!(file, "{timestamp} {message}")
+            });
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_notify_icon_balloon(title: &str, body: &str) -> bool {
+    let title = title.chars().take(63).collect::<String>();
+    let body = body.chars().take(255).collect::<String>();
+    std::thread::Builder::new()
+        .name("moyai-notification".to_string())
+        .spawn(move || unsafe {
+            let result = show_windows_notify_icon_balloon_inner(&title, &body);
+            append_notification_debug_log(&format!("native balloon result={result}"));
+        })
+        .is_ok()
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn show_windows_notify_icon_balloon_inner(title: &str, body: &str) -> bool {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    const NIF_MESSAGE: u32 = 0x0000_0001;
+    const NIF_ICON: u32 = 0x0000_0002;
+    const NIF_TIP: u32 = 0x0000_0004;
+    const NIF_INFO: u32 = 0x0000_0010;
+    const NIM_ADD: u32 = 0x0000_0000;
+    const NIM_MODIFY: u32 = 0x0000_0001;
+    const NIM_DELETE: u32 = 0x0000_0002;
+    const NIIF_INFO: u32 = 0x0000_0001;
+    const WM_APP: u32 = 0x8000;
+    const IDI_INFORMATION: usize = 32516;
+
+    #[repr(C)]
+    struct WndClassW {
+        style: u32,
+        lpfn_wnd_proc: Option<unsafe extern "system" fn(*mut c_void, u32, usize, isize) -> isize>,
+        cb_cls_extra: i32,
+        cb_wnd_extra: i32,
+        h_instance: *mut c_void,
+        h_icon: *mut c_void,
+        h_cursor: *mut c_void,
+        hbr_background: *mut c_void,
+        lpsz_menu_name: *const u16,
+        lpsz_class_name: *const u16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+
+    #[repr(C)]
+    struct NotifyIconDataW {
+        cb_size: u32,
+        hwnd: *mut c_void,
+        uid: u32,
+        uflags: u32,
+        ucallback_message: u32,
+        hicon: *mut c_void,
+        sztip: [u16; 128],
+        dw_state: u32,
+        dw_state_mask: u32,
+        szinfo: [u16; 256],
+        utimeout_or_version: u32,
+        szinfo_title: [u16; 64],
+        dw_info_flags: u32,
+        guid_item: Guid,
+        hballoon_icon: *mut c_void,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn RegisterClassW(lp_wnd_class: *const WndClassW) -> u16;
+        fn CreateWindowExW(
+            dw_ex_style: u32,
+            lp_class_name: *const u16,
+            lp_window_name: *const u16,
+            dw_style: u32,
+            x: i32,
+            y: i32,
+            n_width: i32,
+            n_height: i32,
+            hwnd_parent: *mut c_void,
+            hmenu: *mut c_void,
+            hinstance: *mut c_void,
+            lp_param: *mut c_void,
+        ) -> *mut c_void;
+        fn DestroyWindow(hwnd: *mut c_void) -> i32;
+        fn DefWindowProcW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
+        fn LoadIconW(hinstance: *mut c_void, lp_icon_name: *const u16) -> *mut c_void;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(lp_module_name: *const u16) -> *mut c_void;
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn Shell_NotifyIconW(dw_message: u32, lp_data: *mut NotifyIconDataW) -> i32;
+    }
+
+    unsafe extern "system" fn notification_wnd_proc(
+        hwnd: *mut c_void,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    fn wide_null(value: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    fn resource_id(value: usize) -> *const u16 {
+        value as *const u16
+    }
+
+    fn copy_wide<const N: usize>(target: &mut [u16; N], value: &str) {
+        for (slot, code_unit) in target
+            .iter_mut()
+            .take(N.saturating_sub(1))
+            .zip(value.encode_utf16())
+        {
+            *slot = code_unit;
+        }
+    }
+
+    let hinstance = unsafe { GetModuleHandleW(null()) };
+    let class_name = wide_null("moyai_notification_window");
+    let window_name = wide_null("moyAI");
+    let wnd_class = WndClassW {
+        style: 0,
+        lpfn_wnd_proc: Some(notification_wnd_proc),
+        cb_cls_extra: 0,
+        cb_wnd_extra: 0,
+        h_instance: hinstance,
+        h_icon: null_mut(),
+        h_cursor: null_mut(),
+        hbr_background: null_mut(),
+        lpsz_menu_name: null(),
+        lpsz_class_name: class_name.as_ptr(),
+    };
+    let _ = unsafe { RegisterClassW(&wnd_class) };
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            window_name.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            (-3isize) as *mut c_void,
+            null_mut(),
+            hinstance,
+            null_mut(),
+        )
+    };
+    if hwnd.is_null() {
+        return false;
+    }
+
+    let mut data = NotifyIconDataW {
+        cb_size: std::mem::size_of::<NotifyIconDataW>() as u32,
+        hwnd,
+        uid: 1,
+        uflags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        ucallback_message: WM_APP + 1,
+        hicon: unsafe { LoadIconW(null_mut(), resource_id(IDI_INFORMATION)) },
+        sztip: [0; 128],
+        dw_state: 0,
+        dw_state_mask: 0,
+        szinfo: [0; 256],
+        utimeout_or_version: 0,
+        szinfo_title: [0; 64],
+        dw_info_flags: NIIF_INFO,
+        guid_item: Guid {
+            data1: 0,
+            data2: 0,
+            data3: 0,
+            data4: [0; 8],
+        },
+        hballoon_icon: null_mut(),
+    };
+    copy_wide(&mut data.sztip, "moyAI");
+    let added = unsafe { Shell_NotifyIconW(NIM_ADD, &mut data) } != 0;
+    if !added {
+        let _ = unsafe { DestroyWindow(hwnd) };
+        return false;
+    }
+
+    data.uflags = NIF_INFO;
+    copy_wide(&mut data.szinfo_title, title);
+    copy_wide(&mut data.szinfo, body);
+    let modified = unsafe { Shell_NotifyIconW(NIM_MODIFY, &mut data) } != 0;
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &mut data) };
+    let _ = unsafe { DestroyWindow(hwnd) };
+    modified
+}
+
+#[cfg(target_os = "windows")]
+fn encode_powershell_command(script: &str) -> String {
+    use base64::Engine as _;
+    let bytes = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn shell_execute_hidden(file: &str, parameters: &str) -> bool {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> *mut c_void;
+    }
+
+    fn wide_null(value: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let operation = wide_null("open");
+    let file = wide_null(file);
+    let parameters = wide_null(parameters);
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            parameters.as_ptr(),
+            null(),
+            0,
+        )
+    } as isize;
+    result > 32
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         fallback_workspace_after_project_delete, first_restorable_project_root,
-        open_transcript_rows_to_markdown, title_from_prompt, transcript_markdown_file_name,
+        notification_session_title, open_transcript_rows_to_markdown,
+        run_completion_notification_body, run_terminal_event_notification_body,
+        transcript_markdown_file_name,
     };
     use crate::desktop::models::{DesktopFileChangeRow, DesktopTranscriptRow};
-    use crate::session::{ProjectId, ProjectRecord};
+    use crate::session::{ProjectId, ProjectRecord, RunEvent, RunSummary, SessionStatus};
     use camino::{Utf8Path, Utf8PathBuf};
 
     fn project_record(id: ProjectId, root_path: &str) -> ProjectRecord {
@@ -1622,16 +2251,6 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
         }
-    }
-
-    #[test]
-    fn desktop_title_from_prompt_is_short_and_human_readable() {
-        let title =
-            title_from_prompt("  `calculator.py` と `test_calculator.py` を作成してください。");
-        assert!(title.starts_with("calculator.py と test_calculator.py"));
-        assert!(title.chars().count() <= 42);
-        assert_eq!(title_from_prompt("\n\n"), "New Chat");
-        assert!(title_from_prompt("a ".repeat(80).as_str()).chars().count() <= 42);
     }
 
     #[test]
@@ -1754,20 +2373,83 @@ mod tests {
         assert!(!markdown.contains("__pycache__"));
         assert!(!markdown.contains(".pyc"));
     }
+
+    #[test]
+    fn completion_notification_body_summarizes_terminal_run() {
+        let summary = RunSummary {
+            session_id: crate::session::SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 3,
+            failed_tool_count: 1,
+            change_count: 2,
+        };
+
+        let body = run_completion_notification_body("  case2 GUI  ", &summary);
+
+        assert!(body.contains("case2 GUI が完了しました。"));
+        assert!(body.contains("変更: 2件"));
+        assert!(body.contains("ツール: 3件 / 失敗 1件"));
+        assert_eq!(notification_session_title(""), "タスク");
+    }
+
+    #[test]
+    fn terminal_event_notification_body_uses_terminal_state() {
+        let body = run_terminal_event_notification_body(
+            "case2 GUI",
+            &RunEvent::SessionInterrupted {
+                session_id: crate::session::SessionId::new(),
+                reason: "user requested stop\nsecond line".to_string(),
+            },
+        )
+        .expect("terminal event should produce a notification");
+
+        assert_eq!(body, "case2 GUI を停止しました: user requested stop");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_toast_script_quotes_notification_text() {
+        let script = super::windows_toast_script("moy'AI", "done & \"quoted\"");
+
+        assert!(script.contains("'moy''AI'"));
+        assert!(script.contains("'done & \"quoted\"'"));
+        assert!(script.contains("ShowBalloonTip"));
+    }
 }
 
 struct DesktopRenderer {
     tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
+    notification_title: String,
+    notified_terminal: bool,
 }
 
 impl EventRenderer for DesktopRenderer {
     fn render(&mut self, event: &RunEvent) -> Result<(), CliRenderError> {
+        if let RunEvent::SessionTitleUpdated { title, .. } = event {
+            self.notification_title = notification_session_title(title);
+        }
+        if !self.notified_terminal {
+            if let Some(notification_body) =
+                run_terminal_event_notification_body(&self.notification_title, event)
+            {
+                send_windows_desktop_notification("moyAI", &notification_body);
+                self.notified_terminal = true;
+            }
+        }
         self.tx
             .send(RuntimeMessage::RunEvent(event.clone()))
             .map_err(|error| CliRenderError::Message(error.to_string()))
     }
 
     fn finish(&mut self, summary: &RunSummary) -> Result<(), CliRenderError> {
+        if !self.notified_terminal {
+            let notification_body =
+                run_completion_notification_body(&self.notification_title, summary);
+            send_windows_desktop_notification("moyAI", &notification_body);
+            self.notified_terminal = true;
+        }
         self.tx
             .send(RuntimeMessage::Finished(Ok(summary.clone())))
             .map_err(|error| CliRenderError::Message(error.to_string()))
@@ -1821,6 +2503,7 @@ fn event_requires_todo_refresh(event: &RunEvent) -> bool {
             | RunEvent::RecoverableRuntimeFeedback { .. }
             | RunEvent::SessionCompleted { .. }
             | RunEvent::SessionAwaitingUser { .. }
+            | RunEvent::SessionInterrupted { .. }
             | RunEvent::SessionFailed { .. }
     )
 }

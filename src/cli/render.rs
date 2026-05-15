@@ -33,6 +33,9 @@ impl EventRenderer for HumanRenderer {
             RunEvent::SessionStarted { session_id, title } => {
                 writeln!(stdout, "session {} {}", session_id, title)?;
             }
+            RunEvent::SessionTitleUpdated { session_id, title } => {
+                writeln!(stdout, "session {} title {}", session_id, title)?;
+            }
             RunEvent::UserMessageStored { message_id } => {
                 writeln!(stdout, "user {}", message_id)?;
             }
@@ -127,6 +130,9 @@ impl EventRenderer for HumanRenderer {
             }
             RunEvent::SessionAwaitingUser { session_id, .. } => {
                 writeln!(stdout, "\n[awaiting-user] {session_id}")?;
+            }
+            RunEvent::SessionInterrupted { reason, .. } => {
+                writeln!(stdout, "\n[interrupted] {reason}")?;
             }
             RunEvent::SessionFailed { message, .. } => {
                 writeln!(stdout, "\n[failed] {message}")?;

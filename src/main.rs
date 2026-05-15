@@ -19,8 +19,9 @@ use moyai::harness::{
     HarnessEventStore, HarnessRunId, HarnessRunRecord, HarnessRunStatus, HarnessRunStore,
     ReplayExecution, ReplayMode, ReplayProfile, ReplayReportStore, ReplayStatus,
 };
-use moyai::runtime::SystemClock;
+use moyai::runtime::{SystemClock, build_cancel_token};
 use moyai::session::EditorContext;
+use moyai::session::SessionStatus;
 use moyai::storage::{SqliteStore, StoragePaths};
 use moyai::tui;
 
@@ -59,7 +60,13 @@ fn run() -> Result<(), (u8, String)> {
 fn run_desktop_command(command: CliCommand) -> Result<(), (u8, String)> {
     #[cfg(feature = "tauri-desktop")]
     {
-        run_on_current_thread(command)
+        let CliCommand::Desktop(args) = command else {
+            return Err((
+                2,
+                "desktop launcher received a non-desktop command".to_string(),
+            ));
+        };
+        run_desktop_on_current_thread(args)
     }
     #[cfg(not(feature = "tauri-desktop"))]
     {
@@ -69,6 +76,30 @@ fn run_desktop_command(command: CliCommand) -> Result<(), (u8, String)> {
             "desktop command requires the tauri-desktop feature".to_string(),
         ))
     }
+}
+
+#[cfg(feature = "tauri-desktop")]
+fn run_desktop_on_current_thread(args: moyai::cli::parse::DesktopArgs) -> Result<(), (u8, String)> {
+    let command = CliCommand::Desktop(args.clone());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| (4, format!("failed to build desktop runtime: {error}")))?;
+    runtime.block_on(async move {
+        let app = AppBootstrap::build(&command)
+            .await
+            .map_err(|error| (3, error.to_string()))?;
+        desktop::run(
+            app,
+            desktop::DesktopArgs {
+                directory: args.directory,
+                session_id: args.session_id,
+                continue_last: args.continue_last,
+            },
+        )
+        .await
+        .map_err(|error| (4, error.to_string()))
+    })
 }
 
 fn run_with_large_stack(command: CliCommand) -> Result<(), (u8, String)> {
@@ -168,14 +199,32 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
         }
     }
     let app_command = to_app_command(&command, &app);
+    install_cli_interrupt_handler(&app_command);
     let output_mode = command_output_mode(&command);
     let mut renderer = build_renderer(output_mode);
     let mut prompt = StdConfirmationPrompt;
-    app.run_service
+    let summary = app
+        .run_service
         .execute(app_command, renderer.as_mut(), &mut prompt)
         .await
         .map_err(|error| (4, error.to_string()))?;
+    if summary.status == SessionStatus::Cancelled {
+        return Err((130, "run cancelled by user".to_string()));
+    }
     Ok(())
+}
+
+fn install_cli_interrupt_handler(command: &AppCommand) {
+    let AppCommand::Run(request) = command else {
+        return;
+    };
+    let cancel = request.cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel.cancel();
+            eprintln!("interrupt requested; cancelling active run...");
+        }
+    });
 }
 
 fn hydrate_run_prompt(command: CliCommand) -> Result<CliCommand, String> {
@@ -260,6 +309,7 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
                     })
             },
             image_paths: args.image_paths.clone(),
+            cancel: build_cancel_token(),
         }),
         CliCommand::SessionList(args) => AppCommand::SessionList(SessionListRequest {
             project_id: app.workspace.project_id,

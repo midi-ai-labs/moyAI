@@ -372,6 +372,18 @@ impl DesktopState {
 
     pub fn apply_run_event(&mut self, event: &crate::session::RunEvent) {
         self.app_state.apply_run_event(event);
+        if let crate::session::RunEvent::SessionTitleUpdated { session_id, title } = event {
+            for row in self
+                .snapshot
+                .session_rows
+                .iter_mut()
+                .chain(self.snapshot.chat_session_rows.iter_mut())
+            {
+                if row.session_id == *session_id {
+                    row.label = title.clone();
+                }
+            }
+        }
     }
 
     pub fn set_permission(&mut self, request: &PermissionRequest) {
@@ -429,6 +441,7 @@ impl DesktopState {
             self.set_status_message("new chat cannot start while a run is active");
             return;
         }
+        self.snapshot.selected_session_index = self.snapshot.session_rows.len();
         self.app_state = AppState::default();
         self.draft_prompt.clear();
         self.image_attachment_input.clear();
@@ -834,6 +847,7 @@ mod tests {
                 path: "C:/workspace".to_string(),
             }],
             selected_project_index: 0,
+            chat_session_rows: Vec::new(),
             session_rows,
             session_details: Vec::new(),
             selected_session_index,
@@ -871,5 +885,27 @@ mod tests {
         ));
 
         assert_eq!(state.selected_session_id(), Some(open));
+    }
+
+    #[test]
+    fn start_new_chat_clears_existing_session_selection() {
+        let existing = SessionId::new();
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![DesktopSessionRow {
+                    session_id: existing,
+                    label: "existing".to_string(),
+                }],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.app_state.current_session_id = Some(existing);
+
+        state.start_new_chat();
+
+        assert_eq!(state.selected_session_id(), None);
+        assert_eq!(state.snapshot.selected_session_index, 1);
+        assert_eq!(state.current_session_label(), "新規チャット");
     }
 }

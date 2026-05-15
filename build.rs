@@ -12,6 +12,7 @@ fn main() {
     println!("cargo:rerun-if-changed=ui/desktop-web");
     println!("cargo:rerun-if-changed={APP_ICON}");
     println!("cargo:rerun-if-changed={WINDOW_ICON}");
+    configure_windows_main_thread_stack();
 
     #[cfg(feature = "tauri-desktop")]
     tauri_build::build();
@@ -19,6 +20,22 @@ fn main() {
     if env::var("CARGO_CFG_WINDOWS").is_ok() && env::var_os("CARGO_FEATURE_TAURI_DESKTOP").is_none()
     {
         embed_windows_app_icon();
+    }
+}
+
+fn configure_windows_main_thread_stack() {
+    if env::var("CARGO_CFG_WINDOWS").is_err() {
+        return;
+    }
+    let stack_bytes = 16 * 1024 * 1024;
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        for bin in ["moyai", "moyai-desktop"] {
+            println!("cargo:rustc-link-arg-bin={bin}=/STACK:{stack_bytes}");
+        }
+    } else {
+        for bin in ["moyai", "moyai-desktop"] {
+            println!("cargo:rustc-link-arg-bin={bin}=-Wl,--stack,{stack_bytes}");
+        }
     }
 }
 

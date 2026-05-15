@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::desktop::args::DesktopArgs;
+use crate::desktop::args::{DesktopArgs, quick_chat_workspace_directory};
 use crate::desktop::models::{
     DesktopArtifactRow, DesktopCommandRow, DesktopFileChangeRow, DesktopProjectRow,
     DesktopSessionDetail, DesktopSessionRow, DesktopSnapshot, DesktopTranscriptRow,
@@ -13,6 +13,7 @@ use crate::session::{
 };
 use crate::tui::query::{recent_sessions, session_view};
 use crate::tui::state::{AppState, RunStatus, TranscriptKind};
+use camino::Utf8Path;
 
 pub async fn load_snapshot(app: &App, args: &DesktopArgs) -> Result<DesktopSnapshot, AppRunError> {
     load_snapshot_for_selection(app, args.session_id).await
@@ -78,12 +79,10 @@ async fn build_snapshot(
         &app.workspace.root,
         &hidden_roots,
     );
+    let chat_session_rows = build_quick_chat_session_rows(app, &projects).await?;
     for session in &sessions {
         let view = session_view(&app.session_service, session.id).await?;
-        session_rows.push(DesktopSessionRow {
-            session_id: session.id,
-            label: format_session_row(session),
-        });
+        session_rows.push(build_session_row(session));
         let replay_report = app
             .store
             .harness_replay_report_store()
@@ -105,9 +104,48 @@ async fn build_snapshot(
         project_rows,
         selected_project_index,
         session_rows,
+        chat_session_rows,
         session_details,
         selected_session_index,
     })
+}
+
+async fn build_quick_chat_session_rows(
+    app: &App,
+    projects: &[ProjectRecord],
+) -> Result<Vec<DesktopSessionRow>, AppRunError> {
+    let Some(root) = quick_chat_workspace_directory() else {
+        return Ok(Vec::new());
+    };
+    let project_id = projects
+        .iter()
+        .find(|project| project.root_path.as_path() == root.as_path())
+        .map(|project| project.id);
+    let project_id = match project_id {
+        Some(project_id) => project_id,
+        None => {
+            let Some(project_id) = app
+                .session_service
+                .list_projects(200)
+                .await?
+                .into_iter()
+                .find(|project| project.root_path.as_path() == root.as_path())
+                .map(|project| project.id)
+            else {
+                return Ok(Vec::new());
+            };
+            project_id
+        }
+    };
+    let sessions = recent_sessions(&app.session_service, project_id, 20).await?;
+    Ok(sessions.iter().map(build_session_row).collect())
+}
+
+fn build_session_row(session: &SessionRecord) -> DesktopSessionRow {
+    DesktopSessionRow {
+        session_id: session.id,
+        label: format_session_row(session),
+    }
 }
 
 fn build_project_rows(
@@ -231,13 +269,14 @@ pub fn build_session_detail(
     } else {
         ui_state.load_turn_items(session, &turn_items, state.clone(), todos.clone());
     }
-    let mut detail = build_session_detail_from_app_state(&ui_state);
-    detail.session_id = session.id;
     let file_changes = if turn_items.is_empty() {
         file_change_rows_from_transcript(&transcript)
     } else {
-        file_change_rows_from_turn_items(&turn_items)
+        file_change_rows_from_turn_items_with_root(&turn_items, Some(session.cwd.as_path()))
     };
+    let mut detail = build_session_detail_from_app_state(&ui_state);
+    detail.session_id = session.id;
+    detail.transcript_rows = transcript_rows_with_context(&ui_state, Some(session), &file_changes);
     detail.artifacts = artifact_rows_from_file_changes(&file_changes);
     detail.file_change_summary_text = format_file_change_summary(&file_changes);
     detail.artifact_preview_text = format_artifact_preview(detail.artifacts.first(), &file_changes);
@@ -267,6 +306,13 @@ pub fn build_session_detail_from_app_state(state: &AppState) -> DesktopSessionDe
 }
 
 pub fn file_change_rows_from_turn_items(turn_items: &[TurnItem]) -> Vec<DesktopFileChangeRow> {
+    file_change_rows_from_turn_items_with_root(turn_items, None)
+}
+
+fn file_change_rows_from_turn_items_with_root(
+    turn_items: &[TurnItem],
+    workspace_root: Option<&Utf8Path>,
+) -> Vec<DesktopFileChangeRow> {
     let mut rows = Vec::new();
     for item in turn_items {
         if let TurnItemPayload::FileChange {
@@ -277,7 +323,7 @@ pub fn file_change_rows_from_turn_items(turn_items: &[TurnItem]) -> Vec<DesktopF
                 changes
                     .iter()
                     .filter(|change| file_change_is_user_visible(change))
-                    .map(|change| file_change_row(change, summary.as_str())),
+                    .map(|change| file_change_row(change, summary.as_str(), workspace_root)),
             );
         }
     }
@@ -294,7 +340,13 @@ fn file_change_rows_from_transcript(transcript: &Transcript) -> Vec<DesktopFileC
                         .changes
                         .iter()
                         .filter(|change| file_change_is_user_visible(change))
-                        .map(|change| file_change_row(change, summary.summary.as_str())),
+                        .map(|change| {
+                            file_change_row(
+                                change,
+                                summary.summary.as_str(),
+                                Some(transcript.session.cwd.as_path()),
+                            )
+                        }),
                 );
             }
         }
@@ -302,12 +354,19 @@ fn file_change_rows_from_transcript(transcript: &Transcript) -> Vec<DesktopFileC
     dedupe_file_change_rows(rows)
 }
 
-fn file_change_row(change: &FileChangeEvidence, fallback_summary: &str) -> DesktopFileChangeRow {
-    let path = change
+fn file_change_row(
+    change: &FileChangeEvidence,
+    fallback_summary: &str,
+    workspace_root: Option<&Utf8Path>,
+) -> DesktopFileChangeRow {
+    let raw_path = change
         .path_after
         .as_ref()
         .or(change.path_before.as_ref())
-        .map(|value| value.to_string())
+        .map(|value| value.to_string());
+    let path = raw_path
+        .as_deref()
+        .map(|value| display_file_change_path(Utf8Path::new(value), workspace_root))
         .unwrap_or_else(|| "(不明なパス)".to_string());
     let label = path
         .rsplit(['/', '\\'])
@@ -315,17 +374,54 @@ fn file_change_row(change: &FileChangeEvidence, fallback_summary: &str) -> Deskt
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(path.as_str())
         .to_string();
-    let summary = if change.summary.trim().is_empty() {
+    let raw_summary = if change.summary.trim().is_empty() {
         fallback_summary.trim().to_string()
     } else {
         change.summary.trim().to_string()
     };
+    let summary = normalize_file_change_summary(&raw_summary, raw_path.as_deref(), &path);
     DesktopFileChangeRow {
         label,
         path,
         action: change_kind_label(change.kind).to_string(),
         summary,
     }
+}
+
+fn display_file_change_path(path: &Utf8Path, workspace_root: Option<&Utf8Path>) -> String {
+    let display_path = workspace_root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .filter(|relative| !relative.as_str().trim().is_empty())
+        .unwrap_or(path);
+    display_path.as_str().replace('\\', "/")
+}
+
+fn normalize_file_change_summary(
+    summary: &str,
+    raw_path: Option<&str>,
+    display_path: &str,
+) -> String {
+    let mut normalized = summary.to_string();
+    if let Some(raw_path) = raw_path {
+        for candidate in file_path_summary_variants(raw_path) {
+            normalized = normalized.replace(&candidate, display_path);
+        }
+    }
+    normalized
+}
+
+fn file_path_summary_variants(path: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+    for candidate in [
+        path.to_string(),
+        path.replace('\\', "/"),
+        path.replace('/', "\\"),
+    ] {
+        if !candidate.is_empty() && !variants.contains(&candidate) {
+            variants.push(candidate);
+        }
+    }
+    variants
 }
 
 fn file_change_is_user_visible(change: &FileChangeEvidence) -> bool {
@@ -364,8 +460,9 @@ fn dedupe_file_change_rows(rows: Vec<DesktopFileChangeRow>) -> Vec<DesktopFileCh
     for row in rows {
         if let Some(existing) = deduped
             .iter_mut()
-            .find(|existing| existing.path == row.path && existing.action == row.action)
+            .find(|existing| existing.path == row.path)
         {
+            existing.action = merged_file_change_action(&existing.action, &row.action).to_string();
             if !row.summary.trim().is_empty() {
                 existing.summary = row.summary;
             }
@@ -374,6 +471,18 @@ fn dedupe_file_change_rows(rows: Vec<DesktopFileChangeRow>) -> Vec<DesktopFileCh
         }
     }
     deduped
+}
+
+fn merged_file_change_action(existing: &str, incoming: &str) -> &'static str {
+    if existing == "追加" || incoming == "追加" {
+        "追加"
+    } else if incoming == "削除" {
+        "削除"
+    } else if incoming == "移動" {
+        "移動"
+    } else {
+        "更新"
+    }
 }
 
 fn format_file_change_summary(rows: &[DesktopFileChangeRow]) -> String {
@@ -477,6 +586,7 @@ fn format_session_status(status: SessionStatus) -> &'static str {
         SessionStatus::Running => "実行中",
         SessionStatus::Completed => "完了",
         SessionStatus::AwaitingUser => "確認待ち",
+        SessionStatus::Cancelled => "停止済み",
         SessionStatus::Failed => "失敗",
     }
 }
@@ -504,7 +614,15 @@ fn format_transcript_text(state: &AppState) -> String {
 }
 
 fn transcript_rows(state: &AppState) -> Vec<DesktopTranscriptRow> {
-    let mut rows = if state.transcript_entries.is_empty() {
+    transcript_rows_with_context(state, None, &[])
+}
+
+fn transcript_rows_with_context(
+    state: &AppState,
+    session: Option<&SessionRecord>,
+    file_changes: &[DesktopFileChangeRow],
+) -> Vec<DesktopTranscriptRow> {
+    let base_rows = if state.transcript_entries.is_empty() {
         vec![DesktopTranscriptRow {
             kind: "system".to_string(),
             step: "00".to_string(),
@@ -516,89 +634,203 @@ fn transcript_rows(state: &AppState) -> Vec<DesktopTranscriptRow> {
             .transcript_entries
             .iter()
             .enumerate()
-            .map(|(index, entry)| DesktopTranscriptRow {
-                kind: transcript_kind_key(entry.kind).to_string(),
-                step: format!("{:02}", index + 1),
-                title: entry_heading(entry.kind, &entry.title),
-                body: entry.body.trim().to_string(),
+            .filter_map(|(index, entry)| {
+                let kind = transcript_kind_key(entry.kind);
+                if is_internal_transcript_projection(kind, &entry.title) {
+                    return None;
+                }
+                Some(DesktopTranscriptRow {
+                    kind: kind.to_string(),
+                    step: format!("{:02}", index + 1),
+                    title: entry_heading(entry.kind, &entry.title),
+                    body: entry.body.trim().to_string(),
+                })
             })
             .collect::<Vec<_>>()
     };
 
+    let work_summary = work_summary_row(state, session, file_changes);
+    let mut rows =
+        fold_intermediate_assistant_rows(base_rows, state, file_changes, work_summary.is_some());
+    if let Some(work_summary) = work_summary {
+        let insert_index = rows
+            .iter()
+            .position(|row| row.kind == "assistant")
+            .unwrap_or(rows.len());
+        rows.insert(insert_index, work_summary);
+    }
+    renumber_rows(rows)
+}
+
+fn fold_intermediate_assistant_rows(
+    rows: Vec<DesktopTranscriptRow>,
+    state: &AppState,
+    file_changes: &[DesktopFileChangeRow],
+    has_work_summary: bool,
+) -> Vec<DesktopTranscriptRow> {
+    let should_fold = state.run_status.is_terminal()
+        && has_work_summary
+        && (!state.tool_statuses.is_empty()
+            || !state.sidebar_todos.is_empty()
+            || !file_changes.is_empty()
+            || state.last_summary.is_some());
+    if !should_fold {
+        return rows;
+    }
+    let last_assistant_index = rows
+        .iter()
+        .rposition(|row| row.kind == "assistant" && !row.body.trim().is_empty());
+    let assistant_count = rows.iter().filter(|row| row.kind == "assistant").count();
+    if assistant_count <= 1 {
+        return rows;
+    }
+    rows.into_iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            if row.kind == "assistant" && Some(index) != last_assistant_index {
+                None
+            } else {
+                Some(row)
+            }
+        })
+        .collect()
+}
+
+fn is_internal_transcript_projection(kind: &str, title: &str) -> bool {
+    matches!(kind, "tool" | "summary" | "diff" | "reasoning" | "editing")
+        || matches!(kind, "system") && !title.eq_ignore_ascii_case("User")
+}
+
+fn work_summary_row(
+    state: &AppState,
+    session: Option<&SessionRecord>,
+    file_changes: &[DesktopFileChangeRow],
+) -> Option<DesktopTranscriptRow> {
+    let has_work = !state.tool_statuses.is_empty()
+        || !state.sidebar_todos.is_empty()
+        || !file_changes.is_empty()
+        || state.last_summary.is_some()
+        || matches!(state.run_status, RunStatus::Running | RunStatus::Confirming);
+    if !has_work {
+        return None;
+    }
+
+    let kind = match state.run_status {
+        RunStatus::Running | RunStatus::Confirming => "work_summary_running",
+        RunStatus::Failed => "work_summary_failed",
+        RunStatus::Cancelled => "work_summary_cancelled",
+        _ => "work_summary_completed",
+    };
+    Some(DesktopTranscriptRow {
+        kind: kind.to_string(),
+        step: String::new(),
+        title: work_summary_title(state, session),
+        body: work_summary_body(state, file_changes),
+    })
+}
+
+fn work_summary_title(state: &AppState, session: Option<&SessionRecord>) -> String {
+    let elapsed = session.and_then(session_elapsed_label);
+    match state.run_status {
+        RunStatus::Running => elapsed
+            .map(|value| format!("{value} 作業中"))
+            .unwrap_or_else(|| "作業中".to_string()),
+        RunStatus::Confirming => elapsed
+            .map(|value| format!("{value} 確認待ち"))
+            .unwrap_or_else(|| "確認待ち".to_string()),
+        RunStatus::Failed => elapsed
+            .map(|value| format!("{value}で失敗しました"))
+            .unwrap_or_else(|| "失敗しました".to_string()),
+        RunStatus::Cancelled => elapsed
+            .map(|value| format!("{value}で停止しました"))
+            .unwrap_or_else(|| "停止しました".to_string()),
+        _ => elapsed
+            .map(|value| format!("{value}作業しました"))
+            .unwrap_or_else(|| "作業しました".to_string()),
+    }
+}
+
+fn session_elapsed_label(session: &SessionRecord) -> Option<String> {
+    let end = session
+        .completed_at_ms
+        .unwrap_or(session.updated_at_ms)
+        .max(session.created_at_ms);
+    let elapsed_ms = end.checked_sub(session.created_at_ms)?;
+    Some(format_duration(elapsed_ms))
+}
+
+fn format_duration(elapsed_ms: i64) -> String {
+    let total_seconds = (elapsed_ms / 1000).max(0);
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn work_summary_body(state: &AppState, file_changes: &[DesktopFileChangeRow]) -> String {
+    let mut sections = Vec::new();
     if matches!(state.run_status, RunStatus::Running | RunStatus::Confirming) {
-        rows.push(DesktopTranscriptRow {
-            kind: "running".to_string(),
-            step: format!("{:02}", rows.len() + 1),
-            title: if state.run_status == RunStatus::Confirming {
-                "確認待ち".to_string()
-            } else {
-                "実行中".to_string()
-            },
-            body: format!(
-                "{}\nフェーズ: {}\nコマンド: {}件完了 / {}件開始",
-                state.progress.active_step,
-                state.progress.current_phase,
-                state.progress.tool_calls_completed,
-                state.progress.tool_calls_started
-            ),
-        });
+        sections.push(format!(
+            "### 現在\n- フェーズ: {}\n- 手順: {}\n- モデル要求: {}",
+            state.progress.current_phase, state.progress.active_step, state.progress.model_requests
+        ));
     }
-
     if !state.sidebar_todos.is_empty() {
-        rows.push(DesktopTranscriptRow {
-            kind: "tasks".to_string(),
-            step: format!("{:02}", rows.len() + 1),
-            title: task_summary_title(&state.sidebar_todos),
-            body: format_todo_rows(&state.sidebar_todos),
-        });
+        sections.push(format!(
+            "### タスク\n{}\n{}",
+            task_summary_title(&state.sidebar_todos),
+            format_todo_rows(&state.sidebar_todos)
+        ));
     }
-
     if !state.tool_statuses.is_empty() {
-        rows.push(DesktopTranscriptRow {
-            kind: "summary".to_string(),
-            step: format!("{:02}", rows.len() + 1),
-            title: format_command_summary_title(&state.tool_statuses),
-            body: state
-                .tool_statuses
-                .iter()
-                .take(10)
-                .map(|tool| {
-                    let status = format!("{:?}", tool.status).to_lowercase();
-                    let detail = tool
-                        .summary
-                        .as_ref()
-                        .or(tool.error.as_ref())
-                        .map(|value| format!(" - {}", value.trim()))
-                        .unwrap_or_default();
-                    format!("[{status}] {} - {}{}", tool.tool, tool.title, detail)
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        });
+        sections.push(format!(
+            "### ツール\n{}\n{}",
+            format_command_summary_title(&state.tool_statuses),
+            format_compact_tool_rows(&state.tool_statuses)
+        ));
     }
-
+    if !file_changes.is_empty() {
+        sections.push(format!(
+            "### 変更\n{}",
+            file_changes
+                .iter()
+                .take(8)
+                .map(|row| format!("- [{}] {}", row.action, row.path))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
     if let Some(summary) = &state.last_summary {
-        rows.push(DesktopTranscriptRow {
-            kind: if summary.failed_tool_count > 0 {
-                "error".to_string()
-            } else {
-                "summary".to_string()
-            },
-            step: format!("{:02}", rows.len() + 1),
-            title: "完了サマリ".to_string(),
-            body: format!(
-                "status: {:?}\nfinish_reason: {}\ntools: {} executed, {} failed\nfile changes: {}",
-                summary.status,
-                summary
-                    .finish_reason
-                    .as_ref()
-                    .map(|value| format!("{value:?}"))
-                    .unwrap_or_else(|| "none".to_string()),
-                summary.tool_call_count,
-                summary.failed_tool_count,
-                summary.change_count
-            ),
-        });
+        sections.push(format!(
+            "### 完了\n- 状態: {}\n- ツール: {}件実行 / {}件失敗\n- ファイル変更: {}件",
+            format_session_status(summary.status),
+            summary.tool_call_count,
+            summary.failed_tool_count,
+            summary.change_count
+        ));
+    }
+    if sections.is_empty() {
+        "作業内容を整理しています。".to_string()
+    } else {
+        sections.join("\n\n")
+    }
+}
+
+fn format_compact_tool_rows(tools: &[crate::tui::state::ToolStatusView]) -> String {
+    tools
+        .iter()
+        .take(8)
+        .map(|tool| format!("- [{}] {}", tool_call_status_label(tool.status), tool.title))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn renumber_rows(mut rows: Vec<DesktopTranscriptRow>) -> Vec<DesktopTranscriptRow> {
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.step = format!("{:02}", index + 1);
     }
     rows
 }
@@ -832,6 +1064,7 @@ fn run_status_label(status: RunStatus) -> &'static str {
         RunStatus::Confirming => "確認待ち",
         RunStatus::Completed => "完了",
         RunStatus::AwaitingUser => "ユーザー確認待ち",
+        RunStatus::Cancelled => "停止済み",
         RunStatus::Failed => "失敗",
     }
 }
@@ -856,6 +1089,15 @@ fn todo_status_label(status: &str) -> &'static str {
         "InProgress" => "進行中",
         "Blocked" => "ブロック",
         _ => "未着手",
+    }
+}
+
+fn tool_call_status_label(status: ToolCallStatus) -> &'static str {
+    match status {
+        ToolCallStatus::Pending => "待機中",
+        ToolCallStatus::Running => "実行中",
+        ToolCallStatus::Completed => "完了",
+        ToolCallStatus::Failed => "失敗",
     }
 }
 
@@ -1036,6 +1278,71 @@ mod tests {
     }
 
     #[test]
+    fn file_change_rows_normalize_workspace_paths_and_collapse_session_edits() {
+        let session_id = SessionId::new();
+        let workspace_root = Utf8PathBuf::from("C:/workspace/calculator");
+        let turn_items = vec![TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id: crate::protocol::TurnId::new(),
+            source_item_id: None,
+            sequence_no: 1,
+            payload: TurnItemPayload::FileChange {
+                change_ids: vec![crate::session::ChangeId::new()],
+                changes: vec![
+                    FileChangeEvidence {
+                        change_id: crate::session::ChangeId::new(),
+                        kind: ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("calculator.py")),
+                        summary: "Added calculator.py".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: crate::session::ChangeId::new(),
+                        kind: ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from(
+                            "C:/workspace/calculator/calculator.py",
+                        )),
+                        path_after: Some(Utf8PathBuf::from(
+                            "C:/workspace/calculator/calculator.py",
+                        )),
+                        summary: "Updated calculator.py".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: crate::session::ChangeId::new(),
+                        kind: ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("test_calculator.py")),
+                        summary: "Added test_calculator.py".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: crate::session::ChangeId::new(),
+                        kind: ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from(
+                            "C:/workspace/calculator/test_calculator.py",
+                        )),
+                        path_after: Some(Utf8PathBuf::from(
+                            "C:/workspace/calculator/test_calculator.py",
+                        )),
+                        summary: "Updated test_calculator.py".to_string(),
+                    },
+                ],
+                summary: "Updated files".to_string(),
+            },
+        }];
+
+        let rows = file_change_rows_from_turn_items_with_root(&turn_items, Some(&workspace_root));
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].path, "calculator.py");
+        assert_eq!(rows[0].action, "追加");
+        assert_eq!(rows[0].summary, "Updated calculator.py");
+        assert_eq!(rows[1].path, "test_calculator.py");
+        assert_eq!(rows[1].action, "追加");
+        assert_eq!(rows[1].summary, "Updated test_calculator.py");
+    }
+
+    #[test]
     fn file_change_rows_hide_runtime_cache_files_from_user_history() {
         let session_id = SessionId::new();
         let turn_items = vec![TurnItem {
@@ -1138,7 +1445,12 @@ mod tests {
             error: None,
         }];
         let rows = transcript_rows(&state);
-        assert!(rows.iter().any(|row| row.title == "1件のコマンドを実行"));
+        let summary = rows
+            .iter()
+            .find(|row| row.kind == "work_summary_completed")
+            .expect("tool status should be projected into a work summary");
+        assert!(summary.body.contains("1件のコマンドを実行"));
+        assert!(!rows.iter().any(|row| row.kind == "tool"));
 
         state.run_status = RunStatus::Running;
         state.progress.active_step = "Running python -m unittest".to_string();
@@ -1166,8 +1478,181 @@ mod tests {
         });
 
         let rows = transcript_rows(&state);
-        assert!(rows.iter().any(|row| row.title == "実行中"));
-        assert!(rows.iter().any(|row| row.title.starts_with("タスク進捗")));
-        assert!(rows.iter().any(|row| row.title == "完了サマリ"));
+        let summary = rows
+            .iter()
+            .find(|row| row.kind == "work_summary_running")
+            .expect("running state should be projected into an expanded work summary");
+        assert_eq!(summary.title, "作業中");
+        assert!(summary.body.contains("タスク進捗"));
+        assert!(summary.body.contains("完了サマリ") || summary.body.contains("### 完了"));
+        assert!(!rows.iter().any(|row| row.title == "完了サマリ"));
+    }
+
+    #[test]
+    fn stored_session_work_summary_uses_elapsed_time_and_hides_internal_rows() {
+        let project_id = ProjectId::new();
+        let mut session = session_record(project_id, "calculator");
+        session.created_at_ms = 1_000;
+        session.updated_at_ms = 108_000;
+        session.completed_at_ms = Some(108_000);
+        let state = SessionStateSnapshot::default();
+        let turn_id = crate::protocol::TurnId::new();
+        let turn_items = vec![
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::UserMessage {
+                    text: "make a calculator".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 2,
+                payload: TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "python -m unittest".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 3,
+                payload: TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Write,
+                    status: crate::protocol::ToolLifecycleStatus::Pending,
+                    title: "write".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 4,
+                payload: TurnItemPayload::Terminal {
+                    status: crate::protocol::TurnTerminalStatus::Completed,
+                    summary: "session completed".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 5,
+                payload: TurnItemPayload::AgentMessage {
+                    text: "calculator.pyを追加しました。".to_string(),
+                },
+            },
+        ];
+
+        let detail = build_session_detail(
+            &session,
+            state,
+            Vec::new(),
+            Transcript {
+                session: session.clone(),
+                messages: Vec::new(),
+            },
+            turn_items,
+            None,
+        );
+
+        assert!(
+            detail.transcript_rows.iter().any(
+                |row| row.kind == "work_summary_completed" && row.title == "1m 47s作業しました"
+            )
+        );
+        assert!(!detail.transcript_rows.iter().any(|row| {
+            row.title.contains("Terminal")
+                || row.title.contains("編集中")
+                || row.kind == "tool"
+                || row.kind == "editing"
+        }));
+        assert!(
+            detail
+                .transcript_rows
+                .iter()
+                .any(|row| row.kind == "assistant" && row.body.contains("calculator.py"))
+        );
+    }
+
+    #[test]
+    fn completed_work_transcript_keeps_final_answer_and_folds_intermediate_assistant_prose() {
+        let mut state = AppState::default();
+        state.run_status = RunStatus::Completed;
+        state.last_summary = Some(crate::session::RunSummary {
+            session_id: SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 2,
+            failed_tool_count: 0,
+            change_count: 1,
+        });
+        state.transcript_entries = vec![
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "calculator.py と test_calculator.py を作成".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "まず test_calculator.py を作成します。".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "次に calculator.py を作成します。".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "完了しました。calculator.py と test_calculator.py を作成し、テストも通りました。".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+        ];
+        state.tool_statuses = vec![crate::tui::state::ToolStatusView {
+            tool_call_id: crate::session::ToolCallId::new(),
+            tool: crate::tool::ToolName::Shell,
+            title: "python -m unittest".to_string(),
+            status: ToolCallStatus::Completed,
+            summary: Some("tests passed".to_string()),
+            error: None,
+        }];
+
+        let rows = transcript_rows(&state);
+        let assistant_rows = rows
+            .iter()
+            .filter(|row| row.kind == "assistant")
+            .collect::<Vec<_>>();
+
+        assert_eq!(assistant_rows.len(), 1);
+        assert!(assistant_rows[0].body.contains("完了しました"));
+        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.body.contains("まず test_calculator.py"))
+        );
     }
 }

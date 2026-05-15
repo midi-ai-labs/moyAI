@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
-use tauri::{Manager, State, WindowEvent};
+use tauri::{
+    Manager, State, WindowEvent,
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
+};
 use tokio::sync::Mutex;
 
 use crate::app::App;
@@ -12,16 +16,39 @@ use super::web_model::{DesktopWebState, desktop_web_state};
 
 type SharedController = Arc<Mutex<DesktopController>>;
 
+#[cfg(target_os = "windows")]
+const HTCAPTION: usize = 2;
+#[cfg(target_os = "windows")]
+const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn ReleaseCapture() -> i32;
+    fn SendMessageW(
+        hwnd: *mut core::ffi::c_void,
+        msg: u32,
+        w_param: usize,
+        l_param: isize,
+    ) -> isize;
+}
+
 pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
     let controller = DesktopController::new(app, args).await?;
     let shared: SharedController = Arc::new(Mutex::new(controller));
     tauri::Builder::default()
         .manage(shared)
+        .setup(|app| {
+            install_tray(app.handle())?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             desktop_state,
             set_prompt,
             submit_prompt,
+            cancel_run,
             new_chat,
+            new_project_session,
             review_uncommitted,
             enhance_prompt,
             set_review_draft,
@@ -30,8 +57,10 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             refresh_desktop,
             select_project,
             select_session,
+            select_chat_session,
             delete_project,
             delete_session,
+            delete_chat_session,
             select_artifact,
             export_history_markdown,
             export_transcript_markdown,
@@ -76,15 +105,88 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             toggle_access_mode,
             set_window_opacity,
             answer_permission,
+            start_window_drag,
+            hide_to_tray,
             exit_app
         ])
         .on_window_event(|window, event| {
-            if matches!(event, WindowEvent::CloseRequested { .. }) {
-                window.app_handle().exit(0);
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
             }
         })
         .run(tauri::generate_context!())
         .map_err(|error| AppRunError::Message(format!("tauri desktop runtime failed: {error}")))
+}
+
+#[tauri::command]
+fn start_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        start_windows_caption_drag(&window)?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    window
+        .start_dragging()
+        .map_err(|error| format!("failed to start window drag: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn start_windows_caption_drag(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| format!("failed to get native window handle: {error}"))?;
+    unsafe {
+        let _ = ReleaseCapture();
+        let _ = SendMessageW(hwnd.0 as _, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+    }
+    Ok(())
+}
+
+fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let open = MenuItem::with_id(app, "open_moyai", "Open moyAI", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit_moyai", "終了", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &quit])?;
+    let mut builder = TrayIconBuilder::with_id("moyai-tray")
+        .tooltip("moyAI")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "open_moyai" => restore_main_window(app),
+            "quit_moyai" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } = event
+            {
+                restore_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
+fn restore_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[tauri::command]
+fn hide_to_tray(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
 }
 
 #[tauri::command]
@@ -119,9 +221,28 @@ async fn submit_prompt(controller: State<'_, SharedController>) -> Result<Deskto
 }
 
 #[tauri::command]
+async fn cancel_run(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
+    let mut controller = controller.lock().await;
+    controller.cancel_active_run();
+    controller.drain_runtime_messages();
+    Ok(desktop_web_state(&controller.state))
+}
+
+#[tauri::command]
 async fn new_chat(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
     let mut controller = controller.lock().await;
     controller.start_quick_chat();
+    controller.drain_runtime_messages();
+    Ok(desktop_web_state(&controller.state))
+}
+
+#[tauri::command]
+async fn new_project_session(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    let mut controller = controller.lock().await;
+    controller.start_project_session(index);
     controller.drain_runtime_messages();
     Ok(desktop_web_state(&controller.state))
 }
@@ -213,6 +334,17 @@ async fn select_session(
 }
 
 #[tauri::command]
+async fn select_chat_session(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    let mut controller = controller.lock().await;
+    controller.open_quick_chat_session(index);
+    controller.drain_runtime_messages();
+    Ok(desktop_web_state(&controller.state))
+}
+
+#[tauri::command]
 async fn delete_project(
     controller: State<'_, SharedController>,
     index: usize,
@@ -232,6 +364,17 @@ async fn delete_session(
     let mut controller = controller.lock().await;
     controller.state.select_session(index);
     controller.delete_selected_session();
+    controller.drain_runtime_messages();
+    Ok(desktop_web_state(&controller.state))
+}
+
+#[tauri::command]
+async fn delete_chat_session(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    let mut controller = controller.lock().await;
+    controller.delete_quick_chat_session(index);
     controller.drain_runtime_messages();
     Ok(desktop_web_state(&controller.state))
 }

@@ -29,18 +29,23 @@ pub enum RunStatus {
     Confirming,
     Completed,
     AwaitingUser,
+    Cancelled,
     Failed,
 }
 
 impl RunStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::AwaitingUser | Self::Failed)
+        matches!(
+            self,
+            Self::Completed | Self::AwaitingUser | Self::Cancelled | Self::Failed
+        )
     }
 
     fn default_status_message(self) -> Option<String> {
         match self {
             Self::Completed => Some("run completed".to_string()),
             Self::AwaitingUser => Some("run awaiting user input".to_string()),
+            Self::Cancelled => Some("run cancelled".to_string()),
             Self::Failed => Some("run failed".to_string()),
             Self::Idle | Self::Running | Self::Confirming => None,
         }
@@ -200,6 +205,7 @@ impl AppState {
             SessionStatus::Running => RunStatus::Running,
             SessionStatus::Completed => RunStatus::Completed,
             SessionStatus::AwaitingUser => RunStatus::AwaitingUser,
+            SessionStatus::Cancelled => RunStatus::Cancelled,
             SessionStatus::Failed => RunStatus::Failed,
         };
         self.status_message = self.run_status.default_status_message();
@@ -237,6 +243,7 @@ impl AppState {
             SessionStatus::Running => RunStatus::Running,
             SessionStatus::Completed => RunStatus::Completed,
             SessionStatus::AwaitingUser => RunStatus::AwaitingUser,
+            SessionStatus::Cancelled => RunStatus::Cancelled,
             SessionStatus::Failed => RunStatus::Failed,
         };
         self.status_message = self.run_status.default_status_message();
@@ -278,6 +285,12 @@ impl AppState {
                     active_step: "Session started".to_string(),
                     ..RunProgressView::default()
                 };
+            }
+            RunEvent::SessionTitleUpdated { session_id, title } => {
+                if self.current_session_id == Some(*session_id) {
+                    self.current_session_title = title.clone();
+                    self.status_message = Some(format!("session title updated: {title}"));
+                }
             }
             RunEvent::AssistantStarted { message_id, model } => {
                 self.run_status = RunStatus::Running;
@@ -472,6 +485,21 @@ impl AppState {
                 self.progress.status = "Awaiting User".to_string();
                 self.progress.current_phase = "awaiting_user".to_string();
                 self.progress.active_step = "Awaiting user input".to_string();
+            }
+            RunEvent::SessionInterrupted { reason, .. } => {
+                self.run_status = RunStatus::Cancelled;
+                self.permission = None;
+                self.status_message = Some(reason.clone());
+                self.progress.status = "Cancelled".to_string();
+                self.progress.current_phase = "terminal".to_string();
+                self.progress.active_step = reason.clone();
+                self.transcript_entries.push(TranscriptEntry {
+                    kind: TranscriptKind::System,
+                    title: "Run interrupted".to_string(),
+                    body: reason.clone(),
+                    message_id: None,
+                    tool_call_id: None,
+                });
             }
             RunEvent::SessionFailed { message, .. } => {
                 self.run_status = RunStatus::Failed;
@@ -759,6 +787,7 @@ fn run_status_label_for_progress(status: RunStatus) -> &'static str {
         RunStatus::Confirming => "Confirming",
         RunStatus::Completed => "Completed",
         RunStatus::AwaitingUser => "Awaiting User",
+        RunStatus::Cancelled => "Cancelled",
         RunStatus::Failed => "Failed",
     }
 }

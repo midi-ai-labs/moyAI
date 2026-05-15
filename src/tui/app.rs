@@ -22,7 +22,7 @@ use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode, TuiArgs};
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
-use crate::runtime::SystemClock;
+use crate::runtime::{SystemClock, build_cancel_token};
 use crate::session::{
     EditorContext, PromptDispatchPart, RunEvent, RunSummary, SessionId, SessionRecord,
     SessionStateSnapshot, TodoItem, TodoStatus,
@@ -553,6 +553,7 @@ impl TuiController {
             editor_context: Some(self.current_editor_context()),
             review_request,
             image_paths: Vec::new(),
+            cancel: build_cancel_token(),
         };
         self.state.push_local_prompt_dispatch(&prompt_dispatch);
         self.composer = build_composer();
@@ -957,6 +958,12 @@ impl TuiController {
                 "status=awaiting_user".to_string(),
                 Style::default()
                     .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            RunStatus::Cancelled => (
+                "status=cancelled".to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
             RunStatus::Failed => (

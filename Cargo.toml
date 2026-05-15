@@ -7,7 +7,7 @@ license = "MIT"
 
 [features]
 default = ["tauri-desktop"]
-tauri-desktop = ["dep:tauri", "tauri/custom-protocol", "dep:tauri-build", "dep:rfd"]
+tauri-desktop = ["dep:tauri", "tauri/custom-protocol", "tauri/tray-icon", "dep:tauri-build", "dep:rfd"]
 
 [lib]
 name = "moyai"

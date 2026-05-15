@@ -1,4 +1,5 @@
 use camino::Utf8PathBuf;
+use tokio_util::sync::CancellationToken;
 
 use crate::cli::OutputMode;
 use crate::session::{EditorContext, PromptDispatchPart, SessionId};
@@ -34,6 +35,7 @@ pub struct RunRequest {
     pub editor_context: Option<EditorContext>,
     pub review_request: Option<ReviewRequest>,
     pub image_paths: Vec<Utf8PathBuf>,
+    pub cancel: CancellationToken,
 }
 
 #[derive(Debug, Clone)]

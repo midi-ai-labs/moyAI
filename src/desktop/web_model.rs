@@ -31,6 +31,7 @@ pub struct DesktopWebState {
     pub project_rows: Vec<DesktopProjectRow>,
     pub selected_project_index: i32,
     pub session_rows: Vec<DesktopSessionRow>,
+    pub chat_session_rows: Vec<DesktopSessionRow>,
     pub selected_session_index: i32,
     pub transcript_rows: Vec<DesktopTranscriptRow>,
     pub artifact_rows: Vec<DesktopArtifactRow>,
@@ -45,6 +46,7 @@ pub struct DesktopWebState {
     pub provider_models: Vec<String>,
     pub provider_selected_index: i32,
     pub provider_status_text: String,
+    pub provider_selected_model_summary: Vec<String>,
     pub provider_loading: bool,
     pub provider_apply_enabled: bool,
     pub config_items: Vec<String>,
@@ -129,6 +131,7 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         project_rows: state.snapshot.project_rows.clone(),
         selected_project_index: state.selected_project_index(),
         session_rows: state.snapshot.session_rows.clone(),
+        chat_session_rows: state.snapshot.chat_session_rows.clone(),
         selected_session_index: state.selected_index(),
         transcript_rows: detail.transcript_rows,
         artifact_rows: detail.artifacts,
@@ -143,6 +146,7 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         provider_models: provider_model_labels(state),
         provider_selected_index: state.provider_selected_index,
         provider_status_text: provider_feedback_text(state),
+        provider_selected_model_summary: provider_selected_model_summary(state),
         provider_loading: state.provider_loading,
         provider_apply_enabled: state.can_apply_provider_selection(),
         config_items,
@@ -234,6 +238,57 @@ fn provider_feedback_text(state: &DesktopState) -> String {
         }
     }
     text
+}
+
+fn provider_selected_model_summary(state: &DesktopState) -> Vec<String> {
+    let Some(info) = state.selected_provider_model_info() else {
+        return vec!["選択中のモデル metadata はまだありません。".to_string()];
+    };
+    let mut lines = vec![
+        format!("Model: {}", info.id),
+        format!("Metadata source: {}", info.source),
+        format!("Loaded: {}", if info.loaded { "yes" } else { "unknown/no" }),
+        format!(
+            "Context: {}",
+            info.context_window
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        format!(
+            "Max output: {}",
+            info.max_output_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        format!(
+            "Images: {}",
+            capability_label(info.supports_images, "supported", "not supported")
+        ),
+        format!(
+            "Tools: {}",
+            capability_label(info.supports_tools, "supported", "not supported")
+        ),
+        format!(
+            "Reasoning: {}",
+            capability_label(info.supports_reasoning, "supported", "not reported")
+        ),
+    ];
+    lines.push(format!(
+        "Parallel prediction: {}",
+        info.max_parallel_predictions
+            .filter(|value| *value > 1)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none/reported as serial".to_string())
+    ));
+    lines
+}
+
+fn capability_label<'a>(value: Option<bool>, yes: &'a str, no: &'a str) -> &'a str {
+    match value {
+        Some(true) => yes,
+        Some(false) => no,
+        None => "unknown",
+    }
 }
 
 fn config_feedback_text(key: ConfigField) -> String {

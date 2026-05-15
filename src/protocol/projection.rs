@@ -66,6 +66,10 @@ pub fn project_history_item_for_run_event(
             message_id: None,
             message: message.clone(),
         },
+        RunEvent::SessionInterrupted { reason, .. } => HistoryItemPayload::Error {
+            message_id: None,
+            message: reason.clone(),
+        },
         RunEvent::ReasoningDelta { delta, .. } => HistoryItemPayload::Reasoning {
             text: delta.clone(),
         },
@@ -219,6 +223,7 @@ pub fn project_history_item_for_run_event(
             turn_context: Some(Box::new(turn.context.clone())),
         },
         RunEvent::SessionStarted { .. }
+        | RunEvent::SessionTitleUpdated { .. }
         | RunEvent::UserMessageStored { .. }
         | RunEvent::AssistantStarted { .. }
         | RunEvent::PermissionRequested { .. }
@@ -341,6 +346,10 @@ pub fn project_turn_item_for_run_event(
             status: TurnTerminalStatus::Failed,
             summary: message.clone(),
         },
+        RunEvent::SessionInterrupted { reason, .. } => TurnItemPayload::Terminal {
+            status: TurnTerminalStatus::Interrupted,
+            summary: reason.clone(),
+        },
         RunEvent::RetryScheduled { message, .. } => TurnItemPayload::Warning {
             message: message.clone(),
         },
@@ -372,6 +381,7 @@ pub fn project_turn_item_for_run_event(
         },
         RunEvent::UserMessageStored { .. }
         | RunEvent::SessionStarted { .. }
+        | RunEvent::SessionTitleUpdated { .. }
         | RunEvent::AssistantStarted { .. }
         | RunEvent::ControlEnvelopePrepared { .. }
         | RunEvent::ModelRequestPrepared { .. } => return None,
@@ -393,6 +403,9 @@ fn runtime_msg_for_run_event(
     match event {
         RunEvent::SessionStarted { title, .. } => RuntimeEventMsg::Warning {
             message: format!("thread started: {title}"),
+        },
+        RunEvent::SessionTitleUpdated { title, .. } => RuntimeEventMsg::Warning {
+            message: format!("thread title updated: {title}"),
         },
         RunEvent::UserMessageStored { message_id } => RuntimeEventMsg::UserMessageStored {
             message_id: *message_id,
@@ -548,12 +561,16 @@ fn runtime_msg_for_run_event(
         RunEvent::SessionFailed { message, .. } => RuntimeEventMsg::TurnFailed {
             message: message.clone(),
         },
+        RunEvent::SessionInterrupted { reason, .. } => RuntimeEventMsg::TurnInterrupted {
+            reason: reason.clone(),
+        },
     }
 }
 
 fn session_id_for_run_event(event: &RunEvent) -> Option<SessionId> {
     match event {
         RunEvent::SessionStarted { session_id, .. }
+        | RunEvent::SessionTitleUpdated { session_id, .. }
         | RunEvent::UserTurnStored { session_id, .. }
         | RunEvent::ControlEnvelopePrepared { session_id, .. }
         | RunEvent::ModelRequestPrepared { session_id, .. }
@@ -562,6 +579,7 @@ fn session_id_for_run_event(event: &RunEvent) -> Option<SessionId> {
         | RunEvent::StateUpdated { session_id, .. }
         | RunEvent::SessionCompleted { session_id, .. }
         | RunEvent::SessionAwaitingUser { session_id, .. }
+        | RunEvent::SessionInterrupted { session_id, .. }
         | RunEvent::SessionFailed { session_id, .. } => Some(*session_id),
         RunEvent::UserMessageStored { .. }
         | RunEvent::AssistantStarted { .. }
@@ -1091,4 +1109,46 @@ fn hash_text(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{HistoryItemPayload, RuntimeEventMsg, TurnTerminalStatus};
+    use crate::session::{RunEvent, SessionId};
+
+    #[test]
+    fn session_interrupted_projects_to_interrupted_terminal_items() {
+        let session_id = SessionId::new();
+        let projection = project_protocol_run_event(
+            &RunEvent::SessionInterrupted {
+                session_id,
+                reason: "run cancelled by user".to_string(),
+            },
+            None,
+            TurnId::new(),
+            42,
+        )
+        .expect("interrupted event should project");
+
+        match projection.runtime_event.msg {
+            RuntimeEventMsg::TurnInterrupted { reason } => {
+                assert_eq!(reason, "run cancelled by user");
+            }
+            other => panic!("unexpected runtime event: {other:?}"),
+        }
+        match projection.turn_item.expect("terminal turn item").payload {
+            TurnItemPayload::Terminal { status, summary } => {
+                assert_eq!(status, TurnTerminalStatus::Interrupted);
+                assert_eq!(summary, "run cancelled by user");
+            }
+            other => panic!("unexpected turn item: {other:?}"),
+        }
+        match projection.history_item.expect("history item").payload {
+            HistoryItemPayload::Error { message, .. } => {
+                assert_eq!(message, "run cancelled by user");
+            }
+            other => panic!("unexpected history item: {other:?}"),
+        }
+    }
 }

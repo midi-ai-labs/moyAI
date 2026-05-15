@@ -12,6 +12,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::ShellFamily;
 use crate::edit::path_for_change_storage;
@@ -131,6 +132,7 @@ impl Tool for ShellTool {
             &guarded.absolute,
             &input.command,
             timeout_ms,
+            ctx.cancel.clone(),
         )
         .await?;
         let after = snapshot_workspace(ctx.workspace)?;
@@ -259,6 +261,7 @@ async fn execute_shell_command(
     workdir: &Utf8Path,
     command_text: &str,
     timeout_ms: u64,
+    cancel: CancellationToken,
 ) -> Result<CommandOutput, ToolError> {
     let family = shell.family.unwrap_or(if cfg!(windows) {
         ShellFamily::PowerShell
@@ -305,19 +308,27 @@ async fn execute_shell_command(
     let stdout_task = tokio::spawn(async move { read_pipe(stdout).await });
     let stderr_task = tokio::spawn(async move { read_pipe(stderr).await });
 
-    let (status, timed_out) = match timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-        Ok(result) => (result?, false),
-        Err(_) => {
+    let (status, timed_out) = tokio::select! {
+        _ = cancel.cancelled() => {
             let _ = child.start_kill();
             kill_process_tree(pid).await?;
-            let status = timeout(Duration::from_secs(5), child.wait())
-                .await
-                .map_err(|_| {
-                    ToolError::Message(
-                        "shell command timed out and could not be terminated cleanly".to_string(),
-                    )
-                })??;
-            (status, true)
+            let _ = timeout(Duration::from_secs(5), child.wait()).await;
+            return Err(ToolError::Message("shell command cancelled by user".to_string()));
+        }
+        result = timeout(Duration::from_millis(timeout_ms), child.wait()) => match result {
+            Ok(result) => (result?, false),
+            Err(_) => {
+                let _ = child.start_kill();
+                kill_process_tree(pid).await?;
+                let status = timeout(Duration::from_secs(5), child.wait())
+                    .await
+                    .map_err(|_| {
+                        ToolError::Message(
+                            "shell command timed out and could not be terminated cleanly".to_string(),
+                        )
+                    })??;
+                (status, true)
+            }
         }
     };
 

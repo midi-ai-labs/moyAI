@@ -428,7 +428,8 @@ impl TurnTerminalStatus {
         match self {
             Self::Completed => SessionStatus::Completed,
             Self::AwaitingUser => SessionStatus::AwaitingUser,
-            Self::Failed | Self::Interrupted => SessionStatus::Failed,
+            Self::Interrupted => SessionStatus::Cancelled,
+            Self::Failed => SessionStatus::Failed,
         }
     }
 }

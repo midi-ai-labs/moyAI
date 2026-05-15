@@ -139,6 +139,21 @@ impl<'a> TurnRuntime<'a> {
         let mut docs_supporting_context_budget_exhausted = BTreeSet::<String>::new();
         let mut docs_supporting_context_budget_exhausted_counts = BTreeMap::<String, usize>::new();
         for _step in 0..request.config.session.max_steps_per_turn {
+            if request.cancel.is_cancelled() {
+                return interrupt_turn(
+                    &session_repo,
+                    request.session.session.id,
+                    assistant_message.id,
+                    &request.model.name,
+                    &request.config.model.base_url,
+                    "run cancelled by user",
+                    tool_call_count,
+                    failed_tool_count,
+                    change_count,
+                    sink,
+                )
+                .await;
+            }
             let history_items = self
                 .agent
                 .store
@@ -400,6 +415,7 @@ impl<'a> TurnRuntime<'a> {
             let response = match stream_chat_with_provider_request_timeout(
                 &self.agent.llm,
                 chat_request,
+                step_request.cancel.clone(),
                 &mut stream,
             )
             .await
@@ -425,6 +441,21 @@ impl<'a> TurnRuntime<'a> {
             };
             let finish_reason = Some(response.finish_reason);
             let token_usage = response.usage.clone();
+            if matches!(finish_reason, Some(FinishReason::Cancelled)) {
+                return interrupt_turn(
+                    &session_repo,
+                    request.session.session.id,
+                    assistant_message.id,
+                    &request.model.name,
+                    &request.config.model.base_url,
+                    "run cancelled by user",
+                    tool_call_count,
+                    failed_tool_count,
+                    change_count,
+                    sink,
+                )
+                .await;
+            }
 
             if !stream.reasoning.trim().is_empty() {
                 session_repo
@@ -496,6 +527,21 @@ impl<'a> TurnRuntime<'a> {
             }
 
             for tool_call in stream.tool_calls {
+                if request.cancel.is_cancelled() {
+                    return interrupt_turn(
+                        &session_repo,
+                        request.session.session.id,
+                        assistant_message.id,
+                        &request.model.name,
+                        &request.config.model.base_url,
+                        "run cancelled by user",
+                        tool_call_count,
+                        failed_tool_count,
+                        change_count,
+                        sink,
+                    )
+                    .await;
+                }
                 tool_call_count += 1;
                 let requested_tool_name = tool_call.tool_name.clone();
                 let effective_tool_name = requested_tool_name.clone();
@@ -784,6 +830,7 @@ impl<'a> TurnRuntime<'a> {
                         workspace: &request.session.workspace,
                         config: &request.config,
                         tool_call_id: record.id,
+                        cancel: request.cancel.clone(),
                         prompt,
                         services: &self.agent.tool_services,
                     },
@@ -996,6 +1043,32 @@ impl<'a> TurnRuntime<'a> {
                         }
                     }
                     Err(error) => {
+                        if request.cancel.is_cancelled() {
+                            failed_tool_count += 1;
+                            ToolOrchestrator::fail_executed_call(
+                                &session_repo,
+                                assistant_message.id,
+                                record.id,
+                                record.tool_name,
+                                "tool execution cancelled by user",
+                                &route,
+                                sink,
+                            )
+                            .await?;
+                            return interrupt_turn(
+                                &session_repo,
+                                request.session.session.id,
+                                assistant_message.id,
+                                &request.model.name,
+                                &request.config.model.base_url,
+                                "run cancelled by user",
+                                tool_call_count,
+                                failed_tool_count,
+                                change_count,
+                                sink,
+                            )
+                            .await;
+                        }
                         if is_invalid_tool_arguments_error(&error.to_string()) {
                             let result = invalid_tool_arguments_result(
                                 &effective_tool_name,
@@ -1079,10 +1152,11 @@ impl<'a> TurnRuntime<'a> {
 async fn stream_chat_with_provider_request_timeout(
     llm: &Arc<dyn LlmClient>,
     request: ChatRequest,
+    cancel: CancellationToken,
     sink: &mut dyn LlmEventSink,
 ) -> Result<LlmResponseSummary, crate::error::LlmError> {
     let timeout_ms = request.timeout_ms;
-    let request_future = llm.stream_chat(request, CancellationToken::new(), sink);
+    let request_future = llm.stream_chat(request, cancel, sink);
     if timeout_ms == 0 {
         return request_future.await;
     }
@@ -1135,6 +1209,48 @@ async fn complete_turn(
         assistant_message_id: Some(assistant_message_id),
         status: SessionStatus::Completed,
         finish_reason,
+        tool_call_count,
+        failed_tool_count,
+        change_count,
+    })
+}
+
+async fn interrupt_turn(
+    session_repo: &SqliteSessionRepository,
+    session_id: SessionId,
+    assistant_message_id: crate::session::MessageId,
+    model: &str,
+    base_url: &str,
+    reason: &str,
+    tool_call_count: usize,
+    failed_tool_count: usize,
+    change_count: usize,
+    sink: &mut dyn RunEventSink,
+) -> Result<RunSummary, AgentError> {
+    session_repo
+        .update_message_metadata(
+            assistant_message_id,
+            &MessageMetadata::Assistant(AssistantMessageMeta {
+                model: model.to_string(),
+                base_url: base_url.to_string(),
+                finish_reason: Some(FinishReason::Cancelled),
+                token_usage: None,
+                summary: false,
+            }),
+        )
+        .await?;
+    session_repo
+        .set_status(session_id, SessionStatus::Cancelled)
+        .await?;
+    sink.emit(crate::session::RunEvent::SessionInterrupted {
+        session_id,
+        reason: reason.to_string(),
+    })?;
+    Ok(RunSummary {
+        session_id,
+        assistant_message_id: Some(assistant_message_id),
+        status: SessionStatus::Cancelled,
+        finish_reason: Some(FinishReason::Cancelled),
         tool_call_count,
         failed_tool_count,
         change_count,

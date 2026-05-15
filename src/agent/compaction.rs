@@ -87,7 +87,7 @@ pub async fn maybe_compact(
                 stop_sequences: request.config.model.stop_sequences.clone(),
                 extra_body: request.config.model.extra_body_json.clone(),
             },
-            crate::runtime::build_cancel_token(),
+            request.cancel.clone(),
             &mut accumulator,
         )
         .await?;

@@ -10,7 +10,7 @@ use crate::protocol::{
     CandidateRepairEdit, OperationIntent, RejectedToolProposal, ToolProgressEffect,
     VerificationRunResult, VerificationRunStatus,
 };
-use crate::runtime::{RunEventSink, build_cancel_token};
+use crate::runtime::RunEventSink;
 use crate::session::repository::SessionRepository;
 use crate::session::{
     DiffSummaryPart, FailureKind, MessageId, MessagePart, NewPart, PartKind, SessionContext,
@@ -22,6 +22,7 @@ use crate::tool::context::{ToolContext, ToolServices};
 use crate::tool::registry::ToolRegistry;
 use crate::tool::{ToolName, ToolResult};
 use crate::workspace::Workspace;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ToolRouteRequest<'a> {
@@ -56,6 +57,7 @@ pub(crate) struct ToolExecutionRequest<'a> {
     pub workspace: &'a Workspace,
     pub config: &'a ResolvedConfig,
     pub tool_call_id: ToolCallId,
+    pub cancel: CancellationToken,
     pub prompt: &'a mut dyn ConfirmationPrompt,
     pub services: &'a ToolServices,
 }
@@ -226,7 +228,7 @@ impl ToolOrchestrator {
                     workspace: request.workspace,
                     config: request.config,
                     tool_call_id: request.tool_call_id,
-                    cancel: build_cancel_token(),
+                    cancel: request.cancel,
                     prompt: &mut prompt,
                     services: request.services,
                 },

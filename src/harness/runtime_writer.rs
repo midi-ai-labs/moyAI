@@ -253,6 +253,7 @@ impl<S: RunEventSink + ?Sized> RunEventSink for HarnessRecordingSink<'_, S> {
 fn harness_kind_for_run_event(event: &RunEvent) -> HarnessEventKind {
     match event {
         RunEvent::SessionStarted { .. } => HarnessEventKind::RunStarted,
+        RunEvent::SessionTitleUpdated { .. } => HarnessEventKind::StateSnapshotRecorded,
         RunEvent::UserMessageStored { .. } | RunEvent::UserTurnStored { .. } => {
             HarnessEventKind::UserTurnAccepted
         }
@@ -278,6 +279,7 @@ fn harness_kind_for_run_event(event: &RunEvent) -> HarnessEventKind {
         RunEvent::StateUpdated { .. } => HarnessEventKind::StateSnapshotRecorded,
         RunEvent::SessionCompleted { .. }
         | RunEvent::SessionAwaitingUser { .. }
+        | RunEvent::SessionInterrupted { .. }
         | RunEvent::SessionFailed { .. } => HarnessEventKind::RunTerminalized,
     }
 }
@@ -600,6 +602,7 @@ fn terminal_status_for_run_event(event: &RunEvent) -> Option<HarnessRunStatus> {
     match event {
         RunEvent::SessionCompleted { .. } => Some(HarnessRunStatus::Pass),
         RunEvent::SessionAwaitingUser { .. } => Some(HarnessRunStatus::Blocked),
+        RunEvent::SessionInterrupted { .. } => Some(HarnessRunStatus::Blocked),
         RunEvent::SessionFailed { .. } => Some(HarnessRunStatus::Fail),
         _ => None,
     }

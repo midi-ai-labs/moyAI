@@ -4,6 +4,7 @@ use base64::Engine as _;
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::agent::{AgentLoop, AgentRunRequest, RuntimeInputView};
+use crate::app::session_title::{generate_session_title, is_placeholder_session_title};
 use crate::app::{AppCommand, ReviewRequest, RunRequest, SessionListRequest, SessionShowRequest};
 use crate::cli::{ConfirmationPrompt, EventRenderer};
 use crate::config::merge::apply_patch as apply_config_patch;
@@ -113,6 +114,13 @@ impl RunService {
                 ));
             }
         };
+        let should_generate_session_title = matches!(&selector, SessionSelector::New)
+            && request
+                .title
+                .as_deref()
+                .map(is_placeholder_session_title)
+                .unwrap_or(false)
+            && !request.prompt.trim().is_empty();
         let resuming_interrupted_session = self.session_was_running(&selector).await?;
         hydrate_configured_model_from_provider(&mut effective_config).await?;
         let model = ConfigModelCatalog::new(effective_config.clone()).resolve(None)?;
@@ -222,6 +230,30 @@ impl RunService {
             sink.emit(crate::session::RunEvent::UserMessageStored {
                 message_id: user_message.id,
             })?;
+            if should_generate_session_title {
+                if let Ok(title) = generate_session_title(
+                    &effective_config,
+                    &prepared.prompt,
+                    request.cancel.clone(),
+                )
+                .await
+                {
+                    if !is_placeholder_session_title(&title) {
+                        if self
+                            .store
+                            .session_repo()
+                            .update_session_title(session_context.session.id, &title)
+                            .await
+                            .is_ok()
+                        {
+                            sink.emit(crate::session::RunEvent::SessionTitleUpdated {
+                                session_id: session_context.session.id,
+                                title,
+                            })?;
+                        }
+                    }
+                }
+            }
             user_message.id
         };
 
@@ -241,6 +273,7 @@ impl RunService {
                     state,
                     config: effective_config,
                     model,
+                    cancel: request.cancel.clone(),
                 },
                 prompt,
                 &mut sink,
@@ -251,14 +284,25 @@ impl RunService {
             Err(error) => {
                 let current = self.store.session_repo().get_session(session_id).await?;
                 if current.status == SessionStatus::Running {
-                    self.store
-                        .session_repo()
-                        .set_status(session_id, SessionStatus::Failed)
-                        .await?;
-                    sink.emit(crate::session::RunEvent::SessionFailed {
-                        session_id,
-                        message: error.to_string(),
-                    })?;
+                    if request.cancel.is_cancelled() {
+                        self.store
+                            .session_repo()
+                            .set_status(session_id, SessionStatus::Cancelled)
+                            .await?;
+                        sink.emit(crate::session::RunEvent::SessionInterrupted {
+                            session_id,
+                            reason: "run cancelled by user".to_string(),
+                        })?;
+                    } else {
+                        self.store
+                            .session_repo()
+                            .set_status(session_id, SessionStatus::Failed)
+                            .await?;
+                        sink.emit(crate::session::RunEvent::SessionFailed {
+                            session_id,
+                            message: error.to_string(),
+                        })?;
+                    }
                 }
                 return Err(error.into());
             }
