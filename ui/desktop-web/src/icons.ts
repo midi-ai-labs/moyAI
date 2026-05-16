@@ -15,6 +15,7 @@ export function icon(name: string): string {
     send: '<path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4z"/>',
     square: '<rect x="7" y="7" width="10" height="10" rx="1"/>',
     folder: '<path d="M3 6h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+    image: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m8 13 2.2-2.2a1 1 0 0 1 1.4 0L16 15"/><path d="m14 13 1-1a1 1 0 0 1 1.4 0L21 16"/><circle cx="8" cy="9" r="1"/>',
   };
   return `<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true">${paths[name] ?? paths.plus}</svg>`;
 }

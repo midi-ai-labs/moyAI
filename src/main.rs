@@ -81,6 +81,9 @@ fn run_desktop_command(command: CliCommand) -> Result<(), (u8, String)> {
 #[cfg(feature = "tauri-desktop")]
 fn run_desktop_on_current_thread(args: moyai::cli::parse::DesktopArgs) -> Result<(), (u8, String)> {
     let command = CliCommand::Desktop(args.clone());
+    let global_config_existed_at_launch = moyai::config::loader::global_config_path()
+        .map(|path| path.exists())
+        .unwrap_or(false);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -95,6 +98,7 @@ fn run_desktop_on_current_thread(args: moyai::cli::parse::DesktopArgs) -> Result
                 directory: args.directory,
                 session_id: args.session_id,
                 continue_last: args.continue_last,
+                global_config_existed_at_launch,
             },
         )
         .await
@@ -165,6 +169,13 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
         }
         return Ok(());
     }
+    let desktop_global_config_existed_at_launch = if matches!(command, CliCommand::Desktop(_)) {
+        moyai::config::loader::global_config_path()
+            .map(|path| path.exists())
+            .unwrap_or(false)
+    } else {
+        false
+    };
     let app = AppBootstrap::build(&command)
         .await
         .map_err(|error| (3, error.to_string()))?;
@@ -183,6 +194,7 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
                     directory: args.directory.clone(),
                     session_id: args.session_id,
                     continue_last: args.continue_last,
+                    global_config_existed_at_launch: desktop_global_config_existed_at_launch,
                 },
             )
             .await

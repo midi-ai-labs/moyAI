@@ -44,6 +44,22 @@ export interface PermissionProjection {
   risks: string[];
 }
 
+export interface StartupCheckProjection {
+  key: string;
+  label: string;
+  status: "pending" | "pass" | "warning" | "fail";
+  message: string;
+}
+
+export interface StartupProjection {
+  status: "loading" | "ready" | "requires_config" | "requires_provider";
+  title: string;
+  message: string;
+  detail: string;
+  action_overlay: string;
+  checks: StartupCheckProjection[];
+}
+
 export interface DesktopWebState {
   workspace_path: string;
   provider_label: string;
@@ -52,6 +68,7 @@ export interface DesktopWebState {
   current_session_label: string;
   selected_session_title: string;
   status_message: string;
+  status_detail: string;
   run_status_key: RunStatusKey;
   run_status_text: string;
   run_phase: string;
@@ -62,12 +79,17 @@ export interface DesktopWebState {
   confirmation_visible: boolean;
   confirmation_text: string;
   confirmation: PermissionProjection | null;
+  startup: StartupProjection;
   draft_prompt: string;
   image_input: string;
   attached_images: string[];
   can_submit: boolean;
   busy: boolean;
+  async_polling_required: boolean;
+  pending_async_operations: string[];
   navigation_loading: boolean;
+  post_run_refresh_pending: boolean;
+  background_mutation_pending: boolean;
   overlay: string;
   project_rows: ProjectRow[];
   selected_project_index: number;

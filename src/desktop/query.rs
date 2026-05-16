@@ -7,8 +7,8 @@ use crate::desktop::models::{
 use crate::error::AppRunError;
 use crate::harness::ReplayReport;
 use crate::session::{
-    ProjectId, ProjectRecord, SessionId, SessionRecord, SessionStateSnapshot, TodoItem,
-    ToolCallStatus, Transcript,
+    ProjectId, ProjectRecord, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus,
+    TodoItem, ToolCallStatus, Transcript,
 };
 use crate::tui::query::{recent_sessions, session_view};
 use crate::tui::state::{AppState, RunStatus, TranscriptKind};
@@ -382,9 +382,23 @@ fn transcript_rows_with_context(
             .collect::<Vec<_>>()
     };
 
+    let terminal = state.run_status.is_terminal()
+        || state
+            .last_summary
+            .as_ref()
+            .map(|summary| session_status_is_terminal(summary.status))
+            .unwrap_or(false)
+        || session
+            .map(|session| session_status_is_terminal(session.status))
+            .unwrap_or(false);
     let work_summary = work_summary_row(state, session, file_changes);
-    let mut rows =
-        fold_intermediate_assistant_rows(base_rows, state, file_changes, work_summary.is_some());
+    let mut rows = fold_intermediate_assistant_rows(
+        base_rows,
+        state,
+        file_changes,
+        work_summary.is_some(),
+        terminal,
+    );
     if let Some(work_summary) = work_summary {
         let insert_index = rows
             .iter()
@@ -392,6 +406,7 @@ fn transcript_rows_with_context(
             .unwrap_or(rows.len());
         rows.insert(insert_index, work_summary);
     }
+    normalize_completed_pseudo_tool_call_closeout(&mut rows, terminal);
     renumber_rows(rows)
 }
 
@@ -400,8 +415,9 @@ fn fold_intermediate_assistant_rows(
     state: &AppState,
     file_changes: &[DesktopFileChangeRow],
     has_work_summary: bool,
+    terminal: bool,
 ) -> Vec<DesktopTranscriptRow> {
-    let should_fold = state.run_status.is_terminal()
+    let should_fold = terminal
         && has_work_summary
         && (!state.tool_statuses.is_empty()
             || !state.sidebar_todos.is_empty()
@@ -427,6 +443,57 @@ fn fold_intermediate_assistant_rows(
             }
         })
         .collect()
+}
+
+fn normalize_completed_pseudo_tool_call_closeout(
+    rows: &mut Vec<DesktopTranscriptRow>,
+    terminal: bool,
+) {
+    if !terminal {
+        return;
+    }
+    let last_assistant_index = rows
+        .iter()
+        .rposition(|row| row.kind == "assistant" && !row.body.trim().is_empty());
+    let mut normalized = Vec::with_capacity(rows.len());
+    for (index, mut row) in rows.drain(..).enumerate() {
+        if row.kind == "assistant" && transcript_body_is_pseudo_tool_call_closeout(row.body.trim())
+        {
+            if Some(index) == last_assistant_index {
+                row.body = "完了しました。".to_string();
+                normalized.push(row);
+            }
+            continue;
+        }
+        normalized.push(row);
+    }
+    *rows = normalized;
+}
+
+fn transcript_body_is_pseudo_tool_call_closeout(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("<tool_call>")
+        || lower.contains("</tool_call>")
+        || lower.contains("&lt;tool_call")
+        || lower.contains("&lt;/tool_call")
+        || lower.contains("<function=")
+        || lower.contains("</function>")
+        || lower.contains("&lt;function=")
+        || lower.contains("&lt;/function")
+        || lower.contains("<parameter=command>")
+        || lower.contains("<parameter=path>")
+        || lower.contains("&lt;parameter=command")
+        || lower.contains("&lt;parameter=path")
+}
+
+fn session_status_is_terminal(status: SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Completed
+            | SessionStatus::AwaitingUser
+            | SessionStatus::Cancelled
+            | SessionStatus::Failed
+    )
 }
 
 fn is_internal_transcript_projection(kind: &str, title: &str) -> bool {
@@ -1401,5 +1468,313 @@ mod tests {
                 .iter()
                 .any(|row| row.body.contains("まず test_calculator.py"))
         );
+    }
+
+    #[test]
+    fn completed_work_transcript_replaces_pseudo_tool_call_closeout_body() {
+        let mut state = AppState::default();
+        state.run_status = RunStatus::Completed;
+        state.last_summary = Some(crate::session::RunSummary {
+            session_id: SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 2,
+            failed_tool_count: 0,
+            change_count: 1,
+        });
+        state.transcript_entries = vec![
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "calculator.py と test_calculator.py を作成".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "テストは成功しました。\n<tool_call>\n<function=shell>\n<parameter=command>\nGet-Content calculator.py -Head 5\n</parameter>\n</function>\n</tool_call>".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+        ];
+        state.tool_statuses = vec![crate::tui::state::ToolStatusView {
+            tool_call_id: crate::session::ToolCallId::new(),
+            tool: crate::tool::ToolName::Shell,
+            title: "python -m unittest".to_string(),
+            status: ToolCallStatus::Completed,
+            summary: Some("tests passed".to_string()),
+            error: None,
+        }];
+
+        let rows = transcript_rows(&state);
+        let assistant_rows = rows
+            .iter()
+            .filter(|row| row.kind == "assistant")
+            .collect::<Vec<_>>();
+
+        assert_eq!(assistant_rows.len(), 1);
+        assert_eq!(assistant_rows[0].body, "完了しました。");
+        assert!(!rows.iter().any(|row| row.body.contains("<tool_call>")));
+        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+    }
+
+    #[test]
+    fn completed_work_transcript_removes_intermediate_pseudo_tool_call_rows() {
+        let mut state = AppState::default();
+        state.run_status = RunStatus::Completed;
+        state.last_summary = Some(crate::session::RunSummary {
+            session_id: SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 3,
+            failed_tool_count: 0,
+            change_count: 2,
+        });
+        state.transcript_entries = vec![
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "calculator.py と test_calculator.py を作成".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "</parameter>\n</function>\n</tool_call>".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "完了しました。calculator.py と test_calculator.py を作成しました。"
+                    .to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+        ];
+        state.tool_statuses = vec![crate::tui::state::ToolStatusView {
+            tool_call_id: crate::session::ToolCallId::new(),
+            tool: crate::tool::ToolName::Shell,
+            title: "python -m unittest".to_string(),
+            status: ToolCallStatus::Completed,
+            summary: Some("tests passed".to_string()),
+            error: None,
+        }];
+
+        let rows = transcript_rows(&state);
+        let assistant_rows = rows
+            .iter()
+            .filter(|row| row.kind == "assistant")
+            .collect::<Vec<_>>();
+
+        assert_eq!(assistant_rows.len(), 1);
+        assert!(assistant_rows[0].body.contains("calculator.py"));
+        assert!(!rows.iter().any(|row| row.body.contains("</tool_call>")));
+        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+    }
+
+    #[test]
+    fn completed_work_transcript_replaces_closing_tag_only_pseudo_tool_call_fragment() {
+        let mut state = AppState::default();
+        state.run_status = RunStatus::Completed;
+        state.last_summary = Some(crate::session::RunSummary {
+            session_id: SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 3,
+            failed_tool_count: 0,
+            change_count: 2,
+        });
+        state.transcript_entries = vec![
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "calculator.py と test_calculator.py を作成".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "if name == \"main\": main()\n</parameter> <parameter=path> calculator.py </parameter> </function> </tool_call>"
+                    .to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+        ];
+        state.tool_statuses = vec![crate::tui::state::ToolStatusView {
+            tool_call_id: crate::session::ToolCallId::new(),
+            tool: crate::tool::ToolName::Shell,
+            title: "python -m unittest".to_string(),
+            status: ToolCallStatus::Completed,
+            summary: Some("tests passed".to_string()),
+            error: None,
+        }];
+
+        let rows = transcript_rows(&state);
+        let assistant_rows = rows
+            .iter()
+            .filter(|row| row.kind == "assistant")
+            .collect::<Vec<_>>();
+
+        assert_eq!(assistant_rows.len(), 1);
+        assert_eq!(assistant_rows[0].body, "完了しました。");
+        assert!(!rows.iter().any(|row| row.body.contains("</tool_call>")));
+        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+    }
+
+    #[test]
+    fn completed_work_transcript_replaces_html_escaped_pseudo_tool_call_fragment() {
+        let mut state = AppState::default();
+        state.run_status = RunStatus::Completed;
+        state.last_summary = Some(crate::session::RunSummary {
+            session_id: SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 3,
+            failed_tool_count: 0,
+            change_count: 2,
+        });
+        state.transcript_entries = vec![
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "calculator.py と test_calculator.py を作成".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "if name == \"main\": main()\n&lt;/parameter&gt; &lt;parameter=path&gt; calculator.py &lt;/parameter&gt; &lt;/function&gt; &lt;/tool_call&gt;"
+                    .to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+        ];
+        state.tool_statuses = vec![crate::tui::state::ToolStatusView {
+            tool_call_id: crate::session::ToolCallId::new(),
+            tool: crate::tool::ToolName::Shell,
+            title: "python -m unittest".to_string(),
+            status: ToolCallStatus::Completed,
+            summary: Some("tests passed".to_string()),
+            error: None,
+        }];
+
+        let rows = transcript_rows(&state);
+        let assistant_rows = rows
+            .iter()
+            .filter(|row| row.kind == "assistant")
+            .collect::<Vec<_>>();
+
+        assert_eq!(assistant_rows.len(), 1);
+        assert_eq!(assistant_rows[0].body, "完了しました。");
+        assert!(!rows.iter().any(|row| row.body.contains("&lt;/tool_call")));
+        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+    }
+
+    #[test]
+    fn reopened_completed_session_uses_session_status_for_pseudo_tool_call_cleanup() {
+        let project_id = ProjectId::new();
+        let session = session_record(project_id, "calculator");
+        let mut state = AppState::default();
+        state.run_status = RunStatus::Idle;
+        state.last_summary = Some(crate::session::RunSummary {
+            session_id: session.id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 3,
+            failed_tool_count: 0,
+            change_count: 2,
+        });
+        state.transcript_entries = vec![
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "calculator.py と test_calculator.py を作成".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "if name == \"main\": main()\n&lt;/parameter&gt; &lt;parameter=path&gt; calculator.py &lt;/parameter&gt; &lt;/function&gt; &lt;/tool_call&gt;"
+                    .to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+        ];
+        state.tool_statuses = vec![crate::tui::state::ToolStatusView {
+            tool_call_id: crate::session::ToolCallId::new(),
+            tool: crate::tool::ToolName::Shell,
+            title: "python -m unittest".to_string(),
+            status: ToolCallStatus::Completed,
+            summary: Some("tests passed".to_string()),
+            error: None,
+        }];
+
+        let rows = transcript_rows_with_context(&state, Some(&session), &[]);
+        let assistant_rows = rows
+            .iter()
+            .filter(|row| row.kind == "assistant")
+            .collect::<Vec<_>>();
+
+        assert_eq!(assistant_rows.len(), 1);
+        assert_eq!(assistant_rows[0].body, "完了しました。");
+        assert!(!rows.iter().any(|row| row.body.contains("&lt;/tool_call")));
+        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+    }
+
+    #[test]
+    fn restored_completed_session_uses_last_summary_status_for_pseudo_tool_call_cleanup() {
+        let mut state = AppState::default();
+        state.run_status = RunStatus::Idle;
+        state.last_summary = Some(crate::session::RunSummary {
+            session_id: SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 3,
+            failed_tool_count: 0,
+            change_count: 2,
+        });
+        state.transcript_entries = vec![
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "calculator.py と test_calculator.py を作成".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "テスト失敗を修正します。\n<tool_call>\n<function=write>\n<parameter=path>calculator.py</parameter>\n</function>\n</tool_call>"
+                    .to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "完了しました。".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
+        ];
+
+        let rows = transcript_rows_with_context(&state, None, &[]);
+
+        assert_eq!(rows.iter().filter(|row| row.kind == "assistant").count(), 1);
+        assert!(!rows.iter().any(|row| row.body.contains("<tool_call>")));
+        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
     }
 }

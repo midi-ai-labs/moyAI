@@ -9,6 +9,7 @@ import {
   renderOverlay,
   renderRunStatusStrip,
   renderSidebar,
+  renderStartupSplash,
   renderThreadContent,
   renderTitlebar,
   renderTopbar,
@@ -25,6 +26,10 @@ let currentState: DesktopWebState | null = null;
 let lastRenderedState: DesktopWebState | null = null;
 let polling = false;
 let previousSessionKey = "";
+let splashDismissed = false;
+let splashTimer: number | null = null;
+const splashStartedAt = performance.now();
+const SPLASH_MIN_VISIBLE_MS = 5000;
 const THREAD_END_THRESHOLD_PX = 96;
 const uiState = createUiLocalState();
 
@@ -46,7 +51,7 @@ const eventContext = {
 
 void refresh();
 window.setInterval(() => {
-  if (currentState?.busy || currentState?.confirmation_visible || currentState?.provider_loading || currentState?.navigation_loading) {
+  if (currentState?.async_polling_required) {
     void refresh();
   }
 }, 600);
@@ -70,7 +75,9 @@ async function refresh(): Promise<void> {
 
 async function mutate(name: string, args?: Record<string, unknown>): Promise<void> {
   try {
+    const previous = currentState;
     currentState = await command<DesktopWebState>(name, args);
+    reconcileUiLocalState(previous, currentState, name);
     render(currentState);
   } catch (error) {
     renderError(String(error));
@@ -78,7 +85,22 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
 }
 
 function render(state: DesktopWebState): void {
+  const elapsedSplashMs = performance.now() - splashStartedAt;
+  if (!splashDismissed && shouldShowSplash(state, elapsedSplashMs)) {
+    appRoot.innerHTML = renderStartupSplash(state, elapsedSplashMs, SPLASH_MIN_VISIBLE_MS);
+    scheduleSplashReveal(state, elapsedSplashMs);
+    lastRenderedState = state;
+    return;
+  }
+  if (!splashDismissed) {
+    splashDismissed = true;
+    if (splashTimer !== null) {
+      window.clearTimeout(splashTimer);
+      splashTimer = null;
+    }
+  }
   const previous = lastRenderedState;
+  reconcileUiLocalState(previous, state, null);
   const previousThread = document.querySelector<HTMLElement>("#thread");
   const previousThreadScrollTop = previousThread?.scrollTop ?? 0;
   const previousThreadWasNearEnd = previousThread ? isThreadNearEnd(previousThread) : true;
@@ -129,6 +151,75 @@ function render(state: DesktopWebState): void {
   previousSessionKey = nextSessionKey;
   lastRenderedState = state;
   wireEvents(state, eventContext);
+}
+
+function shouldShowSplash(state: DesktopWebState, elapsedMs: number): boolean {
+  return state.startup.status === "loading" || elapsedMs < SPLASH_MIN_VISIBLE_MS;
+}
+
+function scheduleSplashReveal(state: DesktopWebState, elapsedMs: number): void {
+  if (state.startup.status === "loading" || elapsedMs >= SPLASH_MIN_VISIBLE_MS || splashTimer !== null) {
+    return;
+  }
+  splashTimer = window.setTimeout(() => {
+    splashTimer = null;
+    if (currentState) {
+      render(currentState);
+    }
+  }, Math.max(0, SPLASH_MIN_VISIBLE_MS - elapsedMs));
+}
+
+function reconcileUiLocalState(previous: DesktopWebState | null, state: DesktopWebState, mutationName: string | null): void {
+  const nextSessionKey = state.session_rows[state.selected_session_index]?.session_id ?? state.selected_session_title;
+  const previousSessionKey = previous?.session_rows[previous.selected_session_index]?.session_id ?? previous?.selected_session_title ?? "";
+  const sessionChanged = previous !== null && nextSessionKey !== previousSessionKey;
+  const overlayChanged = previous !== null && previous.overlay !== state.overlay;
+  const imagesCleared = state.attached_images.length === 0 && state.image_input.trim().length === 0;
+
+  if (sessionChanged || operationInvalidatesComposerTray(mutationName)) {
+    uiState.attachmentTrayOpen = false;
+  }
+  if ((mutationName === "attach_image" || mutationName === "browse_image") && state.image_input.trim().length === 0) {
+    uiState.attachmentTrayOpen = false;
+  }
+  if ((mutationName === "clear_images" || mutationName === "remove_image") && imagesCleared) {
+    uiState.attachmentTrayOpen = false;
+  }
+  if (overlayChanged && state.overlay !== "config") {
+    uiState.configDirty = false;
+  }
+  if (uiState.pendingLocalConfirmation && !localConfirmationStillTargetsRow(uiState.pendingLocalConfirmation, state)) {
+    uiState.pendingLocalConfirmation = null;
+  }
+}
+
+function operationInvalidatesComposerTray(name: string | null): boolean {
+  if (
+    name === "submit_prompt" ||
+    name === "send_prompt_review" ||
+    name === "select_project" ||
+    name === "select_session" ||
+    name === "select_chat_session" ||
+    name === "new_chat" ||
+    name === "new_project_session" ||
+    name === "switch_workspace"
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function localConfirmationStillTargetsRow(
+  confirmation: NonNullable<typeof uiState.pendingLocalConfirmation>,
+  state: DesktopWebState
+): boolean {
+  if (confirmation.kind === "project") {
+    const row = state.project_rows[confirmation.index];
+    return row?.label === confirmation.title && row?.path === confirmation.detail;
+  }
+  const rows = confirmation.kind === "chat_session" ? state.chat_session_rows : state.session_rows;
+  const row = rows[confirmation.index];
+  return row?.label === confirmation.title && row?.session_id === confirmation.detail;
 }
 
 function isTerminalRunStatus(status: DesktopWebState["run_status_key"]): boolean {

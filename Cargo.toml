@@ -7,7 +7,14 @@ license = "MIT"
 
 [features]
 default = ["tauri-desktop"]
-tauri-desktop = ["dep:tauri", "tauri/custom-protocol", "tauri/tray-icon", "dep:tauri-build", "dep:rfd"]
+tauri-desktop = [
+    "dep:tauri",
+    "tauri/custom-protocol",
+    "tauri/protocol-asset",
+    "tauri/tray-icon",
+    "dep:tauri-build",
+    "dep:rfd",
+]
 
 [lib]
 name = "moyai"
@@ -35,7 +42,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 similar = "2.7.0"
-tauri = { version = "2.9.2", optional = true }
+tauri = { version = "2.9.2", optional = true, features = ["protocol-asset"] }
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "process", "fs", "signal", "time", "sync", "io-util"] }

@@ -1,3 +1,4 @@
+use super::async_ops::DesktopAsyncOperationRegistry;
 use super::state::{DEFAULT_WINDOW_OPACITY_PERCENT, DesktopOverlay};
 
 #[derive(Debug, Clone)]
@@ -6,6 +7,7 @@ pub struct DesktopViewState {
     pub window_opacity_percent: i32,
     pub artifact_selected_index: usize,
     pub local_search_text: String,
+    pub async_operations: DesktopAsyncOperationRegistry,
 }
 
 impl Default for DesktopViewState {
@@ -15,6 +17,7 @@ impl Default for DesktopViewState {
             window_opacity_percent: DEFAULT_WINDOW_OPACITY_PERCENT,
             artifact_selected_index: 0,
             local_search_text: String::new(),
+            async_operations: DesktopAsyncOperationRegistry::default(),
         }
     }
 }

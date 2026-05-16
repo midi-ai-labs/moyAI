@@ -27,6 +27,7 @@ pub use control::{
     ObligationStatus, ProjectionBundle, ProjectionSurface, ProjectionSurfaceKind,
     RenderedProjectionSurface, TurnControlEnvelope, TurnObligation,
     content_changing_projection_text_separates_availability_from_satisfying_progress_fixture_passes,
+    verification_only_authority_narrows_to_exact_shell_fixture_passes,
 };
 pub use projection::{
     ProtocolRunEventProjection, project_protocol_run_event, project_turn_item_for_run_event,

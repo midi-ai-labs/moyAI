@@ -76,6 +76,51 @@ enum RuntimeMessage {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeMessageAsyncContract {
+    RunStream,
+    TerminalRun,
+    ModalDecision,
+    BackgroundOperation,
+    NavigationOperation,
+    ProviderOperation,
+    StatusOnlyOperation,
+}
+
+impl RuntimeMessage {
+    fn async_contract(&self) -> RuntimeMessageAsyncContract {
+        match self {
+            RuntimeMessage::RunEvent(_) => RuntimeMessageAsyncContract::RunStream,
+            RuntimeMessage::Finished(_) => RuntimeMessageAsyncContract::TerminalRun,
+            RuntimeMessage::Permission(_, _) => RuntimeMessageAsyncContract::ModalDecision,
+            RuntimeMessage::EnhanceFinished { .. } => {
+                RuntimeMessageAsyncContract::BackgroundOperation
+            }
+            RuntimeMessage::SnapshotLoaded(_) => RuntimeMessageAsyncContract::StatusOnlyOperation,
+            RuntimeMessage::SessionLoaded { .. } => {
+                RuntimeMessageAsyncContract::NavigationOperation
+            }
+            RuntimeMessage::SessionDeleted { .. } => {
+                RuntimeMessageAsyncContract::BackgroundOperation
+            }
+            RuntimeMessage::ProjectDeleted { .. } => {
+                RuntimeMessageAsyncContract::BackgroundOperation
+            }
+            RuntimeMessage::CurrentTodosLoaded { .. } => {
+                RuntimeMessageAsyncContract::BackgroundOperation
+            }
+            RuntimeMessage::ModelCatalogLoaded { .. } => {
+                RuntimeMessageAsyncContract::ProviderOperation
+            }
+            RuntimeMessage::HistoryExported(_) => RuntimeMessageAsyncContract::BackgroundOperation,
+            RuntimeMessage::WorkspaceSwitched { .. }
+            | RuntimeMessage::WorkspaceSwitchedForNewProjectSession { .. } => {
+                RuntimeMessageAsyncContract::NavigationOperation
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionLoadReason {
     UserSelection,
@@ -200,6 +245,11 @@ impl DesktopController {
             apply_preferences_override(&preferences, &app.workspace.root, app.config.clone());
         let mut state = DesktopState::new(snapshot, effective_config);
         state.workspace_input = app.workspace.cwd.to_string();
+        state.begin_startup(
+            args.global_config_existed_at_launch,
+            global_config_path().ok(),
+            &app.workspace.root,
+        );
         if let Some(opacity) = preferences.window_opacity_percent {
             state.set_window_opacity_percent(opacity);
         }
@@ -228,6 +278,10 @@ impl DesktopController {
             .is_empty()
         {
             controller.load_provider_models();
+        } else {
+            controller
+                .state
+                .fail_startup_provider_model_load("LLM URL が未設定です。");
         }
         Ok(controller)
     }
@@ -312,6 +366,7 @@ impl DesktopController {
         };
         self.state
             .set_status_message(format!("deleting chat {}...", session_id));
+        self.state.begin_session_delete_mutation();
         self.spawn_session_delete(session_id);
     }
 
@@ -340,6 +395,7 @@ impl DesktopController {
         if !hidden_roots.iter().any(|root| root == &project_root) {
             hidden_roots.push(project_root.clone());
         }
+        self.state.begin_project_delete_mutation();
         self.spawn_project_delete(project_id, project_root, hidden_roots);
     }
 
@@ -415,6 +471,7 @@ impl DesktopController {
         };
         self.state
             .set_status_message("exporting history markdown...");
+        self.state.begin_history_export();
         self.spawn_history_markdown_export(session_id, normalize_markdown_export_path(path));
     }
 
@@ -759,6 +816,7 @@ impl DesktopController {
         };
         self.state
             .set_status_message(format!("deleting chat {}...", session_id));
+        self.state.begin_session_delete_mutation();
         self.spawn_session_delete(session_id);
     }
 
@@ -1329,7 +1387,9 @@ impl DesktopController {
                 "run cancelled by user",
                 "停止しました。現在の処理を中断しています。",
             );
+            self.state.finish_agent_run();
             if let Some(session_id) = session_id {
+                self.state.mark_post_run_refresh_pending();
                 self.spawn_session_cancel_persist(session_id);
             }
         } else {
@@ -1374,6 +1434,8 @@ impl DesktopController {
             return;
         }
         let cancel = build_cancel_token();
+        self.state.clear_post_run_refresh_pending();
+        self.state.begin_agent_run();
         let request = RunRequest {
             prompt: prompt.clone(),
             session_id: self.state.app_state.current_session_id,
@@ -1496,6 +1558,9 @@ impl DesktopController {
                     return;
                 }
                 if !self.should_apply_loaded_session(request_id, session_id, reason) {
+                    if reason == SessionLoadReason::CurrentRefresh {
+                        self.state.clear_post_run_refresh_pending();
+                    }
                     if let Some(request_id) = request_id {
                         self.state.finish_navigation(request_id);
                     }
@@ -1511,10 +1576,17 @@ impl DesktopController {
                     loaded.state,
                     loaded.todos,
                 );
+                if reason == SessionLoadReason::CurrentRefresh {
+                    self.state.clear_post_run_refresh_pending();
+                    return;
+                }
                 self.state
                     .set_status_message(format!("opened session {}", session_id));
             }
             Err(error) => {
+                if reason == SessionLoadReason::CurrentRefresh {
+                    self.state.clear_post_run_refresh_pending();
+                }
                 if request_id
                     .map(|request_id| self.state.finish_navigation(request_id))
                     .unwrap_or(true)
@@ -1530,6 +1602,13 @@ impl DesktopController {
             self.state.app_state.run_status,
             crate::tui::state::RunStatus::Running | crate::tui::state::RunStatus::Confirming
         )
+    }
+
+    fn refresh_current_session_after_terminal_run(&mut self) {
+        self.refresh_snapshot();
+        if let Some(session_id) = self.state.app_state.current_session_id {
+            self.spawn_session_load(session_id, SessionLoadReason::CurrentRefresh, None);
+        }
     }
 
     fn should_apply_loaded_session(
@@ -1640,6 +1719,7 @@ impl DesktopController {
         let mut changed = false;
         while let Ok(message) = self.runtime_rx.try_recv() {
             changed = true;
+            let _contract = message.async_contract();
             match message {
                 RuntimeMessage::RunEvent(event) => {
                     if self
@@ -1656,8 +1736,12 @@ impl DesktopController {
                         _ => None,
                     };
                     self.state.apply_run_event(&event);
+                    if run_event_is_terminal(&event) {
+                        self.state.mark_post_run_refresh_pending();
+                    }
                     if event_requires_todo_refresh(&event) {
                         if let Some(session_id) = self.state.app_state.current_session_id {
+                            self.state.begin_current_todo_refresh();
                             self.spawn_current_todos_refresh(session_id);
                         }
                     }
@@ -1668,18 +1752,14 @@ impl DesktopController {
                 RuntimeMessage::Finished(result) => match result {
                     Ok(summary) => {
                         self.active_run_cancel = None;
+                        self.state.finish_agent_run();
+                        self.state.mark_post_run_refresh_pending();
                         self.state.app_state.set_summary(summary);
-                        self.refresh_snapshot();
-                        if let Some(session_id) = self.state.app_state.current_session_id {
-                            self.spawn_session_load(
-                                session_id,
-                                SessionLoadReason::CurrentRefresh,
-                                None,
-                            );
-                        }
+                        self.refresh_current_session_after_terminal_run();
                     }
                     Err(error) => {
                         self.active_run_cancel = None;
+                        self.state.finish_agent_run();
                         if !matches!(
                             self.state.app_state.run_status,
                             crate::tui::state::RunStatus::Cancelled
@@ -1687,6 +1767,12 @@ impl DesktopController {
                             self.state.app_state.run_status = crate::tui::state::RunStatus::Failed;
                         }
                         self.state.set_status_message(error);
+                        if self.state.app_state.current_session_id.is_some() {
+                            self.state.mark_post_run_refresh_pending();
+                            self.refresh_current_session_after_terminal_run();
+                        } else {
+                            self.state.clear_post_run_refresh_pending();
+                        }
                     }
                 },
                 RuntimeMessage::Permission(request, response) => {
@@ -1700,9 +1786,10 @@ impl DesktopController {
                         }
                     }
                     Err(error) => {
-                        self.state.cancel_prompt_review();
-                        self.state
-                            .set_status_message(format!("prompt enhancement failed: {error}"));
+                        if self.state.fail_prompt_enhance(request_id) {
+                            self.state
+                                .set_status_message(format!("prompt enhancement failed: {error}"));
+                        }
                     }
                 },
                 RuntimeMessage::SnapshotLoaded(result) => match result {
@@ -1715,16 +1802,84 @@ impl DesktopController {
                     reason,
                     result,
                 } => self.apply_session_loaded_message(request_id, session_id, reason, result),
-                RuntimeMessage::SessionDeleted { session_id, result } => match result {
-                    Ok(snapshot) => {
-                        let deleted_was_current =
-                            self.state.app_state.current_session_id == Some(session_id);
-                        self.state.replace_snapshot(snapshot);
-                        if deleted_was_current {
+                RuntimeMessage::SessionDeleted { session_id, result } => {
+                    self.state.finish_session_delete_mutation();
+                    match result {
+                        Ok(snapshot) => {
+                            let deleted_was_current =
+                                self.state.app_state.current_session_id == Some(session_id);
+                            self.state.replace_snapshot(snapshot);
+                            if deleted_was_current {
+                                if let Some(next_session_id) = self.state.selected_session_id() {
+                                    self.state.set_status_message(format!(
+                                        "deleted chat {}; opening {}...",
+                                        session_id, next_session_id
+                                    ));
+                                    let request_id = self.state.begin_session_load(next_session_id);
+                                    self.spawn_session_load(
+                                        next_session_id,
+                                        SessionLoadReason::UserSelection,
+                                        Some(request_id),
+                                    );
+                                } else {
+                                    self.state.start_new_chat();
+                                    self.state
+                                        .set_status_message(format!("deleted chat {}", session_id));
+                                }
+                            } else {
+                                self.state
+                                    .set_status_message(format!("deleted chat {}", session_id));
+                            }
+                        }
+                        Err(error) => self
+                            .state
+                            .set_status_message(format!("chat delete failed: {error}")),
+                    }
+                }
+                RuntimeMessage::ProjectDeleted {
+                    project_id,
+                    project_root,
+                    result,
+                } => {
+                    self.state.finish_project_delete_mutation();
+                    match result {
+                        Ok(loaded) => {
+                            let deleted_was_current = self.app.workspace.project_id == project_id;
+                            self.preferences.mark_project_deleted(&project_root);
+                            self.app = loaded.app.clone();
+                            if !self.is_quick_chat_workspace() {
+                                self.preferences
+                                    .unmark_project_deleted(&self.app.workspace.root);
+                            }
+                            if deleted_was_current {
+                                let effective = apply_preferences_override(
+                                    &self.preferences,
+                                    &self.app.workspace.root,
+                                    self.app.config.clone(),
+                                );
+                                self.state = DesktopState::new(loaded.snapshot, effective);
+                                self.state.workspace_input = self.app.workspace.cwd.to_string();
+                                if let Some(opacity) = self.preferences.window_opacity_percent {
+                                    self.state.set_window_opacity_percent(opacity);
+                                }
+                                self.persist_preferences();
+                                if !self
+                                    .state
+                                    .provider_config
+                                    .provider_base_url_input
+                                    .trim()
+                                    .is_empty()
+                                {
+                                    self.load_provider_models();
+                                }
+                            } else {
+                                self.state.replace_snapshot(loaded.snapshot);
+                                self.persist_preferences();
+                            }
                             if let Some(next_session_id) = self.state.selected_session_id() {
                                 self.state.set_status_message(format!(
-                                    "deleted chat {}; opening {}...",
-                                    session_id, next_session_id
+                                    "deleted project {}; opening {}...",
+                                    project_id, next_session_id
                                 ));
                                 let request_id = self.state.begin_session_load(next_session_id);
                                 self.spawn_session_load(
@@ -1735,83 +1890,25 @@ impl DesktopController {
                             } else {
                                 self.state.start_new_chat();
                                 self.state
-                                    .set_status_message(format!("deleted chat {}", session_id));
+                                    .set_status_message(format!("deleted project {}", project_id));
                             }
-                        } else {
-                            self.state
-                                .set_status_message(format!("deleted chat {}", session_id));
                         }
+                        Err(error) => self
+                            .state
+                            .set_status_message(format!("project delete failed: {error}")),
                     }
-                    Err(error) => self
-                        .state
-                        .set_status_message(format!("chat delete failed: {error}")),
-                },
-                RuntimeMessage::ProjectDeleted {
-                    project_id,
-                    project_root,
-                    result,
-                } => match result {
-                    Ok(loaded) => {
-                        let deleted_was_current = self.app.workspace.project_id == project_id;
-                        self.preferences.mark_project_deleted(&project_root);
-                        self.app = loaded.app.clone();
-                        if !self.is_quick_chat_workspace() {
-                            self.preferences
-                                .unmark_project_deleted(&self.app.workspace.root);
-                        }
-                        if deleted_was_current {
-                            let effective = apply_preferences_override(
-                                &self.preferences,
-                                &self.app.workspace.root,
-                                self.app.config.clone(),
-                            );
-                            self.state = DesktopState::new(loaded.snapshot, effective);
-                            self.state.workspace_input = self.app.workspace.cwd.to_string();
-                            if let Some(opacity) = self.preferences.window_opacity_percent {
-                                self.state.set_window_opacity_percent(opacity);
-                            }
-                            self.persist_preferences();
-                            if !self
-                                .state
-                                .provider_config
-                                .provider_base_url_input
-                                .trim()
-                                .is_empty()
-                            {
-                                self.load_provider_models();
-                            }
-                        } else {
-                            self.state.replace_snapshot(loaded.snapshot);
-                            self.persist_preferences();
-                        }
-                        if let Some(next_session_id) = self.state.selected_session_id() {
-                            self.state.set_status_message(format!(
-                                "deleted project {}; opening {}...",
-                                project_id, next_session_id
-                            ));
-                            let request_id = self.state.begin_session_load(next_session_id);
-                            self.spawn_session_load(
-                                next_session_id,
-                                SessionLoadReason::UserSelection,
-                                Some(request_id),
-                            );
-                        } else {
-                            self.state.start_new_chat();
-                            self.state
-                                .set_status_message(format!("deleted project {}", project_id));
-                        }
-                    }
-                    Err(error) => self
-                        .state
-                        .set_status_message(format!("project delete failed: {error}")),
-                },
+                }
                 RuntimeMessage::CurrentTodosLoaded { session_id, result } => match result {
                     Ok(todos) => {
+                        self.state.finish_current_todo_refresh();
                         if self.state.app_state.current_session_id == Some(session_id) {
                             self.state.app_state.set_sidebar_todos(todos);
                         }
                     }
-                    Err(error) => self.state.set_status_message(error),
+                    Err(error) => {
+                        self.state.finish_current_todo_refresh();
+                        self.state.set_status_message(error);
+                    }
                 },
                 RuntimeMessage::ModelCatalogLoaded {
                     requested_base_url,
@@ -1824,17 +1921,27 @@ impl DesktopController {
                         continue;
                     }
                     match result {
-                        Ok(models) => self.state.finish_provider_model_load(models),
-                        Err(error) => self.state.fail_provider_model_load(error),
+                        Ok(models) => {
+                            self.state.finish_startup_provider_model_load(&models);
+                            self.state.finish_provider_model_load(models);
+                        }
+                        Err(error) => {
+                            self.state.fail_startup_provider_model_load(error.clone());
+                            self.state.fail_provider_model_load(error);
+                        }
                     }
                 }
                 RuntimeMessage::HistoryExported(result) => match result {
-                    Ok(path) => self
-                        .state
-                        .set_status_message(format!("exported history markdown to {}", path)),
-                    Err(error) => self
-                        .state
-                        .set_status_message(format!("history markdown export failed: {error}")),
+                    Ok(path) => {
+                        self.state.finish_history_export();
+                        self.state
+                            .set_status_message(format!("exported history markdown to {}", path));
+                    }
+                    Err(error) => {
+                        self.state.finish_history_export();
+                        self.state
+                            .set_status_message(format!("history markdown export failed: {error}"));
+                    }
                 },
                 RuntimeMessage::WorkspaceSwitched { request_id, result } => {
                     self.apply_workspace_switched_message(request_id, result)
@@ -2457,10 +2564,10 @@ unsafe fn shell_execute_hidden(file: &str, parameters: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        fallback_workspace_after_project_delete, first_restorable_project_root,
-        notification_session_title, open_transcript_rows_to_markdown,
-        run_completion_notification_body, run_terminal_event_notification_body,
-        transcript_markdown_file_name,
+        RuntimeMessage, RuntimeMessageAsyncContract, fallback_workspace_after_project_delete,
+        first_restorable_project_root, notification_session_title,
+        open_transcript_rows_to_markdown, run_completion_notification_body,
+        run_terminal_event_notification_body, transcript_markdown_file_name,
     };
     use crate::desktop::models::{DesktopFileChangeRow, DesktopTranscriptRow};
     use crate::session::{ProjectId, ProjectRecord, RunEvent, RunSummary, SessionStatus};
@@ -2475,6 +2582,27 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn runtime_message_async_contract_classifies_representative_backflow_sources() {
+        assert_eq!(
+            RuntimeMessage::HistoryExported(Ok(Utf8PathBuf::from("C:/workspace/history.md")))
+                .async_contract(),
+            RuntimeMessageAsyncContract::BackgroundOperation
+        );
+        assert_eq!(
+            RuntimeMessage::ModelCatalogLoaded {
+                requested_base_url: "http://127.0.0.1:1234".to_string(),
+                result: Ok(Vec::new()),
+            }
+            .async_contract(),
+            RuntimeMessageAsyncContract::ProviderOperation
+        );
+        assert_eq!(
+            RuntimeMessage::Finished(Err("failed".to_string())).async_contract(),
+            RuntimeMessageAsyncContract::TerminalRun
+        );
     }
 
     #[test]

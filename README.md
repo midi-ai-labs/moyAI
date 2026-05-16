@@ -65,6 +65,8 @@ cargo build --release --bin moyai-desktop
 
 The default Cargo feature set is Tauri-only for desktop builds and enables Tauri's production custom protocol, so a release executable loads bundled `ui/desktop-web/dist` assets instead of connecting to a local dev server.
 
+On cold start, `moyai-desktop.exe` shows the bundled moyAI logo splash for at least five seconds while it checks the launch-time config file state, workspace availability, and configured local LLM model catalog. If setup attention is required, the main window opens directly to Settings or LLM URL.
+
 The target offline machine does not need npm, the Rust toolchain, or internet access. Move the built release executable/assets by USB and run `moyai-desktop.exe`.
 
 ## Run
@@ -159,7 +161,7 @@ cargo fmt --all --check
 cargo check
 cargo test --lib
 cargo test --tests
-cargo run -- preflight run
+cargo run --bin moyai -- preflight run
 ```
 
 ## License

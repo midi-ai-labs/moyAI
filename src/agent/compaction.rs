@@ -3,11 +3,11 @@ use crate::agent::prompt::{AgentRunRequest, build_provider_replay_messages_from_
 use crate::agent::prompt_assets::render_compaction_prompt;
 use crate::error::AgentError;
 use crate::llm::{ChatRequest, LlmClient, ModelContentPart, ModelMessage};
-use crate::protocol::{HistoryItem, HistoryItemPayload};
+use crate::protocol::{ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, TurnId};
 use crate::runtime::RunEventSink;
 use crate::session::{
     AssistantMessageMeta, MessageMetadata, MessagePart, MessageRole, NewMessage, NewPart, PartKind,
-    SessionRecord, SessionRepository, TodoItem,
+    SessionId, SessionRecord, SessionRepository, TodoItem,
 };
 use crate::storage::SqliteSessionRepository;
 use crate::tool::truncate::clip_text_with_ellipsis;
@@ -153,7 +153,13 @@ pub fn needs_compaction(request: &AgentRunRequest) -> bool {
     if available == 0 {
         return false;
     }
-    estimate_history_item_tokens(history_items) >= available as usize
+    estimate_history_item_tokens(compaction_pressure_history_items(history_items))
+        >= available as usize
+}
+
+fn compaction_pressure_history_items(history_items: &[HistoryItem]) -> &[HistoryItem] {
+    let start = latest_summary_history_index(history_items).unwrap_or(0);
+    &history_items[start..]
 }
 
 fn compaction_split_index(request: &AgentRunRequest) -> Option<usize> {
@@ -260,6 +266,77 @@ fn estimate_history_item_token(item: &HistoryItem) -> usize {
 
 fn estimate_text_tokens(text: &str) -> usize {
     (text.len() / 4).max(1)
+}
+
+pub(crate) fn compaction_trigger_ignores_pre_summary_history_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let old_huge = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::Message {
+            message_id: None,
+            role: MessageRole::Assistant,
+            content: vec![ContentPart::Text {
+                text: "x".repeat(600_000),
+            }],
+        },
+    };
+    let compacted_old_id = old_huge.id;
+    let summary = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 2,
+        created_at_ms: 2,
+        payload: HistoryItemPayload::Compaction {
+            mode: crate::protocol::CompactionMode::PreTurn,
+            summary: "CompactionContinuity: compacted older large history.".to_string(),
+            replacement_item_ids: vec![compacted_old_id],
+            continuation: None,
+        },
+    };
+    let current_user = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 3,
+        created_at_ms: 3,
+        payload: HistoryItemPayload::UserTurn {
+            message_id: None,
+            content: vec![ContentPart::Text {
+                text: "write the missing doc".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            turn_context: None,
+        },
+    };
+    let current_assistant = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 4,
+        created_at_ms: 4,
+        payload: HistoryItemPayload::Message {
+            message_id: None,
+            role: MessageRole::Assistant,
+            content: vec![ContentPart::Text {
+                text: "I will write it.".to_string(),
+            }],
+        },
+    };
+    let history = vec![old_huge, summary, current_user, current_assistant];
+    let full_tokens = estimate_history_item_tokens(&history);
+    let pressure_tokens = estimate_history_item_tokens(compaction_pressure_history_items(&history));
+
+    full_tokens > 130_000
+        && pressure_tokens < 1_024
+        && compaction_pressure_history_items(&history).len() == 3
+        && unsummarized_user_turns_from_history_items(&history) == 1
 }
 
 fn clip_compaction_text(text: &str, limit: usize) -> String {

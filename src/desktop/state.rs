@@ -6,12 +6,14 @@ use crate::session::{
 use crate::tool::PermissionRequest;
 use crate::tui::state::{AppState, RunStatus};
 
+use super::async_ops::{DesktopAsyncOperationKind, DesktopAsyncOperationRegistry};
 use super::composer_state::DesktopComposerState;
 use super::models::{DesktopSessionDetail, DesktopSnapshot};
-use super::navigation::{DesktopNavigationState, NavigationRequestId};
+use super::navigation::{DesktopNavigationState, NavigationRequestId, NavigationTarget};
 use super::open_session::OpenSessionView;
 use super::provider_config_state::DesktopProviderConfigState;
 use super::query::build_session_detail_from_app_state_with_session;
+use super::startup::DesktopStartupState;
 use super::view_state::DesktopViewState;
 use crate::config::ResolvedConfig;
 use crate::llm::{ProviderModelInfo, normalize_provider_base_url};
@@ -46,6 +48,7 @@ pub struct DesktopState {
     pub provider_config: DesktopProviderConfigState,
     pub navigation: DesktopNavigationState,
     pub view: DesktopViewState,
+    pub startup: DesktopStartupState,
 }
 
 impl DesktopState {
@@ -59,8 +62,50 @@ impl DesktopState {
             provider_config: DesktopProviderConfigState::new(effective_config),
             navigation: DesktopNavigationState::default(),
             view: DesktopViewState::default(),
+            startup: DesktopStartupState::ready(),
         }
         .with_provider_fields()
+    }
+
+    pub fn begin_startup(
+        &mut self,
+        global_config_existed_at_launch: bool,
+        global_config_path: Option<camino::Utf8PathBuf>,
+        workspace_root: &camino::Utf8Path,
+    ) {
+        self.startup = DesktopStartupState::begin(
+            global_config_existed_at_launch,
+            global_config_path,
+            workspace_root,
+            &self.provider_config.effective_config,
+        );
+        if self.startup.status == super::startup::DesktopStartupStatus::Loading {
+            self.view
+                .async_operations
+                .begin_unique(DesktopAsyncOperationKind::StartupProviderProbe);
+        } else {
+            self.view
+                .async_operations
+                .finish_kind(DesktopAsyncOperationKind::StartupProviderProbe);
+        }
+        self.apply_startup_overlay();
+    }
+
+    pub fn finish_startup_provider_model_load(&mut self, infos: &[ProviderModelInfo]) {
+        self.startup
+            .complete_provider_catalog(&self.provider_config.effective_config, infos);
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::StartupProviderProbe);
+        self.apply_startup_overlay();
+    }
+
+    pub fn fail_startup_provider_model_load(&mut self, message: impl Into<String>) {
+        self.startup.fail_provider_catalog(message);
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::StartupProviderProbe);
+        self.apply_startup_overlay();
     }
 
     pub fn replace_snapshot(&mut self, mut snapshot: DesktopSnapshot) {
@@ -140,19 +185,35 @@ impl DesktopState {
         path: camino::Utf8PathBuf,
         selected_session_id: Option<SessionId>,
     ) -> NavigationRequestId {
-        self.navigation
-            .begin_workspace(path, selected_session_id, false)
+        self.clear_navigation_operations();
+        let id = self
+            .navigation
+            .begin_workspace(path, selected_session_id, false);
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::WorkspaceLoad);
+        id
     }
 
     pub fn begin_new_project_session_workspace_load(
         &mut self,
         path: camino::Utf8PathBuf,
     ) -> NavigationRequestId {
-        self.navigation.begin_workspace(path, None, true)
+        self.clear_navigation_operations();
+        let id = self.navigation.begin_workspace(path, None, true);
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::WorkspaceLoad);
+        id
     }
 
     pub fn begin_session_load(&mut self, session_id: SessionId) -> NavigationRequestId {
-        self.navigation.begin_session(session_id)
+        self.clear_navigation_operations();
+        let id = self.navigation.begin_session(session_id);
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::SessionLoad);
+        id
     }
 
     pub fn is_current_navigation(&self, request_id: NavigationRequestId) -> bool {
@@ -168,15 +229,161 @@ impl DesktopState {
     }
 
     pub fn finish_navigation(&mut self, request_id: NavigationRequestId) -> bool {
-        self.navigation.finish(request_id)
+        let target = self
+            .navigation
+            .active()
+            .filter(|request| request.id == request_id)
+            .map(|request| request.target.clone());
+        let finished = self.navigation.finish(request_id);
+        if finished {
+            if let Some(target) = target {
+                match target {
+                    NavigationTarget::Workspace { .. } => {
+                        self.view
+                            .async_operations
+                            .finish_kind(DesktopAsyncOperationKind::WorkspaceLoad);
+                    }
+                    NavigationTarget::Session { .. } => {
+                        self.view
+                            .async_operations
+                            .finish_kind(DesktopAsyncOperationKind::SessionLoad);
+                    }
+                }
+            }
+        }
+        finished
     }
 
     pub fn clear_navigation(&mut self) {
         self.navigation.clear();
+        self.clear_navigation_operations();
     }
 
     pub fn navigation_loading(&self) -> bool {
-        self.navigation.is_active()
+        self.view
+            .async_operations
+            .is_pending(DesktopAsyncOperationKind::WorkspaceLoad)
+            || self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::SessionLoad)
+    }
+
+    pub fn mark_post_run_refresh_pending(&mut self) {
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::TerminalRunRefresh);
+    }
+
+    pub fn begin_agent_run(&mut self) {
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::AgentRun);
+    }
+
+    pub fn finish_agent_run(&mut self) {
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::AgentRun);
+    }
+
+    pub fn clear_post_run_refresh_pending(&mut self) {
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::TerminalRunRefresh);
+    }
+
+    pub fn post_run_refresh_pending(&self) -> bool {
+        self.view
+            .async_operations
+            .is_pending(DesktopAsyncOperationKind::TerminalRunRefresh)
+    }
+
+    pub fn begin_session_delete_mutation(&mut self) {
+        self.view
+            .async_operations
+            .begin(DesktopAsyncOperationKind::SessionDelete);
+    }
+
+    pub fn finish_session_delete_mutation(&mut self) {
+        self.view
+            .async_operations
+            .finish_one_kind(DesktopAsyncOperationKind::SessionDelete);
+    }
+
+    pub fn begin_project_delete_mutation(&mut self) {
+        self.view
+            .async_operations
+            .begin(DesktopAsyncOperationKind::ProjectDelete);
+    }
+
+    pub fn finish_project_delete_mutation(&mut self) {
+        self.view
+            .async_operations
+            .finish_one_kind(DesktopAsyncOperationKind::ProjectDelete);
+    }
+
+    pub fn background_mutation_pending(&self) -> bool {
+        self.view
+            .async_operations
+            .is_pending(DesktopAsyncOperationKind::ProjectDelete)
+            || self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::SessionDelete)
+    }
+
+    pub fn begin_history_export(&mut self) {
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::HistoryExport);
+    }
+
+    pub fn finish_history_export(&mut self) {
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::HistoryExport);
+    }
+
+    pub fn begin_current_todo_refresh(&mut self) {
+        self.view
+            .async_operations
+            .begin(DesktopAsyncOperationKind::CurrentTodoRefresh);
+    }
+
+    pub fn finish_current_todo_refresh(&mut self) {
+        self.view
+            .async_operations
+            .finish_one_kind(DesktopAsyncOperationKind::CurrentTodoRefresh);
+    }
+
+    pub fn async_polling_required(&self) -> bool {
+        self.view.async_operations.polling_required()
+            || self.is_busy()
+            || self.app_state.permission.is_some()
+            || self.startup.status == super::startup::DesktopStartupStatus::Loading
+    }
+
+    pub fn pending_async_operation_keys(&self) -> Vec<String> {
+        self.view
+            .async_operations
+            .active_kinds()
+            .into_iter()
+            .map(|kind| kind.key().to_string())
+            .collect()
+    }
+
+    pub fn async_operations(&self) -> &DesktopAsyncOperationRegistry {
+        &self.view.async_operations
+    }
+
+    fn clear_navigation_operations(&mut self) {
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::WorkspaceLoad);
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::SessionLoad);
     }
 
     pub fn selected_session_title(&self) -> String {
@@ -372,6 +579,9 @@ impl DesktopState {
         let normalized = normalize_provider_base_url(&input);
         self.provider_config.provider_base_url_input = input;
         self.provider_config.provider_loading = false;
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         if self.provider_config.provider_loaded_base_url.as_deref() != Some(normalized.as_str()) {
             self.provider_config.provider_loaded_base_url = None;
         }
@@ -499,6 +709,9 @@ impl DesktopState {
     }
 
     pub fn begin_prompt_enhance(&mut self, request_id: u64, raw_prompt: &str) {
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::PromptEnhance);
         self.app_state.begin_prompt_enhance(request_id, raw_prompt);
         self.composer.review_draft_text.clear();
         self.view.overlay = DesktopOverlay::PromptReview;
@@ -509,10 +722,25 @@ impl DesktopState {
             .app_state
             .finish_prompt_enhance(request_id, draft.clone());
         if finished {
+            self.view
+                .async_operations
+                .finish_kind(DesktopAsyncOperationKind::PromptEnhance);
             self.composer.review_draft_text = draft;
             self.view.overlay = DesktopOverlay::PromptReview;
         }
         finished
+    }
+
+    pub fn fail_prompt_enhance(&mut self, request_id: u64) -> bool {
+        let active = self
+            .app_state
+            .prompt_review
+            .as_ref()
+            .is_some_and(|review| review.request_id == request_id);
+        if active {
+            self.cancel_prompt_review();
+        }
+        active
     }
 
     pub fn set_review_draft(&mut self, draft: String) {
@@ -521,6 +749,9 @@ impl DesktopState {
     }
 
     pub fn cancel_prompt_review(&mut self) {
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::PromptEnhance);
         self.app_state.cancel_prompt_review();
         self.composer.review_draft_text.clear();
         if self.view.overlay == DesktopOverlay::PromptReview {
@@ -645,6 +876,9 @@ impl DesktopState {
     pub fn begin_provider_model_load(&mut self, normalized_base_url: String) {
         self.provider_config.provider_base_url_input = normalized_base_url;
         self.provider_config.provider_loading = true;
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.provider_loaded_base_url = None;
         self.provider_config.provider_status_text =
             "Loading models in the background...".to_string();
@@ -667,6 +901,9 @@ impl DesktopState {
             .unwrap_or(-1);
         self.provider_config.provider_loaded_base_url = Some(normalized_base_url);
         self.provider_config.provider_loading = false;
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.provider_status_text = format!(
             "Loaded {} models. {}",
             self.provider_config.provider_models.len(),
@@ -680,6 +917,9 @@ impl DesktopState {
 
     pub fn fail_provider_model_load(&mut self, message: impl Into<String>) {
         self.provider_config.provider_loading = false;
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.provider_loaded_base_url = None;
         self.provider_config.provider_status_text = message.into();
         self.provider_config.provider_models = ensure_current_model(
@@ -857,6 +1097,17 @@ impl DesktopState {
             self.view.artifact_selected_index = 0;
         } else if self.view.artifact_selected_index >= count {
             self.view.artifact_selected_index = count - 1;
+        }
+    }
+
+    fn apply_startup_overlay(&mut self) {
+        if let Some(overlay) = self.startup.action_overlay {
+            self.view.overlay = overlay;
+            if overlay == DesktopOverlay::ProviderEditor {
+                self.show_provider_editor();
+            } else if overlay == DesktopOverlay::ConfigEditor {
+                self.show_config_editor();
+            }
         }
     }
 }
@@ -1213,6 +1464,109 @@ mod tests {
             format!("docx/xlsx要約 [完了] {short_id}")
         );
         assert!(!state.selected_session_title().contains("[実行中]"));
+    }
+
+    #[test]
+    fn post_run_refresh_pending_is_typed_until_current_detail_reload() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+
+        assert!(!state.post_run_refresh_pending());
+
+        state.mark_post_run_refresh_pending();
+        assert!(state.post_run_refresh_pending());
+
+        state.clear_post_run_refresh_pending();
+        assert!(!state.post_run_refresh_pending());
+    }
+
+    #[test]
+    fn background_mutation_pending_is_reference_counted() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+
+        assert!(!state.background_mutation_pending());
+
+        state.begin_session_delete_mutation();
+        state.begin_project_delete_mutation();
+        assert!(state.background_mutation_pending());
+
+        state.finish_session_delete_mutation();
+        assert!(state.background_mutation_pending());
+
+        state.finish_project_delete_mutation();
+        assert!(!state.background_mutation_pending());
+
+        state.finish_project_delete_mutation();
+        assert!(!state.background_mutation_pending());
+    }
+
+    #[test]
+    fn async_registry_projects_use_case_polling_roots() {
+        let session_id = SessionId::new();
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+
+        state.begin_workspace_load(camino::Utf8PathBuf::from("C:/workspace"), None);
+        assert!(state.navigation_loading());
+        assert!(state.async_polling_required());
+        assert!(
+            state
+                .pending_async_operation_keys()
+                .contains(&"workspace_load".to_string())
+        );
+
+        let session_request = state.begin_session_load(session_id);
+        assert!(state.navigation_loading());
+        assert!(
+            !state
+                .pending_async_operation_keys()
+                .contains(&"workspace_load".to_string())
+        );
+        assert!(
+            state
+                .pending_async_operation_keys()
+                .contains(&"session_load".to_string())
+        );
+        assert!(state.finish_navigation(session_request));
+        assert!(!state.navigation_loading());
+
+        state.mark_post_run_refresh_pending();
+        state.begin_session_delete_mutation();
+        state.begin_history_export();
+        assert!(state.async_polling_required());
+        assert!(state.post_run_refresh_pending());
+        assert!(state.background_mutation_pending());
+        assert!(
+            state
+                .pending_async_operation_keys()
+                .contains(&"history_export".to_string())
+        );
+    }
+
+    #[test]
+    fn stale_prompt_enhance_result_does_not_clear_new_operation() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+
+        state.begin_prompt_enhance(1, "first");
+        state.begin_prompt_enhance(2, "second");
+
+        assert!(!state.finish_prompt_enhance(1, "old draft".to_string()));
+        assert!(
+            state
+                .pending_async_operation_keys()
+                .contains(&"prompt_enhance".to_string())
+        );
+        assert!(!state.fail_prompt_enhance(1));
+        assert!(
+            state
+                .pending_async_operation_keys()
+                .contains(&"prompt_enhance".to_string())
+        );
+
+        assert!(state.finish_prompt_enhance(2, "new draft".to_string()));
+        assert!(
+            !state
+                .pending_async_operation_keys()
+                .contains(&"prompt_enhance".to_string())
+        );
     }
 
     #[test]

@@ -296,6 +296,15 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
         );
     }
 
+    if gate.gate_id == "preflight.prompt_replay.compaction_orphan_assistant_repaired"
+        && !crate::agent::compaction::compaction_trigger_ignores_pre_summary_history_fixture_passes(
+        )
+    {
+        diagnostics.push(
+            "compaction trigger still counts pre-summary history payloads after a compaction summary exists".to_string(),
+        );
+    }
+
     if gate.gate_id == "preflight.prompt_replay.stale_inactive_authoring_pair_omitted"
         && !crate::agent::prompt::stale_inactive_authoring_replay_omits_fake_executable_arguments()
     {
@@ -346,10 +355,11 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
     }
 
     if gate.gate_id == "preflight.tool_lifecycle.verification_stable_tool_surface"
-        && !crate::agent::loop_impl::verification_active_work_preserves_tool_surface_and_rejects_wrong_command_fixture_passes()
+        && (!crate::agent::loop_impl::verification_active_work_preserves_tool_surface_and_rejects_wrong_command_fixture_passes()
+            || !crate::protocol::verification_only_authority_narrows_to_exact_shell_fixture_passes())
     {
         diagnostics.push(
-            "verification active work still narrows the provider-visible tool interface instead of preserving stable tools and validating shell command satisfaction".to_string(),
+            "verification active work does not project exact shell verification authority, or repair-required verification lost its edit-capable recovery surface".to_string(),
         );
     }
 
@@ -426,7 +436,8 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
         && (!crate::agent::state::verification_failure_promotes_repair_required_active_work_fixture_passes()
             || !crate::agent::repair_lane::source_owned_repair_lane_stays_diagnostic_fixture_passes()
             || !crate::agent::turn_decision::active_work_edit_authority_precedes_verification_rerun_fixture_passes()
-            || !crate::agent::loop_impl::required_repair_write_missing_tool_is_not_restored_fixture_passes())
+            || !crate::agent::loop_impl::required_repair_write_missing_tool_is_not_restored_fixture_passes()
+            || !crate::agent::loop_impl::verification_repair_required_edit_surface_narrows_stale_tools_fixture_passes())
     {
         diagnostics.push(
             "source-owned verification repair is not compiled through item-stream active work / ActionAuthority, or repair-lane diagnostics still override the top-level dispatch authority".to_string(),
@@ -1233,7 +1244,7 @@ pub fn failure_registry_preflight_suite() -> Vec<PreflightGate> {
         PreflightGate {
             gate_id: "preflight.tool_lifecycle.verification_stable_tool_surface"
                 .to_string(),
-            purpose: "verification obligations constrain shell command satisfaction without removing supporting-context tools from the provider-visible interface".to_string(),
+            purpose: "verification-only obligations narrow provider-visible action authority to the exact shell verification command while preserving edit surface when repair is required".to_string(),
             tier: 2,
             layer: PreflightLayer::Flow,
             llm_mode: PreflightLlmMode::NoLlm,
@@ -1726,7 +1737,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
         PreflightFixture {
             fixture_id: "fixture.prompt_replay.compaction_orphan_assistant_repaired".to_string(),
             family: PreflightGateFamily::PromptReplayAuthority,
-            authority_source: "CanonicalHistoryItem PromptProjection CompactionContinuity post_compaction_role_alternation latest_user_input_preserved matching_user_query_restored_before_assistant".to_string(),
+            authority_source: "CanonicalHistoryItem PromptProjection CompactionContinuity post_compaction_role_alternation latest_user_input_preserved matching_user_query_restored_before_assistant compaction_trigger_ignores_pre_summary_history".to_string(),
             required_refs: vec![
                 "CanonicalHistoryItem".to_string(),
                 "PromptProjection".to_string(),
@@ -1734,10 +1745,12 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "post_compaction_role_alternation".to_string(),
                 "latest_user_input_preserved".to_string(),
                 "matching_user_query_restored_before_assistant".to_string(),
+                "compaction_trigger_ignores_pre_summary_history".to_string(),
             ],
             forbidden_refs: vec![
                 "assistant_message_without_matching_user_after_compaction".to_string(),
                 "provider_template_no_user_query".to_string(),
+                "pre_summary_history_token_pressure_retrigger".to_string(),
             ],
             required_artifacts: Vec::new(),
             fail_closed_on_missing_typed_projection: true,
@@ -1867,12 +1880,12 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.tool_lifecycle.verification_stable_tool_surface"
                 .to_string(),
             family: PreflightGateFamily::ToolLifecycleAuthority,
-            authority_source: "CodexHistoryItemStream ActiveWorkContract::Verification stable_tool_interface read_supporting_context shell_command_satisfaction FunctionCallOutput wrong_verification_command progress_effect=no_progress terminal_guard".to_string(),
+            authority_source: "CodexHistoryItemStream ActiveWorkContract::Verification exact_shell_verification_authority repair_required_edit_surface shell_command_satisfaction FunctionCallOutput wrong_verification_command progress_effect=no_progress terminal_guard".to_string(),
             required_refs: vec![
                 "CodexHistoryItemStream".to_string(),
                 "ActiveWorkContract::Verification".to_string(),
-                "stable_tool_interface".to_string(),
-                "read_supporting_context".to_string(),
+                "exact_shell_verification_authority".to_string(),
+                "repair_required_edit_surface".to_string(),
                 "shell_command_satisfaction".to_string(),
                 "FunctionCallOutput".to_string(),
                 "wrong_verification_command".to_string(),
@@ -1880,8 +1893,8 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "terminal_guard".to_string(),
             ],
             forbidden_refs: vec![
-                "verification_shell_only_tool_interface".to_string(),
-                "unavailable_read_during_verification".to_string(),
+                "broad_context_surface_when_only_verification_pending".to_string(),
+                "repair_required_verification_shell_only_surface".to_string(),
                 "schema_const_command_authority".to_string(),
             ],
             required_artifacts: Vec::new(),
@@ -1891,7 +1904,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.tool_lifecycle.authoring_stable_tool_surface"
                 .to_string(),
             family: PreflightGateFamily::ToolLifecycleAuthority,
-            authority_source: "CodexHistoryItemStream ActiveWorkContract::RequestedWorkAuthoring stable_tool_interface content_changing_satisfaction supporting_context progress_projection_saturation FunctionCallOutput progress_effect=no_progress terminal_guard".to_string(),
+            authority_source: "CodexHistoryItemStream ActiveWorkContract::RequestedWorkAuthoring stable_tool_interface content_changing_satisfaction supporting_context progress_projection_saturation supporting_context_budget_recovery_surface FunctionCallOutput progress_effect=no_progress terminal_guard".to_string(),
             required_refs: vec![
                 "CodexHistoryItemStream".to_string(),
                 "ActiveWorkContract::RequestedWorkAuthoring".to_string(),
@@ -1899,6 +1912,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "content_changing_satisfaction".to_string(),
                 "supporting_context".to_string(),
                 "progress_projection_saturation".to_string(),
+                "supporting_context_budget_recovery_surface".to_string(),
                 "FunctionCallOutput".to_string(),
                 "progress_effect=no_progress".to_string(),
                 "terminal_guard".to_string(),
@@ -1915,19 +1929,20 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.tool_lifecycle.progress_projection_stable_surface_guard"
                 .to_string(),
             family: PreflightGateFamily::ToolLifecycleAuthority,
-            authority_source: "ActiveWorkContract::RequestedWorkAuthoring progress_projection_call_output todowrite_visible write_apply_patch_preserved no_required_action_string stable_tool_schema semantic_no_progress_guard".to_string(),
+            authority_source: "ActiveWorkContract::RequestedWorkAuthoring progress_projection_call_output todowrite_visible write_apply_patch_preserved authoring_supporting_context_budget_recovery_surface no_required_action_string stable_tool_schema semantic_no_progress_guard".to_string(),
             required_refs: vec![
                 "ActiveWorkContract::RequestedWorkAuthoring".to_string(),
                 "progress_projection_call_output".to_string(),
                 "todowrite_visible".to_string(),
                 "write_apply_patch_preserved".to_string(),
+                "authoring_supporting_context_budget_recovery_surface".to_string(),
                 "stable_tool_schema".to_string(),
                 "semantic_no_progress_guard".to_string(),
             ],
             forbidden_refs: vec![
                 "required_next_action".to_string(),
                 "schema_const_target_authority".to_string(),
-                "tool_surface_suppression".to_string(),
+                "untyped_tool_surface_suppression".to_string(),
             ],
             required_artifacts: Vec::new(),
             fail_closed_on_missing_typed_projection: true,
@@ -1981,16 +1996,18 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.turn_decision.repair_required_active_work_ignores_shell_only_continuation"
                 .to_string(),
             family: PreflightGateFamily::ControlEnvelopeProjection,
-            authority_source: "HistoryItem ActiveWorkContract::Verification repair_required=true TurnControlEnvelope ActionAuthority tool_surface target".to_string(),
+            authority_source: "HistoryItem ActiveWorkContract::Verification repair_required=true TurnControlEnvelope ActionAuthority tool_surface target repair_required_edit_surface".to_string(),
             required_refs: vec![
                 "ActiveWorkContract".to_string(),
                 "repair_required=true".to_string(),
                 "ActionAuthority".to_string(),
+                "repair_required_edit_surface".to_string(),
             ],
             forbidden_refs: vec![
                 "continuation_shell_override".to_string(),
                 "prompt_candidate_surface_authority".to_string(),
                 "duplicate_success_cache".to_string(),
+                "stale_read_or_shell_before_source_contract_repair".to_string(),
             ],
             required_artifacts: Vec::new(),
             fail_closed_on_missing_typed_projection: true,

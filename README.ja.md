@@ -4,58 +4,56 @@
 
 # moyAI
 
-**moyAI** は、閉域環境、プライベートコード、ローカル LLM 運用を前提にした Rust 製のローカルファースト coding agent です。
+**moyAI** は、ローカル LLM と閉域環境で使うことを前提に作っている Rust 製の coding agent です。
 
-OpenAI 互換のローカル LLM サーバーへ接続し、ワークスペース内の検索、読み取り、編集、shell 実行、セッション履歴、検証を扱います。CLI、TUI、native desktop app は同じ Rust core の上で動きます。
+OpenAI 互換 API を持つローカル LLM サーバーにつなぎ、ワークスペースの調査、ファイル編集、shell 実行、セッション履歴、検証までを扱います。CLI、TUI、Desktop App は同じ Rust core の上で動きます。
 
 [English README](README.md)
 
-## なぜ moyAI か
+## どういうものか
 
-多くの coding agent はクラウド利用、外部ネットワーク、hosted model、online plugin ecosystem を前提にしています。しかし、機密コード、閉域ネットワーク、ローカル推論サーバー、再現性を重視する社内開発環境では、その前提が合わないことがあります。
+最近の coding agent は、クラウド接続、外部ネットワーク、ホストされた model、online plugin ecosystem を前提にしているものが多いです。便利な一方で、機密コード、閉域ネットワーク、ローカル推論サーバー、再現性を重視する社内開発では、そのまま使いづらい場面があります。
 
-moyAI は、そのような環境で実用的に使うために作られています。ローカル実行、明示的な設定、ワークスペースを理解した tool 実行、永続的な session history、実行内容を後から確認できる deterministic harness を重視しています。
+moyAI は、そのあたりを最初から前提にした agent です。ローカルで動くこと、設定が明示的であること、ワークスペース内の作業内容を後から追えること、実行結果を deterministic な preflight / harness で確認できることを重視しています。
 
-## 主な機能
+## できること
 
-- OpenAI 互換 API による local LLM 接続。
-- `/v1/models` と LM Studio `/api/v1/models` metadata による model discovery。
-- CLI、TUI、Tauri desktop app。
-- workspace search、directory inspection、file read、diff-based edit、shell execution。
-- large file、binary、model checkpoint、structured document に対する read guard。
-- 閉域 Docling Serve と HTTP MCP server 連携。
-- protocol-first history による session persistence と Markdown export。
-- vision-capable model への画像添付。
-- `default`、`auto_review`、`full_access` の permission preset。
-- `AGENTS.md`、`CLAUDE.md`、`.moyai/rules*`、local `SKILL.md` の instruction loading。
-- `.moyai/commands/*.md` による reusable workflow command。
-- uncommitted changes / branch comparison の review entrypoint。
-- runtime contract を検査する deterministic preflight / harness command。
+- OpenAI 互換 API 経由で local LLM に接続できます。
+- `/v1/models` と LM Studio `/api/v1/models` metadata から model discovery できます。
+- CLI、TUI、Tauri Desktop App を同じ core で使えます。
+- workspace search、directory inspection、file read、diff-based edit、shell execution を扱えます。
+- large file、binary、model checkpoint、structured document には read guard がかかります。
+- 閉域 Docling Serve と HTTP MCP server を使った document workflow に対応しています。
+- protocol-first history による session persistence と Markdown export ができます。
+- vision-capable model では、CLI / Desktop から画像を添付できます。
+- `default`、`auto_review`、`full_access` の permission preset を選べます。
+- `AGENTS.md`、`CLAUDE.md`、`.moyai/rules*`、local `SKILL.md` を読み込めます。
+- `.moyai/commands/*.md` で project local な workflow command を定義できます。
+- uncommitted changes や branch comparison の review entrypoint を使えます。
+- runtime contract を確認する deterministic preflight / harness command を実行できます。
 
 ## 現在の状態
 
-moyAI は、closed-network / local-LLM 前提の実用 coding agent として開発中です。この repository には core runtime、CLI、TUI、desktop app、session storage、tool execution layer、provider metadata probing、harness / preflight infrastructure が含まれます。
+moyAI は、closed-network / local-LLM 前提の実用 coding agent として開発中です。この repository には core runtime、CLI、TUI、Desktop App、session storage、tool execution layer、provider metadata probing、harness / preflight infrastructure が入っています。
 
-## 現在の想定環境
-
-moyAI は現在、Windows 環境で利用することを前提に開発・検証しています。
-
-開発時点では、LM Studio でホスティングした `qwen/qwen3.6-35b-a3b`、特に `lmstudio-community` 版に最適化しています。その他の model や provider profile への対応は今後の開発予定です。
+現時点では Windows を主な検証環境にしています。開発中の標準 model は、LM Studio でホストした `qwen/qwen3.6-35b-a3b`、特に `lmstudio-community` 版です。ほかの model や provider profile も扱えるようにしていますが、まずはこの構成での安定性を重視しています。
 
 ## 必要なもの
 
 - Rust 2024 edition に対応した Rust toolchain。
-- OpenAI 互換の local または到達可能な LLM endpoint。
+- OpenAI 互換 API を提供する local または到達可能な LLM endpoint。
 - 任意: model metadata discovery 用の LM Studio。
 - 任意: document workflow 用の Docling Serve または HTTP MCP server。
 
 ## Build
 
+まず CLI / core を build する場合:
+
 ```bash
 cargo build
 ```
 
-Desktop UI は Tauri + TypeScript bundle です。build machine では lockfile 済み npm dependencies を install し、web assets を生成してから desktop release を作成します。
+Desktop UI は Tauri + TypeScript bundle です。Desktop release を作る場合は、build machine で npm dependencies を lockfile どおりに install し、web assets を生成してから release binary を作ります。
 
 ```bash
 npm install
@@ -63,9 +61,13 @@ npm run build:desktop-web
 cargo build --release --bin moyai-desktop
 ```
 
-release executable は bundled `ui/desktop-web/dist` assets を Tauri production custom protocol で読み込みます。release target の非接続端末には npm、Rust toolchain、internet access、local dev server は不要です。USB で release executable / assets を移動して `moyai-desktop.exe` を実行できます。
+release executable は、Tauri production custom protocol で bundled `ui/desktop-web/dist` assets を読み込みます。利用先の非接続端末には、npm、Rust toolchain、internet access、local dev server は不要です。release executable / assets を USB などで移動して `moyai-desktop.exe` を実行できます。
+
+`moyai-desktop.exe` の cold start では、同梱された moyAI ロゴ splash を最低 5 秒表示します。その間に、起動時点の設定ファイル、workspace、configured local LLM model catalog を確認します。設定が足りない場合や LLM 接続確認が通らない場合は、メインウィンドウ表示後に Settings または LLM URL を自動で開きます。
 
 ## Run
+
+CLI から workspace を指定して実行する例:
 
 ```bash
 cargo run -- run --dir /path/to/workspace "このプロジェクトの主要モジュールを調べて要約してください。"
@@ -80,18 +82,21 @@ moyai desktop --dir /path/to/workspace
 moyai-desktop
 ```
 
-release build では CLI / TUI 用の `moyai.exe` と、Desktop App を直接起動する `moyai-desktop.exe` が生成されます。Windows では `moyai-desktop.exe` をダブルクリックすると Desktop App が開きます。release では `npm run dev` や `127.0.0.1` dev server は不要です。Desktop runtime window / taskbar icon は `logo/fabicon/android-chrome-512x512.png` を使い、Windows executable resource は multi-size の `logo/fabicon/moyai_app_icon.ico` を使います。
-workspace 未指定時、Desktop App は workspace-free Quick Chat として起動します。Project 作業は project 追加 control から folder を選ぶか、`--dir` を指定したときだけ開始します。
+release build では、CLI / TUI 用の `moyai.exe` と、Desktop App を直接起動する `moyai-desktop.exe` が生成されます。Windows では `moyai-desktop.exe` をダブルクリックするだけで Desktop App を起動できます。release では `npm run dev` や `127.0.0.1` の dev server は使いません。
+
+Desktop runtime window / taskbar icon は `logo/fabicon/android-chrome-512x512.png` を使い、Windows executable resource は multi-size の `logo/fabicon/moyai_app_icon.ico` を使います。
+
+workspace を指定しない場合、Desktop App は workspace-free Quick Chat として起動します。Project 作業は project 追加 control から folder を選ぶか、`--dir` を指定したときに開始します。
 
 ## 設定
 
-moyAI は global config、workspace config、environment variables、CLI overrides から設定を読みます。
+moyAI は global config、workspace config、environment variables、CLI overrides の順に設定を読み込みます。
 
-通常の app 初回起動時に、global config が存在しない場合は編集可能なデフォルト値入りの設定ファイルを自動生成します。
+通常の app 初回起動時に global config が存在しない場合は、編集可能な default 値入りの設定ファイルを自動生成します。
 
 - `%APPDATA%\midi-ai-labs\moyai\config\config.toml`
 
-release folder に `.toml` を同梱する必要はありません。binary は `C:\tools\moyai\` のような安定した install directory に配置し、user config と session data は Windows user profile 配下に保存します。
+release folder に `.toml` を同梱する必要はありません。binary は `C:\tools\moyai\` のような安定した install directory に置き、user config と session data は Windows user profile 配下に保存します。
 
 workspace config:
 
@@ -118,7 +123,7 @@ workspace config:
 ```toml
 [model]
 base_url = "http://127.0.0.1:1234"
-# LM Studio でホスティングした qwen3.6-35b-a3b、lmstudio-community 版。
+# LM Studio でホストした qwen3.6-35b-a3b、lmstudio-community 版。
 model = "qwen/qwen3.6-35b-a3b"
 context_window = 131072
 supports_tools = true
@@ -135,7 +140,7 @@ base_url = "http://127.0.0.1:8123"
 enabled = false
 ```
 
-## Instruction Files
+## Project local instructions
 
 moyAI は repository local の instruction を読み込みます。
 
@@ -150,14 +155,14 @@ moyAI は repository local の instruction を読み込みます。
 
 ## Verification
 
-代表的な local check:
+手元でよく使う check:
 
 ```bash
 cargo fmt --all --check
 cargo check
 cargo test --lib
 cargo test --tests
-cargo run -- preflight run
+cargo run --bin moyai -- preflight run
 ```
 
 ## License

@@ -4,6 +4,7 @@ use super::models::{
     DesktopArtifactRow, DesktopCommandRow, DesktopFileChangeRow, DesktopProjectRow,
     DesktopSessionRow, DesktopTranscriptRow,
 };
+use super::startup::{DesktopStartupCheckStatus, DesktopStartupStatus};
 use super::state::{DesktopOverlay, DesktopState};
 use crate::tui::config_editor::{ConfigField, ConfigFieldState};
 use crate::tui::state::{PromptReviewPhase, RunStatus};
@@ -17,6 +18,24 @@ pub struct DesktopPermissionProjection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopStartupCheckProjection {
+    pub key: String,
+    pub label: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopStartupProjection {
+    pub status: String,
+    pub title: String,
+    pub message: String,
+    pub detail: String,
+    pub action_overlay: String,
+    pub checks: Vec<DesktopStartupCheckProjection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopWebState {
     pub workspace_path: String,
     pub provider_label: String,
@@ -25,6 +44,7 @@ pub struct DesktopWebState {
     pub current_session_label: String,
     pub selected_session_title: String,
     pub status_message: String,
+    pub status_detail: String,
     pub run_status_key: String,
     pub run_status_text: String,
     pub run_phase: String,
@@ -35,12 +55,17 @@ pub struct DesktopWebState {
     pub confirmation_visible: bool,
     pub confirmation_text: String,
     pub confirmation: Option<DesktopPermissionProjection>,
+    pub startup: DesktopStartupProjection,
     pub draft_prompt: String,
     pub image_input: String,
     pub attached_images: Vec<String>,
     pub can_submit: bool,
     pub busy: bool,
+    pub async_polling_required: bool,
+    pub pending_async_operations: Vec<String>,
     pub navigation_loading: bool,
+    pub post_run_refresh_pending: bool,
+    pub background_mutation_pending: bool,
     pub overlay: String,
     pub project_rows: Vec<DesktopProjectRow>,
     pub selected_project_index: i32,
@@ -122,6 +147,12 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         .find(|line| !line.is_empty())
         .unwrap_or("ツール待機中")
         .to_string();
+    let (status_message, status_detail) = state
+        .app_state
+        .status_message
+        .as_deref()
+        .map(display_status_projection)
+        .unwrap_or_else(|| ("準備完了".to_string(), String::new()));
     DesktopWebState {
         workspace_path: state.snapshot.workspace_path.clone(),
         provider_label: state.snapshot.provider_label.clone(),
@@ -137,17 +168,13 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         .to_lowercase(),
         current_session_label: state.current_session_label(),
         selected_session_title: state.selected_session_title(),
-        status_message: state
-            .app_state
-            .status_message
-            .as_deref()
-            .map(display_status_message)
-            .unwrap_or_else(|| "準備完了".to_string()),
+        status_message,
+        status_detail,
         run_status_key: run_status_key(state.app_state.run_status).to_string(),
         run_status_text: state.current_run_status_text(),
-        run_phase: state.app_state.progress.current_phase.clone(),
-        run_active_step: state.app_state.progress.active_step.clone(),
-        latest_tool_summary,
+        run_phase: display_run_phase(&state.app_state.progress.current_phase),
+        run_active_step: display_run_step(&state.app_state.progress.active_step),
+        latest_tool_summary: display_tool_summary(&latest_tool_summary),
         progress_text: detail.progress_text,
         tool_status_text: detail.tool_status_text,
         confirmation_visible: detail.confirmation_visible,
@@ -160,6 +187,7 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
                 risks: permission.risks.clone(),
             }
         }),
+        startup: startup_projection(state),
         draft_prompt: state.composer.draft_prompt.clone(),
         image_input: state.composer.image_attachment_input.clone(),
         attached_images: state
@@ -170,7 +198,11 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
             .collect(),
         can_submit: state.can_submit_prompt(),
         busy: state.is_busy(),
+        async_polling_required: state.async_polling_required(),
+        pending_async_operations: state.pending_async_operation_keys(),
         navigation_loading: state.navigation_loading(),
+        post_run_refresh_pending: state.post_run_refresh_pending(),
+        background_mutation_pending: state.background_mutation_pending(),
         overlay: overlay_key(state.view.overlay).to_string(),
         project_rows: state.snapshot.project_rows.clone(),
         selected_project_index: state.selected_project_index(),
@@ -221,6 +253,50 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         enhance_enabled: !state.is_busy() && !state.composer.draft_prompt.trim().is_empty(),
         image_input_enabled,
         window_opacity_percent: state.view.window_opacity_percent,
+    }
+}
+
+fn startup_projection(state: &DesktopState) -> DesktopStartupProjection {
+    DesktopStartupProjection {
+        status: startup_status_key(state.startup.status).to_string(),
+        title: state.startup.title.clone(),
+        message: state.startup.message.clone(),
+        detail: state.startup.detail.clone(),
+        action_overlay: state
+            .startup
+            .action_overlay
+            .map(overlay_key)
+            .unwrap_or("none")
+            .to_string(),
+        checks: state
+            .startup
+            .checks
+            .iter()
+            .map(|check| DesktopStartupCheckProjection {
+                key: check.key.to_string(),
+                label: check.label.to_string(),
+                status: startup_check_status_key(check.status).to_string(),
+                message: check.message.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn startup_status_key(status: DesktopStartupStatus) -> &'static str {
+    match status {
+        DesktopStartupStatus::Loading => "loading",
+        DesktopStartupStatus::Ready => "ready",
+        DesktopStartupStatus::RequiresConfig => "requires_config",
+        DesktopStartupStatus::RequiresProvider => "requires_provider",
+    }
+}
+
+fn startup_check_status_key(status: DesktopStartupCheckStatus) -> &'static str {
+    match status {
+        DesktopStartupCheckStatus::Pending => "pending",
+        DesktopStartupCheckStatus::Pass => "pass",
+        DesktopStartupCheckStatus::Warning => "warning",
+        DesktopStartupCheckStatus::Fail => "fail",
     }
 }
 
@@ -368,14 +444,120 @@ fn config_feedback_text(key: ConfigField) -> String {
     )
 }
 
-fn display_status_message(message: &str) -> String {
-    if message == "run completed" {
-        "実行完了".to_string()
-    } else if let Some(rest) = message.strip_prefix("assistant running on ") {
-        format!("実行中: {rest}")
-    } else {
-        message.to_string()
+fn display_status_projection(message: &str) -> (String, String) {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("run llm error")
+        || lower.contains("llm http error")
+        || lower.contains("error sending request for url")
+    {
+        return (
+            "LLMに接続できません。LLM URL とモデル設定を確認してください。".to_string(),
+            message.to_string(),
+        );
     }
+    if lower.contains("configured model") && lower.contains("is not available") {
+        return (
+            "設定中のモデルが見つかりません。モデル名と LLM URL を確認してください。".to_string(),
+            message.to_string(),
+        );
+    }
+    if lower.contains("does not advertise image support")
+        || lower.contains("choose a vision-capable model")
+    {
+        return (
+            "このモデルは画像入力に対応していません。画像対応モデルを選択してください。"
+                .to_string(),
+            message.to_string(),
+        );
+    }
+    if lower.contains("permission denied by user") {
+        return (
+            "ユーザーが許可しなかったため、操作を実行しませんでした。".to_string(),
+            String::new(),
+        );
+    }
+    if lower.contains("run cancelled by user") || lower.contains("tool execution cancelled by user")
+    {
+        return ("停止しました。".to_string(), String::new());
+    }
+    if message == "run completed" {
+        return ("実行完了".to_string(), String::new());
+    }
+    if let Some(rest) = message.strip_prefix("assistant running on ") {
+        return (format!("実行中: {rest}"), String::new());
+    }
+    match message {
+        "Image attached to the next prompt." => {
+            ("画像を次の依頼に添付しました。".to_string(), String::new())
+        }
+        "Image attachments cleared." => ("画像添付を解除しました。".to_string(), String::new()),
+        "Enter an image path before attaching." => (
+            "画像ファイルのパスを入力してください。".to_string(),
+            String::new(),
+        ),
+        "Image is already attached." => (
+            "この画像はすでに添付されています。".to_string(),
+            String::new(),
+        ),
+        _ if message.starts_with("Removed image attachment") => {
+            ("画像添付を1件削除しました。".to_string(), String::new())
+        }
+        _ => (message.to_string(), String::new()),
+    }
+}
+
+fn display_run_phase(phase: &str) -> String {
+    match phase.trim().to_ascii_lowercase().as_str() {
+        "" => "待機".to_string(),
+        "model" => "モデル応答".to_string(),
+        "permission" => "確認".to_string(),
+        "tool" => "ツール実行".to_string(),
+        "verify" | "verification" => "検証".to_string(),
+        "compact" | "compaction" => "圧縮".to_string(),
+        "completed" => "完了".to_string(),
+        "failed" => "失敗".to_string(),
+        "cancelled" | "canceled" => "停止".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn display_run_step(step: &str) -> String {
+    let trimmed = step.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(rest) = trimmed.strip_prefix("Model request ") {
+        if let Some((request, tools)) = rest.split_once(" with ") {
+            if let Some(tool_count) = tools.strip_suffix(" tools") {
+                return format!(
+                    "モデル応答 {}（ツール {}件）",
+                    request.trim(),
+                    tool_count.trim()
+                );
+            }
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("Running ") {
+        return format!("実行中: {}", rest.trim());
+    }
+    if let Some(rest) = trimmed.strip_prefix("Confirming ") {
+        return format!("確認待ち: {}", rest.trim());
+    }
+    trimmed.to_string()
+}
+
+fn display_tool_summary(summary: &str) -> String {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return "ツール待機中".to_string();
+    }
+    if trimmed == "No tool activity yet." || trimmed == "Tool activity pending" {
+        return "ツール待機中".to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix("Running ") {
+        return format!("ツール実行中: {}", rest.trim());
+    }
+    trimmed.to_string()
 }
 
 fn truncate_middle(value: &str, max_chars: usize) -> String {
@@ -398,4 +580,125 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
         .rev()
         .collect::<String>();
     format!("{prefix}…{suffix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        desktop_web_state, display_run_phase, display_run_step, display_status_projection,
+        display_tool_summary,
+    };
+    use crate::config::ResolvedConfig;
+    use crate::desktop::models::{DesktopProjectRow, DesktopSnapshot};
+    use crate::desktop::state::DesktopState;
+    use crate::session::ProjectId;
+
+    fn snapshot() -> DesktopSnapshot {
+        DesktopSnapshot {
+            workspace_path: "C:/workspace".to_string(),
+            provider_label: "provider".to_string(),
+            model_label: "model".to_string(),
+            command_rows: Vec::new(),
+            project_rows: vec![DesktopProjectRow {
+                project_id: ProjectId::new(),
+                label: "workspace".to_string(),
+                path: "C:/workspace".to_string(),
+            }],
+            selected_project_index: 0,
+            chat_session_rows: Vec::new(),
+            session_rows: Vec::new(),
+            session_details: Vec::new(),
+            selected_session_index: 0,
+        }
+    }
+
+    fn config_with_provider() -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = "http://127.0.0.1:1234".to_string();
+        config.model.model = "qwen/example".to_string();
+        config
+    }
+
+    #[test]
+    fn web_state_exposes_reverse_polling_roots() {
+        let mut state = DesktopState::new(snapshot(), config_with_provider());
+        state.begin_startup(true, None, camino::Utf8Path::new("."));
+        state.begin_workspace_load(camino::Utf8PathBuf::from("C:/workspace2"), None);
+        state.mark_post_run_refresh_pending();
+        state.begin_session_delete_mutation();
+        state.begin_provider_model_load("http://127.0.0.1:1234".to_string());
+
+        let web = desktop_web_state(&state);
+
+        assert_eq!(web.startup.status, "loading");
+        assert!(web.async_polling_required);
+        assert!(
+            web.pending_async_operations
+                .contains(&"startup_provider_probe".to_string())
+        );
+        assert!(
+            web.pending_async_operations
+                .contains(&"workspace_load".to_string())
+        );
+        assert!(
+            web.pending_async_operations
+                .contains(&"terminal_run_refresh".to_string())
+        );
+        assert!(
+            web.pending_async_operations
+                .contains(&"session_delete".to_string())
+        );
+        assert!(
+            web.pending_async_operations
+                .contains(&"provider_model_catalog_load".to_string())
+        );
+        assert!(web.navigation_loading);
+        assert!(web.post_run_refresh_pending);
+        assert!(web.background_mutation_pending);
+        assert!(web.provider_loading);
+    }
+
+    #[test]
+    fn status_projection_keeps_raw_provider_errors_as_detail() {
+        let raw = "run llm error: llm http error: error sending request for url (http://127.0.0.1:9/v1/models)";
+        let (summary, detail) = display_status_projection(raw);
+        assert_eq!(
+            summary,
+            "LLMに接続できません。LLM URL とモデル設定を確認してください。"
+        );
+        assert_eq!(detail, raw);
+    }
+
+    #[test]
+    fn status_projection_translates_model_and_image_fail_closed_messages() {
+        let (summary, detail) = display_status_projection(
+            "configured model `foo` is not available at `http://127.0.0.1`; available models: bar",
+        );
+        assert_eq!(
+            summary,
+            "設定中のモデルが見つかりません。モデル名と LLM URL を確認してください。"
+        );
+        assert!(detail.contains("configured model"));
+
+        let (summary, detail) =
+            display_status_projection("configured model `foo` does not advertise image support");
+        assert_eq!(
+            summary,
+            "このモデルは画像入力に対応していません。画像対応モデルを選択してください。"
+        );
+        assert!(detail.contains("does not advertise image support"));
+    }
+
+    #[test]
+    fn run_status_projection_uses_user_facing_labels() {
+        assert_eq!(display_run_phase("model"), "モデル応答");
+        assert_eq!(
+            display_run_step("Model request 2 with 7 tools"),
+            "モデル応答 2（ツール 7件）"
+        );
+        assert_eq!(
+            display_tool_summary("No tool activity yet."),
+            "ツール待機中"
+        );
+    }
 }

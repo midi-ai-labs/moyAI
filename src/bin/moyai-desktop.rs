@@ -79,6 +79,9 @@ fn run_on_current_thread() -> Result<(), (u8, String)> {
         session_id,
         continue_last: args.continue_last,
     });
+    let global_config_existed_at_launch = moyai::config::loader::global_config_path()
+        .map(|path| path.exists())
+        .unwrap_or(false);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -93,6 +96,7 @@ fn run_on_current_thread() -> Result<(), (u8, String)> {
                 directory: args.directory,
                 session_id,
                 continue_last: args.continue_last,
+                global_config_existed_at_launch,
             },
         )
         .await

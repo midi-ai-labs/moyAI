@@ -317,14 +317,32 @@ impl ActionAuthority {
         operation_intents.sort_by_key(|intent| intent.as_str());
         operation_intents.dedup();
 
+        let verification_command_only = !required_verification_commands.is_empty()
+            && operation_intents.is_empty()
+            && open_obligations
+                .iter()
+                .any(|item| item.kind == ObligationKind::Verification)
+            && open_obligations
+                .iter()
+                .all(|item| item.operation_intents.is_empty());
         let mut allowed_tools = context.allowed_tools.clone();
         allowed_tools.sort_by_key(|tool| tool.to_string());
         allowed_tools.dedup();
-        let tool_choice = compile_tool_choice(None, &allowed_tools, tool_choice);
+        if verification_command_only && allowed_tools.contains(&ToolName::Shell) {
+            allowed_tools.retain(|tool| *tool == ToolName::Shell);
+        }
+        let required_next_action =
+            if verification_command_only && required_verification_commands.len() == 1 {
+                Some(format!("shell:{}", required_verification_commands[0]))
+            } else {
+                None
+            };
+        let tool_choice =
+            compile_tool_choice(required_next_action.as_deref(), &allowed_tools, tool_choice);
 
         Self {
             projection_id: context.active_contract.projection_id,
-            required_next_action: None,
+            required_next_action,
             required_verification_commands,
             operation_intents,
             allowed_tools,
@@ -833,7 +851,7 @@ fn validate_tool_choice(
 }
 
 fn compile_tool_choice(
-    _required_next_action: Option<&str>,
+    required_next_action: Option<&str>,
     allowed_tools: &[ToolName],
     requested: ToolChoice,
 ) -> ToolChoice {
@@ -843,7 +861,101 @@ fn compile_tool_choice(
     if matches!(requested, ToolChoice::Required | ToolChoice::Named(_)) {
         return requested;
     }
+    if required_next_action.is_some() {
+        return ToolChoice::Required;
+    }
     ToolChoice::Auto
+}
+
+pub fn verification_only_authority_narrows_to_exact_shell_fixture_passes() -> bool {
+    let projection_id = ProjectionId::new();
+    let active_contract = super::ActiveWorkContractProjection {
+        route: crate::session::TaskRoute::Code,
+        process_phase: crate::session::ProcessPhase::Verify,
+        active_work_kind: Some("verification".to_string()),
+        summary: "Run the required verification command.".to_string(),
+        active_targets: vec![Utf8PathBuf::from("docs/calculator-design.md")],
+        operation_intents: Vec::new(),
+        required_next_action: None,
+        required_verification_commands: vec!["python -m unittest".to_string()],
+        allowed_tools: vec![
+            ToolName::List,
+            ToolName::Read,
+            ToolName::Shell,
+            ToolName::Write,
+        ],
+        forbidden_tools: Vec::new(),
+        projection_id,
+    };
+    let context = TurnContext {
+        session_id: SessionId::new(),
+        cwd: Utf8PathBuf::from("C:/workspace"),
+        workspace_root: Utf8PathBuf::from("C:/workspace"),
+        provider: "openai_compat".to_string(),
+        model: "model".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        access_mode: crate::config::AccessMode::AutoReview,
+        sandbox: super::SandboxProfile::WorkspaceWrite,
+        shell_family: crate::config::ShellFamily::PowerShell,
+        model_capabilities: ModelCapabilities {
+            supports_tools: true,
+            supports_reasoning: false,
+            supports_images: false,
+            parallel_tool_calls: false,
+            context_window: 8192,
+            max_output_tokens: 1024,
+        },
+        route: crate::session::TaskRoute::Code,
+        process_phase: crate::session::ProcessPhase::Verify,
+        active_contract,
+        allowed_tools: vec![
+            ToolName::List,
+            ToolName::Read,
+            ToolName::Shell,
+            ToolName::Write,
+        ],
+        tool_choice: ToolChoice::Auto,
+        images: Vec::new(),
+        output_contract: super::OutputContract {
+            final_answer_required: false,
+            structured_schema_name: None,
+            history_markdown_projection: true,
+        },
+        continuation: None,
+        turn_decision_projection: None,
+    };
+    let obligations = ObligationSet::new(vec![
+        TurnObligation {
+            obligation_id: "active_work".to_string(),
+            kind: ObligationKind::UserWork,
+            summary: "Run the required verification command.".to_string(),
+            targets: vec![Utf8PathBuf::from("docs/calculator-design.md")],
+            operation_intents: Vec::new(),
+            required_actions: Vec::new(),
+            verification_commands: Vec::new(),
+            contract_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: ObligationStatus::Open,
+        },
+        TurnObligation {
+            obligation_id: "verification".to_string(),
+            kind: ObligationKind::Verification,
+            summary: "Required verification commands must run.".to_string(),
+            targets: vec![Utf8PathBuf::from("docs/calculator-design.md")],
+            operation_intents: Vec::new(),
+            required_actions: Vec::new(),
+            verification_commands: vec!["python -m unittest".to_string()],
+            contract_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            status: ObligationStatus::Open,
+        },
+    ]);
+    let authority =
+        ActionAuthority::from_obligations(&context, &obligations, context.tool_choice.clone());
+    authority.allowed_tools == vec![ToolName::Shell]
+        && authority.required_next_action.as_deref() == Some("shell:python -m unittest")
+        && authority.tool_choice == ToolChoice::Required
+        && authority.required_action_is_allowed()
 }
 
 fn validate_model_capabilities(

@@ -4,6 +4,8 @@ pub mod args;
 #[cfg(feature = "tauri-desktop")]
 pub mod artifact_projection;
 #[cfg(feature = "tauri-desktop")]
+pub mod async_ops;
+#[cfg(feature = "tauri-desktop")]
 pub mod composer_state;
 #[cfg(feature = "tauri-desktop")]
 pub mod models;
@@ -17,6 +19,8 @@ pub mod preferences;
 pub mod provider_config_state;
 #[cfg(feature = "tauri-desktop")]
 pub mod query;
+#[cfg(feature = "tauri-desktop")]
+pub mod startup;
 #[cfg(feature = "tauri-desktop")]
 pub mod state;
 #[cfg(feature = "tauri-desktop")]

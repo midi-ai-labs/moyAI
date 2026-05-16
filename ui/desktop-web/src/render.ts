@@ -1,3 +1,4 @@
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { icon } from "./icons";
 import { renderMarkdown } from "./markdown";
 import type { DesktopWebState, ProjectRow, TranscriptRow } from "./types";
@@ -5,6 +6,8 @@ import { displayAccessLabel, escapeHtml, fileName, shortenPath, validateConfigIn
 
 export type { LocalConfirmation } from "./render_overlays";
 export { renderConfirmation, renderLocalConfirmation } from "./render_overlays";
+
+const splashLogoUrl = new URL("../../../logo/fabicon/android-chrome-512x512.png", import.meta.url).href;
 
 interface RenderContext {
   artifactPaneCollapsed: boolean;
@@ -24,6 +27,52 @@ export function setRenderContext(context: RenderContext): void {
   configFilterText = context.configFilterText;
   configDirty = context.configDirty;
 }
+
+export function renderStartupSplash(state: DesktopWebState, elapsedMs: number, minVisibleMs: number): string {
+  const remainingMs = Math.max(0, minVisibleMs - elapsedMs);
+  const progressLabel =
+    state.startup.status === "loading"
+      ? "確認中"
+      : remainingMs > 0
+        ? "起動中"
+        : state.startup.status === "ready"
+          ? "準備完了"
+          : "確認が必要";
+  return `
+    <div class="splash-screen">
+      <div class="splash-core">
+        <img class="splash-logo" src="${splashLogoUrl}" alt="moyAI" />
+        <div class="splash-title">${escapeHtml(state.startup.title)}</div>
+        <div class="splash-message">${escapeHtml(state.startup.message)}</div>
+        <div class="splash-progress" aria-label="${escapeHtml(progressLabel)}">
+          <span></span>
+        </div>
+        <div class="splash-detail">${escapeHtml(state.startup.detail)}</div>
+        <div class="splash-checks">
+          ${state.startup.checks
+            .map(
+              (check) => `
+                <div class="splash-check ${check.status}">
+                  <span class="splash-check-status">${startupCheckMark(check.status)}</span>
+                  <span class="splash-check-label">${escapeHtml(check.label)}</span>
+                  <span class="splash-check-message">${escapeHtml(check.message)}</span>
+                </div>
+              `,
+            )
+            .join("")}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function startupCheckMark(status: string): string {
+  if (status === "pass") return "OK";
+  if (status === "warning") return "!";
+  if (status === "fail") return "NG";
+  return "…";
+}
+
 export function renderTitlebar(): string {
   return `
     <header class="app-titlebar" data-drag-region data-tauri-drag-region>
@@ -182,7 +231,17 @@ export function renderTopbar(state: DesktopWebState): string {
       <div class="title-row">
         <div class="title-copy">
           <h1>${escapeHtml(state.selected_session_title)}</h1>
-          <p>${escapeHtml(state.status_message)}</p>
+          <div class="status-line ${state.status_detail.trim().length > 0 ? "has-detail" : ""}">
+            <span>${escapeHtml(state.status_message)}</span>
+            ${
+              state.status_detail.trim().length > 0
+                ? `<details>
+                    <summary>詳細</summary>
+                    <pre>${escapeHtml(state.status_detail)}</pre>
+                  </details>`
+                : ""
+            }
+          </div>
         </div>
         <div class="chips">
           <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${escapeHtml(workspaceLabel)}</button>
@@ -222,7 +281,8 @@ export function renderThreadContent(state: DesktopWebState): string {
   if ((state.transcript_rows.length === 0 || onlyEmptyPlaceholder || state.selected_session_index < 0) && state.file_change_rows.length === 0) {
     return renderEmptyThread(state);
   }
-  return `${state.transcript_rows.map(renderTranscriptCard).join("")}${renderChangeCard(state)}`;
+  const visibleTranscriptRows = state.transcript_rows.filter((row) => !shouldHidePseudoToolCallTranscriptRow(row));
+  return `${visibleTranscriptRows.map(renderTranscriptCard).join("")}${renderChangeCard(state)}`;
 }
 
 function renderEmptyThread(state: DesktopWebState): string {
@@ -257,6 +317,27 @@ function renderTranscriptCard(row: TranscriptRow): string {
       </div>
     </article>
   `;
+}
+
+function shouldHidePseudoToolCallTranscriptRow(row: TranscriptRow): boolean {
+  if (row.kind === "user") {
+    return false;
+  }
+  const body = row.body.toLowerCase();
+  return (
+    body.includes("<tool_call>") ||
+    body.includes("</tool_call>") ||
+    body.includes("&lt;tool_call") ||
+    body.includes("&lt;/tool_call") ||
+    body.includes("<function=") ||
+    body.includes("</function>") ||
+    body.includes("&lt;function=") ||
+    body.includes("&lt;/function") ||
+    body.includes("<parameter=command>") ||
+    body.includes("<parameter=path>") ||
+    body.includes("&lt;parameter=command") ||
+    body.includes("&lt;parameter=path")
+  );
 }
 
 function renderWorkSummaryCard(row: TranscriptRow): string {
@@ -305,10 +386,11 @@ export function renderComposer(state: DesktopWebState): string {
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const sendTitle = state.busy ? "実行中は送信できません" : state.draft_prompt.trim().length === 0 ? "依頼文を入力してください" : "送信";
   const enhanceTitle = state.busy ? "実行中はEnhanceできません" : state.draft_prompt.trim().length === 0 ? "依頼文を入力してください" : "Enhance";
-  const trayVisible = attachmentTrayOpen || state.attached_images.length > 0 || state.image_input.trim().length > 0;
+  const controlsVisible = attachmentTrayOpen || state.image_input.trim().length > 0;
+  const trayVisible = controlsVisible || state.attached_images.length > 0;
   return `
     <section class="composer">
-      ${trayVisible ? renderAttachmentTray(state) : ""}
+      ${trayVisible ? renderAttachmentTray(state, controlsVisible) : ""}
       <textarea id="prompt" placeholder="moyAI に依頼する">${escapeHtml(state.draft_prompt)}</textarea>
       <div class="composer-actions">
         <button class="add-button icon-only" data-action="toggle-attachment-tray" title="画像添付" aria-label="画像添付" ${state.image_input_enabled ? "" : "disabled"}>${icon("plus")}</button>
@@ -323,27 +405,52 @@ export function renderComposer(state: DesktopWebState): string {
   `;
 }
 
-function renderAttachmentTray(state: DesktopWebState): string {
+function renderAttachmentTray(state: DesktopWebState, controlsVisible: boolean): string {
   return `
-    <div class="attachment-tray">
+    <div class="attachment-tray ${controlsVisible ? "expanded" : "compact"}">
       <div class="attachment-row">
-        ${state.attached_images
-          .map(
-            (path, index) => `
-              <button class="thumb" data-action="remove-image" data-index="${index}" title="${escapeHtml(path)}">
-                <span>${escapeHtml(fileName(path))}</span><b>×</b>
-              </button>`
-          )
-          .join("") || '<span class="attachment-empty">画像は未添付です</span>'}
+        ${renderAttachedImages(state)}
       </div>
-      <div class="attachment-controls">
-        <input id="image-input" value="${escapeHtml(state.image_input)}" placeholder="画像ファイルのパス" ${state.image_input_enabled ? "" : "disabled"} />
-        <button class="icon-only" data-action="set-image" title="画像を添付" aria-label="画像を添付" ${state.image_input_enabled ? "" : "disabled"}>${icon("upload")}</button>
-        <button class="icon-only" data-action="browse-image" title="画像を参照" aria-label="画像を参照" ${state.image_input_enabled ? "" : "disabled"}>${icon("folder")}</button>
-        <button class="icon-only" data-action="clear-images" title="添付を解除" aria-label="添付を解除" ${state.attached_images.length > 0 ? "" : "disabled"}>${icon("x")}</button>
-      </div>
+      ${
+        controlsVisible
+          ? `<div class="attachment-controls">
+              <input id="image-input" value="${escapeHtml(state.image_input)}" placeholder="画像ファイルのパス" ${state.image_input_enabled ? "" : "disabled"} />
+              <button class="icon-only" data-action="set-image" title="画像を添付" aria-label="画像を添付" ${state.image_input_enabled ? "" : "disabled"}>${icon("upload")}</button>
+              <button class="icon-only" data-action="browse-image" title="画像を参照" aria-label="画像を参照" ${state.image_input_enabled ? "" : "disabled"}>${icon("folder")}</button>
+              <button class="icon-only" data-action="clear-images" title="添付を解除" aria-label="添付を解除" ${state.attached_images.length > 0 ? "" : "disabled"}>${icon("x")}</button>
+            </div>`
+          : ""
+      }
     </div>
   `;
+}
+
+function renderAttachedImages(state: DesktopWebState): string {
+  if (state.attached_images.length === 0) {
+    return '<span class="attachment-empty">画像は未添付です</span>';
+  }
+  return state.attached_images
+    .map((path, index) => {
+      const thumbnail = attachmentThumbnailSrc(path);
+      return `
+        <button class="thumb image-thumb" data-action="remove-image" data-index="${index}" title="${escapeHtml(path)}" aria-label="添付画像を削除: ${escapeHtml(fileName(path))}">
+          ${
+            thumbnail
+              ? `<img src="${escapeHtml(thumbnail)}" alt="" loading="lazy" />`
+              : `<span class="thumb-fallback">${icon("image")}</span>`
+          }
+          <span>${escapeHtml(fileName(path))}</span><b>×</b>
+        </button>`;
+    })
+    .join("");
+}
+
+function attachmentThumbnailSrc(path: string): string {
+  try {
+    return convertFileSrc(path);
+  } catch {
+    return "";
+  }
 }
 
 export function renderArtifactPane(state: DesktopWebState): string {

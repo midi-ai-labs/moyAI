@@ -136,6 +136,7 @@ impl<'a> TurnRuntime<'a> {
             BTreeMap::<String, usize>::new();
         let mut wrong_verification_command_counts = BTreeMap::<String, usize>::new();
         let mut wrong_authoring_target_counts = BTreeMap::<String, usize>::new();
+        let mut authoring_supporting_context_budget_exhausted = BTreeSet::<String>::new();
         let mut docs_supporting_context_budget_exhausted = BTreeSet::<String>::new();
         let mut docs_supporting_context_budget_exhausted_counts = BTreeMap::<String, usize>::new();
         for _step in 0..request.config.session.max_steps_per_turn {
@@ -260,6 +261,26 @@ impl<'a> TurnRuntime<'a> {
             ) {
                 tools.retain(|tool| {
                     docs_route_supporting_context_budget_recovery_tool_visible(&tool.name)
+                });
+            }
+            if authoring_supporting_context_budget_recovery_surface_active(
+                &step_request.state,
+                &authoring_supporting_context_budget_exhausted,
+            ) {
+                tools.retain(|tool| {
+                    authoring_supporting_context_budget_recovery_tool_visible(&tool.name)
+                });
+            }
+            let pre_authority_tool_names = tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<BTreeSet<_>>();
+            if verification_repair_required_edit_surface_active(
+                &step_request.state,
+                &pre_authority_tool_names,
+            ) {
+                tools.retain(|tool| {
+                    verification_repair_required_edit_surface_tool_visible(&tool.name)
                 });
             }
             let mut tool_names = tools
@@ -873,6 +894,7 @@ impl<'a> TurnRuntime<'a> {
                             operation_non_content_no_progress_counts.clear();
                             verification_supporting_context_no_progress_counts.clear();
                             wrong_authoring_target_counts.clear();
+                            authoring_supporting_context_budget_exhausted.clear();
                             if !docs_route_contract_still_pending_after_file_change(
                                 &step_request.state,
                             ) {
@@ -944,6 +966,14 @@ impl<'a> TurnRuntime<'a> {
                                 ) && operation_progress_class == "supporting_context"
                                 {
                                     docs_supporting_context_budget_exhausted.insert(operation_key);
+                                    continue;
+                                }
+                                if authoring_supporting_context_budget_applies(
+                                    operation_progress_class,
+                                    &step_request.state,
+                                ) {
+                                    authoring_supporting_context_budget_exhausted
+                                        .insert(operation_key);
                                     continue;
                                 }
                                 let message = operation_non_content_no_progress_terminal_message(
@@ -1536,6 +1566,10 @@ fn operation_intents_for_active_work(
         }) if deliverable.is_some() || !pending_deliverables.is_empty() => {
             vec![OperationIntent::ContentChangingAuthoringRequired]
         }
+        Some(ActiveWorkContract::Verification {
+            repair_required: true,
+            ..
+        }) => vec![OperationIntent::ContentChangingAuthoringRequired],
         _ => Vec::new(),
     }
 }
@@ -2532,8 +2566,137 @@ pub(crate) fn docs_route_semantic_no_progress_guard_fixture_passes() -> bool {
 pub(crate) fn progress_projection_stable_surface_guard_fixture_passes() -> bool {
     open_authoring_operation_intent_preserves_tool_surface_fixture_passes()
         && docs_route_semantic_no_progress_guard_fixture_passes()
+        && authoring_supporting_context_budget_recovery_surface_fixture_passes()
+        && verification_repair_required_edit_surface_narrows_stale_tools_fixture_passes()
         && docs_route_supporting_context_budget_exhaustion_is_recoverable_fixture_passes()
         && crate::agent::prompt_assets::docs_route_reminder_projects_write_ready_boundary_fixture_passes()
+}
+
+pub(crate) fn authoring_supporting_context_budget_recovery_surface_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = crate::session::ProcessPhase::Author;
+    state.completion.open_work_count = 1;
+    state.active_targets = vec![Utf8PathBuf::from("docs/calculator-design.md")];
+    let allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "glob".to_string(),
+        "grep".to_string(),
+        "list".to_string(),
+        "read".to_string(),
+        "todowrite".to_string(),
+        "write".to_string(),
+    ]);
+    let metadata = json!({
+        "operation_intent": "content_changing_authoring_required",
+        "operation_progress_class": "supporting_context",
+        "progress_effect": "no_progress",
+        "result_hash": "workspace-list-hash"
+    });
+    let operation_key = operation_non_content_no_progress_key(
+        "list",
+        &metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let exhausted = BTreeSet::from([operation_key.clone()]);
+    let mut visible = allowed.clone();
+    if authoring_supporting_context_budget_recovery_surface_active(&state, &exhausted) {
+        visible.retain(|tool| authoring_supporting_context_budget_recovery_tool_visible(tool));
+    }
+    let mut docs_state = state.clone();
+    docs_state.route = TaskRoute::Docs;
+    docs_state.completion.route_contract_pending = true;
+
+    authoring_supporting_context_budget_applies("supporting_context", &state)
+        && !authoring_supporting_context_budget_applies("progress_projection", &state)
+        && authoring_supporting_context_budget_recovery_surface_active(&state, &exhausted)
+        && !authoring_supporting_context_budget_recovery_surface_active(&docs_state, &exhausted)
+        && should_terminalize_operation_non_content_no_progress_for_state(
+            OPERATION_NON_CONTENT_NO_PROGRESS_TERMINAL_THRESHOLD,
+            &state,
+        )
+        && operation_key.contains("content_changing_authoring_required")
+        && visible
+            == BTreeSet::from([
+                "apply_patch".to_string(),
+                "todowrite".to_string(),
+                "write".to_string(),
+            ])
+        && !visible.contains("list")
+        && !visible.contains("read")
+        && !visible.contains("grep")
+}
+
+pub(crate) fn verification_repair_required_edit_surface_narrows_stale_tools_fixture_passes() -> bool
+{
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = crate::session::ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("calculator.py"),
+        Utf8PathBuf::from("test_calculator.py"),
+    ];
+    state.failure = Some(crate::session::FailureState {
+        kind: crate::session::FailureKind::VerificationFailed,
+        summary: "verification failed: calculator.divide raises the wrong exception".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.completion.open_work_count = 1;
+    state.verification.failing_labels = vec!["test_divide_by_zero".to_string()];
+    state.verification.failure_cluster =
+        Some(crate::agent::state::public_class_attribute_cluster_fixture());
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+
+    let allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "glob".to_string(),
+        "grep".to_string(),
+        "list".to_string(),
+        "read".to_string(),
+        "shell".to_string(),
+        "todowrite".to_string(),
+        "write".to_string(),
+    ]);
+    let mut visible = allowed.clone();
+    if verification_repair_required_edit_surface_active(&state, &allowed) {
+        visible.retain(|tool| verification_repair_required_edit_surface_tool_visible(tool));
+    }
+    let Some(projection) = crate::agent::repair_lane::project_repair_lane(&state, &visible, None)
+    else {
+        return false;
+    };
+
+    verification_repair_required_edit_surface_active(&state, &allowed)
+        && visible
+            == BTreeSet::from([
+                "apply_patch".to_string(),
+                "todowrite".to_string(),
+                "write".to_string(),
+            ])
+        && !visible.contains("read")
+        && !visible.contains("shell")
+        && projection
+            .operation_template
+            .as_ref()
+            .is_some_and(|template| {
+                template
+                    .required_edit_surface
+                    .contains(&"apply_patch".to_string())
+                    && template
+                        .required_edit_surface
+                        .contains(&"write".to_string())
+                    && template.forbidden_stale_tools.contains(&"read".to_string())
+                    && template
+                        .forbidden_stale_tools
+                        .contains(&"shell".to_string())
+            })
 }
 
 pub(crate) fn docs_route_supporting_context_budget_exhaustion_is_recoverable_fixture_passes() -> bool
@@ -3456,6 +3619,67 @@ fn docs_route_supporting_context_budget_recovery_surface_active(
     state.route == TaskRoute::Docs
         && state.completion.route_contract_pending
         && !exhausted_keys.is_empty()
+}
+
+fn authoring_supporting_context_budget_applies(
+    progress_class: &str,
+    state: &SessionStateSnapshot,
+) -> bool {
+    state.route != TaskRoute::Docs
+        && open_executable_work_requires_tool_call(state)
+        && !state.active_targets.is_empty()
+        && progress_class == "supporting_context"
+}
+
+fn authoring_supporting_context_budget_recovery_surface_active(
+    state: &SessionStateSnapshot,
+    exhausted_keys: &BTreeSet<String>,
+) -> bool {
+    state.route != TaskRoute::Docs
+        && open_executable_work_requires_tool_call(state)
+        && !state.active_targets.is_empty()
+        && !exhausted_keys.is_empty()
+}
+
+fn authoring_supporting_context_budget_recovery_tool_visible(tool_name: &str) -> bool {
+    matches!(tool_name, "write" | "apply_patch" | "todowrite")
+}
+
+fn verification_repair_required_edit_surface_active(
+    state: &SessionStateSnapshot,
+    allowed_tools: &BTreeSet<String>,
+) -> bool {
+    let Some(repair_lane) =
+        crate::agent::repair_lane::project_repair_lane(state, allowed_tools, None)
+    else {
+        return false;
+    };
+    let Some(template) = repair_lane.operation_template.as_ref() else {
+        return false;
+    };
+    let has_edit_surface = template
+        .required_edit_surface
+        .iter()
+        .any(|tool| matches!(tool.as_str(), "write" | "apply_patch"));
+    let forbids_stale_read_shell = template
+        .forbidden_stale_tools
+        .iter()
+        .chain(
+            repair_lane
+                .repair_intent
+                .as_ref()
+                .into_iter()
+                .flat_map(|intent| intent.forbidden_directions.iter()),
+        )
+        .any(|item| item.contains("stale_read_or_shell"));
+    state.process_phase == crate::session::ProcessPhase::Repair
+        && state.completion.verification_pending
+        && has_edit_surface
+        && forbids_stale_read_shell
+}
+
+fn verification_repair_required_edit_surface_tool_visible(tool_name: &str) -> bool {
+    matches!(tool_name, "write" | "apply_patch" | "todowrite")
 }
 
 fn docs_route_contract_still_pending_after_file_change(state: &SessionStateSnapshot) -> bool {
