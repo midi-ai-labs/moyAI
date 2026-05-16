@@ -6,7 +6,15 @@ use super::models::{
 };
 use super::state::{DesktopOverlay, DesktopState};
 use crate::tui::config_editor::{ConfigField, ConfigFieldState};
-use crate::tui::state::PromptReviewPhase;
+use crate::tui::state::{PromptReviewPhase, RunStatus};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopPermissionProjection {
+    pub summary: String,
+    pub targets: Vec<String>,
+    pub outside_workspace: bool,
+    pub risks: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopWebState {
@@ -17,16 +25,22 @@ pub struct DesktopWebState {
     pub current_session_label: String,
     pub selected_session_title: String,
     pub status_message: String,
+    pub run_status_key: String,
     pub run_status_text: String,
+    pub run_phase: String,
+    pub run_active_step: String,
+    pub latest_tool_summary: String,
     pub progress_text: String,
     pub tool_status_text: String,
     pub confirmation_visible: bool,
     pub confirmation_text: String,
+    pub confirmation: Option<DesktopPermissionProjection>,
     pub draft_prompt: String,
     pub image_input: String,
     pub attached_images: Vec<String>,
     pub can_submit: bool,
     pub busy: bool,
+    pub navigation_loading: bool,
     pub overlay: String,
     pub project_rows: Vec<DesktopProjectRow>,
     pub selected_project_index: i32,
@@ -69,6 +83,7 @@ pub struct DesktopWebState {
 pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
     let detail = state.selected_detail();
     let config_items = state
+        .provider_config
         .config_editor
         .fields
         .iter()
@@ -98,13 +113,28 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
                 false,
             )
         };
-    let image_input_enabled = !state.is_busy() && state.effective_config.model.supports_images;
+    let image_input_enabled =
+        !state.is_busy() && state.provider_config.effective_config.model.supports_images;
+    let latest_tool_summary = detail
+        .tool_status_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("ツール待機中")
+        .to_string();
     DesktopWebState {
         workspace_path: state.snapshot.workspace_path.clone(),
         provider_label: state.snapshot.provider_label.clone(),
         model_label: state.snapshot.model_label.clone(),
-        access_label: format!("{:?}", state.effective_config.permissions.access_mode)
-            .to_lowercase(),
+        access_label: format!(
+            "{:?}",
+            state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode
+        )
+        .to_lowercase(),
         current_session_label: state.current_session_label(),
         selected_session_title: state.selected_session_title(),
         status_message: state
@@ -113,21 +143,35 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
             .as_deref()
             .map(display_status_message)
             .unwrap_or_else(|| "準備完了".to_string()),
+        run_status_key: run_status_key(state.app_state.run_status).to_string(),
         run_status_text: state.current_run_status_text(),
+        run_phase: state.app_state.progress.current_phase.clone(),
+        run_active_step: state.app_state.progress.active_step.clone(),
+        latest_tool_summary,
         progress_text: detail.progress_text,
         tool_status_text: detail.tool_status_text,
         confirmation_visible: detail.confirmation_visible,
         confirmation_text: detail.confirmation_text,
-        draft_prompt: state.draft_prompt.clone(),
-        image_input: state.image_attachment_input.clone(),
+        confirmation: state.app_state.permission.as_ref().map(|permission| {
+            DesktopPermissionProjection {
+                summary: permission.summary.clone(),
+                targets: permission.targets.clone(),
+                outside_workspace: permission.outside_workspace,
+                risks: permission.risks.clone(),
+            }
+        }),
+        draft_prompt: state.composer.draft_prompt.clone(),
+        image_input: state.composer.image_attachment_input.clone(),
         attached_images: state
+            .composer
             .image_attachment_paths
             .iter()
             .map(|path| path.to_string())
             .collect(),
         can_submit: state.can_submit_prompt(),
         busy: state.is_busy(),
-        overlay: overlay_key(state.overlay).to_string(),
+        navigation_loading: state.navigation_loading(),
+        overlay: overlay_key(state.view.overlay).to_string(),
         project_rows: state.snapshot.project_rows.clone(),
         selected_project_index: state.selected_project_index(),
         session_rows: state.snapshot.session_rows.clone(),
@@ -139,35 +183,56 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         artifact_preview_text: state.selected_artifact_preview_text(),
         file_change_rows: detail.file_changes,
         file_change_summary_text: detail.file_change_summary_text,
-        local_search_text: state.local_search_text.clone(),
+        local_search_text: state.view.local_search_text.clone(),
         local_search_results_text: state.local_search_results_text(),
         command_rows: state.snapshot.command_rows.clone(),
-        provider_base_url: state.provider_base_url_input.clone(),
+        provider_base_url: state.provider_config.provider_base_url_input.clone(),
         provider_models: provider_model_labels(state),
-        provider_selected_index: state.provider_selected_index,
+        provider_selected_index: state.provider_config.provider_selected_index,
         provider_status_text: provider_feedback_text(state),
         provider_selected_model_summary: provider_selected_model_summary(state),
-        provider_loading: state.provider_loading,
+        provider_loading: state.provider_config.provider_loading,
         provider_apply_enabled: state.can_apply_provider_selection(),
         config_items,
-        selected_config_index: state.config_editor.selected as i32,
-        config_field_title: state.config_editor.selected_field().key.label().to_string(),
-        config_value_text: state.config_value_text.clone(),
+        selected_config_index: state.provider_config.config_editor.selected as i32,
+        config_field_title: state
+            .provider_config
+            .config_editor
+            .selected_field()
+            .key
+            .label()
+            .to_string(),
+        config_value_text: state.provider_config.config_value_text.clone(),
         config_feedback_text: state
+            .provider_config
             .config_editor
             .feedback
             .clone()
-            .unwrap_or_else(|| config_feedback_text(state.config_editor.selected_field().key)),
+            .unwrap_or_else(|| {
+                config_feedback_text(state.provider_config.config_editor.selected_field().key)
+            }),
         workspace_input: state.workspace_input.clone(),
         review_raw_text,
-        review_draft_text: state.review_draft_text.clone(),
+        review_draft_text: state.composer.review_draft_text.clone(),
         review_status_text,
         send_enhanced_enabled,
         send_raw_enabled,
         history_export_enabled: state.can_export_history(),
-        enhance_enabled: !state.is_busy() && !state.draft_prompt.trim().is_empty(),
+        enhance_enabled: !state.is_busy() && !state.composer.draft_prompt.trim().is_empty(),
         image_input_enabled,
-        window_opacity_percent: state.window_opacity_percent,
+        window_opacity_percent: state.view.window_opacity_percent,
+    }
+}
+
+fn run_status_key(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Idle => "idle",
+        RunStatus::Running => "running",
+        RunStatus::Confirming => "confirming",
+        RunStatus::Completed => "completed",
+        RunStatus::AwaitingUser => "awaiting_user",
+        RunStatus::Cancelled => "cancelled",
+        RunStatus::Failed => "failed",
     }
 }
 
@@ -205,10 +270,12 @@ fn config_item_label(field: &ConfigFieldState) -> String {
 
 fn provider_model_labels(state: &DesktopState) -> Vec<String> {
     state
+        .provider_config
         .provider_models
         .iter()
         .map(|label| {
             state
+                .provider_config
                 .provider_model_infos
                 .iter()
                 .find(|info| info.id == *label)
@@ -226,7 +293,7 @@ fn provider_model_labels(state: &DesktopState) -> Vec<String> {
 }
 
 fn provider_feedback_text(state: &DesktopState) -> String {
-    let mut text = state.provider_status_text.clone();
+    let mut text = state.provider_config.provider_status_text.clone();
     if let Some(info) = state.selected_provider_model_info() {
         let summary = super::state::provider_model_summary(info);
         if !summary.is_empty() {

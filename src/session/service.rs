@@ -197,11 +197,46 @@ impl SessionService {
         &self,
         session_id: crate::session::SessionId,
     ) -> Result<(), SessionError> {
-        self.store
-            .session_repo()
-            .set_status(session_id, SessionStatus::Failed)
+        self.cancel_running_session(session_id, "Previous run was interrupted.")
             .await?;
         Ok(())
+    }
+
+    pub async fn cancel_running_session(
+        &self,
+        session_id: crate::session::SessionId,
+        reason: &str,
+    ) -> Result<bool, SessionError> {
+        let session = self.store.session_repo().get_session(session_id).await?;
+        if session.status != SessionStatus::Running {
+            return Ok(false);
+        }
+        self.store
+            .session_repo()
+            .set_status(session_id, SessionStatus::Cancelled)
+            .await?;
+        self.store
+            .session_repo()
+            .fail_unfinished_tool_calls(session_id, reason)
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn mark_stale_running_sessions(&self, reason: &str) -> Result<usize, SessionError> {
+        let sessions = self
+            .store
+            .session_repo()
+            .list_recent_sessions(10_000)
+            .await?;
+        let mut cancelled = 0;
+        for session in sessions {
+            if session.status == SessionStatus::Running
+                && self.cancel_running_session(session.id, reason).await?
+            {
+                cancelled += 1;
+            }
+        }
+        Ok(cancelled)
     }
 
     pub async fn load_state(
@@ -312,5 +347,85 @@ impl SessionService {
         session_id: SessionId,
     ) -> Result<Vec<crate::session::TodoItem>, SessionError> {
         Ok(self.store.session_repo().list_todos(session_id).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{NewSession, ProjectRepository, SessionRepository};
+    use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+
+    fn test_service() -> (tempfile::TempDir, SessionService) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir =
+            camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 tempdir");
+        let paths = StoragePaths {
+            data_dir: data_dir.clone(),
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+        };
+        let store = SqliteStore::open(&paths).expect("open sqlite");
+        store.migrate().expect("migrate sqlite");
+        (temp, SessionService::new(StoreBundle::new(store)))
+    }
+
+    #[tokio::test]
+    async fn stale_running_sessions_are_cancelled_on_desktop_restart_cleanup() {
+        let (_temp, service) = test_service();
+        let project_id = ProjectId::new();
+        let repo = service.store.session_repo();
+        service
+            .store
+            .project_repo()
+            .upsert_project(
+                project_id,
+                camino::Utf8Path::new("C:/workspace"),
+                "workspace",
+                "none",
+            )
+            .await
+            .expect("create project");
+        let running = repo
+            .create_session(NewSession {
+                project_id,
+                title: "Running".to_string(),
+                cwd: "C:/workspace".into(),
+                model: "local".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+            })
+            .await
+            .expect("create running session");
+        repo.set_status(running.id, SessionStatus::Running)
+            .await
+            .expect("mark running");
+        let idle = repo
+            .create_session(NewSession {
+                project_id,
+                title: "Idle".to_string(),
+                cwd: "C:/workspace".into(),
+                model: "local".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+            })
+            .await
+            .expect("create idle session");
+
+        let cancelled = service
+            .mark_stale_running_sessions("desktop restart")
+            .await
+            .expect("cleanup stale running sessions");
+
+        assert_eq!(cancelled, 1);
+        assert_eq!(
+            repo.get_session(running.id)
+                .await
+                .expect("reload running")
+                .status,
+            SessionStatus::Cancelled
+        );
+        assert_eq!(
+            repo.get_session(idle.id).await.expect("reload idle").status,
+            SessionStatus::Idle
+        );
     }
 }

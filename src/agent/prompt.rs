@@ -1314,7 +1314,10 @@ fn build_provider_replay_projection_from_history_items(
     if let Some(content) = latest_compaction_provider_context(history_items) {
         result.push(ModelMessage::System { content });
     }
-    let selected_indices = provider_replay_selected_indices(history_items, replay_start, limit);
+    let selected_indices = provider_replay_repair_leading_orphans(
+        history_items,
+        provider_replay_selected_indices(history_items, replay_start, limit),
+    );
     let tool_call_index = tool_call_history_index_after(history_items, replay_start);
     let tool_output_index = first_tool_output_history_index_after(history_items, replay_start);
     let stale_inactive_authoring_calls = stale_inactive_authoring_tool_call_targets_after(
@@ -1530,6 +1533,63 @@ fn provider_replay_selected_indices(
     }
     provider_replay_add_tool_pairs(history_items, start, &mut selected);
     selected.into_iter().collect()
+}
+
+fn provider_replay_repair_leading_orphans(
+    history_items: &[HistoryItem],
+    selected_indices: Vec<usize>,
+) -> Vec<usize> {
+    let mut selected_indices = selected_indices;
+    if let Some(first_index) = selected_indices.first().copied()
+        && !history_item_is_user_query(history_items, first_index)
+        && let Some(prior_user) = latest_user_turn_index_before(history_items, first_index)
+    {
+        selected_indices.push(prior_user);
+        selected_indices.sort_unstable();
+        selected_indices.dedup();
+    }
+
+    let Some(first_user_position) = selected_indices
+        .iter()
+        .position(|index| history_item_is_user_query(history_items, *index))
+    else {
+        return selected_indices;
+    };
+    selected_indices[first_user_position..].to_vec()
+}
+
+fn history_item_is_user_query(history_items: &[HistoryItem], index: usize) -> bool {
+    history_items
+        .get(index)
+        .map(|item| {
+            matches!(
+                item.payload,
+                HistoryItemPayload::UserTurn { .. }
+                    | HistoryItemPayload::Message {
+                        role: MessageRole::User,
+                        ..
+                    }
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn latest_user_turn_index_before(history_items: &[HistoryItem], index: usize) -> Option<usize> {
+    history_items[..index]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(offset, item)| {
+            matches!(
+                item.payload,
+                HistoryItemPayload::UserTurn { .. }
+                    | HistoryItemPayload::Message {
+                        role: MessageRole::User,
+                        ..
+                    }
+            )
+            .then_some(offset)
+        })
 }
 
 fn provider_replay_item_is_visible(payload: &HistoryItemPayload) -> bool {
@@ -6663,6 +6723,109 @@ pub fn provider_replay_preserves_latest_user_across_trailing_compaction() -> boo
         )
     }) && !serialized.contains(original_user_text)
         && !serialized.contains("very long old verification output")
+}
+
+pub fn provider_replay_after_compaction_repairs_orphan_assistant_before_user() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "compaction orphan assistant fixture".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        completed_at_ms: None,
+    };
+    let latest_user = "continue after compaction";
+    let items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 0,
+            created_at_ms: 0,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "user query paired with assistant after compaction".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::MidTurn,
+                summary: "older user turn and answer were compacted".to_string(),
+                replacement_item_ids: vec![crate::protocol::HistoryItemId::new()],
+                continuation: Some(crate::session::ContinuationContract {
+                    route: "code".to_string(),
+                    process_phase: "discover".to_string(),
+                    active_work_kind: Some("typed_continuation".to_string()),
+                    active_work_summary: Some("continue the chat".to_string()),
+                    required_next_action: None,
+                    target_files: Vec::new(),
+                    verification_commands: Vec::new(),
+                    failure_kind: None,
+                    failure_summary: None,
+                    completion_blocker: None,
+                    invariant_refs: vec!["CompactionContinuity".to_string()],
+                }),
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::Message {
+                message_id: None,
+                role: MessageRole::Assistant,
+                content: vec![ContentPart::Text {
+                    text: "orphan answer from compacted pair".to_string(),
+                }],
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: latest_user.to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+    ];
+
+    let replay = build_provider_replay_messages_from_history_items(&session, &items, 32);
+    let Some(first_non_system) = replay
+        .iter()
+        .find(|message| !matches!(message, ModelMessage::System { .. }))
+    else {
+        return false;
+    };
+    let serialized = serde_json::to_string(&replay).unwrap_or_default();
+    matches!(first_non_system, ModelMessage::User { content } if content == "user query paired with assistant after compaction")
+        && serialized.contains("orphan answer from compacted pair")
+        && serialized.contains(latest_user)
 }
 
 pub fn provider_replay_preserves_tool_pair_symmetry_with_model_arguments() -> bool {

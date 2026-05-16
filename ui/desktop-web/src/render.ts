@@ -1,0 +1,700 @@
+import { icon } from "./icons";
+import { renderMarkdown } from "./markdown";
+import type { DesktopWebState, ProjectRow, TranscriptRow } from "./types";
+import { displayAccessLabel, escapeHtml, fileName, shortenPath, validateConfigInput } from "./utils";
+
+export type { LocalConfirmation } from "./render_overlays";
+export { renderConfirmation, renderLocalConfirmation } from "./render_overlays";
+
+interface RenderContext {
+  artifactPaneCollapsed: boolean;
+  attachmentTrayOpen: boolean;
+  configFilterText: string;
+  configDirty: boolean;
+}
+
+let artifactPaneCollapsed = false;
+let attachmentTrayOpen = false;
+let configFilterText = "";
+let configDirty = false;
+
+export function setRenderContext(context: RenderContext): void {
+  artifactPaneCollapsed = context.artifactPaneCollapsed;
+  attachmentTrayOpen = context.attachmentTrayOpen;
+  configFilterText = context.configFilterText;
+  configDirty = context.configDirty;
+}
+export function renderTitlebar(): string {
+  return `
+    <header class="app-titlebar" data-drag-region data-tauri-drag-region>
+      <div class="titlebar-left" data-drag-region data-tauri-drag-region>
+        <span class="app-brand" data-drag-region data-tauri-drag-region>moyAI</span>
+        <nav class="titlebar-menu">
+          <button data-action="show-file-menu" aria-label="ファイルメニュー">ファイル</button>
+          <button data-action="show-edit-menu" aria-label="編集メニュー">編集</button>
+          <button data-action="show-view-menu" aria-label="表示メニュー">表示</button>
+          <button data-action="show-help-menu" aria-label="ヘルプメニュー">ヘルプ</button>
+        </nav>
+      </div>
+      <div class="titlebar-drag" data-drag-region data-tauri-drag-region></div>
+      <div class="titlebar-controls">
+        <button data-action="minimize-window" title="最小化" aria-label="最小化">−</button>
+        <button data-action="toggle-maximize-window" title="最大化" aria-label="最大化">□</button>
+        <button data-action="close-window" title="閉じる" aria-label="閉じる">×</button>
+      </div>
+    </header>
+  `;
+}
+
+function renderProjectRowWithSessions(state: DesktopWebState, row: ProjectRow, index: number): string {
+  const selected = index === state.selected_project_index;
+  const projectRow = renderProjectRow(row, selected, index);
+  if (!selected) {
+    return projectRow;
+  }
+  const sessionRows = renderProjectSessionRows(state);
+  return `${projectRow}${sessionRows}`;
+}
+
+function renderProjectRow(row: ProjectRow, selected: boolean, index: number): string {
+  return `
+    <div class="nav-row-wrap project-row ${selected ? "selected" : ""}">
+      <button class="nav-row" data-action="project" data-index="${index}">
+        <span class="nav-title">${escapeHtml(row.label)}</span>
+        <small>${escapeHtml(row.path)}</small>
+      </button>
+      <button class="row-action add-session" data-action="new-project-session" data-index="${index}" title="このプロジェクトで新しい開発チャット" aria-label="このプロジェクトで新しい開発チャット">${icon("plus")}</button>
+      <button class="row-action danger" data-action="delete-project" data-index="${index}" title="削除" aria-label="削除">${icon("x")}</button>
+    </div>
+  `;
+}
+
+function renderProjectSessionRows(state: DesktopWebState): string {
+  if (state.selected_project_index < 0) {
+    return "";
+  }
+  const rows = state.session_rows
+    .map((row, index) =>
+      renderNavRow(
+        row.label,
+        "開発チャット",
+        index === state.selected_session_index,
+        "session",
+        index,
+        "delete-session",
+        state.busy && index === state.selected_session_index
+      )
+    )
+    .join("");
+  const activeFallback = rows.length === 0 ? renderActiveProjectSessionPlaceholder(state) : "";
+  return rows.length > 0 || activeFallback.length > 0 ? `<div class="project-session-list">${rows}${activeFallback}</div>` : "";
+}
+
+function renderActiveProjectSessionPlaceholder(state: DesktopWebState): string {
+  if (!state.busy) {
+    return "";
+  }
+  const label = activeSessionLabel(state);
+  if (!label) {
+    return "";
+  }
+  return `
+    <div class="nav-row-wrap selected project-session-placeholder">
+      <div class="nav-row">
+        <span class="nav-title"><span class="busy-spinner" title="実行中"></span><span>${escapeHtml(label)}</span></span>
+        <small>開発チャット</small>
+      </div>
+    </div>
+  `;
+}
+
+function activeSessionLabel(state: DesktopWebState): string {
+  const candidates = [state.current_session_label, state.selected_session_title];
+  for (const candidate of candidates) {
+    const label = candidate.trim();
+    if (label.length > 0 && label !== "新規チャット" && label !== "セッション未選択") {
+      return label;
+    }
+  }
+  return "";
+}
+
+function renderChatRows(state: DesktopWebState): string {
+  if (state.chat_session_rows.length === 0) {
+    return '<div class="empty">チャットはありません</div>';
+  }
+  const selectedChatSessionId =
+    state.selected_project_index < 0 && state.selected_session_index >= 0
+      ? state.session_rows[state.selected_session_index]?.session_id
+      : undefined;
+  return state.chat_session_rows
+    .map((row, index) =>
+      renderNavRow(
+        row.label,
+        "通常チャット",
+        row.session_id === selectedChatSessionId,
+        "chat-session",
+        index,
+        "delete-chat-session",
+        state.selected_project_index < 0 && state.busy && row.session_id === selectedChatSessionId
+      )
+    )
+    .join("");
+}
+
+export function renderSidebar(state: DesktopWebState): string {
+  const chatRunning = state.selected_project_index < 0 && state.busy;
+  return `
+    <aside class="sidebar">
+      <div class="window-actions">
+        <button class="icon-button" data-action="show-shortcuts" title="ショートカット" aria-label="ショートカット">${icon("keyboard")}</button>
+        <button class="icon-button" data-action="refresh" title="更新" aria-label="更新">${icon("refresh")}</button>
+      </div>
+      <button class="rail-item" data-action="show-provider" title="LLM URL">
+        <span class="rail-icon">${icon("plug")}</span><span>LLM URL</span>
+      </button>
+      <div class="rail-section row-heading">
+        <span>プロジェクト</span>
+        <button class="tiny-button icon-only" data-action="create-project-from-picker" title="プロジェクトを作成" aria-label="プロジェクトを作成">${icon("folder-plus")}</button>
+      </div>
+      <div class="row-list">
+        ${state.project_rows
+          .map((row, index) => renderProjectRowWithSessions(state, row, index))
+          .join("")}
+      </div>
+      <div class="rail-section row-heading">
+        <span class="section-label">チャット${chatRunning ? '<span class="busy-spinner small" title="実行中"></span>' : ""}</span>
+        <button class="tiny-button icon-only" data-action="new-chat" title="新しいチャット" aria-label="新しいチャット">${icon("edit")}</button>
+      </div>
+      <div class="row-list">${renderChatRows(state)}</div>
+      <button class="settings" data-action="show-config" title="設定"><span class="rail-icon">${icon("settings")}</span><span>設定</span></button>
+    </aside>
+  `;
+}
+
+export function renderTopbar(state: DesktopWebState): string {
+  const workspaceLabel = state.selected_project_index >= 0 ? shortenPath(state.workspace_path) : "プロジェクトなし";
+  const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
+  const exportDisabled = !state.history_export_enabled;
+  const exportTitle = exportDisabled ? "保存できる表示中の履歴がありません" : "表示中の履歴をMarkdown保存";
+  return `
+    <header class="topbar">
+      <div class="title-row">
+        <div class="title-copy">
+          <h1>${escapeHtml(state.selected_session_title)}</h1>
+          <p>${escapeHtml(state.status_message)}</p>
+        </div>
+        <div class="chips">
+          <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${escapeHtml(workspaceLabel)}</button>
+          <button data-action="show-provider" title="${escapeHtml(state.provider_label)}">${escapeHtml(state.model_label)}</button>
+          <button data-action="toggle-access" title="アクセス権限">${escapeHtml(displayAccessLabel(state.access_label))}</button>
+          <button class="icon-button" data-action="export-transcript" title="${exportTitle}" aria-label="${exportTitle}" ${exportDisabled ? "disabled" : ""}>${icon("download")}</button>
+        </div>
+      </div>
+    </header>
+  `;
+}
+
+export function renderRunStatusStrip(state: DesktopWebState): string {
+  if (!state.busy && !state.confirmation_visible) {
+    return "";
+  }
+  const phase = state.run_phase.trim() || "running";
+  const step = state.run_active_step.trim() || state.status_message;
+  const toolLine = state.latest_tool_summary.trim() || "ツール待機中";
+  return `
+    <section class="run-strip" aria-live="polite">
+      <span class="busy-spinner" title="実行中"></span>
+      <strong>${state.confirmation_visible ? "確認待ち" : "実行中"}</strong>
+      <span>${escapeHtml(phase)}</span>
+      <span>${escapeHtml(step)}</span>
+      <small>${escapeHtml(toolLine)}</small>
+      <button class="icon-only danger" data-action="cancel-run" title="実行停止" aria-label="実行停止">${icon("square")}</button>
+    </section>
+  `;
+}
+
+export function renderThreadContent(state: DesktopWebState): string {
+  const onlyEmptyPlaceholder =
+    state.transcript_rows.length === 1 &&
+    state.transcript_rows[0]?.title.includes("チャット") &&
+    state.transcript_rows[0]?.body.includes("下の入力欄");
+  if ((state.transcript_rows.length === 0 || onlyEmptyPlaceholder || state.selected_session_index < 0) && state.file_change_rows.length === 0) {
+    return renderEmptyThread(state);
+  }
+  return `${state.transcript_rows.map(renderTranscriptCard).join("")}${renderChangeCard(state)}`;
+}
+
+function renderEmptyThread(state: DesktopWebState): string {
+  const projectText =
+    state.selected_project_index >= 0
+      ? "このプロジェクトで最初のセッションを作成します"
+      : "通常チャットとして新しいセッションを作成します";
+  const llmText = state.model_label.trim().length > 0 ? `LLM: ${state.model_label}` : "LLM URL を設定してください";
+  return `
+    <div class="empty-thread">
+      <h2>${state.selected_project_index >= 0 ? "このプロジェクトで何を作りますか？" : "何に取り組みますか？"}</h2>
+      <div class="empty-status">
+        ${state.selected_project_index >= 0 ? `<span>${escapeHtml(shortenPath(state.workspace_path))}</span>` : ""}
+        <span>${escapeHtml(projectText)}</span>
+        <span>${escapeHtml(llmText)}</span>
+        <span>${escapeHtml(displayAccessLabel(state.access_label))}</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderTranscriptCard(row: TranscriptRow): string {
+  if (row.kind.startsWith("work_summary")) {
+    return renderWorkSummaryCard(row);
+  }
+  return `
+    <article class="message ${escapeHtml(row.kind)}">
+      <div class="message-step">${escapeHtml(row.step)}</div>
+      <div class="message-body">
+        <h2>${escapeHtml(row.title)}</h2>
+        <div class="markdown-body">${renderMarkdown(row.body)}</div>
+      </div>
+    </article>
+  `;
+}
+
+function renderWorkSummaryCard(row: TranscriptRow): string {
+  const open = row.kind === "work_summary_running" ? "open" : "";
+  const statusText = row.kind === "work_summary_running" ? "実行中" : "作業サマリ";
+  return `
+    <article class="message work-summary ${escapeHtml(row.kind)}">
+      <div class="message-step">${escapeHtml(row.step)}</div>
+      <div class="message-body">
+        <details ${open}>
+          <summary>
+            <span>${escapeHtml(row.title)}</span>
+            <small>${escapeHtml(statusText)}</small>
+          </summary>
+          <div class="markdown-body">${renderMarkdown(row.body)}</div>
+        </details>
+      </div>
+    </article>
+  `;
+}
+
+function renderChangeCard(state: DesktopWebState): string {
+  if (state.file_change_rows.length === 0) {
+    return "";
+  }
+  return `
+    <article class="change-card">
+      <div class="change-header">
+        <strong>${escapeHtml(state.file_change_summary_text.split("\n")[0] ?? "ファイル変更")}</strong>
+      </div>
+      ${state.file_change_rows
+        .map(
+          (row) => `
+            <div class="change-row">
+              <span class="change-action">${escapeHtml(row.action)}</span>
+              <span>${escapeHtml(row.path)}</span>
+              <small>${escapeHtml(row.summary)}</small>
+            </div>`
+        )
+        .join("")}
+    </article>
+  `;
+}
+
+export function renderComposer(state: DesktopWebState): string {
+  const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
+  const sendTitle = state.busy ? "実行中は送信できません" : state.draft_prompt.trim().length === 0 ? "依頼文を入力してください" : "送信";
+  const enhanceTitle = state.busy ? "実行中はEnhanceできません" : state.draft_prompt.trim().length === 0 ? "依頼文を入力してください" : "Enhance";
+  const trayVisible = attachmentTrayOpen || state.attached_images.length > 0 || state.image_input.trim().length > 0;
+  return `
+    <section class="composer">
+      ${trayVisible ? renderAttachmentTray(state) : ""}
+      <textarea id="prompt" placeholder="moyAI に依頼する">${escapeHtml(state.draft_prompt)}</textarea>
+      <div class="composer-actions">
+        <button class="add-button icon-only" data-action="toggle-attachment-tray" title="画像添付" aria-label="画像添付" ${state.image_input_enabled ? "" : "disabled"}>${icon("plus")}</button>
+        <button class="icon-only" data-action="show-command-palette" title="検索 / コマンド" aria-label="検索 / コマンド">${icon("more")}</button>
+        <button class="icon-only" data-action="enhance-prompt" title="${enhanceTitle}" aria-label="${enhanceTitle}" ${state.enhance_enabled ? "" : "disabled"}>${icon("sparkles")}</button>
+        <button class="send icon-only" data-action="send" title="${sendTitle}" aria-label="${sendTitle}" ${state.can_submit ? "" : "disabled"}>${icon("send")}</button>
+      </div>
+      <div class="composer-meta">
+        <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${state.selected_project_index >= 0 ? "プロジェクトで作業" : "プロジェクトを選択"}</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderAttachmentTray(state: DesktopWebState): string {
+  return `
+    <div class="attachment-tray">
+      <div class="attachment-row">
+        ${state.attached_images
+          .map(
+            (path, index) => `
+              <button class="thumb" data-action="remove-image" data-index="${index}" title="${escapeHtml(path)}">
+                <span>${escapeHtml(fileName(path))}</span><b>×</b>
+              </button>`
+          )
+          .join("") || '<span class="attachment-empty">画像は未添付です</span>'}
+      </div>
+      <div class="attachment-controls">
+        <input id="image-input" value="${escapeHtml(state.image_input)}" placeholder="画像ファイルのパス" ${state.image_input_enabled ? "" : "disabled"} />
+        <button class="icon-only" data-action="set-image" title="画像を添付" aria-label="画像を添付" ${state.image_input_enabled ? "" : "disabled"}>${icon("upload")}</button>
+        <button class="icon-only" data-action="browse-image" title="画像を参照" aria-label="画像を参照" ${state.image_input_enabled ? "" : "disabled"}>${icon("folder")}</button>
+        <button class="icon-only" data-action="clear-images" title="添付を解除" aria-label="添付を解除" ${state.attached_images.length > 0 ? "" : "disabled"}>${icon("x")}</button>
+      </div>
+    </div>
+  `;
+}
+
+export function renderArtifactPane(state: DesktopWebState): string {
+  if (artifactPaneCollapsed) {
+    return `
+      <aside class="artifact-pane collapsed">
+        <button class="pin" data-action="toggle-artifact-pane" title="アーティファクトを表示" aria-label="アーティファクトを表示">${icon("folder")}</button>
+      </aside>
+    `;
+  }
+  const previewText = state.artifact_preview_text.trim();
+  const hasPreview = previewText.length > 0 && !previewText.includes("選択されていません");
+  const hasActivity = state.busy && (state.progress_text.trim().length > 0 || state.tool_status_text.trim().length > 0);
+  return `
+    <aside class="artifact-pane">
+      <div class="pane-title">
+        <strong>アーティファクト</strong>
+        <div class="pane-actions">
+          <button class="pin" data-action="toggle-artifact-pane" title="アーティファクトを折りたたむ" aria-label="アーティファクトを折りたたむ">${icon("x")}</button>
+          <button class="pin" data-action="open-artifact-folder" title="アーティファクトのフォルダーを開く" aria-label="アーティファクトのフォルダーを開く">${icon("folder")}</button>
+        </div>
+      </div>
+      <div class="artifact-list">
+        ${
+          state.artifact_rows.length === 0
+            ? '<div class="empty artifact-empty">生成ファイル、開いたファイル、変更履歴がここに表示されます</div>'
+            : state.artifact_rows
+                .map(
+                  (row, index) => `
+                    <button class="artifact-row ${index === state.selected_artifact_index ? "selected" : ""}"
+                      data-action="artifact" data-index="${index}">
+                      <span class="file-icon">▣</span>
+                      <span><b>${escapeHtml(row.label)}</b><small>${escapeHtml(row.path)}</small></span>
+                    </button>`
+                )
+                .join("")
+        }
+      </div>
+      ${
+        hasPreview
+          ? `<div class="preview">
+              <div class="preview-tabs">
+                <span>プレビュー</span>
+                <button data-action="open-artifact-folder">開く</button>
+              </div>
+              <pre>${escapeHtml(state.artifact_preview_text)}</pre>
+            </div>`
+          : ""
+      }
+      ${
+        hasActivity
+          ? `<div class="activity">
+              <h3>進捗</h3>
+              <pre>${escapeHtml(state.progress_text)}</pre>
+              <h3>ツール</h3>
+              <pre>${escapeHtml(state.tool_status_text)}</pre>
+            </div>`
+          : ""
+      }
+    </aside>
+  `;
+}
+
+export function renderOverlay(state: DesktopWebState): string {
+  if (state.overlay === "provider") return renderProviderOverlay(state);
+  if (state.overlay === "config") return renderConfigOverlay(state);
+  if (state.overlay === "workspace") return renderWorkspaceOverlay(state);
+  if (state.overlay === "prompt_review") return renderPromptReviewOverlay(state);
+  if (state.overlay === "command_palette") return renderCommandPalette(state);
+  if (state.overlay === "shortcuts") return renderShortcuts();
+  if (state.overlay === "project_menu") return "";
+  if (state.overlay === "file_menu") return renderMenuPopover("file", [
+    ["new-chat", "新しいチャット", "Ctrl+N"],
+    ["create-project-from-picker", "プロジェクトを追加...", ""],
+    ["open-workspace-folder", "現在のフォルダーを開く", ""],
+  ]);
+  if (state.overlay === "edit_menu") return renderMenuPopover("edit", [
+    ["show-command-palette", "検索 / コマンド", "Ctrl+K"],
+    ["enhance-prompt", "Enhance", ""],
+  ]);
+  if (state.overlay === "view_menu") {
+    return renderMenuPopover(
+      "view",
+      [["refresh", "更新", ""], ["show-provider", "LLM URL", ""], ["show-config", "設定", ""]],
+      `
+        <div class="menu-slider" data-modal>
+          <label class="field-label">ウィンドウ透過率</label>
+          <input id="opacity-input" type="range" min="50" max="100" value="${state.window_opacity_percent}" />
+        </div>
+      `
+    );
+  }
+  if (state.overlay === "help_menu") return renderMenuPopover("help", [["show-shortcuts", "ショートカット", ""]]);
+  return "";
+}
+
+function renderProviderOverlay(state: DesktopWebState): string {
+  const selectedSummary = state.provider_selected_model_summary.length > 0 ? state.provider_selected_model_summary : ["モデル metadata は未取得です。"];
+  return `
+    <div class="modal-backdrop" data-action="close-overlay">
+      <section class="modal wide" data-modal>
+        <h2>LLM URL</h2>
+        <label class="field-label">ベースURL</label>
+        <input id="provider-url" value="${escapeHtml(state.provider_base_url)}" />
+        <div class="split-actions">
+          <button data-action="load-provider-models" ${state.provider_loading ? "disabled" : ""}>${state.provider_loading ? "読込中" : "モデル読込"}</button>
+          <button data-action="apply-provider-session" ${state.provider_apply_enabled ? "" : "disabled"}>セッションに適用</button>
+          <button data-action="save-provider-project" ${state.provider_apply_enabled ? "" : "disabled"}>プロジェクトに保存</button>
+          <button data-action="save-provider-global" ${state.provider_apply_enabled ? "" : "disabled"}>全体に保存</button>
+        </div>
+        <div class="select-list">
+          ${state.provider_models
+            .map(
+              (model, index) => `
+                <button class="${index === state.provider_selected_index ? "selected" : ""}" data-action="select-provider-model" data-index="${index}">
+                  ${escapeHtml(model)}
+                </button>`
+            )
+            .join("")}
+        </div>
+        <div class="provider-summary">
+          ${selectedSummary
+            .map((line) => {
+              const [label, ...rest] = line.split(": ");
+              return `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(rest.join(": ") || line)}</strong></div>`;
+            })
+            .join("")}
+        </div>
+        <pre class="feedback">${escapeHtml(state.provider_status_text)}</pre>
+      </section>
+    </div>
+  `;
+}
+
+function renderConfigOverlay(state: DesktopWebState): string {
+  const normalizedFilter = configFilterText.trim().toLowerCase();
+  const selectedValidation = validateConfigInput(state.config_field_title, state.config_value_text);
+  return `
+    <div class="modal-backdrop" data-action="close-overlay">
+      <section class="modal wide" data-modal>
+        <div class="modal-header">
+          <h2>設定</h2>
+          <button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>
+        </div>
+        <div class="config-grid">
+          <div class="config-list-pane">
+            <input id="config-filter" value="${escapeHtml(configFilterText)}" placeholder="設定項目を検索" aria-label="設定項目を検索" />
+            <div class="select-list config-list">
+              ${renderConfigItems(state, normalizedFilter)}
+            </div>
+          </div>
+          <div class="config-editor-pane">
+            <div class="config-title-row">
+              <label class="field-label" for="config-value">${escapeHtml(state.config_field_title)}</label>
+              <span class="dirty-badge ${configDirty ? "visible" : ""}">変更あり</span>
+            </div>
+            <textarea id="config-value">${escapeHtml(state.config_value_text)}</textarea>
+            <div id="config-validation" class="validation ${selectedValidation.ok ? "ok" : "error"}">${escapeHtml(
+              selectedValidation.message
+            )}</div>
+            <pre class="feedback">${escapeHtml(state.config_feedback_text)}</pre>
+            <div class="split-actions config-actions">
+              <button data-action="apply-session-config">このセッションに適用</button>
+              <button data-action="save-project-config">プロジェクトに保存</button>
+              <button data-action="save-global-config">全体に保存</button>
+              <button data-action="open-project-config-folder">プロジェクト設定を開く</button>
+              <button data-action="open-global-config-folder">全体設定を開く</button>
+              <button data-action="close-overlay">閉じる</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderConfigItems(state: DesktopWebState, normalizedFilter: string): string {
+  const filtered = state.config_items
+    .map((item, index) => ({ item, index, key: item.split(" = ")[0] ?? item }))
+    .filter(({ item }) => normalizedFilter.length === 0 || item.toLowerCase().includes(normalizedFilter));
+  if (filtered.length === 0) {
+    return '<div class="empty">一致する設定項目はありません</div>';
+  }
+  const grouped = new Map<string, Array<{ item: string; index: number; key: string }>>();
+  for (const entry of filtered) {
+    const group = configGroupLabel(entry.key);
+    const rows = grouped.get(group) ?? [];
+    rows.push(entry);
+    grouped.set(group, rows);
+  }
+  return Array.from(grouped.entries())
+    .map(
+      ([group, rows]) => `
+        <div class="config-group-label">${escapeHtml(group)}</div>
+        ${rows
+          .map(({ item, index }) => {
+            const [key, value = ""] = item.split(" = ");
+            return `
+              <button class="${index === state.selected_config_index ? "selected" : ""}" data-action="select-config" data-index="${index}" title="${escapeHtml(item)}">
+                <span>${escapeHtml(key)}</span>
+                <small>${escapeHtml(value)}</small>
+              </button>`;
+          })
+          .join("")}`
+    )
+    .join("");
+}
+
+function configGroupLabel(key: string): string {
+  const prefix = key.split(".")[0] ?? "other";
+  const labels: Record<string, string> = {
+    model: "Model",
+    permissions: "Permissions",
+    inspection: "Files",
+    file_guard: "Files",
+    docling: "Tools",
+    mcp: "Tools",
+    session: "Session",
+    shell: "Tools",
+    desktop: "Desktop",
+    logging: "Harness",
+    tool_output: "Tools",
+    instructions: "Instructions",
+    workspace: "Workspace",
+  };
+  return labels[prefix] ?? "Other";
+}
+
+function renderWorkspaceOverlay(state: DesktopWebState): string {
+  return `
+    <div class="modal-backdrop" data-action="close-overlay">
+      <section class="modal wide" data-modal>
+        <h2>ワークスペース</h2>
+        <label class="field-label">パス</label>
+        <input id="workspace-input" value="${escapeHtml(state.workspace_input)}" />
+        <div class="split-actions">
+          <button data-action="switch-workspace">切り替え</button>
+          <button data-action="browse-workspace">参照</button>
+          <button data-action="open-typed-path">入力パスを開く</button>
+          <button data-action="open-workspace-folder">現在の場所を開く</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderPromptReviewOverlay(state: DesktopWebState): string {
+  return `
+    <div class="modal-backdrop" data-action="close-overlay">
+      <section class="modal wide" data-modal>
+        <h2>Enhance</h2>
+        <div class="review-grid">
+          <pre>${escapeHtml(state.review_raw_text)}</pre>
+          <textarea id="review-draft">${escapeHtml(state.review_draft_text)}</textarea>
+        </div>
+        <pre class="feedback">${escapeHtml(state.review_status_text)}</pre>
+        <div class="modal-actions">
+          <button data-action="cancel-review">キャンセル</button>
+          <button data-action="send-review-raw" ${state.send_raw_enabled ? "" : "disabled"}>原文で送信</button>
+          <button class="send wide-send" data-action="send-review-enhanced" ${state.send_enhanced_enabled ? "" : "disabled"}>推敲文で送信</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderCommandPalette(state: DesktopWebState): string {
+  return `
+    <div class="modal-backdrop" data-action="close-overlay">
+      <section class="modal command" data-modal>
+        <h2>検索 / コマンド</h2>
+        <input id="local-search" value="${escapeHtml(state.local_search_text)}" placeholder="ローカル状態を検索" />
+        <pre class="feedback">${escapeHtml(state.local_search_results_text)}</pre>
+        <div class="select-list compact">
+          ${state.command_rows
+            .map(
+              (row, index) => `
+                <button data-action="insert-command" data-index="${index}">
+                  <span>/${escapeHtml(row.name)}</span><small>${escapeHtml(row.path)}</small>
+                </button>`
+            )
+            .join("")}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderShortcuts(): string {
+  return renderMenuOverlay("ショートカット", [
+    ["close-overlay", "Esc  閉じる"],
+    ["show-command-palette", "Ctrl+K  検索 / コマンド"],
+    ["new-chat", "Ctrl+N  新しいチャット"],
+    ["send", "Ctrl+Enter  送信"],
+  ]);
+}
+
+function renderMenuPopover(
+  menu: "file" | "edit" | "view" | "help",
+  items: Array<[string, string, string]>,
+  extra = ""
+): string {
+  return `
+    <div class="menu-scrim" data-action="close-overlay">
+      <section class="titlebar-popover ${menu}" data-modal role="menu">
+        ${items
+          .map(
+            ([action, label, shortcut]) => `
+              <button data-action="${action}" role="menuitem">
+                <span>${escapeHtml(label)}</span>
+                ${shortcut ? `<small>${escapeHtml(shortcut)}</small>` : ""}
+              </button>`
+          )
+          .join("")}
+        ${extra}
+      </section>
+    </div>
+  `;
+}
+
+function renderMenuOverlay(title: string, items: Array<[string, string]>): string {
+  return `
+    <div class="modal-backdrop" data-action="close-overlay">
+      <section class="modal side" data-modal>
+        <h2>${escapeHtml(title)}</h2>
+        <div class="select-list">
+          ${items.map(([action, label]) => `<button data-action="${action}">${escapeHtml(label)}</button>`).join("")}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderNavRow(
+  label: string,
+  detail: string,
+  selected: boolean,
+  kind: string,
+  index: number,
+  deleteAction: string,
+  running = false
+): string {
+  return `
+    <div class="nav-row-wrap ${selected ? "selected" : ""}">
+      <button class="nav-row" data-action="${kind}" data-index="${index}">
+        <span class="nav-title">${running ? '<span class="busy-spinner" title="実行中"></span>' : ""}<span>${escapeHtml(label)}</span></span>
+        <small>${escapeHtml(detail)}</small>
+      </button>
+      <button class="row-delete" data-action="${deleteAction}" data-index="${index}" title="削除" aria-label="削除">${icon("x")}</button>
+    </div>
+  `;
+}
+
+

@@ -20,6 +20,12 @@ type SharedController = Arc<Mutex<DesktopController>>;
 const HTCAPTION: usize = 2;
 #[cfg(target_os = "windows")]
 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+#[cfg(target_os = "windows")]
+const GWL_EXSTYLE: i32 = -20;
+#[cfg(target_os = "windows")]
+const LWA_ALPHA: u32 = 0x0000_0002;
+#[cfg(target_os = "windows")]
+const WS_EX_LAYERED: isize = 0x0008_0000;
 
 #[cfg(target_os = "windows")]
 #[link(name = "user32")]
@@ -31,6 +37,14 @@ unsafe extern "system" {
         w_param: usize,
         l_param: isize,
     ) -> isize;
+    fn GetWindowLongPtrW(hwnd: *mut core::ffi::c_void, index: i32) -> isize;
+    fn SetWindowLongPtrW(hwnd: *mut core::ffi::c_void, index: i32, new_long: isize) -> isize;
+    fn SetLayeredWindowAttributes(
+        hwnd: *mut core::ffi::c_void,
+        color_key: u32,
+        alpha: u8,
+        flags: u32,
+    ) -> i32;
 }
 
 pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
@@ -103,6 +117,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             save_project_config,
             save_global_config,
             toggle_access_mode,
+            preview_window_opacity,
             set_window_opacity,
             answer_permission,
             start_window_drag,
@@ -194,10 +209,27 @@ fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+async fn mutate_controller<F>(
+    controller: State<'_, SharedController>,
+    action: F,
+) -> Result<DesktopWebState, String>
+where
+    F: FnOnce(&mut DesktopController),
+{
+    let mut controller = controller.lock().await;
+    action(&mut controller);
+    controller.drain_runtime_messages();
+    Ok(desktop_web_state(&controller.state))
+}
+
 #[tauri::command]
-async fn desktop_state(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
+async fn desktop_state(
+    window: tauri::WebviewWindow,
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, String> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
+    apply_native_window_opacity(&window, controller.state.view.window_opacity_percent)?;
     Ok(desktop_web_state(&controller.state))
 }
 
@@ -206,34 +238,25 @@ async fn set_prompt(
     controller: State<'_, SharedController>,
     text: String,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.set_draft_prompt(text);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.set_draft_prompt(text);
+    })
+    .await
 }
 
 #[tauri::command]
 async fn submit_prompt(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.start_run();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::start_run).await
 }
 
 #[tauri::command]
 async fn cancel_run(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.cancel_active_run();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::cancel_active_run).await
 }
 
 #[tauri::command]
 async fn new_chat(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.start_quick_chat();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::start_quick_chat).await
 }
 
 #[tauri::command]
@@ -241,30 +264,24 @@ async fn new_project_session(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.start_project_session(index);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.start_project_session(index);
+    })
+    .await
 }
 
 #[tauri::command]
 async fn review_uncommitted(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.start_review_uncommitted();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::start_review_uncommitted).await
 }
 
 #[tauri::command]
 async fn enhance_prompt(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.start_prompt_enhance();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::start_prompt_enhance).await
 }
 
 #[tauri::command]
@@ -272,10 +289,10 @@ async fn set_review_draft(
     controller: State<'_, SharedController>,
     text: String,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.set_review_draft(text);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.set_review_draft(text);
+    })
+    .await
 }
 
 #[tauri::command]
@@ -283,30 +300,27 @@ async fn send_prompt_review(
     controller: State<'_, SharedController>,
     enhanced: bool,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.send_prompt_review(enhanced);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.send_prompt_review(enhanced);
+    })
+    .await
 }
 
 #[tauri::command]
 async fn cancel_prompt_review(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.cancel_prompt_review();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.cancel_prompt_review();
+    })
+    .await
 }
 
 #[tauri::command]
 async fn refresh_desktop(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.refresh_snapshot();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::refresh_snapshot).await
 }
 
 #[tauri::command]
@@ -314,11 +328,11 @@ async fn select_project(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.select_project(index);
-    controller.open_selected_project();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.select_project(index);
+        controller.open_selected_project();
+    })
+    .await
 }
 
 #[tauri::command]
@@ -326,11 +340,11 @@ async fn select_session(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.select_session(index);
-    controller.open_selected_session();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.select_session(index);
+        controller.open_selected_session();
+    })
+    .await
 }
 
 #[tauri::command]
@@ -338,10 +352,10 @@ async fn select_chat_session(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.open_quick_chat_session(index);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.open_quick_chat_session(index);
+    })
+    .await
 }
 
 #[tauri::command]
@@ -349,11 +363,11 @@ async fn delete_project(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.select_project(index);
-    controller.delete_selected_project();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.select_project(index);
+        controller.delete_selected_project();
+    })
+    .await
 }
 
 #[tauri::command]
@@ -361,11 +375,11 @@ async fn delete_session(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.select_session(index);
-    controller.delete_selected_session();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.select_session(index);
+        controller.delete_selected_session();
+    })
+    .await
 }
 
 #[tauri::command]
@@ -373,10 +387,10 @@ async fn delete_chat_session(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.delete_quick_chat_session(index);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.delete_quick_chat_session(index);
+    })
+    .await
 }
 
 #[tauri::command]
@@ -384,30 +398,32 @@ async fn select_artifact(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.select_artifact(index);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.select_artifact(index);
+    })
+    .await
 }
 
 #[tauri::command]
 async fn export_history_markdown(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.export_selected_history_markdown_auto();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(
+        controller,
+        DesktopController::export_selected_history_markdown_auto,
+    )
+    .await
 }
 
 #[tauri::command]
 async fn export_transcript_markdown(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.export_open_transcript_markdown_auto();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(
+        controller,
+        DesktopController::export_open_transcript_markdown_auto,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -415,34 +431,31 @@ async fn set_image_input(
     controller: State<'_, SharedController>,
     text: String,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.set_image_attachment_input(text);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.set_image_attachment_input(text);
+    })
+    .await
 }
 
 #[tauri::command]
 async fn attach_image(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.attach_image_from_input();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.attach_image_from_input();
+    })
+    .await
 }
 
 #[tauri::command]
 async fn browse_image(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.browse_image_dialog();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::browse_image_dialog).await
 }
 
 #[tauri::command]
 async fn clear_images(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.clear_image_attachments();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.clear_image_attachments();
+    })
+    .await
 }
 
 #[tauri::command]
@@ -450,129 +463,111 @@ async fn remove_image(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.remove_image_attachment(index);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.remove_image_attachment(index);
+    })
+    .await
 }
 
 #[tauri::command]
 async fn show_file_menu(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.show_file_menu();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| controller.state.show_file_menu()).await
 }
 
 #[tauri::command]
 async fn show_edit_menu(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.show_edit_menu();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| controller.state.show_edit_menu()).await
 }
 
 #[tauri::command]
 async fn show_view_menu(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.show_view_menu();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| controller.state.show_view_menu()).await
 }
 
 #[tauri::command]
 async fn show_help_menu(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.show_help_menu();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| controller.state.show_help_menu()).await
 }
 
 #[tauri::command]
 async fn show_project_menu(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.show_project_menu();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.show_project_menu()
+    })
+    .await
 }
 
 #[tauri::command]
 async fn create_project_from_picker(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.create_project_from_picker();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::create_project_from_picker).await
 }
 
 #[tauri::command]
 async fn show_config_editor(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.show_config_editor();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.show_config_editor();
+    })
+    .await
 }
 
 #[tauri::command]
 async fn show_provider_editor(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.show_provider_editor();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.show_provider_editor();
+    })
+    .await
 }
 
 #[tauri::command]
 async fn show_workspace_picker(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    let path = controller.app.workspace.root.to_string();
-    controller.state.show_workspace_picker(&path);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        let path = controller.app.workspace.root.to_string();
+        controller.state.show_workspace_picker(&path);
+    })
+    .await
 }
 
 #[tauri::command]
 async fn show_command_palette(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.show_command_palette();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.show_command_palette();
+    })
+    .await
 }
 
 #[tauri::command]
 async fn show_shortcuts(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.show_keyboard_shortcuts();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.show_keyboard_shortcuts();
+    })
+    .await
 }
 
 #[tauri::command]
 async fn close_overlay(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.hide_overlay();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| controller.state.hide_overlay()).await
 }
 
 #[tauri::command]
@@ -580,80 +575,67 @@ async fn set_workspace_input(
     controller: State<'_, SharedController>,
     text: String,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.set_workspace_input(text);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.set_workspace_input(text);
+    })
+    .await
 }
 
 #[tauri::command]
 async fn switch_workspace(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.switch_workspace();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::switch_workspace).await
 }
 
 #[tauri::command]
 async fn browse_workspace(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.browse_workspace_dialog();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::browse_workspace_dialog).await
 }
 
 #[tauri::command]
 async fn open_workspace_folder(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.open_current_workspace_in_file_manager();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(
+        controller,
+        DesktopController::open_current_workspace_in_file_manager,
+    )
+    .await
 }
 
 #[tauri::command]
 async fn open_project_config_folder(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.open_project_config_folder();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::open_project_config_folder).await
 }
 
 #[tauri::command]
 async fn open_global_config_folder(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.open_global_config_folder();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::open_global_config_folder).await
 }
 
 #[tauri::command]
 async fn open_typed_path(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.open_typed_path_in_file_manager();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(
+        controller,
+        DesktopController::open_typed_path_in_file_manager,
+    )
+    .await
 }
 
 #[tauri::command]
 async fn open_artifact_folder(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.open_selected_artifact_folder();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::open_selected_artifact_folder).await
 }
 
 #[tauri::command]
@@ -661,10 +643,10 @@ async fn set_local_search(
     controller: State<'_, SharedController>,
     text: String,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.set_local_search_text(text);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.set_local_search_text(text);
+    })
+    .await
 }
 
 #[tauri::command]
@@ -672,10 +654,10 @@ async fn insert_command(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.insert_command_from_palette(index);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.insert_command_from_palette(index);
+    })
+    .await
 }
 
 #[tauri::command]
@@ -683,20 +665,17 @@ async fn set_provider_base_url(
     controller: State<'_, SharedController>,
     text: String,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.set_provider_base_url_input(text);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.set_provider_base_url_input(text);
+    })
+    .await
 }
 
 #[tauri::command]
 async fn load_provider_models(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.load_provider_models();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::load_provider_models).await
 }
 
 #[tauri::command]
@@ -704,40 +683,31 @@ async fn select_provider_model(
     controller: State<'_, SharedController>,
     index: i32,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.set_provider_model_selection(index);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.set_provider_model_selection(index);
+    })
+    .await
 }
 
 #[tauri::command]
 async fn apply_provider_session(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.apply_provider_session();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::apply_provider_session).await
 }
 
 #[tauri::command]
 async fn save_provider_project(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.save_provider_project();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::save_provider_project).await
 }
 
 #[tauri::command]
 async fn save_provider_global(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.save_provider_global();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::save_provider_global).await
 }
 
 #[tauri::command]
@@ -745,10 +715,10 @@ async fn set_config_selection(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.set_config_selection(index);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.set_config_selection(index);
+    })
+    .await
 }
 
 #[tauri::command]
@@ -756,61 +726,95 @@ async fn set_config_value(
     controller: State<'_, SharedController>,
     text: String,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.state.set_config_value(text);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.state.set_config_value(text);
+    })
+    .await
 }
 
 #[tauri::command]
 async fn apply_session_config(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.apply_session_config();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::apply_session_config).await
 }
 
 #[tauri::command]
 async fn save_project_config(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.save_project_config();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::save_project_config).await
 }
 
 #[tauri::command]
 async fn save_global_config(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.save_global_config();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, DesktopController::save_global_config).await
 }
 
 #[tauri::command]
 async fn toggle_access_mode(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, DesktopController::toggle_access_mode_session).await
+}
+
+#[tauri::command]
+async fn preview_window_opacity(
+    window: tauri::WebviewWindow,
+    controller: State<'_, SharedController>,
+    percent: i32,
+) -> Result<(), String> {
     let mut controller = controller.lock().await;
-    controller.toggle_access_mode_session();
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    controller.state.set_window_opacity_percent(percent);
+    apply_native_window_opacity(&window, controller.state.view.window_opacity_percent)
 }
 
 #[tauri::command]
 async fn set_window_opacity(
+    window: tauri::WebviewWindow,
     controller: State<'_, SharedController>,
     percent: i32,
 ) -> Result<DesktopWebState, String> {
     let mut controller = controller.lock().await;
-    controller.state.set_window_opacity_percent(percent);
+    controller.set_window_opacity_percent(percent);
     controller.drain_runtime_messages();
+    apply_native_window_opacity(&window, controller.state.view.window_opacity_percent)?;
     Ok(desktop_web_state(&controller.state))
+}
+
+fn apply_native_window_opacity(window: &tauri::WebviewWindow, percent: i32) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        apply_windows_window_opacity(window, percent)?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window, percent);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_window_opacity(window: &tauri::WebviewWindow, percent: i32) -> Result<(), String> {
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| format!("failed to get native window handle: {error}"))?;
+    let hwnd = hwnd.0 as *mut core::ffi::c_void;
+    let opacity = percent.clamp(
+        super::state::MIN_WINDOW_OPACITY_PERCENT,
+        super::state::MAX_WINDOW_OPACITY_PERCENT,
+    );
+    let alpha = ((opacity as f64 / 100.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED);
+        if SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA) == 0 {
+            return Err("failed to apply native window opacity".to_string());
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -818,8 +822,8 @@ async fn answer_permission(
     controller: State<'_, SharedController>,
     allow: bool,
 ) -> Result<DesktopWebState, String> {
-    let mut controller = controller.lock().await;
-    controller.answer_permission(allow);
-    controller.drain_runtime_messages();
-    Ok(desktop_web_state(&controller.state))
+    mutate_controller(controller, |controller| {
+        controller.answer_permission(allow);
+    })
+    .await
 }

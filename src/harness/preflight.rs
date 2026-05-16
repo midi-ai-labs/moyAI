@@ -287,6 +287,15 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
         );
     }
 
+    if gate.gate_id == "preflight.prompt_replay.compaction_orphan_assistant_repaired"
+        && !crate::agent::prompt::provider_replay_after_compaction_repairs_orphan_assistant_before_user(
+        )
+    {
+        diagnostics.push(
+            "provider replay can still emit an orphan assistant message after compaction without restoring its matching user query".to_string(),
+        );
+    }
+
     if gate.gate_id == "preflight.prompt_replay.stale_inactive_authoring_pair_omitted"
         && !crate::agent::prompt::stale_inactive_authoring_replay_omits_fake_executable_arguments()
     {
@@ -1111,6 +1120,17 @@ pub fn failure_registry_preflight_suite() -> Vec<PreflightGate> {
             fixture_id: "fixture.prompt_replay.tool_pair_symmetry".to_string(),
         },
         PreflightGate {
+            gate_id: "preflight.prompt_replay.compaction_orphan_assistant_repaired".to_string(),
+            purpose: "provider replay after compaction restores the matching user query for an assistant/tool item that would otherwise become orphaned before the latest user query".to_string(),
+            tier: 2,
+            layer: PreflightLayer::Flow,
+            llm_mode: PreflightLlmMode::NoLlm,
+            deterministic: true,
+            status: PreflightGateStatus::Active,
+            family: PreflightGateFamily::PromptReplayAuthority,
+            fixture_id: "fixture.prompt_replay.compaction_orphan_assistant_repaired".to_string(),
+        },
+        PreflightGate {
             gate_id: "preflight.prompt_replay.stale_inactive_authoring_pair_omitted".to_string(),
             purpose: "provider replay omits stale inactive authoring tool-call/output pairs as executable history instead of exposing fake sentinel arguments".to_string(),
             tier: 2,
@@ -1699,6 +1719,25 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "standalone_tool_output_without_call".to_string(),
                 "provider_tool_role_without_assistant_tool_call".to_string(),
                 "arguments_null_drops_tool_call".to_string(),
+            ],
+            required_artifacts: Vec::new(),
+            fail_closed_on_missing_typed_projection: true,
+        },
+        PreflightFixture {
+            fixture_id: "fixture.prompt_replay.compaction_orphan_assistant_repaired".to_string(),
+            family: PreflightGateFamily::PromptReplayAuthority,
+            authority_source: "CanonicalHistoryItem PromptProjection CompactionContinuity post_compaction_role_alternation latest_user_input_preserved matching_user_query_restored_before_assistant".to_string(),
+            required_refs: vec![
+                "CanonicalHistoryItem".to_string(),
+                "PromptProjection".to_string(),
+                "CompactionContinuity".to_string(),
+                "post_compaction_role_alternation".to_string(),
+                "latest_user_input_preserved".to_string(),
+                "matching_user_query_restored_before_assistant".to_string(),
+            ],
+            forbidden_refs: vec![
+                "assistant_message_without_matching_user_after_compaction".to_string(),
+                "provider_template_no_user_query".to_string(),
             ],
             required_artifacts: Vec::new(),
             fail_closed_on_missing_typed_projection: true,

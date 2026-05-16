@@ -2,15 +2,27 @@
 pub mod app;
 pub mod args;
 #[cfg(feature = "tauri-desktop")]
+pub mod artifact_projection;
+#[cfg(feature = "tauri-desktop")]
+pub mod composer_state;
+#[cfg(feature = "tauri-desktop")]
 pub mod models;
 #[cfg(feature = "tauri-desktop")]
+pub mod navigation;
+#[cfg(feature = "tauri-desktop")]
+pub mod open_session;
+#[cfg(feature = "tauri-desktop")]
 pub mod preferences;
+#[cfg(feature = "tauri-desktop")]
+pub mod provider_config_state;
 #[cfg(feature = "tauri-desktop")]
 pub mod query;
 #[cfg(feature = "tauri-desktop")]
 pub mod state;
 #[cfg(feature = "tauri-desktop")]
 pub mod tauri_app;
+#[cfg(feature = "tauri-desktop")]
+pub mod view_state;
 #[cfg(feature = "tauri-desktop")]
 pub mod web_model;
 

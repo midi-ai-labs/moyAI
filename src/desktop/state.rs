@@ -1,18 +1,22 @@
-use crate::config::ResolvedConfig;
 use crate::protocol::TurnItem;
 use crate::session::{
-    ProjectId, PromptDispatchPart, SessionId, SessionRecord, SessionStateSnapshot, TodoItem,
-    Transcript,
+    ProjectId, PromptDispatchPart, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus,
+    TodoItem, Transcript,
 };
 use crate::tool::PermissionRequest;
-use crate::tui::config_editor::ConfigEditorState;
 use crate::tui::state::{AppState, RunStatus};
 
+use super::composer_state::DesktopComposerState;
 use super::models::{DesktopSessionDetail, DesktopSnapshot};
-use super::query::build_session_detail_from_app_state;
+use super::navigation::{DesktopNavigationState, NavigationRequestId};
+use super::open_session::OpenSessionView;
+use super::provider_config_state::DesktopProviderConfigState;
+use super::query::build_session_detail_from_app_state_with_session;
+use super::view_state::DesktopViewState;
+use crate::config::ResolvedConfig;
 use crate::llm::{ProviderModelInfo, normalize_provider_base_url};
 
-pub const MIN_WINDOW_OPACITY_PERCENT: i32 = 55;
+pub const MIN_WINDOW_OPACITY_PERCENT: i32 = 50;
 pub const MAX_WINDOW_OPACITY_PERCENT: i32 = 100;
 pub const DEFAULT_WINDOW_OPACITY_PERCENT: i32 = 96;
 
@@ -36,60 +40,25 @@ pub enum DesktopOverlay {
 pub struct DesktopState {
     pub snapshot: DesktopSnapshot,
     pub app_state: AppState,
-    pub draft_prompt: String,
-    pub image_attachment_input: String,
-    pub image_attachment_paths: Vec<camino::Utf8PathBuf>,
-    pub review_draft_text: String,
+    pub open_session: Option<OpenSessionView>,
+    pub composer: DesktopComposerState,
     pub workspace_input: String,
-    pub overlay: DesktopOverlay,
-    pub effective_config: ResolvedConfig,
-    pub config_editor: ConfigEditorState,
-    pub config_value_text: String,
-    pub provider_base_url_input: String,
-    pub provider_models: Vec<String>,
-    pub provider_model_infos: Vec<ProviderModelInfo>,
-    pub provider_selected_index: i32,
-    pub provider_loaded_base_url: Option<String>,
-    pub provider_status_text: String,
-    pub provider_loading: bool,
-    pub window_opacity_percent: i32,
-    pub artifact_selected_index: usize,
-    pub local_search_text: String,
+    pub provider_config: DesktopProviderConfigState,
+    pub navigation: DesktopNavigationState,
+    pub view: DesktopViewState,
 }
 
 impl DesktopState {
     pub fn new(snapshot: DesktopSnapshot, effective_config: ResolvedConfig) -> Self {
-        let config_editor = ConfigEditorState::from_config(&effective_config);
-        let config_value_text = config_editor.selected_field().value.clone();
-        let provider_models = initial_provider_models(&effective_config);
-        let provider_selected_index = provider_models
-            .iter()
-            .position(|model| model == &effective_config.model.model)
-            .map(|index| index as i32)
-            .unwrap_or(-1);
-        let provider_model_infos = initial_provider_model_infos(&effective_config);
         Self {
             snapshot,
             app_state: AppState::default(),
-            draft_prompt: String::new(),
-            image_attachment_input: String::new(),
-            image_attachment_paths: Vec::new(),
-            review_draft_text: String::new(),
+            open_session: None,
+            composer: DesktopComposerState::default(),
             workspace_input: String::new(),
-            overlay: DesktopOverlay::None,
-            effective_config,
-            config_editor,
-            config_value_text,
-            provider_base_url_input: String::new(),
-            provider_models,
-            provider_model_infos,
-            provider_selected_index,
-            provider_loaded_base_url: None,
-            provider_status_text: "Enter a provider URL, then load the model list.".to_string(),
-            provider_loading: false,
-            window_opacity_percent: DEFAULT_WINDOW_OPACITY_PERCENT,
-            artifact_selected_index: 0,
-            local_search_text: String::new(),
+            provider_config: DesktopProviderConfigState::new(effective_config),
+            navigation: DesktopNavigationState::default(),
+            view: DesktopViewState::default(),
         }
         .with_provider_fields()
     }
@@ -117,15 +86,22 @@ impl DesktopState {
     pub fn select_session(&mut self, index: usize) {
         if index < self.snapshot.session_rows.len() {
             self.snapshot.selected_session_index = index;
-            self.artifact_selected_index = 0;
+            self.view.artifact_selected_index = 0;
         }
     }
 
     pub fn select_project(&mut self, index: usize) {
         if index < self.snapshot.project_rows.len() {
+            let changed = self.snapshot.selected_project_index != index;
             self.snapshot.selected_project_index = index;
             self.snapshot.selected_session_index = 0;
-            self.artifact_selected_index = 0;
+            self.view.artifact_selected_index = 0;
+            if changed {
+                self.snapshot.session_rows.clear();
+                self.snapshot.session_details.clear();
+                self.app_state = AppState::default();
+                self.open_session = None;
+            }
         }
     }
 
@@ -159,6 +135,50 @@ impl DesktopState {
         self.snapshot.selected_session_id()
     }
 
+    pub fn begin_workspace_load(
+        &mut self,
+        path: camino::Utf8PathBuf,
+        selected_session_id: Option<SessionId>,
+    ) -> NavigationRequestId {
+        self.navigation
+            .begin_workspace(path, selected_session_id, false)
+    }
+
+    pub fn begin_new_project_session_workspace_load(
+        &mut self,
+        path: camino::Utf8PathBuf,
+    ) -> NavigationRequestId {
+        self.navigation.begin_workspace(path, None, true)
+    }
+
+    pub fn begin_session_load(&mut self, session_id: SessionId) -> NavigationRequestId {
+        self.navigation.begin_session(session_id)
+    }
+
+    pub fn is_current_navigation(&self, request_id: NavigationRequestId) -> bool {
+        self.navigation.is_current(request_id)
+    }
+
+    pub fn is_current_session_navigation(
+        &self,
+        request_id: NavigationRequestId,
+        session_id: SessionId,
+    ) -> bool {
+        self.navigation.is_current_session(request_id, session_id)
+    }
+
+    pub fn finish_navigation(&mut self, request_id: NavigationRequestId) -> bool {
+        self.navigation.finish(request_id)
+    }
+
+    pub fn clear_navigation(&mut self) {
+        self.navigation.clear();
+    }
+
+    pub fn navigation_loading(&self) -> bool {
+        self.navigation.is_active()
+    }
+
     pub fn selected_session_title(&self) -> String {
         self.snapshot
             .session_rows
@@ -182,23 +202,28 @@ impl DesktopState {
     pub fn selected_detail(&self) -> DesktopSessionDetail {
         if let Some(selected_id) = self.selected_session_id() {
             if self.app_state.current_session_id == Some(selected_id) {
-                let mut detail = build_session_detail_from_app_state(&self.app_state);
-                if detail.artifacts.is_empty() {
-                    if let Some(stored) = self.snapshot.detail_for(selected_id) {
-                        detail.artifacts = stored.artifacts.clone();
-                        detail.file_changes = stored.file_changes.clone();
-                        detail.file_change_summary_text = stored.file_change_summary_text.clone();
-                        detail.artifact_preview_text = stored.artifact_preview_text.clone();
-                    }
+                if let Some(open_session) = self
+                    .open_session
+                    .as_ref()
+                    .filter(|open_session| open_session.session_id() == selected_id)
+                {
+                    return open_session
+                        .live_detail(&self.app_state, self.snapshot.detail_for(selected_id));
                 }
-                return detail;
+                return build_session_detail_from_app_state_with_session(&self.app_state, None);
             }
             if let Some(detail) = self.snapshot.detail_for(selected_id) {
                 return detail.clone();
             }
         }
         if self.app_state.current_session_id.is_some() {
-            build_session_detail_from_app_state(&self.app_state)
+            if let Some(open_session) = self.open_session.as_ref().filter(|open_session| {
+                Some(open_session.session_id()) == self.app_state.current_session_id
+            }) {
+                open_session.live_detail(&self.app_state, None)
+            } else {
+                build_session_detail_from_app_state_with_session(&self.app_state, None)
+            }
         } else {
             DesktopSessionDetail {
                 session_id: SessionId::new(),
@@ -229,7 +254,7 @@ impl DesktopState {
 
     pub fn selected_artifact_preview_text(&self) -> String {
         let detail = self.selected_detail();
-        let Some(artifact) = detail.artifacts.get(self.artifact_selected_index) else {
+        let Some(artifact) = detail.artifacts.get(self.view.artifact_selected_index) else {
             return detail.artifact_preview_text;
         };
         super::query::format_artifact_preview(Some(artifact), &detail.file_changes)
@@ -238,14 +263,14 @@ impl DesktopState {
     pub fn selected_artifact_path(&self) -> Option<String> {
         self.selected_detail()
             .artifacts
-            .get(self.artifact_selected_index)
+            .get(self.view.artifact_selected_index)
             .map(|artifact| artifact.path.clone())
     }
 
     pub fn select_artifact(&mut self, index: usize) {
         let detail = self.selected_detail();
         if index < detail.artifacts.len() {
-            self.artifact_selected_index = index;
+            self.view.artifact_selected_index = index;
         }
     }
 
@@ -253,34 +278,42 @@ impl DesktopState {
         if self.selected_detail().artifacts.is_empty() {
             -1
         } else {
-            self.artifact_selected_index as i32
+            self.view.artifact_selected_index as i32
         }
     }
 
     pub fn current_run_status_text(&self) -> String {
         if self.app_state.current_session_id.is_some() {
-            build_session_detail_from_app_state(&self.app_state).run_status_text
+            if let Some(open_session) = self.open_session.as_ref().filter(|open_session| {
+                Some(open_session.session_id()) == self.app_state.current_session_id
+            }) {
+                open_session.live_detail(&self.app_state, None)
+            } else {
+                build_session_detail_from_app_state_with_session(&self.app_state, None)
+            }
+            .run_status_text
         } else {
             self.selected_detail().run_status_text
         }
     }
 
     pub fn set_draft_prompt(&mut self, prompt: String) {
-        self.draft_prompt = prompt;
+        self.composer.draft_prompt = prompt;
     }
 
     pub fn set_image_attachment_input(&mut self, input: String) {
-        self.image_attachment_input = input;
+        self.composer.image_attachment_input = input;
     }
 
     pub fn attach_image_from_input(&mut self) {
-        let trimmed = self.image_attachment_input.trim();
+        let trimmed = self.composer.image_attachment_input.trim();
         if trimmed.is_empty() {
             self.set_status_message("Enter an image path before attaching.");
             return;
         }
         let path = camino::Utf8PathBuf::from(trimmed);
         if self
+            .composer
             .image_attachment_paths
             .iter()
             .any(|existing| existing == &path)
@@ -288,13 +321,14 @@ impl DesktopState {
             self.set_status_message("Image is already attached.");
             return;
         }
-        self.image_attachment_paths.push(path);
-        self.image_attachment_input.clear();
+        self.composer.image_attachment_paths.push(path);
+        self.composer.image_attachment_input.clear();
         self.set_status_message("Image attached to the next prompt.");
     }
 
     pub fn attach_image_path(&mut self, path: camino::Utf8PathBuf) {
         if self
+            .composer
             .image_attachment_paths
             .iter()
             .any(|existing| existing == &path)
@@ -302,30 +336,30 @@ impl DesktopState {
             self.set_status_message("Image is already attached.");
             return;
         }
-        self.image_attachment_paths.push(path);
-        self.image_attachment_input.clear();
+        self.composer.image_attachment_paths.push(path);
+        self.composer.image_attachment_input.clear();
         self.set_status_message("Image attached to the next prompt.");
     }
 
     pub fn clear_image_attachments(&mut self) {
-        self.image_attachment_paths.clear();
-        self.image_attachment_input.clear();
+        self.composer.image_attachment_paths.clear();
+        self.composer.image_attachment_input.clear();
         self.set_status_message("Image attachments cleared.");
     }
 
     pub fn remove_image_attachment(&mut self, index: usize) {
-        if index >= self.image_attachment_paths.len() {
+        if index >= self.composer.image_attachment_paths.len() {
             self.set_status_message("Image attachment is no longer available.");
             return;
         }
-        let removed = self.image_attachment_paths.remove(index);
+        let removed = self.composer.image_attachment_paths.remove(index);
         self.set_status_message(format!("Removed image attachment {}", removed));
     }
 
     pub fn image_attachment_summary(&self) -> String {
-        match self.image_attachment_paths.len() {
+        match self.composer.image_attachment_paths.len() {
             0 => "No images attached".to_string(),
-            1 => format!("1 image: {}", self.image_attachment_paths[0]),
+            1 => format!("1 image: {}", self.composer.image_attachment_paths[0]),
             count => format!("{count} images attached"),
         }
     }
@@ -336,12 +370,13 @@ impl DesktopState {
 
     pub fn set_provider_base_url_input(&mut self, input: String) {
         let normalized = normalize_provider_base_url(&input);
-        self.provider_base_url_input = input;
-        self.provider_loading = false;
-        if self.provider_loaded_base_url.as_deref() != Some(normalized.as_str()) {
-            self.provider_loaded_base_url = None;
+        self.provider_config.provider_base_url_input = input;
+        self.provider_config.provider_loading = false;
+        if self.provider_config.provider_loaded_base_url.as_deref() != Some(normalized.as_str()) {
+            self.provider_config.provider_loaded_base_url = None;
         }
-        self.provider_status_text = "Load the model list for this provider.".to_string();
+        self.provider_config.provider_status_text =
+            "Load the model list for this provider.".to_string();
     }
 
     pub fn load_open_session(
@@ -352,12 +387,20 @@ impl DesktopState {
         state: SessionStateSnapshot,
         todos: Vec<TodoItem>,
     ) {
+        let open_session = OpenSessionView::from_loaded(
+            session,
+            transcript,
+            turn_items,
+            state.clone(),
+            todos.clone(),
+        );
         if turn_items.is_empty() {
             self.app_state.load_transcript(transcript, state, todos);
         } else {
             self.app_state
                 .load_turn_items(session, turn_items, state, todos);
         }
+        self.open_session = Some(open_session);
         if let Some(index) = self
             .snapshot
             .session_rows
@@ -366,22 +409,58 @@ impl DesktopState {
         {
             self.snapshot.selected_session_index = index;
         }
-        self.overlay = DesktopOverlay::None;
-        self.artifact_selected_index = 0;
+        self.view.overlay = DesktopOverlay::None;
+        self.view.artifact_selected_index = 0;
     }
 
     pub fn apply_run_event(&mut self, event: &crate::session::RunEvent) {
         self.app_state.apply_run_event(event);
-        if let crate::session::RunEvent::SessionTitleUpdated { session_id, title } = event {
-            for row in self
-                .snapshot
-                .session_rows
-                .iter_mut()
-                .chain(self.snapshot.chat_session_rows.iter_mut())
-            {
-                if row.session_id == *session_id {
-                    row.label = title.clone();
-                }
+        match event {
+            crate::session::RunEvent::SessionStarted { session_id, title } => {
+                self.update_session_row_title(*session_id, title);
+                self.update_session_row_status(*session_id, SessionStatus::Running);
+            }
+            crate::session::RunEvent::SessionTitleUpdated { session_id, title } => {
+                self.update_session_row_title(*session_id, title);
+            }
+            crate::session::RunEvent::SessionCompleted { session_id, .. } => {
+                self.update_session_row_status(*session_id, SessionStatus::Completed);
+            }
+            crate::session::RunEvent::SessionAwaitingUser { session_id, .. } => {
+                self.update_session_row_status(*session_id, SessionStatus::AwaitingUser);
+            }
+            crate::session::RunEvent::SessionInterrupted { session_id, .. } => {
+                self.update_session_row_status(*session_id, SessionStatus::Cancelled);
+            }
+            crate::session::RunEvent::SessionFailed { session_id, .. } => {
+                self.update_session_row_status(*session_id, SessionStatus::Failed);
+            }
+            _ => {}
+        }
+    }
+
+    fn update_session_row_title(&mut self, session_id: SessionId, title: &str) {
+        for row in self
+            .snapshot
+            .session_rows
+            .iter_mut()
+            .chain(self.snapshot.chat_session_rows.iter_mut())
+        {
+            if row.session_id == session_id {
+                row.set_title_preserving_status(title);
+            }
+        }
+    }
+
+    fn update_session_row_status(&mut self, session_id: SessionId, status: SessionStatus) {
+        for row in self
+            .snapshot
+            .session_rows
+            .iter_mut()
+            .chain(self.snapshot.chat_session_rows.iter_mut())
+        {
+            if row.session_id == session_id {
+                row.set_status(status);
             }
         }
     }
@@ -394,14 +473,35 @@ impl DesktopState {
         self.app_state.clear_permission();
     }
 
+    pub fn mark_run_cancellation_requested(&mut self, reason: &str, status_message: &str) {
+        self.app_state.run_status = RunStatus::Cancelled;
+        self.app_state.permission = None;
+        self.app_state.status_message = Some(status_message.to_string());
+        self.app_state.progress.status = "Cancelled".to_string();
+        self.app_state.progress.current_phase = "terminal".to_string();
+        self.app_state.progress.active_step = reason.to_string();
+        if let Some(session_id) = self.app_state.current_session_id {
+            for row in self
+                .snapshot
+                .session_rows
+                .iter_mut()
+                .chain(self.snapshot.chat_session_rows.iter_mut())
+            {
+                if row.session_id == session_id {
+                    row.set_status(SessionStatus::Cancelled);
+                }
+            }
+        }
+    }
+
     pub fn push_local_prompt_dispatch(&mut self, prompt_dispatch: &PromptDispatchPart) {
         self.app_state.push_local_prompt_dispatch(prompt_dispatch);
     }
 
     pub fn begin_prompt_enhance(&mut self, request_id: u64, raw_prompt: &str) {
         self.app_state.begin_prompt_enhance(request_id, raw_prompt);
-        self.review_draft_text.clear();
-        self.overlay = DesktopOverlay::PromptReview;
+        self.composer.review_draft_text.clear();
+        self.view.overlay = DesktopOverlay::PromptReview;
     }
 
     pub fn finish_prompt_enhance(&mut self, request_id: u64, draft: String) -> bool {
@@ -409,22 +509,22 @@ impl DesktopState {
             .app_state
             .finish_prompt_enhance(request_id, draft.clone());
         if finished {
-            self.review_draft_text = draft;
-            self.overlay = DesktopOverlay::PromptReview;
+            self.composer.review_draft_text = draft;
+            self.view.overlay = DesktopOverlay::PromptReview;
         }
         finished
     }
 
     pub fn set_review_draft(&mut self, draft: String) {
-        self.review_draft_text = draft.clone();
+        self.composer.review_draft_text = draft.clone();
         self.app_state.update_prompt_review_draft(draft);
     }
 
     pub fn cancel_prompt_review(&mut self) {
         self.app_state.cancel_prompt_review();
-        self.review_draft_text.clear();
-        if self.overlay == DesktopOverlay::PromptReview {
-            self.overlay = DesktopOverlay::None;
+        self.composer.review_draft_text.clear();
+        if self.view.overlay == DesktopOverlay::PromptReview {
+            self.view.overlay = DesktopOverlay::None;
         }
     }
 
@@ -443,128 +543,133 @@ impl DesktopState {
         }
         self.snapshot.selected_session_index = self.snapshot.session_rows.len();
         self.app_state = AppState::default();
-        self.draft_prompt.clear();
-        self.image_attachment_input.clear();
-        self.image_attachment_paths.clear();
-        self.review_draft_text.clear();
-        self.artifact_selected_index = 0;
-        self.overlay = DesktopOverlay::None;
+        self.open_session = None;
+        self.composer.clear_request_inputs();
+        self.view.artifact_selected_index = 0;
+        self.view.overlay = DesktopOverlay::None;
         self.set_status_message("new chat ready");
     }
 
     pub fn reset_effective_config(&mut self, config: ResolvedConfig) {
-        self.effective_config = config.clone();
-        self.config_editor = ConfigEditorState::from_config(&config);
-        self.config_value_text = self.config_editor.selected_field().value.clone();
-        self.provider_base_url_input = config.model.base_url.clone();
-        self.provider_models = initial_provider_models(&config);
-        self.provider_model_infos = initial_provider_model_infos(&config);
-        self.provider_selected_index = self
-            .provider_models
-            .iter()
-            .position(|model| model == &config.model.model)
-            .map(|index| index as i32)
-            .unwrap_or(-1);
-        self.provider_loaded_base_url = Some(normalize_provider_base_url(&config.model.base_url));
-        self.provider_loading = false;
-        self.provider_status_text = "Load the model list for this provider.".to_string();
+        self.provider_config.replace_effective_config(config);
     }
 
     pub fn show_config_editor(&mut self) {
-        self.config_value_text = self.config_editor.selected_field().value.clone();
-        self.overlay = DesktopOverlay::ConfigEditor;
+        self.provider_config.config_value_text = self
+            .provider_config
+            .config_editor
+            .selected_field()
+            .value
+            .clone();
+        self.view.overlay = DesktopOverlay::ConfigEditor;
     }
 
     pub fn show_provider_editor(&mut self) {
-        self.provider_base_url_input = self.effective_config.model.base_url.clone();
-        self.provider_models = ensure_current_model(
-            self.provider_models.clone(),
-            &self.effective_config.model.model,
+        self.provider_config.provider_base_url_input =
+            self.provider_config.effective_config.model.base_url.clone();
+        self.provider_config.provider_models = ensure_current_model(
+            self.provider_config.provider_models.clone(),
+            &self.provider_config.effective_config.model.model,
         );
-        self.provider_model_infos =
-            ensure_current_model_info(self.provider_model_infos.clone(), &self.effective_config);
-        self.provider_selected_index = self
+        self.provider_config.provider_model_infos = ensure_current_model_info(
+            self.provider_config.provider_model_infos.clone(),
+            &self.provider_config.effective_config,
+        );
+        self.provider_config.provider_selected_index = self
+            .provider_config
             .provider_models
             .iter()
-            .position(|model| model == &self.effective_config.model.model)
+            .position(|model| model == &self.provider_config.effective_config.model.model)
             .map(|index| index as i32)
             .unwrap_or(-1);
-        if self.provider_status_text.is_empty() {
-            self.provider_status_text = "Load the model list for this provider.".to_string();
+        if self.provider_config.provider_status_text.is_empty() {
+            self.provider_config.provider_status_text =
+                "Load the model list for this provider.".to_string();
         }
-        self.overlay = DesktopOverlay::ProviderEditor;
+        self.view.overlay = DesktopOverlay::ProviderEditor;
     }
 
     pub fn show_workspace_picker(&mut self, current_path: &str) {
         self.workspace_input = current_path.to_string();
-        self.overlay = DesktopOverlay::WorkspacePicker;
+        self.view.overlay = DesktopOverlay::WorkspacePicker;
     }
 
     pub fn show_file_menu(&mut self) {
-        self.overlay = DesktopOverlay::FileMenu;
+        self.view.overlay = DesktopOverlay::FileMenu;
     }
 
     pub fn show_edit_menu(&mut self) {
-        self.overlay = DesktopOverlay::EditMenu;
+        self.view.overlay = DesktopOverlay::EditMenu;
     }
 
     pub fn show_view_menu(&mut self) {
-        self.overlay = DesktopOverlay::ViewMenu;
+        self.view.overlay = DesktopOverlay::ViewMenu;
     }
 
     pub fn show_help_menu(&mut self) {
-        self.overlay = DesktopOverlay::HelpMenu;
+        self.view.overlay = DesktopOverlay::HelpMenu;
     }
 
     pub fn show_project_menu(&mut self) {
-        self.overlay = DesktopOverlay::ProjectMenu;
+        self.view.overlay = DesktopOverlay::ProjectMenu;
     }
 
     pub fn hide_overlay(&mut self) {
-        self.overlay = DesktopOverlay::None;
+        self.view.overlay = DesktopOverlay::None;
     }
 
     pub fn set_config_selection(&mut self, index: usize) {
-        if index < self.config_editor.fields.len() {
-            self.config_editor.selected = index;
-            self.config_value_text = self.config_editor.selected_field().value.clone();
+        if index < self.provider_config.config_editor.fields.len() {
+            self.provider_config.config_editor.selected = index;
+            self.provider_config.config_value_text = self
+                .provider_config
+                .config_editor
+                .selected_field()
+                .value
+                .clone();
         }
     }
 
     pub fn set_config_value(&mut self, value: String) {
-        self.config_value_text = value.clone();
+        self.provider_config.config_value_text = value.clone();
         if let Some(field) = self
+            .provider_config
             .config_editor
             .fields
-            .get_mut(self.config_editor.selected)
+            .get_mut(self.provider_config.config_editor.selected)
         {
             field.value = value;
         }
     }
 
     pub fn begin_provider_model_load(&mut self, normalized_base_url: String) {
-        self.provider_base_url_input = normalized_base_url;
-        self.provider_loading = true;
-        self.provider_loaded_base_url = None;
-        self.provider_status_text = "Loading models in the background...".to_string();
+        self.provider_config.provider_base_url_input = normalized_base_url;
+        self.provider_config.provider_loading = true;
+        self.provider_config.provider_loaded_base_url = None;
+        self.provider_config.provider_status_text =
+            "Loading models in the background...".to_string();
     }
 
     pub fn finish_provider_model_load(&mut self, infos: Vec<ProviderModelInfo>) {
-        let normalized_base_url = normalize_provider_base_url(&self.provider_base_url_input);
+        let normalized_base_url =
+            normalize_provider_base_url(&self.provider_config.provider_base_url_input);
         let models = infos.iter().map(|info| info.id.clone()).collect::<Vec<_>>();
-        self.provider_models = ensure_current_model(models, &self.effective_config.model.model);
-        self.provider_model_infos = ensure_current_model_infos(infos, &self.effective_config);
-        self.provider_selected_index = self
+        self.provider_config.provider_models =
+            ensure_current_model(models, &self.provider_config.effective_config.model.model);
+        self.provider_config.provider_model_infos =
+            ensure_current_model_infos(infos, &self.provider_config.effective_config);
+        self.provider_config.provider_selected_index = self
+            .provider_config
             .provider_models
             .iter()
-            .position(|model| model == &self.effective_config.model.model)
+            .position(|model| model == &self.provider_config.effective_config.model.model)
             .map(|index| index as i32)
             .unwrap_or(-1);
-        self.provider_loaded_base_url = Some(normalized_base_url);
-        self.provider_loading = false;
-        self.provider_status_text = format!(
+        self.provider_config.provider_loaded_base_url = Some(normalized_base_url);
+        self.provider_config.provider_loading = false;
+        self.provider_config.provider_status_text = format!(
             "Loaded {} models. {}",
-            self.provider_models.len(),
+            self.provider_config.provider_models.len(),
             self.selected_provider_model_info()
                 .map(provider_model_summary)
                 .unwrap_or_default()
@@ -574,56 +679,65 @@ impl DesktopState {
     }
 
     pub fn fail_provider_model_load(&mut self, message: impl Into<String>) {
-        self.provider_loading = false;
-        self.provider_loaded_base_url = None;
-        self.provider_status_text = message.into();
-        self.provider_models = ensure_current_model(
-            self.provider_models.clone(),
-            &self.effective_config.model.model,
+        self.provider_config.provider_loading = false;
+        self.provider_config.provider_loaded_base_url = None;
+        self.provider_config.provider_status_text = message.into();
+        self.provider_config.provider_models = ensure_current_model(
+            self.provider_config.provider_models.clone(),
+            &self.provider_config.effective_config.model.model,
         );
-        if self.provider_selected_index < 0 && !self.provider_models.is_empty() {
-            self.provider_selected_index = 0;
+        if self.provider_config.provider_selected_index < 0
+            && !self.provider_config.provider_models.is_empty()
+        {
+            self.provider_config.provider_selected_index = 0;
         }
     }
 
     pub fn set_provider_model_selection(&mut self, index: i32) {
-        if index >= 0 && (index as usize) < self.provider_models.len() {
-            self.provider_selected_index = index;
+        if index >= 0 && (index as usize) < self.provider_config.provider_models.len() {
+            self.provider_config.provider_selected_index = index;
         }
     }
 
     pub fn set_provider_model_value(&mut self, value: &str) {
         let id = value.split("  [").next().unwrap_or(value).trim();
-        if let Some(index) = self.provider_models.iter().position(|item| item == id) {
-            self.provider_selected_index = index as i32;
+        if let Some(index) = self
+            .provider_config
+            .provider_models
+            .iter()
+            .position(|item| item == id)
+        {
+            self.provider_config.provider_selected_index = index as i32;
         }
     }
 
     pub fn selected_provider_model(&self) -> Option<&str> {
-        self.provider_models
-            .get(self.provider_selected_index.max(0) as usize)
+        self.provider_config
+            .provider_models
+            .get(self.provider_config.provider_selected_index.max(0) as usize)
             .map(String::as_str)
             .filter(|value| !value.trim().is_empty())
     }
 
     pub fn selected_provider_model_info(&self) -> Option<&ProviderModelInfo> {
         let selected = self.selected_provider_model()?;
-        self.provider_model_infos
+        self.provider_config
+            .provider_model_infos
             .iter()
             .find(|info| info.id == selected)
     }
 
     pub fn set_window_opacity_percent(&mut self, value: i32) {
-        self.window_opacity_percent =
+        self.view.window_opacity_percent =
             value.clamp(MIN_WINDOW_OPACITY_PERCENT, MAX_WINDOW_OPACITY_PERCENT);
     }
 
     pub fn set_local_search_text(&mut self, text: String) {
-        self.local_search_text = text;
+        self.view.local_search_text = text;
     }
 
     pub fn local_search_results_text(&self) -> String {
-        let needle = self.local_search_text.trim().to_lowercase();
+        let needle = self.view.local_search_text.trim().to_lowercase();
         if needle.is_empty() {
             return "プロジェクト、チャット、履歴、アーティファクト、コマンドを検索できます。"
                 .to_string();
@@ -672,11 +786,11 @@ impl DesktopState {
     }
 
     pub fn show_command_palette(&mut self) {
-        self.overlay = DesktopOverlay::CommandPalette;
+        self.view.overlay = DesktopOverlay::CommandPalette;
     }
 
     pub fn show_keyboard_shortcuts(&mut self) {
-        self.overlay = DesktopOverlay::KeyboardShortcuts;
+        self.view.overlay = DesktopOverlay::KeyboardShortcuts;
     }
 
     pub fn insert_command_from_palette(&mut self, index: usize) {
@@ -684,8 +798,8 @@ impl DesktopState {
             self.set_status_message("command palette selection is no longer available");
             return;
         };
-        self.draft_prompt = format!("/{} ", command.name);
-        self.overlay = DesktopOverlay::None;
+        self.composer.draft_prompt = format!("/{} ", command.name);
+        self.view.overlay = DesktopOverlay::None;
         self.set_status_message(format!("inserted command /{}", command.name));
     }
 
@@ -697,7 +811,7 @@ impl DesktopState {
     }
 
     pub fn can_submit_prompt(&self) -> bool {
-        !self.is_busy() && !self.draft_prompt.trim().is_empty()
+        !self.is_busy() && !self.composer.draft_prompt.trim().is_empty()
     }
 
     pub fn can_open_session(&self) -> bool {
@@ -717,17 +831,22 @@ impl DesktopState {
     }
 
     pub fn can_apply_provider_selection(&self) -> bool {
-        let normalized = normalize_provider_base_url(&self.provider_base_url_input);
-        !self.provider_loading
-            && !self.provider_base_url_input.trim().is_empty()
-            && self.provider_loaded_base_url.as_deref() == Some(normalized.as_str())
+        let normalized = normalize_provider_base_url(&self.provider_config.provider_base_url_input);
+        !self.provider_config.provider_loading
+            && !self
+                .provider_config
+                .provider_base_url_input
+                .trim()
+                .is_empty()
+            && self.provider_config.provider_loaded_base_url.as_deref() == Some(normalized.as_str())
             && self.selected_provider_model().is_some()
     }
 
     fn with_provider_fields(mut self) -> Self {
-        self.provider_base_url_input = self.effective_config.model.base_url.clone();
-        self.provider_loaded_base_url = Some(normalize_provider_base_url(
-            &self.effective_config.model.base_url,
+        self.provider_config.provider_base_url_input =
+            self.provider_config.effective_config.model.base_url.clone();
+        self.provider_config.provider_loaded_base_url = Some(normalize_provider_base_url(
+            &self.provider_config.effective_config.model.base_url,
         ));
         self
     }
@@ -735,9 +854,9 @@ impl DesktopState {
     fn clamp_artifact_selection(&mut self) {
         let count = self.selected_detail().artifacts.len();
         if count == 0 {
-            self.artifact_selected_index = 0;
-        } else if self.artifact_selected_index >= count {
-            self.artifact_selected_index = count - 1;
+            self.view.artifact_selected_index = 0;
+        } else if self.view.artifact_selected_index >= count {
+            self.view.artifact_selected_index = count - 1;
         }
     }
 }
@@ -752,11 +871,11 @@ fn truncate_for_search(value: &str, max_chars: usize) -> String {
     format!("{shortened}…")
 }
 
-fn initial_provider_models(config: &ResolvedConfig) -> Vec<String> {
+pub(crate) fn initial_provider_models(config: &ResolvedConfig) -> Vec<String> {
     ensure_current_model(Vec::new(), &config.model.model)
 }
 
-fn initial_provider_model_infos(config: &ResolvedConfig) -> Vec<ProviderModelInfo> {
+pub(crate) fn initial_provider_model_infos(config: &ResolvedConfig) -> Vec<ProviderModelInfo> {
     ensure_current_model_infos(Vec::new(), config)
 }
 
@@ -854,6 +973,10 @@ mod tests {
         }
     }
 
+    fn session_row(session_id: SessionId, title: &str, status: SessionStatus) -> DesktopSessionRow {
+        DesktopSessionRow::from_parts(session_id, title, status)
+    }
+
     #[test]
     fn replace_snapshot_falls_back_from_deleted_selection_to_open_session() {
         let deleted = SessionId::new();
@@ -861,14 +984,8 @@ mod tests {
         let mut state = DesktopState::new(
             snapshot(
                 vec![
-                    DesktopSessionRow {
-                        session_id: deleted,
-                        label: "deleted".to_string(),
-                    },
-                    DesktopSessionRow {
-                        session_id: open,
-                        label: "open".to_string(),
-                    },
+                    session_row(deleted, "deleted", SessionStatus::Running),
+                    session_row(open, "open", SessionStatus::Running),
                 ],
                 0,
             ),
@@ -877,10 +994,7 @@ mod tests {
         state.app_state.current_session_id = Some(open);
 
         state.replace_snapshot(snapshot(
-            vec![DesktopSessionRow {
-                session_id: open,
-                label: "open".to_string(),
-            }],
+            vec![session_row(open, "open", SessionStatus::Running)],
             0,
         ));
 
@@ -892,10 +1006,7 @@ mod tests {
         let existing = SessionId::new();
         let mut state = DesktopState::new(
             snapshot(
-                vec![DesktopSessionRow {
-                    session_id: existing,
-                    label: "existing".to_string(),
-                }],
+                vec![session_row(existing, "existing", SessionStatus::Running)],
                 0,
             ),
             ResolvedConfig::default(),
@@ -907,5 +1018,220 @@ mod tests {
         assert_eq!(state.selected_session_id(), None);
         assert_eq!(state.snapshot.selected_session_index, 1);
         assert_eq!(state.current_session_label(), "新規チャット");
+    }
+
+    #[test]
+    fn selecting_different_project_clears_stale_session_projection() {
+        let existing = SessionId::new();
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    existing,
+                    "old project session",
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.snapshot.project_rows.push(DesktopProjectRow {
+            project_id: ProjectId::new(),
+            label: "other workspace".to_string(),
+            path: "C:/other-workspace".to_string(),
+        });
+        state.app_state.current_session_id = Some(existing);
+        state.app_state.current_session_title = "old project session".to_string();
+
+        state.select_project(1);
+
+        assert_eq!(state.selected_project_index(), 1);
+        assert!(state.snapshot.session_rows.is_empty());
+        assert!(state.snapshot.session_details.is_empty());
+        assert_eq!(state.selected_session_id(), None);
+        assert_eq!(state.current_session_label(), "新規チャット");
+        assert_eq!(state.selected_session_title(), "セッション未選択");
+    }
+
+    #[test]
+    fn navigation_loading_tracks_workspace_and_session_loads() {
+        let session_id = SessionId::new();
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+
+        assert!(!state.navigation_loading());
+
+        let workspace_request =
+            state.begin_workspace_load(camino::Utf8PathBuf::from("C:/workspace"), None);
+        assert!(state.navigation_loading());
+        assert!(state.is_current_navigation(workspace_request));
+        state.finish_navigation(workspace_request);
+        assert!(!state.navigation_loading());
+
+        let session_request = state.begin_session_load(session_id);
+        assert!(state.navigation_loading());
+        assert!(state.is_current_session_navigation(session_request, session_id));
+        let newer_request =
+            state.begin_workspace_load(camino::Utf8PathBuf::from("C:/other-workspace"), None);
+        assert!(state.navigation_loading());
+        assert!(!state.finish_navigation(session_request));
+        assert!(state.navigation_loading());
+        assert!(state.finish_navigation(newer_request));
+        assert!(!state.navigation_loading());
+    }
+
+    #[test]
+    fn loaded_open_session_detail_keeps_elapsed_work_summary_title() {
+        let project_id = ProjectId::new();
+        let session_id = SessionId::new();
+        let mut session = SessionRecord {
+            id: session_id,
+            project_id,
+            title: "elapsed session".to_string(),
+            status: crate::session::SessionStatus::Completed,
+            cwd: camino::Utf8PathBuf::from("C:/workspace"),
+            model: "model".to_string(),
+            base_url: "http://localhost:1234".to_string(),
+            created_at_ms: 1_000,
+            updated_at_ms: 34_000,
+            completed_at_ms: Some(34_000),
+        };
+        let turn_id = crate::protocol::TurnId::new();
+        let turn_items = vec![
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: crate::protocol::TurnItemPayload::UserMessage {
+                    text: "このworkspace内にある資料ってどんなものがありますか？".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 2,
+                payload: crate::protocol::TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "workspace scan".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 3,
+                payload: crate::protocol::TurnItemPayload::AgentMessage {
+                    text: "このワークスペースには資料があります。".to_string(),
+                },
+            },
+        ];
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &session.title,
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        session.project_id = state.snapshot.project_rows[0].project_id;
+
+        state.load_open_session(
+            &session,
+            &Transcript {
+                session: session.clone(),
+                messages: Vec::new(),
+            },
+            &turn_items,
+            SessionStateSnapshot::default(),
+            Vec::new(),
+        );
+
+        assert!(state.selected_detail().transcript_rows.iter().any(|row| {
+            row.kind == "work_summary_completed" && row.title == "33s作業しました"
+        }));
+    }
+
+    #[test]
+    fn cancel_request_terminalizes_busy_projection_and_row_label() {
+        let session_id = SessionId::new();
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(session_id, "Long task", SessionStatus::Running)],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.app_state.current_session_id = Some(session_id);
+        state.app_state.run_status = RunStatus::Running;
+
+        state.mark_run_cancellation_requested("run cancelled by user", "停止しました。");
+
+        assert!(!state.is_busy());
+        assert_eq!(state.app_state.run_status, RunStatus::Cancelled);
+        let short_id = session_id.to_string().chars().take(8).collect::<String>();
+        assert_eq!(
+            state.snapshot.session_rows[0].label,
+            format!("Long task [停止済み] {short_id}")
+        );
+    }
+
+    #[test]
+    fn terminal_run_event_updates_session_row_status_without_snapshot_refresh() {
+        let session_id = SessionId::new();
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    "docx/xlsx要約",
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.app_state.current_session_id = Some(session_id);
+        state.app_state.current_session_title = "docx/xlsx要約".to_string();
+        state.app_state.run_status = RunStatus::Running;
+
+        state.apply_run_event(&crate::session::RunEvent::SessionCompleted {
+            session_id,
+            finish_reason: None,
+        });
+
+        assert_eq!(state.app_state.run_status, RunStatus::Completed);
+        let short_id = session_id.to_string().chars().take(8).collect::<String>();
+        assert_eq!(
+            state.snapshot.session_rows[0].label,
+            format!("docx/xlsx要約 [完了] {short_id}")
+        );
+        assert!(!state.selected_session_title().contains("[実行中]"));
+    }
+
+    #[test]
+    fn window_opacity_is_clamped_to_safe_visibility_range() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+
+        state.set_window_opacity_percent(0);
+        assert_eq!(
+            state.view.window_opacity_percent,
+            MIN_WINDOW_OPACITY_PERCENT
+        );
+
+        state.set_window_opacity_percent(150);
+        assert_eq!(
+            state.view.window_opacity_percent,
+            MAX_WINDOW_OPACITY_PERCENT
+        );
+
+        state.set_window_opacity_percent(75);
+        assert_eq!(state.view.window_opacity_percent, 75);
     }
 }

@@ -1,19 +1,23 @@
 use crate::app::App;
 use crate::desktop::args::{DesktopArgs, quick_chat_workspace_directory};
 use crate::desktop::models::{
-    DesktopArtifactRow, DesktopCommandRow, DesktopFileChangeRow, DesktopProjectRow,
-    DesktopSessionDetail, DesktopSessionRow, DesktopSnapshot, DesktopTranscriptRow,
+    DesktopCommandRow, DesktopFileChangeRow, DesktopProjectRow, DesktopSessionDetail,
+    DesktopSessionRow, DesktopSnapshot, DesktopTranscriptRow, format_session_status,
 };
 use crate::error::AppRunError;
-use crate::harness::{ReplayReport, ReplayReportStore};
-use crate::protocol::{FileChangeEvidence, TurnItem, TurnItemPayload};
+use crate::harness::ReplayReport;
 use crate::session::{
-    ChangeKind, MessagePart, ProjectId, ProjectRecord, SessionId, SessionRecord,
-    SessionStateSnapshot, SessionStatus, TodoItem, ToolCallStatus, Transcript,
+    ProjectId, ProjectRecord, SessionId, SessionRecord, SessionStateSnapshot, TodoItem,
+    ToolCallStatus, Transcript,
 };
 use crate::tui::query::{recent_sessions, session_view};
 use crate::tui::state::{AppState, RunStatus, TranscriptKind};
-use camino::Utf8Path;
+
+use super::artifact_projection::{
+    artifact_rows_from_file_changes, file_change_rows_from_transcript,
+    file_change_rows_from_turn_items_with_root, format_file_change_summary,
+};
+pub use super::artifact_projection::{file_change_rows_from_turn_items, format_artifact_preview};
 
 pub async fn load_snapshot(app: &App, args: &DesktopArgs) -> Result<DesktopSnapshot, AppRunError> {
     load_snapshot_for_selection(app, args.session_id).await
@@ -69,7 +73,6 @@ async fn build_snapshot(
     selected_session_index: usize,
 ) -> Result<DesktopSnapshot, AppRunError> {
     let mut session_rows = Vec::with_capacity(sessions.len());
-    let mut session_details = Vec::with_capacity(sessions.len());
     let projects = app.session_service.list_projects(30).await?;
     let hidden_roots =
         internal_desktop_project_roots(app.session_service.store.paths().data_dir.as_path());
@@ -81,20 +84,7 @@ async fn build_snapshot(
     );
     let chat_session_rows = build_quick_chat_session_rows(app, &projects).await?;
     for session in &sessions {
-        let view = session_view(&app.session_service, session.id).await?;
         session_rows.push(build_session_row(session));
-        let replay_report = app
-            .store
-            .harness_replay_report_store()
-            .latest_report_for_session(session.id)?;
-        session_details.push(build_session_detail(
-            session,
-            view.state,
-            view.todos,
-            view.transcript,
-            view.turn_items,
-            replay_report,
-        ));
     }
     Ok(DesktopSnapshot {
         workspace_path: app.workspace.root.to_string(),
@@ -105,7 +95,7 @@ async fn build_snapshot(
         selected_project_index,
         session_rows,
         chat_session_rows,
-        session_details,
+        session_details: Vec::new(),
         selected_session_index,
     })
 }
@@ -142,10 +132,7 @@ async fn build_quick_chat_session_rows(
 }
 
 fn build_session_row(session: &SessionRecord) -> DesktopSessionRow {
-    DesktopSessionRow {
-        session_id: session.id,
-        label: format_session_row(session),
-    }
+    DesktopSessionRow::from_session(session)
 }
 
 fn build_project_rows(
@@ -288,11 +275,18 @@ pub fn build_session_detail(
 }
 
 pub fn build_session_detail_from_app_state(state: &AppState) -> DesktopSessionDetail {
+    build_session_detail_from_app_state_with_session(state, None)
+}
+
+pub fn build_session_detail_from_app_state_with_session(
+    state: &AppState,
+    session: Option<&SessionRecord>,
+) -> DesktopSessionDetail {
     let session_state = state.session_state.clone().unwrap_or_default();
     DesktopSessionDetail {
         session_id: state.current_session_id.unwrap_or_else(SessionId::new),
         transcript_text: format_transcript_text(state),
-        transcript_rows: transcript_rows(state),
+        transcript_rows: transcript_rows_with_context(state, session, &[]),
         tool_status_text: format_tool_status_text(state, &session_state, &state.sidebar_todos),
         progress_text: format_progress_text(state),
         run_status_text: format_run_status_text(state, &session_state),
@@ -302,248 +296,6 @@ pub fn build_session_detail_from_app_state(state: &AppState) -> DesktopSessionDe
         file_changes: Vec::new(),
         file_change_summary_text: "ファイル変更はまだありません。".to_string(),
         artifact_preview_text: "アーティファクトは選択されていません。".to_string(),
-    }
-}
-
-pub fn file_change_rows_from_turn_items(turn_items: &[TurnItem]) -> Vec<DesktopFileChangeRow> {
-    file_change_rows_from_turn_items_with_root(turn_items, None)
-}
-
-fn file_change_rows_from_turn_items_with_root(
-    turn_items: &[TurnItem],
-    workspace_root: Option<&Utf8Path>,
-) -> Vec<DesktopFileChangeRow> {
-    let mut rows = Vec::new();
-    for item in turn_items {
-        if let TurnItemPayload::FileChange {
-            changes, summary, ..
-        } = &item.payload
-        {
-            rows.extend(
-                changes
-                    .iter()
-                    .filter(|change| file_change_is_user_visible(change))
-                    .map(|change| file_change_row(change, summary.as_str(), workspace_root)),
-            );
-        }
-    }
-    dedupe_file_change_rows(rows)
-}
-
-fn file_change_rows_from_transcript(transcript: &Transcript) -> Vec<DesktopFileChangeRow> {
-    let mut rows = Vec::new();
-    for message in &transcript.messages {
-        for part in &message.parts {
-            if let MessagePart::DiffSummary(summary) = &part.payload {
-                rows.extend(
-                    summary
-                        .changes
-                        .iter()
-                        .filter(|change| file_change_is_user_visible(change))
-                        .map(|change| {
-                            file_change_row(
-                                change,
-                                summary.summary.as_str(),
-                                Some(transcript.session.cwd.as_path()),
-                            )
-                        }),
-                );
-            }
-        }
-    }
-    dedupe_file_change_rows(rows)
-}
-
-fn file_change_row(
-    change: &FileChangeEvidence,
-    fallback_summary: &str,
-    workspace_root: Option<&Utf8Path>,
-) -> DesktopFileChangeRow {
-    let raw_path = change
-        .path_after
-        .as_ref()
-        .or(change.path_before.as_ref())
-        .map(|value| value.to_string());
-    let path = raw_path
-        .as_deref()
-        .map(|value| display_file_change_path(Utf8Path::new(value), workspace_root))
-        .unwrap_or_else(|| "(不明なパス)".to_string());
-    let label = path
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(path.as_str())
-        .to_string();
-    let raw_summary = if change.summary.trim().is_empty() {
-        fallback_summary.trim().to_string()
-    } else {
-        change.summary.trim().to_string()
-    };
-    let summary = normalize_file_change_summary(&raw_summary, raw_path.as_deref(), &path);
-    DesktopFileChangeRow {
-        label,
-        path,
-        action: change_kind_label(change.kind).to_string(),
-        summary,
-    }
-}
-
-fn display_file_change_path(path: &Utf8Path, workspace_root: Option<&Utf8Path>) -> String {
-    let display_path = workspace_root
-        .and_then(|root| path.strip_prefix(root).ok())
-        .filter(|relative| !relative.as_str().trim().is_empty())
-        .unwrap_or(path);
-    display_path.as_str().replace('\\', "/")
-}
-
-fn normalize_file_change_summary(
-    summary: &str,
-    raw_path: Option<&str>,
-    display_path: &str,
-) -> String {
-    let mut normalized = summary.to_string();
-    if let Some(raw_path) = raw_path {
-        for candidate in file_path_summary_variants(raw_path) {
-            normalized = normalized.replace(&candidate, display_path);
-        }
-    }
-    normalized
-}
-
-fn file_path_summary_variants(path: &str) -> Vec<String> {
-    let mut variants = Vec::new();
-    for candidate in [
-        path.to_string(),
-        path.replace('\\', "/"),
-        path.replace('/', "\\"),
-    ] {
-        if !candidate.is_empty() && !variants.contains(&candidate) {
-            variants.push(candidate);
-        }
-    }
-    variants
-}
-
-fn file_change_is_user_visible(change: &FileChangeEvidence) -> bool {
-    change
-        .path_after
-        .as_ref()
-        .or(change.path_before.as_ref())
-        .is_some_and(|path| is_user_visible_artifact_path(path.as_str()))
-}
-
-fn artifact_rows_from_file_changes(rows: &[DesktopFileChangeRow]) -> Vec<DesktopArtifactRow> {
-    let mut artifacts = rows
-        .iter()
-        .filter(|row| is_user_visible_artifact_path(&row.path))
-        .map(|row| DesktopArtifactRow {
-            label: row.label.clone(),
-            path: row.path.clone(),
-            kind: "ファイル".to_string(),
-            action: row.action.clone(),
-        })
-        .collect::<Vec<_>>();
-    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
-    artifacts.dedup_by(|left, right| left.path == right.path);
-    artifacts
-}
-
-fn is_user_visible_artifact_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
-    !normalized.contains("/__pycache__/")
-        && !normalized.starts_with("__pycache__/")
-        && !normalized.ends_with(".pyc")
-}
-
-fn dedupe_file_change_rows(rows: Vec<DesktopFileChangeRow>) -> Vec<DesktopFileChangeRow> {
-    let mut deduped: Vec<DesktopFileChangeRow> = Vec::new();
-    for row in rows {
-        if let Some(existing) = deduped
-            .iter_mut()
-            .find(|existing| existing.path == row.path)
-        {
-            existing.action = merged_file_change_action(&existing.action, &row.action).to_string();
-            if !row.summary.trim().is_empty() {
-                existing.summary = row.summary;
-            }
-        } else {
-            deduped.push(row);
-        }
-    }
-    deduped
-}
-
-fn merged_file_change_action(existing: &str, incoming: &str) -> &'static str {
-    if existing == "追加" || incoming == "追加" {
-        "追加"
-    } else if incoming == "削除" {
-        "削除"
-    } else if incoming == "移動" {
-        "移動"
-    } else {
-        "更新"
-    }
-}
-
-fn format_file_change_summary(rows: &[DesktopFileChangeRow]) -> String {
-    if rows.is_empty() {
-        return "ファイル変更はまだありません。".to_string();
-    }
-    let added = rows.iter().filter(|row| row.action == "追加").count();
-    let updated = rows.iter().filter(|row| row.action == "更新").count();
-    let deleted = rows.iter().filter(|row| row.action == "削除").count();
-    let moved = rows.iter().filter(|row| row.action == "移動").count();
-    let mut lines = vec![format!(
-        "{}件のファイル変更（追加{} / 更新{} / 削除{} / 移動{}）",
-        rows.len(),
-        added,
-        updated,
-        deleted,
-        moved
-    )];
-    lines.extend(rows.iter().take(8).map(|row| {
-        if row.summary.trim().is_empty() {
-            format!("- [{}] {}", row.action, row.path)
-        } else {
-            format!("- [{}] {} - {}", row.action, row.path, row.summary)
-        }
-    }));
-    lines.join("\n")
-}
-
-pub fn format_artifact_preview(
-    artifact: Option<&DesktopArtifactRow>,
-    changes: &[DesktopFileChangeRow],
-) -> String {
-    let Some(artifact) = artifact else {
-        return "アーティファクトは選択されていません。".to_string();
-    };
-    let mut lines = vec![
-        format!("アーティファクト: {}", artifact.label),
-        format!("パス: {}", artifact.path),
-        format!("種別: {}", artifact.kind),
-        format!("操作: {}", artifact.action),
-    ];
-    if let Some(change) = changes.iter().find(|change| change.path == artifact.path) {
-        if !change.summary.trim().is_empty() {
-            lines.push(String::new());
-            lines.push(change.summary.clone());
-        }
-    }
-    lines.push(String::new());
-    lines.push(
-        "差分はセッション履歴のファイル変更から確認できます。Undo は安全契約を増やすため、この画面には露出していません。"
-            .to_string(),
-    );
-    lines.join("\n")
-}
-
-fn change_kind_label(kind: ChangeKind) -> &'static str {
-    match kind {
-        ChangeKind::Add => "追加",
-        ChangeKind::Update => "更新",
-        ChangeKind::Delete => "削除",
-        ChangeKind::Move => "移動",
     }
 }
 
@@ -571,26 +323,6 @@ fn load_command_rows(workspace_root: &camino::Utf8Path) -> Vec<DesktopCommandRow
     rows
 }
 
-fn format_session_row(session: &SessionRecord) -> String {
-    format!(
-        "{} [{}] {}",
-        truncate_text(&session.title, 24),
-        format_session_status(session.status),
-        short_session_id(session.id)
-    )
-}
-
-fn format_session_status(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Idle => "待機中",
-        SessionStatus::Running => "実行中",
-        SessionStatus::Completed => "完了",
-        SessionStatus::AwaitingUser => "確認待ち",
-        SessionStatus::Cancelled => "停止済み",
-        SessionStatus::Failed => "失敗",
-    }
-}
-
 fn format_transcript_text(state: &AppState) -> String {
     if state.transcript_entries.is_empty() {
         return "履歴はまだありません。".to_string();
@@ -613,6 +345,7 @@ fn format_transcript_text(state: &AppState) -> String {
         .join("\n\n")
 }
 
+#[cfg(test)]
 fn transcript_rows(state: &AppState) -> Vec<DesktopTranscriptRow> {
     transcript_rows_with_context(state, None, &[])
 }
@@ -698,7 +431,9 @@ fn fold_intermediate_assistant_rows(
 
 fn is_internal_transcript_projection(kind: &str, title: &str) -> bool {
     matches!(kind, "tool" | "summary" | "diff" | "reasoning" | "editing")
-        || matches!(kind, "system") && !title.eq_ignore_ascii_case("User")
+        || matches!(kind, "system")
+            && !title.eq_ignore_ascii_case("User")
+            && !title.eq_ignore_ascii_case("Context Compaction")
 }
 
 fn work_summary_row(
@@ -1101,10 +836,6 @@ fn tool_call_status_label(status: ToolCallStatus) -> &'static str {
     }
 }
 
-fn short_session_id(session_id: SessionId) -> String {
-    session_id.to_string().chars().take(8).collect()
-}
-
 fn truncate_text(value: &str, max_chars: usize) -> String {
     let count = value.chars().count();
     if count <= max_chars {
@@ -1118,6 +849,8 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{FileChangeEvidence, TurnItem, TurnItemPayload};
+    use crate::session::{ChangeKind, SessionStatus};
     use camino::Utf8PathBuf;
 
     fn session_record(project_id: ProjectId, title: &str) -> SessionRecord {
@@ -1427,6 +1160,13 @@ mod tests {
                 message_id: None,
                 tool_call_id: None,
             },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::System,
+                title: "Context Compaction".to_string(),
+                body: "圧縮しました\n\nCompactionContinuity".to_string(),
+                message_id: None,
+                tool_call_id: None,
+            },
         ];
 
         let text = format_transcript_text(&state);
@@ -1435,6 +1175,13 @@ mod tests {
         assert!(text.contains("[02] コマンド / ツール - write"));
         assert!(text.contains("[03] ファイル変更 - File changes"));
         assert!(!text.contains("===="));
+        let rows = transcript_rows(&state);
+        let compaction = rows
+            .iter()
+            .find(|row| row.title == "システム - Context Compaction")
+            .expect("context compaction should remain visible in Desktop transcript");
+        assert!(compaction.body.contains("圧縮しました"));
+        assert!(compaction.body.contains("CompactionContinuity"));
 
         state.tool_statuses = vec![crate::tui::state::ToolStatusView {
             tool_call_id: crate::session::ToolCallId::new(),

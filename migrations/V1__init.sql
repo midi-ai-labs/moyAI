@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
     title TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('idle', 'running', 'completed', 'awaiting_user', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('idle', 'running', 'completed', 'awaiting_user', 'cancelled', 'failed')),
     cwd_path TEXT NOT NULL,
     model_name TEXT NOT NULL,
     base_url TEXT NOT NULL,

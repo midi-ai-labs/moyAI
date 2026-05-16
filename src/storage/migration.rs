@@ -26,6 +26,8 @@ const V16_PROTOCOL_EVENT_STORE: &str =
     include_str!("../../migrations/V16__protocol_event_store.sql");
 const V17_SESSION_STATE_TYPED_VERIFICATION_EVIDENCE: &str =
     include_str!("../../migrations/V17__session_state_typed_verification_evidence.sql");
+const V18_SESSIONS_CANCELLED_STATUS: &str =
+    include_str!("../../migrations/V18__sessions_cancelled_status.sql");
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
     connection.execute_batch(V1_INIT)?;
@@ -64,6 +66,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     connection.execute_batch(V16_PROTOCOL_EVENT_STORE)?;
     if needs_session_state_typed_verification_evidence_migration(connection)? {
         connection.execute_batch(V17_SESSION_STATE_TYPED_VERIFICATION_EVIDENCE)?;
+    }
+    if needs_sessions_cancelled_status_migration(connection)? {
+        connection.execute_batch(V18_SESSIONS_CANCELLED_STATUS)?;
     }
     Ok(())
 }
@@ -189,4 +194,20 @@ fn needs_session_state_typed_verification_evidence_migration(
         || !columns
             .iter()
             .any(|column| column == "verification_requirement_refs_json"))
+}
+
+fn needs_sessions_cancelled_status_migration(
+    connection: &Connection,
+) -> Result<bool, StorageError> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(sql
+        .as_deref()
+        .map(|value| !value.contains("'cancelled'"))
+        .unwrap_or(false))
 }

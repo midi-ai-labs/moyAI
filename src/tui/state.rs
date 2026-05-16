@@ -197,9 +197,6 @@ impl AppState {
         self.current_session_title = transcript.session.title.clone();
         self.transcript_entries = transcript_entries_from_transcript(transcript);
         self.tool_statuses = tool_statuses_from_transcript(transcript);
-        self.progress = progress_from_loaded_state(self.run_status, &self.tool_statuses, &todos);
-        self.sidebar_todos = todos;
-        self.session_state = Some(state);
         self.run_status = match transcript.session.status {
             SessionStatus::Idle => RunStatus::Idle,
             SessionStatus::Running => RunStatus::Running,
@@ -208,6 +205,9 @@ impl AppState {
             SessionStatus::Cancelled => RunStatus::Cancelled,
             SessionStatus::Failed => RunStatus::Failed,
         };
+        self.progress = progress_from_loaded_state(self.run_status, &self.tool_statuses, &todos);
+        self.sidebar_todos = todos;
+        self.session_state = Some(state);
         self.status_message = self.run_status.default_status_message();
         self.permission = None;
         self.prompt_review = None;
@@ -235,9 +235,6 @@ impl AppState {
         self.current_session_title = session.title.clone();
         self.transcript_entries = transcript_entries_from_turn_items(turn_items);
         self.tool_statuses = tool_statuses_from_turn_items(turn_items);
-        self.progress = progress_from_loaded_state(self.run_status, &self.tool_statuses, &todos);
-        self.sidebar_todos = todos;
-        self.session_state = Some(state);
         self.run_status = match session.status {
             SessionStatus::Idle => RunStatus::Idle,
             SessionStatus::Running => RunStatus::Running,
@@ -246,6 +243,9 @@ impl AppState {
             SessionStatus::Cancelled => RunStatus::Cancelled,
             SessionStatus::Failed => RunStatus::Failed,
         };
+        self.progress = progress_from_loaded_state(self.run_status, &self.tool_statuses, &todos);
+        self.sidebar_todos = todos;
+        self.session_state = Some(state);
         self.status_message = self.run_status.default_status_message();
         self.permission = None;
         self.prompt_review = None;
@@ -974,11 +974,17 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
             }),
             TurnItemPayload::Plan { summary }
             | TurnItemPayload::PromptDispatch { summary }
-            | TurnItemPayload::State { summary }
-            | TurnItemPayload::ContextCompaction { summary } => Some(TranscriptEntry {
+            | TurnItemPayload::State { summary } => Some(TranscriptEntry {
                 kind: TranscriptKind::System,
                 title: "Context".to_string(),
                 body: summary.clone(),
+                message_id: None,
+                tool_call_id: None,
+            }),
+            TurnItemPayload::ContextCompaction { summary } => Some(TranscriptEntry {
+                kind: TranscriptKind::System,
+                title: "Context Compaction".to_string(),
+                body: format!("圧縮しました\n\n{}", summary.trim()),
                 message_id: None,
                 tool_call_id: None,
             }),

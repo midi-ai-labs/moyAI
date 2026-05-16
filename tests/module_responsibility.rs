@@ -58,6 +58,7 @@ fn harness_preflight_module_runs_codex_style_active_gates() {
     assert!(gate_ids.contains("preflight.prompt_replay.stale_write_arguments_summary_projection"));
     assert!(gate_ids.contains("preflight.prompt_replay.active_user_hook_non_droppable"));
     assert!(gate_ids.contains("preflight.prompt_replay.tool_pair_symmetry"));
+    assert!(gate_ids.contains("preflight.prompt_replay.compaction_orphan_assistant_repaired"));
     assert!(gate_ids.contains("preflight.prompt_replay.stale_inactive_authoring_pair_omitted"));
     assert!(gate_ids.contains("preflight.prompt_replay.progress_projection_pair_omitted"));
     assert!(gate_ids.contains("preflight.tool_lifecycle.typed_route_metadata_authority"));
@@ -113,6 +114,14 @@ fn vision_input_projection_uses_codex_labeled_image_item() {
 fn provider_replay_keeps_latest_user_hook_after_trailing_compaction() {
     assert!(
         moyai::agent::prompt::provider_replay_preserves_latest_user_across_trailing_compaction()
+    );
+}
+
+#[test]
+fn provider_replay_drops_orphan_assistant_after_compaction() {
+    assert!(
+        moyai::agent::prompt::provider_replay_after_compaction_repairs_orphan_assistant_before_user(
+        )
     );
 }
 

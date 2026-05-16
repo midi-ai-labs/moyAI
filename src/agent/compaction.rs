@@ -2,7 +2,7 @@ use crate::agent::event::StreamAccumulator;
 use crate::agent::prompt::{AgentRunRequest, build_provider_replay_messages_from_history_items};
 use crate::agent::prompt_assets::render_compaction_prompt;
 use crate::error::AgentError;
-use crate::llm::{ChatRequest, LlmClient, ModelMessage};
+use crate::llm::{ChatRequest, LlmClient, ModelContentPart, ModelMessage};
 use crate::protocol::{HistoryItem, HistoryItemPayload};
 use crate::runtime::RunEventSink;
 use crate::session::{
@@ -73,7 +73,7 @@ pub async fn maybe_compact(
                     &todo_block,
                     &continuation_block,
                 ),
-                messages: summary_messages,
+                messages: summary_messages.clone(),
                 tools: Vec::new(),
                 timeout_ms: request.config.model.request_timeout_ms,
                 stream_idle_timeout_ms: request.config.model.stream_idle_timeout_ms,
@@ -92,10 +92,16 @@ pub async fn maybe_compact(
         )
         .await?;
 
-    let summary_text = accumulator.text.trim().to_string();
-    if summary_text.is_empty() {
-        return Ok(false);
-    }
+    let summary_text = match accumulator.text.trim() {
+        "" => deterministic_compaction_summary(
+            &request.session.session,
+            split_index,
+            &summary_messages,
+            &todo_block,
+            &continuation_block,
+        ),
+        text => text.to_string(),
+    };
 
     let message = session_repo
         .append_message(
@@ -345,6 +351,69 @@ fn continuation_focus_block(request: &AgentRunRequest, todos: &[TodoItem]) -> St
     lines.join("\n")
 }
 
+fn deterministic_compaction_summary(
+    session: &SessionRecord,
+    summarized_messages: usize,
+    summary_messages: &[ModelMessage],
+    todo_block: &str,
+    continuation_block: &str,
+) -> String {
+    let transcript_excerpt = summary_messages
+        .iter()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(compaction_message_excerpt)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Compaction summary for session `{}`.\nSummarized history items: {}.\nContinuation invariant: CompactionContinuity.\nRecent compacted transcript excerpt:\n{}\nCurrent todo state:\n{}\nContinuation focus:\n{}",
+        session.title, summarized_messages, transcript_excerpt, todo_block, continuation_block
+    )
+}
+
+fn compaction_message_excerpt(message: &ModelMessage) -> String {
+    match message {
+        ModelMessage::System { content } => {
+            format!("system: {}", clip_compaction_text(content, 240))
+        }
+        ModelMessage::User { content } => format!("user: {}", clip_compaction_text(content, 240)),
+        ModelMessage::UserParts { parts } => format!(
+            "user: {}",
+            clip_compaction_text(&model_content_parts_excerpt(parts), 240)
+        ),
+        ModelMessage::Assistant { content } => {
+            format!("assistant: {}", clip_compaction_text(content, 240))
+        }
+        ModelMessage::AssistantToolCalls {
+            content,
+            tool_calls,
+        } => format!(
+            "assistant tool calls: {} [{} calls]",
+            clip_compaction_text(content.as_deref().unwrap_or(""), 180),
+            tool_calls.len()
+        ),
+        ModelMessage::Tool {
+            tool_name, result, ..
+        } => {
+            format!("tool {tool_name}: {}", clip_compaction_text(result, 240))
+        }
+    }
+}
+
+fn model_content_parts_excerpt(parts: &[ModelContentPart]) -> String {
+    parts
+        .iter()
+        .map(|part| match part {
+            ModelContentPart::Text { text } => text.clone(),
+            ModelContentPart::Image { mime_type, .. } => format!("[image:{mime_type}]"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn compaction_continuation_contract(
     request: &AgentRunRequest,
     todos: &[TodoItem],
@@ -437,5 +506,105 @@ fn todo_status_label(todo: &TodoItem) -> &'static str {
         crate::session::TodoStatus::Blocked => "blocked",
         crate::session::TodoStatus::Completed => "completed",
         crate::session::TodoStatus::Cancelled => "cancelled",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use camino::Utf8PathBuf;
+
+    use crate::protocol::{ContentPart, HistoryItemId, TurnId};
+    use crate::session::{ProjectId, SessionId, SessionStatus};
+
+    fn user_item(session_id: SessionId, turn_id: TurnId, sequence_no: i64) -> HistoryItem {
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no,
+            created_at_ms: sequence_no,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: format!("turn {sequence_no}"),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        }
+    }
+
+    fn assistant_item(session_id: SessionId, turn_id: TurnId, sequence_no: i64) -> HistoryItem {
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no,
+            created_at_ms: sequence_no,
+            payload: HistoryItemPayload::Message {
+                message_id: None,
+                role: MessageRole::Assistant,
+                content: vec![ContentPart::Text {
+                    text: format!("answer {sequence_no}"),
+                }],
+            },
+        }
+    }
+
+    fn session_record(session_id: SessionId) -> SessionRecord {
+        SessionRecord {
+            id: session_id,
+            project_id: ProjectId::new(),
+            title: "compaction test".to_string(),
+            status: SessionStatus::Running,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "test-model".to_string(),
+            base_url: "http://localhost:1234".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn user_turn_threshold_selects_older_history_for_compaction() {
+        let session_id = SessionId::new();
+        let mut items = Vec::new();
+        for turn in 0..4 {
+            let turn_id = TurnId::new();
+            items.push(user_item(session_id, turn_id, turn * 2 + 1));
+            items.push(assistant_item(session_id, turn_id, turn * 2 + 2));
+        }
+
+        assert_eq!(unsummarized_user_turns_from_history_items(&items), 4);
+        let session = session_record(session_id);
+        let summary_messages = build_compaction_messages_from_history_items(&session, &items[..6]);
+
+        assert!(!summary_messages.is_empty());
+    }
+
+    #[test]
+    fn deterministic_fallback_summary_keeps_continuity_marker() {
+        let summary = deterministic_compaction_summary(
+            &session_record(SessionId::new()),
+            6,
+            &[
+                ModelMessage::User {
+                    content: "1+1".to_string(),
+                },
+                ModelMessage::Assistant {
+                    content: "2".to_string(),
+                },
+            ],
+            "No active todo list was recorded.",
+            "No active work state requires special continuation.",
+        );
+
+        assert!(summary.contains("Summarized history items: 6"));
+        assert!(summary.contains("CompactionContinuity"));
+        assert!(summary.contains("user: 1+1"));
+        assert!(summary.contains("assistant: 2"));
     }
 }

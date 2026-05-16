@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::args::{DesktopArgs, quick_chat_workspace_directory};
 use super::models::DesktopTranscriptRow;
+use super::navigation::NavigationRequestId;
 use super::preferences::DesktopPreferences;
 use super::query::{
     load_session_detail, load_snapshot, load_snapshot_continue_last, load_snapshot_for_selection,
@@ -42,6 +43,7 @@ enum RuntimeMessage {
     },
     SnapshotLoaded(Result<super::models::DesktopSnapshot, String>),
     SessionLoaded {
+        request_id: Option<NavigationRequestId>,
         session_id: SessionId,
         reason: SessionLoadReason,
         result: Result<LoadedSession, String>,
@@ -64,8 +66,14 @@ enum RuntimeMessage {
         result: Result<Vec<ProviderModelInfo>, String>,
     },
     HistoryExported(Result<Utf8PathBuf, String>),
-    WorkspaceSwitched(Result<WorkspaceLoadResult, String>),
-    WorkspaceSwitchedForNewProjectSession(Result<WorkspaceLoadResult, String>),
+    WorkspaceSwitched {
+        request_id: NavigationRequestId,
+        result: Result<WorkspaceLoadResult, String>,
+    },
+    WorkspaceSwitchedForNewProjectSession {
+        request_id: NavigationRequestId,
+        result: Result<WorkspaceLoadResult, String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +185,11 @@ impl DesktopController {
                     })?;
             }
         }
+        app.session_service
+            .mark_stale_running_sessions(
+                "Desktop started without an active worker for this run; marking the prior run interrupted.",
+            )
+            .await?;
 
         let snapshot = if args.continue_last {
             load_snapshot_continue_last(&app).await?
@@ -207,7 +220,13 @@ impl DesktopController {
             next_enhance_request_id: 1,
         };
         controller.persist_preferences();
-        if !controller.state.provider_base_url_input.trim().is_empty() {
+        if !controller
+            .state
+            .provider_config
+            .provider_base_url_input
+            .trim()
+            .is_empty()
+        {
             controller.load_provider_models();
         }
         Ok(controller)
@@ -252,7 +271,12 @@ impl DesktopController {
         if let Some(session_id) = self.state.selected_session_id() {
             self.state
                 .set_status_message(format!("opening session {session_id}..."));
-            self.spawn_session_load(session_id, SessionLoadReason::UserSelection);
+            let request_id = self.state.begin_session_load(session_id);
+            self.spawn_session_load(
+                session_id,
+                SessionLoadReason::UserSelection,
+                Some(request_id),
+            );
         }
     }
 
@@ -271,7 +295,8 @@ impl DesktopController {
         }
         self.state
             .set_status_message(format!("opening project {}...", path));
-        self.spawn_workspace_load(path);
+        let request_id = self.state.begin_workspace_load(path.clone(), None);
+        self.spawn_workspace_load(path, request_id);
     }
 
     pub(crate) fn delete_selected_session(&mut self) {
@@ -361,8 +386,8 @@ impl DesktopController {
             &self.state.selected_session_title(),
             &self.app.workspace.root,
             session_id,
-            &self.state.effective_config.model.base_url,
-            &self.state.effective_config.model.model,
+            &self.state.provider_config.effective_config.model.base_url,
+            &self.state.provider_config.effective_config.model.model,
             &detail.transcript_rows,
             &detail.file_changes,
         );
@@ -428,7 +453,12 @@ impl DesktopController {
         });
     }
 
-    fn spawn_session_load(&self, session_id: SessionId, reason: SessionLoadReason) {
+    fn spawn_session_load(
+        &self,
+        session_id: SessionId,
+        reason: SessionLoadReason,
+        request_id: Option<NavigationRequestId>,
+    ) {
         let app = self.app.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
@@ -451,8 +481,44 @@ impl DesktopController {
                     .map_err(|error| error.to_string())
             });
             let _ = runtime_tx.send(RuntimeMessage::SessionLoaded {
+                request_id,
                 session_id,
                 reason,
+                result,
+            });
+        });
+    }
+
+    fn spawn_session_cancel_persist(&self, session_id: SessionId) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop cancel-persist runtime");
+            let result = runtime.block_on(async move {
+                app.session_service
+                    .cancel_running_session(session_id, "run cancelled by user")
+                    .await
+                    .map_err(|error| error.to_string())?;
+                load_session_detail(&app, session_id)
+                    .await
+                    .map(
+                        |(session, transcript, turn_items, state, todos)| LoadedSession {
+                            session,
+                            transcript,
+                            turn_items,
+                            state,
+                            todos,
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionLoaded {
+                request_id: None,
+                session_id,
+                reason: SessionLoadReason::CurrentRefresh,
                 result,
             });
         });
@@ -564,7 +630,7 @@ impl DesktopController {
     }
 
     pub(crate) fn start_run(&mut self) {
-        let prompt = self.state.draft_prompt.trim().to_string();
+        let prompt = self.state.composer.draft_prompt.trim().to_string();
         if prompt.is_empty() {
             return;
         }
@@ -598,7 +664,8 @@ impl DesktopController {
         self.state.hide_overlay();
         self.state
             .set_status_message("opening workspace-free quick chat...");
-        self.spawn_workspace_load(root);
+        let request_id = self.state.begin_workspace_load(root.clone(), None);
+        self.spawn_workspace_load(root, request_id);
     }
 
     pub(crate) fn start_project_session(&mut self, index: usize) {
@@ -624,7 +691,10 @@ impl DesktopController {
             "opening project {} for a new development chat...",
             path
         ));
-        self.spawn_workspace_load_for_new_project_session(path);
+        let request_id = self
+            .state
+            .begin_new_project_session_workspace_load(path.clone());
+        self.spawn_workspace_load_for_new_project_session(path, request_id);
     }
 
     pub(crate) fn open_quick_chat_session(&mut self, index: usize) {
@@ -664,7 +734,10 @@ impl DesktopController {
         self.state.hide_overlay();
         self.state
             .set_status_message(format!("opening chat {session_id}..."));
-        self.spawn_workspace_load_for_selection(root, Some(session_id));
+        let request_id = self
+            .state
+            .begin_workspace_load(root.clone(), Some(session_id));
+        self.spawn_workspace_load_for_selection(root, Some(session_id), request_id);
     }
 
     pub(crate) fn delete_quick_chat_session(&mut self, index: usize) {
@@ -701,7 +774,8 @@ impl DesktopController {
                 self.state.hide_overlay();
                 self.state
                     .set_status_message(format!("opening project workspace {}...", path));
-                self.spawn_workspace_load(path);
+                let request_id = self.state.begin_workspace_load(path.clone(), None);
+                self.spawn_workspace_load(path, request_id);
             }
             Ok(None) => self.state.set_status_message("project creation cancelled"),
             Err(error) => self
@@ -711,13 +785,13 @@ impl DesktopController {
     }
 
     pub(crate) fn start_review_uncommitted(&mut self) {
-        let prompt = self.state.draft_prompt.trim().to_string();
+        let prompt = self.state.composer.draft_prompt.trim().to_string();
         let prompt_dispatch = crate::session::PromptDispatchPart::raw(&prompt);
         self.launch_run_with_options(prompt, prompt_dispatch, Some(ReviewRequest::Uncommitted));
     }
 
     pub(crate) fn start_prompt_enhance(&mut self) {
-        let raw_prompt = self.state.draft_prompt.trim().to_string();
+        let raw_prompt = self.state.composer.draft_prompt.trim().to_string();
         if raw_prompt.is_empty() || self.state.is_busy() {
             return;
         }
@@ -725,7 +799,7 @@ impl DesktopController {
         self.next_enhance_request_id += 1;
         self.state.begin_prompt_enhance(request_id, &raw_prompt);
         let runtime_tx = self.runtime_tx.clone();
-        let config = self.state.effective_config.clone();
+        let config = self.state.provider_config.effective_config.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -752,14 +826,15 @@ impl DesktopController {
     }
 
     pub(crate) fn load_provider_models(&mut self) {
-        let normalized = normalize_provider_base_url(&self.state.provider_base_url_input);
+        let normalized =
+            normalize_provider_base_url(&self.state.provider_config.provider_base_url_input);
         if normalized.is_empty() {
             self.state.fail_provider_model_load("provider URL is empty");
             return;
         }
         self.state.begin_provider_model_load(normalized.clone());
         let runtime_tx = self.runtime_tx.clone();
-        let config = self.state.effective_config.clone();
+        let config = self.state.provider_config.effective_config.clone();
         std::thread::spawn(move || {
             let request_base_url = normalized.clone();
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -785,7 +860,7 @@ impl DesktopController {
         self.state.reset_effective_config(config);
         self.preferences.set_workspace_override(
             &self.app.workspace.root,
-            full_effective_override(&self.state.effective_config),
+            full_effective_override(&self.state.provider_config.effective_config),
         );
         self.persist_preferences();
         self.state
@@ -798,7 +873,7 @@ impl DesktopController {
             return;
         };
         self.state.reset_effective_config(config);
-        match self.state.config_editor.save_scope(
+        match self.state.provider_config.config_editor.save_scope(
             &self.app.workspace.root,
             crate::tui::config_editor::ConfigSaveScope::Project,
         ) {
@@ -820,7 +895,7 @@ impl DesktopController {
             return;
         };
         self.state.reset_effective_config(config);
-        match self.state.config_editor.save_scope(
+        match self.state.provider_config.config_editor.save_scope(
             &self.app.workspace.root,
             crate::tui::config_editor::ConfigSaveScope::Global,
         ) {
@@ -838,7 +913,12 @@ impl DesktopController {
     }
 
     pub(crate) fn apply_session_config(&mut self) {
-        match self.state.config_editor.build_session_override() {
+        match self
+            .state
+            .provider_config
+            .config_editor
+            .build_session_override()
+        {
             Ok(patch) => {
                 let config = apply_config_patch(self.app.config.clone(), patch.clone());
                 self.state.reset_effective_config(config);
@@ -860,13 +940,13 @@ impl DesktopController {
             return;
         }
 
-        let mut config = self.state.effective_config.clone();
+        let mut config = self.state.provider_config.effective_config.clone();
         config.permissions.access_mode = config.permissions.access_mode.next();
         let access_mode = config.permissions.access_mode;
         self.state.reset_effective_config(config);
         self.preferences.set_workspace_override(
             &self.app.workspace.root,
-            full_effective_override(&self.state.effective_config),
+            full_effective_override(&self.state.provider_config.effective_config),
         );
         self.persist_preferences();
         self.state.set_status_message(format!(
@@ -876,7 +956,7 @@ impl DesktopController {
     }
 
     pub(crate) fn save_project_config(&mut self) {
-        match self.state.config_editor.save_scope(
+        match self.state.provider_config.config_editor.save_scope(
             &self.app.workspace.root,
             crate::tui::config_editor::ConfigSaveScope::Project,
         ) {
@@ -894,7 +974,7 @@ impl DesktopController {
     }
 
     pub(crate) fn save_global_config(&mut self) {
-        match self.state.config_editor.save_scope(
+        match self.state.provider_config.config_editor.save_scope(
             &self.app.workspace.root,
             crate::tui::config_editor::ConfigSaveScope::Global,
         ) {
@@ -918,7 +998,13 @@ impl DesktopController {
                 let effective =
                     apply_preferences_override(&self.preferences, &self.app.workspace.root, config);
                 self.state.reset_effective_config(effective);
-                if !self.state.provider_base_url_input.trim().is_empty() {
+                if !self
+                    .state
+                    .provider_config
+                    .provider_base_url_input
+                    .trim()
+                    .is_empty()
+                {
                     self.load_provider_models();
                 }
             }
@@ -937,14 +1023,19 @@ impl DesktopController {
         let Some(requested) = self.resolve_workspace_input() else {
             return;
         };
-        self.spawn_workspace_load(requested);
+        let request_id = self.state.begin_workspace_load(requested.clone(), None);
+        self.spawn_workspace_load(requested, request_id);
     }
 
-    fn spawn_workspace_load(&self, requested: Utf8PathBuf) {
-        self.spawn_workspace_load_for_selection(requested, None);
+    fn spawn_workspace_load(&self, requested: Utf8PathBuf, request_id: NavigationRequestId) {
+        self.spawn_workspace_load_for_selection(requested, None, request_id);
     }
 
-    fn spawn_workspace_load_for_new_project_session(&self, requested: Utf8PathBuf) {
+    fn spawn_workspace_load_for_new_project_session(
+        &self,
+        requested: Utf8PathBuf,
+        request_id: NavigationRequestId,
+    ) {
         let store = self.app.session_service.store.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
@@ -961,9 +1052,8 @@ impl DesktopController {
                     .map_err(|error| error.to_string())?;
                 Ok(WorkspaceLoadResult { app, snapshot })
             });
-            let _ = runtime_tx.send(RuntimeMessage::WorkspaceSwitchedForNewProjectSession(
-                result,
-            ));
+            let _ = runtime_tx
+                .send(RuntimeMessage::WorkspaceSwitchedForNewProjectSession { request_id, result });
         });
     }
 
@@ -971,6 +1061,7 @@ impl DesktopController {
         &self,
         requested: Utf8PathBuf,
         selected_session_id: Option<SessionId>,
+        request_id: NavigationRequestId,
     ) {
         let store = self.app.session_service.store.clone();
         let runtime_tx = self.runtime_tx.clone();
@@ -988,7 +1079,7 @@ impl DesktopController {
                     .map_err(|error| error.to_string())?;
                 Ok(WorkspaceLoadResult { app, snapshot })
             });
-            let _ = runtime_tx.send(RuntimeMessage::WorkspaceSwitched(result));
+            let _ = runtime_tx.send(RuntimeMessage::WorkspaceSwitched { request_id, result });
         });
     }
 
@@ -1147,7 +1238,8 @@ impl DesktopController {
     }
 
     fn provider_selection_patch(&mut self) -> Option<PartialResolvedConfig> {
-        let base_url = normalize_provider_base_url(&self.state.provider_base_url_input);
+        let base_url =
+            normalize_provider_base_url(&self.state.provider_config.provider_base_url_input);
         if base_url.is_empty() {
             self.state.set_status_message("provider URL is empty");
             return None;
@@ -1158,7 +1250,7 @@ impl DesktopController {
             return None;
         };
         let model = model.to_string();
-        let mut hydrated_model_config = self.state.effective_config.model.clone();
+        let mut hydrated_model_config = self.state.provider_config.effective_config.model.clone();
         hydrated_model_config.base_url = base_url.clone();
         hydrated_model_config.model = model.clone();
         if let Some(info) = self.state.selected_provider_model_info() {
@@ -1185,7 +1277,7 @@ impl DesktopController {
     fn apply_provider_selection_to_effective_config(&mut self) -> Option<ResolvedConfig> {
         let patch = self.provider_selection_patch()?;
         Some(apply_config_patch(
-            self.state.effective_config.clone(),
+            self.state.provider_config.effective_config.clone(),
             patch,
         ))
     }
@@ -1194,7 +1286,7 @@ impl DesktopController {
         if !self.persist_preferences_to_disk {
             return;
         }
-        self.preferences.window_opacity_percent = Some(self.state.window_opacity_percent);
+        self.preferences.window_opacity_percent = Some(self.state.view.window_opacity_percent);
         if self.is_quick_chat_workspace() {
             self.preferences.last_workspace = None;
         } else {
@@ -1232,12 +1324,23 @@ impl DesktopController {
             requested = true;
         }
         if requested {
-            self.state
-                .set_status_message("実行停止を要求しました。現在の処理を中断しています。");
+            let session_id = self.state.app_state.current_session_id;
+            self.state.mark_run_cancellation_requested(
+                "run cancelled by user",
+                "停止しました。現在の処理を中断しています。",
+            );
+            if let Some(session_id) = session_id {
+                self.spawn_session_cancel_persist(session_id);
+            }
         } else {
             self.state
                 .set_status_message("停止できる実行中タスクはありません。");
         }
+    }
+
+    pub(crate) fn set_window_opacity_percent(&mut self, percent: i32) {
+        self.state.set_window_opacity_percent(percent);
+        self.persist_preferences();
     }
 
     fn launch_run_with_options(
@@ -1246,14 +1349,27 @@ impl DesktopController {
         prompt_dispatch: crate::session::PromptDispatchPart,
         review_request: Option<ReviewRequest>,
     ) {
+        if self.active_run_cancel.is_some() {
+            self.state.set_status_message(
+                "前回の停止処理を片付けています。状態が更新されてから再度実行してください。",
+            );
+            return;
+        }
         if prompt.trim().is_empty() && review_request.is_none() {
             return;
         }
-        let image_paths = self.state.image_attachment_paths.clone();
-        if !image_paths.is_empty() && !self.state.effective_config.model.supports_images {
+        let image_paths = self.state.composer.image_attachment_paths.clone();
+        if !image_paths.is_empty()
+            && !self
+                .state
+                .provider_config
+                .effective_config
+                .model
+                .supports_images
+        {
             self.state.set_status_message(format!(
                 "model `{}` does not advertise image support",
-                self.state.effective_config.model.model
+                self.state.provider_config.effective_config.model.model
             ));
             return;
         }
@@ -1269,9 +1385,23 @@ impl DesktopController {
                 .is_none()
                 .then(|| NEW_SESSION_PLACEHOLDER_TITLE.to_string()),
             cwd: self.app.workspace.cwd.clone(),
-            model: self.state.effective_config.model.model.clone(),
-            base_url: self.state.effective_config.model.base_url.clone(),
-            config_override: Some(full_effective_override(&self.state.effective_config)),
+            model: self
+                .state
+                .provider_config
+                .effective_config
+                .model
+                .model
+                .clone(),
+            base_url: self
+                .state
+                .provider_config
+                .effective_config
+                .model
+                .base_url
+                .clone(),
+            config_override: Some(full_effective_override(
+                &self.state.provider_config.effective_config,
+            )),
             output_mode: OutputMode::Human,
             show_reasoning: true,
             prompt_dispatch: Some(prompt_dispatch.clone()),
@@ -1282,9 +1412,9 @@ impl DesktopController {
         };
         self.active_run_cancel = Some(cancel);
         self.state.push_local_prompt_dispatch(&prompt_dispatch);
-        self.state.draft_prompt.clear();
-        self.state.image_attachment_paths.clear();
-        self.state.image_attachment_input.clear();
+        self.state.composer.draft_prompt.clear();
+        self.state.composer.image_attachment_paths.clear();
+        self.state.composer.image_attachment_input.clear();
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
         let notification_title = request
@@ -1325,6 +1455,7 @@ impl DesktopController {
     fn current_editor_context(&self) -> EditorContext {
         let shell_family = self
             .state
+            .provider_config
             .effective_config
             .shell
             .family
@@ -1352,12 +1483,173 @@ impl DesktopController {
         }
     }
 
+    fn apply_session_loaded_message(
+        &mut self,
+        request_id: Option<NavigationRequestId>,
+        session_id: SessionId,
+        reason: SessionLoadReason,
+        result: Result<LoadedSession, String>,
+    ) {
+        match result {
+            Ok(loaded) => {
+                if self.session_load_is_blocked_by_active_run() {
+                    return;
+                }
+                if !self.should_apply_loaded_session(request_id, session_id, reason) {
+                    if let Some(request_id) = request_id {
+                        self.state.finish_navigation(request_id);
+                    }
+                    return;
+                }
+                if let Some(request_id) = request_id {
+                    self.state.finish_navigation(request_id);
+                }
+                self.state.load_open_session(
+                    &loaded.session,
+                    &loaded.transcript,
+                    &loaded.turn_items,
+                    loaded.state,
+                    loaded.todos,
+                );
+                self.state
+                    .set_status_message(format!("opened session {}", session_id));
+            }
+            Err(error) => {
+                if request_id
+                    .map(|request_id| self.state.finish_navigation(request_id))
+                    .unwrap_or(true)
+                {
+                    self.state.set_status_message(error);
+                }
+            }
+        }
+    }
+
+    fn session_load_is_blocked_by_active_run(&self) -> bool {
+        matches!(
+            self.state.app_state.run_status,
+            crate::tui::state::RunStatus::Running | crate::tui::state::RunStatus::Confirming
+        )
+    }
+
+    fn should_apply_loaded_session(
+        &self,
+        request_id: Option<NavigationRequestId>,
+        session_id: SessionId,
+        reason: SessionLoadReason,
+    ) -> bool {
+        match reason {
+            SessionLoadReason::UserSelection => {
+                request_id.is_some_and(|request_id| {
+                    self.state
+                        .is_current_session_navigation(request_id, session_id)
+                }) && self.state.selected_session_id() == Some(session_id)
+            }
+            SessionLoadReason::CurrentRefresh => {
+                self.state.app_state.current_session_id == Some(session_id)
+            }
+        }
+    }
+
+    fn apply_workspace_switched_message(
+        &mut self,
+        request_id: NavigationRequestId,
+        result: Result<WorkspaceLoadResult, String>,
+    ) {
+        match result {
+            Ok(loaded) => {
+                if !self.state.is_current_navigation(request_id) {
+                    return;
+                }
+                self.replace_workspace_from_load(loaded);
+                if let Some(session_id) = self.state.selected_session_id() {
+                    self.state
+                        .set_status_message(format!("opening session {session_id}..."));
+                    let request_id = self.state.begin_session_load(session_id);
+                    self.spawn_session_load(
+                        session_id,
+                        SessionLoadReason::UserSelection,
+                        Some(request_id),
+                    );
+                } else {
+                    self.state.set_status_message(format!(
+                        "workspace set to {}",
+                        self.app.workspace.root
+                    ));
+                }
+            }
+            Err(error) => {
+                if self.state.finish_navigation(request_id) {
+                    self.state.set_status_message(error);
+                }
+            }
+        }
+    }
+
+    fn apply_new_project_workspace_switched_message(
+        &mut self,
+        request_id: NavigationRequestId,
+        result: Result<WorkspaceLoadResult, String>,
+    ) {
+        match result {
+            Ok(loaded) => {
+                if !self.state.is_current_navigation(request_id) {
+                    return;
+                }
+                self.replace_workspace_from_load(loaded);
+                self.state.start_new_chat();
+                self.state.set_status_message("new development chat ready");
+            }
+            Err(error) => {
+                if self.state.finish_navigation(request_id) {
+                    self.state.set_status_message(error);
+                }
+            }
+        }
+    }
+
+    fn replace_workspace_from_load(&mut self, loaded: WorkspaceLoadResult) {
+        self.app = loaded.app.clone();
+        if !self.is_quick_chat_workspace() {
+            self.preferences
+                .unmark_project_deleted(&self.app.workspace.root);
+        }
+        let effective = apply_preferences_override(
+            &self.preferences,
+            &self.app.workspace.root,
+            self.app.config.clone(),
+        );
+        self.state = DesktopState::new(loaded.snapshot, effective);
+        self.state.workspace_input = self.app.workspace.cwd.to_string();
+        if let Some(opacity) = self.preferences.window_opacity_percent {
+            self.state.set_window_opacity_percent(opacity);
+        }
+        self.persist_preferences();
+        if !self
+            .state
+            .provider_config
+            .provider_base_url_input
+            .trim()
+            .is_empty()
+        {
+            self.load_provider_models();
+        }
+    }
+
     pub(crate) fn drain_runtime_messages(&mut self) -> bool {
         let mut changed = false;
         while let Ok(message) = self.runtime_rx.try_recv() {
             changed = true;
             match message {
                 RuntimeMessage::RunEvent(event) => {
+                    if self
+                        .active_run_cancel
+                        .as_ref()
+                        .is_some_and(|cancel| cancel.is_cancelled())
+                        && !run_event_is_terminal(&event)
+                    {
+                        continue;
+                    }
                     let refresh_session_id = match &event {
                         RunEvent::SessionStarted { session_id, .. }
                         | RunEvent::SessionTitleUpdated { session_id, .. } => Some(*session_id),
@@ -1379,7 +1671,11 @@ impl DesktopController {
                         self.state.app_state.set_summary(summary);
                         self.refresh_snapshot();
                         if let Some(session_id) = self.state.app_state.current_session_id {
-                            self.spawn_session_load(session_id, SessionLoadReason::CurrentRefresh);
+                            self.spawn_session_load(
+                                session_id,
+                                SessionLoadReason::CurrentRefresh,
+                                None,
+                            );
                         }
                     }
                     Err(error) => {
@@ -1414,41 +1710,11 @@ impl DesktopController {
                     Err(error) => self.state.set_status_message(error),
                 },
                 RuntimeMessage::SessionLoaded {
+                    request_id,
                     session_id,
                     reason,
                     result,
-                } => match result {
-                    Ok(loaded) => {
-                        if matches!(
-                            self.state.app_state.run_status,
-                            crate::tui::state::RunStatus::Running
-                                | crate::tui::state::RunStatus::Confirming
-                        ) {
-                            continue;
-                        }
-                        let should_apply = match reason {
-                            SessionLoadReason::UserSelection => {
-                                self.state.selected_session_id() == Some(session_id)
-                            }
-                            SessionLoadReason::CurrentRefresh => {
-                                self.state.app_state.current_session_id == Some(session_id)
-                            }
-                        };
-                        if !should_apply {
-                            continue;
-                        }
-                        self.state.load_open_session(
-                            &loaded.session,
-                            &loaded.transcript,
-                            &loaded.turn_items,
-                            loaded.state,
-                            loaded.todos,
-                        );
-                        self.state
-                            .set_status_message(format!("opened session {}", session_id));
-                    }
-                    Err(error) => self.state.set_status_message(error),
-                },
+                } => self.apply_session_loaded_message(request_id, session_id, reason, result),
                 RuntimeMessage::SessionDeleted { session_id, result } => match result {
                     Ok(snapshot) => {
                         let deleted_was_current =
@@ -1460,9 +1726,11 @@ impl DesktopController {
                                     "deleted chat {}; opening {}...",
                                     session_id, next_session_id
                                 ));
+                                let request_id = self.state.begin_session_load(next_session_id);
                                 self.spawn_session_load(
                                     next_session_id,
                                     SessionLoadReason::UserSelection,
+                                    Some(request_id),
                                 );
                             } else {
                                 self.state.start_new_chat();
@@ -1503,7 +1771,13 @@ impl DesktopController {
                                 self.state.set_window_opacity_percent(opacity);
                             }
                             self.persist_preferences();
-                            if !self.state.provider_base_url_input.trim().is_empty() {
+                            if !self
+                                .state
+                                .provider_config
+                                .provider_base_url_input
+                                .trim()
+                                .is_empty()
+                            {
                                 self.load_provider_models();
                             }
                         } else {
@@ -1515,9 +1789,11 @@ impl DesktopController {
                                 "deleted project {}; opening {}...",
                                 project_id, next_session_id
                             ));
+                            let request_id = self.state.begin_session_load(next_session_id);
                             self.spawn_session_load(
                                 next_session_id,
                                 SessionLoadReason::UserSelection,
+                                Some(request_id),
                             );
                         } else {
                             self.state.start_new_chat();
@@ -1541,8 +1817,9 @@ impl DesktopController {
                     requested_base_url,
                     result,
                 } => {
-                    if normalize_provider_base_url(&self.state.provider_base_url_input)
-                        != requested_base_url
+                    if normalize_provider_base_url(
+                        &self.state.provider_config.provider_base_url_input,
+                    ) != requested_base_url
                     {
                         continue;
                     }
@@ -1559,65 +1836,12 @@ impl DesktopController {
                         .state
                         .set_status_message(format!("history markdown export failed: {error}")),
                 },
-                RuntimeMessage::WorkspaceSwitched(result) => match result {
-                    Ok(loaded) => {
-                        self.app = loaded.app.clone();
-                        if !self.is_quick_chat_workspace() {
-                            self.preferences
-                                .unmark_project_deleted(&self.app.workspace.root);
-                        }
-                        let effective = apply_preferences_override(
-                            &self.preferences,
-                            &self.app.workspace.root,
-                            self.app.config.clone(),
-                        );
-                        self.state = DesktopState::new(loaded.snapshot, effective);
-                        self.state.workspace_input = self.app.workspace.cwd.to_string();
-                        if let Some(opacity) = self.preferences.window_opacity_percent {
-                            self.state.set_window_opacity_percent(opacity);
-                        }
-                        self.persist_preferences();
-                        if !self.state.provider_base_url_input.trim().is_empty() {
-                            self.load_provider_models();
-                        }
-                        if let Some(session_id) = self.state.selected_session_id() {
-                            self.state
-                                .set_status_message(format!("opening session {session_id}..."));
-                            self.spawn_session_load(session_id, SessionLoadReason::UserSelection);
-                        }
-                        self.state.set_status_message(format!(
-                            "workspace set to {}",
-                            self.app.workspace.root
-                        ));
-                    }
-                    Err(error) => self.state.set_status_message(error),
-                },
-                RuntimeMessage::WorkspaceSwitchedForNewProjectSession(result) => match result {
-                    Ok(loaded) => {
-                        self.app = loaded.app.clone();
-                        if !self.is_quick_chat_workspace() {
-                            self.preferences
-                                .unmark_project_deleted(&self.app.workspace.root);
-                        }
-                        let effective = apply_preferences_override(
-                            &self.preferences,
-                            &self.app.workspace.root,
-                            self.app.config.clone(),
-                        );
-                        self.state = DesktopState::new(loaded.snapshot, effective);
-                        self.state.workspace_input = self.app.workspace.cwd.to_string();
-                        if let Some(opacity) = self.preferences.window_opacity_percent {
-                            self.state.set_window_opacity_percent(opacity);
-                        }
-                        self.state.start_new_chat();
-                        self.state.set_status_message("new development chat ready");
-                        self.persist_preferences();
-                        if !self.state.provider_base_url_input.trim().is_empty() {
-                            self.load_provider_models();
-                        }
-                    }
-                    Err(error) => self.state.set_status_message(error),
-                },
+                RuntimeMessage::WorkspaceSwitched { request_id, result } => {
+                    self.apply_workspace_switched_message(request_id, result)
+                }
+                RuntimeMessage::WorkspaceSwitchedForNewProjectSession { request_id, result } => {
+                    self.apply_new_project_workspace_switched_message(request_id, result)
+                }
             }
         }
         changed
@@ -2502,6 +2726,16 @@ fn event_requires_todo_refresh(event: &RunEvent) -> bool {
             | RunEvent::CandidateRepairEditRecorded { .. }
             | RunEvent::RecoverableRuntimeFeedback { .. }
             | RunEvent::SessionCompleted { .. }
+            | RunEvent::SessionAwaitingUser { .. }
+            | RunEvent::SessionInterrupted { .. }
+            | RunEvent::SessionFailed { .. }
+    )
+}
+
+fn run_event_is_terminal(event: &RunEvent) -> bool {
+    matches!(
+        event,
+        RunEvent::SessionCompleted { .. }
             | RunEvent::SessionAwaitingUser { .. }
             | RunEvent::SessionInterrupted { .. }
             | RunEvent::SessionFailed { .. }
