@@ -5,6 +5,7 @@ export interface TranscriptRow {
   step: string;
   title: string;
   body: string;
+  file_changes: FileChangeRow[];
 }
 
 export interface ProjectRow {

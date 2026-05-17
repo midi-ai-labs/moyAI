@@ -28,6 +28,8 @@ const V17_SESSION_STATE_TYPED_VERIFICATION_EVIDENCE: &str =
     include_str!("../../migrations/V17__session_state_typed_verification_evidence.sql");
 const V18_SESSIONS_CANCELLED_STATUS: &str =
     include_str!("../../migrations/V18__sessions_cancelled_status.sql");
+const V19_SESSION_STATE_TOKEN_ACCOUNTING: &str =
+    include_str!("../../migrations/V19__session_state_token_accounting.sql");
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
     connection.execute_batch(V1_INIT)?;
@@ -69,6 +71,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     }
     if needs_sessions_cancelled_status_migration(connection)? {
         connection.execute_batch(V18_SESSIONS_CANCELLED_STATUS)?;
+    }
+    if needs_session_state_token_accounting_migration(connection)? {
+        connection.execute_batch(V19_SESSION_STATE_TOKEN_ACCOUNTING)?;
     }
     Ok(())
 }
@@ -210,4 +215,16 @@ fn needs_sessions_cancelled_status_migration(
         .as_deref()
         .map(|value| !value.contains("'cancelled'"))
         .unwrap_or(false))
+}
+
+fn needs_session_state_token_accounting_migration(
+    connection: &Connection,
+) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare("PRAGMA table_info(session_state)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(!columns
+        .iter()
+        .any(|column| column == "token_accounting_json"))
 }

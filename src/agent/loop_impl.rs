@@ -34,7 +34,7 @@ use crate::session::{
     RequestControlObligationDiagnostic, RequestControlSurfaceDiagnostic, RequestDiagnosticsPart,
     RequestMessageDiagnostic, RequestToolCallDiagnostic, RequestToolSchemaDiagnostic, RunSummary,
     SessionId, SessionRepository, SessionStateSnapshot, SessionStatus, TaskRoute, TextPart,
-    TodoItem, TodoKind, TodoStatus, TurnDecisionWarningSeverity,
+    TodoItem, TodoKind, TodoStatus, TokenAccountingState, TurnDecisionWarningSeverity,
 };
 use crate::storage::{SqliteSessionRepository, StoreBundle};
 use crate::tool::context::ToolServices;
@@ -49,6 +49,8 @@ const DOCS_ROUTE_BUDGET_EXHAUSTED_CORRECTION_TERMINAL_THRESHOLD: usize = 3;
 const VERIFICATION_SUPPORTING_CONTEXT_NO_PROGRESS_TERMINAL_THRESHOLD: usize = 3;
 const WRONG_VERIFICATION_COMMAND_TERMINAL_THRESHOLD: usize = 3;
 const WRONG_AUTHORING_TARGET_TERMINAL_THRESHOLD: usize = 3;
+const OPEN_OBLIGATION_FINAL_MESSAGE_TERMINAL_THRESHOLD: usize = 3;
+const CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS: u64 = 120_000;
 
 #[derive(Clone)]
 pub struct AgentLoop {
@@ -139,6 +141,8 @@ impl<'a> TurnRuntime<'a> {
         let mut authoring_supporting_context_budget_exhausted = BTreeSet::<String>::new();
         let mut docs_supporting_context_budget_exhausted = BTreeSet::<String>::new();
         let mut docs_supporting_context_budget_exhausted_counts = BTreeMap::<String, usize>::new();
+        let mut open_obligation_final_message_count = 0usize;
+        let mut open_obligation_final_message_correction = None::<String>;
         for _step in 0..request.config.session.max_steps_per_turn {
             if request.cancel.is_cancelled() {
                 return interrupt_turn(
@@ -235,6 +239,9 @@ impl<'a> TurnRuntime<'a> {
             let hard_final_step = request.config.session.max_steps_per_turn <= 1;
             let mut system_prompt = bundle.system_prompt.clone();
             let mut tools = bundle.tools.clone();
+            if let Some(correction) = open_obligation_final_message_correction.take() {
+                system_prompt = format!("{correction}\n\n{system_prompt}");
+            }
             if hard_final_step {
                 let todo_snapshot =
                     serde_json::to_string_pretty(&todos).unwrap_or_else(|_| "[]".to_string());
@@ -395,7 +402,11 @@ impl<'a> TurnRuntime<'a> {
                 system_prompt,
                 messages: provider_messages,
                 tools: tools.clone(),
-                timeout_ms: step_request.config.model.request_timeout_ms,
+                timeout_ms: closeout_final_response_timeout_ms(
+                    step_request.config.model.request_timeout_ms,
+                    &step_request.state,
+                    active_work.as_ref(),
+                ),
                 stream_idle_timeout_ms: step_request.config.model.stream_idle_timeout_ms,
                 extra_headers: step_request.config.model.extra_headers.clone(),
                 temperature: step_request.config.model.temperature,
@@ -443,6 +454,44 @@ impl<'a> TurnRuntime<'a> {
             {
                 Ok(response) => response,
                 Err(error) => {
+                    if provider_error_is_request_timeout(&error)
+                        && clean_closeout_final_message_lifecycle(
+                            &step_request.state,
+                            active_work.as_ref(),
+                        )
+                    {
+                        let fallback = closeout_timeout_fallback_text();
+                        session_repo
+                            .append_part(
+                                assistant_message.id,
+                                NewPart {
+                                    kind: PartKind::Text,
+                                    payload: MessagePart::Text(TextPart {
+                                        text: fallback.to_string(),
+                                    }),
+                                },
+                            )
+                            .await?;
+                        sink.emit(crate::session::RunEvent::TextDelta {
+                            message_id: assistant_message.id,
+                            delta: fallback.to_string(),
+                        })?;
+                        return complete_turn(
+                            &session_repo,
+                            request.session.session.id,
+                            assistant_message.id,
+                            &request.model.name,
+                            &request.config.model.base_url,
+                            Some(FinishReason::Stop),
+                            None,
+                            request.model.context_window,
+                            tool_call_count,
+                            failed_tool_count,
+                            change_count,
+                            sink,
+                        )
+                        .await;
+                    }
                     let message = format!("provider model request failed: {error}");
                     fail_turn(
                         &session_repo,
@@ -476,6 +525,41 @@ impl<'a> TurnRuntime<'a> {
                     sink,
                 )
                 .await;
+            }
+
+            if stream.tool_calls.is_empty()
+                && !matches!(finish_reason, Some(FinishReason::Length))
+                && !closeout_ready_final_message_authority(&step_request.state)
+            {
+                open_obligation_final_message_count += 1;
+                if open_obligation_final_message_count
+                    >= OPEN_OBLIGATION_FINAL_MESSAGE_TERMINAL_THRESHOLD
+                {
+                    let message = open_obligation_final_message_terminal_message(
+                        &step_request.state,
+                        open_obligation_final_message_count,
+                    );
+                    fail_turn(
+                        &session_repo,
+                        request.session.session.id,
+                        assistant_message.id,
+                        &request.model.name,
+                        &request.config.model.base_url,
+                        &message,
+                        tool_call_count,
+                        failed_tool_count,
+                        change_count,
+                        sink,
+                    )
+                    .await?;
+                    return Err(AgentError::Message(message));
+                }
+                open_obligation_final_message_correction =
+                    Some(open_obligation_final_message_correction_text(
+                        &step_request.state,
+                        open_obligation_final_message_count,
+                    ));
+                continue;
             }
 
             if !stream.reasoning.trim().is_empty() {
@@ -539,6 +623,7 @@ impl<'a> TurnRuntime<'a> {
                     &request.config.model.base_url,
                     finish_reason,
                     token_usage,
+                    request.model.context_window,
                     tool_call_count,
                     failed_tool_count,
                     change_count,
@@ -628,6 +713,7 @@ impl<'a> TurnRuntime<'a> {
                             &request.config.model.base_url,
                             Some(FinishReason::Stop),
                             token_usage,
+                            request.model.context_window,
                             tool_call_count,
                             failed_tool_count,
                             change_count,
@@ -1064,6 +1150,7 @@ impl<'a> TurnRuntime<'a> {
                                 &request.config.model.base_url,
                                 Some(FinishReason::Stop),
                                 token_usage,
+                                request.model.context_window,
                                 tool_call_count,
                                 failed_tool_count,
                                 change_count,
@@ -1210,6 +1297,7 @@ async fn complete_turn(
     base_url: &str,
     finish_reason: Option<FinishReason>,
     token_usage: Option<crate::session::TokenUsage>,
+    context_window: u32,
     tool_call_count: usize,
     failed_tool_count: usize,
     change_count: usize,
@@ -1222,11 +1310,19 @@ async fn complete_turn(
                 model: model.to_string(),
                 base_url: base_url.to_string(),
                 finish_reason,
-                token_usage,
+                token_usage: token_usage.clone(),
                 summary: false,
             }),
         )
         .await?;
+    persist_provider_token_accounting(
+        session_repo,
+        session_id,
+        context_window,
+        token_usage.as_ref(),
+        sink,
+    )
+    .await?;
     session_repo
         .set_status(session_id, SessionStatus::Completed)
         .await?;
@@ -1243,6 +1339,23 @@ async fn complete_turn(
         failed_tool_count,
         change_count,
     })
+}
+
+async fn persist_provider_token_accounting(
+    session_repo: &SqliteSessionRepository,
+    session_id: SessionId,
+    context_window: u32,
+    token_usage: Option<&crate::session::TokenUsage>,
+    sink: &mut dyn RunEventSink,
+) -> Result<(), AgentError> {
+    let Some(token_usage) = token_usage else {
+        return Ok(());
+    };
+    let mut state = session_repo.get_state(session_id).await?;
+    state.token_accounting = TokenAccountingState::from_provider_usage(context_window, token_usage);
+    session_repo.update_state(session_id, &state).await?;
+    sink.emit(crate::session::RunEvent::StateUpdated { session_id, state })?;
+    Ok(())
 }
 
 async fn interrupt_turn(
@@ -2179,6 +2292,81 @@ fn clean_closeout_final_message_lifecycle(
         && state.completion.blocked_reason.is_none()
 }
 
+fn closeout_final_response_timeout_ms(
+    configured_timeout_ms: u64,
+    state: &SessionStateSnapshot,
+    active_work: Option<&ActiveWorkContract>,
+) -> u64 {
+    if !clean_closeout_final_message_lifecycle(state, active_work) {
+        return configured_timeout_ms;
+    }
+    if configured_timeout_ms == 0 {
+        return CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS;
+    }
+    configured_timeout_ms.min(CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS)
+}
+
+fn provider_error_is_request_timeout(error: &crate::error::LlmError) -> bool {
+    error
+        .to_string()
+        .starts_with("provider request timeout after ")
+}
+
+fn closeout_timeout_fallback_text() -> &'static str {
+    "完了しました。"
+}
+
+fn open_obligation_final_message_correction_text(
+    state: &SessionStateSnapshot,
+    attempt: usize,
+) -> String {
+    let targets = state
+        .active_targets
+        .iter()
+        .map(|target| target.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target_line = if targets.is_empty() {
+        "Open targets: none recorded.".to_string()
+    } else {
+        format!("Open targets: {targets}.")
+    };
+    let blocked_reason = state
+        .completion
+        .blocked_reason
+        .as_deref()
+        .unwrap_or("Open work remains for the latest user request.");
+    format!(
+        "The previous response was not accepted as a final answer because the current turn still has open obligations. Attempt {attempt}/{OPEN_OBLIGATION_FINAL_MESSAGE_TERMINAL_THRESHOLD}. {blocked_reason}\n{target_line}\nUse a file-changing tool call such as `write` or `apply_patch` for the active target before any final assistant message. Read/list/search and planning are supporting context only; a text-only promise does not satisfy this turn."
+    )
+}
+
+fn open_obligation_final_message_terminal_message(
+    state: &SessionStateSnapshot,
+    attempts: usize,
+) -> String {
+    let targets = state
+        .active_targets
+        .iter()
+        .map(|target| target.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let blocked_reason = state
+        .completion
+        .blocked_reason
+        .as_deref()
+        .unwrap_or("open obligations remain");
+    if targets.is_empty() {
+        format!(
+            "model returned a final assistant message {attempts} time(s) while {blocked_reason}; no clean closeout was accepted"
+        )
+    } else {
+        format!(
+            "model returned a final assistant message {attempts} time(s) while {blocked_reason}; open targets: {targets}; no clean closeout was accepted"
+        )
+    }
+}
+
 pub(crate) fn clean_closeout_final_message_lifecycle_fixture_passes() -> bool {
     let mut state = SessionStateSnapshot::default();
     state.completion.closeout_ready = true;
@@ -2192,6 +2380,52 @@ pub(crate) fn clean_closeout_final_message_lifecycle_fixture_passes() -> bool {
             &state,
         ) == ToolChoice::None
         && closeout_ready_final_message_authority(&state)
+}
+
+pub(crate) fn closeout_ready_final_response_timeout_guard_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.completion.closeout_ready = true;
+    state.completion.open_work_count = 0;
+    state.completion.verification_pending = false;
+    state.completion.route_contract_pending = false;
+    closeout_final_response_timeout_ms(0, &state, None) == CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS
+        && closeout_final_response_timeout_ms(CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS + 1, &state, None)
+            == CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS
+        && closeout_final_response_timeout_ms(30_000, &state, None) == 30_000
+        && closeout_timeout_fallback_text() == "完了しました。"
+        && provider_error_is_request_timeout(&crate::error::LlmError::Message(
+            provider_request_timeout_error_message(CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS),
+        ))
+}
+
+pub(crate) fn open_obligation_final_message_guard_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = crate::session::ProcessPhase::Author;
+    state.active_targets = vec![
+        Utf8PathBuf::from("calculator.py"),
+        Utf8PathBuf::from("test_calculator.py"),
+    ];
+    state.completion.closeout_ready = false;
+    state.completion.open_work_count = 2;
+    state.completion.blocked_reason =
+        Some("Requested implementation updates are still missing from the workspace.".to_string());
+
+    let correction = open_obligation_final_message_correction_text(&state, 1);
+    let terminal = open_obligation_final_message_terminal_message(
+        &state,
+        OPEN_OBLIGATION_FINAL_MESSAGE_TERMINAL_THRESHOLD,
+    );
+
+    open_executable_work_requires_tool_call(&state)
+        && !closeout_ready_final_message_authority(&state)
+        && !clean_closeout_final_message_lifecycle(&state, None)
+        && correction.contains("not accepted as a final answer")
+        && correction.contains("calculator.py, test_calculator.py")
+        && correction.contains("write")
+        && correction.contains("apply_patch")
+        && terminal.contains("no clean closeout was accepted")
+        && terminal.contains("calculator.py, test_calculator.py")
 }
 
 pub(crate) fn executed_tool_failure_terminal_guard_fixture_passes() -> bool {
@@ -2721,7 +2955,7 @@ pub(crate) fn docs_route_supporting_context_budget_exhaustion_is_recoverable_fix
         "operation_intent": "content_changing_authoring_required",
         "operation_progress_class": "supporting_context",
         "progress_effect": "no_progress",
-        "result_hash": "ignored-for-docs"
+        "result_hash": "omitted-for-docs"
     });
     let operation_key = operation_non_content_no_progress_key(
         "read",

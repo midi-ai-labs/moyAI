@@ -101,6 +101,11 @@ impl PatchParser {
                     };
                     hunks.push(hunk);
                 }
+                if hunks.is_empty() {
+                    return Err(PatchError::Message(format!(
+                        "update file section `{path}` must include at least one hunk line"
+                    )));
+                }
                 operations.push(PatchOperation::Update {
                     path: Utf8PathBuf::from(path),
                     hunks,
@@ -285,9 +290,10 @@ fn repair_patch_structure(text: &str) -> String {
                         .is_some_and(|ch| matches!(ch, ' ' | '+' | '-'))
             });
 
+            let has_nonempty_body = body.iter().any(|entry| !entry.is_empty());
             if has_explicit_hunk {
                 repaired.extend(body.iter().map(|entry| normalize_explicit_hunk_line(entry)));
-            } else if !body.is_empty() {
+            } else if has_nonempty_body {
                 repaired.extend(body.iter().map(|entry| format!("+{entry}")));
             }
             continue;
@@ -518,6 +524,12 @@ fn parse_hunk(header: &str, lines: &[&str], index: &mut usize) -> Result<PatchCh
         };
         body.push(parsed);
         *index += 1;
+    }
+
+    if body.is_empty() {
+        return Err(PatchError::Message(
+            "update hunk body cannot be empty".to_string(),
+        ));
     }
 
     Ok(PatchChunk {

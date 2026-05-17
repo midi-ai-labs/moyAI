@@ -444,6 +444,7 @@ impl DesktopState {
                     } else {
                         "通常チャットとして開始できます。プロジェクト作業をする場合は、左のプロジェクト作成からフォルダを選択してください。".to_string()
                     },
+                    file_changes: Vec::new(),
                 }],
                 tool_status_text: "ツール実行はまだありません。".to_string(),
                 progress_text: "待機中\nフェーズ: 準備完了\n手順: 実行中の作業はありません"

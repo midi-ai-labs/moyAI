@@ -1,7 +1,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { icon } from "./icons";
 import { renderMarkdown } from "./markdown";
-import type { DesktopWebState, ProjectRow, TranscriptRow } from "./types";
+import type { DesktopWebState, FileChangeRow, ProjectRow, TranscriptRow } from "./types";
 import { displayAccessLabel, escapeHtml, fileName, shortenPath, validateConfigInput } from "./utils";
 
 export type { LocalConfirmation } from "./render_overlays";
@@ -282,7 +282,7 @@ export function renderThreadContent(state: DesktopWebState): string {
     return renderEmptyThread(state);
   }
   const visibleTranscriptRows = state.transcript_rows.filter((row) => !shouldHidePseudoToolCallTranscriptRow(row));
-  return `${visibleTranscriptRows.map(renderTranscriptCard).join("")}${renderChangeCard(state)}`;
+  return visibleTranscriptRows.map(renderTranscriptCard).join("");
 }
 
 function renderEmptyThread(state: DesktopWebState): string {
@@ -308,6 +308,9 @@ function renderTranscriptCard(row: TranscriptRow): string {
   if (row.kind.startsWith("work_summary")) {
     return renderWorkSummaryCard(row);
   }
+  if (row.kind === "file_changes") {
+    return renderFileChangesTranscriptCard(row);
+  }
   return `
     <article class="message ${escapeHtml(row.kind)}">
       <div class="message-step">${escapeHtml(row.step)}</div>
@@ -316,6 +319,64 @@ function renderTranscriptCard(row: TranscriptRow): string {
         <div class="markdown-body">${renderMarkdown(row.body)}</div>
       </div>
     </article>
+  `;
+}
+
+function renderFileChangesTranscriptCard(row: TranscriptRow): string {
+  const changes = normalizedTranscriptFileChanges(row);
+  const body = changes.length === 0 ? `<div class="markdown-body">${renderMarkdown(row.body)}</div>` : renderTranscriptFileChangeTable(changes);
+  return `
+    <article class="message file_changes">
+      <div class="message-step">${escapeHtml(row.step)}</div>
+      <div class="message-body">
+        <h2>${escapeHtml(row.title)}</h2>
+        ${body}
+      </div>
+    </article>
+  `;
+}
+
+function normalizedTranscriptFileChanges(row: TranscriptRow): FileChangeRow[] {
+  if (Array.isArray(row.file_changes) && row.file_changes.length > 0) {
+    return row.file_changes;
+  }
+  return parseFileChangesFromTranscriptBody(row.body);
+}
+
+function parseFileChangesFromTranscriptBody(body: string): FileChangeRow[] {
+  return body
+    .split(/\r?\n/)
+    .map((line) => line.trim().match(/^[-*]\s+\[([^\]]+)\]\s+(.+?)(?:\s+-\s+(.+))?$/))
+    .filter((match): match is RegExpMatchArray => match !== null)
+    .map((match) => ({
+      action: match[1].trim(),
+      path: match[2].trim(),
+      label: fileName(match[2].trim()),
+      summary: (match[3] ?? "").trim(),
+    }));
+}
+
+function renderTranscriptFileChangeTable(changes: FileChangeRow[]): string {
+  const rows = changes
+    .map(
+      (change) => `
+        <div class="transcript-change-row">
+          <span class="transcript-change-action">${escapeHtml(change.action)}</span>
+          <strong title="${escapeHtml(change.path)}">${escapeHtml(change.path)}</strong>
+          <small>${escapeHtml(change.summary || change.label || change.path)}</small>
+        </div>
+      `,
+    )
+    .join("");
+  return `
+    <div class="transcript-change-table" role="table" aria-label="ファイル変更結果">
+      <div class="transcript-change-row transcript-change-head" role="row">
+        <span>操作</span>
+        <span>ファイル</span>
+        <span>内容</span>
+      </div>
+      ${rows}
+    </div>
   `;
 }
 
@@ -355,29 +416,6 @@ function renderWorkSummaryCard(row: TranscriptRow): string {
           <div class="markdown-body">${renderMarkdown(row.body)}</div>
         </details>
       </div>
-    </article>
-  `;
-}
-
-function renderChangeCard(state: DesktopWebState): string {
-  if (state.file_change_rows.length === 0) {
-    return "";
-  }
-  return `
-    <article class="change-card">
-      <div class="change-header">
-        <strong>${escapeHtml(state.file_change_summary_text.split("\n")[0] ?? "ファイル変更")}</strong>
-      </div>
-      ${state.file_change_rows
-        .map(
-          (row) => `
-            <div class="change-row">
-              <span class="change-action">${escapeHtml(row.action)}</span>
-              <span>${escapeHtml(row.path)}</span>
-              <small>${escapeHtml(row.summary)}</small>
-            </div>`
-        )
-        .join("")}
     </article>
   `;
 }

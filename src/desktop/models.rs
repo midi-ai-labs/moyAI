@@ -7,6 +7,8 @@ pub struct DesktopTranscriptRow {
     pub step: String,
     pub title: String,
     pub body: String,
+    #[serde(default)]
+    pub file_changes: Vec<DesktopFileChangeRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -263,7 +263,11 @@ pub fn build_session_detail(
     };
     let mut detail = build_session_detail_from_app_state(&ui_state);
     detail.session_id = session.id;
-    detail.transcript_rows = transcript_rows_with_context(&ui_state, Some(session), &file_changes);
+    detail.transcript_rows = if turn_items.is_empty() {
+        transcript_rows_with_context(&ui_state, Some(session), &file_changes)
+    } else {
+        transcript_rows_from_turn_items_with_context(session, &turn_items)
+    };
     detail.artifacts = artifact_rows_from_file_changes(&file_changes);
     detail.file_change_summary_text = format_file_change_summary(&file_changes);
     detail.artifact_preview_text = format_artifact_preview(detail.artifacts.first(), &file_changes);
@@ -272,6 +276,257 @@ pub fn build_session_detail(
         append_replay_summary(&mut detail.tool_status_text, &report);
     }
     detail
+}
+
+#[derive(Default)]
+struct TurnTranscriptGroup {
+    user_body: String,
+    assistant_bodies: Vec<String>,
+    tool_rows: Vec<String>,
+    file_change_items: Vec<crate::protocol::TurnItem>,
+    system_rows: Vec<DesktopTranscriptRow>,
+    terminal_summary: Option<String>,
+}
+
+impl TurnTranscriptGroup {
+    fn has_content(&self) -> bool {
+        !self.user_body.trim().is_empty()
+            || !self.assistant_bodies.is_empty()
+            || !self.tool_rows.is_empty()
+            || !self.file_change_items.is_empty()
+            || !self.system_rows.is_empty()
+            || self.terminal_summary.is_some()
+    }
+}
+
+fn transcript_rows_from_turn_items_with_context(
+    session: &SessionRecord,
+    turn_items: &[crate::protocol::TurnItem],
+) -> Vec<DesktopTranscriptRow> {
+    let mut rows = Vec::new();
+    let mut current = TurnTranscriptGroup::default();
+    let ordered = turn_items.iter().collect::<Vec<_>>();
+    let show_session_elapsed_on_work_summary = ordered
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.payload,
+                crate::protocol::TurnItemPayload::UserMessage { .. }
+            )
+        })
+        .count()
+        <= 1;
+
+    for item in ordered {
+        match &item.payload {
+            crate::protocol::TurnItemPayload::UserMessage { text } => {
+                flush_turn_transcript_group(
+                    &mut rows,
+                    session,
+                    &mut current,
+                    show_session_elapsed_on_work_summary,
+                );
+                current.user_body = text.clone();
+            }
+            crate::protocol::TurnItemPayload::AgentMessage { text } => {
+                current.assistant_bodies.push(text.clone());
+            }
+            crate::protocol::TurnItemPayload::ToolStatus { title, status, .. } => {
+                current.tool_rows.push(format!(
+                    "- [{}] {}",
+                    turn_tool_status_label(*status),
+                    title.trim()
+                ));
+            }
+            crate::protocol::TurnItemPayload::FileChange { .. } => {
+                current.file_change_items.push((*item).clone());
+            }
+            crate::protocol::TurnItemPayload::ContextCompaction { summary } => {
+                current.system_rows.push(DesktopTranscriptRow {
+                    kind: "system".to_string(),
+                    step: String::new(),
+                    title: "システム - Context Compaction".to_string(),
+                    body: format!("圧縮しました\n\n{}", summary.trim()),
+                    file_changes: Vec::new(),
+                });
+            }
+            crate::protocol::TurnItemPayload::ApprovalRequest { summary, .. } => {
+                current.system_rows.push(DesktopTranscriptRow {
+                    kind: "system".to_string(),
+                    step: String::new(),
+                    title: "確認".to_string(),
+                    body: summary.clone(),
+                    file_changes: Vec::new(),
+                });
+            }
+            crate::protocol::TurnItemPayload::Warning { message } => {
+                current.system_rows.push(DesktopTranscriptRow {
+                    kind: "system".to_string(),
+                    step: String::new(),
+                    title: "警告".to_string(),
+                    body: message.clone(),
+                    file_changes: Vec::new(),
+                });
+            }
+            crate::protocol::TurnItemPayload::Error { message } => {
+                current.system_rows.push(DesktopTranscriptRow {
+                    kind: "error".to_string(),
+                    step: String::new(),
+                    title: "エラー".to_string(),
+                    body: message.clone(),
+                    file_changes: Vec::new(),
+                });
+            }
+            crate::protocol::TurnItemPayload::Terminal { summary, .. } => {
+                current.terminal_summary = Some(summary.clone());
+            }
+            crate::protocol::TurnItemPayload::Reasoning { .. }
+            | crate::protocol::TurnItemPayload::Plan { .. }
+            | crate::protocol::TurnItemPayload::PromptDispatch { .. }
+            | crate::protocol::TurnItemPayload::State { .. } => {}
+        }
+    }
+    flush_turn_transcript_group(
+        &mut rows,
+        session,
+        &mut current,
+        show_session_elapsed_on_work_summary,
+    );
+    if rows.is_empty() {
+        rows.push(DesktopTranscriptRow {
+            kind: "system".to_string(),
+            step: "00".to_string(),
+            title: "履歴はまだありません".to_string(),
+            body: "依頼を送信すると、ユーザー入力、ツール実行、ファイル変更、最終応答がここに並びます。".to_string(),
+            file_changes: Vec::new(),
+        });
+    }
+    normalize_completed_pseudo_tool_call_closeout(&mut rows, true);
+    renumber_rows(rows)
+}
+
+fn flush_turn_transcript_group(
+    rows: &mut Vec<DesktopTranscriptRow>,
+    session: &SessionRecord,
+    group: &mut TurnTranscriptGroup,
+    show_session_elapsed_on_work_summary: bool,
+) {
+    if !group.has_content() {
+        return;
+    }
+    if !group.user_body.trim().is_empty() {
+        rows.push(DesktopTranscriptRow {
+            kind: "user".to_string(),
+            step: String::new(),
+            title: "ユーザー依頼".to_string(),
+            body: group.user_body.trim().to_string(),
+            file_changes: Vec::new(),
+        });
+    }
+    rows.extend(group.system_rows.drain(..));
+
+    let file_changes = file_change_rows_from_turn_items_with_root(
+        &group.file_change_items,
+        Some(session.cwd.as_path()),
+    );
+    if !group.tool_rows.is_empty() || !file_changes.is_empty() || group.terminal_summary.is_some() {
+        rows.push(DesktopTranscriptRow {
+            kind: "work_summary_completed".to_string(),
+            step: String::new(),
+            title: if show_session_elapsed_on_work_summary {
+                session_elapsed_label(session)
+                    .map(|value| format!("{value}作業しました"))
+                    .unwrap_or_else(|| "作業履歴 / 作業サマリ".to_string())
+            } else {
+                "作業履歴 / 作業サマリ".to_string()
+            },
+            body: turn_work_summary_body(group, &file_changes),
+            file_changes: Vec::new(),
+        });
+    }
+    for body in group.assistant_bodies.drain(..) {
+        if body.trim().is_empty() {
+            continue;
+        }
+        rows.push(DesktopTranscriptRow {
+            kind: "assistant".to_string(),
+            step: String::new(),
+            title: "応答".to_string(),
+            body: body.trim().to_string(),
+            file_changes: Vec::new(),
+        });
+    }
+    if !file_changes.is_empty() {
+        rows.push(DesktopTranscriptRow {
+            kind: "file_changes".to_string(),
+            step: String::new(),
+            title: "ファイル変更結果".to_string(),
+            body: file_change_transcript_body(&file_changes),
+            file_changes: file_changes.clone(),
+        });
+    }
+
+    group.user_body.clear();
+    group.tool_rows.clear();
+    group.file_change_items.clear();
+    group.terminal_summary = None;
+}
+
+fn turn_work_summary_body(
+    group: &TurnTranscriptGroup,
+    file_changes: &[DesktopFileChangeRow],
+) -> String {
+    let mut sections = Vec::new();
+    if !group.tool_rows.is_empty() {
+        sections.push(format!(
+            "### 作業履歴\n{}",
+            group
+                .tool_rows
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    sections.push(format!(
+        "### 作業サマリ\n- ツール実行: {}件\n- ファイル変更: {}件{}",
+        group.tool_rows.len(),
+        file_changes.len(),
+        group
+            .terminal_summary
+            .as_ref()
+            .map(|summary| format!("\n- 終了: {}", summary.trim()))
+            .unwrap_or_default()
+    ));
+    sections.join("\n\n")
+}
+
+fn file_change_transcript_body(file_changes: &[DesktopFileChangeRow]) -> String {
+    file_changes
+        .iter()
+        .map(|row| {
+            let summary = if row.summary.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" - {}", row.summary.trim())
+            };
+            format!("- [{}] {}{}", row.action, row.path, summary)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn turn_tool_status_label(status: crate::protocol::ToolLifecycleStatus) -> &'static str {
+    match status {
+        crate::protocol::ToolLifecycleStatus::Pending
+        | crate::protocol::ToolLifecycleStatus::Blocked
+        | crate::protocol::ToolLifecycleStatus::Rejected
+        | crate::protocol::ToolLifecycleStatus::Deferred => "待機",
+        crate::protocol::ToolLifecycleStatus::Running => "実行中",
+        crate::protocol::ToolLifecycleStatus::Completed => "完了",
+        crate::protocol::ToolLifecycleStatus::Failed => "失敗",
+    }
 }
 
 pub fn build_session_detail_from_app_state(state: &AppState) -> DesktopSessionDetail {
@@ -361,6 +616,7 @@ fn transcript_rows_with_context(
             step: "00".to_string(),
             title: "履歴はまだありません".to_string(),
             body: "依頼を送信すると、ユーザー入力、ツール実行、ファイル変更、最終応答がここに並びます。".to_string(),
+            file_changes: Vec::new(),
         }]
     } else {
         state
@@ -377,6 +633,7 @@ fn transcript_rows_with_context(
                     step: format!("{:02}", index + 1),
                     title: entry_heading(entry.kind, &entry.title),
                     body: entry.body.trim().to_string(),
+                    file_changes: Vec::new(),
                 })
             })
             .collect::<Vec<_>>()
@@ -528,6 +785,7 @@ fn work_summary_row(
         step: String::new(),
         title: work_summary_title(state, session),
         body: work_summary_body(state, file_changes),
+        file_changes: Vec::new(),
     })
 }
 
@@ -1075,6 +1333,155 @@ mod tests {
         assert_eq!(rows[0].path, "src/main.rs");
         assert_eq!(rows[0].action, "更新");
         assert!(rows[0].summary.contains("desktop UI projection"));
+    }
+
+    #[test]
+    fn transcript_rows_keep_file_changes_inside_each_user_turn() {
+        let session = session_record(ProjectId::new(), "multi-turn");
+        let session_id = session.id;
+        let turn_a = crate::protocol::TurnId::new();
+        let turn_b = crate::protocol::TurnId::new();
+        let turn_items = vec![
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: turn_a,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::UserMessage {
+                    text: "指示プロンプトA".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: turn_a,
+                source_item_id: None,
+                sequence_no: 2,
+                payload: TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Write,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "Updated a.py".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: turn_a,
+                source_item_id: None,
+                sequence_no: 3,
+                payload: TurnItemPayload::FileChange {
+                    change_ids: vec![crate::session::ChangeId::new()],
+                    changes: vec![FileChangeEvidence {
+                        change_id: crate::session::ChangeId::new(),
+                        kind: ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("a.py")),
+                        path_after: Some(Utf8PathBuf::from("a.py")),
+                        summary: "A change".to_string(),
+                    }],
+                    summary: "A change".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: turn_a,
+                source_item_id: None,
+                sequence_no: 4,
+                payload: TurnItemPayload::AgentMessage {
+                    text: "応答A".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: turn_b,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::UserMessage {
+                    text: "指示プロンプトB".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: turn_b,
+                source_item_id: None,
+                sequence_no: 2,
+                payload: TurnItemPayload::FileChange {
+                    change_ids: vec![crate::session::ChangeId::new()],
+                    changes: vec![FileChangeEvidence {
+                        change_id: crate::session::ChangeId::new(),
+                        kind: ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("b.py")),
+                        summary: "B change".to_string(),
+                    }],
+                    summary: "B change".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: turn_b,
+                source_item_id: None,
+                sequence_no: 3,
+                payload: TurnItemPayload::AgentMessage {
+                    text: "応答B".to_string(),
+                },
+            },
+        ];
+
+        let rows = transcript_rows_from_turn_items_with_context(&session, &turn_items);
+        let index_user_a = rows
+            .iter()
+            .position(|row| row.kind == "user" && row.body.contains("指示プロンプトA"))
+            .expect("user A row");
+        let index_change_a = rows
+            .iter()
+            .position(|row| row.kind == "file_changes" && row.body.contains("a.py"))
+            .expect("file change A row");
+        let index_assistant_a = rows
+            .iter()
+            .position(|row| row.kind == "assistant" && row.body.contains("応答A"))
+            .expect("assistant A row");
+        let index_user_b = rows
+            .iter()
+            .position(|row| row.kind == "user" && row.body.contains("指示プロンプトB"))
+            .expect("user B row");
+        let index_change_b = rows
+            .iter()
+            .position(|row| row.kind == "file_changes" && row.body.contains("b.py"))
+            .expect("file change B row");
+        let index_assistant_b = rows
+            .iter()
+            .position(|row| row.kind == "assistant" && row.body.contains("応答B"))
+            .expect("assistant B row");
+
+        assert!(index_user_a < index_assistant_a);
+        assert!(index_assistant_a < index_change_a);
+        assert!(index_user_a < index_change_a);
+        assert!(index_change_a < index_user_b);
+        assert!(index_user_b < index_assistant_b);
+        assert!(index_assistant_b < index_change_b);
+        assert!(index_user_b < index_change_b);
+        assert_eq!(
+            rows.iter().filter(|row| row.kind == "file_changes").count(),
+            2
+        );
+        assert_eq!(rows[index_change_a].file_changes.len(), 1);
+        assert_eq!(rows[index_change_a].file_changes[0].action, "更新");
+        assert_eq!(rows[index_change_a].file_changes[0].path, "a.py");
+        assert_eq!(rows[index_change_b].file_changes.len(), 1);
+        assert_eq!(rows[index_change_b].file_changes[0].action, "追加");
+        assert_eq!(rows[index_change_b].file_changes[0].path, "b.py");
+        assert!(
+            rows.iter()
+                .filter(|row| row.kind.starts_with("work_summary"))
+                .count()
+                >= 2
+        );
     }
 
     #[test]

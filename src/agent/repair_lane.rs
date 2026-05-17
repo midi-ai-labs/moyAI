@@ -522,7 +522,9 @@ fn required_target_for_subtype(
         | RepairLaneSubtype::PublicMissingAttributeMismatch
         | RepairLaneSubtype::PublicStateAssertionMismatch
         | RepairLaneSubtype::SourceImportTimeNameResolution
-        | RepairLaneSubtype::SourceParseDefect => first_non_test_target(&state.active_targets),
+        | RepairLaneSubtype::SourceParseDefect => first_non_test_target(&state.active_targets)
+            .or_else(|| first_non_test_failure_target(state))
+            .or_else(|| first_source_ref_target(cluster)),
         RepairLaneSubtype::PublicCallableSignatureMismatch => cluster
             .and_then(|cluster| {
                 cluster
@@ -534,6 +536,8 @@ fn required_target_for_subtype(
             .or_else(|| first_non_test_target(&state.active_targets)),
         RepairLaneSubtype::PublicMethodAttributeMismatch => {
             first_non_test_target(&state.active_targets)
+                .or_else(|| first_non_test_failure_target(state))
+                .or_else(|| first_source_ref_target(cluster))
         }
         RepairLaneSubtype::PublicExceptionMismatch => cluster
             .and_then(|cluster| {
@@ -629,6 +633,29 @@ fn first_non_test_target(targets: &[Utf8PathBuf]) -> Option<String> {
         .map(|target| target.as_str().to_string())
 }
 
+fn first_non_test_failure_target(state: &SessionStateSnapshot) -> Option<String> {
+    state
+        .failure
+        .as_ref()
+        .and_then(|failure| first_non_test_target(&failure.targets))
+}
+
+fn first_source_ref_target(cluster: Option<&VerificationFailureCluster>) -> Option<String> {
+    cluster.and_then(|cluster| {
+        cluster
+            .source_refs
+            .iter()
+            .chain(
+                cluster
+                    .evidence
+                    .iter()
+                    .flat_map(|evidence| evidence.source_refs.iter()),
+            )
+            .find(|target| target_is_mutable_source_like(target))
+            .cloned()
+    })
+}
+
 fn first_test_target(targets: &[Utf8PathBuf]) -> Option<String> {
     targets
         .iter()
@@ -712,6 +739,7 @@ pub(crate) fn verification_failure_evidence_from_summary(
             public_constructor_body_exception(summary)
                 .map(|observation| observation.actual_exception)
         });
+    let source_refs = source_refs_for_evidence(&subtype, summary, target.as_deref());
 
     vec![VerificationFailureEvidence {
         evidence_kind: "verification_failure".to_string(),
@@ -732,7 +760,7 @@ pub(crate) fn verification_failure_evidence_from_summary(
         evidence_markers,
         sibling_obligations,
         requirement_refs: Vec::new(),
-        source_refs: source_refs_from_summary(summary),
+        source_refs,
         test_refs: test_refs_from_summary(summary),
     }]
 }
@@ -829,6 +857,24 @@ fn source_refs_from_summary(summary: &str) -> Vec<String> {
     file_refs_from_summary(summary, false)
 }
 
+fn source_refs_for_evidence(
+    subtype: &RepairLaneSubtype,
+    summary: &str,
+    target: Option<&str>,
+) -> Vec<String> {
+    let mut refs = source_refs_from_summary(summary);
+    if matches!(subtype, RepairLaneSubtype::ImportExportMissingExport)
+        && let Some(target) = target
+        && target_is_mutable_source_like(target)
+        && !refs
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(target))
+    {
+        refs.insert(0, target.to_string());
+    }
+    stable_unique(refs)
+}
+
 fn test_refs_from_summary(summary: &str) -> Vec<String> {
     file_refs_from_summary(summary, true)
 }
@@ -891,6 +937,7 @@ fn file_refs_from_summary(summary: &str, tests: bool) -> Vec<String> {
     let mut refs = failure_summary_logical_lines(summary)
         .into_iter()
         .filter_map(|line| quoted_file_frame_path(line))
+        .filter(|path| !runtime_traceback_frame_path(path))
         .filter(|path| target_is_test_like(path) == tests)
         .map(|path| {
             path.replace('\\', "/")
@@ -903,6 +950,17 @@ fn file_refs_from_summary(summary: &str, tests: bool) -> Vec<String> {
     refs.sort();
     refs.dedup();
     refs
+}
+
+fn runtime_traceback_frame_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/lib/unittest/")
+        || normalized.contains("/lib/site-packages/")
+        || normalized.contains("/lib/python")
+        || normalized.contains("/python")
+            && normalized.contains("/lib/")
+            && !normalized.contains("/workspace/")
+            && !normalized.contains("/project_sandbox/")
 }
 
 fn missing_symbol_from_cluster(cluster: Option<&VerificationFailureCluster>) -> Option<String> {

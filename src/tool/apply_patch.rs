@@ -6,7 +6,7 @@ use camino::Utf8Path;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::edit::{PatchChunk, PatchOperation, PatchParser};
+use crate::edit::{PatchChunk, PatchLine, PatchOperation, PatchParser};
 use crate::error::ToolError;
 use crate::session::ChangeRepository;
 use crate::tool::context::ToolContext;
@@ -272,6 +272,11 @@ async fn apply_update(
                 .formatter
                 .format_if_configured(&destination, normalized)
                 .await?;
+            if formatted == original && destination == source_path {
+                return Err(crate::error::EditError::Message(no_content_patch_message(
+                    &destination,
+                )));
+            }
             if let Some(message) =
                 suspicious_full_rewrite_message(&original, &formatted, &hunks, &destination)
             {
@@ -348,6 +353,11 @@ fn suspicious_full_rewrite_message(
     if !PatchParser::is_full_rewrite(hunks) {
         return None;
     }
+    if substantive_artifact_collapsed_to_noop_acknowledgement(original, updated) {
+        return Some(format!(
+            "full-file rewrite for `{path}` would replace a substantive artifact with a no-op acknowledgement. Do not patch files to say they are already up to date; leave the file unchanged or make a real content update."
+        ));
+    }
     let original_first = first_nonempty_line(original)?;
     let updated_first = first_nonempty_line(updated)?;
     if starts_with_indentation(updated_first) && !starts_with_indentation(original_first) {
@@ -357,6 +367,50 @@ fn suspicious_full_rewrite_message(
         ));
     }
     None
+}
+
+fn no_content_patch_message(path: &Utf8Path) -> String {
+    format!(
+        "apply_patch made no content changes to `{path}`. This is no-progress and cannot satisfy active authoring or verification repair work; leave the file unchanged and continue with a real edit or verification command."
+    )
+}
+
+fn substantive_artifact_collapsed_to_noop_acknowledgement(original: &str, updated: &str) -> bool {
+    let original_lines = meaningful_line_count(original);
+    let updated_lines = meaningful_line_count(updated);
+    original_lines >= 8 && updated_lines <= 3 && is_noop_acknowledgement_text(updated)
+}
+
+fn meaningful_line_count(text: &str) -> usize {
+    text.lines().filter(|line| !line.trim().is_empty()).count()
+}
+
+fn is_noop_acknowledgement_text(text: &str) -> bool {
+    let normalized = text
+        .trim()
+        .trim_matches(|ch: char| {
+            ch == '-'
+                || ch == '*'
+                || ch == '#'
+                || ch == '`'
+                || ch == '"'
+                || ch == '\''
+                || ch.is_whitespace()
+        })
+        .to_lowercase();
+    let normalized = normalized.replace(['_', '-'], " ");
+    [
+        "content is already up to date",
+        "already up to date",
+        "no changes needed",
+        "no changes required",
+        "unchanged",
+        "変更なし",
+        "更新済み",
+        "変更はありません",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn first_nonempty_line(text: &str) -> Option<&str> {
@@ -397,4 +451,74 @@ fn edit_request_risks(
 
 fn starts_with_indentation(line: &str) -> bool {
     line.starts_with(' ') || line.starts_with('\t')
+}
+
+pub(crate) fn destructive_noop_patch_is_rejected_fixture_passes() -> bool {
+    let original = "# CLI 電卓 設計文書\n\n## 概要\n\n四則演算を行う。\n\n## 関数仕様\n\n- add\n- subtract\n- multiply\n- divide\n- power\n- modulo\n";
+    let updated = "--- Content is already up to date ---\n";
+    let hunks = vec![PatchChunk {
+        old_start: 0,
+        old_lines: 0,
+        new_start: 0,
+        new_lines: 0,
+        lines: vec![PatchLine::Insert(
+            "--- Content is already up to date ---".to_string(),
+        )],
+    }];
+    let path = Utf8Path::new("docs/calculator-design.md");
+    let message =
+        suspicious_full_rewrite_message(original, updated, &hunks, path).unwrap_or_default();
+    message.contains("no-op acknowledgement")
+        && message.contains("leave the file unchanged")
+        && !substantive_artifact_collapsed_to_noop_acknowledgement(
+            "one line\n",
+            "--- Content is already up to date ---\n",
+        )
+}
+
+pub(crate) fn empty_or_zero_diff_patch_is_rejected_fixture_passes() -> bool {
+    let empty_update = "*** Begin Patch\n*** Update File: docs/calculator-design.md\n*** Update File: docs/calculator-design.md\n*** End Patch";
+    let empty_rejected = PatchParser::parse(empty_update).err().is_some_and(|error| {
+        error
+            .to_string()
+            .contains("must include at least one hunk line")
+    });
+    let path = Utf8Path::new("docs/calculator-design.md");
+    empty_rejected
+        && no_content_patch_message(path).contains("made no content changes")
+        && no_content_patch_message(path).contains("cannot satisfy active authoring")
+}
+
+pub(crate) fn hunkless_update_patch_is_rejected_fixture_passes() -> bool {
+    let hunkless_update =
+        "*** Begin Patch\n*** Update File: docs/calculator-design.md\n\n*** End Patch";
+    let hunkless_rejected = PatchParser::parse(hunkless_update)
+        .err()
+        .is_some_and(|error| {
+            error
+                .to_string()
+                .contains("must include at least one hunk line")
+        });
+
+    let explicit_empty_hunk =
+        "*** Begin Patch\n*** Update File: docs/calculator-design.md\n@@ -1,1 +1,1\n*** End Patch";
+    let empty_hunk_rejected = PatchParser::parse(explicit_empty_hunk)
+        .err()
+        .is_some_and(|error| {
+            error
+                .to_string()
+                .contains("update hunk body cannot be empty")
+        });
+
+    hunkless_rejected && empty_hunk_rejected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hunkless_update_patch_is_rejected_before_apply() {
+        assert!(hunkless_update_patch_is_rejected_fixture_passes());
+    }
 }

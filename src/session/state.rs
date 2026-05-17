@@ -151,6 +151,60 @@ pub struct CompletionState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum TokenAccountingSource {
+    #[default]
+    Unknown,
+    ProviderReported,
+    CompactionRecomputed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TokenAccountingState {
+    #[serde(default)]
+    pub active_context_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_provider_prompt_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_provider_completion_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_provider_total_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_provider_reasoning_tokens: Option<u32>,
+    #[serde(default)]
+    pub source: TokenAccountingSource,
+}
+
+impl TokenAccountingState {
+    pub fn from_provider_usage(context_window: u32, usage: &super::TokenUsage) -> Self {
+        Self {
+            active_context_tokens: usage.total_tokens as u64,
+            context_window: Some(context_window),
+            last_provider_prompt_tokens: Some(usage.prompt_tokens),
+            last_provider_completion_tokens: Some(usage.completion_tokens),
+            last_provider_total_tokens: Some(usage.total_tokens),
+            last_provider_reasoning_tokens: usage.reasoning_tokens,
+            source: TokenAccountingSource::ProviderReported,
+        }
+    }
+
+    pub fn from_replay_estimate(
+        context_window: u32,
+        active_context_tokens: usize,
+        source: TokenAccountingSource,
+    ) -> Self {
+        Self {
+            active_context_tokens: active_context_tokens as u64,
+            context_window: Some(context_window),
+            source,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum ContractStatus {
     #[default]
     Pending,
@@ -286,6 +340,8 @@ pub struct SessionStateSnapshot {
     pub verification: VerificationState,
     #[serde(default)]
     pub completion: CompletionState,
+    #[serde(default)]
+    pub token_accounting: TokenAccountingState,
     #[serde(default)]
     pub docs_route: Option<DocsRouteState>,
     #[serde(default)]

@@ -7,12 +7,13 @@ use crate::protocol::{ContentPart, HistoryItem, HistoryItemId, HistoryItemPayloa
 use crate::runtime::RunEventSink;
 use crate::session::{
     AssistantMessageMeta, MessageMetadata, MessagePart, MessageRole, NewMessage, NewPart, PartKind,
-    SessionId, SessionRecord, SessionRepository, TodoItem,
+    SessionId, SessionRecord, SessionRepository, TodoItem, TokenAccountingSource,
+    TokenAccountingState,
 };
 use crate::storage::SqliteSessionRepository;
 use crate::tool::truncate::clip_text_with_ellipsis;
 
-const MAX_USER_TURNS_BEFORE_SUMMARY: usize = 2;
+const AUTO_COMPACT_CONTEXT_WINDOW_PERCENT: usize = 90;
 const MAX_COMPACTION_TARGETS: usize = 3;
 
 pub async fn maybe_compact(
@@ -130,11 +131,35 @@ pub async fn maybe_compact(
     sink.emit(crate::session::RunEvent::CompactionCompleted {
         message_id: message.id,
         summarized_messages: split_index,
-        summary: summary_text,
+        summary: summary_text.clone(),
         continuation,
     })?;
+    persist_compaction_token_accounting(session_repo, request, &summary_text, sink).await?;
 
     Ok(true)
+}
+
+async fn persist_compaction_token_accounting(
+    session_repo: &SqliteSessionRepository,
+    request: &AgentRunRequest,
+    summary_text: &str,
+    sink: &mut dyn RunEventSink,
+) -> Result<(), AgentError> {
+    let mut state = session_repo.get_state(request.session.session.id).await?;
+    let estimated_tokens = estimate_compaction_summary_replay_tokens(summary_text);
+    state.token_accounting = TokenAccountingState::from_replay_estimate(
+        request.model.context_window,
+        estimated_tokens,
+        TokenAccountingSource::CompactionRecomputed,
+    );
+    session_repo
+        .update_state(request.session.session.id, &state)
+        .await?;
+    sink.emit(crate::session::RunEvent::StateUpdated {
+        session_id: request.session.session.id,
+        state,
+    })?;
+    Ok(())
 }
 
 pub fn needs_compaction(request: &AgentRunRequest) -> bool {
@@ -142,19 +167,10 @@ pub fn needs_compaction(request: &AgentRunRequest) -> bool {
     if history_items.is_empty() {
         return false;
     }
-    if unsummarized_user_turns_from_history_items(history_items) > MAX_USER_TURNS_BEFORE_SUMMARY {
-        return true;
-    }
-    let reserved = request
-        .model
-        .max_output_tokens
-        .saturating_add(request.config.session.overflow_margin_tokens as u32);
-    let available = request.model.context_window.saturating_sub(reserved);
-    if available == 0 {
+    let Some(limit) = auto_compact_token_limit(request.model.context_window) else {
         return false;
-    }
-    estimate_history_item_tokens(compaction_pressure_history_items(history_items))
-        >= available as usize
+    };
+    compaction_trigger_pressure_tokens(request) >= limit
 }
 
 fn compaction_pressure_history_items(history_items: &[HistoryItem]) -> &[HistoryItem] {
@@ -169,41 +185,32 @@ fn compaction_split_index(request: &AgentRunRequest) -> Option<usize> {
     }
     let latest_summary = latest_summary_history_index(history_items);
     let start = latest_summary.map(|index| index + 1).unwrap_or(0);
-    if unsummarized_user_turns_from_history_items(history_items) > MAX_USER_TURNS_BEFORE_SUMMARY {
-        if let Some(split) = latest_user_turn_history_index_after_summary(history_items, start) {
-            if split > start {
-                return Some(split);
-            }
-        }
-    }
     let items = &history_items[start..];
     if items.len() <= 4 {
         return None;
     }
 
+    let auto_compact_limit = auto_compact_token_limit(request.model.context_window)?;
     let preserve_recent_cap = request
         .config
         .session
         .transcript_limit_messages
         .clamp(8, 24);
-    let reserved = request
-        .model
-        .max_output_tokens
-        .saturating_add(request.config.session.overflow_margin_tokens as u32);
-    let available = request.model.context_window.saturating_sub(reserved) as usize;
-    let recent_token_budget = (available / 2).max(1_024);
+    let recent_token_budget = (auto_compact_limit / 2).clamp(1, auto_compact_limit);
 
     let mut keep_count = 0usize;
-    let mut recent_tokens = 0usize;
-    for item in items.iter().rev() {
+    for _item in items.iter().rev() {
         let next_count = keep_count + 1;
-        let next_tokens = recent_tokens + estimate_history_item_token(item);
+        let split_candidate = history_items.len().saturating_sub(next_count);
+        let next_tokens = estimate_provider_replay_tokens(
+            &request.session.session,
+            &history_items[split_candidate..],
+        );
         if next_count > 4 && (next_count > preserve_recent_cap || next_tokens > recent_token_budget)
         {
             break;
         }
         keep_count = next_count;
-        recent_tokens = next_tokens;
     }
 
     if keep_count >= items.len() {
@@ -212,29 +219,6 @@ fn compaction_split_index(request: &AgentRunRequest) -> Option<usize> {
 
     let split = history_items.len().saturating_sub(keep_count);
     if split <= start { None } else { Some(split) }
-}
-
-fn unsummarized_user_turns_from_history_items(history_items: &[HistoryItem]) -> usize {
-    let start = latest_summary_history_index(history_items)
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    history_items[start..]
-        .iter()
-        .filter(|item| matches!(item.payload, HistoryItemPayload::UserTurn { .. }))
-        .count()
-}
-
-fn latest_user_turn_history_index_after_summary(
-    history_items: &[HistoryItem],
-    start: usize,
-) -> Option<usize> {
-    history_items[start..]
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(offset, item)| {
-            matches!(item.payload, HistoryItemPayload::UserTurn { .. }).then_some(start + offset)
-        })
 }
 
 fn latest_summary_history_index(history_items: &[HistoryItem]) -> Option<usize> {
@@ -254,6 +238,62 @@ fn build_compaction_messages_from_history_items(
     build_provider_replay_messages_from_history_items(session, history_items, history_items.len())
 }
 
+fn auto_compact_token_limit(context_window: u32) -> Option<usize> {
+    if context_window == 0 {
+        return None;
+    }
+    Some((context_window as usize).saturating_mul(AUTO_COMPACT_CONTEXT_WINDOW_PERCENT) / 100)
+}
+
+fn compaction_trigger_pressure_tokens(request: &AgentRunRequest) -> usize {
+    let provider_visible_tokens = estimate_provider_replay_tokens(
+        &request.session.session,
+        compaction_pressure_history_items(&request.runtime_input.history_items),
+    );
+    compaction_pressure_with_accounting(provider_visible_tokens, &request.state.token_accounting)
+}
+
+fn compaction_pressure_with_accounting(
+    provider_visible_tokens: usize,
+    accounting: &TokenAccountingState,
+) -> usize {
+    let accounted_tokens = accounting.active_context_tokens.min(usize::MAX as u64) as usize;
+    provider_visible_tokens.max(accounted_tokens)
+}
+
+fn compaction_trigger_provider_visible_tokens(
+    session: &SessionRecord,
+    history_items: &[HistoryItem],
+) -> usize {
+    estimate_provider_replay_tokens(session, compaction_pressure_history_items(history_items))
+}
+
+fn estimate_provider_replay_tokens(
+    session: &SessionRecord,
+    history_items: &[HistoryItem],
+) -> usize {
+    estimate_model_message_tokens(&build_compaction_messages_from_history_items(
+        session,
+        history_items,
+    ))
+}
+
+fn estimate_model_message_tokens(messages: &[ModelMessage]) -> usize {
+    messages.iter().map(estimate_model_message_token).sum()
+}
+
+fn estimate_model_message_token(message: &ModelMessage) -> usize {
+    serde_json::to_string(message)
+        .map(|text| estimate_text_tokens(&text))
+        .unwrap_or(1)
+}
+
+fn estimate_compaction_summary_replay_tokens(summary: &str) -> usize {
+    estimate_model_message_token(&ModelMessage::System {
+        content: summary.to_string(),
+    })
+}
+
 fn estimate_history_item_tokens(history_items: &[HistoryItem]) -> usize {
     history_items.iter().map(estimate_history_item_token).sum()
 }
@@ -265,7 +305,7 @@ fn estimate_history_item_token(item: &HistoryItem) -> usize {
 }
 
 fn estimate_text_tokens(text: &str) -> usize {
-    (text.len() / 4).max(1)
+    text.len().div_ceil(4).max(1)
 }
 
 pub(crate) fn compaction_trigger_ignores_pre_summary_history_fixture_passes() -> bool {
@@ -331,12 +371,24 @@ pub(crate) fn compaction_trigger_ignores_pre_summary_history_fixture_passes() ->
     };
     let history = vec![old_huge, summary, current_user, current_assistant];
     let full_tokens = estimate_history_item_tokens(&history);
-    let pressure_tokens = estimate_history_item_tokens(compaction_pressure_history_items(&history));
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "compaction trigger fixture".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: camino::Utf8PathBuf::from("C:/workspace"),
+        model: "test-model".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let pressure_tokens = compaction_trigger_provider_visible_tokens(&session, &history);
 
     full_tokens > 130_000
         && pressure_tokens < 1_024
         && compaction_pressure_history_items(&history).len() == 3
-        && unsummarized_user_turns_from_history_items(&history) == 1
+        && auto_compact_token_limit(131_072) == Some(117_964)
 }
 
 fn clip_compaction_text(text: &str, limit: usize) -> String {
@@ -646,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn user_turn_threshold_selects_older_history_for_compaction() {
+    fn small_multi_turn_history_does_not_trigger_without_token_pressure() {
         let session_id = SessionId::new();
         let mut items = Vec::new();
         for turn in 0..4 {
@@ -655,11 +707,50 @@ mod tests {
             items.push(assistant_item(session_id, turn_id, turn * 2 + 2));
         }
 
-        assert_eq!(unsummarized_user_turns_from_history_items(&items), 4);
         let session = session_record(session_id);
-        let summary_messages = build_compaction_messages_from_history_items(&session, &items[..6]);
+        let pressure_tokens = compaction_trigger_provider_visible_tokens(&session, &items);
+        let limit = auto_compact_token_limit(131_072).expect("context window has a limit");
 
-        assert!(!summary_messages.is_empty());
+        assert!(pressure_tokens < limit);
+    }
+
+    #[test]
+    fn provider_visible_pressure_reaches_codex_style_limit() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let items = vec![
+            user_item(session_id, turn_id, 1),
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 2,
+                created_at_ms: 2,
+                payload: HistoryItemPayload::Message {
+                    message_id: None,
+                    role: MessageRole::Assistant,
+                    content: vec![ContentPart::Text {
+                        text: "x".repeat(4_000),
+                    }],
+                },
+            },
+        ];
+        let session = session_record(session_id);
+        let pressure_tokens = compaction_trigger_provider_visible_tokens(&session, &items);
+
+        assert!(pressure_tokens >= auto_compact_token_limit(1_024).unwrap());
+    }
+
+    #[test]
+    fn provider_reported_accounting_can_exceed_visible_estimate() {
+        let accounting = TokenAccountingState {
+            active_context_tokens: 1_200,
+            context_window: Some(1_024),
+            source: TokenAccountingSource::ProviderReported,
+            ..TokenAccountingState::default()
+        };
+
+        assert_eq!(compaction_pressure_with_accounting(200, &accounting), 1_200);
     }
 
     #[test]

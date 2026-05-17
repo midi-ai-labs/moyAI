@@ -2034,7 +2034,7 @@ fn open_transcript_rows_to_markdown(
         markdown.push_str("完了しました。\n\n");
     }
 
-    if !file_changes.is_empty() {
+    if !file_changes.is_empty() && !rows.iter().any(|row| row.kind == "file_changes") {
         markdown.push_str("<details><summary>ファイル変更履歴</summary>\n\n");
         for change in file_changes {
             markdown.push_str("- ");
@@ -2647,12 +2647,14 @@ mod tests {
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
                 body: "Create a report.".to_string(),
+                file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
                 kind: "assistant".to_string(),
                 step: "02".to_string(),
                 title: "Response".to_string(),
                 body: "Done.\nSaved files.".to_string(),
+                file_changes: Vec::new(),
             },
         ];
 
@@ -2686,12 +2688,14 @@ mod tests {
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
                 body: "Create files.".to_string(),
+                file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
                 kind: "assistant".to_string(),
                 step: "02".to_string(),
                 title: "Response".to_string(),
                 body: "Now run this:\n<tool_call>\n<function=shell>\n</tool_call>".to_string(),
+                file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
                 kind: "summary".to_string(),
@@ -2699,6 +2703,7 @@ mod tests {
                 title: "File changes".to_string(),
                 body: "Added README.md\nAdded __pycache__\\space_invader.cpython-313.pyc"
                     .to_string(),
+                file_changes: Vec::new(),
             },
         ];
         let changes = vec![DesktopFileChangeRow {

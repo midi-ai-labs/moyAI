@@ -3728,6 +3728,7 @@ pub(crate) fn requested_work_contract_from_instruction_text(text: &str) -> Reque
             record_requested_target(&mut contract, &token, line_intent);
         }
     }
+    promote_same_document_reference_updates(text, &mut contract);
 
     RequestedWorkContract {
         deliverable_targets: dedupe_targets(contract.deliverable_targets),
@@ -3736,6 +3737,52 @@ pub(crate) fn requested_work_contract_from_instruction_text(text: &str) -> Reque
         naming_patterns: dedupe_targets(contract.naming_patterns),
         verification_commands: dedupe_targets(contract.verification_commands),
     }
+}
+
+fn promote_same_document_reference_updates(text: &str, contract: &mut RequestedWorkContract) {
+    if !contract.deliverable_targets.is_empty() || !same_document_update_alias_requested(text) {
+        return;
+    }
+
+    for reference in &contract.reference_inputs {
+        if classify_artifact_target(reference) == ArtifactTargetKind::Documentation {
+            contract.deliverable_targets.push(reference.clone());
+        }
+    }
+}
+
+fn same_document_update_alias_requested(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let references_existing_document = [
+        "based on",
+        "use the previous",
+        "from the previous",
+        "existing document",
+        "same document",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || text.contains("をもとに")
+        || text.contains("を基に")
+        || text.contains("前回作成")
+        || text.contains("既存")
+        || text.contains("現在の");
+    let updates_same_document = [
+        "update the document",
+        "update the docs",
+        "update docs only",
+        "documentation only",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || text.contains("設計書だけを更新")
+        || text.contains("設計書のみを更新")
+        || text.contains("設計書を更新")
+        || text.contains("文書だけを更新")
+        || text.contains("文書のみを更新")
+        || text.contains("ドキュメントだけを更新")
+        || text.contains("ドキュメントのみを更新");
+    references_existing_document && updates_same_document
 }
 
 fn explicit_artifact_targets_in_text(text: &str) -> Vec<String> {
@@ -3993,10 +4040,20 @@ fn line_target_is_reference_input(line: &str, target: &str) -> bool {
     if line_target_is_protected_reference_input(&normalized_line, &lower_target) {
         return true;
     }
+    if line_explicitly_mutates_target(&normalized_line, &lower_target) {
+        return false;
+    }
     if [
         format!("{lower_target} を参照"),
         format!("{lower_target} を参考"),
         format!("{lower_target} に従って"),
+        format!("{lower_target} に合わせて"),
+        format!("{lower_target} に合わせ"),
+        format!("{lower_target} をもとに"),
+        format!("{lower_target} を基に"),
+        format!("{lower_target} に基づ"),
+        format!("{lower_target} に沿って"),
+        format!("{lower_target} に準拠"),
         format!("read {lower_target}"),
         format!("follow {lower_target}"),
         format!("according to {lower_target}"),
@@ -4005,6 +4062,32 @@ fn line_target_is_reference_input(line: &str, target: &str) -> bool {
     ]
     .into_iter()
     .any(|pattern| normalized_line.contains(&pattern))
+    {
+        return true;
+    }
+
+    if normalized_line.contains(&format!("{lower_target} の"))
+        && [
+            "合わせて",
+            "に合わせ",
+            "もとに",
+            "基に",
+            "基づ",
+            "沿って",
+            "準拠",
+            "参照",
+            "参考",
+            "従って",
+            "仕様",
+            "設計",
+            "要件",
+            "requirements",
+            "spec",
+            "specification",
+            "design",
+        ]
+        .into_iter()
+        .any(|marker| normalized_line.contains(marker))
     {
         return true;
     }
@@ -4033,6 +4116,38 @@ fn line_target_is_reference_input(line: &str, target: &str) -> bool {
         && ["section", "heading", "節", "セクション"]
             .into_iter()
             .any(|marker| normalized_line.contains(marker))
+}
+
+fn line_explicitly_mutates_target(normalized_line: &str, lower_target: &str) -> bool {
+    if !normalized_line.contains(lower_target) {
+        return false;
+    }
+
+    [
+        format!("{lower_target} を作成"),
+        format!("{lower_target} を生成"),
+        format!("{lower_target} を更新"),
+        format!("{lower_target} を修正"),
+        format!("{lower_target} を編集"),
+        format!("{lower_target} を追記"),
+        format!("{lower_target} を追加"),
+        format!("{lower_target} を変更"),
+        format!("{lower_target} を書き"),
+        format!("{lower_target} に追記"),
+        format!("{lower_target} に追加"),
+        format!("{lower_target} へ追記"),
+        format!("{lower_target} へ追加"),
+        format!("create {lower_target}"),
+        format!("write {lower_target}"),
+        format!("update {lower_target}"),
+        format!("modify {lower_target}"),
+        format!("edit {lower_target}"),
+        format!("rewrite {lower_target}"),
+        format!("generate {lower_target}"),
+        format!("add {lower_target}"),
+    ]
+    .into_iter()
+    .any(|pattern| normalized_line.contains(&pattern))
 }
 
 fn line_target_is_protected_reference_input(normalized_line: &str, lower_target: &str) -> bool {

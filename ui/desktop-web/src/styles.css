@@ -959,6 +959,55 @@ textarea:focus-visible,
   color: #ff9ba4;
 }
 
+.message.file_changes .message-step {
+  background: #18291e;
+  color: #8ee6a3;
+}
+
+.transcript-change-table {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.transcript-change-row {
+  display: grid;
+  grid-template-columns: 70px minmax(160px, 1fr) minmax(160px, 1.2fr);
+  gap: 10px;
+  align-items: center;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  font-size: 13px;
+}
+
+.transcript-change-row:last-child {
+  border-bottom: 0;
+}
+
+.transcript-change-head {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.transcript-change-row strong,
+.transcript-change-row small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transcript-change-row small {
+  color: var(--muted);
+}
+
+.transcript-change-action {
+  color: var(--ok);
+  font-weight: 650;
+}
+
 .change-card {
   max-width: 800px;
   margin: 24px auto;

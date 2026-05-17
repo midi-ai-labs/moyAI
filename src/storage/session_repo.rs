@@ -588,7 +588,7 @@ impl SessionRepository for SqliteSessionRepository {
                         verification_todo_id, verification_commands_json, verification_failures_json, verification_evidence_summary,
                         completion_closeout_ready, completion_open_work_count, completion_verification_pending, completion_route_contract_pending,
                         completion_blocked_reason, completion_route_contract_summary, docs_route_state_json, implementation_handoff_json,
-                        verification_failure_cluster_json, verification_requirement_refs_json
+                        verification_failure_cluster_json, verification_requirement_refs_json, token_accounting_json
                  FROM session_state
                  WHERE session_id = ?1",
                 params![session_id.to_string()],
@@ -632,6 +632,7 @@ impl SessionRepository for SqliteSessionRepository {
                     let implementation_handoff_json: String = row.get(21)?;
                     let verification_failure_cluster_json: String = row.get(22)?;
                     let verification_requirement_refs_json: String = row.get(23)?;
+                    let token_accounting_json: String = row.get(24)?;
                     let failure = match failure_kind {
                         Some(kind) => Some(FailureState {
                             kind,
@@ -727,6 +728,15 @@ impl SessionRepository for SqliteSessionRepository {
                             blocked_reason: row.get(18)?,
                             route_contract_summary: row.get(19)?,
                         },
+                        token_accounting: serde_json::from_str(&token_accounting_json).map_err(
+                            |error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    24,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            },
+                        )?,
                         docs_route: serde_json::from_str(&docs_route_state_json).map_err(
                             |error| {
                                 rusqlite::Error::FromSqlConversionFailure(
@@ -969,15 +979,16 @@ fn upsert_session_state_row(
         serde_json::to_string(&state.verification.failure_cluster)?;
     let verification_requirement_refs_json =
         serde_json::to_string(&state.verification.requirement_refs)?;
+    let token_accounting_json = serde_json::to_string(&state.token_accounting)?;
     connection.execute(
         "INSERT INTO session_state (
              session_id, task_route, phase, review_scope_json, active_todo_id, active_targets_json, contract_refs_json, failure_kind, failure_summary, failure_tool_name,
              failure_targets_json, verification_todo_id, verification_commands_json, verification_failures_json,
              verification_evidence_summary, completion_closeout_ready, completion_open_work_count,
              completion_verification_pending, completion_route_contract_pending, completion_blocked_reason, completion_route_contract_summary,
-             docs_route_state_json, implementation_handoff_json, verification_failure_cluster_json, verification_requirement_refs_json, updated_at_ms
+             docs_route_state_json, implementation_handoff_json, verification_failure_cluster_json, verification_requirement_refs_json, token_accounting_json, updated_at_ms
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
          ON CONFLICT(session_id) DO UPDATE SET
              task_route = excluded.task_route,
              phase = excluded.phase,
@@ -1003,6 +1014,7 @@ fn upsert_session_state_row(
              implementation_handoff_json = excluded.implementation_handoff_json,
              verification_failure_cluster_json = excluded.verification_failure_cluster_json,
              verification_requirement_refs_json = excluded.verification_requirement_refs_json,
+             token_accounting_json = excluded.token_accounting_json,
              updated_at_ms = excluded.updated_at_ms",
         params![
             session_id.to_string(),
@@ -1030,6 +1042,7 @@ fn upsert_session_state_row(
             implementation_handoff_json,
             verification_failure_cluster_json,
             verification_requirement_refs_json,
+            token_accounting_json,
             updated_at_ms
         ],
     )?;
@@ -1215,5 +1228,94 @@ fn todo_priority_text(value: TodoPriority) -> &'static str {
         TodoPriority::High => "high",
         TodoPriority::Medium => "medium",
         TodoPriority::Low => "low",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{
+        ProjectId, ProjectRepository, TokenAccountingSource, TokenAccountingState, TokenUsage,
+    };
+    use crate::storage::{SqliteStore, StoragePaths};
+    use camino::Utf8Path;
+
+    #[test]
+    fn token_accounting_round_trips_in_session_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = Utf8Path::from_path(temp.path()).expect("utf8 tempdir");
+        let paths = StoragePaths {
+            data_dir: data_dir.to_path_buf(),
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+        };
+        let store = SqliteStore::open(&paths).expect("open sqlite");
+        store.migrate().expect("migrate sqlite");
+        let project_repo = store.project_repo();
+        let session_repo = store.session_repo();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let project_id = ProjectId::new();
+            let root = Utf8Path::new("C:/workspace/token-accounting");
+            project_repo
+                .upsert_project(project_id, root, "Token Accounting", "none")
+                .await
+                .expect("insert project");
+            let session = session_repo
+                .create_session(NewSession {
+                    project_id,
+                    title: "state roundtrip".to_string(),
+                    cwd: root.to_path_buf(),
+                    model: "model".to_string(),
+                    base_url: "http://localhost:1234".to_string(),
+                })
+                .await
+                .expect("insert session");
+
+            let mut state = session_repo
+                .get_state(session.id)
+                .await
+                .expect("load state");
+            state.token_accounting = TokenAccountingState::from_provider_usage(
+                4096,
+                &TokenUsage {
+                    prompt_tokens: 123,
+                    completion_tokens: 45,
+                    total_tokens: 168,
+                    reasoning_tokens: Some(9),
+                },
+            );
+            session_repo
+                .update_state(session.id, &state)
+                .await
+                .expect("persist state");
+
+            let loaded = session_repo
+                .get_state(session.id)
+                .await
+                .expect("reload state");
+            assert_eq!(loaded.token_accounting.active_context_tokens, 168);
+            assert_eq!(loaded.token_accounting.context_window, Some(4096));
+            assert_eq!(
+                loaded.token_accounting.last_provider_prompt_tokens,
+                Some(123)
+            );
+            assert_eq!(
+                loaded.token_accounting.last_provider_completion_tokens,
+                Some(45)
+            );
+            assert_eq!(
+                loaded.token_accounting.last_provider_reasoning_tokens,
+                Some(9)
+            );
+            assert_eq!(
+                loaded.token_accounting.source,
+                TokenAccountingSource::ProviderReported
+            );
+        });
     }
 }

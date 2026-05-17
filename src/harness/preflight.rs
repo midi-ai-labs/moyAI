@@ -231,14 +231,18 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
 
     if gate.gate_id == "preflight.state_reducer.requested_work_completion_promotes_verification"
         && (!crate::agent::state::requested_work_completion_promotes_verification_fixture_passes()
+            || !crate::agent::state::required_verification_survives_authoring_completion_fixture_passes()
             || !crate::agent::state::partial_requested_work_remains_authoring_phase_fixture_passes(
             )
             || !crate::agent::state::passed_verification_consumes_pending_required_commands_fixture_passes()
             || !crate::agent::state::resumed_new_user_turn_ignores_prior_closeout_fixture_passes()
-            || !crate::agent::state::partial_verification_pass_preserves_remaining_required_commands_fixture_passes())
+            || !crate::agent::state::new_authoring_turn_overrides_prior_verification_fixture_passes()
+            || !crate::agent::state::partial_verification_pass_preserves_remaining_required_commands_fixture_passes()
+            || !crate::agent::state::reference_design_input_does_not_become_pending_authoring_target_fixture_passes()
+            || !crate::agent::state::same_document_reference_update_remains_authoring_target_fixture_passes())
     {
         diagnostics.push(
-            "requested-work item-stream evidence did not preserve partial authoring phase, promote completed authoring to exact verification shell authority before closeout, keep resumed new user turns out of prior closeout authority, or consume passed verification commands before clean closeout".to_string(),
+            "requested-work item-stream evidence did not preserve partial authoring phase, keep reference inputs out of unrelated pending deliverables, preserve same-document reference updates as authoring targets, promote completed authoring to exact verification shell authority before closeout, retain explicit verification commands after latest authoring writes, keep resumed/new authoring turns out of stale closeout or verification authority, or consume passed verification commands before clean closeout".to_string(),
         );
     }
 
@@ -322,10 +326,13 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
     }
 
     if gate.gate_id == "preflight.tool_lifecycle.no_content_write_is_no_progress"
-        && !crate::agent::tool_orchestrator::no_content_write_metadata_projects_no_progress_fixture_passes()
+        && (!crate::agent::tool_orchestrator::no_content_write_metadata_projects_no_progress_fixture_passes()
+            || !crate::tool::apply_patch::destructive_noop_patch_is_rejected_fixture_passes()
+            || !crate::tool::apply_patch::empty_or_zero_diff_patch_is_rejected_fixture_passes()
+            || !crate::tool::apply_patch::hunkless_update_patch_is_rejected_fixture_passes())
     {
         diagnostics.push(
-            "no-content write output can still be projected as successful repair progress".to_string(),
+            "no-content write output or destructive no-op acknowledgement patch can still be projected as successful repair progress".to_string(),
         );
     }
 
@@ -425,10 +432,11 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
     if gate.gate_id == "preflight.turn_decision.codex_stable_tool_surface_authority"
         && (!crate::agent::loop_impl::singleton_write_surface_requires_tool_choice_fixture_passes()
             || !crate::agent::loop_impl::concrete_write_required_action_narrows_broad_surface_fixture_passes()
-            || !crate::agent::loop_impl::open_work_uses_auto_tool_choice_with_harness_closeout_guard_fixture_passes())
+            || !crate::agent::loop_impl::open_work_uses_auto_tool_choice_with_harness_closeout_guard_fixture_passes()
+            || !crate::agent::loop_impl::open_obligation_final_message_guard_fixture_passes())
     {
         diagnostics.push(
-            "tool schemas or tool choice still derive from provider-visible required-action strings, or open executable work still forces required tool_choice instead of Codex-style auto sampling plus lifecycle/harness evidence".to_string(),
+            "tool schemas or tool choice still derive from provider-visible required-action strings, open executable work still forces required tool_choice instead of Codex-style auto sampling plus lifecycle/harness evidence, or open obligations can still accept a text-only final assistant message as clean closeout".to_string(),
         );
     }
 
@@ -445,10 +453,12 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
     }
 
     if gate.gate_id == "preflight.closeout.final_assistant_message_lifecycle"
-        && !crate::agent::loop_impl::clean_closeout_final_message_lifecycle_fixture_passes()
+        && (!crate::agent::loop_impl::clean_closeout_final_message_lifecycle_fixture_passes()
+            || !crate::agent::loop_impl::closeout_ready_final_response_timeout_guard_fixture_passes(
+            ))
     {
         diagnostics.push(
-            "clean closeout still requires a synthetic completion tool instead of final assistant message lifecycle".to_string(),
+            "clean closeout still requires a synthetic completion tool or can wait indefinitely for a provider final message after item-stream evidence is already satisfied".to_string(),
         );
     }
 
@@ -506,7 +516,9 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
         == "preflight.state_reducer.verification_failure_preserves_repair_target_authority"
         && (!crate::agent::state::verification_failure_preserves_repair_targets_fixture_passes()
             || !crate::agent::state::source_owned_verification_failure_preserves_recent_source_edit_target_fixture_passes()
+            || !crate::agent::state::out_of_order_history_items_use_sequence_authority_for_repair_fixture_passes()
             || !crate::agent::state::verification_failure_diagnostic_labels_do_not_become_repair_targets_fixture_passes()
+            || !crate::agent::state::verification_failure_ignores_runtime_loader_frame_fixture_passes()
             || !crate::agent::repair_lane::source_owned_verification_repair_lane_fixture_passes()
             || !crate::agent::repair_lane::source_owned_repair_lane_rejects_diagnostic_label_targets_fixture_passes()
             || !crate::agent::contract_reconciliation::contract_reconciliation_ignores_diagnostic_label_targets_fixture_passes())
@@ -695,6 +707,7 @@ fn prompt_replay_stale_write_fixture_passes() -> bool {
         && crate::agent::content_shape_contract::test_target_content_shape_projection_is_positive_and_forbidden()
         && crate::agent::loop_impl::content_shape_mismatch_feedback_carries_positive_test_contract()
         && crate::agent::tool_result_classification::required_write_content_shape_mismatch_is_nonprogress()
+        && crate::tool::apply_patch::destructive_noop_patch_is_rejected_fixture_passes()
         && crate::agent::prompt::content_shape_mismatch_replay_preserves_tool_lifecycle_without_payload()
         && crate::agent::prompt::stale_inactive_authoring_replay_uses_live_builder()
         && crate::agent::prompt::exact_authoring_write_required_preserves_source_progress_projection(
@@ -1191,7 +1204,7 @@ pub fn failure_registry_preflight_suite() -> Vec<PreflightGate> {
         PreflightGate {
             gate_id: "preflight.tool_lifecycle.no_content_write_is_no_progress"
                 .to_string(),
-            purpose: "no-content write outputs are typed no-progress results and cannot satisfy verification repair progress".to_string(),
+            purpose: "no-content write outputs and destructive no-op acknowledgement patches are typed no-progress / rejected results and cannot satisfy verification repair or authoring progress".to_string(),
             tier: 2,
             layer: PreflightLayer::Flow,
             llm_mode: PreflightLlmMode::NoLlm,
@@ -1383,7 +1396,7 @@ pub fn failure_registry_preflight_suite() -> Vec<PreflightGate> {
         },
         PreflightGate {
             gate_id: "preflight.closeout.final_assistant_message_lifecycle".to_string(),
-            purpose: "clean closeout uses assistant message completion with no provider-visible synthetic completion tool".to_string(),
+            purpose: "clean closeout uses assistant message completion with no provider-visible synthetic completion tool, while closeout-ready final-only provider waits are bounded by a terminal guard".to_string(),
             tier: 2,
             layer: PreflightLayer::Flow,
             llm_mode: PreflightLlmMode::NoLlm,
@@ -1547,13 +1560,19 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.state_reducer.requested_work_completion_promotes_verification"
                 .to_string(),
             family: PreflightGateFamily::StateReducerAuthority,
-            authority_source: "RequestedWorkAuthoring FileChangeEvidence authoring_complete Verification verification_command_obligation before_closeout VerificationRunResult passed_verification_command_consumed clean_closeout".to_string(),
+            authority_source: "RequestedWorkAuthoring ReferenceInput reference_input_not_pending_deliverable same_document_reference_update_authoring_target FileChangeEvidence authoring_complete Verification verification_command_obligation before_closeout canonical_item_chronology turn_local_sequence_no latest_content_change_invalidates_prior_verification VerificationRunResult passed_verification_command_consumed clean_closeout".to_string(),
             required_refs: vec![
                 "RequestedWorkAuthoring".to_string(),
+                "ReferenceInput".to_string(),
+                "reference_input_not_pending_deliverable".to_string(),
+                "same_document_reference_update_authoring_target".to_string(),
                 "FileChangeEvidence".to_string(),
                 "authoring_complete".to_string(),
                 "Verification".to_string(),
                 "verification_command_obligation".to_string(),
+                "canonical_item_chronology".to_string(),
+                "turn_local_sequence_no".to_string(),
+                "latest_content_change_invalidates_prior_verification".to_string(),
                 "VerificationRunResult".to_string(),
                 "passed_verification_command_consumed".to_string(),
                 "clean_closeout".to_string(),
@@ -1591,7 +1610,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "fixture.state_reducer.verification_failure_preserves_repair_target_authority"
                     .to_string(),
             family: PreflightGateFamily::StateReducerAuthority,
-            authority_source: "CodexHistoryItemStream session_state_projection_not_sequence_floor VerificationRunResult VerificationFailureCluster active_obligation_targets source_owned_repair_control_snapshot source_owned_recent_file_change_target_preserved verification_labels_not_file_targets no_fail_closed_dispatch".to_string(),
+            authority_source: "CodexHistoryItemStream session_state_projection_not_sequence_floor VerificationRunResult VerificationFailureCluster active_obligation_targets source_owned_repair_control_snapshot source_owned_recent_file_change_target_preserved verification_labels_not_file_targets python_runtime_traceback_frames_excluded import_error_module_target_authority no_fail_closed_dispatch".to_string(),
             required_refs: vec![
                 "CodexHistoryItemStream".to_string(),
                 "session_state_projection_not_sequence_floor".to_string(),
@@ -1601,11 +1620,14 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "source_owned_repair_control_snapshot".to_string(),
                 "source_owned_recent_file_change_target_preserved".to_string(),
                 "verification_labels_not_file_targets".to_string(),
+                "python_runtime_traceback_frames_excluded".to_string(),
+                "import_error_module_target_authority".to_string(),
             ],
             forbidden_refs: vec![
                 "session_state_sequence_floor".to_string(),
                 "empty_active_targets_after_verification_failure".to_string(),
                 "repair_unclassified_before_dispatch".to_string(),
+                "stdlib_unittest_loader_frame_as_repair_target".to_string(),
             ],
             required_artifacts: Vec::new(),
             fail_closed_on_missing_typed_projection: false,
@@ -1837,17 +1859,24 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.tool_lifecycle.no_content_write_is_no_progress"
                 .to_string(),
             family: PreflightGateFamily::ToolProposalRejectionLifecycle,
-            authority_source: "ToolLifecycleEnvelope FunctionCallOutput success=false progress_effect=no_progress no_content_change".to_string(),
+            authority_source: "ToolLifecycleEnvelope FunctionCallOutput success=false progress_effect=no_progress no_content_change destructive_noop_acknowledgement_patch_rejected empty_apply_patch_hunks_rejected hunkless_update_patch_rejected zero_diff_patch_rejected artifact_preservation".to_string(),
             required_refs: vec![
                 "ToolLifecycleEnvelope".to_string(),
                 "FunctionCallOutput".to_string(),
                 "success=false".to_string(),
                 "progress_effect=no_progress".to_string(),
                 "no_content_change".to_string(),
+                "destructive_noop_acknowledgement_patch_rejected".to_string(),
+                "empty_apply_patch_hunks_rejected".to_string(),
+                "hunkless_update_patch_rejected".to_string(),
+                "zero_diff_patch_rejected".to_string(),
+                "artifact_preservation".to_string(),
             ],
             forbidden_refs: vec![
                 "duplicate_success_cache".to_string(),
                 "repair_progress_from_no_content_write".to_string(),
+                "noop_acknowledgement_as_content_progress".to_string(),
+                "zero_diff_patch_as_content_progress".to_string(),
             ],
             required_artifacts: Vec::new(),
             fail_closed_on_missing_typed_projection: false,
@@ -2109,7 +2138,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.turn_decision.codex_stable_tool_surface_authority"
                 .to_string(),
             family: PreflightGateFamily::ControlEnvelopeProjection,
-            authority_source: "CodexResponsesRequest ActiveWorkContract RequestedWorkAuthoring candidate_tool_surface ActionAuthority stable_tool_schema tool_choice_auto open_work_lifecycle_evidence harness_closeout_guard".to_string(),
+            authority_source: "CodexResponsesRequest ActiveWorkContract RequestedWorkAuthoring candidate_tool_surface ActionAuthority stable_tool_schema tool_choice_auto open_work_lifecycle_evidence harness_closeout_guard open_obligation_final_message_guard".to_string(),
             required_refs: vec![
                 "CodexResponsesRequest".to_string(),
                 "ActiveWorkContract".to_string(),
@@ -2119,12 +2148,14 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "tool_choice_auto".to_string(),
                 "open_work_lifecycle_evidence".to_string(),
                 "harness_closeout_guard".to_string(),
+                "open_obligation_final_message_guard".to_string(),
             ],
             forbidden_refs: vec![
                 "required_action_string_grammar".to_string(),
                 "schema_const_payload_injection".to_string(),
                 "prompt_prose_only_write_authority".to_string(),
                 "tool_choice_required_for_open_executable_work".to_string(),
+                "text_only_final_clean_closeout_with_open_obligations".to_string(),
             ],
             required_artifacts: Vec::new(),
             fail_closed_on_missing_typed_projection: true,
@@ -2157,16 +2188,19 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
         PreflightFixture {
             fixture_id: "fixture.closeout.final_assistant_message_lifecycle".to_string(),
             family: PreflightGateFamily::ControlEnvelopeProjection,
-            authority_source: "CodexTurnComplete final_assistant_message no_synthetic_completion_tool no_closeout_reread_tool no_open_obligations".to_string(),
+            authority_source: "CodexTurnComplete final_assistant_message no_synthetic_completion_tool no_closeout_reread_tool no_open_obligations bounded_closeout_final_response_timeout satisfied_item_stream_terminal_guard".to_string(),
             required_refs: vec![
                 "CodexTurnComplete".to_string(),
                 "final_assistant_message".to_string(),
                 "no_synthetic_completion_tool".to_string(),
                 "no_open_obligations".to_string(),
+                "bounded_closeout_final_response_timeout".to_string(),
+                "satisfied_item_stream_terminal_guard".to_string(),
             ],
             forbidden_refs: vec![
                 "synthetic_completion_required_action".to_string(),
                 "mandatory_closeout_reread".to_string(),
+                "unbounded_closeout_provider_wait".to_string(),
             ],
             required_artifacts: Vec::new(),
             fail_closed_on_missing_typed_projection: true,

@@ -310,10 +310,13 @@ fn reset_prior_closeout_for_new_user_turn(
     if !state.completion.closeout_ready {
         return state;
     }
-    let Some(latest_user_index) = latest_user_turn_index(history_items) else {
+    let Some(latest_user_sequence) = latest_user_turn_sequence(history_items) else {
         return state;
     };
-    if latest_user_index == 0 {
+    if !history_items
+        .iter()
+        .any(|item| history_item_order_scalar(item) < latest_user_sequence)
+    {
         return state;
     }
     state.process_phase = ProcessPhase::Discover;
@@ -337,12 +340,6 @@ fn promote_requested_work_authoring_authority(
     if state.completion.route_contract_pending && state.docs_route.is_some() {
         return state;
     }
-    if state.completion.verification_pending
-        || state.completion.closeout_ready
-        || requested_work_verification_passed(session, history_items)
-    {
-        return state;
-    }
 
     let latest_user = latest_user_text_from_history_items(history_items);
     let explicit_required_commands = explicit_required_verification_commands_from_history_items(
@@ -357,6 +354,12 @@ fn promote_requested_work_authoring_authority(
         None,
     );
     if requested_work.pending_targets.is_empty() {
+        if state.completion.verification_pending
+            || state.completion.closeout_ready
+            || requested_work_verification_passed(session, history_items)
+        {
+            return state;
+        }
         return state;
     }
 
@@ -469,7 +472,7 @@ fn promote_requested_work_verification_authority(
         &explicit_required_commands,
         None,
     );
-    if requested_work.required_targets.is_empty() || !requested_work.pending_targets.is_empty() {
+    if !requested_work.pending_targets.is_empty() {
         return state;
     }
 
@@ -515,6 +518,9 @@ fn requested_work_verification_passed(
     if explicit_required_commands.is_empty() {
         return false;
     }
+    let latest_content_change_sequence =
+        latest_content_change_sequence_since_latest_user(history_items)
+            .unwrap_or_else(|| latest_user_turn_sequence(history_items).unwrap_or(i64::MIN));
     history_items_since_latest_user_turn(history_items)
         .iter()
         .any(|item| {
@@ -525,12 +531,27 @@ fn requested_work_verification_passed(
             else {
                 return false;
             };
+            if history_item_order_scalar(item) <= latest_content_change_sequence {
+                return false;
+            }
             matches!(run.status, VerificationRunStatus::Passed)
                 && explicit_required_commands.iter().any(|required| {
                     verification_command_identity_key(required)
                         == verification_command_identity_key(&run.command)
                 })
         })
+}
+
+fn latest_content_change_sequence_since_latest_user(history_items: &[HistoryItem]) -> Option<i64> {
+    history_items_since_latest_user_turn(history_items)
+        .into_iter()
+        .filter_map(|item| match &item.payload {
+            HistoryItemPayload::FileChange { changes, .. } if !changes.is_empty() => {
+                Some(history_item_order_scalar(item))
+            }
+            _ => None,
+        })
+        .max()
 }
 
 fn apply_typed_item_stream_authority(
@@ -543,6 +564,8 @@ fn apply_typed_item_stream_authority(
     let mut observed_written_targets = BTreeSet::new();
     let mut verification_passed = false;
     let mut passed_verification_command_keys = BTreeSet::new();
+    let latest_content_change_sequence =
+        latest_content_change_sequence_since_latest_user(history_items);
 
     for item in history_items_since_latest_user_turn(history_items) {
         match &item.payload {
@@ -563,6 +586,11 @@ fn apply_typed_item_stream_authority(
                 verification_run,
                 ..
             } => {
+                if latest_content_change_sequence
+                    .is_some_and(|sequence| history_item_order_scalar(item) <= sequence)
+                {
+                    continue;
+                }
                 if *success == Some(true)
                     && matches!(
                         progress_effect,
@@ -632,22 +660,45 @@ fn apply_typed_item_stream_authority(
     state
 }
 
-fn history_items_since_latest_user_turn(history_items: &[HistoryItem]) -> &[HistoryItem] {
-    let start = latest_user_turn_index(history_items).unwrap_or(0);
-    &history_items[start..]
+fn history_items_in_sequence(history_items: &[HistoryItem]) -> Vec<&HistoryItem> {
+    let mut ordered = history_items.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|item| (history_item_order_scalar(item), item.sequence_no));
+    ordered
 }
 
-fn latest_user_turn_index(history_items: &[HistoryItem]) -> Option<usize> {
-    history_items.iter().rposition(|item| {
-        matches!(
-            item.payload,
-            HistoryItemPayload::UserTurn { .. }
-                | HistoryItemPayload::Message {
-                    role: MessageRole::User,
-                    ..
-                }
-        )
-    })
+fn history_items_since_latest_user_turn(history_items: &[HistoryItem]) -> Vec<&HistoryItem> {
+    let Some(latest_user_sequence) = latest_user_turn_sequence(history_items) else {
+        return history_items_in_sequence(history_items);
+    };
+    history_items_in_sequence(history_items)
+        .into_iter()
+        .filter(|item| history_item_order_scalar(item) >= latest_user_sequence)
+        .collect()
+}
+
+fn latest_user_turn_sequence(history_items: &[HistoryItem]) -> Option<i64> {
+    history_items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.payload,
+                HistoryItemPayload::UserTurn { .. }
+                    | HistoryItemPayload::Message {
+                        role: MessageRole::User,
+                        ..
+                    }
+            )
+        })
+        .map(history_item_order_scalar)
+        .max()
+}
+
+fn history_item_order_scalar(item: &HistoryItem) -> i64 {
+    if item.created_at_ms > 0 {
+        item.created_at_ms.saturating_mul(1_000_000) + item.sequence_no
+    } else {
+        item.sequence_no
+    }
 }
 
 pub fn project_model_turn_state(
@@ -1047,8 +1098,8 @@ fn latest_typed_verification_failure_context(
     session: &SessionRecord,
     history_items: &[HistoryItem],
 ) -> Option<TypedVerificationFailureEvidence> {
-    let latest_user_text = history_items
-        .iter()
+    let latest_user_text = history_items_in_sequence(history_items)
+        .into_iter()
         .rev()
         .find_map(|item| match &item.payload {
             HistoryItemPayload::UserTurn { content, .. } => Some(
@@ -1070,7 +1121,7 @@ fn latest_typed_verification_failure_context(
     let mut latest_failure = None;
     let mut recent_source_change_targets: Vec<Utf8PathBuf> = Vec::new();
 
-    for item in history_items {
+    for item in history_items_in_sequence(history_items) {
         match &item.payload {
             HistoryItemPayload::FileChange { changes, .. } => {
                 let changed_targets = file_change_repair_targets(changes, &session.cwd)
@@ -1564,11 +1615,17 @@ fn requested_work_discipline_from_history_items(
     .collect::<Vec<_>>();
     let observed_written_targets =
         observed_written_targets_since_latest_user_history_items(history_items, workspace_root);
+    let target_mutation_request =
+        latest_user_requests_target_mutation(user_text, &required_targets);
     let pending_targets = required_targets
         .iter()
         .filter(|target| {
-            !observed_target_set_contains(&observed_written_targets, target)
-                && !workspace_root.join(target.as_str()).exists()
+            let changed_after_latest_user =
+                observed_target_set_contains(&observed_written_targets, target);
+            if changed_after_latest_user {
+                return false;
+            }
+            target_mutation_request || !workspace_root.join(target.as_str()).exists()
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1585,9 +1642,41 @@ fn requested_work_discipline_from_history_items(
     }
 }
 
-fn latest_user_text_from_history_items(history_items: &[HistoryItem]) -> Option<String> {
-    history_items
+fn latest_user_requests_target_mutation(user_text: &str, required_targets: &[Utf8PathBuf]) -> bool {
+    if required_targets.is_empty() {
+        return false;
+    }
+    let normalized = user_text.to_ascii_lowercase();
+    const MUTATION_MARKERS: &[&str] = &[
+        "update",
+        "modify",
+        "change",
+        "edit",
+        "revise",
+        "implement",
+        "add",
+        "extend",
+        "support",
+        "refactor",
+        "fix",
+        "変更",
+        "更新",
+        "修正",
+        "実装",
+        "追加",
+        "拡張",
+        "対応",
+        "扱える",
+        "直して",
+    ];
+    MUTATION_MARKERS
         .iter()
+        .any(|marker| normalized.contains(&marker.to_ascii_lowercase()))
+}
+
+fn latest_user_text_from_history_items(history_items: &[HistoryItem]) -> Option<String> {
+    history_items_in_sequence(history_items)
+        .into_iter()
         .rev()
         .find_map(|item| match &item.payload {
             HistoryItemPayload::UserTurn { content, .. } => Some(content_text(content)),
@@ -2152,16 +2241,16 @@ fn observed_written_targets_since_latest_verification_failure(
             {
                 return None;
             }
-            Some(item.sequence_no)
+            Some(history_item_order_scalar(item))
         })
-        .last()
+        .max()
     else {
         return BTreeSet::new();
     };
 
     let mut targets = BTreeSet::new();
-    for item in history_items {
-        if item.sequence_no <= latest_failure_sequence {
+    for item in history_items_in_sequence(history_items) {
+        if history_item_order_scalar(item) <= latest_failure_sequence {
             continue;
         }
         if let HistoryItemPayload::FileChange { changes, .. } = &item.payload {
@@ -2377,6 +2466,433 @@ pub(crate) fn requested_work_completion_promotes_verification_fixture_passes() -
         )
 }
 
+pub(crate) fn required_verification_survives_authoring_completion_fixture_passes() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let first_turn_id = TurnId::new();
+    let second_turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "verification survives authoring completion".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: first_turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create `calculator.py` and `test_calculator.py`, then run `python -m unittest`.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: first_turn_id,
+            sequence_no: 38,
+            created_at_ms: 38,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: ToolCallId::new(),
+                status: ToolLifecycleStatus::Completed,
+                title: "Run shell command: python -m unittest".to_string(),
+                output_text: "Ran 21 tests in 0.000s\n\nOK".to_string(),
+                metadata: Value::Null,
+                success: Some(true),
+                progress_effect: ToolProgressEffect::VerificationPassed,
+                blocked_action: None,
+                required_next_action: None,
+                result_hash: Some("prior-pass".to_string()),
+                verification_run: Some(VerificationRunResult {
+                    command: "python -m unittest".to_string(),
+                    status: VerificationRunStatus::Passed,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    output_summary: "Ran 21 tests in 0.000s\n\nOK".to_string(),
+                    failure_cluster: None,
+                    artifact_refs: Vec::new(),
+                    requirement_refs: Vec::new(),
+                }),
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: second_turn_id,
+            sequence_no: 1,
+            created_at_ms: 100,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "`docs/calculator-design.md` の拡張仕様に合わせて実装と test を更新してください。\n\n要件:\n- `calculator.py` に `pow` と `mod` を追加すること。\n- 入力値 validation と error handling を設計書と一致させること。\n- `test_calculator.py` に追加仕様の unittest を入れること。\n\n最後に `python -m unittest` を実行して成功を確認してから終了してください。".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: second_turn_id,
+            sequence_no: 36,
+            created_at_ms: 136,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new(), ChangeId::new(), ChangeId::new()],
+                changes: vec![
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("calculator.py")),
+                        path_after: Some(Utf8PathBuf::from("calculator.py")),
+                        summary: "Updated calculator.py".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("test_calculator.py")),
+                        path_after: Some(Utf8PathBuf::from("test_calculator.py")),
+                        summary: "Updated test_calculator.py".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("docs/calculator-design.md")),
+                        path_after: Some(Utf8PathBuf::from("docs/calculator-design.md")),
+                        summary: "Updated docs/calculator-design.md".to_string(),
+                    },
+                ],
+                summary: "Updated calculator.py, test_calculator.py, and docs/calculator-design.md".to_string(),
+            },
+        },
+    ];
+    let state = reduce_session_state_from_history_items(
+        &session,
+        &items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+
+    matches!(state.process_phase, ProcessPhase::Verify)
+        && state.completion.verification_pending
+        && !state.completion.closeout_ready
+        && state
+            .verification
+            .required_commands
+            .iter()
+            .any(|command| command == "python -m unittest")
+        && matches!(
+            active,
+            Some(ActiveWorkContract::Verification {
+                repair_required: false,
+                ..
+            })
+        )
+}
+
+pub(crate) fn reference_design_input_does_not_become_pending_authoring_target_fixture_passes()
+-> bool {
+    let Ok(temp) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
+        return false;
+    };
+    if fs::create_dir_all(workspace.join("docs").as_std_path()).is_err() {
+        return false;
+    }
+    for (path, content) in [
+        ("calculator.py", "def add(a, b):\n    return a + b\n"),
+        (
+            "test_calculator.py",
+            "import unittest\n\nclass CalculatorTest(unittest.TestCase):\n    pass\n",
+        ),
+        (
+            "docs/calculator-design.md",
+            "# Calculator design\n\nAdd power and modulo behavior.\n",
+        ),
+    ] {
+        if fs::write(workspace.join(path).as_std_path(), content).is_err() {
+            return false;
+        }
+    }
+
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "reference design input".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: workspace,
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let user_item = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::UserTurn {
+            message_id: None,
+            content: vec![ContentPart::Text {
+                text: "`docs/calculator-design.md` の拡張仕様に合わせて実装と test を更新してください。\n\n要件:\n- `calculator.py` に `pow` と `mod` を追加すること。\n- 入力値 validation と error handling を設計書と一致させること。\n- `test_calculator.py` に追加仕様の unittest を入れること。\n\n最後に `python -m unittest` を実行して成功を確認してから終了してください。".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            turn_context: None,
+        },
+    };
+
+    let authoring_items = vec![user_item.clone()];
+    let authoring_state = reduce_session_state_from_history_items(
+        &session,
+        &authoring_items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let authoring_active =
+        active_work_contract_for_history_items(&session, &authoring_items, &authoring_state, &[]);
+    let authoring_targets_are_code_and_test = authoring_state.process_phase == ProcessPhase::Author
+        && authoring_state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "calculator.py")
+        && authoring_state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "test_calculator.py")
+        && !authoring_state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "docs/calculator-design.md")
+        && matches!(
+            authoring_active,
+            Some(ActiveWorkContract::RequestedWorkAuthoring {
+                pending_targets,
+                ..
+            }) if pending_targets.iter().any(|target| target.as_str() == "calculator.py")
+                && pending_targets.iter().any(|target| target.as_str() == "test_calculator.py")
+                && !pending_targets.iter().any(|target| target.as_str() == "docs/calculator-design.md")
+        );
+    if !authoring_targets_are_code_and_test {
+        return false;
+    }
+
+    let completed_items = vec![
+        user_item,
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new(), ChangeId::new()],
+                changes: vec![
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("calculator.py")),
+                        path_after: Some(Utf8PathBuf::from("calculator.py")),
+                        summary: "Updated calculator.py".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("test_calculator.py")),
+                        path_after: Some(Utf8PathBuf::from("test_calculator.py")),
+                        summary: "Updated test_calculator.py".to_string(),
+                    },
+                ],
+                summary: "Updated calculator.py and test_calculator.py".to_string(),
+            },
+        },
+    ];
+    let completed_state = reduce_session_state_from_history_items(
+        &session,
+        &completed_items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let completed_active =
+        active_work_contract_for_history_items(&session, &completed_items, &completed_state, &[]);
+    matches!(completed_state.process_phase, ProcessPhase::Verify)
+        && completed_state.completion.verification_pending
+        && !completed_state.completion.closeout_ready
+        && !completed_state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "docs/calculator-design.md")
+        && completed_state
+            .verification
+            .required_commands
+            .iter()
+            .any(|command| command == "python -m unittest")
+        && matches!(
+            completed_active,
+            Some(ActiveWorkContract::Verification {
+                repair_required: false,
+                ..
+            })
+        )
+}
+
+pub(crate) fn same_document_reference_update_remains_authoring_target_fixture_passes() -> bool {
+    let Ok(temp) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
+        return false;
+    };
+    if fs::create_dir_all(workspace.join("docs").as_std_path()).is_err() {
+        return false;
+    }
+    for (path, content) in [
+        ("calculator.py", "def add(a, b):\n    return a + b\n"),
+        (
+            "test_calculator.py",
+            "import unittest\n\nclass CalculatorTest(unittest.TestCase):\n    pass\n",
+        ),
+        (
+            "docs/calculator-design.md",
+            "# Calculator design\n\nCurrent four-operation calculator.\n",
+        ),
+    ] {
+        if fs::write(workspace.join(path).as_std_path(), content).is_err() {
+            return false;
+        }
+    }
+
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "same document docs update".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: workspace,
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let user_item = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::UserTurn {
+            message_id: None,
+            content: vec![ContentPart::Text {
+                text: "前回作成した `docs/calculator-design.md` をもとに、電卓仕様を拡張してください。\n今回は実装コードと test は変更せず、設計書だけを更新してください。\n\n追加仕様:\n- 累乗 `pow`\n- 剰余 `mod`\n- 入力値 validation\n- CLI 利用例\n- error handling 方針\n\n最後に `python -m unittest` を実行して既存実装が壊れていないことを確認してください。".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            turn_context: None,
+        },
+    };
+
+    let authoring_items = vec![user_item.clone()];
+    let authoring_state = reduce_session_state_from_history_items(
+        &session,
+        &authoring_items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let authoring_active =
+        active_work_contract_for_history_items(&session, &authoring_items, &authoring_state, &[]);
+    let docs_update_is_authoring = authoring_state.process_phase == ProcessPhase::Author
+        && authoring_state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "docs/calculator-design.md")
+        && !authoring_state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "calculator.py")
+        && !authoring_state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "test_calculator.py")
+        && matches!(
+            authoring_active,
+            Some(ActiveWorkContract::RequestedWorkAuthoring {
+                pending_targets,
+                ..
+            }) if pending_targets == vec![Utf8PathBuf::from("docs/calculator-design.md")]
+        );
+    if !docs_update_is_authoring {
+        return false;
+    }
+
+    let completed_items = vec![
+        user_item,
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                    kind: crate::session::ChangeKind::Update,
+                    path_before: Some(Utf8PathBuf::from("docs/calculator-design.md")),
+                    path_after: Some(Utf8PathBuf::from("docs/calculator-design.md")),
+                    summary: "Updated docs/calculator-design.md".to_string(),
+                }],
+                summary: "Updated docs/calculator-design.md".to_string(),
+            },
+        },
+    ];
+    let completed_state = reduce_session_state_from_history_items(
+        &session,
+        &completed_items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let completed_active =
+        active_work_contract_for_history_items(&session, &completed_items, &completed_state, &[]);
+
+    matches!(completed_state.process_phase, ProcessPhase::Verify)
+        && completed_state.completion.verification_pending
+        && !completed_state.completion.closeout_ready
+        && completed_state
+            .verification
+            .required_commands
+            .iter()
+            .any(|command| command == "python -m unittest")
+        && matches!(
+            completed_active,
+            Some(ActiveWorkContract::Verification {
+                repair_required: false,
+                ..
+            })
+        )
+}
+
 pub(crate) fn verification_failure_preserves_repair_targets_fixture_passes() -> bool {
     let session_id = crate::session::SessionId::new();
     let turn_id = TurnId::new();
@@ -2495,6 +3011,416 @@ pub(crate) fn verification_failure_preserves_repair_targets_fixture_passes() -> 
             .active_targets
             .iter()
             .any(|target| target.as_str() == "10 + 5" || target.as_str() == "5")
+}
+
+pub(crate) fn verification_failure_ignores_runtime_loader_frame_fixture_passes() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "verification import repair target authority".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let output_summary = "E\n\
+======================================================================\n\
+ERROR: test_calculator (unittest.loader._FailedTest.test_calculator)\n\
+----------------------------------------------------------------------\n\
+ImportError: Failed to import test module: test_calculator\n\
+Traceback (most recent call last):\n\
+  File \"C:\\Python313\\Lib\\unittest\\loader.py\", line 396, in _find_test_path\n\
+    module = self._get_module_from_name(name)\n\
+  File \"C:\\Python313\\Lib\\unittest\\loader.py\", line 339, in _get_module_from_name\n\
+    __import__(name)\n\
+  File \"C:\\workspace\\project\\test_calculator.py\", line 4, in <module>\n\
+    from calculator import add, subtract, multiply, divide, calculate\n\
+ImportError: cannot import name 'calculate' from 'calculator' (C:\\workspace\\project\\calculator.py)\n\
+\n\
+----------------------------------------------------------------------\n\
+Ran 1 test in 0.000s\n\
+\n\
+FAILED (errors=1)\n";
+    let evidence = crate::agent::repair_lane::verification_failure_evidence_from_summary(
+        FailureKind::VerificationFailed,
+        output_summary,
+    );
+    let source_refs = evidence
+        .iter()
+        .flat_map(|item| item.source_refs.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let test_refs = evidence
+        .iter()
+        .flat_map(|item| item.test_refs.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-import-export-runtime-loader-frame".to_string(),
+        failing_labels: vec!["test_calculator".to_string()],
+        primary_failure: Some("E".to_string()),
+        evidence,
+        sibling_obligations: Vec::new(),
+        source_refs,
+        test_refs,
+    };
+    let mut verify_state = SessionStateSnapshot::default();
+    verify_state.process_phase = ProcessPhase::Verify;
+    verify_state.active_targets = vec![
+        Utf8PathBuf::from("calculator.py"),
+        Utf8PathBuf::from("test_calculator.py"),
+    ];
+    verify_state.completion.verification_pending = true;
+    verify_state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create `calculator.py` and `test_calculator.py`, then run `python -m unittest`.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new(), ChangeId::new()],
+                changes: vec![
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("calculator.py")),
+                        summary: "Added calculator.py".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("test_calculator.py")),
+                        summary: "Added test_calculator.py".to_string(),
+                    },
+                ],
+                summary: "Added calculator.py; Added test_calculator.py".to_string(),
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::SessionState {
+                state: verify_state,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: ToolCallId::new(),
+                status: ToolLifecycleStatus::Completed,
+                title: "Run shell command: python -m unittest".to_string(),
+                output_text: output_summary.to_string(),
+                metadata: Value::Null,
+                success: Some(false),
+                progress_effect: ToolProgressEffect::VerificationFailed,
+                blocked_action: None,
+                required_next_action: None,
+                result_hash: Some("fixture-result".to_string()),
+                verification_run: Some(VerificationRunResult {
+                    command: "python -m unittest".to_string(),
+                    status: VerificationRunStatus::Failed,
+                    exit_code: Some(1),
+                    timed_out: false,
+                    output_summary: output_summary.to_string(),
+                    failure_cluster: Some(cluster),
+                    artifact_refs: Vec::new(),
+                    requirement_refs: Vec::new(),
+                }),
+            },
+        },
+    ];
+    let state = reduce_session_state_from_history_items(
+        &session,
+        &items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+    matches!(state.process_phase, ProcessPhase::Repair)
+        && state.completion.verification_pending
+        && state
+            .verification
+            .failure_cluster
+            .as_ref()
+            .is_some_and(|cluster| {
+                cluster
+                    .source_refs
+                    .iter()
+                    .any(|target| target == "calculator.py")
+                    && !cluster
+                        .source_refs
+                        .iter()
+                        .any(|target| target == "loader.py")
+            })
+        && state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "calculator.py")
+        && state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "test_calculator.py")
+        && !state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "loader.py")
+        && matches!(
+            active,
+            Some(ActiveWorkContract::Verification {
+                repair_required: true,
+                targets,
+                ..
+            }) if targets.iter().any(|target| target.as_str() == "calculator.py")
+                && !targets.iter().any(|target| target.as_str() == "loader.py")
+        )
+}
+
+pub(crate) fn out_of_order_history_items_use_sequence_authority_for_repair_fixture_passes() -> bool
+{
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "sequence authority repair".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-public-missing-near-name".to_string(),
+        failing_labels: vec!["test_float_result".to_string()],
+        primary_failure: Some("E".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_class_attribute_mismatch".to_string()),
+            label: Some("test_float_result".to_string()),
+            target: Some("test_calculator.py".to_string()),
+            symbol: Some("calculator._format_result".to_string()),
+            call_site: Some("calculator._format_result(1.5)".to_string()),
+            exception: Some("AttributeError".to_string()),
+            expected: Some("1.5".to_string()),
+            observed: Some("calculator._format_result missing".to_string()),
+            public_state_assertions: vec!["calculator._format_result(1.5)".to_string()],
+            public_missing_attributes: vec!["calculator._format_result".to_string()],
+            evidence_markers: vec![
+                "`calculator._format_result` is missing; source near-name candidate is `calculator.format_result`".to_string(),
+                "public missing method `calculator._format_result`".to_string(),
+            ],
+            sibling_obligations: vec!["calculator._format_result".to_string()],
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_calculator.py".to_string()],
+        }],
+        sibling_obligations: vec!["calculator._format_result".to_string()],
+        source_refs: Vec::new(),
+        test_refs: vec!["test_calculator.py".to_string()],
+    };
+    let old_failure = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 3,
+        created_at_ms: 3,
+        payload: HistoryItemPayload::ToolOutput {
+            call_id: ToolCallId::new(),
+            status: ToolLifecycleStatus::Completed,
+            title: "Run shell command: python -m unittest".to_string(),
+            output_text: "older verification failure".to_string(),
+            metadata: Value::Null,
+            success: Some(false),
+            progress_effect: ToolProgressEffect::VerificationFailed,
+            blocked_action: None,
+            required_next_action: None,
+            result_hash: Some("old-failure".to_string()),
+            verification_run: Some(VerificationRunResult {
+                command: "python -m unittest".to_string(),
+                status: VerificationRunStatus::Failed,
+                exit_code: Some(1),
+                timed_out: false,
+                output_summary: "older verification failure".to_string(),
+                failure_cluster: Some(cluster.clone()),
+                artifact_refs: Vec::new(),
+                requirement_refs: Vec::new(),
+            }),
+        },
+    };
+    let initial_authoring_edit = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 2,
+        created_at_ms: 2,
+        payload: HistoryItemPayload::FileChange {
+            change_ids: vec![ChangeId::new(), ChangeId::new()],
+            changes: vec![
+                FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                    kind: crate::session::ChangeKind::Update,
+                    path_before: Some(Utf8PathBuf::from("calculator.py")),
+                    path_after: Some(Utf8PathBuf::from("calculator.py")),
+                    summary: "Updated calculator.py".to_string(),
+                },
+                FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                    kind: crate::session::ChangeKind::Update,
+                    path_before: Some(Utf8PathBuf::from("test_calculator.py")),
+                    path_after: Some(Utf8PathBuf::from("test_calculator.py")),
+                    summary: "Updated test_calculator.py".to_string(),
+                },
+            ],
+            summary: "Updated calculator.py and test_calculator.py".to_string(),
+        },
+    };
+    let post_old_repair_edit = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 4,
+        created_at_ms: 4,
+        payload: HistoryItemPayload::FileChange {
+            change_ids: vec![ChangeId::new()],
+            changes: vec![FileChangeEvidence {
+                change_id: ChangeId::new(),
+                kind: crate::session::ChangeKind::Update,
+                path_before: Some(Utf8PathBuf::from("calculator.py")),
+                path_after: Some(Utf8PathBuf::from("calculator.py")),
+                summary: "Edited calculator.py after an older failure".to_string(),
+            }],
+            summary: "Edited calculator.py".to_string(),
+        },
+    };
+    let latest_failure = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 6,
+        created_at_ms: 6,
+        payload: HistoryItemPayload::ToolOutput {
+            call_id: ToolCallId::new(),
+            status: ToolLifecycleStatus::Completed,
+            title: "Run shell command: python -m unittest".to_string(),
+            output_text: "AttributeError: module 'calculator' has no attribute '_format_result'. Did you mean: 'format_result'?".to_string(),
+            metadata: Value::Null,
+            success: Some(false),
+            progress_effect: ToolProgressEffect::VerificationFailed,
+            blocked_action: None,
+            required_next_action: None,
+            result_hash: Some("latest-failure".to_string()),
+            verification_run: Some(VerificationRunResult {
+                command: "python -m unittest".to_string(),
+                status: VerificationRunStatus::Failed,
+                exit_code: Some(1),
+                timed_out: false,
+                output_summary: "AttributeError: module 'calculator' has no attribute '_format_result'. Did you mean: 'format_result'?".to_string(),
+                failure_cluster: Some(cluster),
+                artifact_refs: Vec::new(),
+                requirement_refs: Vec::new(),
+            }),
+        },
+    };
+    let user = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::UserTurn {
+            message_id: None,
+            content: vec![ContentPart::Text {
+                text: "Update calculator.py and test_calculator.py, then run python -m unittest."
+                    .to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            turn_context: None,
+        },
+    };
+    let items = vec![
+        user,
+        latest_failure,
+        old_failure,
+        post_old_repair_edit,
+        initial_authoring_edit,
+    ];
+    let state = reduce_session_state_from_history_items(
+        &session,
+        &items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let active_work = active_work_contract_for_history_items(&session, &items, &state, &[]);
+    let repair_lane = crate::agent::repair_lane::project_repair_lane(
+        &state,
+        &BTreeSet::from([
+            "apply_patch".to_string(),
+            "shell".to_string(),
+            "todowrite".to_string(),
+            "write".to_string(),
+        ]),
+        None,
+    );
+
+    let passes = matches!(state.process_phase, ProcessPhase::Repair)
+        && state.completion.verification_pending
+        && state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "calculator.py")
+        && matches!(
+            active_work,
+            Some(ActiveWorkContract::Verification {
+                repair_required: true,
+                ..
+            })
+        )
+        && repair_lane
+            .as_ref()
+            .and_then(|lane| lane.operation_template.as_ref())
+            .and_then(|template| template.exact_target.as_deref())
+            == Some("calculator.py");
+    passes
 }
 
 pub(crate) fn source_owned_verification_failure_preserves_recent_source_edit_target_fixture_passes()
@@ -3353,6 +4279,144 @@ pub(crate) fn resumed_new_user_turn_ignores_prior_closeout_fixture_passes() -> b
             active,
             Some(ActiveWorkContract::RequestedWorkAuthoring { .. })
         )
+}
+
+pub(crate) fn new_authoring_turn_overrides_prior_verification_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let first_turn_id = TurnId::new();
+    let second_turn_id = TurnId::new();
+    let temp_root = std::env::temp_dir().join(format!("moyai-fr10-006-{session_id}"));
+    if fs::create_dir_all(&temp_root).is_err() {
+        return false;
+    }
+    let _cleanup = TempDirCleanup(temp_root.clone());
+    if fs::write(
+        temp_root.join("calculator.py"),
+        "def calculate(a, op, b):\n    return a\n",
+    )
+    .is_err()
+        || fs::write(
+            temp_root.join("test_calculator.py"),
+            "import unittest\n\nclass CalculatorTest(unittest.TestCase):\n    pass\n",
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(cwd) = Utf8PathBuf::from_path_buf(temp_root) else {
+        return false;
+    };
+    let session = SessionRecord {
+        id: session_id,
+        project_id: ProjectId::new(),
+        title: "new authoring after verification".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd,
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let mut previous = SessionStateSnapshot::default();
+    previous.process_phase = ProcessPhase::Verify;
+    previous.active_targets = vec![
+        Utf8PathBuf::from("calculator.py"),
+        Utf8PathBuf::from("test_calculator.py"),
+    ];
+    previous.completion.verification_pending = true;
+    previous
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: first_turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create `calculator.py` and `test_calculator.py`, then run `python -m unittest`.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: first_turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new(), ChangeId::new()],
+                changes: vec![
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("calculator.py")),
+                        summary: "Added calculator.py".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("test_calculator.py")),
+                        summary: "Added test_calculator.py".to_string(),
+                    },
+                ],
+                summary: "Added calculator.py and test_calculator.py".to_string(),
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: second_turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Update `calculator.py` and `test_calculator.py` to support sqrt and pow, then run `python -m unittest`.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+    ];
+
+    let state = reduce_session_state_from_history_items(&session, &items, &[], &previous);
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+    let pending_targets = match active {
+        Some(ActiveWorkContract::RequestedWorkAuthoring {
+            pending_targets, ..
+        }) => pending_targets,
+        _ => Vec::new(),
+    };
+    matches!(state.process_phase, ProcessPhase::Author)
+        && !state.completion.verification_pending
+        && !state.completion.closeout_ready
+        && pending_targets
+            .iter()
+            .any(|target| target.as_str() == "calculator.py")
+        && pending_targets
+            .iter()
+            .any(|target| target.as_str() == "test_calculator.py")
+}
+
+struct TempDirCleanup(std::path::PathBuf);
+
+impl Drop for TempDirCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 pub(crate) fn partial_verification_pass_preserves_remaining_required_commands_fixture_passes()
