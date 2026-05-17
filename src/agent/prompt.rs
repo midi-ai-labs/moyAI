@@ -3708,14 +3708,14 @@ pub(crate) fn requested_work_contract_from_instruction_text(text: &str) -> Reque
                 contract.reference_inputs.push(trimmed.to_string());
                 continue;
             }
-            if let Some(target) = normalize_artifact_token(trimmed) {
+            for target in artifact_tokens_from_instruction_segment(trimmed) {
                 record_requested_target(&mut contract, &target, line_intent);
             }
         }
 
         for token in line_without_code
-            .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '、' | '，'))
-            .filter_map(normalize_artifact_token)
+            .split(artifact_token_separator)
+            .flat_map(artifact_tokens_from_instruction_segment)
         {
             if looks_like_naming_pattern(&token) {
                 contract.naming_patterns.push(token);
@@ -3794,7 +3794,7 @@ fn artifact_targets_from_instruction_text(text: &str, include_unknown: bool) -> 
     for raw_line in text.lines() {
         let (line_without_code, code_spans) = split_backtick_spans(raw_line);
         for code_span in code_spans {
-            if let Some(target) = normalize_artifact_token(code_span.trim()) {
+            for target in artifact_tokens_from_instruction_segment(code_span.trim()) {
                 if include_unknown
                     || classify_artifact_target(&target) != ArtifactTargetKind::Unknown
                 {
@@ -3804,8 +3804,8 @@ fn artifact_targets_from_instruction_text(text: &str, include_unknown: bool) -> 
         }
         targets.extend(
             line_without_code
-                .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '、' | '，'))
-                .filter_map(normalize_artifact_token)
+                .split(artifact_token_separator)
+                .flat_map(artifact_tokens_from_instruction_segment)
                 .filter(|target| {
                     include_unknown
                         || classify_artifact_target(target) != ArtifactTargetKind::Unknown
@@ -4043,6 +4043,9 @@ fn line_target_is_reference_input(line: &str, target: &str) -> bool {
     if line_explicitly_mutates_target(&normalized_line, &lower_target) {
         return false;
     }
+    if line_documents_target_into_separate_document(&normalized_line, &lower_target) {
+        return true;
+    }
     if [
         format!("{lower_target} を参照"),
         format!("{lower_target} を参考"),
@@ -4116,6 +4119,55 @@ fn line_target_is_reference_input(line: &str, target: &str) -> bool {
         && ["section", "heading", "節", "セクション"]
             .into_iter()
             .any(|marker| normalized_line.contains(marker))
+}
+
+fn line_documents_target_into_separate_document(normalized_line: &str, lower_target: &str) -> bool {
+    if classify_artifact_target(lower_target) != ArtifactTargetKind::Implementation {
+        return false;
+    }
+
+    let mentions_target_as_subject = [
+        format!("{lower_target} の"),
+        format!("about {lower_target}"),
+        format!("{lower_target} usage"),
+        format!("{lower_target} how to"),
+    ]
+    .into_iter()
+    .any(|pattern| normalized_line.contains(&pattern));
+    if !mentions_target_as_subject {
+        return false;
+    }
+
+    let documents_usage_or_behavior = [
+        "使い方",
+        "使用方法",
+        "利用方法",
+        "実行方法",
+        "テスト実行方法",
+        "テスト方法",
+        "確認方法",
+        "説明",
+        "解説",
+        "usage",
+        "how to use",
+        "how-to",
+        "test command",
+        "test instructions",
+        "describe",
+        "document",
+    ]
+    .into_iter()
+    .any(|marker| normalized_line.contains(marker));
+    if !documents_usage_or_behavior {
+        return false;
+    }
+
+    artifact_targets_from_instruction_text(normalized_line, false)
+        .into_iter()
+        .any(|target| {
+            target.to_ascii_lowercase() != lower_target
+                && classify_artifact_target(&target) == ArtifactTargetKind::Documentation
+        })
 }
 
 fn line_explicitly_mutates_target(normalized_line: &str, lower_target: &str) -> bool {
@@ -4412,6 +4464,34 @@ fn looks_like_naming_pattern(candidate: &str) -> bool {
     candidate.contains('*') || candidate.contains('?')
 }
 
+fn artifact_token_separator(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            ',' | '、'
+                | '，'
+                | '。'
+                | '；'
+                | ';'
+                | '：'
+                | ':'
+                | '（'
+                | '）'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+        )
+}
+
+fn artifact_tokens_from_instruction_segment(segment: &str) -> Vec<String> {
+    normalize_artifact_token(segment).into_iter().collect()
+}
+
 fn normalize_artifact_token(token: &str) -> Option<String> {
     let trimmed = token
         .trim_matches(|ch: char| {
@@ -4427,6 +4507,7 @@ fn normalize_artifact_token(token: &str) -> Option<String> {
     }
 
     let candidate = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    let candidate = truncate_after_artifact_extension(candidate).unwrap_or(candidate);
     if !(candidate.contains('/') || candidate.contains('\\') || candidate.contains('.')) {
         return None;
     }
@@ -4447,6 +4528,37 @@ fn normalize_artifact_token(token: &str) -> Option<String> {
     }
     Some(candidate.to_string())
 }
+
+fn truncate_after_artifact_extension(candidate: &str) -> Option<&str> {
+    let lower = candidate.to_ascii_lowercase();
+    let mut selected_end = None;
+    for extension in ARTIFACT_TOKEN_EXTENSIONS {
+        let mut search_from = 0usize;
+        while let Some(offset) = lower[search_from..].find(extension) {
+            let start = search_from + offset;
+            let end = start + extension.len();
+            let next = candidate[end..].chars().next();
+            if next.is_none_or(|ch| !artifact_extension_continuation(ch)) {
+                selected_end = Some(selected_end.map_or(end, |current: usize| current.min(end)));
+                break;
+            }
+            search_from = end;
+        }
+    }
+    selected_end.map(|end| &candidate[..end])
+}
+
+fn artifact_extension_continuation(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\')
+}
+
+const ARTIFACT_TOKEN_EXTENSIONS: &[&str] = &[
+    ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".go", ".java", ".kt", ".swift",
+    ".c", ".h", ".hpp", ".cpp", ".cc", ".cs", ".rb", ".php", ".sh", ".ps1", ".bat", ".cmd", ".sql",
+    ".html", ".css", ".scss", ".sass", ".vue", ".svelte", ".json", ".toml", ".yaml", ".yml",
+    ".xml", ".ini", ".env", ".md", ".rst", ".adoc", ".txt", ".csv", ".tsv", ".pdf", ".docx",
+    ".xlsx", ".pptx",
+];
 
 fn artifact_token_has_substantive_character(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '_' | '*' | '?')

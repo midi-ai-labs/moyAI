@@ -2893,6 +2893,373 @@ pub(crate) fn same_document_reference_update_remains_authoring_target_fixture_pa
         )
 }
 
+pub(crate) fn japanese_prompt_filename_boundaries_remain_artifact_targets_fixture_passes() -> bool {
+    let Ok(temp) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
+        return false;
+    };
+    let text = "Pythonで小さな挨拶CLIを作ってください。hello.py と test_hello.py を作成し、python -m unittest で検証してください。仕様: greet(name) は Hello, {name}! を返し、CLI は第一引数の名前に対して挨拶を出力します。";
+    let contract = requested_work_contract_from_instruction_text(text);
+    if contract.deliverable_targets != vec!["hello.py".to_string(), "test_hello.py".to_string()] {
+        return false;
+    }
+    if !contract
+        .verification_commands
+        .iter()
+        .any(|command| command == "python -m unittest")
+    {
+        return false;
+    }
+
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "japanese filename boundary".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: workspace,
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let user_item = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::UserTurn {
+            message_id: None,
+            content: vec![ContentPart::Text {
+                text: text.to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            turn_context: None,
+        },
+    };
+
+    let initial_items = vec![user_item.clone()];
+    let initial_state = reduce_session_state_from_history_items(
+        &session,
+        &initial_items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let initial_active =
+        active_work_contract_for_history_items(&session, &initial_items, &initial_state, &[]);
+    let expected_initial_targets = vec![
+        Utf8PathBuf::from("hello.py"),
+        Utf8PathBuf::from("test_hello.py"),
+    ];
+    if initial_state.process_phase != ProcessPhase::Author
+        || initial_state.active_targets != expected_initial_targets
+        || !matches!(
+            initial_active,
+            Some(ActiveWorkContract::RequestedWorkAuthoring {
+                pending_targets,
+                ..
+            }) if pending_targets == expected_initial_targets
+        )
+    {
+        return false;
+    }
+
+    let partial_items = vec![
+        user_item.clone(),
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                    kind: crate::session::ChangeKind::Add,
+                    path_before: None,
+                    path_after: Some(Utf8PathBuf::from("hello.py")),
+                    summary: "Added hello.py".to_string(),
+                }],
+                summary: "Added hello.py".to_string(),
+            },
+        },
+    ];
+    let partial_state = reduce_session_state_from_history_items(
+        &session,
+        &partial_items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    if partial_state.process_phase != ProcessPhase::Author
+        || partial_state.active_targets != vec![Utf8PathBuf::from("test_hello.py")]
+    {
+        return false;
+    }
+
+    let completed_items = vec![
+        user_item,
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new(), ChangeId::new()],
+                changes: vec![
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("hello.py")),
+                        summary: "Added hello.py".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("test_hello.py")),
+                        summary: "Added test_hello.py".to_string(),
+                    },
+                ],
+                summary: "Added hello.py and test_hello.py".to_string(),
+            },
+        },
+    ];
+    let completed_state = reduce_session_state_from_history_items(
+        &session,
+        &completed_items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let completed_active =
+        active_work_contract_for_history_items(&session, &completed_items, &completed_state, &[]);
+
+    matches!(completed_state.process_phase, ProcessPhase::Verify)
+        && completed_state.completion.verification_pending
+        && !completed_state.completion.closeout_ready
+        && completed_state
+            .verification
+            .required_commands
+            .iter()
+            .any(|command| command == "python -m unittest")
+        && matches!(
+            completed_active,
+            Some(ActiveWorkContract::Verification {
+                repair_required: false,
+                ..
+            })
+        )
+}
+
+pub(crate) fn docs_output_referenced_code_does_not_become_pending_authoring_target_fixture_passes()
+-> bool {
+    let Ok(temp) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
+        return false;
+    };
+    for (path, content) in [
+        (
+            "hello.py",
+            "def greet(name):\n    return f'Hello, {name}!'\n",
+        ),
+        (
+            "test_hello.py",
+            "import unittest\n\nclass HelloTest(unittest.TestCase):\n    pass\n",
+        ),
+    ] {
+        if fs::write(workspace.join(path).as_std_path(), content).is_err() {
+            return false;
+        }
+    }
+
+    let text = "この同じセッションで README.md を追加し、hello.py の使い方とテスト実行方法を短く書いてください。最後に python -m unittest を実行して確認してください。";
+    let contract = requested_work_contract_from_instruction_text(text);
+    if contract.deliverable_targets != vec!["README.md".to_string()]
+        || !contract
+            .reference_inputs
+            .iter()
+            .any(|target| target == "hello.py")
+        || contract
+            .deliverable_targets
+            .iter()
+            .any(|target| target == "hello.py")
+        || !contract
+            .verification_commands
+            .iter()
+            .any(|command| command == "python -m unittest")
+    {
+        return false;
+    }
+
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "docs output referenced code".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: workspace,
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let user_item = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::UserTurn {
+            message_id: None,
+            content: vec![ContentPart::Text {
+                text: text.to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            turn_context: None,
+        },
+    };
+
+    let initial_items = vec![user_item.clone()];
+    let initial_state = reduce_session_state_from_history_items(
+        &session,
+        &initial_items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let initial_active =
+        active_work_contract_for_history_items(&session, &initial_items, &initial_state, &[]);
+    let expected_initial_targets = vec![Utf8PathBuf::from("README.md")];
+    if initial_state.process_phase != ProcessPhase::Author
+        || initial_state.active_targets != expected_initial_targets
+        || !matches!(
+            initial_active,
+            Some(ActiveWorkContract::RequestedWorkAuthoring {
+                pending_targets,
+                ..
+            }) if pending_targets == expected_initial_targets
+        )
+    {
+        return false;
+    }
+
+    let authored_items = vec![
+        user_item.clone(),
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                    kind: crate::session::ChangeKind::Add,
+                    path_before: None,
+                    path_after: Some(Utf8PathBuf::from("README.md")),
+                    summary: "Added README.md".to_string(),
+                }],
+                summary: "Added README.md".to_string(),
+            },
+        },
+    ];
+    let authored_state = reduce_session_state_from_history_items(
+        &session,
+        &authored_items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let authored_active =
+        active_work_contract_for_history_items(&session, &authored_items, &authored_state, &[]);
+    if authored_state.process_phase != ProcessPhase::Verify
+        || authored_state.completion.closeout_ready
+        || !authored_state.completion.verification_pending
+        || authored_state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "hello.py")
+        || !authored_state
+            .verification
+            .required_commands
+            .iter()
+            .any(|command| command == "python -m unittest")
+        || !matches!(
+            authored_active,
+            Some(ActiveWorkContract::Verification {
+                repair_required: false,
+                ..
+            })
+        )
+    {
+        return false;
+    }
+
+    let verified_items = vec![
+        user_item,
+        authored_items[1].clone(),
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: ToolCallId::new(),
+                status: ToolLifecycleStatus::Completed,
+                title: "Run shell command: python -m unittest".to_string(),
+                output_text: "Ran 3 tests in 0.000s\n\nOK".to_string(),
+                metadata: Value::Null,
+                success: Some(true),
+                progress_effect: ToolProgressEffect::VerificationPassed,
+                blocked_action: None,
+                required_next_action: None,
+                result_hash: Some("docs-output-reference-code-verification".to_string()),
+                verification_run: Some(VerificationRunResult {
+                    command: "python -m unittest".to_string(),
+                    status: VerificationRunStatus::Passed,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    output_summary: "Ran 3 tests in 0.000s\n\nOK".to_string(),
+                    failure_cluster: None,
+                    artifact_refs: Vec::new(),
+                    requirement_refs: Vec::new(),
+                }),
+            },
+        },
+    ];
+    let verified_state = reduce_session_state_from_history_items(
+        &session,
+        &verified_items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let verified_active =
+        active_work_contract_for_history_items(&session, &verified_items, &verified_state, &[]);
+
+    verified_state.process_phase == ProcessPhase::Closeout
+        && verified_state.completion.closeout_ready
+        && !verified_state.completion.verification_pending
+        && verified_state.verification.required_commands.is_empty()
+        && verified_active.is_none()
+        && verified_state
+            .active_targets
+            .iter()
+            .all(|target| target.as_str() != "hello.py")
+}
+
 pub(crate) fn verification_failure_preserves_repair_targets_fixture_passes() -> bool {
     let session_id = crate::session::SessionId::new();
     let turn_id = TurnId::new();

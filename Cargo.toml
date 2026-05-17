@@ -28,6 +28,7 @@ clap = { version = "4.5.39", features = ["derive", "env"] }
 content_inspector = "0.2.4"
 crossterm = "0.28.1"
 directories-next = "2.0.0"
+encoding_rs = "0.8.35"
 eventsource-stream = "0.2.3"
 futures-util = "0.3.32"
 globset = "0.4.16"

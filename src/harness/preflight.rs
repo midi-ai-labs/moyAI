@@ -239,7 +239,9 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::agent::state::new_authoring_turn_overrides_prior_verification_fixture_passes()
             || !crate::agent::state::partial_verification_pass_preserves_remaining_required_commands_fixture_passes()
             || !crate::agent::state::reference_design_input_does_not_become_pending_authoring_target_fixture_passes()
-            || !crate::agent::state::same_document_reference_update_remains_authoring_target_fixture_passes())
+            || !crate::agent::state::same_document_reference_update_remains_authoring_target_fixture_passes()
+            || !crate::agent::state::japanese_prompt_filename_boundaries_remain_artifact_targets_fixture_passes()
+            || !crate::agent::state::docs_output_referenced_code_does_not_become_pending_authoring_target_fixture_passes())
     {
         diagnostics.push(
             "requested-work item-stream evidence did not preserve partial authoring phase, keep reference inputs out of unrelated pending deliverables, preserve same-document reference updates as authoring targets, promote completed authoring to exact verification shell authority before closeout, retain explicit verification commands after latest authoring writes, keep resumed/new authoring turns out of stale closeout or verification authority, or consume passed verification commands before clean closeout".to_string(),
@@ -410,6 +412,23 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
         );
     }
 
+    if gate.gate_id == "preflight.tool_lifecycle.shell_mutation_syncs_edit_baseline"
+        && (!crate::edit::safety::shell_mutation_syncs_confirmed_edit_baseline_fixture_passes()
+            || !crate::tool::shell::shell_change_set_syncs_confirmed_edit_baseline_fixture_passes())
+    {
+        diagnostics.push(
+            "shell-detected workspace file mutations can still bypass the confirmed-content baseline used by write/apply_patch stale-change guards".to_string(),
+        );
+    }
+
+    if gate.gate_id == "preflight.tool_lifecycle.shell_output_encoding_authority"
+        && !crate::tool::shell::shell_output_encoding_fixture_passes()
+    {
+        diagnostics.push(
+            "shell stdout/stderr display projection can still mojibake Japanese Windows output or fails to force Python subprocess UTF-8 text mode".to_string(),
+        );
+    }
+
     if gate.gate_id == "preflight.vision.input_item_lifecycle_authority"
         && (!crate::agent::prompt::vision_input_provider_projection_fixture_passes()
             || !crate::harness::manual_st::vision_prompt_uses_labeled_attachment_fixture_passes())
@@ -454,11 +473,12 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
 
     if gate.gate_id == "preflight.closeout.final_assistant_message_lifecycle"
         && (!crate::agent::loop_impl::clean_closeout_final_message_lifecycle_fixture_passes()
+            || !crate::agent::loop_impl::answer_only_final_message_lifecycle_fixture_passes()
             || !crate::agent::loop_impl::closeout_ready_final_response_timeout_guard_fixture_passes(
             ))
     {
         diagnostics.push(
-            "clean closeout still requires a synthetic completion tool or can wait indefinitely for a provider final message after item-stream evidence is already satisfied".to_string(),
+            "clean closeout still requires a synthetic completion tool, no-executable-work answer-only turns can still reject final assistant messages, or closeout can wait indefinitely for a provider final message after item-stream evidence is already satisfied".to_string(),
         );
     }
 
@@ -1347,6 +1367,32 @@ pub fn failure_registry_preflight_suite() -> Vec<PreflightGate> {
                 .to_string(),
         },
         PreflightGate {
+            gate_id: "preflight.tool_lifecycle.shell_mutation_syncs_edit_baseline"
+                .to_string(),
+            purpose: "workspace file mutations detected after shell execution are synchronized into the same confirmed-content baseline used by write/apply_patch, while deleted paths are removed from that baseline".to_string(),
+            tier: 2,
+            layer: PreflightLayer::Flow,
+            llm_mode: PreflightLlmMode::NoLlm,
+            deterministic: true,
+            status: PreflightGateStatus::Active,
+            family: PreflightGateFamily::ToolLifecycleAuthority,
+            fixture_id: "fixture.tool_lifecycle.shell_mutation_syncs_edit_baseline"
+                .to_string(),
+        },
+        PreflightGate {
+            gate_id: "preflight.tool_lifecycle.shell_output_encoding_authority"
+                .to_string(),
+            purpose: "shell stdout/stderr display projection preserves UTF-8 and Japanese Windows legacy code-page output, and Windows child Python processes are forced toward UTF-8 text mode".to_string(),
+            tier: 2,
+            layer: PreflightLayer::Flow,
+            llm_mode: PreflightLlmMode::NoLlm,
+            deterministic: true,
+            status: PreflightGateStatus::Active,
+            family: PreflightGateFamily::ToolLifecycleAuthority,
+            fixture_id: "fixture.tool_lifecycle.shell_output_encoding_authority"
+                .to_string(),
+        },
+        PreflightGate {
             gate_id: "preflight.vision.input_item_lifecycle_authority".to_string(),
             purpose: "vision attachments are provider-visible labeled image items while local source paths remain diagnostics/UI metadata, not workspace file authority".to_string(),
             tier: 2,
@@ -1396,7 +1442,7 @@ pub fn failure_registry_preflight_suite() -> Vec<PreflightGate> {
         },
         PreflightGate {
             gate_id: "preflight.closeout.final_assistant_message_lifecycle".to_string(),
-            purpose: "clean closeout uses assistant message completion with no provider-visible synthetic completion tool, while closeout-ready final-only provider waits are bounded by a terminal guard".to_string(),
+            purpose: "clean closeout and no-executable-work answer-only turns use assistant message completion with no provider-visible synthetic completion tool, while closeout-ready final-only provider waits are bounded by a terminal guard".to_string(),
             tier: 2,
             layer: PreflightLayer::Flow,
             llm_mode: PreflightLlmMode::NoLlm,
@@ -1560,12 +1606,14 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.state_reducer.requested_work_completion_promotes_verification"
                 .to_string(),
             family: PreflightGateFamily::StateReducerAuthority,
-            authority_source: "RequestedWorkAuthoring ReferenceInput reference_input_not_pending_deliverable same_document_reference_update_authoring_target FileChangeEvidence authoring_complete Verification verification_command_obligation before_closeout canonical_item_chronology turn_local_sequence_no latest_content_change_invalidates_prior_verification VerificationRunResult passed_verification_command_consumed clean_closeout".to_string(),
+            authority_source: "RequestedWorkAuthoring ReferenceInput reference_input_not_pending_deliverable same_document_reference_update_authoring_target japanese_prompt_filename_token_boundary docs_output_referenced_code_not_pending_deliverable FileChangeEvidence authoring_complete Verification verification_command_obligation before_closeout canonical_item_chronology turn_local_sequence_no latest_content_change_invalidates_prior_verification VerificationRunResult passed_verification_command_consumed clean_closeout".to_string(),
             required_refs: vec![
                 "RequestedWorkAuthoring".to_string(),
                 "ReferenceInput".to_string(),
                 "reference_input_not_pending_deliverable".to_string(),
                 "same_document_reference_update_authoring_target".to_string(),
+                "japanese_prompt_filename_token_boundary".to_string(),
+                "docs_output_referenced_code_not_pending_deliverable".to_string(),
                 "FileChangeEvidence".to_string(),
                 "authoring_complete".to_string(),
                 "Verification".to_string(),
@@ -2097,6 +2145,47 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fail_closed_on_missing_typed_projection: false,
         },
         PreflightFixture {
+            fixture_id: "fixture.tool_lifecycle.shell_mutation_syncs_edit_baseline"
+                .to_string(),
+            family: PreflightGateFamily::ToolLifecycleAuthority,
+            authority_source: "ShellTool detected_file_changes absolute_paths EditSafety confirmed_content_baseline write_apply_patch_stale_guard".to_string(),
+            required_refs: vec![
+                "ShellTool".to_string(),
+                "detected_file_changes".to_string(),
+                "absolute_paths".to_string(),
+                "EditSafety".to_string(),
+                "confirmed_content_baseline".to_string(),
+                "write_apply_patch_stale_guard".to_string(),
+            ],
+            forbidden_refs: vec![
+                "shell_change_relative_path_invalidation".to_string(),
+                "shell_file_change_without_edit_baseline".to_string(),
+                "stale_guard_requires_read_when_read_disallowed".to_string(),
+            ],
+            required_artifacts: Vec::new(),
+            fail_closed_on_missing_typed_projection: false,
+        },
+        PreflightFixture {
+            fixture_id: "fixture.tool_lifecycle.shell_output_encoding_authority"
+                .to_string(),
+            family: PreflightGateFamily::ToolLifecycleAuthority,
+            authority_source: "ShellTool stdout_bytes stderr_bytes display_projection Windows CP932 Shift_JIS fallback PYTHONUTF8 PYTHONIOENCODING".to_string(),
+            required_refs: vec![
+                "ShellTool".to_string(),
+                "stdout_bytes".to_string(),
+                "stderr_bytes".to_string(),
+                "display_projection".to_string(),
+                "PYTHONUTF8".to_string(),
+                "PYTHONIOENCODING".to_string(),
+            ],
+            forbidden_refs: vec![
+                "unconditional_utf8_lossy_decoding".to_string(),
+                "japanese_mojibake_in_shell_output".to_string(),
+            ],
+            required_artifacts: Vec::new(),
+            fail_closed_on_missing_typed_projection: false,
+        },
+        PreflightFixture {
             fixture_id: "fixture.vision.input_item_lifecycle_authority".to_string(),
             family: PreflightGateFamily::ProtocolItemLifecycle,
             authority_source: "CodexUserInput LocalImage ContentItem::InputImage image_label provider_visible_image_item diagnostic_source_path_not_workspace_authority".to_string(),
@@ -2188,12 +2277,13 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
         PreflightFixture {
             fixture_id: "fixture.closeout.final_assistant_message_lifecycle".to_string(),
             family: PreflightGateFamily::ControlEnvelopeProjection,
-            authority_source: "CodexTurnComplete final_assistant_message no_synthetic_completion_tool no_closeout_reread_tool no_open_obligations bounded_closeout_final_response_timeout satisfied_item_stream_terminal_guard".to_string(),
+            authority_source: "CodexTurnComplete final_assistant_message no_synthetic_completion_tool no_closeout_reread_tool no_open_obligations answer_only_no_executable_work bounded_closeout_final_response_timeout satisfied_item_stream_terminal_guard".to_string(),
             required_refs: vec![
                 "CodexTurnComplete".to_string(),
                 "final_assistant_message".to_string(),
                 "no_synthetic_completion_tool".to_string(),
                 "no_open_obligations".to_string(),
+                "answer_only_no_executable_work".to_string(),
                 "bounded_closeout_final_response_timeout".to_string(),
                 "satisfied_item_stream_terminal_guard".to_string(),
             ],
@@ -2201,6 +2291,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "synthetic_completion_required_action".to_string(),
                 "mandatory_closeout_reread".to_string(),
                 "unbounded_closeout_provider_wait".to_string(),
+                "answer_only_final_message_rejected_by_closeout_flag".to_string(),
             ],
             required_artifacts: Vec::new(),
             fail_closed_on_missing_typed_projection: true,

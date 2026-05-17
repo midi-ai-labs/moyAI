@@ -2604,6 +2604,7 @@ dependencies = [
  "content_inspector",
  "crossterm",
  "directories-next",
+ "encoding_rs",
  "eventsource-stream",
  "futures-util",
  "globset",

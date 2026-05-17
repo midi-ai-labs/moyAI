@@ -4,6 +4,7 @@ use std::process::Stdio;
 
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
+use encoding_rs::SHIFT_JIS;
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Deserialize;
@@ -136,7 +137,13 @@ impl Tool for ShellTool {
         )
         .await?;
         let after = snapshot_workspace(ctx.workspace)?;
-        let changes = build_shell_changes(&ctx, before, after)?;
+        let shell_changes = build_shell_changes(&ctx, before, after)?;
+        sync_shell_change_set(
+            &ctx.services.edit_safety,
+            ctx.session.session.id,
+            &shell_changes,
+        )?;
+        let changes = shell_changes.changes;
         let change_ids = ctx
             .services
             .store
@@ -152,19 +159,6 @@ impl Tool for ShellTool {
                 path_after: change.path_after.clone(),
             })
             .collect::<Vec<_>>();
-        let changed_paths = changes
-            .iter()
-            .flat_map(|change| {
-                [change.path_before.clone(), change.path_after.clone()]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        ctx.services
-            .edit_safety
-            .invalidate_paths(ctx.session.session.id, &changed_paths)?;
-
         let merged_output = if output.stderr.is_empty() {
             output.stdout
         } else if output.stdout.is_empty() {
@@ -332,7 +326,7 @@ async fn execute_shell_command(
         }
     };
 
-    let stdout = String::from_utf8_lossy(&join_pipe(stdout_task, "stdout").await?).into_owned();
+    let stdout = decode_shell_bytes_for_display(&join_pipe(stdout_task, "stdout").await?);
     let stderr_bytes = join_pipe(stderr_task, "stderr").await?;
     let stderr = if timed_out {
         if stderr_bytes.is_empty() {
@@ -340,11 +334,11 @@ async fn execute_shell_command(
         } else {
             format!(
                 "{}\ncommand timed out",
-                String::from_utf8_lossy(&stderr_bytes)
+                decode_shell_bytes_for_display(&stderr_bytes)
             )
         }
     } else {
-        String::from_utf8_lossy(&stderr_bytes).into_owned()
+        decode_shell_bytes_for_display(&stderr_bytes)
     };
 
     Ok(CommandOutput {
@@ -417,7 +411,13 @@ fn platform_bootstrap_env(
     #[cfg(windows)]
     {
         let _ = captured;
-        Vec::new()
+        vec![
+            ("PYTHONUTF8".to_string(), std::ffi::OsString::from("1")),
+            (
+                "PYTHONIOENCODING".to_string(),
+                std::ffi::OsString::from("utf-8"),
+            ),
+        ]
     }
     #[cfg(not(windows))]
     {
@@ -679,11 +679,45 @@ fn snapshot_workspace(
     Ok(snapshot)
 }
 
+struct ShellChangeSet {
+    changes: Vec<crate::edit::FileChange>,
+    removed_paths: Vec<Utf8PathBuf>,
+    current_paths: Vec<Utf8PathBuf>,
+}
+
+fn decode_shell_bytes_for_display(bytes: &[u8]) -> String {
+    match String::from_utf8(bytes.to_vec()) {
+        Ok(value) => value,
+        Err(_) => {
+            let (decoded, _, had_errors) = SHIFT_JIS.decode(bytes);
+            if had_errors {
+                String::from_utf8_lossy(bytes).into_owned()
+            } else {
+                decoded.into_owned()
+            }
+        }
+    }
+}
+
+fn sync_shell_change_set(
+    edit_safety: &crate::edit::EditSafety,
+    session_id: crate::session::SessionId,
+    shell_changes: &ShellChangeSet,
+) -> Result<(), ToolError> {
+    edit_safety
+        .sync_file_mutations(
+            session_id,
+            &shell_changes.removed_paths,
+            &shell_changes.current_paths,
+        )
+        .map_err(ToolError::from)
+}
+
 fn build_shell_changes(
     ctx: &ToolContext<'_>,
     before: HashMap<Utf8PathBuf, SnapshotEntry>,
     after: HashMap<Utf8PathBuf, SnapshotEntry>,
-) -> Result<Vec<crate::edit::FileChange>, ToolError> {
+) -> Result<ShellChangeSet, ToolError> {
     let mut all_paths = before
         .keys()
         .chain(after.keys())
@@ -693,6 +727,8 @@ fn build_shell_changes(
     all_paths.dedup();
 
     let mut changes = Vec::new();
+    let mut removed_paths = Vec::new();
+    let mut current_paths = Vec::new();
     for path in all_paths {
         let before_entry = before.get(&path);
         let after_entry = after.get(&path);
@@ -703,6 +739,12 @@ fn build_shell_changes(
         };
         if !changed {
             continue;
+        }
+        if before_entry.is_some() {
+            removed_paths.push(path.clone());
+        }
+        if after_entry.is_some() {
+            current_paths.push(path.clone());
         }
         let before_text = before_entry
             .and_then(|entry| entry.text.clone())
@@ -725,5 +767,92 @@ fn build_shell_changes(
         )?;
         changes.push(change);
     }
-    Ok(changes)
+    Ok(ShellChangeSet {
+        changes,
+        removed_paths,
+        current_paths,
+    })
+}
+
+pub(crate) fn shell_change_set_syncs_confirmed_edit_baseline_fixture_passes() -> bool {
+    let temp = match tempfile::tempdir() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let path = match Utf8PathBuf::from_path_buf(temp.path().join("shell-edited.txt")) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if fs::write(&path, "before").is_err() {
+        return false;
+    }
+    let edit_safety = crate::edit::EditSafety::default();
+    let session_id = crate::session::SessionId::new();
+    if edit_safety
+        .record_current_file_state(session_id, &path)
+        .is_err()
+    {
+        return false;
+    }
+    if fs::write(&path, "after").is_err() {
+        return false;
+    }
+    let shell_changes = ShellChangeSet {
+        changes: Vec::new(),
+        removed_paths: vec![path.clone()],
+        current_paths: vec![path.clone()],
+    };
+    if sync_shell_change_set(&edit_safety, session_id, &shell_changes).is_err() {
+        return false;
+    }
+    let metadata = match fs::metadata(&path) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let mtime_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as i64);
+    edit_safety
+        .assert_fresh_write(session_id, &path, mtime_ms, Some(metadata.len()))
+        .is_ok()
+}
+
+pub(crate) fn shell_output_encoding_fixture_passes() -> bool {
+    let cp932_japanese = [
+        0x8e, 0xa9, 0x91, 0x52, 0x91, 0xce, 0x90, 0x94, 0x82, 0xcc, 0x8a, 0xee, 0x96, 0x7b, 0x93,
+        0x49, 0x82, 0xc8, 0x92, 0x6c,
+    ];
+    if decode_shell_bytes_for_display(&cp932_japanese) != "自然対数の基本的な値" {
+        return false;
+    }
+    if decode_shell_bytes_for_display("自然対数の基本的な値".as_bytes()) != "自然対数の基本的な値"
+    {
+        return false;
+    }
+    let env = platform_bootstrap_env(&HashMap::new());
+    let env_map = env
+        .into_iter()
+        .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+        .collect::<HashMap<_, _>>();
+    if cfg!(windows) {
+        env_map.get("PYTHONUTF8").map(String::as_str) == Some("1")
+            && env_map.get("PYTHONIOENCODING").map(String::as_str) == Some("utf-8")
+    } else {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shell_change_set_syncs_confirmed_edit_baseline() {
+        assert!(super::shell_change_set_syncs_confirmed_edit_baseline_fixture_passes());
+    }
+
+    #[test]
+    fn shell_output_encoding_preserves_japanese_text() {
+        assert!(super::shell_output_encoding_fixture_passes());
+    }
 }

@@ -2274,10 +2274,30 @@ fn tool_choice_from_policy(policy: &crate::agent::prompt::PromptPolicy) -> ToolC
 }
 
 fn closeout_ready_final_message_authority(state: &SessionStateSnapshot) -> bool {
-    state.completion.closeout_ready
+    (state.completion.closeout_ready || answer_only_final_message_authority(state))
         && state.completion.open_work_count == 0
         && !state.completion.verification_pending
         && !state.completion.route_contract_pending
+        && state.completion.blocked_reason.is_none()
+        && state.active_targets.is_empty()
+        && state.verification.required_commands.is_empty()
+        && state.verification.failure_cluster.is_none()
+        && state.failure.is_none()
+}
+
+fn answer_only_final_message_authority(state: &SessionStateSnapshot) -> bool {
+    matches!(
+        state.process_phase,
+        crate::session::ProcessPhase::Discover | crate::session::ProcessPhase::Closeout
+    ) && state.completion.open_work_count == 0
+        && !state.completion.verification_pending
+        && !state.completion.route_contract_pending
+        && state.completion.blocked_reason.is_none()
+        && state.active_targets.is_empty()
+        && state.verification.required_commands.is_empty()
+        && state.verification.failing_labels.is_empty()
+        && state.verification.failure_cluster.is_none()
+        && state.failure.is_none()
 }
 
 fn clean_closeout_final_message_lifecycle(
@@ -2380,6 +2400,45 @@ pub(crate) fn clean_closeout_final_message_lifecycle_fixture_passes() -> bool {
             &state,
         ) == ToolChoice::None
         && closeout_ready_final_message_authority(&state)
+}
+
+pub(crate) fn answer_only_final_message_lifecycle_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = crate::session::ProcessPhase::Discover;
+    state.completion.closeout_ready = false;
+    state.completion.open_work_count = 0;
+    state.completion.verification_pending = false;
+    state.completion.route_contract_pending = false;
+
+    let mut executable = state.clone();
+    executable.process_phase = crate::session::ProcessPhase::Author;
+    executable.active_targets = vec![Utf8PathBuf::from("hello.py")];
+    executable.completion.open_work_count = 1;
+    executable.completion.blocked_reason =
+        Some("Requested implementation updates are still missing from the workspace.".to_string());
+
+    let mut verification = state.clone();
+    verification.process_phase = crate::session::ProcessPhase::Verify;
+    verification.completion.verification_pending = true;
+    verification
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+
+    answer_only_final_message_authority(&state)
+        && closeout_ready_final_message_authority(&state)
+        && tool_choice_for_dispatch(
+            &crate::agent::prompt::PromptPolicy::default(),
+            &BTreeSet::new(),
+            &state,
+        ) == ToolChoice::None
+        && !answer_only_final_message_authority(&executable)
+        && !closeout_ready_final_message_authority(&executable)
+        && open_executable_work_requires_tool_call(&executable)
+        && !answer_only_final_message_authority(&verification)
+        && !closeout_ready_final_message_authority(&verification)
+        && open_executable_work_requires_tool_call(&verification)
 }
 
 pub(crate) fn closeout_ready_final_response_timeout_guard_fixture_passes() -> bool {

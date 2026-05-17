@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::fs;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
@@ -33,6 +35,45 @@ impl EditSafety {
             .entry(session_id)
             .or_default()
             .insert(stamp.path.clone(), stamp);
+        Ok(())
+    }
+
+    pub fn record_current_file_state(
+        &self,
+        session_id: SessionId,
+        path: &Utf8Path,
+    ) -> Result<(), EditError> {
+        let metadata = fs::metadata(path)?;
+        self.record_read(
+            session_id,
+            FileReadStamp {
+                path: path.to_path_buf(),
+                read_at_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|value| value.as_millis() as i64)
+                    .unwrap_or_default(),
+                mtime_ms: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                    .map(|value| value.as_millis() as i64),
+                size_bytes: Some(metadata.len()),
+            },
+        )
+    }
+
+    pub fn sync_file_mutations(
+        &self,
+        session_id: SessionId,
+        removed_paths: &[Utf8PathBuf],
+        current_paths: &[Utf8PathBuf],
+    ) -> Result<(), EditError> {
+        self.invalidate_paths(session_id, removed_paths)?;
+        for path in current_paths {
+            if path.exists() {
+                self.record_current_file_state(session_id, path)?;
+            }
+        }
         Ok(())
     }
 
@@ -91,5 +132,63 @@ impl EditSafety {
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) fn shell_mutation_syncs_confirmed_edit_baseline_fixture_passes() -> bool {
+    let temp = match tempfile::tempdir() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let path = match Utf8PathBuf::from_path_buf(temp.path().join("target.txt")) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if fs::write(&path, "before").is_err() {
+        return false;
+    }
+    let safety = EditSafety::default();
+    let session_id = SessionId::new();
+    if safety.record_current_file_state(session_id, &path).is_err() {
+        return false;
+    }
+    if fs::write(&path, "after shell mutation").is_err() {
+        return false;
+    }
+    let metadata = match fs::metadata(&path) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let mtime_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as i64);
+    if safety
+        .assert_fresh_write(session_id, &path, mtime_ms, Some(metadata.len()))
+        .is_ok()
+    {
+        return false;
+    }
+    if safety
+        .sync_file_mutations(
+            session_id,
+            std::slice::from_ref(&path),
+            std::slice::from_ref(&path),
+        )
+        .is_err()
+    {
+        return false;
+    }
+    safety
+        .assert_fresh_write(session_id, &path, mtime_ms, Some(metadata.len()))
+        .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shell_mutation_syncs_confirmed_edit_baseline() {
+        assert!(super::shell_mutation_syncs_confirmed_edit_baseline_fixture_passes());
     }
 }
