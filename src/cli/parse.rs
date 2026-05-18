@@ -292,7 +292,7 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
 }
 
 #[derive(Parser)]
-#[command(name = "moyai")]
+#[command(name = "moyai", version)]
 struct RootCli {
     #[command(subcommand)]
     command: RootCommand,

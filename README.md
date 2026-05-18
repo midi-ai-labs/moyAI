@@ -63,6 +63,14 @@ npm run build:desktop-web
 cargo build --release --bin moyai-desktop
 ```
 
+For a Windows release zip, use the release packaging script:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.1.0
+```
+
+By default, the output is written outside the repository under `project_sandbox/releases/`. The zip contains `moyai.exe`, `moyai-desktop.exe`, bundled Desktop assets, README files, LICENSE, a sample config, and SHA256 checksums.
+
 The default Cargo feature set is Tauri-only for desktop builds and enables Tauri's production custom protocol, so a release executable loads bundled `ui/desktop-web/dist` assets instead of connecting to a local dev server.
 
 On cold start, `moyai-desktop.exe` shows the bundled moyAI logo splash for at least five seconds while it checks the launch-time config file state, workspace availability, the configured local LLM model catalog, and Docling Serve `/health` + `/ready` when Docling is enabled. If setup attention is required, the main window opens directly to Settings or LLM URL.

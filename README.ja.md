@@ -71,6 +71,14 @@ npm run build:desktop-web
 cargo build --release --bin moyai-desktop
 ```
 
+Windows 向けの配布用 zip を作る場合は、release packaging script を使います。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.1.0
+```
+
+出力先は既定で repository の外側にある `project_sandbox/releases/` です。zip には `moyai.exe`、`moyai-desktop.exe`、同梱済み Desktop assets、README、LICENSE、設定例、SHA256 checksum が入ります。
+
 release executable は、同梱された `ui/desktop-web/dist` assets を Tauri production custom protocol で読み込みます。利用先の非接続端末には、npm、Rust toolchain、internet access、local dev server は不要です。必要な binary と assets を USB などで移し、`moyai-desktop.exe` を実行してください。
 
 `moyai-desktop.exe` の cold start では、同梱の moyAI ロゴ splash を最低 5 秒表示します。その間に、設定ファイル、workspace、configured local LLM model catalog を確認します。Docling を有効にしている場合は、Docling Serve の `/health` と `/ready` も同じ起動チェックで確認します。設定が足りない場合、LLM 接続確認が通らない場合、Docling 有効時に Docling へ届かない場合は、メインウィンドウを開いたあとに Settings または LLM URL を自動で表示します。

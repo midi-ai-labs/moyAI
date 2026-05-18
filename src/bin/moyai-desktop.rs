@@ -15,6 +15,7 @@ const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Parser)]
 #[command(
     name = "moyai-desktop",
+    version,
     about = "Launch the moyAI desktop application."
 )]
 struct DesktopLauncherArgs {
