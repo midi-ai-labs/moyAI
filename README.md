@@ -1,131 +1,139 @@
 <p align="center">
-  <img src="logo/moyai_3d_logo.png" alt="moyAI logo" width="640">
+  <img src="logo/moyai_3d_logo.png" alt="moyAI logo" width="520">
 </p>
 
-# moyAI
+<h1 align="center">moyAI</h1>
 
-**moyAI** is a local-first coding agent for developers who need practical software engineering support in restricted, private, or offline-friendly environments.
+<p align="center">
+  <strong>A local-first coding agent for private workspaces, local LLMs, and closed-network development.</strong>
+</p>
 
-It connects to OpenAI-compatible local LLM servers, works directly with your workspace, and provides CLI, TUI, and native desktop interfaces on top of the same Rust core.
+<p align="center">
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.1.0"><img alt="Release" src="https://img.shields.io/badge/release-v0.1.0_beta-6d8cff"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
+  <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
+  <img alt="LLM" src="https://img.shields.io/badge/LLM-OpenAI_compatible-111827">
+</p>
 
-[日本語版 README](README.ja.md)
+<p align="center">
+  <a href="README.ja.md">日本語 README</a>
+  ·
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.1.0">Download beta</a>
+  ·
+  <a href="#quick-start">Quick Start</a>
+  ·
+  <a href="#configuration">Configuration</a>
+</p>
 
-## Why moyAI
+---
 
-Many coding agents assume a cloud-first environment: network access, hosted models, online plugin ecosystems, and external services. That model is not a good fit for teams working with private code, closed networks, local inference servers, or reproducible internal tooling.
+## What Is moyAI?
 
-moyAI was built for that environment. It focuses on local execution, explicit configuration, file-system-aware tools, durable session history, and deterministic verification assets that help you understand what happened during an agent run.
+moyAI is a Rust-based coding agent built for environments where cloud-first developer tools are hard to adopt.
 
-## Features
+It connects to an OpenAI-compatible local LLM server, reads and edits your workspace, runs shell commands, keeps session history, and presents the same agent core through a CLI, TUI, and Tauri Desktop app.
 
-- Local LLM support through OpenAI-compatible APIs.
-- LM Studio model discovery through `/v1/models` and `/api/v1/models` metadata.
-- CLI, TUI, and Tauri desktop app.
-- Workspace search, directory inspection, file reading, diff-based editing, and shell execution.
-- Size-aware read guards for large files, binary files, model checkpoints, and structured documents.
-- Optional Docling Serve and HTTP MCP integration for closed-network document workflows.
-- Session persistence with protocol-first history and Markdown export.
-- Vision-capable model support for image attachments from CLI and desktop workflows.
+The focus is straightforward: keep the model local, keep the evidence visible, and keep the workflow useful for real engineering tasks.
+
+## Why It Exists
+
+Many coding agents assume hosted models, online services, plugin marketplaces, and constant internet access. That is not always realistic for private source code, internal networks, local inference servers, or reproducible engineering environments.
+
+moyAI is designed around those constraints:
+
+| Principle | What It Means |
+| --- | --- |
+| Local-first | Works with OpenAI-compatible local LLM endpoints such as LM Studio. |
+| Workspace-aware | Searches, reads, edits, patches, and verifies files in your project. |
+| Evidence-oriented | Keeps transcript, file changes, tool output, and session history inspectable. |
+| GUI and terminal | Offers Desktop, CLI, and TUI entrypoints over the same Rust core. |
+| Closed-network friendly | Release builds run without npm, Rust toolchain, internet, or a dev server on the target machine. |
+
+## Highlights
+
+- Tauri Desktop app with project chat, quick chat, transcript, artifacts, settings, and provider discovery.
+- CLI and TUI for terminal-centered workflows.
+- OpenAI-compatible local LLM connection with model availability checks.
+- LM Studio metadata discovery through `/v1/models` and `/api/v1/models`.
+- Workspace search, directory inspection, guarded file reads, diff-based edits, and shell execution.
 - Permission presets: `default`, `auto_review`, and `full_access`.
-- Local instruction loading from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, and local `SKILL.md` files.
-- Reusable workflow commands from `.moyai/commands/*.md`.
-- Review entrypoints for uncommitted changes and branch comparison.
-- Deterministic preflight and harness commands for validating runtime contracts.
+- Vision-capable model support for image attachments.
+- Optional Docling Serve and HTTP MCP integration for document-heavy workflows.
+- Local instructions from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md`, and local `SKILL.md` files.
+- Protocol-first session history with Markdown export and deterministic preflight / harness commands.
 
-## Project Status
+## Current Release
 
-moyAI is an active Rust implementation aimed at closed-network and local-LLM use. The current repository includes the core runtime, CLI, TUI, desktop app, session storage, tool execution layer, provider metadata probing, and harness/preflight infrastructure.
+The first beta release is available here:
 
-## Current Target Environment
+[**moyAI v0.1.0 beta release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.1.0)
 
-moyAI is currently developed and tested primarily on Windows.
+The Windows release zip includes:
 
-During development, moyAI has been optimized for `qwen/qwen3.6-35b-a3b` hosted by LM Studio, specifically the `lmstudio-community` build. Other models and broader provider profiles are planned for future development.
+- `bin/moyai.exe` for CLI / TUI workflows
+- `bin/moyai-desktop.exe` for the Desktop app
+- bundled `ui/desktop-web/dist/` assets
+- README files, license, release notes, config example, manifest, and SHA256 checksums
 
-## Requirements
+On the target Windows machine, you do not need npm, the Rust toolchain, internet access, or a local web dev server.
 
-- Rust toolchain with the 2024 edition support.
-- A local or reachable OpenAI-compatible LLM endpoint.
-- Optional: LM Studio for model metadata discovery.
-- Optional: Docling Serve or configured HTTP MCP servers for document workflows.
+## Quick Start
 
-## Build
+1. Start a local OpenAI-compatible LLM server.
+2. Download and extract the latest release zip.
+3. Launch `bin/moyai-desktop.exe`.
+4. Open `LLM URL`, set the base URL and model, then confirm model discovery.
+5. Use Quick Chat, or select a project workspace and start a development chat.
 
-```bash
-cargo build
-```
-
-The desktop UI is a Tauri + TypeScript bundle. On a build machine, install the locked npm dependencies and build the web assets before producing a desktop release:
-
-```bash
-npm install
-npm run build:desktop-web
-cargo build --release --bin moyai-desktop
-```
-
-For a Windows release zip, use the release packaging script:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.1.0
-```
-
-By default, the output is written outside the repository under `project_sandbox/releases/`. The zip contains `moyai.exe`, `moyai-desktop.exe`, bundled Desktop assets, README files, LICENSE, a sample config, and SHA256 checksums.
-
-The default Cargo feature set is Tauri-only for desktop builds and enables Tauri's production custom protocol, so a release executable loads bundled `ui/desktop-web/dist` assets instead of connecting to a local dev server.
-
-On cold start, `moyai-desktop.exe` shows the bundled moyAI logo splash for at least five seconds while it checks the launch-time config file state, workspace availability, the configured local LLM model catalog, and Docling Serve `/health` + `/ready` when Docling is enabled. If setup attention is required, the main window opens directly to Settings or LLM URL.
-
-The target offline machine does not need npm, the Rust toolchain, or internet access. Move the built release executable/assets by USB and run `moyai-desktop.exe`.
-
-## Run
+CLI examples:
 
 ```bash
-cargo run -- run --dir /path/to/workspace "Inspect this project and summarize the main modules."
-```
-
-After installing the binary:
-
-```bash
-moyai run --dir /path/to/workspace "Add tests for the parser."
+moyai run --dir /path/to/workspace "Inspect this project and summarize the main modules."
 moyai tui --dir /path/to/workspace
 moyai desktop --dir /path/to/workspace
 moyai-desktop
 ```
 
-Release builds include `moyai.exe` for CLI/TUI workflows and `moyai-desktop.exe` for launching the desktop app directly. On Windows, double-click `moyai-desktop.exe` or run `.\target\release\moyai-desktop.exe` to open the desktop app; no `npm run dev` / `127.0.0.1` server is required for release. The desktop runtime window/taskbar icon uses `logo/fabicon/android-chrome-512x512.png`, and the Windows executable resource uses the multi-size `logo/fabicon/moyai_app_icon.ico`.
-When no workspace is specified, the desktop app opens a workspace-free Quick Chat state. Project work starts only after selecting a folder from the project add control or passing `--dir`.
+Development build:
+
+```bash
+cargo build
+```
+
+Desktop release build:
+
+```bash
+npm install
+npm run build:desktop-web
+cargo build --release --bin moyai --bin moyai-desktop
+```
+
+Windows release package:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.1.0
+```
+
+By default, release artifacts are written outside the repository under `project_sandbox/releases/`.
 
 ## Configuration
 
-moyAI reads configuration from one user-wide config file, then applies environment variables and CLI overrides.
+moyAI uses one user-wide config file, then applies environment variables and CLI overrides on top.
 
-On first normal app startup, moyAI creates a global config file with editable default values if it does not already exist:
+Default Windows config path:
 
-- `%APPDATA%\midi-ai-labs\moyai\config\config.toml`
+```text
+%APPDATA%\midi-ai-labs\moyai\config\config.toml
+```
 
-The release folder and workspace folders do not need to contain a `.toml` file. Place the binary in a stable install directory such as `C:\tools\moyai\`; moyAI stores user configuration and session data under the Windows user profile. Desktop and TUI settings screens save to the same user-wide config file, so CLI and GUI runs see the same provider, permission, Docling, MCP, and file guard settings.
-
-Common environment variables:
-
-- `MOYAI_BASE_URL`
-- `MOYAI_MODEL`
-- `MOYAI_CONFIG_PATH`
-- `MOYAI_DATA_DIR`
-- `MOYAI_ACCESS_MODE`
-- `MOYAI_REQUEST_TIMEOUT_MS`
-- `MOYAI_STREAM_IDLE_TIMEOUT_MS`
-- `MOYAI_CONTEXT_WINDOW`
-- `MOYAI_MAX_OUTPUT_TOKENS`
-- `MOYAI_SUPPORTS_IMAGES`
-- `MOYAI_DOCLING_ENABLED`
-- `MOYAI_MCP_ENABLED`
+The release folder and workspace folders do not need their own config file. Desktop, TUI, and CLI all read the same user-wide settings.
 
 Example:
 
 ```toml
 [model]
 base_url = "http://127.0.0.1:1234"
-# LM Studio-hosted qwen3.6-35b-a3b, lmstudio-community build.
 model = "qwen/qwen3.6-35b-a3b"
 context_window = 131072
 supports_tools = true
@@ -142,7 +150,33 @@ base_url = "http://127.0.0.1:8123"
 enabled = false
 ```
 
-## Instruction Files
+Common environment variables:
+
+- `MOYAI_BASE_URL`
+- `MOYAI_MODEL`
+- `MOYAI_CONFIG_PATH`
+- `MOYAI_DATA_DIR`
+- `MOYAI_ACCESS_MODE`
+- `MOYAI_REQUEST_TIMEOUT_MS`
+- `MOYAI_STREAM_IDLE_TIMEOUT_MS`
+- `MOYAI_CONTEXT_WINDOW`
+- `MOYAI_MAX_OUTPUT_TOKENS`
+- `MOYAI_SUPPORTS_IMAGES`
+- `MOYAI_DOCLING_ENABLED`
+- `MOYAI_MCP_ENABLED`
+
+## Startup Checks
+
+On cold start, `moyai-desktop.exe` shows the moyAI splash for at least five seconds while it checks:
+
+- global config file state
+- workspace availability
+- configured provider and model catalog
+- Docling Serve `/health` and `/ready` when Docling is enabled
+
+If setup attention is needed, the app opens directly to Settings or LLM URL.
+
+## Project Instructions
 
 moyAI loads local project instructions from:
 
@@ -166,6 +200,12 @@ cargo test --lib
 cargo test --tests
 cargo run --bin moyai -- preflight run
 ```
+
+## Status
+
+moyAI is currently developed and tested primarily on Windows. The main development profile uses `qwen/qwen3.6-35b-a3b` hosted by LM Studio, especially the `lmstudio-community` build.
+
+Other OpenAI-compatible models can be used, but model behavior, tool-use quality, context length, and vision support vary by provider and model.
 
 ## License
 
