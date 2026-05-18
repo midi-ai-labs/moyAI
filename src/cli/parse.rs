@@ -1,5 +1,5 @@
 use camino::Utf8PathBuf;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, error::ErrorKind};
 
 use crate::error::CliUsageError;
 use crate::session::SessionId;
@@ -138,7 +138,21 @@ pub enum CliCommand {
 }
 
 pub fn parse() -> Result<CliCommand, CliUsageError> {
-    let cli = RootCli::try_parse().map_err(|error| CliUsageError::Message(error.to_string()))?;
+    let cli = match RootCli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            error
+                .print()
+                .map_err(|print_error| CliUsageError::Message(print_error.to_string()))?;
+            std::process::exit(0);
+        }
+        Err(error) => return Err(CliUsageError::Message(error.to_string())),
+    };
     match cli.command {
         RootCommand::Run(args) => {
             if args.session_id.is_some() && args.continue_last {
