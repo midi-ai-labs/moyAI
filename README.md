@@ -26,6 +26,10 @@
   <a href="#configuration">Configuration</a>
 </p>
 
+<p align="center">
+  <img src="logo/moyai-screenshot-sample.png" alt="moyAI Desktop screenshot" width="920">
+</p>
+
 ---
 
 ## What Is moyAI?
