@@ -99,7 +99,6 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             switch_workspace,
             browse_workspace,
             open_workspace_folder,
-            open_project_config_folder,
             open_global_config_folder,
             open_typed_path,
             open_artifact_folder,
@@ -109,12 +108,10 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             load_provider_models,
             select_provider_model,
             apply_provider_session,
-            save_provider_project,
             save_provider_global,
             set_config_selection,
             set_config_value,
             apply_session_config,
-            save_project_config,
             save_global_config,
             toggle_access_mode,
             preview_window_opacity,
@@ -607,13 +604,6 @@ async fn open_workspace_folder(
 }
 
 #[tauri::command]
-async fn open_project_config_folder(
-    controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::open_project_config_folder).await
-}
-
-#[tauri::command]
 async fn open_global_config_folder(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
@@ -697,13 +687,6 @@ async fn apply_provider_session(
 }
 
 #[tauri::command]
-async fn save_provider_project(
-    controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::save_provider_project).await
-}
-
-#[tauri::command]
 async fn save_provider_global(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
@@ -737,13 +720,6 @@ async fn apply_session_config(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
     mutate_controller(controller, DesktopController::apply_session_config).await
-}
-
-#[tauri::command]
-async fn save_project_config(
-    controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::save_project_config).await
 }
 
 #[tauri::command]

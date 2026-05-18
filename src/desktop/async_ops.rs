@@ -1,7 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DesktopAsyncOperationKind {
     AgentRun,
-    StartupProviderProbe,
+    StartupReadinessCheck,
     ProviderModelCatalogLoad,
     WorkspaceLoad,
     SessionLoad,
@@ -17,7 +17,7 @@ impl DesktopAsyncOperationKind {
     pub fn key(self) -> &'static str {
         match self {
             Self::AgentRun => "agent_run",
-            Self::StartupProviderProbe => "startup_provider_probe",
+            Self::StartupReadinessCheck => "startup_readiness_check",
             Self::ProviderModelCatalogLoad => "provider_model_catalog_load",
             Self::WorkspaceLoad => "workspace_load",
             Self::SessionLoad => "session_load",

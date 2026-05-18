@@ -402,12 +402,9 @@ impl<'a> TurnRuntime<'a> {
                 system_prompt,
                 messages: provider_messages,
                 tools: tools.clone(),
-                timeout_ms: closeout_final_response_timeout_ms(
-                    step_request.config.model.request_timeout_ms,
-                    &step_request.state,
-                    active_work.as_ref(),
-                ),
+                timeout_ms: step_request.config.model.request_timeout_ms,
                 stream_idle_timeout_ms: step_request.config.model.stream_idle_timeout_ms,
+                stream_max_retries: step_request.config.model.stream_max_retries,
                 extra_headers: step_request.config.model.extra_headers.clone(),
                 temperature: step_request.config.model.temperature,
                 top_p: step_request.config.model.top_p,
@@ -422,6 +419,11 @@ impl<'a> TurnRuntime<'a> {
                     matches!(dispatch_tool_choice, ToolChoice::Required),
                 ),
             };
+            let terminal_response_timeout_ms = terminal_response_timeout_ms_for_state(
+                step_request.config.model.request_timeout_ms,
+                &step_request.state,
+                active_work.as_ref(),
+            );
             let diagnostics = request_diagnostics_from_chat(
                 &chat_request,
                 &tools,
@@ -444,11 +446,12 @@ impl<'a> TurnRuntime<'a> {
             })?;
 
             let mut stream = StreamAccumulator::default();
-            let response = match stream_chat_with_provider_request_timeout(
+            let response = match stream_chat_with_optional_terminal_timeout(
                 &self.agent.llm,
                 chat_request,
                 step_request.cancel.clone(),
                 &mut stream,
+                terminal_response_timeout_ms,
             )
             .await
             {
@@ -1266,14 +1269,17 @@ impl<'a> TurnRuntime<'a> {
     }
 }
 
-async fn stream_chat_with_provider_request_timeout(
+async fn stream_chat_with_optional_terminal_timeout(
     llm: &Arc<dyn LlmClient>,
     request: ChatRequest,
     cancel: CancellationToken,
     sink: &mut dyn LlmEventSink,
+    terminal_response_timeout_ms: Option<u64>,
 ) -> Result<LlmResponseSummary, crate::error::LlmError> {
-    let timeout_ms = request.timeout_ms;
     let request_future = llm.stream_chat(request, cancel, sink);
+    let Some(timeout_ms) = terminal_response_timeout_ms else {
+        return request_future.await;
+    };
     if timeout_ms == 0 {
         return request_future.await;
     }
@@ -2326,6 +2332,15 @@ fn closeout_final_response_timeout_ms(
     configured_timeout_ms.min(CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS)
 }
 
+fn terminal_response_timeout_ms_for_state(
+    configured_timeout_ms: u64,
+    state: &SessionStateSnapshot,
+    active_work: Option<&ActiveWorkContract>,
+) -> Option<u64> {
+    clean_closeout_final_message_lifecycle(state, active_work)
+        .then(|| closeout_final_response_timeout_ms(configured_timeout_ms, state, active_work))
+}
+
 fn provider_error_is_request_timeout(error: &crate::error::LlmError) -> bool {
     error
         .to_string()
@@ -2447,10 +2462,17 @@ pub(crate) fn closeout_ready_final_response_timeout_guard_fixture_passes() -> bo
     state.completion.open_work_count = 0;
     state.completion.verification_pending = false;
     state.completion.route_contract_pending = false;
+    let mut authoring_state = SessionStateSnapshot::default();
+    authoring_state.process_phase = crate::session::ProcessPhase::Author;
+    authoring_state.active_targets = vec![Utf8PathBuf::from("docs.md")];
+    authoring_state.completion.closeout_ready = false;
+    authoring_state.completion.open_work_count = 1;
     closeout_final_response_timeout_ms(0, &state, None) == CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS
         && closeout_final_response_timeout_ms(CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS + 1, &state, None)
             == CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS
         && closeout_final_response_timeout_ms(30_000, &state, None) == 30_000
+        && terminal_response_timeout_ms_for_state(30_000, &state, None) == Some(30_000)
+        && terminal_response_timeout_ms_for_state(30_000, &authoring_state, None).is_none()
         && closeout_timeout_fallback_text() == "完了しました。"
         && provider_error_is_request_timeout(&crate::error::LlmError::Message(
             provider_request_timeout_error_message(CLOSEOUT_FINAL_RESPONSE_TIMEOUT_MS),

@@ -1,11 +1,8 @@
-use std::collections::BTreeMap;
 use std::fs;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use directories_next::ProjectDirs;
 use serde::{Deserialize, Serialize};
-
-use crate::config::model::PartialResolvedConfig;
 
 const DESKTOP_PREFS_ENV: &str = "MOYAI_DESKTOP_PREFS_PATH";
 
@@ -15,14 +12,6 @@ pub struct DesktopPreferences {
     pub window_opacity_percent: Option<i32>,
     #[serde(default)]
     pub deleted_project_roots: Vec<Utf8PathBuf>,
-    #[serde(default)]
-    pub workspaces: BTreeMap<String, DesktopWorkspacePreferences>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DesktopWorkspacePreferences {
-    #[serde(default)]
-    pub session_override: PartialResolvedConfig,
 }
 
 impl DesktopPreferences {
@@ -53,25 +42,6 @@ impl DesktopPreferences {
         fs::rename(&temp_path, &path).map_err(|error| error.to_string())
     }
 
-    pub fn workspace_override(&self, root: &Utf8Path) -> Option<PartialResolvedConfig> {
-        self.workspaces
-            .get(root.as_str())
-            .map(|prefs| prefs.session_override.clone())
-    }
-
-    pub fn set_workspace_override(&mut self, root: &Utf8Path, patch: PartialResolvedConfig) {
-        self.workspaces.insert(
-            root.as_str().to_string(),
-            DesktopWorkspacePreferences {
-                session_override: patch,
-            },
-        );
-    }
-
-    pub fn clear_workspace_override(&mut self, root: &Utf8Path) {
-        self.workspaces.remove(root.as_str());
-    }
-
     pub fn mark_project_deleted(&mut self, root: &Utf8Path) {
         if !self.deleted_project_roots.iter().any(|path| path == root) {
             self.deleted_project_roots.push(root.to_path_buf());
@@ -83,7 +53,6 @@ impl DesktopPreferences {
         {
             self.last_workspace = None;
         }
-        self.clear_workspace_override(root);
     }
 
     pub fn unmark_project_deleted(&mut self, root: &Utf8Path) {
@@ -111,22 +80,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_delete_tombstone_clears_restore_state_and_override() {
+    fn project_delete_tombstone_clears_restore_state() {
         let root = Utf8Path::new("C:/workspace/deleted");
         let mut preferences = DesktopPreferences {
             last_workspace: Some(root.to_path_buf()),
             window_opacity_percent: Some(95),
             deleted_project_roots: Vec::new(),
-            workspaces: BTreeMap::new(),
         };
-        preferences.set_workspace_override(root, PartialResolvedConfig::default());
 
         preferences.mark_project_deleted(root);
         preferences.mark_project_deleted(root);
 
         assert_eq!(preferences.deleted_project_roots, vec![root.to_path_buf()]);
         assert!(preferences.last_workspace.is_none());
-        assert!(preferences.workspace_override(root).is_none());
         assert!(preferences.is_project_deleted(root));
 
         preferences.unmark_project_deleted(root);

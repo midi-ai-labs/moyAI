@@ -78,6 +78,7 @@ pub async fn maybe_compact(
                 tools: Vec::new(),
                 timeout_ms: request.config.model.request_timeout_ms,
                 stream_idle_timeout_ms: request.config.model.stream_idle_timeout_ms,
+                stream_max_retries: request.config.model.stream_max_retries,
                 extra_headers: request.config.model.extra_headers.clone(),
                 temperature: request.config.model.temperature,
                 top_p: request.config.model.top_p,

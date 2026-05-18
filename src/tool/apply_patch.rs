@@ -13,9 +13,7 @@ use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
 use crate::tool::write_support::{build_read_stamp, to_summary, write_text_file};
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
-use crate::workspace::{
-    AccessKind, GuardedPath, PathGuard, is_protected_instruction_or_config_path,
-};
+use crate::workspace::{AccessKind, GuardedPath, PathGuard, is_protected_workspace_authority_path};
 
 #[derive(Debug, Deserialize)]
 pub struct ApplyPatchInput {
@@ -439,12 +437,12 @@ fn edit_request_risks(
     if move_or_rename {
         risks.push(PermissionRisk::MoveOrRename);
     }
-    if is_protected_instruction_or_config_path(workspace_root, &guarded.absolute)
+    if is_protected_workspace_authority_path(workspace_root, &guarded.absolute)
         || move_guard.as_ref().is_some_and(|target| {
-            is_protected_instruction_or_config_path(workspace_root, &target.absolute)
+            is_protected_workspace_authority_path(workspace_root, &target.absolute)
         })
     {
-        risks.push(PermissionRisk::ProtectedInstructionOrConfig);
+        risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
     }
     risks
 }

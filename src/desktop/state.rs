@@ -82,11 +82,11 @@ impl DesktopState {
         if self.startup.status == super::startup::DesktopStartupStatus::Loading {
             self.view
                 .async_operations
-                .begin_unique(DesktopAsyncOperationKind::StartupProviderProbe);
+                .begin_unique(DesktopAsyncOperationKind::StartupReadinessCheck);
         } else {
             self.view
                 .async_operations
-                .finish_kind(DesktopAsyncOperationKind::StartupProviderProbe);
+                .finish_kind(DesktopAsyncOperationKind::StartupReadinessCheck);
         }
         self.apply_startup_overlay();
     }
@@ -94,17 +94,34 @@ impl DesktopState {
     pub fn finish_startup_provider_model_load(&mut self, infos: &[ProviderModelInfo]) {
         self.startup
             .complete_provider_catalog(&self.provider_config.effective_config, infos);
-        self.view
-            .async_operations
-            .finish_kind(DesktopAsyncOperationKind::StartupProviderProbe);
+        self.sync_startup_readiness_operation();
         self.apply_startup_overlay();
     }
 
     pub fn fail_startup_provider_model_load(&mut self, message: impl Into<String>) {
         self.startup.fail_provider_catalog(message);
-        self.view
-            .async_operations
-            .finish_kind(DesktopAsyncOperationKind::StartupProviderProbe);
+        self.sync_startup_readiness_operation();
+        self.apply_startup_overlay();
+    }
+
+    pub fn begin_startup_docling_check(&mut self) -> bool {
+        let should_probe = self
+            .startup
+            .begin_docling_check(&self.provider_config.effective_config);
+        self.sync_startup_readiness_operation();
+        self.apply_startup_overlay();
+        should_probe
+    }
+
+    pub fn finish_startup_docling_check(&mut self, base_url: &str) {
+        self.startup.complete_docling_check(base_url);
+        self.sync_startup_readiness_operation();
+        self.apply_startup_overlay();
+    }
+
+    pub fn fail_startup_docling_check(&mut self, message: impl Into<String>) {
+        self.startup.fail_docling_check(message);
+        self.sync_startup_readiness_operation();
         self.apply_startup_overlay();
     }
 
@@ -384,6 +401,24 @@ impl DesktopState {
         self.view
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::SessionLoad);
+    }
+
+    fn sync_startup_readiness_operation(&mut self) {
+        if self.startup.status == super::startup::DesktopStartupStatus::Loading {
+            if !self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::StartupReadinessCheck)
+            {
+                self.view
+                    .async_operations
+                    .begin_unique(DesktopAsyncOperationKind::StartupReadinessCheck);
+            }
+        } else {
+            self.view
+                .async_operations
+                .finish_kind(DesktopAsyncOperationKind::StartupReadinessCheck);
+        }
     }
 
     pub fn selected_session_title(&self) -> String {

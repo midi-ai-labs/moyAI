@@ -350,14 +350,6 @@ impl TuiController {
             KeyCode::F(3) => {
                 let message = self
                     .config_editor
-                    .save_scope(&self.app.workspace.root, ConfigSaveScope::Project)
-                    .map_err(AppRunError::Message)?;
-                self.reload_config().await?;
-                self.state.status_message = Some(message);
-            }
-            KeyCode::F(4) => {
-                let message = self
-                    .config_editor
                     .save_scope(&self.app.workspace.root, ConfigSaveScope::Global)
                     .map_err(AppRunError::Message)?;
                 self.reload_config().await?;
@@ -1184,7 +1176,7 @@ impl TuiController {
                 Line::from(""),
                 Line::from("Up/Down select field"),
                 Line::from("Type edits current value, Backspace/Delete clear"),
-                Line::from("F2 Apply Session  F3 Save Project  F4 Save Global"),
+                Line::from("F2 Apply Session  F3 Save Global"),
                 Line::from("Blank value means inherit/remove"),
                 Line::from(format!(
                     "Env override: {}",

@@ -23,7 +23,7 @@ use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
-use crate::workspace::{AccessKind, PathGuard, is_protected_instruction_or_config_path};
+use crate::workspace::{AccessKind, PathGuard, is_protected_workspace_authority_path};
 
 #[derive(Debug, Deserialize)]
 pub struct ShellInput {
@@ -546,7 +546,7 @@ fn shell_permission_risks(
         risks.push(PermissionRisk::Network);
     }
     if command_mentions_protected_target(workspace, command) {
-        risks.push(PermissionRisk::ProtectedInstructionOrConfig);
+        risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
     }
     risks
 }
@@ -611,8 +611,6 @@ fn command_mentions_protected_target(
         "agents.local.md",
         "claude.md",
         "skill.md",
-        "moyai.toml",
-        ".moyai/config.toml",
         ".moyai/rules",
         ".moyai\\rules",
     ]
@@ -623,7 +621,7 @@ fn command_mentions_protected_target(
     }
     extract_absolute_paths(command)
         .into_iter()
-        .any(|path| is_protected_instruction_or_config_path(&workspace.root, &path))
+        .any(|path| is_protected_workspace_authority_path(&workspace.root, &path))
 }
 
 #[derive(Clone)]

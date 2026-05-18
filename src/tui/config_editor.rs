@@ -2,7 +2,7 @@ use std::fs;
 
 use camino::Utf8Path;
 
-use crate::config::loader::{global_config_path, project_config_paths};
+use crate::config::loader::global_config_path;
 use crate::config::model::{
     AccessMode, McpServerConfig, PartialDoclingConfig, PartialFileGuardConfig,
     PartialInspectionConfig, PartialMcpConfig, PartialModelConfig, PartialPermissionsConfig,
@@ -12,7 +12,6 @@ use crate::config::model::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigSaveScope {
     Session,
-    Project,
     Global,
 }
 
@@ -268,15 +267,10 @@ impl ConfigEditorState {
         parse_editor_patch(self)
     }
 
-    pub fn save_scope(&self, root: &Utf8Path, scope: ConfigSaveScope) -> Result<String, String> {
+    pub fn save_scope(&self, _root: &Utf8Path, scope: ConfigSaveScope) -> Result<String, String> {
         match scope {
             ConfigSaveScope::Session => {
                 return Err("session override is memory only; use Apply Session".to_string());
-            }
-            ConfigSaveScope::Project => {
-                let path = choose_project_config_path(root);
-                save_config_sections(&path, self)?;
-                Ok(format!("saved project config to {}", path))
             }
             ConfigSaveScope::Global => {
                 let path = global_config_path().map_err(|error| error.to_string())?;
@@ -284,17 +278,6 @@ impl ConfigEditorState {
                 Ok(format!("saved global config to {}", path))
             }
         }
-    }
-}
-
-fn choose_project_config_path(root: &Utf8Path) -> camino::Utf8PathBuf {
-    let [primary, secondary] = project_config_paths(root);
-    if secondary.exists() {
-        secondary
-    } else if primary.exists() {
-        primary
-    } else {
-        primary
     }
 }
 

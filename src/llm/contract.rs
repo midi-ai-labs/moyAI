@@ -84,6 +84,7 @@ pub struct ChatRequest {
     pub tools: Vec<ToolSchema>,
     pub timeout_ms: u64,
     pub stream_idle_timeout_ms: u64,
+    pub stream_max_retries: u8,
     pub extra_headers: BTreeMap<String, String>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,

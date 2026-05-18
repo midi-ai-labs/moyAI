@@ -27,12 +27,6 @@ pub fn is_instruction_file(path: &Utf8Path) -> bool {
         .any(|candidate| file_name.eq_ignore_ascii_case(candidate))
 }
 
-pub fn is_workspace_config_path(root: &Utf8Path, path: &Utf8Path) -> bool {
-    relative_workspace_path(root, path).is_some_and(|relative| {
-        relative == Utf8Path::new("moyai.toml") || relative == Utf8Path::new(".moyai/config.toml")
-    })
-}
-
 pub fn is_rule_file(root: &Utf8Path, path: &Utf8Path) -> bool {
     relative_workspace_path(root, path).is_some_and(|relative| {
         let mut components = relative.components();
@@ -70,11 +64,8 @@ pub fn is_skill_file(root: &Utf8Path, path: &Utf8Path) -> bool {
         .any(|(prefix, skill_dir)| first.as_str() == *prefix && second.as_str() == *skill_dir)
 }
 
-pub fn is_protected_instruction_or_config_path(root: &Utf8Path, path: &Utf8Path) -> bool {
-    is_instruction_file(path)
-        || is_workspace_config_path(root, path)
-        || is_rule_file(root, path)
-        || is_skill_file(root, path)
+pub fn is_protected_workspace_authority_path(root: &Utf8Path, path: &Utf8Path) -> bool {
+    is_instruction_file(path) || is_rule_file(root, path) || is_skill_file(root, path)
 }
 
 fn relative_workspace_path<'a>(root: &'a Utf8Path, path: &'a Utf8Path) -> Option<&'a Utf8Path> {

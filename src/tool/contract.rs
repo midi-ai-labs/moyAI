@@ -83,7 +83,7 @@ pub enum PermissionRisk {
     DestructiveDelete,
     MoveOrRename,
     Network,
-    ProtectedInstructionOrConfig,
+    ProtectedWorkspaceAuthority,
 }
 
 impl PermissionRisk {
@@ -92,7 +92,7 @@ impl PermissionRisk {
             Self::DestructiveDelete => "delete",
             Self::MoveOrRename => "move/rename",
             Self::Network => "network",
-            Self::ProtectedInstructionOrConfig => "protected instruction/config",
+            Self::ProtectedWorkspaceAuthority => "protected workspace authority",
         }
     }
 }

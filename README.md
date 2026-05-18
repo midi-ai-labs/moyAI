@@ -65,7 +65,7 @@ cargo build --release --bin moyai-desktop
 
 The default Cargo feature set is Tauri-only for desktop builds and enables Tauri's production custom protocol, so a release executable loads bundled `ui/desktop-web/dist` assets instead of connecting to a local dev server.
 
-On cold start, `moyai-desktop.exe` shows the bundled moyAI logo splash for at least five seconds while it checks the launch-time config file state, workspace availability, and configured local LLM model catalog. If setup attention is required, the main window opens directly to Settings or LLM URL.
+On cold start, `moyai-desktop.exe` shows the bundled moyAI logo splash for at least five seconds while it checks the launch-time config file state, workspace availability, the configured local LLM model catalog, and Docling Serve `/health` + `/ready` when Docling is enabled. If setup attention is required, the main window opens directly to Settings or LLM URL.
 
 The target offline machine does not need npm, the Rust toolchain, or internet access. Move the built release executable/assets by USB and run `moyai-desktop.exe`.
 
@@ -89,18 +89,13 @@ When no workspace is specified, the desktop app opens a workspace-free Quick Cha
 
 ## Configuration
 
-moyAI reads configuration from global config, workspace config, environment variables, and CLI overrides.
+moyAI reads configuration from one user-wide config file, then applies environment variables and CLI overrides.
 
 On first normal app startup, moyAI creates a global config file with editable default values if it does not already exist:
 
 - `%APPDATA%\midi-ai-labs\moyai\config\config.toml`
 
-The release folder does not need to contain a `.toml` file. Place the binary in a stable install directory such as `C:\tools\moyai\`; moyAI stores user configuration and session data under the Windows user profile.
-
-Workspace config files:
-
-- `moyai.toml`
-- `.moyai/config.toml`
+The release folder and workspace folders do not need to contain a `.toml` file. Place the binary in a stable install directory such as `C:\tools\moyai\`; moyAI stores user configuration and session data under the Windows user profile. Desktop and TUI settings screens save to the same user-wide config file, so CLI and GUI runs see the same provider, permission, Docling, MCP, and file guard settings.
 
 Common environment variables:
 

@@ -6,10 +6,11 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::app::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
 use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest};
 use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode};
-use crate::config::loader::{global_config_path, project_config_paths};
+use crate::config::loader::global_config_path;
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::{PartialModelConfig, PartialPermissionsConfig, PartialResolvedConfig};
 use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
+use crate::docling::{normalize_docling_base_url, probe_docling_readiness};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 use crate::llm::{
     ProviderModelInfo, apply_provider_model_info_to_config, fetch_provider_model_infos,
@@ -65,6 +66,10 @@ enum RuntimeMessage {
         requested_base_url: String,
         result: Result<Vec<ProviderModelInfo>, String>,
     },
+    StartupDoclingChecked {
+        requested_base_url: String,
+        result: Result<(), String>,
+    },
     HistoryExported(Result<Utf8PathBuf, String>),
     WorkspaceSwitched {
         request_id: NavigationRequestId,
@@ -110,6 +115,9 @@ impl RuntimeMessage {
                 RuntimeMessageAsyncContract::BackgroundOperation
             }
             RuntimeMessage::ModelCatalogLoaded { .. } => {
+                RuntimeMessageAsyncContract::ProviderOperation
+            }
+            RuntimeMessage::StartupDoclingChecked { .. } => {
                 RuntimeMessageAsyncContract::ProviderOperation
             }
             RuntimeMessage::HistoryExported(_) => RuntimeMessageAsyncContract::BackgroundOperation,
@@ -241,9 +249,7 @@ impl DesktopController {
         } else {
             load_snapshot(&app, &args).await?
         };
-        let effective_config =
-            apply_preferences_override(&preferences, &app.workspace.root, app.config.clone());
-        let mut state = DesktopState::new(snapshot, effective_config);
+        let mut state = DesktopState::new(snapshot, app.config.clone());
         state.workspace_input = app.workspace.cwd.to_string();
         state.begin_startup(
             args.global_config_existed_at_launch,
@@ -283,6 +289,7 @@ impl DesktopController {
                 .state
                 .fail_startup_provider_model_load("LLM URL が未設定です。");
         }
+        controller.check_startup_docling();
         Ok(controller)
     }
 
@@ -911,41 +918,48 @@ impl DesktopController {
         });
     }
 
+    pub(crate) fn check_startup_docling(&mut self) {
+        let config = self.state.provider_config.effective_config.docling.clone();
+        if !config.enabled {
+            self.state.begin_startup_docling_check();
+            return;
+        }
+        let normalized = normalize_docling_base_url(&config.base_url);
+        if normalized.is_empty() {
+            self.state
+                .fail_startup_docling_check("Docling Serve URL が未設定です。");
+            return;
+        }
+        if !self.state.begin_startup_docling_check() {
+            return;
+        }
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let requested_base_url = normalized.clone();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop docling-probe runtime");
+            let result = runtime.block_on(async move {
+                probe_docling_readiness(config)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            let _ = runtime_tx.send(RuntimeMessage::StartupDoclingChecked {
+                requested_base_url,
+                result,
+            });
+        });
+    }
+
     pub(crate) fn apply_provider_session(&mut self) {
         let Some(config) = self.apply_provider_selection_to_effective_config() else {
             return;
         };
         self.state.reset_effective_config(config);
-        self.preferences.set_workspace_override(
-            &self.app.workspace.root,
-            full_effective_override(&self.state.provider_config.effective_config),
-        );
-        self.persist_preferences();
         self.state
-            .set_status_message("applied provider selection to this workspace session");
+            .set_status_message("applied provider selection to this session");
         self.state.hide_overlay();
-    }
-
-    pub(crate) fn save_provider_project(&mut self) {
-        let Some(config) = self.apply_provider_selection_to_effective_config() else {
-            return;
-        };
-        self.state.reset_effective_config(config);
-        match self.state.provider_config.config_editor.save_scope(
-            &self.app.workspace.root,
-            crate::tui::config_editor::ConfigSaveScope::Project,
-        ) {
-            Ok(message) => {
-                self.preferences
-                    .clear_workspace_override(&self.app.workspace.root);
-                self.persist_preferences();
-                self.reload_config();
-                self.state.set_status_message(message);
-            }
-            Err(error) => self
-                .state
-                .set_status_message(format!("config save failed: {error}")),
-        }
     }
 
     pub(crate) fn save_provider_global(&mut self) {
@@ -958,9 +972,6 @@ impl DesktopController {
             crate::tui::config_editor::ConfigSaveScope::Global,
         ) {
             Ok(message) => {
-                self.preferences
-                    .clear_workspace_override(&self.app.workspace.root);
-                self.persist_preferences();
                 self.reload_config();
                 self.state.set_status_message(message);
             }
@@ -980,9 +991,7 @@ impl DesktopController {
             Ok(patch) => {
                 let config = apply_config_patch(self.app.config.clone(), patch.clone());
                 self.state.reset_effective_config(config);
-                self.preferences
-                    .set_workspace_override(&self.app.workspace.root, patch);
-                self.persist_preferences();
+                self.check_startup_docling();
                 self.state.set_status_message("applied session override");
             }
             Err(error) => self
@@ -1002,33 +1011,10 @@ impl DesktopController {
         config.permissions.access_mode = config.permissions.access_mode.next();
         let access_mode = config.permissions.access_mode;
         self.state.reset_effective_config(config);
-        self.preferences.set_workspace_override(
-            &self.app.workspace.root,
-            full_effective_override(&self.state.provider_config.effective_config),
-        );
-        self.persist_preferences();
         self.state.set_status_message(format!(
             "session access mode set to {}",
             access_mode.label()
         ));
-    }
-
-    pub(crate) fn save_project_config(&mut self) {
-        match self.state.provider_config.config_editor.save_scope(
-            &self.app.workspace.root,
-            crate::tui::config_editor::ConfigSaveScope::Project,
-        ) {
-            Ok(message) => {
-                self.preferences
-                    .clear_workspace_override(&self.app.workspace.root);
-                self.persist_preferences();
-                self.reload_config();
-                self.state.set_status_message(message);
-            }
-            Err(error) => self
-                .state
-                .set_status_message(format!("config save failed: {error}")),
-        }
     }
 
     pub(crate) fn save_global_config(&mut self) {
@@ -1037,9 +1023,6 @@ impl DesktopController {
             crate::tui::config_editor::ConfigSaveScope::Global,
         ) {
             Ok(message) => {
-                self.preferences
-                    .clear_workspace_override(&self.app.workspace.root);
-                self.persist_preferences();
                 self.reload_config();
                 self.state.set_status_message(message);
             }
@@ -1053,9 +1036,7 @@ impl DesktopController {
         match ConfigLoader::load(&self.app.workspace.root, None) {
             Ok(config) => {
                 self.app.config = config.clone();
-                let effective =
-                    apply_preferences_override(&self.preferences, &self.app.workspace.root, config);
-                self.state.reset_effective_config(effective);
+                self.state.reset_effective_config(config);
                 if !self
                     .state
                     .provider_config
@@ -1065,6 +1046,7 @@ impl DesktopController {
                 {
                     self.load_provider_models();
                 }
+                self.check_startup_docling();
             }
             Err(error) => self
                 .state
@@ -1207,23 +1189,6 @@ impl DesktopController {
     pub(crate) fn open_current_workspace_in_file_manager(&mut self) {
         let root = self.app.workspace.root.clone();
         self.open_path_in_file_manager(&root);
-    }
-
-    pub(crate) fn open_project_config_folder(&mut self) {
-        let [primary, secondary] = project_config_paths(&self.app.workspace.root);
-        let config_path = if secondary.exists() {
-            secondary
-        } else if primary.exists() {
-            primary
-        } else {
-            primary
-        };
-        let Some(folder) = config_path.parent().map(camino::Utf8Path::to_path_buf) else {
-            self.state
-                .set_status_message("project config folder could not be resolved");
-            return;
-        };
-        self.open_path_in_file_manager(&folder);
     }
 
     pub(crate) fn open_global_config_folder(&mut self) {
@@ -1693,12 +1658,7 @@ impl DesktopController {
             self.preferences
                 .unmark_project_deleted(&self.app.workspace.root);
         }
-        let effective = apply_preferences_override(
-            &self.preferences,
-            &self.app.workspace.root,
-            self.app.config.clone(),
-        );
-        self.state = DesktopState::new(loaded.snapshot, effective);
+        self.state = DesktopState::new(loaded.snapshot, self.app.config.clone());
         self.state.workspace_input = self.app.workspace.cwd.to_string();
         if let Some(opacity) = self.preferences.window_opacity_percent {
             self.state.set_window_opacity_percent(opacity);
@@ -1852,12 +1812,8 @@ impl DesktopController {
                                     .unmark_project_deleted(&self.app.workspace.root);
                             }
                             if deleted_was_current {
-                                let effective = apply_preferences_override(
-                                    &self.preferences,
-                                    &self.app.workspace.root,
-                                    self.app.config.clone(),
-                                );
-                                self.state = DesktopState::new(loaded.snapshot, effective);
+                                self.state =
+                                    DesktopState::new(loaded.snapshot, self.app.config.clone());
                                 self.state.workspace_input = self.app.workspace.cwd.to_string();
                                 if let Some(opacity) = self.preferences.window_opacity_percent {
                                     self.state.set_window_opacity_percent(opacity);
@@ -1928,6 +1884,30 @@ impl DesktopController {
                         Err(error) => {
                             self.state.fail_startup_provider_model_load(error.clone());
                             self.state.fail_provider_model_load(error);
+                        }
+                    }
+                }
+                RuntimeMessage::StartupDoclingChecked {
+                    requested_base_url,
+                    result,
+                } => {
+                    let current = normalize_docling_base_url(
+                        &self.state.provider_config.effective_config.docling.base_url,
+                    );
+                    if !self.state.provider_config.effective_config.docling.enabled
+                        || current != requested_base_url
+                    {
+                        continue;
+                    }
+                    match result {
+                        Ok(()) => {
+                            self.state.finish_startup_docling_check(&requested_base_url);
+                        }
+                        Err(error) => {
+                            self.state.fail_startup_docling_check(error.clone());
+                            self.state.set_status_message(format!(
+                                "Docling startup check failed: {error}"
+                            ));
                         }
                     }
                 }
@@ -2600,6 +2580,14 @@ mod tests {
             RuntimeMessageAsyncContract::ProviderOperation
         );
         assert_eq!(
+            RuntimeMessage::StartupDoclingChecked {
+                requested_base_url: "http://127.0.0.1:8123".to_string(),
+                result: Ok(()),
+            }
+            .async_contract(),
+            RuntimeMessageAsyncContract::ProviderOperation
+        );
+        assert_eq!(
             RuntimeMessage::Finished(Err("failed".to_string())).async_contract(),
             RuntimeMessageAsyncContract::TerminalRun
         );
@@ -2873,17 +2861,6 @@ fn run_event_is_terminal(event: &RunEvent) -> bool {
             | RunEvent::SessionInterrupted { .. }
             | RunEvent::SessionFailed { .. }
     )
-}
-
-fn apply_preferences_override(
-    preferences: &DesktopPreferences,
-    workspace_root: &camino::Utf8Path,
-    base_config: ResolvedConfig,
-) -> ResolvedConfig {
-    match preferences.workspace_override(workspace_root) {
-        Some(patch) => apply_config_patch(base_config, patch),
-        None => base_config,
-    }
 }
 
 async fn purge_deleted_project_roots(

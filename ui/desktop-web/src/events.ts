@@ -230,21 +230,18 @@ function dispatchAction(action: string, index: number, state: DesktopWebState, c
   if (action === "switch-workspace") void context.mutate("switch_workspace");
   if (action === "browse-workspace") void context.mutate("browse_workspace");
   if (action === "open-workspace-folder") void context.mutate("open_workspace_folder");
-  if (action === "open-project-config-folder") void context.mutate("open_project_config_folder");
   if (action === "open-global-config-folder") void context.mutate("open_global_config_folder");
   if (action === "open-typed-path") void context.mutate("open_typed_path");
   if (action === "open-artifact-folder") void context.mutate("open_artifact_folder");
   if (action === "load-provider-models") void context.mutate("load_provider_models");
   if (action === "select-provider-model") void context.mutate("select_provider_model", { index });
   if (action === "apply-provider-session") void context.mutate("apply_provider_session");
-  if (action === "save-provider-project") void context.mutate("save_provider_project");
   if (action === "save-provider-global") void context.mutate("save_provider_global");
   if (action === "select-config") {
     context.uiState.configDirty = false;
     void context.mutate("set_config_selection", { index });
   }
   if (action === "apply-session-config") submitConfigAction("apply_session_config", state, context);
-  if (action === "save-project-config") submitConfigAction("save_project_config", state, context);
   if (action === "save-global-config") submitConfigAction("save_global_config", state, context);
   if (action === "toggle-access") void context.mutate("toggle_access_mode");
   if (action === "insert-command") void context.mutate("insert_command", { index });

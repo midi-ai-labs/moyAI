@@ -36,13 +36,12 @@ pub struct OpenAiCompatClient {
 impl OpenAiCompatClient {
     pub fn new(
         connect_timeout_ms: u64,
-        request_timeout_ms: u64,
+        _request_timeout_ms: u64,
         max_retries: u8,
         api_key: Option<String>,
     ) -> Result<Self, LlmError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(connect_timeout_ms))
-            .timeout(Duration::from_millis(request_timeout_ms))
             .build()?;
         Ok(Self {
             client,
@@ -60,139 +59,166 @@ impl LlmClient for OpenAiCompatClient {
         cancel: CancellationToken,
         sink: &mut dyn LlmEventSink,
     ) -> Result<LlmResponseSummary, LlmError> {
-        let response = self.send_request(&request).await?;
+        let mut stream_retry_attempt = 0_u8;
 
-        let mut stream = response.bytes_stream().eventsource();
-        let mut usage = None;
-        let mut finish_reason = None;
-        let mut saw_terminal_signal = false;
-        let mut ended_by_eof = false;
-        let mut tool_calls: HashMap<usize, PartialToolCall> = HashMap::new();
+        'stream_attempt: loop {
+            let response = self.send_request(&request).await?;
 
-        loop {
-            let next_event = if let Some(timeout) =
-                stream_idle_timeout(request.stream_idle_timeout_ms)
-            {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        return Ok(LlmResponseSummary {
-                            finish_reason: FinishReason::Cancelled,
-                            usage,
-                        });
-                    }
-                    result = tokio::time::timeout(timeout, stream.next()) => {
-                        result.map_err(|_| stream_idle_timeout_error(request.stream_idle_timeout_ms))?
-                    }
-                }
-            } else {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        return Ok(LlmResponseSummary {
-                            finish_reason: FinishReason::Cancelled,
-                            usage,
-                        });
-                    }
-                    result = stream.next() => result,
-                }
-            };
+            let mut stream = response.bytes_stream().eventsource();
+            let mut usage = None;
+            let mut finish_reason = None;
+            let mut saw_terminal_signal = false;
+            let mut ended_by_eof = false;
+            let mut emitted_events = 0_usize;
+            let mut tool_calls: HashMap<usize, PartialToolCall> = HashMap::new();
 
-            let Some(event) = next_event else {
-                ended_by_eof = true;
-                break;
-            };
-
-            let event =
-                event.map_err(|error| LlmError::Message(format!("SSE stream error: {error}")))?;
-            if event.data == "[DONE]" {
-                saw_terminal_signal = true;
-                break;
-            }
-
-            let chunk = serde_json::from_str::<OpenAiChatChunk>(&event.data).map_err(|error| {
-                LlmError::Message(format!(
-                    "failed to parse openai-compatible stream chunk: {}. Raw chunk: {}",
-                    error,
-                    summarize_stream_chunk(&event.data)
-                ))
-            })?;
-            if let Some(error) = chunk.error.as_ref() {
-                return Err(LlmError::Message(format!(
-                    "openai-compatible stream error: {}",
-                    summarize_stream_error(error)
-                )));
-            }
-            if let Some(value) = chunk.usage.as_ref() {
-                usage = Some(to_usage(value));
-            }
-            if chunk.choices.is_empty() {
-                continue;
-            }
-
-            for choice in chunk.choices {
-                if let Some(value) = choice.delta.content {
-                    sink.push(LlmEvent::TextDelta(value))?;
-                }
-                if let Some(value) = choice.delta.reasoning {
-                    sink.push(LlmEvent::ReasoningDelta(value))?;
-                }
-                if let Some(deltas) = choice.delta.tool_calls {
-                    for delta in deltas {
-                        let entry = tool_calls.entry(delta.index).or_default();
-                        if let Some(id) = delta.id {
-                            entry.call_id = Some(id);
+            loop {
+                let next_event = if let Some(timeout) =
+                    stream_idle_timeout(request.stream_idle_timeout_ms)
+                {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            return Ok(LlmResponseSummary {
+                                finish_reason: FinishReason::Cancelled,
+                                usage,
+                            });
                         }
-                        if let Some(function) = delta.function {
-                            if let Some(name) = function.name {
-                                entry.tool_name = Some(name);
-                            }
-                            if let Some(arguments) = function.arguments {
-                                entry.arguments.push_str(&arguments);
-                            }
-                        }
-                        let call_id = entry
-                            .call_id
-                            .clone()
-                            .unwrap_or_else(|| format!("tool_call_{}", choice.index));
-                        let tool_name = entry
-                            .tool_name
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_string());
-                        if !entry.started {
-                            sink.push(LlmEvent::ToolCallStart {
-                                call_id: call_id.clone(),
-                                tool_name: tool_name.clone(),
-                            })?;
-                            entry.started = true;
-                        }
-                        if !entry.arguments.is_empty() {
-                            sink.push(LlmEvent::ToolCallArgsDelta {
-                                call_id,
-                                delta: entry.arguments_delta(),
-                            })?;
+                        result = tokio::time::timeout(timeout, stream.next()) => {
+                            result.map_err(|_| stream_idle_timeout_error(request.stream_idle_timeout_ms))?
                         }
                     }
-                }
-                if let Some(value) = choice.finish_reason {
+                } else {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            return Ok(LlmResponseSummary {
+                                finish_reason: FinishReason::Cancelled,
+                                usage,
+                            });
+                        }
+                        result = stream.next() => result,
+                    }
+                };
+
+                let Some(event) = next_event else {
+                    ended_by_eof = true;
+                    break;
+                };
+
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error)
+                        if emitted_events == 0
+                            && should_retry_stream_event_error(&error.to_string())
+                            && stream_retry_attempt < request.stream_max_retries =>
+                    {
+                        stream_retry_attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(retry_delay_ms(
+                            stream_retry_attempt,
+                            None,
+                        )))
+                        .await;
+                        continue 'stream_attempt;
+                    }
+                    Err(error) => {
+                        return Err(LlmError::Message(format!("SSE stream error: {error}")));
+                    }
+                };
+                if event.data == "[DONE]" {
                     saw_terminal_signal = true;
-                    finish_reason = Some(parse_finish_reason(&value));
+                    break;
+                }
+
+                let chunk =
+                    serde_json::from_str::<OpenAiChatChunk>(&event.data).map_err(|error| {
+                        LlmError::Message(format!(
+                            "failed to parse openai-compatible stream chunk: {}. Raw chunk: {}",
+                            error,
+                            summarize_stream_chunk(&event.data)
+                        ))
+                    })?;
+                if let Some(error) = chunk.error.as_ref() {
+                    return Err(LlmError::Message(format!(
+                        "openai-compatible stream error: {}",
+                        summarize_stream_error(error)
+                    )));
+                }
+                if let Some(value) = chunk.usage.as_ref() {
+                    usage = Some(to_usage(value));
+                }
+                if chunk.choices.is_empty() {
+                    continue;
+                }
+
+                for choice in chunk.choices {
+                    if let Some(value) = choice.delta.content {
+                        sink.push(LlmEvent::TextDelta(value))?;
+                        emitted_events += 1;
+                    }
+                    if let Some(value) = choice.delta.reasoning {
+                        sink.push(LlmEvent::ReasoningDelta(value))?;
+                        emitted_events += 1;
+                    }
+                    if let Some(deltas) = choice.delta.tool_calls {
+                        for delta in deltas {
+                            let entry = tool_calls.entry(delta.index).or_default();
+                            if let Some(id) = delta.id {
+                                entry.call_id = Some(id);
+                            }
+                            if let Some(function) = delta.function {
+                                if let Some(name) = function.name {
+                                    entry.tool_name = Some(name);
+                                }
+                                if let Some(arguments) = function.arguments {
+                                    entry.arguments.push_str(&arguments);
+                                }
+                            }
+                            let call_id = entry
+                                .call_id
+                                .clone()
+                                .unwrap_or_else(|| format!("tool_call_{}", choice.index));
+                            let tool_name = entry
+                                .tool_name
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string());
+                            if !entry.started {
+                                sink.push(LlmEvent::ToolCallStart {
+                                    call_id: call_id.clone(),
+                                    tool_name: tool_name.clone(),
+                                })?;
+                                emitted_events += 1;
+                                entry.started = true;
+                            }
+                            if !entry.arguments.is_empty() {
+                                sink.push(LlmEvent::ToolCallArgsDelta {
+                                    call_id,
+                                    delta: entry.arguments_delta(),
+                                })?;
+                                emitted_events += 1;
+                            }
+                        }
+                    }
+                    if let Some(value) = choice.finish_reason {
+                        saw_terminal_signal = true;
+                        finish_reason = Some(parse_finish_reason(&value));
+                    }
                 }
             }
+
+            if ended_by_eof && !saw_terminal_signal {
+                return Err(stream_missing_terminal_signal_error());
+            }
+
+            let finish_reason = finish_reason.unwrap_or(FinishReason::Stop);
+
+            sink.push(LlmEvent::Finished {
+                finish_reason,
+                usage: usage.clone(),
+            })?;
+            return Ok(LlmResponseSummary {
+                finish_reason,
+                usage,
+            });
         }
-
-        if ended_by_eof && !saw_terminal_signal {
-            return Err(stream_missing_terminal_signal_error());
-        }
-
-        let finish_reason = finish_reason.unwrap_or(FinishReason::Stop);
-
-        sink.push(LlmEvent::Finished {
-            finish_reason,
-            usage: usage.clone(),
-        })?;
-        Ok(LlmResponseSummary {
-            finish_reason,
-            usage,
-        })
     }
 }
 
@@ -211,17 +237,34 @@ impl OpenAiCompatClient {
             }
             apply_extra_headers(&mut headers, &request.extra_headers)?;
 
-            let result = self
+            let request_builder = self
                 .client
                 .post(format!(
                     "{}/v1/chat/completions",
                     request.base_url.trim_end_matches('/')
                 ))
-                .timeout(Duration::from_millis(request.timeout_ms))
                 .headers(headers)
-                .json(&to_openai_request(request)?)
-                .send()
-                .await;
+                .json(&to_openai_request(request)?);
+
+            let result = if let Some(timeout) = request_header_timeout(request.timeout_ms) {
+                match tokio::time::timeout(timeout, request_builder.send()).await {
+                    Ok(result) => result,
+                    Err(_) if attempt < self.max_retries => {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(retry_delay_ms(attempt, None)))
+                            .await;
+                        continue;
+                    }
+                    Err(_) => {
+                        return Err(LlmError::Message(format!(
+                            "provider request timeout after {}ms before response headers",
+                            request.timeout_ms
+                        )));
+                    }
+                }
+            } else {
+                request_builder.send().await
+            };
 
             match result {
                 Ok(response) if response.status().is_success() => return Ok(response),
@@ -322,6 +365,37 @@ fn is_retryable_status(status: StatusCode, body: &str) -> bool {
 
 fn should_retry_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+}
+
+fn should_retry_stream_event_error(error: &str) -> bool {
+    let lowered = error.to_ascii_lowercase();
+    lowered.contains("transport error")
+        || lowered.contains("error decoding response body")
+        || lowered.contains("connection")
+        || lowered.contains("timed out")
+}
+
+fn request_header_timeout(timeout_ms: u64) -> Option<Duration> {
+    if timeout_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(timeout_ms))
+    }
+}
+
+pub(crate) fn stream_event_retry_classifier_fixture_passes() -> bool {
+    should_retry_stream_event_error("Transport error: error decoding response body")
+        && should_retry_stream_event_error("connection reset by peer")
+        && should_retry_stream_event_error("operation timed out")
+        && !should_retry_stream_event_error("failed to parse openai-compatible stream chunk")
+        && !should_retry_stream_event_error("openai-compatible stream error")
+}
+
+pub(crate) fn streaming_timeout_contract_fixture_passes() -> bool {
+    request_header_timeout(30_000) == Some(Duration::from_millis(30_000))
+        && request_header_timeout(0).is_none()
+        && stream_idle_timeout(300_000) == Some(Duration::from_millis(300_000))
+        && stream_idle_timeout(0).is_none()
 }
 
 fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {

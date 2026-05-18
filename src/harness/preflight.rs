@@ -38,6 +38,7 @@ pub enum PreflightGateFamily {
     PromptReplayAuthority,
     ToolLifecycleAuthority,
     ToolProposalRejectionLifecycle,
+    LlmTransportAuthority,
     VerificationEvidenceAuthority,
     ManualStEvidenceSchema,
     ArtifactReplaySchema,
@@ -220,6 +221,26 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
         );
     }
 
+    if gate.gate_id == "preflight.llm_transport.stream_retry_before_first_event"
+        && !crate::llm::openai_compat::stream_event_retry_classifier_fixture_passes()
+    {
+        diagnostics.push(
+            "provider SSE decode/transport failures before the first emitted model event are not classified as retryable, or non-transport stream errors are retryable"
+                .to_string(),
+        );
+    }
+
+    if gate.gate_id == "preflight.llm_transport.streaming_timeout_boundary"
+        && (!crate::llm::openai_compat::streaming_timeout_contract_fixture_passes()
+            || !crate::agent::loop_impl::closeout_ready_final_response_timeout_guard_fixture_passes(
+            ))
+    {
+        diagnostics.push(
+            "provider streaming timeout contract does not separate response-header timeout from stream idle timeout"
+                .to_string(),
+        );
+    }
+
     if matches!(gate.family, PreflightGateFamily::StateReducerAuthority)
         && !state_reducer_runtime_feedback_fixture_passes()
     {
@@ -241,10 +262,13 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::agent::state::reference_design_input_does_not_become_pending_authoring_target_fixture_passes()
             || !crate::agent::state::same_document_reference_update_remains_authoring_target_fixture_passes()
             || !crate::agent::state::japanese_prompt_filename_boundaries_remain_artifact_targets_fixture_passes()
-            || !crate::agent::state::docs_output_referenced_code_does_not_become_pending_authoring_target_fixture_passes())
+            || !crate::agent::state::docs_output_referenced_code_does_not_become_pending_authoring_target_fixture_passes()
+            || !crate::agent::state::requested_work_without_verification_closes_after_file_change_fixture_passes()
+            || !crate::agent::state::structured_document_summary_waits_for_remaining_sources_fixture_passes()
+            || !crate::agent::state::structured_document_summary_output_headings_survive_compacted_history_fixture_passes())
     {
         diagnostics.push(
-            "requested-work item-stream evidence did not preserve partial authoring phase, keep reference inputs out of unrelated pending deliverables, preserve same-document reference updates as authoring targets, promote completed authoring to exact verification shell authority before closeout, retain explicit verification commands after latest authoring writes, keep resumed/new authoring turns out of stale closeout or verification authority, or consume passed verification commands before clean closeout".to_string(),
+            "requested-work item-stream evidence did not preserve partial authoring phase, keep reference inputs out of unrelated pending deliverables, preserve same-document reference updates as authoring targets, keep staged structured-document summaries open until all sources are processed, recover structured-document progress from output headings after compacted history, close no-verification deliverables after FileChange evidence, promote completed authoring to exact verification shell authority before closeout, retain explicit verification commands after latest authoring writes, keep resumed/new authoring turns out of stale closeout or verification authority, or consume passed verification commands before clean closeout".to_string(),
         );
     }
 
@@ -1037,6 +1061,28 @@ pub fn failure_registry_preflight_suite() -> Vec<PreflightGate> {
             fixture_id: "fixture.item_lifecycle.provider_replay_call_output_symmetry".to_string(),
         },
         PreflightGate {
+            gate_id: "preflight.llm_transport.stream_retry_before_first_event".to_string(),
+            purpose: "retry provider SSE transport/body decode failures only before any model event has been emitted, avoiding duplicate partial output".to_string(),
+            tier: 2,
+            layer: PreflightLayer::Flow,
+            llm_mode: PreflightLlmMode::NoLlm,
+            deterministic: true,
+            status: PreflightGateStatus::Active,
+            family: PreflightGateFamily::LlmTransportAuthority,
+            fixture_id: "fixture.llm_transport.stream_retry_before_first_event".to_string(),
+        },
+        PreflightGate {
+            gate_id: "preflight.llm_transport.streaming_timeout_boundary".to_string(),
+            purpose: "streaming requests use request timeout for response headers and stream idle timeout for body progress, not one total-body timeout".to_string(),
+            tier: 2,
+            layer: PreflightLayer::Flow,
+            llm_mode: PreflightLlmMode::NoLlm,
+            deterministic: true,
+            status: PreflightGateStatus::Active,
+            family: PreflightGateFamily::LlmTransportAuthority,
+            fixture_id: "fixture.llm_transport.streaming_timeout_boundary".to_string(),
+        },
+        PreflightGate {
             gate_id: "preflight.control_envelope.dispatch_projection_authority".to_string(),
             purpose: "provider dispatch uses a typed TurnControlEnvelope and fails closed on missing projection".to_string(),
             tier: 2,
@@ -1568,6 +1614,46 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fail_closed_on_missing_typed_projection: true,
         },
         PreflightFixture {
+            fixture_id: "fixture.llm_transport.stream_retry_before_first_event".to_string(),
+            family: PreflightGateFamily::LlmTransportAuthority,
+            authority_source: "ProviderStreamRetry stream_max_retries sse_transport_error body_decode_error retry_before_first_model_event no_retry_after_partial_model_event no_retry_for_parse_or_provider_error".to_string(),
+            required_refs: vec![
+                "ProviderStreamRetry".to_string(),
+                "stream_max_retries".to_string(),
+                "sse_transport_error".to_string(),
+                "body_decode_error".to_string(),
+                "retry_before_first_model_event".to_string(),
+                "no_retry_after_partial_model_event".to_string(),
+                "no_retry_for_parse_or_provider_error".to_string(),
+            ],
+            forbidden_refs: vec![
+                "retry_after_partial_output".to_string(),
+                "stream_error_always_terminal".to_string(),
+            ],
+            required_artifacts: Vec::new(),
+            fail_closed_on_missing_typed_projection: true,
+        },
+        PreflightFixture {
+            fixture_id: "fixture.llm_transport.streaming_timeout_boundary".to_string(),
+            family: PreflightGateFamily::LlmTransportAuthority,
+            authority_source: "ProviderStreamingTimeout request_timeout_ms response_header_timeout stream_idle_timeout_ms stream_body_idle_timeout no_total_body_timeout long_running_stream_allowed".to_string(),
+            required_refs: vec![
+                "ProviderStreamingTimeout".to_string(),
+                "request_timeout_ms".to_string(),
+                "response_header_timeout".to_string(),
+                "stream_idle_timeout_ms".to_string(),
+                "stream_body_idle_timeout".to_string(),
+                "no_total_body_timeout".to_string(),
+                "long_running_stream_allowed".to_string(),
+            ],
+            forbidden_refs: vec![
+                "request_timeout_as_total_body_timeout".to_string(),
+                "stream_idle_timeout_shadowed".to_string(),
+            ],
+            required_artifacts: Vec::new(),
+            fail_closed_on_missing_typed_projection: true,
+        },
+        PreflightFixture {
             fixture_id: "fixture.control_envelope.dispatch_projection_authority".to_string(),
             family: PreflightGateFamily::ControlEnvelopeProjection,
             authority_source: "TurnControlEnvelope ProjectionBundle ActionAuthority allowed_surface tool_choice availability_metadata satisfying_file_change_progress_surface".to_string(),
@@ -1606,7 +1692,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.state_reducer.requested_work_completion_promotes_verification"
                 .to_string(),
             family: PreflightGateFamily::StateReducerAuthority,
-            authority_source: "RequestedWorkAuthoring ReferenceInput reference_input_not_pending_deliverable same_document_reference_update_authoring_target japanese_prompt_filename_token_boundary docs_output_referenced_code_not_pending_deliverable FileChangeEvidence authoring_complete Verification verification_command_obligation before_closeout canonical_item_chronology turn_local_sequence_no latest_content_change_invalidates_prior_verification VerificationRunResult passed_verification_command_consumed clean_closeout".to_string(),
+            authority_source: "RequestedWorkAuthoring ReferenceInput reference_input_not_pending_deliverable same_document_reference_update_authoring_target japanese_prompt_filename_token_boundary docs_output_referenced_code_not_pending_deliverable structured_document_summary_remaining_sources_block_closeout structured_document_summary_output_heading_progress_after_compaction no_verification_requested_work_file_change_closeout FileChangeEvidence authoring_complete Verification verification_command_obligation before_closeout canonical_item_chronology turn_local_sequence_no latest_content_change_invalidates_prior_verification VerificationRunResult passed_verification_command_consumed clean_closeout".to_string(),
             required_refs: vec![
                 "RequestedWorkAuthoring".to_string(),
                 "ReferenceInput".to_string(),
@@ -1614,6 +1700,9 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "same_document_reference_update_authoring_target".to_string(),
                 "japanese_prompt_filename_token_boundary".to_string(),
                 "docs_output_referenced_code_not_pending_deliverable".to_string(),
+                "structured_document_summary_remaining_sources_block_closeout".to_string(),
+                "structured_document_summary_output_heading_progress_after_compaction".to_string(),
+                "no_verification_requested_work_file_change_closeout".to_string(),
                 "FileChangeEvidence".to_string(),
                 "authoring_complete".to_string(),
                 "Verification".to_string(),

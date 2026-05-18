@@ -634,7 +634,7 @@ mod tests {
         assert!(web.async_polling_required);
         assert!(
             web.pending_async_operations
-                .contains(&"startup_provider_probe".to_string())
+                .contains(&"startup_readiness_check".to_string())
         );
         assert!(
             web.pending_async_operations

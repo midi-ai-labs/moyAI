@@ -20,10 +20,10 @@ use crate::protocol::{
 };
 use crate::session::{ChangeId, ProjectId, SessionId, SessionRecord, ToolCallId};
 use crate::session::{
-    ContractStatus, DocsArea, DocsAreaCoverage, DocsDeliverableCoverage, DocsDeliverableKind,
-    DocsFactCheck, DocsFactCheckKind, DocsGroundingCoverage, DocsGroundingRequirement,
-    DocsPendingDeliverable, DocsRouteState, FailureKind, FailureState, MessagePart, MessageRole,
-    ProcessPhase, SessionStateSnapshot, TaskRoute, TodoItem, Transcript,
+    CompletionState, ContractStatus, DocsArea, DocsAreaCoverage, DocsDeliverableCoverage,
+    DocsDeliverableKind, DocsFactCheck, DocsFactCheckKind, DocsGroundingCoverage,
+    DocsGroundingRequirement, DocsPendingDeliverable, DocsRouteState, FailureKind, FailureState,
+    MessagePart, MessageRole, ProcessPhase, SessionStateSnapshot, TaskRoute, TodoItem, Transcript,
     VerificationFailureCluster, VerificationFailureEvidence,
 };
 use crate::tool::ToolName;
@@ -354,6 +354,46 @@ fn promote_requested_work_authoring_authority(
         None,
     );
     if requested_work.pending_targets.is_empty() {
+        if let Some(snapshot) = structured_document_summary_snapshot_from_history_items(
+            session.cwd.as_path(),
+            history_items,
+            latest_user.as_deref(),
+        ) {
+            if !snapshot.missing_files.is_empty() {
+                state.process_phase = ProcessPhase::Author;
+                state.active_targets = vec![Utf8PathBuf::from(snapshot.output_target.clone())];
+                state.completion.open_work_count = 1;
+                state.completion.closeout_ready = false;
+                state.completion.verification_pending = false;
+                state.completion.blocked_reason = Some(format!(
+                    "structured document summary is incomplete; remaining source file(s): {}",
+                    snapshot
+                        .missing_files
+                        .iter()
+                        .take(8)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                return state;
+            }
+        }
+        if !requested_work.required_targets.is_empty()
+            && requested_work.verification_commands.is_empty()
+            && !state.completion.verification_pending
+            && !state.completion.route_contract_pending
+            && state.failure.is_none()
+            && state.verification.failure_cluster.is_none()
+        {
+            state.process_phase = ProcessPhase::Closeout;
+            state.active_targets.clear();
+            state.completion.open_work_count = 0;
+            state.completion.closeout_ready = true;
+            state.completion.verification_pending = false;
+            state.completion.blocked_reason = None;
+            state.verification.required_commands.clear();
+            return state;
+        }
         if state.completion.verification_pending
             || state.completion.closeout_ready
             || requested_work_verification_passed(session, history_items)
@@ -801,6 +841,19 @@ pub(crate) fn active_work_contract_for_history_items(
 
     if state.completion.route_contract_pending && state.docs_route.is_some() {
         return state_native_active_work_contract(state);
+    }
+
+    if let Some(snapshot) = structured_document_summary_snapshot_from_history_items(
+        session.cwd.as_path(),
+        history_items,
+        latest_user.as_deref(),
+    ) {
+        if !snapshot.missing_files.is_empty() {
+            return Some(ActiveWorkContract::RequestedWorkAuthoring {
+                pending_targets: vec![Utf8PathBuf::from(snapshot.output_target)],
+                verification_commands: Vec::new(),
+            });
+        }
     }
 
     if !requested_work.pending_targets.is_empty() {
@@ -2464,6 +2517,299 @@ pub(crate) fn requested_work_completion_promotes_verification_fixture_passes() -
                 ..
             })
         )
+}
+
+pub(crate) fn requested_work_without_verification_closes_after_file_change_fixture_passes() -> bool
+{
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "requested deliverable closeout".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Use docling_convert to summarize every docx and xlsx file in this folder into `docs.md`.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                    kind: crate::session::ChangeKind::Add,
+                    path_before: None,
+                    path_after: Some(Utf8PathBuf::from("docs.md")),
+                    summary: "Added docs.md".to_string(),
+                }],
+                summary: "Added docs.md".to_string(),
+            },
+        },
+    ];
+    let prior_state = SessionStateSnapshot {
+        process_phase: ProcessPhase::Author,
+        active_targets: vec![Utf8PathBuf::from("docs.md")],
+        completion: CompletionState {
+            open_work_count: 1,
+            closeout_ready: false,
+            verification_pending: false,
+            blocked_reason: Some(
+                ActiveWorkContract::RequestedWorkAuthoring {
+                    pending_targets: vec![Utf8PathBuf::from("docs.md")],
+                    verification_commands: Vec::new(),
+                }
+                .summary(),
+            ),
+            ..CompletionState::default()
+        },
+        ..SessionStateSnapshot::default()
+    };
+    let state = reduce_session_state_from_history_items(&session, &items, &[], &prior_state);
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+    state.process_phase == ProcessPhase::Closeout
+        && state.completion.closeout_ready
+        && !state.completion.verification_pending
+        && state.completion.open_work_count == 0
+        && state.completion.blocked_reason.is_none()
+        && state.active_targets.is_empty()
+        && active.is_none()
+}
+
+pub(crate) fn structured_document_summary_waits_for_remaining_sources_fixture_passes() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let root = std::env::temp_dir().join(format!("moyai-structured-summary-{}", session_id));
+    let _ = fs::remove_dir_all(&root);
+    if fs::create_dir_all(&root).is_err()
+        || fs::write(root.join("a.docx"), b"a").is_err()
+        || fs::write(root.join("b.docx"), b"b").is_err()
+        || fs::write(root.join("c.xlsx"), b"c").is_err()
+    {
+        return false;
+    }
+    let Ok(cwd) = Utf8PathBuf::from_path_buf(root.clone()) else {
+        let _ = fs::remove_dir_all(&root);
+        return false;
+    };
+    let call_id = ToolCallId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "structured document summary".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd,
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let docling_args = serde_json::json!({ "path": "a.docx" });
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Use docling_convert to summarize all docx / xlsx files into `docs.md`. Process 2 files at a time.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolCall {
+                call_id,
+                tool: ToolName::DoclingConvert,
+                arguments: docling_args.clone(),
+                model_arguments: docling_args.clone(),
+                effective_arguments: docling_args,
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: Vec::new(),
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id,
+                status: ToolLifecycleStatus::Completed,
+                title: "Docling converted a.docx".to_string(),
+                output_text: "Docling status: success".to_string(),
+                metadata: Value::Null,
+                success: Some(true),
+                progress_effect: ToolProgressEffect::MadeProgress,
+                blocked_action: None,
+                required_next_action: None,
+                result_hash: None,
+                verification_run: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                    kind: crate::session::ChangeKind::Add,
+                    path_before: None,
+                    path_after: Some(Utf8PathBuf::from("docs.md")),
+                    summary: "Added docs.md".to_string(),
+                }],
+                summary: "Added docs.md".to_string(),
+            },
+        },
+    ];
+    let state = reduce_session_state_from_history_items(
+        &session,
+        &items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+    let _ = fs::remove_dir_all(&root);
+    state.process_phase == ProcessPhase::Author
+        && !state.completion.closeout_ready
+        && state.active_targets == vec![Utf8PathBuf::from("docs.md")]
+        && state
+            .completion
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("structured document summary is incomplete"))
+        && matches!(
+            active,
+            Some(ActiveWorkContract::RequestedWorkAuthoring { .. })
+        )
+}
+
+pub(crate) fn structured_document_summary_output_headings_survive_compacted_history_fixture_passes()
+-> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let root =
+        std::env::temp_dir().join(format!("moyai-structured-summary-compacted-{}", session_id));
+    let _ = fs::remove_dir_all(&root);
+    let docs_body = "# Summary\n\n## Batch 1\n\n### a.docx\n\nDone.\n\n### b.docx\n\nDone.\n\n## Batch 2\n\n### c.xlsx\n\nDone.\n";
+    if fs::create_dir_all(&root).is_err()
+        || fs::write(root.join("a.docx"), b"a").is_err()
+        || fs::write(root.join("b.docx"), b"b").is_err()
+        || fs::write(root.join("c.xlsx"), b"c").is_err()
+        || fs::write(root.join("docs.md"), docs_body).is_err()
+    {
+        return false;
+    }
+    let Ok(cwd) = Utf8PathBuf::from_path_buf(root.clone()) else {
+        let _ = fs::remove_dir_all(&root);
+        return false;
+    };
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "compacted structured document summary".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd,
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Use docling_convert to summarize all docx / xlsx files into `docs.md`."
+                        .to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                    kind: crate::session::ChangeKind::Update,
+                    path_before: Some(Utf8PathBuf::from("docs.md")),
+                    path_after: Some(Utf8PathBuf::from("docs.md")),
+                    summary: "Updated docs.md".to_string(),
+                }],
+                summary: "Updated docs.md".to_string(),
+            },
+        },
+    ];
+    let state = reduce_session_state_from_history_items(
+        &session,
+        &items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+    let _ = fs::remove_dir_all(&root);
+    state.process_phase == ProcessPhase::Closeout
+        && state.completion.closeout_ready
+        && state.completion.blocked_reason.is_none()
+        && state.active_targets.is_empty()
+        && active.is_none()
 }
 
 pub(crate) fn required_verification_survives_authoring_completion_fixture_passes() -> bool {
@@ -5589,6 +5935,85 @@ pub(crate) fn structured_document_summary_snapshot(
         current_batch_processed,
     })
 }
+
+fn structured_document_summary_snapshot_from_history_items(
+    workspace_root: &Utf8Path,
+    history_items: &[HistoryItem],
+    latest_user_text: Option<&str>,
+) -> Option<StructuredDocumentSummarySnapshot> {
+    let latest_user_text = latest_user_text?;
+    let contract = structured_document_summary_contract(latest_user_text, workspace_root)?;
+    let mut progress =
+        structured_document_summary_progress_from_history_items(history_items, &contract);
+    let mut processed = progress
+        .processed_files
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for file in structured_document_processed_files_from_output(workspace_root, &contract) {
+        if processed.insert(file.clone()) {
+            progress.processed_files.push(file);
+        }
+    }
+    let processed_set = progress
+        .processed_files
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let missing_files = contract
+        .expected_files
+        .iter()
+        .filter(|value| !processed_set.contains(&value.to_ascii_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected_batch_sizes = contract
+        .batch_size
+        .map(|batch_size| expected_batch_sizes(contract.expected_files.len(), batch_size))
+        .unwrap_or_default();
+    let completed_batch_total = progress.batch_sizes.iter().sum::<usize>();
+    let current_batch_processed = progress
+        .processed_files
+        .len()
+        .saturating_sub(completed_batch_total);
+    let current_batch_expected = expected_batch_sizes
+        .get(progress.batch_sizes.len())
+        .copied();
+
+    Some(StructuredDocumentSummarySnapshot {
+        output_target: contract.output_target,
+        expected_files: contract.expected_files,
+        processed_files: progress.processed_files,
+        missing_files,
+        batch_size: contract.batch_size,
+        expected_batch_sizes,
+        observed_batch_sizes: progress.batch_sizes,
+        current_batch_expected,
+        current_batch_processed,
+    })
+}
+
+fn structured_document_processed_files_from_output(
+    workspace_root: &Utf8Path,
+    contract: &StructuredDocumentSummaryContract,
+) -> Vec<String> {
+    let path = workspace_root.join(contract.output_target.as_str());
+    let Ok(content) = fs::read_to_string(path.as_std_path()) else {
+        return Vec::new();
+    };
+    let lower = content.to_ascii_lowercase();
+    contract
+        .expected_files
+        .iter()
+        .filter(|file| {
+            let file_lower = file.to_ascii_lowercase();
+            lower.contains(&format!("### {file_lower}"))
+                || lower.contains(&format!("#### {file_lower}"))
+                || lower.contains(&file_lower)
+        })
+        .cloned()
+        .collect()
+}
+
 fn structured_document_summary_contract(
     text: &str,
     workspace_root: &Utf8Path,
@@ -5766,6 +6191,104 @@ fn structured_document_summary_progress(
                 }
                 _ => {}
             }
+        }
+    }
+
+    let processed_files = contract
+        .expected_files
+        .iter()
+        .filter(|value| processed.contains(&value.to_ascii_lowercase()))
+        .cloned()
+        .collect();
+    StructuredDocumentSummaryProgress {
+        processed_files,
+        batch_sizes,
+    }
+}
+
+fn structured_document_summary_progress_from_history_items(
+    history_items: &[HistoryItem],
+    contract: &StructuredDocumentSummaryContract,
+) -> StructuredDocumentSummaryProgress {
+    let Some(latest_user_index) =
+        history_items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, item)| {
+                matches!(item.payload, HistoryItemPayload::UserTurn { .. }).then_some(index)
+            })
+    else {
+        return StructuredDocumentSummaryProgress::default();
+    };
+
+    let expected = contract
+        .expected_files
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut tool_calls: HashMap<ToolCallId, (ToolName, Value)> = HashMap::new();
+    let mut processed = BTreeSet::new();
+    let mut pending_batch = BTreeSet::new();
+    let mut batch_sizes = Vec::new();
+    let output_target = contract.output_target.to_ascii_lowercase();
+
+    for item in &history_items[latest_user_index + 1..] {
+        match &item.payload {
+            HistoryItemPayload::ToolCall {
+                call_id,
+                tool,
+                arguments,
+                effective_arguments,
+                ..
+            } => {
+                let args = if effective_arguments.is_null() {
+                    arguments.clone()
+                } else {
+                    effective_arguments.clone()
+                };
+                tool_calls.insert(*call_id, (*tool, args));
+            }
+            HistoryItemPayload::ToolOutput {
+                call_id,
+                status,
+                success,
+                ..
+            } if *status == ToolLifecycleStatus::Completed && success.unwrap_or(true) => {
+                let Some((tool, args)) = tool_calls.get(call_id) else {
+                    continue;
+                };
+                if *tool != ToolName::DoclingConvert {
+                    continue;
+                }
+                let Some(target) = extract_docling_target(&args.to_string()) else {
+                    continue;
+                };
+                let normalized = target.to_ascii_lowercase();
+                if !expected.contains(&normalized) {
+                    continue;
+                }
+                if processed.insert(normalized.clone()) {
+                    pending_batch.insert(normalized);
+                }
+            }
+            HistoryItemPayload::FileChange {
+                changes, summary, ..
+            } => {
+                let output_changed = changes.iter().any(|change| {
+                    change
+                        .path_after
+                        .as_ref()
+                        .or(change.path_before.as_ref())
+                        .map(|path| path.as_str().replace('\\', "/").to_ascii_lowercase())
+                        .is_some_and(|path| path.ends_with(&output_target))
+                }) || summary.to_ascii_lowercase().contains(&output_target);
+                if output_changed && !pending_batch.is_empty() {
+                    batch_sizes.push(pending_batch.len());
+                    pending_batch.clear();
+                }
+            }
+            _ => {}
         }
     }
 

@@ -14,7 +14,6 @@ use crate::config::model::{
     ResolvedConfig,
 };
 use crate::error::ConfigError;
-use crate::workspace::project::find_workspace_root;
 
 const GLOBAL_CONFIG_PATH_ENV: &str = "MOYAI_CONFIG_PATH";
 
@@ -22,22 +21,20 @@ pub struct ConfigLoader;
 
 impl ConfigLoader {
     pub fn load(
-        start_dir: &Utf8Path,
+        _start_dir: &Utf8Path,
+        cli: Option<&RunArgs>,
+    ) -> Result<ResolvedConfig, ConfigError> {
+        Self::load_with_global_path(global_config_path()?, cli)
+    }
+
+    fn load_with_global_path(
+        global_config_path: Utf8PathBuf,
         cli: Option<&RunArgs>,
     ) -> Result<ResolvedConfig, ConfigError> {
         let mut resolved = ResolvedConfig::default();
 
-        if let Some(global) = read_optional(global_config_path()?)? {
+        if let Some(global) = read_optional(global_config_path)? {
             resolved = apply_patch(resolved, global);
-        }
-
-        let project_root = find_workspace_root(start_dir)
-            .map_err(|error| ConfigError::Workspace(error.to_string()))?
-            .unwrap_or_else(|| start_dir.to_path_buf());
-        for candidate in project_config_paths(&project_root) {
-            if let Some(project) = read_optional(candidate)? {
-                resolved = apply_patch(resolved, project);
-            }
         }
 
         resolved = apply_patch(resolved, env_patch());
@@ -72,13 +69,6 @@ pub fn global_config_path() -> Result<Utf8PathBuf, ConfigError> {
     let config_dir = Utf8PathBuf::from_path_buf(dirs.config_dir().to_path_buf())
         .map_err(|_| ConfigError::Message("config directory is not valid UTF-8".to_string()))?;
     Ok(config_dir.join("config.toml"))
-}
-
-pub fn project_config_paths(root: &Utf8Path) -> [Utf8PathBuf; 2] {
-    [
-        root.join("moyai.toml"),
-        root.join(".moyai").join("config.toml"),
-    ]
 }
 
 fn read_optional(path: Utf8PathBuf) -> Result<Option<PartialResolvedConfig>, ConfigError> {
@@ -530,6 +520,35 @@ mod tests {
 
         let text = fs::read_to_string(path).expect("read config");
         assert_eq!(text, "[model]\nmodel = \"custom\"\n");
+    }
+
+    #[test]
+    fn load_uses_global_config_and_ignores_workspace_config_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 path");
+        fs::create_dir_all(root.join(".moyai")).expect("workspace dirs");
+        fs::write(
+            root.join("moyai.toml"),
+            "[model]\nmodel = \"workspace-primary\"\nbase_url = \"http://workspace-primary\"\n",
+        )
+        .expect("workspace primary config");
+        fs::write(
+            root.join(".moyai").join("config.toml"),
+            "[model]\nmodel = \"workspace-secondary\"\nbase_url = \"http://workspace-secondary\"\n",
+        )
+        .expect("workspace secondary config");
+
+        let global = Utf8PathBuf::from_path_buf(temp.path().join("global.toml")).expect("utf8");
+        fs::write(
+            &global,
+            "[model]\nmodel = \"global-model\"\nbase_url = \"http://global\"\n",
+        )
+        .expect("global config");
+
+        let config = ConfigLoader::load_with_global_path(global, None).expect("load config");
+
+        assert_eq!(config.model.model, "global-model");
+        assert_eq!(config.model.base_url, "http://global");
     }
 }
 

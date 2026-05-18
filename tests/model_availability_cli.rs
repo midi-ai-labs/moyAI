@@ -4,15 +4,6 @@ use serde_json::Value;
 #[test]
 fn model_availability_cli_writes_fail_closed_report() {
     let temp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(
-        temp.path().join("moyai.toml"),
-        r#"
-[model]
-connect_timeout_ms = 50
-request_timeout_ms = 50
-"#,
-    )
-    .expect("config");
     let output = temp.path().join("model_availability.json");
 
     Command::cargo_bin("moyai")

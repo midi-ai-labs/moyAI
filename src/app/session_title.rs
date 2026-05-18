@@ -45,6 +45,7 @@ pub async fn generate_session_title(
                 tools: Vec::new(),
                 timeout_ms: config.model.request_timeout_ms,
                 stream_idle_timeout_ms: config.model.stream_idle_timeout_ms,
+                stream_max_retries: config.model.stream_max_retries,
                 extra_headers: config.model.extra_headers.clone(),
                 temperature: Some(0.2),
                 top_p: config.model.top_p,

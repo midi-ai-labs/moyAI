@@ -11,6 +11,6 @@ pub use path_guard::{AccessKind, GuardedPath, PathGuard, PathPolicy};
 pub use project::VcsKind;
 pub use review::{branch_review_scope, uncommitted_review_scope};
 pub use special_paths::{
-    instruction_file_names, is_instruction_file, is_protected_instruction_or_config_path,
-    is_rule_file, is_skill_file, is_workspace_config_path, skill_roots,
+    instruction_file_names, is_instruction_file, is_protected_workspace_authority_path,
+    is_rule_file, is_skill_file, skill_roots,
 };

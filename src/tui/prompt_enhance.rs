@@ -40,6 +40,7 @@ pub async fn enhance_prompt(config: &ResolvedConfig, raw_prompt: &str) -> Result
                 tools: Vec::new(),
                 timeout_ms: config.model.request_timeout_ms,
                 stream_idle_timeout_ms: config.model.stream_idle_timeout_ms,
+                stream_max_retries: config.model.stream_max_retries,
                 extra_headers: config.model.extra_headers.clone(),
                 temperature: config.model.temperature,
                 top_p: config.model.top_p,

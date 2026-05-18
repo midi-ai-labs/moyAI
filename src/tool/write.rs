@@ -13,7 +13,7 @@ use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
 use crate::tool::write_support::{build_read_stamp, to_summary, write_text_file};
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
-use crate::workspace::{AccessKind, PathGuard, is_protected_instruction_or_config_path};
+use crate::workspace::{AccessKind, PathGuard, is_protected_workspace_authority_path};
 
 #[derive(Debug, Deserialize)]
 pub struct WriteInput {
@@ -55,8 +55,8 @@ impl Tool for WriteTool {
         let input = serde_json::from_value::<WriteInput>(raw_arguments)?;
         let guarded = PathGuard::require_path(ctx.workspace, &input.path, AccessKind::Edit, true)?;
         let mut risks = Vec::new();
-        if is_protected_instruction_or_config_path(&ctx.workspace.root, &guarded.absolute) {
-            risks.push(PermissionRisk::ProtectedInstructionOrConfig);
+        if is_protected_workspace_authority_path(&ctx.workspace.root, &guarded.absolute) {
+            risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
         }
         ctx.confirm_if_needed(
             AccessKind::Edit,
