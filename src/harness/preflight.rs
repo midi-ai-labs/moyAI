@@ -574,6 +574,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
 
     if gate.gate_id == "preflight.state_reducer.docs_route_contract_authority"
         && (!crate::agent::state::docs_route_contract_promotes_docs_repair_fixture_passes()
+            || !crate::agent::state::docs_route_localized_topic_completion_fixture_passes()
             || !crate::agent::loop_impl::docs_route_semantic_no_progress_guard_fixture_passes()
             || !crate::agent::loop_impl::docs_route_supporting_context_budget_exhaustion_is_recoverable_fixture_passes()
             || !crate::agent::loop_impl::docs_route_budget_exhaustion_narrows_recovery_surface_fixture_passes()
@@ -1772,7 +1773,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
         PreflightFixture {
             fixture_id: "fixture.state_reducer.docs_route_contract_authority".to_string(),
             family: PreflightGateFamily::StateReducerAuthority,
-            authority_source: "CodexHistoryItemStream TaskRoute::Docs DocsRouteState DocsRepair route_contract_pending docs_only_mutation_boundary generated_dependency_evidence_excluded RequestedWorkAuthoring_not_primary docs_route_semantic_no_progress_guard docs_supporting_context_budget_exhausted_corrective_tool_output docs_budget_exhausted_recovery_surface_narrowed docs_budget_exhaustion_survives_partial_write docs_completed_deliverable_regression_rejected write_ready_prompt_projection".to_string(),
+            authority_source: "CodexHistoryItemStream TaskRoute::Docs DocsRouteState DocsRepair route_contract_pending docs_only_mutation_boundary generated_dependency_evidence_excluded RequestedWorkAuthoring_not_primary localized_docs_topic_completion docs_route_semantic_no_progress_guard docs_supporting_context_budget_exhausted_corrective_tool_output docs_budget_exhausted_recovery_surface_narrowed docs_budget_exhaustion_survives_partial_write docs_completed_deliverable_regression_rejected write_ready_prompt_projection".to_string(),
             required_refs: vec![
                 "CodexHistoryItemStream".to_string(),
                 "TaskRoute::Docs".to_string(),
@@ -1781,6 +1782,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "route_contract_pending".to_string(),
                 "docs_only_mutation_boundary".to_string(),
                 "generated_dependency_evidence_excluded".to_string(),
+                "localized_docs_topic_completion".to_string(),
                 "docs_route_semantic_no_progress_guard".to_string(),
                 "docs_supporting_context_budget_exhausted_corrective_tool_output".to_string(),
                 "docs_budget_exhausted_recovery_surface_narrowed".to_string(),
