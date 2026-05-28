@@ -13,7 +13,8 @@ use crate::agent::edit_recovery::{
     invalid_apply_patch_arguments_need_write_recovery,
     invalid_edit_arguments_control_recovery_envelope, invalid_edit_arguments_no_progress_key,
     invalid_edit_arguments_terminal_message, invalid_edit_recovery_semantic_no_progress_key,
-    invalid_tool_arguments_result, invalid_write_arguments_need_patch_capable_recovery,
+    invalid_tool_arguments_no_progress_key, invalid_tool_arguments_result,
+    invalid_tool_arguments_terminal_message, invalid_write_arguments_need_patch_capable_recovery,
     is_invalid_tool_arguments_error, normalized_escaped_source_write_candidate,
     patch_context_mismatch_target_grounding_read_satisfied,
     patch_context_mismatch_target_grounding_surface_active,
@@ -1463,37 +1464,28 @@ impl<'a> TurnRuntime<'a> {
                     ) {
                         malformed_apply_patch_write_recovery_pending = true;
                     }
-                    if let Some(key) = invalid_edit_arguments_no_progress_key(
+                    if let Some(message) = record_invalid_arguments_no_progress_message(
+                        &mut invalid_edit_argument_counts,
                         &raw_proposal.effective_tool,
                         &result.metadata,
+                        &step_request.state,
                         &tool_names_for_route,
                         &dispatch_tool_choice,
                     ) {
-                        let count = invalid_edit_argument_counts
-                            .entry(key)
-                            .and_modify(|count| *count += 1)
-                            .or_insert(1);
-                        if should_terminalize_invalid_edit_arguments_no_progress(*count) {
-                            let message = invalid_edit_arguments_terminal_message(
-                                &raw_proposal.effective_tool,
-                                *count,
-                                &result.metadata,
-                            );
-                            return fail_turn(
-                                &session_repo,
-                                request.session.session.id,
-                                assistant_message.id,
-                                &request.model.name,
-                                &request.config.model.base_url,
-                                &message,
-                                tool_call_count,
-                                failed_tool_count,
-                                change_count,
-                                request.protocol_turn_id,
-                                sink,
-                            )
-                            .await;
-                        }
+                        return fail_turn(
+                            &session_repo,
+                            request.session.session.id,
+                            assistant_message.id,
+                            &request.model.name,
+                            &request.config.model.base_url,
+                            &message,
+                            tool_call_count,
+                            failed_tool_count,
+                            change_count,
+                            request.protocol_turn_id,
+                            sink,
+                        )
+                        .await;
                     }
                     if TurnLifecycleKernel::closeout_ready_final_message_authority(
                         &step_request.state,
@@ -1737,37 +1729,28 @@ impl<'a> TurnRuntime<'a> {
                         ) {
                             malformed_apply_patch_write_recovery_pending = true;
                         }
-                        if let Some(key) = invalid_edit_arguments_no_progress_key(
+                        if let Some(message) = record_invalid_arguments_no_progress_message(
+                            &mut invalid_edit_argument_counts,
                             &effective_tool_name,
                             &result.metadata,
+                            &step_request.state,
                             &tool_names_for_route,
                             &dispatch_tool_choice,
                         ) {
-                            let count = invalid_edit_argument_counts
-                                .entry(key)
-                                .and_modify(|count| *count += 1)
-                                .or_insert(1);
-                            if should_terminalize_invalid_edit_arguments_no_progress(*count) {
-                                let message = invalid_edit_arguments_terminal_message(
-                                    &effective_tool_name,
-                                    *count,
-                                    &result.metadata,
-                                );
-                                return fail_turn(
-                                    &session_repo,
-                                    request.session.session.id,
-                                    assistant_message.id,
-                                    &request.model.name,
-                                    &request.config.model.base_url,
-                                    &message,
-                                    tool_call_count,
-                                    failed_tool_count,
-                                    change_count,
-                                    request.protocol_turn_id,
-                                    sink,
-                                )
-                                .await;
-                            }
+                            return fail_turn(
+                                &session_repo,
+                                request.session.session.id,
+                                assistant_message.id,
+                                &request.model.name,
+                                &request.config.model.base_url,
+                                &message,
+                                tool_call_count,
+                                failed_tool_count,
+                                change_count,
+                                request.protocol_turn_id,
+                                sink,
+                            )
+                            .await;
                         }
                         continue;
                     }
@@ -2399,37 +2382,28 @@ impl<'a> TurnRuntime<'a> {
                             ) {
                                 malformed_apply_patch_write_recovery_pending = true;
                             }
-                            if let Some(key) = invalid_edit_arguments_no_progress_key(
+                            if let Some(message) = record_invalid_arguments_no_progress_message(
+                                &mut invalid_edit_argument_counts,
                                 &effective_tool_name,
                                 &result.metadata,
+                                &step_request.state,
                                 &tool_names_for_route,
                                 &dispatch_tool_choice,
                             ) {
-                                let count = invalid_edit_argument_counts
-                                    .entry(key)
-                                    .and_modify(|count| *count += 1)
-                                    .or_insert(1);
-                                if should_terminalize_invalid_edit_arguments_no_progress(*count) {
-                                    let message = invalid_edit_arguments_terminal_message(
-                                        &effective_tool_name,
-                                        *count,
-                                        &result.metadata,
-                                    );
-                                    return fail_turn(
-                                        &session_repo,
-                                        request.session.session.id,
-                                        assistant_message.id,
-                                        &request.model.name,
-                                        &request.config.model.base_url,
-                                        &message,
-                                        tool_call_count,
-                                        failed_tool_count,
-                                        change_count,
-                                        request.protocol_turn_id,
-                                        sink,
-                                    )
-                                    .await;
-                                }
+                                return fail_turn(
+                                    &session_repo,
+                                    request.session.session.id,
+                                    assistant_message.id,
+                                    &request.model.name,
+                                    &request.config.model.base_url,
+                                    &message,
+                                    tool_call_count,
+                                    failed_tool_count,
+                                    change_count,
+                                    request.protocol_turn_id,
+                                    sink,
+                                )
+                                .await;
                             }
                             continue;
                         }
@@ -2548,6 +2522,56 @@ async fn append_part_and_emit_event(
         .await?;
     sink.emit_pre_recorded(event)?;
     Ok(())
+}
+
+fn record_invalid_arguments_no_progress_message(
+    counts: &mut BTreeMap<String, usize>,
+    effective_tool_name: &str,
+    metadata: &Value,
+    state: &SessionStateSnapshot,
+    allowed_tools: &BTreeSet<String>,
+    tool_choice: &ToolChoice,
+) -> Option<String> {
+    if let Some(key) = invalid_edit_arguments_no_progress_key(
+        effective_tool_name,
+        metadata,
+        allowed_tools,
+        tool_choice,
+    ) {
+        let count = counts
+            .entry(key)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        if should_terminalize_invalid_edit_arguments_no_progress(*count) {
+            return Some(invalid_edit_arguments_terminal_message(
+                effective_tool_name,
+                *count,
+                metadata,
+            ));
+        }
+        return None;
+    }
+    let key = invalid_tool_arguments_no_progress_key(
+        effective_tool_name,
+        metadata,
+        state,
+        allowed_tools,
+        tool_choice,
+    )?;
+    let count = counts
+        .entry(key)
+        .and_modify(|count| *count += 1)
+        .or_insert(1);
+    if should_terminalize_invalid_edit_arguments_no_progress(*count) {
+        Some(invalid_tool_arguments_terminal_message(
+            effective_tool_name,
+            *count,
+            metadata,
+            state,
+        ))
+    } else {
+        None
+    }
 }
 
 async fn complete_turn(
@@ -6224,6 +6248,91 @@ pub(crate) fn invalid_edit_arguments_terminal_guard_fixture_passes() -> bool {
         && terminal_message.contains("invalid edit arguments")
         && terminal_message.contains("test_widget.py")
         && terminal_message.contains("outer timeout")
+}
+
+pub(crate) fn non_edit_invalid_tool_arguments_terminal_guard_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = crate::session::ProcessPhase::Author;
+    state.completion.open_work_count = 1;
+    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    let allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "read".to_string(),
+        "shell".to_string(),
+        "todowrite".to_string(),
+    ]);
+    let result = invalid_tool_arguments_result(
+        "read",
+        r#"{"limit":"120","offset":"0","path":"component.py"}"#,
+        "tool json error: invalid type: string \"120\", expected usize",
+        &state,
+        Some(&allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let same_shape = invalid_tool_arguments_result(
+        "read",
+        r#"{"limit":"999","offset":"30","path":"other.py"}"#,
+        "tool json error: invalid type: string \"999\", expected usize",
+        &state,
+        Some(&allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let generic_key = invalid_tool_arguments_no_progress_key(
+        "read",
+        &result.metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let same_shape_key = invalid_tool_arguments_no_progress_key(
+        "read",
+        &same_shape.metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let edit_key = invalid_edit_arguments_no_progress_key(
+        "read",
+        &result.metadata,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let mut counts = BTreeMap::<String, usize>::new();
+    let first = record_invalid_arguments_no_progress_message(
+        &mut counts,
+        "read",
+        &result.metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let second = record_invalid_arguments_no_progress_message(
+        &mut counts,
+        "read",
+        &same_shape.metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let third = record_invalid_arguments_no_progress_message(
+        &mut counts,
+        "read",
+        &result.metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    edit_key.is_none()
+        && generic_key.is_some()
+        && generic_key == same_shape_key
+        && first.is_none()
+        && second.is_none()
+        && third.is_some_and(|message| {
+            message.contains("Provider repeated invalid arguments for `read`")
+                && message.contains("test_widget.py")
+                && message.contains("malformed supporting tool call")
+        })
 }
 
 pub(crate) fn malformed_write_patch_capable_recovery_surface_fixture_passes() -> bool {

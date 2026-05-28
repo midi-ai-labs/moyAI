@@ -862,6 +862,127 @@ pub(crate) fn invalid_edit_arguments_no_progress_key(
     ))
 }
 
+pub(crate) fn invalid_tool_arguments_no_progress_key(
+    effective_tool_name: &str,
+    metadata: &Value,
+    state: &SessionStateSnapshot,
+    allowed_tools: &BTreeSet<String>,
+    tool_choice: &ToolChoice,
+) -> Option<String> {
+    if metadata
+        .get("invalid_tool_arguments")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || metadata
+            .get("side_effects_applied")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return None;
+    }
+    if matches!(effective_tool_name, "write" | "apply_patch")
+        && invalid_edit_arguments_no_progress_key(
+            effective_tool_name,
+            metadata,
+            allowed_tools,
+            tool_choice,
+        )
+        .is_some()
+    {
+        return None;
+    }
+    let arguments_shape = invalid_tool_argument_shape(
+        metadata
+            .get("arguments_json")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    let error_family = invalid_tool_argument_error_family(
+        metadata
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown_tool_argument_error"),
+    );
+    let active_targets = state
+        .active_targets
+        .iter()
+        .map(|target| normalize_path_for_target_match(target.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!(
+        "invalid_tool_arguments|tool={effective_tool_name}|error_family={error_family}|argument_shape={arguments_shape}|targets={active_targets}|allowed={}|choice={}",
+        allowed_tools.iter().cloned().collect::<Vec<_>>().join(","),
+        tool_choice_label(tool_choice)
+    ))
+}
+
+pub(crate) fn invalid_tool_arguments_terminal_message(
+    effective_tool_name: &str,
+    count: usize,
+    metadata: &Value,
+    state: &SessionStateSnapshot,
+) -> String {
+    let active_targets = state
+        .active_targets
+        .iter()
+        .map(|target| target.as_str())
+        .collect::<Vec<_>>();
+    let target_text = if active_targets.is_empty() {
+        "open executable work".to_string()
+    } else {
+        format!("active target(s): {}", active_targets.join(", "))
+    };
+    let error = metadata
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("invalid tool arguments");
+    format!(
+        "Provider repeated invalid arguments for `{effective_tool_name}` with no progress {count} time(s) while {target_text} remained open. Last schema error: {error}. Runtime stopped before spending more turns on the same malformed supporting tool call."
+    )
+}
+
+fn invalid_tool_argument_shape(arguments_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(arguments_json) else {
+        return "unparseable_json".to_string();
+    };
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| format!("{key}:{}", value_type_name(value)))
+            .collect::<Vec<_>>()
+            .join(","),
+        other => value_type_name(&other).to_string(),
+    }
+}
+
+fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn invalid_tool_argument_error_family(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("invalid type") && lower.contains("expected usize") {
+        return "invalid_type_expected_usize".to_string();
+    }
+    if lower.contains("invalid type") {
+        return "invalid_type".to_string();
+    }
+    if lower.contains("missing field") {
+        return "missing_required_field".to_string();
+    }
+    if lower.contains("unknown field") {
+        return "unknown_field".to_string();
+    }
+    crate::harness::artifact::hash_bytes(lower.as_bytes())
+}
+
 pub(crate) fn invalid_edit_recovery_semantic_no_progress_key(
     envelope: &InvalidEditRecoveryEnvelope,
 ) -> String {

@@ -763,6 +763,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
 
     if gate.gate_id == "preflight.tool_lifecycle.rejected_tool_semantic_terminal_guard"
         && (!crate::agent::tool_orchestrator::rejected_tool_semantic_terminal_guard_fixture_passes()
+            || !crate::agent::loop_impl::non_edit_invalid_tool_arguments_terminal_guard_fixture_passes()
             || !crate::tool::registry::unknown_tool_feedback_does_not_restore_shell_surface_fixture_passes())
     {
         diagnostics.push(
@@ -3938,7 +3939,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.tool_lifecycle.rejected_tool_semantic_terminal_guard"
                 .to_string(),
             family: PreflightGateFamily::ToolLifecycleAuthority,
-            authority_source: "RejectedToolProposal semantic_no_progress_key invalid_edit_recovery_semantic_no_progress_key tool_allowed_false tool_choice_auto broad_surface_terminal_guard rejected_tool_required_action_terminal_guard lifecycle_kernel_provider_noncompliance provider_ignored_edit_only_surface malformed_tool_arguments_terminal_guard result_hash_evidence_not_key repair_required_edit_before_verification_rerun argument_payload_omitted projection_noise_absent".to_string(),
+            authority_source: "RejectedToolProposal semantic_no_progress_key invalid_edit_recovery_semantic_no_progress_key tool_allowed_false tool_choice_auto broad_surface_terminal_guard rejected_tool_required_action_terminal_guard lifecycle_kernel_provider_noncompliance provider_ignored_edit_only_surface malformed_tool_arguments_terminal_guard non_edit_invalid_tool_arguments_terminal_guard result_hash_evidence_not_key repair_required_edit_before_verification_rerun argument_payload_omitted projection_noise_absent".to_string(),
             required_refs: vec![
                 "RejectedToolProposal".to_string(),
                 "semantic_no_progress_key".to_string(),
@@ -3950,6 +3951,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "lifecycle_kernel_provider_noncompliance".to_string(),
                 "provider_ignored_edit_only_surface".to_string(),
                 "malformed_tool_arguments_terminal_guard".to_string(),
+                "non_edit_invalid_tool_arguments_terminal_guard".to_string(),
                 "result_hash_evidence_not_key".to_string(),
                 "repair_required_edit_before_verification_rerun".to_string(),
             ],
