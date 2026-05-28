@@ -3787,7 +3787,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.tool_lifecycle.active_authoring_rejects_wrong_target"
                 .to_string(),
             family: PreflightGateFamily::ToolLifecycleAuthority,
-            authority_source: "CodexHistoryItemStream ActiveWorkContract::RequestedWorkAuthoring active_deliverable_targets workspace_path_coordinate_authority escaped_windows_absolute_target_matches_relative_deliverable workspace_prefix_boundary ActiveWorkContract::Verification repair_required RepairOperationTemplate exact_target write_admission source_owned_repair_generated_test_rewrite_rejected ToolLifecycleEnvelope FunctionCallOutput success=false wrong_authoring_target progress_effect=no_progress terminal_guard stable_tool_schema".to_string(),
+            authority_source: "CodexHistoryItemStream ActiveWorkContract::RequestedWorkAuthoring active_deliverable_targets workspace_path_coordinate_authority escaped_windows_absolute_target_matches_relative_deliverable workspace_prefix_boundary ActiveWorkContract::Verification repair_required RepairOperationTemplate exact_target write_admission source_owned_repair_generated_test_rewrite_rejected ToolLifecycleEnvelope FunctionCallOutput success=false wrong_authoring_target wrong_authoring_target_semantic_no_progress_key progress_effect=no_progress terminal_guard stable_tool_schema".to_string(),
             required_refs: vec![
                 "CodexHistoryItemStream".to_string(),
                 "ActiveWorkContract::RequestedWorkAuthoring".to_string(),
@@ -3798,6 +3798,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "ToolLifecycleEnvelope".to_string(),
                 "FunctionCallOutput".to_string(),
                 "wrong_authoring_target".to_string(),
+                "wrong_authoring_target_semantic_no_progress_key".to_string(),
                 "RepairOperationTemplate exact_target write_admission".to_string(),
                 "source_owned_repair_generated_test_rewrite_rejected".to_string(),
                 "progress_effect=no_progress".to_string(),

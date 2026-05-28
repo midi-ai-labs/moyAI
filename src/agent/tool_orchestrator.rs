@@ -2740,8 +2740,8 @@ fn wrong_authoring_target_key(
     parsed_arguments: &Value,
     active_work: Option<&ActiveWorkContract>,
     workspace_root: &Utf8Path,
-    allowed_tools: &BTreeSet<String>,
-    tool_choice: &ToolChoice,
+    _allowed_tools: &BTreeSet<String>,
+    _tool_choice: &ToolChoice,
 ) -> String {
     let submitted = submitted_authoring_targets(effective_tool_name, parsed_arguments)
         .into_iter()
@@ -2762,9 +2762,7 @@ fn wrong_authoring_target_key(
         })
         .unwrap_or_default();
     format!(
-        "tool={effective_tool_name}|submitted={submitted}|active={active}|allowed={}|choice={}",
-        allowed_tools.iter().cloned().collect::<Vec<_>>().join(","),
-        tool_choice_label(tool_choice),
+        "wrong_authoring_target|class=content_changing_edit_outside_active_authority|submitted={submitted}|active={active}"
     )
 }
 

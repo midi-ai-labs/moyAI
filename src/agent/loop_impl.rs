@@ -8363,6 +8363,20 @@ pub(crate) fn active_authoring_rejects_wrong_target_fixture_passes() -> bool {
         &ToolChoice::Required,
         wrong_write_result,
     );
+    let wrong_patch_args = json!({"patch_text": "*** Begin Patch\n*** Update File: arcade_game.py\n@@\n-pass\n+different pass\n*** End Patch"});
+    let wrong_patch_result = wrong_patch
+        .as_ref()
+        .expect("wrong patch should be rejected");
+    let cross_tool_decision = ToolLifecycleRuntime::record_wrong_authoring_target_no_progress(
+        &mut wrong_authoring_counts,
+        "apply_patch",
+        &wrong_patch_args,
+        Some(&active),
+        workspace_root,
+        &allowed,
+        &ToolChoice::Auto,
+        wrong_patch_result,
+    );
     let progressed_active = ActiveWorkContract::RequestedWorkAuthoring {
         pending_targets: vec![Utf8PathBuf::from("arcade_game.py")],
         verification_commands: vec!["python -m unittest".to_string()],
@@ -8435,6 +8449,11 @@ pub(crate) fn active_authoring_rejects_wrong_target_fixture_passes() -> bool {
         && outside_workspace_absolute_write.is_some()
         && first_decision.count == 1
         && second_decision.count == 2
+        && cross_tool_decision.count == 3
+        && cross_tool_decision
+            .terminal_message
+            .as_deref()
+            .is_some_and(|message| message.contains("active requested-work deliverable set"))
         && progressed_decision.count == 1
         && docs_completed_target_regression
             .as_ref()
@@ -8451,19 +8470,7 @@ pub(crate) fn active_authoring_rejects_wrong_target_fixture_passes() -> bool {
             })
         && docs_active_target_write.is_none()
         && docs_completed_target_patch.is_some()
-        && ToolLifecycleRuntime::record_wrong_authoring_target_no_progress(
-            &mut wrong_authoring_counts,
-            "write",
-            &second_wrong_args,
-            Some(&active),
-            workspace_root,
-            &allowed,
-            &ToolChoice::Required,
-            wrong_write_result,
-        )
-        .terminal_message
-        .as_deref()
-        .is_some_and(|message| message.contains("active requested-work deliverable set"))
+        && wrong_authoring_counts.len() == 2
 }
 
 pub(crate) fn verification_repair_rejects_non_exact_write_target_fixture_passes() -> bool {
