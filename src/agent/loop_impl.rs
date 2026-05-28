@@ -598,6 +598,10 @@ impl<'a> TurnRuntime<'a> {
                     && TurnLifecycleKernel::open_executable_work_requires_tool_call(
                         &step_request.state,
                     );
+            let failed_edit_recovery_active = invalid_edit_arguments_recovery.is_some()
+                && TurnLifecycleKernel::open_executable_work_requires_tool_call(
+                    &step_request.state,
+                );
             let code_authoring_final_message_hard_edit_recovery_active =
                 (open_obligation_final_message_hard_edit_recovery_pending
                     || open_obligation_final_message_recovery
@@ -612,11 +616,13 @@ impl<'a> TurnRuntime<'a> {
             let code_authoring_final_message_recovery_stable_surface_active =
                 open_obligation_final_message_recovery_active
                     && !code_authoring_final_message_hard_edit_recovery_active
+                    && !failed_edit_recovery_active
                     && TurnLifecycleKernel::code_authoring_open_obligation_final_message_recovery_uses_stable_surface(
                         &step_request.state,
                     );
             let code_repair_final_message_recovery_stable_surface_active =
                 open_obligation_final_message_recovery_active
+                    && !failed_edit_recovery_active
                     && TurnLifecycleKernel::code_repair_open_obligation_final_message_recovery_uses_stable_surface(
                         &step_request.state,
                     );
@@ -704,6 +710,7 @@ impl<'a> TurnRuntime<'a> {
                 malformed_apply_patch_write_recovery_active,
                 progress_projection_edit_recovery_active,
                 progress_projection_edit_recovery_needs_grounding_read,
+                failed_edit_recovery_active,
                 open_obligation_final_message_recovery_active,
                 open_obligation_final_message_count,
             };
@@ -11353,6 +11360,110 @@ pub(crate) fn code_authoring_final_message_recovery_reopens_stable_surface_fixtu
     );
 
     recovered_tool_names == stable_tool_names && matches!(choice, ToolChoice::Auto)
+}
+
+pub(crate) fn failed_edit_final_message_recovery_keeps_failed_edit_surface_fixture_passes() -> bool
+{
+    let mut tools = vec![
+        crate::llm::ToolSchema {
+            name: "apply_patch".to_string(),
+            description: "apply a patch".to_string(),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        },
+        crate::llm::ToolSchema {
+            name: "todowrite".to_string(),
+            description: "update progress".to_string(),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        },
+    ];
+    let stable_tools = vec![
+        crate::llm::ToolSchema {
+            name: "apply_patch".to_string(),
+            description: "apply a patch".to_string(),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        },
+        crate::llm::ToolSchema {
+            name: "read".to_string(),
+            description: "read a file".to_string(),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        },
+        crate::llm::ToolSchema {
+            name: "shell".to_string(),
+            description: "run a shell command".to_string(),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        },
+        crate::llm::ToolSchema {
+            name: "todowrite".to_string(),
+            description: "update progress".to_string(),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        },
+        crate::llm::ToolSchema {
+            name: "write".to_string(),
+            description: "write a file".to_string(),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        },
+    ];
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = crate::session::ProcessPhase::Author;
+    state.active_targets = vec![Utf8PathBuf::from("test_component.py")];
+    state.completion.open_work_count = 1;
+    state.completion.closeout_ready = false;
+
+    let recovery = TurnLifecycleRecoveryContext {
+        failed_edit_recovery_active: true,
+        open_obligation_final_message_recovery_active: true,
+        open_obligation_final_message_count: 1,
+        ..TurnLifecycleRecoveryContext::default()
+    };
+    TurnLifecycleKernel::apply_pre_normalization_recovery_surface(
+        &mut tools,
+        &stable_tools,
+        TurnLifecyclePreNormalizationSurfaceInput {
+            state: &state,
+            recovery,
+            code_authoring_final_message_hard_edit_recovery_active: false,
+            code_authoring_final_message_recovery_stable_surface_active: true,
+            code_repair_final_message_recovery_stable_surface_active: false,
+        },
+    );
+    TurnLifecycleKernel::apply_post_normalization_recovery_surface(
+        &mut tools,
+        &stable_tools,
+        TurnLifecycleRecoverySurfaceInput {
+            state: &state,
+            recovery,
+            code_authoring_final_message_hard_edit_recovery_active: false,
+            generated_test_orientation_allowed: true,
+        },
+    );
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
+    let plan = TurnLifecycleKernel::compile_turn_lifecycle_plan(TurnLifecyclePlanInput {
+        policy: &crate::agent::prompt::PromptPolicy::default(),
+        state: &state,
+        tool_names: &tool_names,
+        recovery,
+    });
+
+    tool_names.contains("apply_patch")
+        && tool_names.contains("todowrite")
+        && tool_names.contains("write")
+        && !tool_names.contains("shell")
+        && !tool_names.contains("read")
+        && matches!(plan.tool_choice, ToolChoice::Required)
+        && plan.plan_reason == "failed_edit_final_message_recovery"
+        && plan.proposal_policy == "tool_call_required_or_provider_noncompliance"
+        && plan.terminal_policy == "same_hard_recovery_no_progress_terminal"
 }
 
 fn verification_final_message_recovery_uses_shell_fixture_passes() -> bool {

@@ -729,6 +729,10 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
                 crate::agent::loop_impl::code_authoring_final_message_recovery_reopens_stable_surface_fixture_passes(),
             ),
             (
+                "failed_edit_final_message_recovery_keeps_failed_edit_surface",
+                crate::agent::loop_impl::failed_edit_final_message_recovery_keeps_failed_edit_surface_fixture_passes(),
+            ),
+            (
                 "docs_route_supporting_context_budget_exhaustion_is_recoverable",
                 crate::agent::loop_impl::docs_route_supporting_context_budget_exhaustion_is_recoverable_fixture_passes(),
             ),
@@ -875,6 +879,10 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             (
                 "open_obligation_final_message_recovery_preserves_stable_surface",
                 crate::agent::loop_impl::open_obligation_final_message_recovery_preserves_stable_surface_fixture_passes(),
+            ),
+            (
+                "failed_edit_final_message_recovery_keeps_failed_edit_surface",
+                crate::agent::loop_impl::failed_edit_final_message_recovery_keeps_failed_edit_surface_fixture_passes(),
             ),
             (
                 "provider_required_tool_choice_final_message_recovery",
@@ -4191,12 +4199,13 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
         PreflightFixture {
             fixture_id: "fixture.lifecycle_kernel.turn_lifecycle_plan_authority".to_string(),
             family: PreflightGateFamily::ToolLifecycleAuthority,
-            authority_source: "TurnLifecycleKernel TurnLifecyclePlan stable_surface_default open_obligation_final_message_recovery provider_noncompliance_edit_recovery provider_noncompliance_recovery_overrides_grounding wrong_target_authoring_edit_recovery wrong_target_generated_test_source_reference_read provider_required_tool_choice_final_message_recovery docs_provider_required_final_message_required_tool_choice code_authoring_final_message_hard_edit_recovery tool_choice_auto hard_recovery_required replay_policy proposal_policy corrective_policy terminal_policy continuation_expectation diagnostics_projection".to_string(),
+            authority_source: "TurnLifecycleKernel TurnLifecyclePlan stable_surface_default open_obligation_final_message_recovery failed_edit_final_message_recovery provider_noncompliance_edit_recovery provider_noncompliance_recovery_overrides_grounding wrong_target_authoring_edit_recovery wrong_target_generated_test_source_reference_read provider_required_tool_choice_final_message_recovery docs_provider_required_final_message_required_tool_choice code_authoring_final_message_hard_edit_recovery tool_choice_auto hard_recovery_required replay_policy proposal_policy corrective_policy terminal_policy continuation_expectation diagnostics_projection".to_string(),
             required_refs: vec![
                 "TurnLifecycleKernel".to_string(),
                 "TurnLifecyclePlan".to_string(),
                 "stable_surface_default".to_string(),
                 "open_obligation_final_message_recovery".to_string(),
+                "failed_edit_final_message_recovery".to_string(),
                 "provider_noncompliance_edit_recovery".to_string(),
                 "provider_noncompliance_recovery_overrides_grounding".to_string(),
                 "wrong_target_authoring_edit_recovery".to_string(),
@@ -4221,7 +4230,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.turn_decision.codex_stable_tool_surface_authority"
                 .to_string(),
             family: PreflightGateFamily::ControlEnvelopeProjection,
-            authority_source: "CodexResponsesRequest ActiveWorkContract RequestedWorkAuthoring candidate_tool_surface ActionAuthority workspace_target_identity_normalization stable_tool_schema tool_choice_auto requested_work_singleton_stable_surface singleton_missing_target_apply_patch_action_auto_choice codex_style_code_authoring_omits_whole_file_write codex_style_code_authoring_omits_json_discovery_surface codex_style_docs_authoring_omits_non_codex_json_surface generated_test_source_reference_grounding_after_source_change singleton_missing_target_source_reference_or_create_authority generated_test_consumed_source_reference_active_target_grounding repair_target_aliases_collapse_to_singleton_write_action typed_required_action_rendered_text open_work_lifecycle_evidence normal_authoring_final_message_recovery_stable_surface docs_open_obligation_required_edit_recovery open_obligation_final_message_recovery_persists_across_no_progress_tool authoring_final_message_target_grounding_read docs_patch_context_final_message_grounding docs_existing_target_update_exact_read_grounding source_repair_exact_write_final_message_recovery hard_repair_recovery_executable_schema_surface harness_closeout_guard open_obligation_final_message_guard open_obligation_final_message_guard_context_key".to_string(),
+            authority_source: "CodexResponsesRequest ActiveWorkContract RequestedWorkAuthoring candidate_tool_surface ActionAuthority workspace_target_identity_normalization stable_tool_schema tool_choice_auto requested_work_singleton_stable_surface singleton_missing_target_apply_patch_action_auto_choice codex_style_code_authoring_omits_whole_file_write codex_style_code_authoring_omits_json_discovery_surface codex_style_docs_authoring_omits_non_codex_json_surface generated_test_source_reference_grounding_after_source_change singleton_missing_target_source_reference_or_create_authority generated_test_consumed_source_reference_active_target_grounding repair_target_aliases_collapse_to_singleton_write_action typed_required_action_rendered_text open_work_lifecycle_evidence normal_authoring_final_message_recovery_stable_surface failed_edit_final_message_recovery_keeps_failed_edit_surface docs_open_obligation_required_edit_recovery open_obligation_final_message_recovery_persists_across_no_progress_tool authoring_final_message_target_grounding_read docs_patch_context_final_message_grounding docs_existing_target_update_exact_read_grounding source_repair_exact_write_final_message_recovery hard_repair_recovery_executable_schema_surface harness_closeout_guard open_obligation_final_message_guard open_obligation_final_message_guard_context_key".to_string(),
             required_refs: vec![
                 "CodexResponsesRequest".to_string(),
                 "ActiveWorkContract".to_string(),
@@ -4242,6 +4251,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "typed_required_action_rendered_text".to_string(),
                 "open_work_lifecycle_evidence".to_string(),
                 "normal_authoring_final_message_recovery_stable_surface".to_string(),
+                "failed_edit_final_message_recovery_keeps_failed_edit_surface".to_string(),
                 "docs_open_obligation_required_edit_recovery".to_string(),
                 "open_obligation_final_message_recovery_persists_across_no_progress_tool"
                     .to_string(),

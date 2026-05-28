@@ -315,6 +315,17 @@ impl TurnLifecycleKernel {
             }
             return;
         }
+        if input.recovery.failed_edit_recovery_active
+            && input.recovery.open_obligation_final_message_recovery_active
+        {
+            augment_tools_from_stable_surface(
+                tools,
+                stable_tools,
+                failed_edit_final_message_recovery_tool_visible,
+            );
+            tools.retain(|tool| failed_edit_final_message_recovery_tool_visible(&tool.name));
+            return;
+        }
         if input.recovery.verification_target_grounding_active {
             augment_tools_from_stable_surface(
                 tools,
@@ -472,6 +483,15 @@ impl TurnLifecycleKernel {
                 tool_name == "write"
             });
             tools.retain(|tool| tool.name == "write");
+        } else if input.recovery.failed_edit_recovery_active
+            && input.recovery.open_obligation_final_message_recovery_active
+        {
+            augment_tools_from_stable_surface(
+                tools,
+                stable_tools,
+                failed_edit_final_message_recovery_tool_visible,
+            );
+            tools.retain(|tool| failed_edit_final_message_recovery_tool_visible(&tool.name));
         } else if input.recovery.malformed_apply_patch_write_recovery_active {
             augment_tools_from_stable_surface(tools, stable_tools, |tool_name| {
                 matches!(tool_name, "apply_patch" | "write")
@@ -1113,6 +1133,7 @@ pub(crate) struct TurnLifecycleRecoveryContext {
     pub(crate) malformed_apply_patch_write_recovery_active: bool,
     pub(crate) progress_projection_edit_recovery_active: bool,
     pub(crate) progress_projection_edit_recovery_needs_grounding_read: bool,
+    pub(crate) failed_edit_recovery_active: bool,
     pub(crate) open_obligation_final_message_recovery_active: bool,
     pub(crate) open_obligation_final_message_count: usize,
 }
@@ -1136,6 +1157,11 @@ fn lifecycle_tool_choice(input: &TurnLifecyclePlanInput<'_>) -> ToolChoice {
         return ToolChoice::Required;
     }
     if recovery.wrong_target_authoring_edit_recovery_active {
+        return ToolChoice::Required;
+    }
+    if recovery.failed_edit_recovery_active
+        && recovery.open_obligation_final_message_recovery_active
+    {
         return ToolChoice::Required;
     }
     if recovery.provider_required_tool_choice_final_message_recovery_active
@@ -1204,6 +1230,11 @@ fn lifecycle_plan_reason(input: &TurnLifecyclePlanInput<'_>) -> &'static str {
     if recovery.wrong_target_authoring_edit_recovery_active {
         return "wrong_target_authoring_edit_recovery";
     }
+    if recovery.failed_edit_recovery_active
+        && recovery.open_obligation_final_message_recovery_active
+    {
+        return "failed_edit_final_message_recovery";
+    }
     if recovery.provider_required_tool_choice_final_message_recovery_active {
         return "provider_required_tool_choice_final_message_recovery";
     }
@@ -1259,6 +1290,7 @@ fn lifecycle_replay_policy(plan_reason: &str) -> &'static str {
         "empty_effective_surface" => "no_executable_tool_replay",
         "provider_noncompliance_edit_recovery"
         | "wrong_target_authoring_edit_recovery"
+        | "failed_edit_final_message_recovery"
         | "provider_required_tool_choice_final_message_recovery"
         | "malformed_write_patch_recovery"
         | "malformed_apply_patch_write_recovery"
@@ -1286,6 +1318,7 @@ fn lifecycle_corrective_policy(plan_reason: &str) -> &'static str {
     match plan_reason {
         "provider_noncompliance_edit_recovery"
         | "wrong_target_authoring_edit_recovery"
+        | "failed_edit_final_message_recovery"
         | "provider_required_tool_choice_final_message_recovery"
         | "malformed_write_patch_recovery"
         | "malformed_apply_patch_write_recovery"
@@ -1314,6 +1347,7 @@ fn lifecycle_proposal_policy(plan_reason: &str) -> &'static str {
         "empty_effective_surface" => "final_message_only_or_fail_closed",
         "provider_noncompliance_edit_recovery"
         | "wrong_target_authoring_edit_recovery"
+        | "failed_edit_final_message_recovery"
         | "provider_required_tool_choice_final_message_recovery"
         | "malformed_write_patch_recovery"
         | "malformed_apply_patch_write_recovery"
@@ -1343,6 +1377,7 @@ fn lifecycle_terminal_policy(plan_reason: &str) -> &'static str {
         "empty_effective_surface" => "no_tool_surface_terminal_policy",
         "provider_noncompliance_edit_recovery"
         | "wrong_target_authoring_edit_recovery"
+        | "failed_edit_final_message_recovery"
         | "provider_required_tool_choice_final_message_recovery"
         | "malformed_write_patch_recovery"
         | "malformed_apply_patch_write_recovery"
@@ -1516,6 +1551,10 @@ fn docs_route_content_grounding_after_progress_projection_tool_visible(tool_name
         tool_name,
         "apply_patch" | "docling_convert" | "grep" | "mcp_call" | "read" | "shell"
     )
+}
+
+fn failed_edit_final_message_recovery_tool_visible(tool_name: &str) -> bool {
+    matches!(tool_name, "apply_patch" | "todowrite" | "write")
 }
 
 fn open_obligation_final_message_recovery_tool_visible(
