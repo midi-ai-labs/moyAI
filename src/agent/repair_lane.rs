@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use camino::Utf8PathBuf;
 use sha2::{Digest, Sha256};
 
+use crate::agent::content_shape_contract::python_source_for_test_target;
 use crate::agent::contract_reconciliation::{
     ContractFailureOwner, ContractReconciliationDecision,
     reconcile_session_state_failure_with_cluster,
@@ -18,7 +19,6 @@ use crate::session::{
 pub(crate) struct RepairLaneProjection {
     pub subtype: RepairLaneSubtype,
     pub required_target: Option<String>,
-    pub required_next_action: Option<String>,
     pub allowed_tools: Vec<String>,
     pub forbidden_tools: Vec<String>,
     pub missing_symbol: Option<String>,
@@ -33,6 +33,8 @@ pub(crate) struct RepairLaneProjection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RepairLaneSubtype {
+    GeneratedTestSubprocessEncodingMissing,
+    GeneratedTestSubprocessOutputCaptureMissing,
     GeneratedTestLoggingContractOverreach,
     ImportExportMissingExport,
     NoTestsRan,
@@ -43,6 +45,8 @@ pub(crate) enum RepairLaneSubtype {
     PublicExceptionMismatch,
     PublicMethodAttributeMismatch,
     PublicMissingAttributeMismatch,
+    PublicCommandContractFailure,
+    PublicOutputStreamAssertionMismatch,
     PublicStateAssertionMismatch,
     SourceImportTimeNameResolution,
     SourceParseDefect,
@@ -53,6 +57,12 @@ pub(crate) enum RepairLaneSubtype {
 impl RepairLaneSubtype {
     fn as_str(&self) -> &'static str {
         match self {
+            Self::GeneratedTestSubprocessEncodingMissing => {
+                "generated_test_subprocess_encoding_missing"
+            }
+            Self::GeneratedTestSubprocessOutputCaptureMissing => {
+                "generated_test_subprocess_output_capture_missing"
+            }
             Self::GeneratedTestLoggingContractOverreach => {
                 "generated_test_logging_contract_overreach"
             }
@@ -65,6 +75,8 @@ impl RepairLaneSubtype {
             Self::PublicExceptionMismatch => "public_exception_mismatch",
             Self::PublicMethodAttributeMismatch => "public_method_attribute_mismatch",
             Self::PublicMissingAttributeMismatch => "public_missing_attribute_mismatch",
+            Self::PublicCommandContractFailure => "public_command_contract_failure",
+            Self::PublicOutputStreamAssertionMismatch => "public_output_stream_assertion_mismatch",
             Self::PublicStateAssertionMismatch => "public_state_assertion_mismatch",
             Self::SourceImportTimeNameResolution => "source_import_time_name_resolution",
             Self::SourceParseDefect => "source_parse_defect",
@@ -79,7 +91,6 @@ impl RepairLaneProjection {
         RepairLaneDiagnostic {
             subtype: self.subtype.as_str().to_string(),
             required_target: self.required_target.clone(),
-            required_next_action: self.required_next_action.clone(),
             allowed_tools: self.allowed_tools.clone(),
             forbidden_tools: self.forbidden_tools.clone(),
             missing_symbol: self.missing_symbol.clone(),
@@ -97,7 +108,6 @@ impl RepairLaneProjection {
 pub(crate) fn project_repair_lane(
     state: &SessionStateSnapshot,
     allowed_tools: &BTreeSet<String>,
-    _required_next_action: Option<&str>,
 ) -> Option<RepairLaneProjection> {
     if !state.completion.verification_pending
         || !matches!(
@@ -132,7 +142,6 @@ pub(crate) fn project_repair_lane(
     if no_tests_ran_generated_test_target_outranks_stale_write_action(
         &subtype,
         typed_required_target.as_deref(),
-        None,
     ) && let Some(target) = typed_required_target.as_deref()
     {
         required_target = Some(target.to_string());
@@ -163,16 +172,24 @@ pub(crate) fn project_repair_lane(
             && reconciliation.permits_generated_test_repair()
         {
             required_target = reconciliation.required_target.clone();
+        } else if reconciliation.owner == ContractFailureOwner::SourceTestContractMismatch {
+            required_target = reconciliation.required_target.clone();
         } else if reconciliation.blocks_source_repair() {
             required_target = reconciliation.required_target.clone();
         }
     }
+    required_target = normalize_source_owned_required_target(
+        required_target,
+        state,
+        verification_cluster.as_ref(),
+        generated_test_target.as_deref(),
+        contract_reconciliation.as_ref(),
+    );
     let repair_intent = repair_intent_projection(
         &subtype,
         required_target.as_deref(),
         generated_test_target.as_deref(),
         missing_symbol.as_deref(),
-        None,
         &public_state_assertions,
         &public_missing_attributes,
         verification_cluster.as_ref(),
@@ -184,7 +201,6 @@ pub(crate) fn project_repair_lane(
         generated_test_target.as_deref(),
         &allowed,
         &forbidden,
-        None,
         &public_state_assertions,
         &public_missing_attributes,
         verification_cluster.as_ref(),
@@ -194,7 +210,6 @@ pub(crate) fn project_repair_lane(
     let repair_control_snapshot = repair_control_snapshot_projection(
         &subtype,
         required_target.as_deref(),
-        None,
         &allowed,
         &forbidden,
         repair_intent.as_ref(),
@@ -204,7 +219,6 @@ pub(crate) fn project_repair_lane(
     Some(RepairLaneProjection {
         subtype,
         required_target,
-        required_next_action: None,
         allowed_tools: allowed,
         forbidden_tools: forbidden,
         missing_symbol,
@@ -232,12 +246,12 @@ pub(crate) fn source_owned_verification_repair_lane_fixture_passes() -> bool {
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
+        Utf8PathBuf::from("component.py"),
+        Utf8PathBuf::from("test_component.py"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: calculator.calculate is missing".to_string(),
+        summary: "verification failed: component.calculate is missing".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
@@ -250,14 +264,13 @@ pub(crate) fn source_owned_verification_repair_lane_fixture_passes() -> bool {
         .required_commands
         .push("python -m unittest".to_string());
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
-    let Some(projection) = project_repair_lane(&state, &allowed_tools, None) else {
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
         return false;
     };
     let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
         return false;
     };
-    projection.required_target.as_deref() == Some("calculator.py")
-        && projection.required_next_action.is_none()
+    projection.required_target.as_deref() == Some("component.py")
         && projection
             .contract_reconciliation
             .as_ref()
@@ -278,8 +291,8 @@ pub(crate) fn source_owned_repair_lane_rejects_diagnostic_label_targets_fixture_
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
         Utf8PathBuf::from(label_target),
-        Utf8PathBuf::from("space_invader.py"),
-        Utf8PathBuf::from("test_space_invader.py"),
+        Utf8PathBuf::from("arcade_game.py"),
+        Utf8PathBuf::from("test_arcade_game.py"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
@@ -291,12 +304,12 @@ pub(crate) fn source_owned_repair_lane_rejects_diagnostic_label_targets_fixture_
     state.verification.failing_labels = vec!["test_update_calls_collision_BEH4".to_string()];
     let mut cluster = crate::agent::state::public_class_attribute_cluster_fixture();
     cluster.source_refs = vec![label_target.to_string()];
-    cluster.test_refs = vec!["test_space_invader.py".to_string()];
+    cluster.test_refs = vec!["test_arcade_game.py".to_string()];
     for evidence in &mut cluster.evidence {
         evidence.subtype = Some("public_state_assertion_mismatch".to_string());
         evidence.target = Some(label_target.to_string());
         evidence.source_refs = vec![label_target.to_string()];
-        evidence.test_refs = vec!["test_space_invader.py".to_string()];
+        evidence.test_refs = vec!["test_arcade_game.py".to_string()];
     }
     state.verification.failure_cluster = Some(cluster);
     state
@@ -304,15 +317,15 @@ pub(crate) fn source_owned_repair_lane_rejects_diagnostic_label_targets_fixture_
         .required_commands
         .push("python -m unittest".to_string());
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
-    let Some(projection) = project_repair_lane(&state, &allowed_tools, None) else {
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
         return false;
     };
-    projection.required_target.as_deref() == Some("space_invader.py")
+    projection.required_target.as_deref() == Some("arcade_game.py")
         && projection
             .operation_template
             .as_ref()
             .and_then(|template| template.exact_target.as_deref())
-            == Some("space_invader.py")
+            == Some("arcade_game.py")
         && projection.required_target.as_deref() != Some(label_target)
 }
 
@@ -320,12 +333,12 @@ pub(crate) fn source_owned_repair_lane_stays_diagnostic_fixture_passes() -> bool
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
+        Utf8PathBuf::from("component.py"),
+        Utf8PathBuf::from("test_component.py"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: calculator.calculate is missing".to_string(),
+        summary: "verification failed: component.calculate is missing".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
@@ -339,19 +352,1303 @@ pub(crate) fn source_owned_repair_lane_stays_diagnostic_fixture_passes() -> bool
         .push("python -m unittest".to_string());
 
     let allowed_tools = BTreeSet::from(["shell".to_string()]);
-    let Some(projection) =
-        project_repair_lane(&state, &allowed_tools, Some("shell:python -m unittest"))
-    else {
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
         return false;
     };
-    projection.required_target.as_deref() == Some("calculator.py")
-        && projection.required_next_action.is_none()
+    projection.required_target.as_deref() == Some("component.py")
         && projection
             .operation_template
             .as_ref()
-            .and_then(|template| template.required_next_action.as_deref())
-            .is_none()
-        && active_targets_contain_repair_target(&state, "calculator.py")
+            .is_some_and(|template| template.exact_target.as_deref() == Some("component.py"))
+        && active_targets_contain_repair_target(&state, "component.py")
+}
+
+pub(crate) fn source_owned_repair_lane_derives_source_from_generated_test_target_fixture_passes()
+-> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: public widget behavior mismatch".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.failing_labels = vec!["test_cli_no_args".to_string()];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-source-owned-generated-test-target".to_string(),
+        failing_labels: vec!["test_cli_no_args".to_string()],
+        primary_failure: Some("stdout did not match public contract".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generic_verification_failure".to_string()),
+            label: Some("test_cli_no_args".to_string()),
+            target: Some("test_widget.py".to_string()),
+            symbol: None,
+            call_site: Some("subprocess.run([sys.executable, 'widget.py'])".to_string()),
+            exception: None,
+            expected: Some("usage text".to_string()),
+            observed: Some("empty stdout".to_string()),
+            public_state_assertions: vec!["CLI prints usage text".to_string()],
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec!["public behavior repair".to_string()],
+            sibling_obligations: vec!["widget.py CLI behavior".to_string()],
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: vec!["widget.py CLI behavior".to_string()],
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    });
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+
+    projection.required_target.as_deref() == Some("widget.py")
+        && projection
+            .operation_template
+            .as_ref()
+            .and_then(|template| template.exact_target.as_deref())
+            == Some("widget.py")
+        && projection
+            .operation_template
+            .as_ref()
+            .is_some_and(|template| template.source_test_ownership == "source")
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "SourceViolatesContract"
+                    && decision.source_repair_allowed
+                    && !decision.test_repair_allowed
+            })
+        && snapshot.repair_owner == "source"
+        && snapshot.required_target.as_deref() == Some("widget.py")
+}
+
+pub(crate) fn source_owned_repair_lane_canonicalizes_absolute_source_target_fixture_passes() -> bool
+{
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: public widget exception contract mismatch".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: vec![
+            Utf8PathBuf::from("C:/workspace/project/widget.py"),
+            Utf8PathBuf::from("widget.py"),
+        ],
+    });
+    state.completion.verification_pending = true;
+    state.verification.failing_labels = vec!["test_widget_negative".to_string()];
+    let mut cluster = crate::agent::state::public_class_attribute_cluster_fixture();
+    cluster.source_refs = vec!["widget.py".to_string()];
+    cluster.test_refs = vec!["test_widget.py".to_string()];
+    for evidence in &mut cluster.evidence {
+        evidence.subtype = Some("public_exception_mismatch".to_string());
+        evidence.target = Some("C:/workspace/project/widget.py".to_string());
+        evidence.source_refs = vec!["widget.py".to_string()];
+        evidence.test_refs = vec!["test_widget.py".to_string()];
+    }
+    state.verification.failure_cluster = Some(cluster);
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+    projection.required_target.as_deref() == Some("widget.py")
+        && projection
+            .operation_template
+            .as_ref()
+            .and_then(|template| template.exact_target.as_deref())
+            == Some("widget.py")
+        && snapshot.required_target.as_deref() == Some("widget.py")
+}
+
+pub(crate) fn no_tests_ran_missing_generated_test_target_stays_test_owned_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "Command: python -X utf8 -m unittest\n\n----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nOK".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: vec![Utf8PathBuf::from("test_widget.py")],
+    });
+    state.completion.verification_pending = true;
+    state.verification.required_commands = vec!["python -m unittest".to_string()];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-no-tests-ran-generated-test-target".to_string(),
+        failing_labels: Vec::new(),
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("no_tests_ran".to_string()),
+            label: None,
+            target: None,
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: None,
+            observed: None,
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+            sibling_obligations: Vec::new(),
+            evidence_markers: vec!["no_tests_ran".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    });
+    let allowed_tools = BTreeSet::from([
+        "apply_patch".to_string(),
+        "read".to_string(),
+        "todowrite".to_string(),
+        "write".to_string(),
+    ]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+    projection.required_target.as_deref() == Some("test_widget.py")
+        && projection
+            .operation_template
+            .as_ref()
+            .and_then(|template| template.exact_target.as_deref())
+            == Some("test_widget.py")
+        && projection
+            .operation_template
+            .as_ref()
+            .is_some_and(|template| {
+                template.operation_kind == "generated_test_command_or_collection"
+                    && template.source_test_ownership.contains("generated_test")
+            })
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "TestViolatesContract"
+                    && decision.test_repair_allowed
+                    && !decision.source_repair_allowed
+            })
+        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot.repair_owner.contains("generated_test")
+}
+
+pub(crate) fn public_output_stream_assertion_mismatch_fixture_passes() -> bool {
+    let summary = r#"FAIL: test_cli_invalid_option (test_tool.ToolCliTests.test_cli_invalid_option)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\workspace\test_tool.py", line 17, in test_cli_invalid_option
+    self.assertIn("error", result.stderr)
+AssertionError: 'error' not found in ''
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.120s
+
+FAILED (failures=1)"#;
+    let evidence =
+        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
+    let Some(item) = evidence.first() else {
+        return false;
+    };
+    item.subtype.as_deref() == Some("public_output_stream_assertion_mismatch")
+        && item.target.is_none()
+        && item.call_site.as_deref() == Some(r#"self.assertIn("error", result.stderr)"#)
+        && item.expected.as_deref() == Some("error")
+        && item.observed.as_deref() == Some("empty stderr")
+        && item
+            .evidence_markers
+            .iter()
+            .any(|marker| marker == "public_output_stream:stderr")
+        && item
+            .sibling_obligations
+            .iter()
+            .any(|obligation| obligation == "source_public_behavior_assertion")
+        && item.source_refs.is_empty()
+        && item.test_refs == vec!["test_tool.py".to_string()]
+}
+
+pub(crate) fn generated_test_subprocess_output_capture_missing_projects_test_repair_fixture_passes()
+-> bool {
+    let summary = r#"FAIL: test_interactive_cli (test_calculator.CalculatorTest.test_interactive_cli)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\workspace\test_calculator.py", line 42, in test_interactive_cli
+    self.assertIn("結果: 5", result.stdout)
+TypeError: argument of type 'NoneType' is not iterable
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.130s
+
+FAILED (errors=1)"#;
+    let evidence =
+        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
+    let Some(item) = evidence.first() else {
+        return false;
+    };
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-subprocess-capture".to_string(),
+        failing_labels: vec!["test_calculator.CalculatorTest.test_interactive_cli".to_string()],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: evidence.clone(),
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_calculator.py".to_string()],
+    };
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("calculator.py"),
+        Utf8PathBuf::from("test_calculator.py"),
+    ];
+    state.completion.verification_pending = true;
+    state.verification.failure_cluster = Some(cluster);
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: summary.to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    let allowed = ["write", "apply_patch"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let Some(projection) = project_repair_lane(&state, &allowed) else {
+        return false;
+    };
+    item.subtype.as_deref() == Some("generated_test_subprocess_output_capture_missing")
+        && item.target.as_deref() == Some("test_calculator.py")
+        && item.source_refs.is_empty()
+        && item.test_refs == vec!["test_calculator.py".to_string()]
+        && item
+            .evidence_markers
+            .iter()
+            .any(|marker| marker == "generated_test_subprocess_output_capture_missing")
+        && item.sibling_obligations.is_empty()
+        && projection.required_target.as_deref() == Some("test_calculator.py")
+        && projection
+            .operation_template
+            .as_ref()
+            .is_some_and(|template| {
+                template.operation_kind == "generated_test_subprocess_output_capture_repair"
+                    && template.source_test_ownership.contains("generated_test")
+            })
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "TestViolatesContract"
+                    && decision.test_repair_allowed
+                    && !decision.source_repair_allowed
+            })
+        && projection
+            .repair_control_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.repair_owner.contains("generated_test"))
+}
+
+pub(crate) fn generated_test_subprocess_encoding_missing_projects_test_repair_fixture_passes()
+-> bool {
+    let summary = r#"Exception in thread Thread-1 (_readerthread):
+Traceback (most recent call last):
+  File "C:\Python313\Lib\subprocess.py", line 1615, in _readerthread
+    buffer.append(fh.read())
+  File "<frozen codecs>", line 325, in decode
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0x83 in position 0: invalid start byte
+
+======================================================================
+ERROR: test_cli_invalid_operator (test_calculator.TestCliEntrypoint.test_cli_invalid_operator)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\workspace\test_calculator.py", line 122, in test_cli_invalid_operator
+    self.assertIn('エラー', result.stdout)
+TypeError: argument of type 'NoneType' is not iterable
+
+----------------------------------------------------------------------
+Ran 17 tests in 0.373s
+
+FAILED (errors=1)"#;
+    let evidence =
+        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
+    let Some(item) = evidence.first() else {
+        return false;
+    };
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-subprocess-encoding".to_string(),
+        failing_labels: vec![
+            "test_calculator.TestCliEntrypoint.test_cli_invalid_operator".to_string(),
+        ],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: evidence.clone(),
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_calculator.py".to_string()],
+    };
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("calculator.py"),
+        Utf8PathBuf::from("test_calculator.py"),
+    ];
+    state.completion.verification_pending = true;
+    state.verification.failure_cluster = Some(cluster);
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: summary.to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    let allowed = ["write", "apply_patch"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let Some(projection) = project_repair_lane(&state, &allowed) else {
+        return false;
+    };
+    item.subtype.as_deref() == Some("generated_test_subprocess_encoding_missing")
+        && item.target.as_deref() == Some("test_calculator.py")
+        && item.source_refs.is_empty()
+        && item.test_refs == vec!["test_calculator.py".to_string()]
+        && item
+            .evidence_markers
+            .iter()
+            .any(|marker| marker == "generated_test_subprocess_encoding_missing")
+        && item.observed.as_deref().is_some_and(|observed| {
+            observed.contains("UnicodeDecodeError")
+                && observed.contains("child UTF-8 output authority")
+        })
+        && projection.required_target.as_deref() == Some("test_calculator.py")
+        && projection
+            .operation_template
+            .as_ref()
+            .is_some_and(|template| {
+                template.operation_kind == "generated_test_subprocess_encoding_repair"
+                    && template.source_test_ownership.contains("generated_test")
+            })
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "TestViolatesContract"
+                    && decision.test_repair_allowed
+                    && !decision.source_repair_allowed
+            })
+        && projection
+            .repair_control_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.repair_owner.contains("generated_test"))
+}
+
+pub(crate) fn generated_test_parse_defect_projects_test_repair_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: test_widget import failed with SyntaxError".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.failing_labels = vec!["test_widget".to_string()];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-parse-defect".to_string(),
+        failing_labels: vec!["test_widget".to_string()],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("source_parse_defect".to_string()),
+            label: Some("test_widget".to_string()),
+            target: Some("test_widget.py".to_string()),
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: None,
+            observed: Some("SyntaxError: expected ':'".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "source parse defect `SyntaxError: expected ':'`".to_string(),
+                "source parse frame `test_widget.py`".to_string(),
+                "source_parse_defect".to_string(),
+            ],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    });
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+
+    projection.required_target.as_deref() == Some("test_widget.py")
+        && projection
+            .operation_template
+            .as_ref()
+            .and_then(|template| template.exact_target.as_deref())
+            == Some("test_widget.py")
+        && projection
+            .operation_template
+            .as_ref()
+            .is_some_and(|template| template.source_test_ownership.contains("generated_test"))
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "TestViolatesContract"
+                    && decision.test_repair_allowed
+                    && !decision.source_repair_allowed
+            })
+        && snapshot.repair_owner == "generated_test"
+        && snapshot.required_target.as_deref() == Some("test_widget.py")
+}
+
+pub(crate) fn generated_test_import_nameerror_projects_test_repair_fixture_passes() -> bool {
+    let summary = r#"ERROR: test_calculator (unittest.loader._FailedTest.test_calculator)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_calculator
+Traceback (most recent call last):
+  File "C:\Python313\Lib\unittest\loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "C:\Python313\Lib\unittest\loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "C:\Users\example\Desktop\CodingAgent\project_sandbox\fr21-manual-st-loop-2026-05-27\required-core-rerun-003\case1\workspace\test_calculator.py", line 13, in <module>
+    class TestAddition(FILE, API, BEH):
+                       ^^^^
+NameError: name 'FILE' is not defined
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)"#;
+    let evidence =
+        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
+    let Some(item) = evidence.first() else {
+        return false;
+    };
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-import-nameerror".to_string(),
+        failing_labels: vec!["test_calculator".to_string()],
+        primary_failure: Some("Command: python -m unittest".to_string()),
+        evidence: evidence.clone(),
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_calculator.py".to_string()],
+    };
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("calculator.py"),
+        Utf8PathBuf::from("test_calculator.py"),
+    ];
+    state.completion.verification_pending = true;
+    state.verification.failure_cluster = Some(cluster);
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: summary.to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+
+    item.test_refs == vec!["test_calculator.py".to_string()]
+        && item
+            .evidence_markers
+            .iter()
+            .any(|marker| marker == "generated_test_artifact_name_resolution_defect")
+        && item
+            .evidence_markers
+            .iter()
+            .any(|marker| marker.contains("generated test missing name `FILE`"))
+        && projection.required_target.as_deref() == Some("test_calculator.py")
+        && projection
+            .operation_template
+            .as_ref()
+            .is_some_and(|template| template.source_test_ownership.contains("generated_test"))
+        && projection
+            .repair_control_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| {
+                snapshot.repair_owner.contains("generated_test")
+                    && snapshot.required_target.as_deref() == Some("test_calculator.py")
+            })
+}
+
+pub(crate) fn generated_test_reflection_api_misuse_projects_test_repair_fixture_passes() -> bool {
+    let summary = r#"ERROR: test_main_guard (test_calculator.TestCliEntrypointApi5Beh5.test_main_guard)
+API-5: __name__ == '__main__' guard exists.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\workspace\test_calculator.py", line 159, in test_main_guard
+    source = inspect.getsource(main.__module__)
+  File "C:\Python313\Lib\inspect.py", line 1258, in getsource
+    lines, lnum = getsourcelines(object)
+  File "C:\Python313\Lib\inspect.py", line 943, in getfile
+    raise TypeError('module, class, method, function, traceback, frame, or code object was expected, got {}'.format(type(object).__name__))
+TypeError: module, class, method, function, traceback, frame, or code object was expected, got str
+
+----------------------------------------------------------------------
+Ran 24 tests in 0.003s
+
+FAILED (errors=1)"#;
+    let evidence =
+        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
+    let Some(item) = evidence.first() else {
+        return false;
+    };
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-reflection-api-misuse".to_string(),
+        failing_labels: vec!["test_main_guard".to_string()],
+        primary_failure: Some("Command: python -m unittest".to_string()),
+        evidence: evidence.clone(),
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_calculator.py".to_string()],
+    };
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("calculator.py"),
+        Utf8PathBuf::from("test_calculator.py"),
+    ];
+    state.completion.verification_pending = true;
+    state.verification.failure_cluster = Some(cluster);
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: summary.to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+
+    item.test_refs == vec!["test_calculator.py".to_string()]
+        && item
+            .evidence_markers
+            .iter()
+            .any(|marker| marker == "generated_test_artifact_api_misuse")
+        && item
+            .evidence_markers
+            .iter()
+            .any(|marker| marker.contains("generated test invalid reflection subject"))
+        && projection.required_target.as_deref() == Some("test_calculator.py")
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "TestViolatesContract"
+                    && decision.test_repair_allowed
+                    && !decision.source_repair_allowed
+            })
+        && projection
+            .repair_control_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| {
+                snapshot.repair_owner.contains("generated_test")
+                    && snapshot.required_target.as_deref() == Some("test_calculator.py")
+            })
+}
+
+pub(crate) fn repair_intent_defers_verification_command_evidence_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: test_widget import failed with SyntaxError".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.required_commands = vec!["python -m unittest".to_string()];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-deferred-verification-command-evidence".to_string(),
+        failing_labels: vec!["test_widget".to_string()],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("source_parse_defect".to_string()),
+            label: Some("test_widget".to_string()),
+            target: Some("test_widget.py".to_string()),
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: None,
+            observed: Some("SyntaxError: expected ':'".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "source parse defect `SyntaxError: expected ':'`".to_string(),
+                "source parse frame `test_widget.py`".to_string(),
+                "source_parse_defect".to_string(),
+            ],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    });
+
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(intent) = projection.repair_intent.as_ref() else {
+        return false;
+    };
+    let Some(template_intent) = projection
+        .operation_template
+        .as_ref()
+        .and_then(|template| template.repair_intent.as_ref())
+    else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+    let command_is_absent = |evidence: &[String]| {
+        evidence.iter().all(|item| {
+            !item.starts_with("Command:")
+                && !item.contains("python -X utf8 -m unittest")
+                && !item.contains("python -m unittest")
+        })
+    };
+
+    command_is_absent(&intent.required_evidence)
+        && command_is_absent(&intent.progress_evidence)
+        && command_is_absent(&template_intent.required_evidence)
+        && command_is_absent(&template_intent.progress_evidence)
+        && snapshot.recovery_choices.iter().all(|choice| {
+            command_is_absent(&choice.required_evidence)
+                && command_is_absent(&choice.progress_evidence)
+        })
+        && snapshot
+            .verification_rerun_condition
+            .as_deref()
+            .is_some_and(|condition| {
+                condition.contains("after a successful edit")
+                    && condition.contains("rerun the recorded verification command")
+            })
+        && state
+            .verification
+            .required_commands
+            .iter()
+            .any(|command| command == "python -m unittest")
+}
+
+pub(crate) fn public_command_contract_failure_projects_compact_source_repair_fixture_passes() -> bool
+{
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("tool.py"),
+        Utf8PathBuf::from("test_tool.py"),
+    ];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "public_command_contract_failed: target=tool.py; observed=argv invocation entered interactive stdin mode instead of processing command-line arguments; expected=direct argv command handling preserves route-owned exit/stdout/stderr contract".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: vec![Utf8PathBuf::from("tool.py")],
+    });
+    state.completion.verification_pending = true;
+    state.verification.required_commands = vec![
+        "python -X utf8 tool.py 2 + 3".to_string(),
+        "python -X utf8 tool.py 8 +".to_string(),
+    ];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-public-command-contract-failure".to_string(),
+        failing_labels: vec!["failed command: python -X utf8 tool.py 2 + 3".to_string()],
+        primary_failure: Some("public_command_contract_failed: target=tool.py; observed=argv invocation entered interactive stdin mode instead of processing command-line arguments; expected=direct argv command handling preserves route-owned exit/stdout/stderr contract".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_command_contract_failure".to_string()),
+            label: Some("public_command_contract".to_string()),
+            target: Some("tool.py".to_string()),
+            symbol: None,
+            call_site: Some("python -X utf8 tool.py 2 + 3".to_string()),
+            exception: None,
+            expected: Some("route-owned public argv command satisfies expected exit code and stdout/stderr observation".to_string()),
+            observed: Some("argv invocation entered interactive stdin mode instead of processing command-line arguments".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "public_command_contract_failure".to_string(),
+                "source_public_command_contract_assertion".to_string(),
+            ],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: vec!["tool.py".to_string()],
+            test_refs: Vec::new(),
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["tool.py".to_string()],
+        test_refs: Vec::new(),
+    });
+
+    let allowed_tools = BTreeSet::from(["apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(template) = projection.operation_template.as_ref() else {
+        return false;
+    };
+    let Some(intent) = projection.repair_intent.as_ref() else {
+        return false;
+    };
+    projection.subtype == RepairLaneSubtype::PublicCommandContractFailure
+        && projection.required_target.as_deref() == Some("tool.py")
+        && template.operation_kind == "source_public_command_contract"
+        && template.source_test_ownership == "source"
+        && intent.repair_owner == "source"
+        && intent
+            .required_edit_intent
+            .contains("direct command-line invocations")
+        && intent
+            .required_evidence
+            .iter()
+            .any(|item| item.contains("public command contract failure"))
+        && intent.required_evidence.iter().all(|item| {
+            !item.contains("Traceback") && !item.contains("C:\\") && !item.contains("line 9")
+        })
+        && intent
+            .forbidden_directions
+            .iter()
+            .any(|item| item == "interactive_stdin_only_cli_when_argv_contract_exists")
+}
+
+pub(crate) fn generated_test_contract_overreach_projects_test_repair_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: generated test requires an uncontracted logging side effect"
+            .to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.failing_labels = vec!["test_visible_error_contract".to_string()];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-contract-overreach".to_string(),
+        failing_labels: vec!["test_visible_error_contract".to_string()],
+        primary_failure: Some(
+            "AssertionError: no logs of level ERROR or higher triggered".to_string(),
+        ),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generated_test_logging_contract_overreach".to_string()),
+            label: Some("test_visible_error_contract".to_string()),
+            target: Some("test_widget.py".to_string()),
+            symbol: None,
+            call_site: Some("with self.assertLogs(level=\"ERROR\") as captured".to_string()),
+            exception: Some(
+                "AssertionError: no logs of level ERROR or higher triggered".to_string(),
+            ),
+            expected: Some(
+                "visible stderr/return-code contract without logging side effect".to_string(),
+            ),
+            observed: Some("generated test asserted logging side effect".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "generated-test logging side-effect assertion".to_string(),
+                "generated_test_logging_contract_overreach".to_string(),
+                "generated-test contract overreach".to_string(),
+            ],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    });
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(template) = projection.operation_template.as_ref() else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+
+    projection.required_target.as_deref() == Some("test_widget.py")
+        && template.exact_target.as_deref() == Some("test_widget.py")
+        && template.operation_kind == "generated_test_logging_contract_repair"
+        && template.source_test_ownership.contains("generated_test")
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "TestViolatesContract"
+                    && decision.test_repair_allowed
+                    && !decision.source_repair_allowed
+                    && decision.required_target.as_deref() == Some("test_widget.py")
+            })
+        && snapshot.repair_owner == "generated_test"
+        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot
+            .hard_invariants
+            .iter()
+            .any(|invariant| invariant == "forbid_source_repair_for_generated_test_contract_owner")
+}
+
+pub(crate) fn ungrounded_generated_public_output_assertion_projects_test_repair_fixture_passes()
+-> bool {
+    let summary = r#"FAIL: test_subprocess_eof_terminates (test_widget.TestCliSubprocess.test_subprocess_eof_terminates)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\workspace\test_widget.py", line 42, in test_subprocess_eof_terminates
+    self.assertIn("goodbye", result.stdout)
+AssertionError: 'goodbye' not found in 'Widget CLI ready\n>>> \n'
+
+----------------------------------------------------------------------
+Ran 35 tests in 0.288s
+
+FAILED (failures=1)"#;
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: generated test asserts uncontracted EOF stdout".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.failing_labels = vec!["test_subprocess_eof_terminates".to_string()];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-ungrounded-generated-public-output".to_string(),
+        failing_labels: vec!["test_subprocess_eof_terminates".to_string()],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: verification_failure_evidence_from_summary(
+            FailureKind::VerificationFailed,
+            summary,
+        ),
+        sibling_obligations: public_output_stream_assertion_obligations(summary),
+        source_refs: source_refs_from_summary(summary),
+        test_refs: test_refs_from_summary(summary),
+    });
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+
+    projection.required_target.as_deref() == Some("test_widget.py")
+        && projection
+            .verification_cluster
+            .as_ref()
+            .is_some_and(|cluster| {
+                cluster.evidence.iter().any(|evidence| {
+                    evidence
+                        .evidence_markers
+                        .iter()
+                        .any(|marker| marker == "generated_test_contract_overreach")
+                })
+            })
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "TestViolatesContract"
+                    && decision.test_repair_allowed
+                    && !decision.source_repair_allowed
+                    && decision.required_target.as_deref() == Some("test_widget.py")
+            })
+        && snapshot.repair_owner == "generated_test"
+        && snapshot.required_target.as_deref() == Some("test_widget.py")
+}
+
+pub(crate) fn generated_test_public_output_numeric_format_overreach_projects_test_repair_fixture_passes()
+-> bool {
+    let summary = r#"FAIL: test_valid_division_expression (test_widget.TestCliSubprocess.test_valid_division_expression)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\workspace\project\test_widget.py", line 42, in test_valid_division_expression
+    self.assertIn("Result: 5.0", proc.stdout)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Result: 5.0' not found in "Widget CLI\nInput: Result: 5\nInput: Bye\n"
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.120s
+
+FAILED (failures=1)"#;
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: summary.to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.failing_labels = vec!["test_valid_division_expression".to_string()];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-public-output-numeric-format-overreach".to_string(),
+        failing_labels: vec!["test_valid_division_expression".to_string()],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: verification_failure_evidence_from_summary(
+            FailureKind::VerificationFailed,
+            summary,
+        ),
+        sibling_obligations: public_output_stream_assertion_obligations(summary),
+        source_refs: source_refs_from_summary(summary),
+        test_refs: test_refs_from_summary(summary),
+    });
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+
+    projection.required_target.as_deref() == Some("test_widget.py")
+        && projection
+            .verification_cluster
+            .as_ref()
+            .is_some_and(|cluster| {
+                cluster.evidence.iter().any(|evidence| {
+                    evidence.observed.as_deref().is_some_and(|observed| {
+                        observed.contains("Result: 5") && !observed.contains("unmatched")
+                    }) && evidence
+                        .evidence_markers
+                        .iter()
+                        .any(|marker| marker == "generated_test_contract_overreach")
+                })
+            })
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "TestViolatesContract"
+                    && decision.test_repair_allowed
+                    && !decision.source_repair_allowed
+                    && decision.required_target.as_deref() == Some("test_widget.py")
+            })
+        && snapshot.repair_owner == "generated_test"
+        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot
+            .hard_invariants
+            .iter()
+            .any(|invariant| invariant == "forbid_source_repair_for_generated_test_contract_owner")
+}
+
+pub(crate) fn generated_test_exception_type_overreach_projects_test_repair_fixture_passes() -> bool
+{
+    let summary = r#"ERROR: test_divide_by_zero (test_widget.TestWidget.test_divide_by_zero)
+0 による除算で ZeroDivisionError が発生すること
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\workspace\project\test_widget.py", line 42, in test_divide_by_zero
+    widget.divide(10, 0)
+  File "C:\workspace\project\widget.py", line 7, in divide
+    raise ValueError("division by zero")
+ValueError: division by zero
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.002s
+
+FAILED (errors=1)"#;
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: summary.to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.failing_labels = vec!["test_divide_by_zero".to_string()];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-exception-type-overreach".to_string(),
+        failing_labels: vec!["test_divide_by_zero".to_string()],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: verification_failure_evidence_from_summary(
+            FailureKind::VerificationFailed,
+            summary,
+        ),
+        sibling_obligations: Vec::new(),
+        source_refs: source_refs_from_summary(summary),
+        test_refs: test_refs_from_summary(summary),
+    });
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+
+    projection.required_target.as_deref() == Some("test_widget.py")
+        && projection
+            .verification_cluster
+            .as_ref()
+            .is_some_and(|cluster| {
+                cluster.evidence.iter().any(|evidence| {
+                    evidence.expected.as_deref() == Some("ZeroDivisionError")
+                        && evidence.observed.as_deref() == Some("ValueError")
+                        && evidence
+                            .evidence_markers
+                            .iter()
+                            .any(|marker| marker == "generated_test_contract_overreach")
+                })
+            })
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "TestViolatesContract"
+                    && decision.test_repair_allowed
+                    && !decision.source_repair_allowed
+                    && decision.required_target.as_deref() == Some("test_widget.py")
+            })
+        && snapshot.repair_owner == "generated_test"
+        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot
+            .hard_invariants
+            .iter()
+            .any(|invariant| invariant == "forbid_source_repair_for_generated_test_contract_owner")
+}
+
+pub(crate) fn generic_generated_test_only_repair_lane_preserves_active_test_target_fixture_passes()
+-> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: generated test stale literal".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.failing_labels = vec!["test_invalid_visible_contract".to_string()];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-generic-generated-test-only-repair-lane".to_string(),
+        failing_labels: vec!["test_invalid_visible_contract".to_string()],
+        primary_failure: Some("AssertionError: stale literal expectation".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generic_verification_failure".to_string()),
+            label: Some("test_invalid_visible_contract".to_string()),
+            target: None,
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: Some("old visible literal".to_string()),
+            observed: Some("current visible literal".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec!["generic_verification_failure".to_string()],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    });
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(template) = projection.operation_template.as_ref() else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+
+    projection.required_target.as_deref() == Some("test_widget.py")
+        && template.exact_target.as_deref() == Some("test_widget.py")
+        && template.operation_kind == "source_test_contract_repair"
+        && template.source_test_ownership == "source_or_generated_test_by_contract_evidence"
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "SourceTestContractMismatch"
+                    && decision.source_repair_allowed
+                    && decision.test_repair_allowed
+                    && decision.required_target.as_deref() == Some("test_widget.py")
+            })
+        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot.repair_owner == "source_or_generated_test_by_contract_evidence"
+}
+
+pub(crate) fn contract_visible_public_exception_projects_source_repair_fixture_passes() -> bool {
+    let summary = r#"FAIL: test_invalid_public_input (test_widget.TestWidget.test_invalid_public_input)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\workspace\test_widget.py", line 41, in test_invalid_public_input
+    with self.assertRaises(ValueError):
+AssertionError: ValueError not raised
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.001s
+
+FAILED (failures=1)"#;
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.contract_refs = vec![
+        Utf8PathBuf::from("scenario_contract.md"),
+        Utf8PathBuf::from("scenario_contract.json"),
+    ];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: public exception was not raised".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.failing_labels = vec!["test_invalid_public_input".to_string()];
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-contract-visible-public-exception-repair".to_string(),
+        failing_labels: state.verification.failing_labels.clone(),
+        primary_failure: Some("AssertionError: ValueError not raised".to_string()),
+        evidence: verification_failure_evidence_from_summary(
+            FailureKind::VerificationFailed,
+            summary,
+        ),
+        sibling_obligations: vec!["source_public_behavior_assertion".to_string()],
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    });
+
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(template) = projection.operation_template.as_ref() else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+
+    projection.required_target.as_deref() == Some("widget.py")
+        && template.exact_target.as_deref() == Some("widget.py")
+        && template.operation_kind == "source_exception_contract"
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "SourceViolatesContract"
+                    && decision.source_repair_allowed
+                    && !decision.test_repair_allowed
+                    && decision.required_target.as_deref() == Some("widget.py")
+            })
+        && snapshot.repair_owner == "source"
+        && snapshot.required_target.as_deref() == Some("widget.py")
 }
 
 fn repair_lane_subtype(
@@ -374,6 +1671,12 @@ fn repair_lane_subtype(
 
 fn repair_lane_subtype_from_str(value: &str) -> Option<RepairLaneSubtype> {
     match value {
+        "generated_test_subprocess_encoding_missing" => {
+            Some(RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing)
+        }
+        "generated_test_subprocess_output_capture_missing" => {
+            Some(RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing)
+        }
         "generated_test_logging_contract_overreach" => {
             Some(RepairLaneSubtype::GeneratedTestLoggingContractOverreach)
         }
@@ -396,6 +1699,10 @@ fn repair_lane_subtype_from_str(value: &str) -> Option<RepairLaneSubtype> {
         "public_missing_attribute_mismatch" => {
             Some(RepairLaneSubtype::PublicMissingAttributeMismatch)
         }
+        "public_command_contract_failure" => Some(RepairLaneSubtype::PublicCommandContractFailure),
+        "public_output_stream_assertion_mismatch" => {
+            Some(RepairLaneSubtype::PublicOutputStreamAssertionMismatch)
+        }
         "public_state_assertion_mismatch" => Some(RepairLaneSubtype::PublicStateAssertionMismatch),
         "source_import_time_name_resolution" => {
             Some(RepairLaneSubtype::SourceImportTimeNameResolution)
@@ -411,6 +1718,10 @@ fn repair_lane_subtype_from_summary(kind: FailureKind, summary: &str) -> RepairL
     let lower = summary.to_ascii_lowercase();
     if matches!(kind, FailureKind::PatchMismatch) {
         RepairLaneSubtype::PatchMismatch
+    } else if generated_test_subprocess_encoding_missing(summary).is_some() {
+        RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
+    } else if generated_test_subprocess_output_capture_missing(summary).is_some() {
+        RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
     } else if generated_test_logging_contract_overreach(summary).is_some() {
         RepairLaneSubtype::GeneratedTestLoggingContractOverreach
     } else if lower.contains("cannot import name") {
@@ -429,10 +1740,16 @@ fn repair_lane_subtype_from_summary(kind: FailureKind, summary: &str) -> RepairL
         RepairLaneSubtype::PublicConstructorSignatureMismatch
     } else if public_callable_signature_mismatch(summary).is_some() {
         RepairLaneSubtype::PublicCallableSignatureMismatch
-    } else if public_exception_mismatch(summary).is_some() {
+    } else if public_exception_mismatch(summary).is_some()
+        || public_expected_exception_not_raised(summary).is_some()
+    {
         RepairLaneSubtype::PublicExceptionMismatch
     } else if !public_missing_method_attributes(summary).is_empty() {
         RepairLaneSubtype::PublicMethodAttributeMismatch
+    } else if public_command_contract_failure(summary).is_some() {
+        RepairLaneSubtype::PublicCommandContractFailure
+    } else if public_output_stream_assertion_mismatch(summary).is_some() {
+        RepairLaneSubtype::PublicOutputStreamAssertionMismatch
     } else if (lower.contains("assertionerror:")
         || lower.contains("indexerror: list index out of range")
         || lower.contains("public state assertion mismatch detected"))
@@ -454,6 +1771,60 @@ struct GeneratedTestLoggingContractOverreach {
     logger_name: Option<String>,
     level: Option<String>,
     assertion_line: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicOutputStreamAssertionMismatch {
+    stream: String,
+    expected_substring: String,
+    observed_value: String,
+    observed_output: String,
+    assertion_line: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicCommandContractFailure {
+    command: Option<String>,
+    observed_issue: String,
+}
+
+fn public_command_contract_failure(summary: &str) -> Option<PublicCommandContractFailure> {
+    let lower = summary.to_ascii_lowercase();
+    if !(lower.contains("public_command_contract")
+        || lower.contains("public command contract")
+        || lower.contains("route-owned public argv command contract"))
+    {
+        return None;
+    }
+    let command = failure_summary_logical_lines(summary)
+        .into_iter()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("command:")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    let observed_issue = if lower.contains("interactive stdin") || lower.contains("eoferror") {
+        "argv invocation entered interactive stdin mode instead of processing command-line arguments"
+            .to_string()
+    } else if lower.contains("stdout had no line ending")
+        || lower.contains("expected public result line suffix")
+    {
+        "stdout did not expose the expected public result line suffix".to_string()
+    } else if lower.contains("stderr contained none")
+        || lower.contains("stdout contained none")
+        || lower.contains("usage/help/error")
+    {
+        "stdout/stderr did not expose the expected usage/help/error observation".to_string()
+    } else {
+        "public command did not satisfy the route-owned argv/exit/stdout/stderr contract"
+            .to_string()
+    };
+    Some(PublicCommandContractFailure {
+        command,
+        observed_issue,
+    })
 }
 
 fn generated_test_logging_contract_overreach(
@@ -483,6 +1854,260 @@ fn generated_test_logging_contract_overreach(
     })
 }
 
+fn public_output_stream_assertion_mismatch(
+    summary: &str,
+) -> Option<PublicOutputStreamAssertionMismatch> {
+    let logical_lines = failure_summary_logical_lines(summary);
+    for (index, line) in logical_lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(assert_start) = trimmed.find("self.assertIn(") {
+            let Some(stream) = public_output_stream_subject(trimmed) else {
+                continue;
+            };
+            let after = &trimmed[assert_start + "self.assertIn(".len()..];
+            let Some(end) = after.rfind(')') else {
+                continue;
+            };
+            let args = top_level_arguments(after[..end].trim());
+            let Some(expected) = args
+                .first()
+                .map(|value| clean_output_assertion_value(value))
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let observed = subsequent_assertion_not_found_observed_value(&logical_lines, index)
+                .unwrap_or_else(|| format!("unmatched {stream} output"));
+            let observed_output = if observed.is_empty() {
+                format!("empty {stream}")
+            } else {
+                format!("{stream} `{observed}`")
+            };
+            return Some(PublicOutputStreamAssertionMismatch {
+                stream: stream.to_string(),
+                expected_substring: expected,
+                observed_value: observed,
+                observed_output,
+                assertion_line: trimmed.to_string(),
+            });
+        }
+        if let Some(assert_start) = trimmed.find("self.assertEqual(") {
+            let after = &trimmed[assert_start + "self.assertEqual(".len()..];
+            let Some(end) = after.rfind(')') else {
+                continue;
+            };
+            let args = top_level_arguments(after[..end].trim());
+            if args.len() < 2 {
+                continue;
+            }
+            let Some((stream, expected)) = public_output_assert_equal_stream_and_expected(&args)
+            else {
+                continue;
+            };
+            let (observed, error_expected) =
+                subsequent_assertion_equal_observed_expected_values(&logical_lines, index)
+                    .unwrap_or_else(|| (format!("unmatched {stream} output"), expected.clone()));
+            let expected = if !error_expected.is_empty() {
+                error_expected
+            } else {
+                expected
+            };
+            let observed_output = if observed.is_empty() {
+                format!("empty {stream}")
+            } else {
+                format!("{stream} `{observed}`")
+            };
+            return Some(PublicOutputStreamAssertionMismatch {
+                stream: stream.to_string(),
+                expected_substring: expected,
+                observed_value: observed,
+                observed_output,
+                assertion_line: trimmed.to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn generated_test_subprocess_output_capture_missing(
+    summary: &str,
+) -> Option<PublicOutputStreamAssertionMismatch> {
+    let lower = summary.to_ascii_lowercase();
+    if !(lower.contains("typeerror:")
+        && lower.contains("nonetype")
+        && lower.contains("not iterable"))
+    {
+        return None;
+    }
+    if test_refs_from_summary(summary).is_empty() {
+        return None;
+    }
+    for line in failure_summary_logical_lines(summary) {
+        let trimmed = line.trim();
+        let Some(assert_start) = trimmed.find("self.assertIn(") else {
+            continue;
+        };
+        let Some(stream) = public_output_stream_subject(trimmed) else {
+            continue;
+        };
+        let after = &trimmed[assert_start + "self.assertIn(".len()..];
+        let Some(end) = after.rfind(')') else {
+            continue;
+        };
+        let args = top_level_arguments(after[..end].trim());
+        let Some(expected) = args
+            .first()
+            .map(|value| clean_output_assertion_value(value))
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        return Some(PublicOutputStreamAssertionMismatch {
+            stream: stream.to_string(),
+            expected_substring: expected,
+            observed_value: format!("CompletedProcess.{stream} is None"),
+            observed_output: format!(
+                "CompletedProcess.{stream} is None because generated subprocess.run did not capture {stream}"
+            ),
+            assertion_line: trimmed.to_string(),
+        });
+    }
+    None
+}
+
+fn generated_test_subprocess_encoding_missing(
+    summary: &str,
+) -> Option<PublicOutputStreamAssertionMismatch> {
+    let lower = summary.to_ascii_lowercase();
+    if !(lower.contains("unicodedecodeerror")
+        && lower.contains("utf-8")
+        && lower.contains("subprocess.py")
+        && lower.contains("_readerthread")
+        && lower.contains("nonetype")
+        && lower.contains("not iterable"))
+    {
+        return None;
+    }
+    if test_refs_from_summary(summary).is_empty() {
+        return None;
+    }
+    for line in failure_summary_logical_lines(summary) {
+        let trimmed = line.trim();
+        let Some(assert_start) = trimmed.find("self.assertIn(") else {
+            continue;
+        };
+        let Some(stream) = public_output_stream_subject(trimmed) else {
+            continue;
+        };
+        let after = &trimmed[assert_start + "self.assertIn(".len()..];
+        let Some(end) = after.rfind(')') else {
+            continue;
+        };
+        let args = top_level_arguments(after[..end].trim());
+        let Some(expected) = args
+            .first()
+            .map(|value| clean_output_assertion_value(value))
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        return Some(PublicOutputStreamAssertionMismatch {
+            stream: stream.to_string(),
+            expected_substring: expected,
+            observed_value: format!("CompletedProcess.{stream} is None after UnicodeDecodeError"),
+            observed_output: format!(
+                "UnicodeDecodeError while parent decoded child subprocess {stream} as UTF-8 without explicit child UTF-8 output authority"
+            ),
+            assertion_line: trimmed.to_string(),
+        });
+    }
+    None
+}
+
+fn public_output_assert_equal_stream_and_expected(args: &[&str]) -> Option<(&'static str, String)> {
+    let first_stream = args
+        .first()
+        .and_then(|arg| public_output_stream_subject(arg));
+    let second_stream = args
+        .get(1)
+        .and_then(|arg| public_output_stream_subject(arg));
+    if let Some(stream) = first_stream {
+        return args
+            .get(1)
+            .map(|arg| clean_output_assertion_value(arg))
+            .filter(|value| !value.is_empty())
+            .map(|expected| (stream, expected));
+    }
+    if let Some(stream) = second_stream {
+        return args
+            .first()
+            .map(|arg| clean_output_assertion_value(arg))
+            .filter(|value| !value.is_empty())
+            .map(|expected| (stream, expected));
+    }
+    None
+}
+
+fn public_output_stream_subject(assertion_line: &str) -> Option<&'static str> {
+    if assertion_line.contains("result.stderr") || assertion_line.contains(".stderr") {
+        Some("stderr")
+    } else if assertion_line.contains("result.stdout") || assertion_line.contains(".stdout") {
+        Some("stdout")
+    } else {
+        None
+    }
+}
+
+fn assertion_not_found_observed_value(line: &str) -> Option<String> {
+    let detail = line.trim().strip_prefix("AssertionError:")?.trim();
+    let (_, observed) = detail.split_once(" not found in ")?;
+    Some(clean_output_assertion_value(observed))
+}
+
+fn subsequent_assertion_not_found_observed_value(lines: &[&str], index: usize) -> Option<String> {
+    lines
+        .iter()
+        .skip(index + 1)
+        .take(6)
+        .find_map(|line| assertion_not_found_observed_value(line))
+}
+
+fn assertion_equal_observed_expected_values(line: &str) -> Option<(String, String)> {
+    let detail = line.trim().strip_prefix("AssertionError:")?.trim();
+    let (observed, expected) = detail.split_once("!=")?;
+    Some((
+        clean_output_assertion_value(observed),
+        clean_output_assertion_value(expected),
+    ))
+}
+
+fn subsequent_assertion_equal_observed_expected_values(
+    lines: &[&str],
+    index: usize,
+) -> Option<(String, String)> {
+    lines
+        .iter()
+        .skip(index + 1)
+        .take(8)
+        .find_map(|line| assertion_equal_observed_expected_values(line))
+}
+
+fn clean_output_assertion_value(value: &str) -> String {
+    let value = value.trim().trim_end_matches(',').trim();
+    if value.len() >= 2 {
+        let mut chars = value.chars();
+        let first = chars.next();
+        let last = value.chars().last();
+        if matches!(
+            (first, last),
+            (Some('\''), Some('\'')) | (Some('"'), Some('"'))
+        ) {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
+}
+
 fn extract_assert_logs_logger(assertion_line: &str) -> Option<String> {
     extract_delimited_after(assertion_line, "assertLogs(\"", '"')
         .or_else(|| extract_delimited_after(assertion_line, "assertLogs('", '\''))
@@ -507,7 +2132,9 @@ fn required_target_for_subtype(
     cluster: Option<&VerificationFailureCluster>,
 ) -> Option<String> {
     match subtype {
-        RepairLaneSubtype::GeneratedTestLoggingContractOverreach => {
+        RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
+        | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
+        | RepairLaneSubtype::GeneratedTestLoggingContractOverreach => {
             first_test_target(&state.active_targets).or_else(|| first_target(&state.active_targets))
         }
         RepairLaneSubtype::ImportExportMissingExport => import_export_source_target(state, cluster)
@@ -520,11 +2147,14 @@ fn required_target_for_subtype(
         | RepairLaneSubtype::PublicConstructorBodyException
         | RepairLaneSubtype::PublicConstructorSignatureMismatch
         | RepairLaneSubtype::PublicMissingAttributeMismatch
+        | RepairLaneSubtype::PublicCommandContractFailure
+        | RepairLaneSubtype::PublicOutputStreamAssertionMismatch
         | RepairLaneSubtype::PublicStateAssertionMismatch
         | RepairLaneSubtype::SourceImportTimeNameResolution
         | RepairLaneSubtype::SourceParseDefect => first_non_test_target(&state.active_targets)
             .or_else(|| first_non_test_failure_target(state))
-            .or_else(|| first_source_ref_target(cluster)),
+            .or_else(|| first_source_ref_target(cluster))
+            .or_else(|| source_target_from_cluster_test_refs(cluster)),
         RepairLaneSubtype::PublicCallableSignatureMismatch => cluster
             .and_then(|cluster| {
                 cluster
@@ -579,6 +2209,8 @@ fn typed_repair_target_outranks_required_action(
     }
     match subtype {
         RepairLaneSubtype::PublicMissingAttributeMismatch
+        | RepairLaneSubtype::PublicCommandContractFailure
+        | RepairLaneSubtype::PublicOutputStreamAssertionMismatch
         | RepairLaneSubtype::PublicStateAssertionMismatch => {
             !has_explicit_generated_test_conflict_evidence_in_cluster(cluster)
         }
@@ -591,7 +2223,9 @@ fn typed_repair_target_outranks_required_action(
         | RepairLaneSubtype::ImportExportMissingExport
         | RepairLaneSubtype::SourceImportTimeNameResolution
         | RepairLaneSubtype::SourceParseDefect => true,
-        RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+        RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
+        | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
+        | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
         | RepairLaneSubtype::NoTestsRan
         | RepairLaneSubtype::PatchMismatch
         | RepairLaneSubtype::GenericVerificationFailure => false,
@@ -601,7 +2235,6 @@ fn typed_repair_target_outranks_required_action(
 fn no_tests_ran_generated_test_target_outranks_stale_write_action(
     subtype: &RepairLaneSubtype,
     typed_target: Option<&str>,
-    _required_next_action: Option<&str>,
 ) -> bool {
     let _ = (subtype, typed_target);
     false
@@ -661,6 +2294,132 @@ fn first_test_target(targets: &[Utf8PathBuf]) -> Option<String> {
         .iter()
         .find(|target| target_is_test_like(target.as_str()))
         .map(|target| target.as_str().to_string())
+}
+
+fn normalize_source_owned_required_target(
+    required_target: Option<String>,
+    state: &SessionStateSnapshot,
+    cluster: Option<&VerificationFailureCluster>,
+    generated_test_target: Option<&str>,
+    reconciliation: Option<&ContractReconciliationDecision>,
+) -> Option<String> {
+    let Some(reconciliation) = reconciliation else {
+        return required_target;
+    };
+    if !reconciliation.source_repair_allowed || reconciliation.test_repair_allowed {
+        return required_target;
+    }
+    if required_target
+        .as_deref()
+        .is_some_and(target_is_mutable_source_like)
+    {
+        if let Some(target) = required_target.as_deref()
+            && let Some(canonical) = canonical_relative_source_target_for(target, state, cluster)
+        {
+            return Some(canonical);
+        }
+        return required_target;
+    }
+
+    first_non_test_target(&state.active_targets)
+        .or_else(|| first_non_test_failure_target(state))
+        .or_else(|| first_source_ref_target(cluster))
+        .or_else(|| {
+            required_target
+                .as_deref()
+                .and_then(source_target_for_generated_test_target)
+        })
+        .or_else(|| generated_test_target.and_then(source_target_for_generated_test_target))
+        .or_else(|| source_target_from_test_targets(&state.active_targets))
+        .or_else(|| {
+            state
+                .failure
+                .as_ref()
+                .and_then(|failure| source_target_from_test_targets(&failure.targets))
+        })
+        .or_else(|| source_target_from_cluster_test_refs(cluster))
+}
+
+fn canonical_relative_source_target_for(
+    target: &str,
+    state: &SessionStateSnapshot,
+    cluster: Option<&VerificationFailureCluster>,
+) -> Option<String> {
+    first_matching_source_target(&state.active_targets, target)
+        .or_else(|| {
+            state
+                .failure
+                .as_ref()
+                .and_then(|failure| first_matching_source_target(&failure.targets, target))
+        })
+        .or_else(|| {
+            cluster.and_then(|cluster| {
+                cluster
+                    .source_refs
+                    .iter()
+                    .chain(
+                        cluster
+                            .evidence
+                            .iter()
+                            .flat_map(|evidence| evidence.source_refs.iter()),
+                    )
+                    .find(|candidate| source_targets_equivalent(candidate, target))
+                    .cloned()
+            })
+        })
+}
+
+fn first_matching_source_target(targets: &[Utf8PathBuf], target: &str) -> Option<String> {
+    targets
+        .iter()
+        .map(|candidate| candidate.as_str())
+        .find(|candidate| {
+            target_is_mutable_source_like(candidate) && source_targets_equivalent(candidate, target)
+        })
+        .map(str::to_string)
+}
+
+fn source_targets_equivalent(candidate: &str, target: &str) -> bool {
+    let candidate = candidate.replace('\\', "/");
+    let target = target.replace('\\', "/");
+    candidate.eq_ignore_ascii_case(&target)
+        || target
+            .to_ascii_lowercase()
+            .ends_with(&format!("/{}", candidate.to_ascii_lowercase()))
+        || candidate
+            .to_ascii_lowercase()
+            .ends_with(&format!("/{}", target.to_ascii_lowercase()))
+}
+
+fn source_target_from_test_targets(targets: &[Utf8PathBuf]) -> Option<String> {
+    targets
+        .iter()
+        .filter_map(|target| source_target_for_generated_test_target(target.as_str()))
+        .next()
+}
+
+fn source_target_from_cluster_test_refs(
+    cluster: Option<&VerificationFailureCluster>,
+) -> Option<String> {
+    cluster.and_then(|cluster| {
+        cluster
+            .test_refs
+            .iter()
+            .chain(
+                cluster
+                    .evidence
+                    .iter()
+                    .flat_map(|evidence| evidence.test_refs.iter()),
+            )
+            .filter_map(|target| source_target_for_generated_test_target(target))
+            .next()
+    })
+}
+
+fn source_target_for_generated_test_target(target: &str) -> Option<String> {
+    python_source_for_test_target(target)
+        .map(|contract| contract.source_path)
+        .filter(|source| target_is_mutable_source_like(source))
 }
 
 fn target_is_test_like(target: &str) -> bool {
@@ -740,6 +2499,10 @@ pub(crate) fn verification_failure_evidence_from_summary(
                 .map(|observation| observation.actual_exception)
         });
     let source_refs = source_refs_for_evidence(&subtype, summary, target.as_deref());
+    let public_output_mismatch = public_output_stream_assertion_mismatch(summary);
+    let public_command_failure = public_command_contract_failure(summary);
+    let generated_encoding_missing = generated_test_subprocess_encoding_missing(summary);
+    let generated_capture_missing = generated_test_subprocess_output_capture_missing(summary);
 
     vec![VerificationFailureEvidence {
         evidence_kind: "verification_failure".to_string(),
@@ -747,9 +2510,44 @@ pub(crate) fn verification_failure_evidence_from_summary(
         label: None,
         target,
         symbol,
-        call_site,
+        call_site: call_site.or_else(|| {
+            public_output_mismatch
+                .as_ref()
+                .map(|mismatch| mismatch.assertion_line.clone())
+                .or_else(|| {
+                    generated_encoding_missing
+                        .as_ref()
+                        .map(|mismatch| mismatch.assertion_line.clone())
+                })
+                .or_else(|| {
+                    generated_capture_missing
+                        .as_ref()
+                        .map(|mismatch| mismatch.assertion_line.clone())
+                })
+        }),
         exception,
-        expected: None,
+        expected: public_output_mismatch
+            .as_ref()
+            .map(|mismatch| mismatch.expected_substring.clone())
+            .or_else(|| {
+                public_exception_mismatch(summary)
+                    .and_then(|mismatch| mismatch.expected_exception)
+            })
+            .or_else(|| {
+                public_command_failure.as_ref().map(|_| {
+                    "route-owned public argv command satisfies expected exit code and stdout/stderr observation".to_string()
+                })
+            })
+            .or_else(|| {
+                generated_encoding_missing
+                    .as_ref()
+                    .map(|mismatch| mismatch.expected_substring.clone())
+            })
+            .or_else(|| {
+                generated_capture_missing
+                    .as_ref()
+                    .map(|mismatch| mismatch.expected_substring.clone())
+            }),
         observed: typed_evidence_observed_from_summary(&subtype, summary).or_else(|| {
             public_state_assertion_observations(summary)
                 .into_iter()
@@ -790,6 +2588,21 @@ fn typed_evidence_observed_from_summary(
             public_constructor_body_exception(summary)
                 .map(|observation| observation.actual_exception)
         }
+        RepairLaneSubtype::PublicOutputStreamAssertionMismatch => {
+            public_output_stream_assertion_mismatch(summary)
+                .map(|mismatch| mismatch.observed_output)
+        }
+        RepairLaneSubtype::PublicCommandContractFailure => {
+            public_command_contract_failure(summary).map(|failure| failure.observed_issue)
+        }
+        RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing => {
+            generated_test_subprocess_encoding_missing(summary)
+                .map(|mismatch| mismatch.observed_output)
+        }
+        RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing => {
+            generated_test_subprocess_output_capture_missing(summary)
+                .map(|mismatch| mismatch.observed_output)
+        }
         _ => None,
     }
 }
@@ -819,10 +2632,14 @@ fn typed_evidence_target_from_summary(
         | RepairLaneSubtype::PublicClassAttributeMismatch
         | RepairLaneSubtype::PublicMethodAttributeMismatch
         | RepairLaneSubtype::PublicMissingAttributeMismatch
+        | RepairLaneSubtype::PublicCommandContractFailure
+        | RepairLaneSubtype::PublicOutputStreamAssertionMismatch
         | RepairLaneSubtype::PublicStateAssertionMismatch => {
             source_refs_from_summary(summary).into_iter().next()
         }
-        RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+        RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
+        | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
+        | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
         | RepairLaneSubtype::NoTestsRan => test_refs_from_summary(summary).into_iter().next(),
         RepairLaneSubtype::PatchMismatch | RepairLaneSubtype::GenericVerificationFailure => None,
     }
@@ -849,6 +2666,9 @@ fn typed_evidence_call_site_from_summary(
         RepairLaneSubtype::PublicExceptionMismatch => {
             public_exception_mismatch(summary).and_then(|mismatch| mismatch.call_site)
         }
+        RepairLaneSubtype::PublicCommandContractFailure => {
+            public_command_contract_failure(summary).and_then(|failure| failure.command)
+        }
         _ => None,
     }
 }
@@ -863,6 +2683,14 @@ fn source_refs_for_evidence(
     target: Option<&str>,
 ) -> Vec<String> {
     let mut refs = source_refs_from_summary(summary);
+    if matches!(
+        subtype,
+        RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
+            | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
+            | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+    ) {
+        return Vec::new();
+    }
     if matches!(subtype, RepairLaneSubtype::ImportExportMissingExport)
         && let Some(target) = target
         && target_is_mutable_source_like(target)
@@ -929,6 +2757,21 @@ fn contract_classification_markers_from_summary(summary: &str) -> Vec<String> {
         || lower.contains("generatedtestoutofscope")
     {
         markers.push("generated_test_out_of_scope".to_string());
+    }
+    if generated_test_name_resolution_defect(summary).is_some() {
+        markers.push("generated_test_artifact_name_resolution_defect".to_string());
+    }
+    if generated_test_subprocess_encoding_missing(summary).is_some() {
+        markers.push("generated_test_subprocess_encoding_missing".to_string());
+    }
+    if generated_test_subprocess_output_capture_missing(summary).is_some() {
+        markers.push("generated_test_subprocess_output_capture_missing".to_string());
+    }
+    if generated_test_public_output_contract_overreach(summary).is_some() {
+        markers.push("generated_test_contract_overreach".to_string());
+    }
+    if generated_test_exception_type_overreach(summary).is_some() {
+        markers.push("generated_test_contract_overreach".to_string());
     }
     markers
 }
@@ -2633,8 +4476,15 @@ fn constructor_call_site_before(lines: &[&str], constructor: &str) -> Option<Str
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PublicExceptionMismatch {
     actual_exception: String,
+    expected_exception: Option<String>,
     call_site: Option<String>,
     source_site: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicExpectedExceptionNotRaised {
+    expected_exception: String,
+    call_site: Option<String>,
 }
 
 fn public_exception_mismatch(summary: &str) -> Option<PublicExceptionMismatch> {
@@ -2642,34 +4492,71 @@ fn public_exception_mismatch(summary: &str) -> Option<PublicExceptionMismatch> {
     if !lower.contains("traceback") || !lower.contains("test_") {
         return None;
     }
+    if let Some(not_raised) = public_expected_exception_not_raised(summary) {
+        return Some(PublicExceptionMismatch {
+            actual_exception: format!("{} not raised", not_raised.expected_exception),
+            expected_exception: Some(not_raised.expected_exception),
+            call_site: not_raised.call_site,
+            source_site: None,
+        });
+    }
     let logical_lines = failure_summary_logical_lines(summary);
     let actual_index = logical_lines
         .iter()
         .rposition(|line| exception_name_from_line(line).is_some())?;
     let actual_exception = exception_name_from_line(logical_lines[actual_index])?;
+    let expected_exception = expected_public_exception_name_before_actual(
+        &logical_lines[..actual_index],
+        &actual_exception,
+    );
     let call_site = public_exception_call_site_before(&logical_lines[..actual_index]);
     let source_site = public_exception_source_site_before(&logical_lines[..actual_index])?;
     Some(PublicExceptionMismatch {
         actual_exception,
+        expected_exception,
         call_site,
         source_site: Some(source_site),
     })
 }
 
+fn expected_public_exception_name_before_actual(
+    lines: &[&str],
+    actual_exception: &str,
+) -> Option<String> {
+    lines.iter().rev().find_map(|line| {
+        let trimmed = line.trim();
+        if exception_name_from_line(trimmed).is_some() {
+            return None;
+        }
+        known_exception_name_in_text(trimmed).filter(|expected| expected != actual_exception)
+    })
+}
+
 fn exception_name_from_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
-    for exception in [
-        "ZeroDivisionError",
-        "ValueError",
-        "TypeError",
-        "RuntimeError",
-        "OverflowError",
-    ] {
+    for exception in known_public_exception_names() {
         if trimmed.starts_with(exception) && trimmed[exception.len()..].starts_with(':') {
             return Some(exception.to_string());
         }
     }
     None
+}
+
+fn known_public_exception_names() -> [&'static str; 5] {
+    [
+        "ZeroDivisionError",
+        "ValueError",
+        "TypeError",
+        "RuntimeError",
+        "OverflowError",
+    ]
+}
+
+fn known_exception_name_in_text(text: &str) -> Option<String> {
+    known_public_exception_names()
+        .into_iter()
+        .find(|exception| text.contains(exception))
+        .map(str::to_string)
 }
 
 fn public_exception_call_site_before(lines: &[&str]) -> Option<String> {
@@ -2693,6 +4580,37 @@ fn public_exception_call_site_before(lines: &[&str]) -> Option<String> {
     })
 }
 
+fn public_expected_exception_not_raised(summary: &str) -> Option<PublicExpectedExceptionNotRaised> {
+    let lower = summary.to_ascii_lowercase();
+    if !lower.contains("traceback")
+        || !lower.contains("test_")
+        || !lower.contains("assertraises")
+        || !lower.contains("assertionerror:")
+        || !lower.contains(" not raised")
+    {
+        return None;
+    }
+    let logical_lines = failure_summary_logical_lines(summary);
+    let expected_exception = logical_lines.iter().rev().find_map(|line| {
+        let trimmed = line.trim();
+        let payload = trimmed.strip_prefix("AssertionError:")?.trim();
+        let exception = payload.strip_suffix(" not raised")?.trim();
+        (!exception.is_empty()).then(|| exception.to_string())
+    })?;
+    let call_site = logical_lines.iter().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.contains("assertRaises(") || trimmed.contains("assertRaisesRegex(") {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
+    });
+    Some(PublicExpectedExceptionNotRaised {
+        expected_exception,
+        call_site,
+    })
+}
+
 fn public_exception_source_site_before(lines: &[&str]) -> Option<String> {
     lines.windows(2).rev().find_map(|window| {
         let frame = window[0].trim();
@@ -2705,6 +4623,10 @@ fn public_exception_source_site_before(lines: &[&str]) -> Option<String> {
 }
 
 fn quoted_file_frame_path(frame: &str) -> Option<String> {
+    let trimmed = frame.trim();
+    if !trimmed.starts_with("File ") {
+        return None;
+    }
     let start = frame.find('"')? + 1;
     let rest = &frame[start..];
     let end = rest.find('"')?;
@@ -2782,6 +4704,64 @@ fn source_import_time_name_resolution_defect(
         return Some(SourceImportTimeNameResolutionDefect {
             missing_name,
             suggested_name,
+            path,
+            line: line_number,
+        });
+    }
+    None
+}
+
+fn generated_test_name_resolution_defect(
+    summary: &str,
+) -> Option<SourceImportTimeNameResolutionDefect> {
+    let lower = summary.to_ascii_lowercase();
+    if !lower.contains("nameerror:") || !lower.contains(" is not defined") {
+        return None;
+    }
+    let logical_lines = failure_summary_logical_lines(summary);
+    for (index, line) in logical_lines.iter().enumerate() {
+        let Some((missing_name, suggested_name)) = source_import_time_name_error_detail(line)
+        else {
+            continue;
+        };
+        let (path, line_number) = source_parse_defect_location_before(&logical_lines[..index]);
+        if !path.as_deref().is_some_and(target_is_test_like) {
+            continue;
+        }
+        return Some(SourceImportTimeNameResolutionDefect {
+            missing_name,
+            suggested_name,
+            path,
+            line: line_number,
+        });
+    }
+    None
+}
+
+fn generated_test_reflection_api_misuse(
+    summary: &str,
+) -> Option<SourceImportTimeNameResolutionDefect> {
+    let lower = summary.to_ascii_lowercase();
+    if !lower.contains("typeerror:")
+        || !lower.contains("code object was expected, got str")
+        || !lower.contains("inspect.getsource(")
+        || !lower.contains("__module__")
+    {
+        return None;
+    }
+    let logical_lines = failure_summary_logical_lines(summary);
+    for (index, line) in logical_lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.contains("inspect.getsource(") || !trimmed.contains("__module__") {
+            continue;
+        }
+        let (path, line_number) = source_parse_defect_location_before(&logical_lines[..index]);
+        if !path.as_deref().is_some_and(target_is_test_like) {
+            continue;
+        }
+        return Some(SourceImportTimeNameResolutionDefect {
+            missing_name: "inspect.getsource(__module__ string)".to_string(),
+            suggested_name: None,
             path,
             line: line_number,
         });
@@ -2908,7 +4888,6 @@ fn repair_operation_template(
     generated_test_target: Option<&str>,
     allowed_tools: &[String],
     forbidden_tools: &[String],
-    _required_next_action: Option<&str>,
     public_state_assertions: &[String],
     public_missing_attributes: &[String],
     cluster: Option<&VerificationFailureCluster>,
@@ -2919,10 +4898,20 @@ fn repair_operation_template(
         return None;
     }
     let target = required_target.map(str::to_string);
-    let operation_kind = contract_reconciliation
-        .and_then(repair_operation_kind_from_contract_reconciliation)
-        .unwrap_or_else(|| repair_operation_kind(subtype))
-        .to_string();
+    let operation_kind = if matches!(
+        subtype,
+        RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
+            | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
+            | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+            | RepairLaneSubtype::NoTestsRan
+    ) {
+        repair_operation_kind(subtype)
+    } else {
+        contract_reconciliation
+            .and_then(repair_operation_kind_from_contract_reconciliation)
+            .unwrap_or_else(|| repair_operation_kind(subtype))
+    }
+    .to_string();
     let source_test_ownership = contract_reconciliation
         .and_then(repair_source_test_ownership_from_contract_reconciliation)
         .unwrap_or_else(|| {
@@ -2961,7 +4950,6 @@ fn repair_operation_template(
         source_test_ownership,
         required_edit_surface,
         forbidden_stale_tools: forbidden_tools.to_vec(),
-        required_next_action: None,
         verification_rerun_condition: Some(
             "after a successful edit to the exact target, rerun the recorded verification command"
                 .to_string(),
@@ -2977,7 +4965,6 @@ fn repair_intent_projection(
     required_target: Option<&str>,
     generated_test_target: Option<&str>,
     missing_symbol: Option<&str>,
-    _required_next_action: Option<&str>,
     public_state_assertions: &[String],
     public_missing_attributes: &[String],
     cluster: Option<&VerificationFailureCluster>,
@@ -2991,11 +4978,11 @@ fn repair_intent_projection(
     let exact_target = required_target.unwrap_or("no_repair_target");
     let target_evidence = format!("exact target `{exact_target}`");
     let mut required_evidence = vec![target_evidence];
-    required_evidence.extend(
-        cluster
-            .into_iter()
-            .filter_map(|cluster| cluster.primary_failure.clone()),
-    );
+    if let Some(primary_failure) = cluster.and_then(|cluster| cluster.primary_failure.as_ref()) {
+        if !is_deferred_verification_command_evidence(primary_failure) {
+            required_evidence.push(primary_failure.clone());
+        }
+    }
     required_evidence.extend(public_state_assertions.iter().take(4).cloned());
     required_evidence.extend(public_missing_attributes.iter().take(4).cloned());
     if let Some(symbol) = missing_symbol {
@@ -3010,10 +4997,9 @@ fn repair_intent_projection(
                 .to_string(),
         ]
     } else {
-        vec![
-            format!("content-changing `write` or `apply_patch` to `{exact_target}`"),
-            "exact recorded verification command rerun after repair edit".to_string(),
-        ]
+        vec![format!(
+            "content-changing `write` or `apply_patch` to `{exact_target}`"
+        )]
     };
     if let Some(generated_test_target) = generated_test_target {
         progress_evidence.push(format!(
@@ -3056,6 +5042,28 @@ fn repair_intent_projection(
                     "stale_read_or_shell_before_test_contract_repair",
                 ],
             ),
+            RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing => (
+                "generated_test",
+                "generated_test_contract_reconciliation",
+                "targeted_test_contract_edit_then_verification",
+                "add explicit child UTF-8 output authority such as PYTHONUTF8=1 and PYTHONIOENCODING=utf-8, or python -X utf8, before the generated test decodes subprocess output as UTF-8",
+                vec![
+                    "source_public_output_patch_for_test_owned_encoding_defect",
+                    "weakening_stdout_stderr_assertion_without_child_encoding_authority",
+                    "stale_read_or_shell_before_test_contract_repair",
+                ],
+            ),
+            RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing => (
+                "generated_test",
+                "generated_test_contract_reconciliation",
+                "targeted_test_contract_edit_then_verification",
+                "add subprocess stdout/stderr capture authority to the generated test before asserting CompletedProcess output streams",
+                vec![
+                    "source_public_output_patch_for_test_owned_capture_defect",
+                    "weakening_stdout_stderr_assertion_without_capture",
+                    "stale_read_or_shell_before_test_contract_repair",
+                ],
+            ),
             RepairLaneSubtype::ImportExportMissingExport => (
                 "source_or_generated_test_by_contract_evidence",
                 "source_test_contract_reconciliation",
@@ -3088,7 +5096,19 @@ fn repair_intent_projection(
                     "stale_read_or_shell_before_contract_repair",
                 ],
             ),
+            RepairLaneSubtype::PublicCommandContractFailure => (
+                "source",
+                "same_target_repair",
+                "targeted_edit_then_exact_verification",
+                "repair the source CLI argv mode so route-owned public commands do not enter interactive stdin mode and satisfy exit/stdout/stderr observations",
+                vec![
+                    "generated_test_rewrite_for_source_owned_public_command_violation",
+                    "interactive_stdin_only_cli_when_argv_contract_exists",
+                    "stale_shell_before_source_contract_repair",
+                ],
+            ),
             RepairLaneSubtype::PublicMissingAttributeMismatch
+            | RepairLaneSubtype::PublicOutputStreamAssertionMismatch
             | RepairLaneSubtype::PublicStateAssertionMismatch => (
                 "source_or_generated_test_by_contract_evidence",
                 "source_test_contract_reconciliation",
@@ -3145,16 +5165,45 @@ fn repair_intent_projection(
                 ],
             ),
         });
+    let mut required_edit_intent = required_edit_intent.to_string();
+    let mut forbidden_directions = forbidden
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if matches!(subtype, RepairLaneSubtype::PublicCommandContractFailure) {
+        required_edit_intent = "repair the source CLI argv mode so direct command-line invocations satisfy the route-owned public command contract without falling into interactive stdin".to_string();
+        required_evidence.push(
+            "public command contract failure: argv invocation must produce the recorded exit/stdout/stderr behavior".to_string(),
+        );
+        required_evidence.push(
+            "interactive stdin mode is not a substitute for direct argv command handling"
+                .to_string(),
+        );
+        required_evidence.sort();
+        required_evidence.dedup();
+        for direction in [
+            "generated_test_rewrite_for_source_owned_public_command_violation",
+            "interactive_stdin_only_cli_when_argv_contract_exists",
+        ] {
+            if !forbidden_directions.iter().any(|item| item == direction) {
+                forbidden_directions.push(direction.to_string());
+            }
+        }
+    }
 
     Some(RepairIntentDiagnostic {
         repair_owner: repair_owner.to_string(),
         rollback_depth: rollback_depth.to_string(),
         recovery_action: recovery_action.to_string(),
-        required_edit_intent: required_edit_intent.to_string(),
+        required_edit_intent,
         required_evidence,
         progress_evidence,
-        forbidden_directions: forbidden.into_iter().map(str::to_string).collect(),
+        forbidden_directions,
     })
+}
+
+fn is_deferred_verification_command_evidence(evidence: &str) -> bool {
+    evidence.trim_start().starts_with("Command:")
 }
 
 fn repair_intent_from_contract_reconciliation(
@@ -3264,8 +5313,9 @@ fn repair_intent_from_contract_reconciliation(
             "repair the source behavior that violates the scenario contract requirement ids",
             vec![
                 "generated_test_rewrite_for_source_owned_contract_violation",
+                "stale_shell_before_source_contract_repair",
+                "unbounded_context_churn_before_source_contract_repair",
                 "weakening_scenario_contract_without_contract_change_entry",
-                "stale_read_or_shell_before_source_contract_repair",
             ],
         )),
     }
@@ -3274,7 +5324,6 @@ fn repair_intent_from_contract_reconciliation(
 fn repair_control_snapshot_projection(
     subtype: &RepairLaneSubtype,
     required_target: Option<&str>,
-    _required_next_action: Option<&str>,
     allowed_tools: &[String],
     forbidden_tools: &[String],
     repair_intent: Option<&RepairIntentDiagnostic>,
@@ -3337,7 +5386,6 @@ fn repair_control_snapshot_projection(
         recovery_action: intent.recovery_action.clone(),
         rollback_depth: intent.rollback_depth.clone(),
         allowed_tools: allowed_tools.to_vec(),
-        required_next_action: None,
         required_evidence: intent.required_evidence.clone(),
         forbidden_directions: intent.forbidden_directions.clone(),
         progress_evidence: intent.progress_evidence.clone(),
@@ -3351,7 +5399,6 @@ fn repair_control_snapshot_projection(
                 .filter(|tool| *tool == "write" || *tool == "apply_patch")
                 .cloned()
                 .collect(),
-            required_next_action: None,
             required_evidence: intent.required_evidence.clone(),
             forbidden_directions: vec![
                 "test_expectation_weakening_without_contract_conflict_evidence".to_string(),
@@ -3385,7 +5432,6 @@ fn repair_control_snapshot_projection(
         rollback_depth: intent.rollback_depth.clone(),
         operation_id: operation_template.map(|template| template.operation_id.clone()),
         required_target: required_target.map(str::to_string),
-        required_next_action: None,
         allowed_surface_snapshot: allowed_tools.to_vec(),
         hard_invariants,
         recovery_choices,
@@ -3399,8 +5445,14 @@ fn repair_control_snapshot_projection(
 
 fn repair_operation_kind(subtype: &RepairLaneSubtype) -> &'static str {
     match subtype {
+        RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing => {
+            "generated_test_subprocess_encoding_repair"
+        }
         RepairLaneSubtype::GeneratedTestLoggingContractOverreach => {
             "generated_test_logging_contract_repair"
+        }
+        RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing => {
+            "generated_test_subprocess_output_capture_repair"
         }
         RepairLaneSubtype::PublicClassAttributeMismatch => "source_api_member_alias_or_value",
         RepairLaneSubtype::PublicConstructorSignatureMismatch => "source_constructor_signature",
@@ -3409,6 +5461,10 @@ fn repair_operation_kind(subtype: &RepairLaneSubtype) -> &'static str {
         RepairLaneSubtype::PublicExceptionMismatch => "source_exception_contract",
         RepairLaneSubtype::PublicMethodAttributeMismatch => "source_public_method_alias",
         RepairLaneSubtype::PublicMissingAttributeMismatch => "source_or_test_data_model",
+        RepairLaneSubtype::PublicCommandContractFailure => "source_public_command_contract",
+        RepairLaneSubtype::PublicOutputStreamAssertionMismatch => {
+            "source_public_output_stream_contract"
+        }
         RepairLaneSubtype::PublicStateAssertionMismatch => "source_public_state_invariant",
         RepairLaneSubtype::ImportExportMissingExport => "source_import_export",
         RepairLaneSubtype::SourceImportTimeNameResolution => "source_import_time_name_resolution",
@@ -3459,7 +5515,9 @@ fn repair_source_test_ownership(
     }
     if matches!(
         subtype,
-        RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+        RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
+            | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
+            | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
     ) {
         return "generated_test_by_contract_evidence";
     }
@@ -3471,6 +5529,8 @@ fn repair_source_test_ownership(
             | RepairLaneSubtype::PublicCallableSignatureMismatch
             | RepairLaneSubtype::PublicExceptionMismatch
             | RepairLaneSubtype::PublicMethodAttributeMismatch
+            | RepairLaneSubtype::PublicCommandContractFailure
+            | RepairLaneSubtype::PublicOutputStreamAssertionMismatch
             | RepairLaneSubtype::PublicStateAssertionMismatch
             | RepairLaneSubtype::ImportExportMissingExport
             | RepairLaneSubtype::SourceImportTimeNameResolution
@@ -3545,11 +5605,37 @@ fn repair_evidence_markers_from_summary(
             markers.push(format!("public callable call site `{call_site}`"));
         }
     }
+    if let Some(not_raised) = public_expected_exception_not_raised(failure_summary) {
+        markers.push("source_public_behavior_assertion".to_string());
+        markers.push(format!(
+            "expected public exception `{}`",
+            not_raised.expected_exception
+        ));
+        if let Some(call_site) = not_raised.call_site {
+            markers.push(format!("public exception assertion `{call_site}`"));
+        }
+    }
     for method in public_missing_method_attributes(failure_summary) {
         markers.push(format!("public missing method `{}`", method.attribute));
         markers.push(format!("public method call site `{}`", method.call_site));
     }
     markers.extend(public_method_sibling_obligations(failure_summary));
+    if !matches!(
+        subtype,
+        RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
+    ) {
+        markers.extend(public_output_stream_assertion_markers(failure_summary));
+    }
+    if let Some(failure) = public_command_contract_failure(failure_summary) {
+        markers.push("source_public_command_contract_assertion".to_string());
+        markers.push(failure.observed_issue);
+        if let Some(command) = failure.command {
+            markers.push(format!("public command `{command}`"));
+        }
+    }
+    markers.extend(generated_test_exception_type_overreach_markers(
+        failure_summary,
+    ));
     markers.extend(public_state_assertions(failure_summary));
     markers.extend(public_state_assertion_observations(failure_summary));
     markers.extend(
@@ -3569,7 +5655,18 @@ fn repair_evidence_markers_from_summary(
     ));
     markers.extend(source_parse_defect_markers(failure_summary));
     markers.extend(source_import_time_name_resolution_markers(failure_summary));
+    markers.extend(generated_test_name_resolution_markers(failure_summary));
+    markers.extend(generated_test_reflection_api_misuse_markers(
+        failure_summary,
+    ));
     markers.extend(generated_test_logging_contract_markers(failure_summary));
+    markers.extend(generated_test_subprocess_output_capture_markers(
+        failure_summary,
+    ));
+    markers.extend(generated_test_subprocess_encoding_markers(failure_summary));
+    markers.extend(generated_test_public_output_contract_markers(
+        failure_summary,
+    ));
     if has_explicit_generated_test_conflict_evidence(failure_summary) {
         markers.push("already-read generated-test conflict evidence".to_string());
     }
@@ -3644,6 +5741,202 @@ fn generated_test_logging_contract_markers(failure_summary: &str) -> Vec<String>
     markers
 }
 
+fn generated_test_subprocess_output_capture_markers(failure_summary: &str) -> Vec<String> {
+    let Some(mismatch) = generated_test_subprocess_output_capture_missing(failure_summary) else {
+        return Vec::new();
+    };
+    vec![
+        "generated_test_subprocess_output_capture_missing".to_string(),
+        "generated test subprocess output capture missing".to_string(),
+        format!(
+            "generated-test subprocess output assertion `{}` expected `{}` observed `{}`",
+            mismatch.assertion_line, mismatch.expected_substring, mismatch.observed_value
+        ),
+    ]
+}
+
+fn generated_test_subprocess_encoding_markers(failure_summary: &str) -> Vec<String> {
+    let Some(mismatch) = generated_test_subprocess_encoding_missing(failure_summary) else {
+        return Vec::new();
+    };
+    vec![
+        "generated_test_subprocess_encoding_missing".to_string(),
+        "generated test subprocess child encoding missing".to_string(),
+        "generated test parent UTF-8 decode lacks child output encoding authority".to_string(),
+        format!(
+            "generated-test subprocess output assertion `{}` expected `{}` observed `{}`",
+            mismatch.assertion_line, mismatch.expected_substring, mismatch.observed_value
+        ),
+    ]
+}
+
+fn generated_test_public_output_contract_markers(failure_summary: &str) -> Vec<String> {
+    let Some(overreach) = generated_test_public_output_contract_overreach(failure_summary) else {
+        return Vec::new();
+    };
+    vec![
+        "generated_test_contract_overreach".to_string(),
+        "generated-test public output formatting assertion overreach".to_string(),
+        format!(
+            "generated-test public output assertion `{}` expected `{}` observed `{}`",
+            overreach.assertion_line, overreach.expected_substring, overreach.observed_value
+        ),
+    ]
+}
+
+fn generated_test_exception_type_overreach_markers(failure_summary: &str) -> Vec<String> {
+    let Some((expected, actual)) = generated_test_exception_type_overreach(failure_summary) else {
+        return Vec::new();
+    };
+    vec![
+        "generated_test_contract_overreach".to_string(),
+        "generated-test exception type assertion overreach".to_string(),
+        format!(
+            "generated-test expected exact exception `{expected}` but source raised `{actual}`"
+        ),
+    ]
+}
+
+fn generated_test_exception_type_overreach(failure_summary: &str) -> Option<(String, String)> {
+    let mismatch = public_exception_mismatch(failure_summary)?;
+    if mismatch.actual_exception.ends_with(" not raised") {
+        return None;
+    }
+    let expected = mismatch.expected_exception?;
+    if expected == mismatch.actual_exception {
+        return None;
+    }
+    if test_refs_from_summary(failure_summary).is_empty()
+        || source_refs_from_summary(failure_summary).is_empty()
+    {
+        return None;
+    }
+    Some((expected, mismatch.actual_exception))
+}
+
+fn generated_test_public_output_contract_overreach(
+    failure_summary: &str,
+) -> Option<PublicOutputStreamAssertionMismatch> {
+    let mismatch = public_output_stream_assertion_mismatch(failure_summary)?;
+    if mismatch.stream != "stdout" || test_refs_from_summary(failure_summary).is_empty() {
+        return None;
+    }
+    (public_output_values_are_same_scalar_with_decorative_formatting(
+        &mismatch.expected_substring,
+        &mismatch.observed_value,
+    ) || public_output_assertion_is_ungrounded_process_lifecycle(failure_summary, &mismatch))
+    .then_some(mismatch)
+}
+
+fn public_output_assertion_is_ungrounded_process_lifecycle(
+    failure_summary: &str,
+    mismatch: &PublicOutputStreamAssertionMismatch,
+) -> bool {
+    let lower = failure_summary.to_ascii_lowercase();
+    if !lower.contains("eof")
+        && !lower.contains("end of file")
+        && !lower.contains("no input")
+        && !lower.contains("empty input")
+    {
+        return false;
+    }
+    let expected = clean_output_assertion_value(&mismatch.expected_substring);
+    if expected.is_empty() {
+        return false;
+    }
+    let observed = clean_output_assertion_value(&mismatch.observed_value);
+    observed.contains(">>>") || observed.is_empty() || !observed.contains(&expected)
+}
+
+fn public_output_values_are_same_scalar_with_decorative_formatting(
+    expected: &str,
+    observed: &str,
+) -> bool {
+    let expected_scalar = normalize_decorated_public_output_scalar(expected);
+    let observed_scalar = normalize_public_output_observed_scalar_for_expected(expected, observed)
+        .unwrap_or_else(|| normalize_decorated_public_output_scalar(observed));
+    if expected_scalar.is_empty() || observed_scalar.is_empty() || expected == observed {
+        return false;
+    }
+    match (
+        expected_scalar.parse::<f64>(),
+        observed_scalar.parse::<f64>(),
+    ) {
+        (Ok(expected), Ok(observed)) => (expected - observed).abs() < f64::EPSILON,
+        _ => false,
+    }
+}
+
+fn normalize_decorated_public_output_scalar(value: &str) -> String {
+    let mut trimmed = clean_output_assertion_value(value);
+    trimmed = trimmed.trim().to_string();
+    if let Some(rest) = trimmed.strip_prefix('=') {
+        trimmed = rest.trim().to_string();
+    }
+    if let Some((_, rest)) = trimmed.rsplit_once(':') {
+        let candidate = rest.trim();
+        if !candidate.is_empty() {
+            trimmed = candidate.to_string();
+        }
+    }
+    trimmed
+}
+
+fn normalize_public_output_observed_scalar_for_expected(
+    expected: &str,
+    observed: &str,
+) -> Option<String> {
+    let expected = clean_output_assertion_value(expected);
+    let observed = clean_output_assertion_value(observed);
+    let (label, _) = expected.split_once(':')?;
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+    let label_start = observed.find(label)?;
+    let rest = observed[label_start + label.len()..].trim_start();
+    let rest = rest
+        .strip_prefix(':')
+        .or_else(|| rest.strip_prefix('：'))
+        .unwrap_or(rest)
+        .trim_start();
+    let mut scalar = String::new();
+    for ch in rest.chars() {
+        if ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+' || ch == 'e' || ch == 'E' {
+            scalar.push(ch);
+        } else if !scalar.is_empty() {
+            break;
+        }
+    }
+    (!scalar.is_empty()).then_some(scalar)
+}
+
+fn public_output_stream_assertion_markers(failure_summary: &str) -> Vec<String> {
+    let Some(mismatch) = public_output_stream_assertion_mismatch(failure_summary) else {
+        return Vec::new();
+    };
+    vec![
+        format!("public_output_stream:{}", mismatch.stream),
+        format!(
+            "public output stream assertion `{}` contains `{}`",
+            mismatch.stream, mismatch.expected_substring
+        ),
+    ]
+}
+
+fn public_output_stream_assertion_obligations(failure_summary: &str) -> Vec<String> {
+    let Some(mismatch) = public_output_stream_assertion_mismatch(failure_summary) else {
+        return Vec::new();
+    };
+    vec![
+        "source_public_behavior_assertion".to_string(),
+        format!(
+            "{} contains `{}`",
+            mismatch.stream, mismatch.expected_substring
+        ),
+    ]
+}
+
 fn source_import_time_name_resolution_markers(failure_summary: &str) -> Vec<String> {
     let Some(defect) = source_import_time_name_resolution_defect(failure_summary) else {
         return Vec::new();
@@ -3657,6 +5950,48 @@ fn source_import_time_name_resolution_markers(failure_summary: &str) -> Vec<Stri
     }
     if let Some(line) = defect.line {
         markers.push(format!("source import-time frame line {line}"));
+    }
+    markers
+}
+
+fn generated_test_name_resolution_markers(failure_summary: &str) -> Vec<String> {
+    let Some(defect) = generated_test_name_resolution_defect(failure_summary) else {
+        return Vec::new();
+    };
+    let mut markers = vec![
+        "generated_test_artifact_name_resolution_defect".to_string(),
+        format!("generated test missing name `{}`", defect.missing_name),
+    ];
+    if let Some(suggested_name) = defect.suggested_name {
+        markers.push(format!(
+            "generated test near-name candidate `{suggested_name}`"
+        ));
+    }
+    if let Some(path) = defect.path {
+        markers.push(format!("generated test name-resolution frame `{path}`"));
+    }
+    if let Some(line) = defect.line {
+        markers.push(format!("generated test name-resolution frame line {line}"));
+    }
+    markers
+}
+
+fn generated_test_reflection_api_misuse_markers(failure_summary: &str) -> Vec<String> {
+    let Some(defect) = generated_test_reflection_api_misuse(failure_summary) else {
+        return Vec::new();
+    };
+    let mut markers = vec![
+        "generated_test_artifact_api_misuse".to_string(),
+        format!(
+            "generated test invalid reflection subject `{}`",
+            defect.missing_name
+        ),
+    ];
+    if let Some(path) = defect.path {
+        markers.push(format!("generated test api-misuse frame `{path}`"));
+    }
+    if let Some(line) = defect.line {
+        markers.push(format!("generated test api-misuse frame line {line}"));
     }
     markers
 }
@@ -3693,6 +6028,20 @@ fn repair_sibling_obligations_from_summary(
     obligations.extend(public_constructor_sibling_obligations(failure_summary));
     obligations.extend(public_api_data_model_semantic_obligations(failure_summary));
     obligations.extend(public_method_sibling_obligations(failure_summary));
+    if let Some(not_raised) = public_expected_exception_not_raised(failure_summary) {
+        obligations.push("source_public_behavior_assertion".to_string());
+        obligations.push(format!(
+            "expected public exception `{}`",
+            not_raised.expected_exception
+        ));
+    }
+    if !matches!(
+        subtype,
+        RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
+            | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
+    ) {
+        obligations.extend(public_output_stream_assertion_obligations(failure_summary));
+    }
     obligations.extend(public_state_assertions.iter().cloned());
     obligations.extend(public_state_game_loop_operation_obligations(
         failure_summary,

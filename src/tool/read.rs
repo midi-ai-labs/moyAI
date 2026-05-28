@@ -48,7 +48,7 @@ impl Tool for ReadTool {
         mut ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<ReadInput>(raw_arguments)?;
-        let guarded = PathGuard::require_path(ctx.workspace, &input.path, AccessKind::Read, true)?;
+        let guarded = PathGuard::require_path(ctx.workspace, &input.path, AccessKind::Read)?;
         ctx.confirm_if_needed(
             AccessKind::Read,
             format!("Read {}", guarded.absolute),

@@ -65,6 +65,16 @@ Python API は既存の `calculate(left, operator, right)` の引数意味を壊
 - stage1: `python -m unittest`
 - stage3: `python -m unittest`
 
+## public command contract
+
+- stage3: `python -X utf8 calculator.py 2 + 3`; exit `0`; stdout_line_suffix `5`
+- stage3: `python -X utf8 calculator.py 2 pow 3`; exit `0`; stdout_line_suffix `8`
+- stage3: `python -X utf8 calculator.py sin 0`; exit `0`; stdout_line_suffix `0`
+- stage3: `python -X utf8 calculator.py cos 0`; exit `0`; stdout_line_suffix `1`
+- stage3: `python -X utf8 calculator.py sqrt 16`; exit `0`; stdout_line_suffix `4`
+- stage3: `python -X utf8 calculator.py 8 +`; exit `1`; stderr_contains_any `usage|使用方法|使い方`
+- stage3: `python -X utf8 calculator.py log 10`; exit `1`; stderr_contains_any `usage|使用方法|使い方`
+
 ## 合格条件
 
 - stage1 から stage3 まで同一 session で完走する
@@ -108,6 +118,7 @@ CLI の trailing `.0`、unknown two-token command、exit code は stage2 / stage
 ## 記録すべき証跡
 
 - `route_manifest.json`
+- `case_progress.json`
 - `verification_command_log.json`
 - `workspace_diff_manifest.json`
 - `stage1.jsonl`

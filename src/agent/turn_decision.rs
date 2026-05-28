@@ -26,7 +26,7 @@ pub(crate) fn build_turn_decision_diagnostic(
     active_targets.dedup();
 
     let repair_lane =
-        project_repair_lane(state, allowed_tools, None).map(|projection| projection.diagnostic());
+        project_repair_lane(state, allowed_tools).map(|projection| projection.diagnostic());
     let active_work_summary = active_work.map(ActiveWorkContract::summary);
     let mut policy_targets = policy
         .execution_focus_targets
@@ -47,7 +47,6 @@ pub(crate) fn build_turn_decision_diagnostic(
         active_targets,
         verification_pending: state.completion.verification_pending,
         closeout_ready: state.completion.closeout_ready,
-        required_next_action: None,
         required_verification_commands: state.verification.required_commands.clone(),
         policy_targets,
         allowed_tools: allowed_tools.iter().cloned().collect(),
@@ -126,6 +125,24 @@ fn projection_warnings(diagnostic: &TurnDecisionDiagnostic) -> Vec<TurnDecisionW
                 "RepairControlSnapshot and repair lane disagree on the exact repair target.",
             ));
         }
+        if diagnostic.process_phase == "repair"
+            && !diagnostic.active_targets.is_empty()
+            && repair_lane
+                .required_target
+                .as_deref()
+                .is_some_and(|target| {
+                    !diagnostic
+                        .active_targets
+                        .iter()
+                        .any(|active| diagnostic_targets_equivalent(active.as_str(), target))
+                })
+        {
+            warnings.push(warning(
+                "repair_target_not_in_active_work_targets",
+                TurnDecisionWarningSeverity::Error,
+                "Repair lane exact target is outside the current ActiveWork target set.",
+            ));
+        }
         if let Some(template) = repair_lane.operation_template.as_ref() {
             if template.source_test_ownership == "source"
                 && template
@@ -152,10 +169,12 @@ fn projection_warnings(diagnostic: &TurnDecisionDiagnostic) -> Vec<TurnDecisionW
                 ));
             }
         }
-        if snapshot.selected_recovery_action.starts_with("fail_closed") {
+        if diagnostic.process_phase == "repair"
+            && snapshot.selected_recovery_action.starts_with("fail_closed")
+        {
             warnings.push(warning(
                 "repair_unclassified_before_dispatch",
-                TurnDecisionWarningSeverity::Warning,
+                TurnDecisionWarningSeverity::Error,
                 "Repair lane classification is fail-closed; item-stream authority must decide the provider-visible next action.",
             ));
         }
@@ -193,6 +212,17 @@ fn diagnostic_target_is_test_like(target: &str) -> bool {
         .is_some_and(|name| name.starts_with("test_") || name.ends_with("_test.py"))
 }
 
+fn diagnostic_targets_equivalent(left: &str, right: &str) -> bool {
+    let left = left.replace('\\', "/").to_ascii_lowercase();
+    let right = right.replace('\\', "/").to_ascii_lowercase();
+    left == right
+        || left
+            .rsplit('/')
+            .next()
+            .zip(right.rsplit('/').next())
+            .is_some_and(|(left_name, right_name)| left_name == right_name)
+}
+
 fn warning(
     code: &str,
     severity: TurnDecisionWarningSeverity,
@@ -227,12 +257,12 @@ pub(crate) fn active_work_edit_authority_precedes_verification_rerun_fixture_pas
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
+        Utf8PathBuf::from("component.py"),
+        Utf8PathBuf::from("test_component.py"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: crate::session::FailureKind::VerificationFailed,
-        summary: "verification failed: calculator.calculate is missing".to_string(),
+        summary: "verification failed: component.calculate is missing".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
@@ -259,12 +289,11 @@ pub(crate) fn active_work_edit_authority_precedes_verification_rerun_fixture_pas
         Some("required".to_string()),
     );
 
-    diagnostic.required_next_action.is_none()
-        && diagnostic.active_targets
-            == vec![
-                Utf8PathBuf::from("calculator.py"),
-                Utf8PathBuf::from("test_calculator.py"),
-            ]
+    diagnostic.active_targets
+        == vec![
+            Utf8PathBuf::from("component.py"),
+            Utf8PathBuf::from("test_component.py"),
+        ]
         && diagnostic
             .repair_lane
             .as_ref()
@@ -281,16 +310,83 @@ pub(crate) fn active_work_edit_authority_precedes_verification_rerun_fixture_pas
             .all(|warning| warning.severity != TurnDecisionWarningSeverity::Error)
 }
 
+pub(crate) fn repair_lane_target_matches_active_work_authority_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.failure = Some(crate::session::FailureState {
+        kind: crate::session::FailureKind::VerificationFailed,
+        summary: "verification failed: generated test stale literal".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.failing_labels = vec!["test_invalid_visible_contract".to_string()];
+    state.verification.failure_cluster = Some(crate::session::VerificationFailureCluster {
+        cluster_id: "fixture-turn-decision-repair-target-active-work".to_string(),
+        failing_labels: vec!["test_invalid_visible_contract".to_string()],
+        primary_failure: Some("AssertionError: stale literal expectation".to_string()),
+        evidence: vec![crate::session::VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generic_verification_failure".to_string()),
+            label: Some("test_invalid_visible_contract".to_string()),
+            target: None,
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: Some("old visible literal".to_string()),
+            observed: Some("current visible literal".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec!["generic_verification_failure".to_string()],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    });
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+    let active_work = ActiveWorkContract::Verification {
+        commands: state.verification.required_commands.clone(),
+        failing_labels: state.verification.failing_labels.clone(),
+        repair_required: true,
+        targets: state.active_targets.clone(),
+    };
+    let diagnostic = build_turn_decision_diagnostic(
+        &state,
+        Some(&active_work),
+        &PromptPolicy::default(),
+        &BTreeSet::from(["write".to_string(), "apply_patch".to_string()]),
+        Some("required".to_string()),
+    );
+
+    diagnostic.active_targets == vec![Utf8PathBuf::from("test_widget.py")]
+        && diagnostic
+            .repair_lane
+            .as_ref()
+            .is_some_and(|lane| lane.required_target.as_deref() == Some("test_widget.py"))
+        && diagnostic
+            .warnings
+            .iter()
+            .all(|warning| warning.severity != TurnDecisionWarningSeverity::Error)
+}
+
 pub(crate) fn post_repair_edit_progress_promotes_shell_rerun_fixture_passes() -> bool {
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Verify;
-    state.active_targets = vec![Utf8PathBuf::from("test_calculator.py")];
+    state.active_targets = vec![Utf8PathBuf::from("test_component.py")];
     state.failure = Some(crate::session::FailureState {
         kind: crate::session::FailureKind::VerificationFailed,
-        summary: "verification failed: calculator.calculate was repaired and needs rerun"
+        summary: "verification failed: component.calculate was repaired and needs rerun"
             .to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
-        targets: vec![Utf8PathBuf::from("calculator.py")],
+        targets: vec![Utf8PathBuf::from("component.py")],
     });
     state.completion.verification_pending = true;
     state.verification.failing_labels = vec!["test_calculate_add".to_string()];
@@ -315,23 +411,60 @@ pub(crate) fn post_repair_edit_progress_promotes_shell_rerun_fixture_passes() ->
         Some("required".to_string()),
     );
 
-    diagnostic.required_next_action.is_none()
-        && diagnostic.allowed_tools == vec!["shell".to_string()]
+    diagnostic.allowed_tools == vec!["shell".to_string()]
         && diagnostic
             .warnings
             .iter()
             .all(|warning| warning.severity != TurnDecisionWarningSeverity::Error)
 }
 
+pub(crate) fn post_repair_verify_phase_ignores_stale_unclassified_repair_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Verify;
+    state.failure = Some(crate::session::FailureState {
+        kind: crate::session::FailureKind::VerificationFailed,
+        summary: "stale verification failure remains until the post-edit rerun".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: Vec::new(),
+    });
+    state.completion.verification_pending = true;
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+    let active_work = ActiveWorkContract::Verification {
+        commands: state.verification.required_commands.clone(),
+        failing_labels: Vec::new(),
+        repair_required: false,
+        targets: Vec::new(),
+    };
+    let allowed_tools = BTreeSet::from(["shell".to_string()]);
+    let diagnostic = build_turn_decision_diagnostic(
+        &state,
+        Some(&active_work),
+        &PromptPolicy::default(),
+        &allowed_tools,
+        Some("required".to_string()),
+    );
+
+    diagnostic.process_phase == "verify"
+        && diagnostic.allowed_tools == vec!["shell".to_string()]
+        && diagnostic.repair_lane.is_some()
+        && diagnostic.warnings.iter().all(|warning| {
+            warning.code != "repair_unclassified_before_dispatch"
+                && warning.severity != TurnDecisionWarningSeverity::Error
+        })
+}
+
 pub(crate) fn repair_required_active_work_ignores_shell_only_continuation_fixture_passes() -> bool {
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
-    state.active_targets = vec![Utf8PathBuf::from("calculator.py")];
+    state.active_targets = vec![Utf8PathBuf::from("component.py")];
     state.failure = Some(crate::session::FailureState {
         kind: crate::session::FailureKind::VerificationFailed,
         summary: "verification failed: divide raises wrong public exception".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
-        targets: vec![Utf8PathBuf::from("calculator.py")],
+        targets: vec![Utf8PathBuf::from("component.py")],
     });
     state.completion.verification_pending = true;
     state
@@ -343,15 +476,14 @@ pub(crate) fn repair_required_active_work_ignores_shell_only_continuation_fixtur
         completed: Vec::new(),
         remaining: Vec::new(),
         next_actions: Vec::new(),
-        target_files: vec![Utf8PathBuf::from("calculator.py")],
+        target_files: vec![Utf8PathBuf::from("component.py")],
         verification_commands: vec!["python -m unittest".to_string()],
         continuation_contract: Some(crate::session::ContinuationContract {
             route: route_label(state.route).to_string(),
             process_phase: process_phase_label(state.process_phase).to_string(),
             active_work_kind: Some("verification".to_string()),
-            active_work_summary: Some("Repair calculator.py before rerun.".to_string()),
-            required_next_action: None,
-            target_files: vec![Utf8PathBuf::from("calculator.py")],
+            active_work_summary: Some("Repair component.py before rerun.".to_string()),
+            target_files: vec![Utf8PathBuf::from("component.py")],
             verification_commands: vec!["python -m unittest".to_string()],
             failure_kind: Some("verification_failed".to_string()),
             failure_summary: Some(
@@ -376,7 +508,56 @@ pub(crate) fn repair_required_active_work_ignores_shell_only_continuation_fixtur
         Some("required".to_string()),
     );
 
-    diagnostic.required_next_action.is_none()
+    diagnostic.allowed_tools == vec!["shell".to_string()]
+}
+
+pub(crate) fn unclassified_repair_fails_closed_before_dispatch_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = ProcessPhase::Repair;
+    state.failure = Some(crate::session::FailureState {
+        kind: crate::session::FailureKind::VerificationFailed,
+        summary: "verification command timed out before typed failure classification".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: Vec::new(),
+    });
+    state.completion.verification_pending = true;
+    state
+        .verification
+        .required_commands
+        .push("python -X utf8 -m unittest".to_string());
+    let active_work = ActiveWorkContract::Verification {
+        commands: state.verification.required_commands.clone(),
+        failing_labels: Vec::new(),
+        repair_required: true,
+        targets: Vec::new(),
+    };
+    let allowed_tools = BTreeSet::from([
+        "apply_patch".to_string(),
+        "read".to_string(),
+        "shell".to_string(),
+        "write".to_string(),
+    ]);
+    let diagnostic = build_turn_decision_diagnostic(
+        &state,
+        Some(&active_work),
+        &PromptPolicy::default(),
+        &allowed_tools,
+        Some("auto".to_string()),
+    );
+
+    diagnostic
+        .repair_lane
+        .as_ref()
+        .and_then(|lane| lane.repair_control_snapshot.as_ref())
+        .is_some_and(|snapshot| {
+            snapshot.repair_owner == "unknown"
+                && snapshot.selected_recovery_action.starts_with("fail_closed")
+        })
+        && diagnostic.warnings.iter().any(|warning| {
+            warning.code == "repair_unclassified_before_dispatch"
+                && warning.severity == TurnDecisionWarningSeverity::Error
+        })
 }
 
 fn route_label(route: TaskRoute) -> &'static str {

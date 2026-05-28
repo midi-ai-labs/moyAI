@@ -6,12 +6,14 @@ use super::models::{
 };
 use super::startup::{DesktopStartupCheckStatus, DesktopStartupStatus};
 use super::state::{DesktopOverlay, DesktopState};
+use crate::config::ProviderMetadataMode;
 use crate::tui::config_editor::{ConfigField, ConfigFieldState};
 use crate::tui::state::{PromptReviewPhase, RunStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopPermissionProjection {
     pub summary: String,
+    pub details: Vec<String>,
     pub targets: Vec<String>,
     pub outside_workspace: bool,
     pub risks: Vec<String>,
@@ -82,6 +84,9 @@ pub struct DesktopWebState {
     pub local_search_results_text: String,
     pub command_rows: Vec<DesktopCommandRow>,
     pub provider_base_url: String,
+    pub provider_metadata_mode: String,
+    pub provider_context_window: String,
+    pub provider_max_output_tokens: String,
     pub provider_models: Vec<String>,
     pub provider_selected_index: i32,
     pub provider_status_text: String,
@@ -182,6 +187,7 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         confirmation: state.app_state.permission.as_ref().map(|permission| {
             DesktopPermissionProjection {
                 summary: permission.summary.clone(),
+                details: permission.details.clone(),
                 targets: permission.targets.clone(),
                 outside_workspace: permission.outside_workspace,
                 risks: permission.risks.clone(),
@@ -219,6 +225,15 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         local_search_results_text: state.local_search_results_text(),
         command_rows: state.snapshot.command_rows.clone(),
         provider_base_url: state.provider_config.provider_base_url_input.clone(),
+        provider_metadata_mode: provider_metadata_mode_key(
+            state.provider_config.provider_metadata_mode_input,
+        )
+        .to_string(),
+        provider_context_window: state.provider_config.provider_context_window_input.clone(),
+        provider_max_output_tokens: state
+            .provider_config
+            .provider_max_output_tokens_input
+            .clone(),
         provider_models: provider_model_labels(state),
         provider_selected_index: state.provider_config.provider_selected_index,
         provider_status_text: provider_feedback_text(state),
@@ -370,6 +385,20 @@ fn provider_model_labels(state: &DesktopState) -> Vec<String> {
 
 fn provider_feedback_text(state: &DesktopState) -> String {
     let mut text = state.provider_config.provider_status_text.clone();
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(provider_metadata_mode_detail(
+        state.provider_config.provider_metadata_mode_input,
+    ));
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "Managed request limits: context_window={}, max_output_tokens={}.",
+        state.provider_config.provider_context_window_input,
+        state.provider_config.provider_max_output_tokens_input
+    ));
     if let Some(info) = state.selected_provider_model_info() {
         let summary = super::state::provider_model_summary(info);
         if !summary.is_empty() {
@@ -381,6 +410,24 @@ fn provider_feedback_text(state: &DesktopState) -> String {
         }
     }
     text
+}
+
+fn provider_metadata_mode_key(mode: ProviderMetadataMode) -> &'static str {
+    match mode {
+        ProviderMetadataMode::LmStudioNativeRequired => "lm_studio_native_required",
+        ProviderMetadataMode::OpenAiCompatibleOnly => "openai_compatible_only",
+    }
+}
+
+fn provider_metadata_mode_detail(mode: ProviderMetadataMode) -> &'static str {
+    match mode {
+        ProviderMetadataMode::LmStudioNativeRequired => {
+            "Provider mode: LM Studio native metadata required."
+        }
+        ProviderMetadataMode::OpenAiCompatibleOnly => {
+            "Provider mode: OpenAI-compatible only. The language / no-thinking system policy is active."
+        }
+    }
 }
 
 fn provider_selected_model_summary(state: &DesktopState) -> Vec<String> {
@@ -588,10 +635,13 @@ mod tests {
         desktop_web_state, display_run_phase, display_run_step, display_status_projection,
         display_tool_summary,
     };
+    use crate::config::ProviderMetadataMode;
     use crate::config::ResolvedConfig;
     use crate::desktop::models::{DesktopProjectRow, DesktopSnapshot};
     use crate::desktop::state::DesktopState;
     use crate::session::ProjectId;
+    use crate::tool::{PermissionRequest, PermissionRisk};
+    use crate::workspace::AccessKind;
 
     fn snapshot() -> DesktopSnapshot {
         DesktopSnapshot {
@@ -659,6 +709,22 @@ mod tests {
     }
 
     #[test]
+    fn web_state_projects_provider_metadata_mode_switch() {
+        let mut state = DesktopState::new(snapshot(), config_with_provider());
+        state.set_provider_metadata_mode_input(ProviderMetadataMode::OpenAiCompatibleOnly);
+
+        let web = desktop_web_state(&state);
+
+        assert_eq!(web.provider_metadata_mode, "openai_compatible_only");
+        assert_eq!(web.provider_context_window, "131072");
+        assert_eq!(web.provider_max_output_tokens, "8192");
+        assert!(
+            web.provider_status_text
+                .contains("language / no-thinking system policy is active")
+        );
+    }
+
+    #[test]
     fn status_projection_keeps_raw_provider_errors_as_detail() {
         let raw = "run llm error: llm http error: error sending request for url (http://127.0.0.1:9/v1/models)";
         let (summary, detail) = display_status_projection(raw);
@@ -700,5 +766,34 @@ mod tests {
             display_tool_summary("No tool activity yet."),
             "ツール待機中"
         );
+    }
+
+    #[test]
+    fn web_state_projects_permission_details() {
+        let mut state = DesktopState::new(snapshot(), config_with_provider());
+        state.app_state.set_permission(&PermissionRequest {
+            access: AccessKind::Shell,
+            summary: "Install pygame library".to_string(),
+            details: vec![
+                "Command: pip install pygame".to_string(),
+                "Workdir: C:/workspace".to_string(),
+            ],
+            targets: vec![camino::Utf8PathBuf::from("C:/workspace")],
+            outside_workspace: false,
+            risks: vec![PermissionRisk::ExternalConnection],
+        });
+
+        let web = desktop_web_state(&state);
+        let confirmation = web
+            .confirmation
+            .expect("permission projection should be present");
+
+        assert_eq!(confirmation.summary, "Install pygame library");
+        assert!(
+            confirmation
+                .details
+                .contains(&"Command: pip install pygame".to_string())
+        );
+        assert_eq!(confirmation.risks, vec!["external connection/setup"]);
     }
 }

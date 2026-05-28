@@ -15,6 +15,9 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
     if let Some(value) = patch.prompt_profile {
         target.prompt_profile = value;
     }
+    if let Some(value) = patch.provider_metadata_mode {
+        target.provider_metadata_mode = value;
+    }
     if let Some(value) = patch.api_key_env {
         target.api_key_env = value;
     }

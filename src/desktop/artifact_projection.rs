@@ -1,7 +1,9 @@
 use camino::Utf8Path;
 
 use crate::desktop::models::{DesktopArtifactRow, DesktopFileChangeRow};
-use crate::protocol::{FileChangeEvidence, TurnItem, TurnItemPayload};
+use crate::protocol::{
+    FileChangeEvidence, TurnItem, TurnItemPayload, turn_items_in_projection_order,
+};
 use crate::session::{ChangeKind, MessagePart, Transcript};
 pub fn file_change_rows_from_turn_items(turn_items: &[TurnItem]) -> Vec<DesktopFileChangeRow> {
     file_change_rows_from_turn_items_with_root(turn_items, None)
@@ -12,7 +14,7 @@ pub(crate) fn file_change_rows_from_turn_items_with_root(
     workspace_root: Option<&Utf8Path>,
 ) -> Vec<DesktopFileChangeRow> {
     let mut rows = Vec::new();
-    for item in turn_items {
+    for item in turn_items_in_projection_order(turn_items) {
         if let TurnItemPayload::FileChange {
             changes, summary, ..
         } = &item.payload
@@ -246,5 +248,57 @@ fn change_kind_label(kind: ChangeKind) -> &'static str {
         ChangeKind::Update => "更新",
         ChangeKind::Delete => "削除",
         ChangeKind::Move => "移動",
+    }
+}
+
+pub(crate) fn desktop_file_change_projection_uses_turn_local_sequence_fixture_passes() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let rows = file_change_rows_from_turn_items(&[
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 3,
+            payload: TurnItemPayload::FileChange {
+                change_ids: vec![crate::session::ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: crate::session::ChangeId::new(),
+                    kind: ChangeKind::Update,
+                    path_before: None,
+                    path_after: Some(camino::Utf8PathBuf::from("same.txt")),
+                    summary: "latest summary".to_string(),
+                }],
+                summary: "latest summary".to_string(),
+            },
+        },
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 2,
+            payload: TurnItemPayload::FileChange {
+                change_ids: vec![crate::session::ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: crate::session::ChangeId::new(),
+                    kind: ChangeKind::Add,
+                    path_before: None,
+                    path_after: Some(camino::Utf8PathBuf::from("same.txt")),
+                    summary: "initial summary".to_string(),
+                }],
+                summary: "initial summary".to_string(),
+            },
+        },
+    ]);
+    rows.len() == 1 && rows[0].action == "追加" && rows[0].summary == "latest summary"
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn desktop_file_change_projection_uses_turn_local_sequence() {
+        assert!(super::desktop_file_change_projection_uses_turn_local_sequence_fixture_passes());
     }
 }

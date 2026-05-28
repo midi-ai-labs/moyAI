@@ -54,6 +54,7 @@ Python のテキスト入出力は UTF-8 前提で扱ってください。
 ## 記録すべき証跡
 
 - `route_manifest.json`
+- `case_progress.json`
 - `verification_command_log.json`
 - `workspace_diff_manifest.json`
 - `run.jsonl`

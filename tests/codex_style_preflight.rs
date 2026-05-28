@@ -43,6 +43,7 @@ fn preflight_artifact_cli_requires_route_level_evidence() {
 
     for artifact in [
         "route_manifest.json",
+        "case_progress.json",
         "verification_command_log.json",
         "workspace_diff_manifest.json",
         "result.json",

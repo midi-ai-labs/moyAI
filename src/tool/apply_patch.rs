@@ -35,7 +35,7 @@ impl Tool for ApplyPatchTool {
                 "properties": {
                     "patch_text": {
                         "type": "string",
-                        "description": "Entire patch text. Must start with `*** Begin Patch` and end with `*** End Patch`. For new files, use `*** Add File: path` and prefix every added line with `+`. Do not use unified diff markers like `---` or `+++`."
+                        "description": "Entire patch text. Must start with `*** Begin Patch` and end with `*** End Patch`. For new files, use `*** Add File: path` and prefix every added line with `+`, including blank lines and top-level def/class/import lines. Do not use unified diff markers like `---` or `+++`."
                     }
                 }
             }),
@@ -56,8 +56,7 @@ impl Tool for ApplyPatchTool {
         for operation in operations {
             match &operation {
                 PatchOperation::Add { path, .. } => {
-                    let guarded =
-                        PathGuard::require_path(ctx.workspace, path, AccessKind::Edit, true)?;
+                    let guarded = PathGuard::require_path(ctx.workspace, path, AccessKind::Edit)?;
                     ctx.confirm_if_needed(
                         AccessKind::Edit,
                         format!("Apply patch to {}", guarded.absolute),
@@ -76,12 +75,11 @@ impl Tool for ApplyPatchTool {
                     changes.push(change);
                 }
                 PatchOperation::Update { path, move_to, .. } => {
-                    let guarded =
-                        PathGuard::require_path(ctx.workspace, path, AccessKind::Edit, true)?;
+                    let guarded = PathGuard::require_path(ctx.workspace, path, AccessKind::Edit)?;
                     let move_guard = move_to
                         .as_ref()
                         .map(|target| {
-                            PathGuard::require_path(ctx.workspace, target, AccessKind::Edit, true)
+                            PathGuard::require_path(ctx.workspace, target, AccessKind::Edit)
                         })
                         .transpose()?;
                     let mut targets = vec![guarded.absolute.clone()];
@@ -119,8 +117,7 @@ impl Tool for ApplyPatchTool {
                     changes.push(change);
                 }
                 PatchOperation::Delete { path } => {
-                    let guarded =
-                        PathGuard::require_path(ctx.workspace, path, AccessKind::Edit, true)?;
+                    let guarded = PathGuard::require_path(ctx.workspace, path, AccessKind::Edit)?;
                     ctx.confirm_if_needed(
                         AccessKind::Edit,
                         format!("Delete {}", guarded.absolute),
@@ -179,7 +176,7 @@ impl Tool for ApplyPatchTool {
 
 fn guided_patch_error(error: crate::error::PatchError) -> ToolError {
     ToolError::Patch(crate::error::PatchError::Message(format!(
-        "{error}. Use the exact apply_patch grammar, for example:\n*** Begin Patch\n*** Add File: notes.txt\n+hello\n*** End Patch\nIf the target file already exists, switch to `*** Update File: path` instead of `*** Add File`."
+        "{error}. Use the exact apply_patch grammar. Add File body lines must start with `+`, including blank lines and top-level def/class/import lines. Update File hunks must use `@@` and every hunk line must start with ` `, `+`, or `-`; to replace an entire existing file, send a single Update File hunk whose new file lines all start with `+`.\nExample:\n*** Begin Patch\n*** Add File: notes.txt\n+hello\n+\n+def example():\n+    return hello\n*** End Patch\nIf the target file already exists, switch to `*** Update File: path` with valid hunk lines instead of `*** Add File`."
     )))
 }
 
@@ -452,7 +449,7 @@ fn starts_with_indentation(line: &str) -> bool {
 }
 
 pub(crate) fn destructive_noop_patch_is_rejected_fixture_passes() -> bool {
-    let original = "# CLI 電卓 設計文書\n\n## 概要\n\n四則演算を行う。\n\n## 関数仕様\n\n- add\n- subtract\n- multiply\n- divide\n- power\n- modulo\n";
+    let original = "# Component Design\n\n## Overview\n\nDefines a generated component.\n\n## Public API\n\n- create\n- update\n- delete\n- render\n- validate\n- serialize\n";
     let updated = "--- Content is already up to date ---\n";
     let hunks = vec![PatchChunk {
         old_start: 0,
@@ -463,7 +460,7 @@ pub(crate) fn destructive_noop_patch_is_rejected_fixture_passes() -> bool {
             "--- Content is already up to date ---".to_string(),
         )],
     }];
-    let path = Utf8Path::new("docs/calculator-design.md");
+    let path = Utf8Path::new("docs/component-design.md");
     let message =
         suspicious_full_rewrite_message(original, updated, &hunks, path).unwrap_or_default();
     message.contains("no-op acknowledgement")
@@ -475,13 +472,13 @@ pub(crate) fn destructive_noop_patch_is_rejected_fixture_passes() -> bool {
 }
 
 pub(crate) fn empty_or_zero_diff_patch_is_rejected_fixture_passes() -> bool {
-    let empty_update = "*** Begin Patch\n*** Update File: docs/calculator-design.md\n*** Update File: docs/calculator-design.md\n*** End Patch";
+    let empty_update = "*** Begin Patch\n*** Update File: docs/component-design.md\n*** Update File: docs/component-design.md\n*** End Patch";
     let empty_rejected = PatchParser::parse(empty_update).err().is_some_and(|error| {
         error
             .to_string()
             .contains("must include at least one hunk line")
     });
-    let path = Utf8Path::new("docs/calculator-design.md");
+    let path = Utf8Path::new("docs/component-design.md");
     empty_rejected
         && no_content_patch_message(path).contains("made no content changes")
         && no_content_patch_message(path).contains("cannot satisfy active authoring")
@@ -489,17 +486,17 @@ pub(crate) fn empty_or_zero_diff_patch_is_rejected_fixture_passes() -> bool {
 
 pub(crate) fn hunkless_update_patch_is_rejected_fixture_passes() -> bool {
     let hunkless_update =
-        "*** Begin Patch\n*** Update File: docs/calculator-design.md\n\n*** End Patch";
+        "*** Begin Patch\n*** Update File: docs/component-design.md\n\n*** End Patch";
     let hunkless_rejected = PatchParser::parse(hunkless_update)
         .err()
         .is_some_and(|error| {
-            error
-                .to_string()
-                .contains("must include at least one hunk line")
+            let message = error.to_string();
+            message.contains("must include at least one hunk line")
+                || message.contains("unexpected patch hunk line")
         });
 
     let explicit_empty_hunk =
-        "*** Begin Patch\n*** Update File: docs/calculator-design.md\n@@ -1,1 +1,1\n*** End Patch";
+        "*** Begin Patch\n*** Update File: docs/component-design.md\n@@ -1,1 +1,1\n*** End Patch";
     let empty_hunk_rejected = PatchParser::parse(explicit_empty_hunk)
         .err()
         .is_some_and(|error| {
@@ -511,6 +508,29 @@ pub(crate) fn hunkless_update_patch_is_rejected_fixture_passes() -> bool {
     hunkless_rejected && empty_hunk_rejected
 }
 
+pub(crate) fn markdown_update_body_without_diff_prefix_is_rejected_fixture_passes() -> bool {
+    let bare_markdown_update = "*** Begin Patch\n*** Update File: docs/component-design.md\n# Component Design\n\n- API: create\n- Behavior: update\n*** End Patch";
+    PatchParser::parse(bare_markdown_update)
+        .err()
+        .is_some_and(|error| {
+            let message = error.to_string();
+            message.contains("unexpected patch hunk line")
+                || message.contains("Every update hunk line must start")
+                || message.contains("Expected update hunk")
+        })
+}
+
+pub(crate) fn add_file_unprefixed_content_line_feedback_names_line_fixture_passes() -> bool {
+    let add_file_with_unprefixed_function = "*** Begin Patch\n*** Add File: source.py\n+\"\"\"module\"\"\"\ndef build():\n+    return 1\n*** End Patch";
+    PatchParser::parse(add_file_with_unprefixed_function)
+        .err()
+        .is_some_and(|error| {
+            let message = error.to_string();
+            message.contains("add file body line `def build():` must start with `+`")
+                && message.contains("including blank lines")
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,5 +538,15 @@ mod tests {
     #[test]
     fn hunkless_update_patch_is_rejected_before_apply() {
         assert!(hunkless_update_patch_is_rejected_fixture_passes());
+    }
+
+    #[test]
+    fn markdown_update_body_without_diff_prefix_is_rejected_before_apply() {
+        assert!(markdown_update_body_without_diff_prefix_is_rejected_fixture_passes());
+    }
+
+    #[test]
+    fn add_file_unprefixed_content_line_feedback_names_line() {
+        assert!(add_file_unprefixed_content_line_feedback_names_line_fixture_passes());
     }
 }

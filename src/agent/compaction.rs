@@ -104,9 +104,12 @@ pub async fn maybe_compact(
         ),
         text => text.to_string(),
     };
+    let summary_text =
+        compaction_summary_with_continuity(summary_text, split_index, &continuation_block);
 
-    let message = session_repo
-        .append_message(
+    let continuation = compaction_continuation_contract(request, todos);
+    let (_message, compaction_event) = session_repo
+        .append_message_with_parts_and_protocol_event(
             NewMessage {
                 session_id: request.session.session.id,
                 parent_message_id: Some(request.user_message_id),
@@ -125,16 +128,18 @@ pub async fn maybe_compact(
                     text: summary_text.clone(),
                 }),
             }],
+            |message_id| crate::session::RunEvent::CompactionCompleted {
+                message_id,
+                summarized_messages: split_index,
+                summary: summary_text.clone(),
+                continuation,
+            },
+            request.protocol_turn_id,
+            sink.reserve_protocol_sequence_no(),
         )
         .await?;
 
-    let continuation = compaction_continuation_contract(request, todos);
-    sink.emit(crate::session::RunEvent::CompactionCompleted {
-        message_id: message.id,
-        summarized_messages: split_index,
-        summary: summary_text.clone(),
-        continuation,
-    })?;
+    sink.emit_pre_recorded(compaction_event)?;
     persist_compaction_token_accounting(session_repo, request, &summary_text, sink).await?;
 
     Ok(true)
@@ -153,13 +158,20 @@ async fn persist_compaction_token_accounting(
         estimated_tokens,
         TokenAccountingSource::CompactionRecomputed,
     );
-    session_repo
-        .update_state(request.session.session.id, &state)
-        .await?;
-    sink.emit(crate::session::RunEvent::StateUpdated {
+    let event = crate::session::RunEvent::StateUpdated {
         session_id: request.session.session.id,
-        state,
-    })?;
+        state: state.clone(),
+    };
+    session_repo
+        .update_state_with_protocol_event(
+            request.session.session.id,
+            &state,
+            &event,
+            request.protocol_turn_id,
+            sink.reserve_protocol_sequence_no(),
+        )
+        .await?;
+    sink.emit_pre_recorded(event)?;
     Ok(())
 }
 
@@ -392,6 +404,19 @@ pub(crate) fn compaction_trigger_ignores_pre_summary_history_fixture_passes() ->
         && auto_compact_token_limit(131_072) == Some(117_964)
 }
 
+pub(crate) fn llm_summary_text_is_wrapped_with_typed_continuity_fixture_passes() -> bool {
+    let summary = compaction_summary_with_continuity(
+        "Older work was summarized.".to_string(),
+        12,
+        "Route: code\nPhase: repair\nTargets: component.py",
+    );
+    summary.contains("Summarized history items: 12")
+        && summary.contains("CompactionContinuity")
+        && summary.contains("Continuation focus:")
+        && summary.contains("Phase: repair")
+        && summary.contains("Older work was summarized.")
+}
+
 fn clip_compaction_text(text: &str, limit: usize) -> String {
     let normalized = text.trim().replace('\t', " ");
     if normalized.len() <= limit {
@@ -504,6 +529,32 @@ fn deterministic_compaction_summary(
     )
 }
 
+pub(crate) fn compaction_summary_with_continuity(
+    summary_text: String,
+    summarized_messages: usize,
+    continuation_block: &str,
+) -> String {
+    let trimmed = summary_text.trim();
+    let has_continuity = trimmed.contains("CompactionContinuity");
+    let has_focus = trimmed.contains("Continuation focus:");
+    if has_continuity && has_focus {
+        return trimmed.to_string();
+    }
+    let mut lines = vec![
+        format!("Summarized history items: {summarized_messages}."),
+        "Continuation invariant: CompactionContinuity.".to_string(),
+        "Continuation focus:".to_string(),
+        continuation_block.trim().to_string(),
+        "Compacted summary:".to_string(),
+    ];
+    if trimmed.is_empty() {
+        lines.push("No model summary text was returned.".to_string());
+    } else {
+        lines.push(trimmed.to_string());
+    }
+    lines.join("\n")
+}
+
 fn compaction_message_excerpt(message: &ModelMessage) -> String {
     match message {
         ModelMessage::System { content } => {
@@ -590,7 +641,6 @@ fn compaction_continuation_contract(
             .as_ref()
             .map(|_| "typed_continuation".to_string()),
         active_work_summary,
-        required_next_action: None,
         target_files,
         verification_commands,
         failure_kind: request
@@ -775,5 +825,10 @@ mod tests {
         assert!(summary.contains("CompactionContinuity"));
         assert!(summary.contains("user: 1+1"));
         assert!(summary.contains("assistant: 2"));
+    }
+
+    #[test]
+    fn llm_summary_text_is_wrapped_with_typed_continuity() {
+        assert!(llm_summary_text_is_wrapped_with_typed_continuity_fixture_passes());
     }
 }

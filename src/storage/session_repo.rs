@@ -1,16 +1,22 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use camino::Utf8Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::StorageError;
+use crate::protocol::{
+    ToolProgressEffect, TurnId, UserTurn, VerificationRunResult, VerificationRunStatus,
+    project_protocol_run_event,
+};
 use crate::runtime::{Clock, SystemClock};
 use crate::session::{
-    CompletionState, FailureKind, FailureState, MessageId, MessageMetadata, MessageRecord,
-    MessageRole, NewMessage, NewPart, NewSession, PartKind, PartRecord, ProcessPhase, SessionId,
-    SessionRecord, SessionRepository, SessionStateSnapshot, SessionStatus, TaskRoute, TodoItem,
-    TodoKind, TodoPriority, TodoStatus, ToolCallId, ToolCallRecord, ToolCallStatus, Transcript,
-    TranscriptMessage, VerificationState,
+    CompletionState, FailureKind, FailureState, MessageId, MessageMetadata, MessagePart,
+    MessageRecord, MessageRole, NewMessage, NewPart, NewSession, PartKind, PartRecord,
+    ProcessPhase, ProjectRepository, RunEvent, SessionId, SessionRecord, SessionRepository,
+    SessionStateSnapshot, SessionStatus, TaskRoute, TextPart, TodoItem, TodoKind, TodoPriority,
+    TodoStatus, ToolCallId, ToolCallPart, ToolCallRecord, ToolCallStatus, ToolResultPart,
+    Transcript, TranscriptMessage, VerificationState,
 };
 
 #[derive(Clone)]
@@ -156,6 +162,590 @@ impl SqliteSessionRepository {
             "UPDATE messages SET metadata_json = ?2 WHERE id = ?1",
             params![message_id.to_string(), serde_json::to_string(metadata)?],
         )?;
+        Ok(())
+    }
+
+    pub async fn append_user_message_with_protocol_bundle(
+        &self,
+        draft: NewMessage,
+        parts: Vec<NewPart>,
+        initial_state: &SessionStateSnapshot,
+        turn: &UserTurn,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: i64,
+    ) -> Result<MessageRecord, StorageError> {
+        let id = MessageId::new();
+        let now = SystemClock.now_ms();
+        let metadata_json = serde_json::to_string(&draft.metadata)?;
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let sequence_no = next_message_sequence_in_transaction(&transaction, draft.session_id)?;
+
+        transaction.execute(
+            "DELETE FROM session_todos WHERE session_id = ?1",
+            params![draft.session_id.to_string()],
+        )?;
+        upsert_session_state_row(&transaction, draft.session_id, initial_state, now)?;
+        transaction.execute(
+            "INSERT INTO messages (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id.to_string(),
+                draft.session_id.to_string(),
+                draft.parent_message_id.map(|value| value.to_string()),
+                match draft.role {
+                    MessageRole::User => "user",
+                    MessageRole::Assistant => "assistant",
+                },
+                sequence_no,
+                metadata_json,
+                now
+            ],
+        )?;
+        for (part_sequence_no, part) in parts.into_iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO message_parts (id, message_id, sequence_no, part_kind, payload_json, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    crate::session::PartId::new().to_string(),
+                    id.to_string(),
+                    part_sequence_no as i64,
+                    part_kind_text(part.kind),
+                    serde_json::to_string(&part.payload)?,
+                    now
+                ],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE sessions SET status = 'running', updated_at_ms = ?2, completed_at_ms = NULL WHERE id = ?1",
+            params![draft.session_id.to_string(), now],
+        )?;
+
+        let run_event = crate::session::RunEvent::UserTurnStored {
+            session_id: draft.session_id,
+            message_id: id,
+            turn: Box::new(turn.clone()),
+        };
+        let projection = project_protocol_run_event(
+            &run_event,
+            Some(draft.session_id),
+            protocol_turn_id,
+            protocol_sequence_no,
+        )
+        .ok_or_else(|| {
+            StorageError::Message("UserTurnStored did not produce protocol projection".to_string())
+        })?;
+        crate::protocol::insert_event_bundle_in_transaction(
+            &transaction,
+            &projection.runtime_event,
+            projection.history_item.as_ref(),
+            projection.turn_item.as_ref(),
+        )?;
+        transaction.commit()?;
+
+        Ok(MessageRecord {
+            id,
+            session_id: draft.session_id,
+            role: draft.role,
+            parent_message_id: draft.parent_message_id,
+            sequence_no,
+            created_at_ms: now,
+            metadata: draft.metadata,
+        })
+    }
+
+    pub async fn append_assistant_message_with_protocol_start(
+        &self,
+        draft: NewMessage,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+        model: String,
+    ) -> Result<(MessageRecord, RunEvent), StorageError> {
+        let id = MessageId::new();
+        let now = SystemClock.now_ms();
+        let metadata_json = serde_json::to_string(&draft.metadata)?;
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let sequence_no = next_message_sequence_in_transaction(&transaction, draft.session_id)?;
+        transaction.execute(
+            "INSERT INTO messages (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id.to_string(),
+                draft.session_id.to_string(),
+                draft.parent_message_id.map(|value| value.to_string()),
+                match draft.role {
+                    MessageRole::User => "user",
+                    MessageRole::Assistant => "assistant",
+                },
+                sequence_no,
+                metadata_json,
+                now
+            ],
+        )?;
+        let event = RunEvent::AssistantStarted {
+            message_id: id,
+            model,
+        };
+        insert_protocol_projection_if_requested(
+            &transaction,
+            &event,
+            Some(draft.session_id),
+            protocol_turn_id,
+            protocol_sequence_no,
+        )?;
+        transaction.commit()?;
+        Ok((
+            MessageRecord {
+                id,
+                session_id: draft.session_id,
+                role: draft.role,
+                parent_message_id: draft.parent_message_id,
+                sequence_no,
+                created_at_ms: now,
+                metadata: draft.metadata,
+            },
+            event,
+        ))
+    }
+
+    pub async fn append_message_with_parts_and_protocol_event(
+        &self,
+        draft: NewMessage,
+        parts: Vec<NewPart>,
+        event_factory: impl FnOnce(MessageId) -> RunEvent,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<(MessageRecord, RunEvent), StorageError> {
+        let id = MessageId::new();
+        let now = SystemClock.now_ms();
+        let metadata_json = serde_json::to_string(&draft.metadata)?;
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let sequence_no = next_message_sequence_in_transaction(&transaction, draft.session_id)?;
+        transaction.execute(
+            "INSERT INTO messages (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id.to_string(),
+                draft.session_id.to_string(),
+                draft.parent_message_id.map(|value| value.to_string()),
+                match draft.role {
+                    MessageRole::User => "user",
+                    MessageRole::Assistant => "assistant",
+                },
+                sequence_no,
+                metadata_json,
+                now
+            ],
+        )?;
+        for part in parts {
+            insert_part_in_transaction(&transaction, id, part)?;
+        }
+        let event = event_factory(id);
+        insert_protocol_projection_if_requested(
+            &transaction,
+            &event,
+            Some(draft.session_id),
+            protocol_turn_id,
+            protocol_sequence_no,
+        )?;
+        transaction.commit()?;
+        Ok((
+            MessageRecord {
+                id,
+                session_id: draft.session_id,
+                role: draft.role,
+                parent_message_id: draft.parent_message_id,
+                sequence_no,
+                created_at_ms: now,
+                metadata: draft.metadata,
+            },
+            event,
+        ))
+    }
+
+    pub async fn append_part_with_protocol_bundle(
+        &self,
+        session_id: SessionId,
+        message_id: MessageId,
+        part: NewPart,
+        event: &RunEvent,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<PartRecord, StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let record = insert_part_in_transaction(&transaction, message_id, part)?;
+        insert_protocol_projection_if_requested(
+            &transaction,
+            event,
+            Some(session_id),
+            protocol_turn_id,
+            protocol_sequence_no,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub async fn update_state_with_protocol_event(
+        &self,
+        session_id: SessionId,
+        state: &SessionStateSnapshot,
+        event: &RunEvent,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<(), StorageError> {
+        let now = SystemClock.now_ms();
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        upsert_session_state_row(&transaction, session_id, state, now)?;
+        insert_protocol_projection_if_requested(
+            &transaction,
+            event,
+            Some(session_id),
+            protocol_turn_id,
+            protocol_sequence_no,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub async fn update_session_title_with_protocol_event(
+        &self,
+        session_id: SessionId,
+        title: &str,
+        event: &RunEvent,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<(), StorageError> {
+        let now = SystemClock.now_ms();
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE sessions SET title = ?2, updated_at_ms = ?3 WHERE id = ?1",
+            params![session_id.to_string(), title, now],
+        )?;
+        insert_protocol_projection_if_requested(
+            &transaction,
+            event,
+            Some(session_id),
+            protocol_turn_id,
+            protocol_sequence_no,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub async fn set_status_with_protocol_event(
+        &self,
+        session_id: SessionId,
+        status: SessionStatus,
+        event: &RunEvent,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<(), StorageError> {
+        let now = SystemClock.now_ms();
+        let status_text = match status {
+            SessionStatus::Idle => "idle",
+            SessionStatus::Running => "running",
+            SessionStatus::Completed => "completed",
+            SessionStatus::AwaitingUser => "awaiting_user",
+            SessionStatus::Cancelled => "cancelled",
+            SessionStatus::Failed => "failed",
+        };
+        let completed_at_ms = if matches!(
+            status,
+            SessionStatus::Completed
+                | SessionStatus::AwaitingUser
+                | SessionStatus::Cancelled
+                | SessionStatus::Failed
+        ) {
+            Some(now)
+        } else {
+            None
+        };
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE sessions SET status = ?2, updated_at_ms = ?3, completed_at_ms = ?4 WHERE id = ?1",
+            params![session_id.to_string(), status_text, now, completed_at_ms],
+        )?;
+        insert_protocol_projection_if_requested(
+            &transaction,
+            event,
+            Some(session_id),
+            protocol_turn_id,
+            protocol_sequence_no,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub async fn record_pending_tool_call_with_protocol_bundle(
+        &self,
+        session_id: SessionId,
+        message_id: MessageId,
+        tool_name: &str,
+        arguments_json: &str,
+        title: Option<&str>,
+        metadata_json: serde_json::Value,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<(ToolCallRecord, RunEvent), StorageError> {
+        let id = ToolCallId::new();
+        let started_at_ms = SystemClock::now_ms();
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO tool_calls (id, session_id, message_id, tool_name, status, arguments_json, title, metadata_json, output_text, truncated_output_path, error_text, started_at_ms, finished_at_ms)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, NULL, NULL, NULL, ?8, NULL)",
+            params![
+                id.to_string(),
+                session_id.to_string(),
+                message_id.to_string(),
+                tool_name,
+                arguments_json,
+                title,
+                serde_json::to_string(&metadata_json)?,
+                started_at_ms
+            ],
+        )?;
+        let parsed_tool_name = parse_tool_name(tool_name);
+        let event = RunEvent::ToolCallPending {
+            tool_call_id: id,
+            tool: parsed_tool_name,
+            title: title.unwrap_or(tool_name).to_string(),
+            metadata: metadata_json.clone(),
+        };
+        insert_protocol_projection_if_requested(
+            &transaction,
+            &event,
+            Some(session_id),
+            protocol_turn_id,
+            protocol_sequence_no,
+        )?;
+        insert_part_in_transaction(
+            &transaction,
+            message_id,
+            NewPart {
+                kind: PartKind::ToolCall,
+                payload: MessagePart::ToolCall(ToolCallPart {
+                    tool_call_id: id,
+                    tool_name: parsed_tool_name,
+                    arguments_json: arguments_json.to_string(),
+                    model_arguments_json: metadata_json
+                        .get("tool_route")
+                        .and_then(|route| route.get("original_arguments_json"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string),
+                    effective_arguments_json: Some(arguments_json.to_string()),
+                }),
+            },
+        )?;
+        transaction.commit()?;
+        Ok((
+            ToolCallRecord {
+                id,
+                session_id,
+                message_id,
+                tool_name: parsed_tool_name,
+                status: ToolCallStatus::Pending,
+                arguments_json: arguments_json.to_string(),
+                title: title.map(|value| value.to_string()),
+                metadata_json,
+                output_text: None,
+                truncated_output_path: None,
+                error_text: None,
+                started_at_ms,
+                finished_at_ms: None,
+            },
+            event,
+        ))
+    }
+
+    pub async fn complete_tool_call_with_protocol_bundle(
+        &self,
+        session_id: SessionId,
+        message_id: MessageId,
+        tool_call_id: ToolCallId,
+        tool_name: crate::tool::ToolName,
+        title: &str,
+        metadata_json: serde_json::Value,
+        output_text: &str,
+        truncated_output_path: Option<&camino::Utf8Path>,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<RunEvent, StorageError> {
+        let finished_at_ms = SystemClock::now_ms();
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE tool_calls
+             SET status = 'completed',
+                 title = ?2,
+                 metadata_json = ?3,
+                 output_text = ?4,
+                 truncated_output_path = ?5,
+                 error_text = NULL,
+                 finished_at_ms = ?6
+             WHERE id = ?1",
+            params![
+                tool_call_id.to_string(),
+                title,
+                serde_json::to_string(&metadata_json)?,
+                output_text,
+                truncated_output_path.map(|value| value.as_str()),
+                finished_at_ms
+            ],
+        )?;
+        let event = RunEvent::ToolCallCompleted {
+            tool_call_id,
+            tool: tool_name,
+            title: title.to_string(),
+            summary: output_text.to_string(),
+            metadata: metadata_json.clone(),
+        };
+        insert_protocol_projection_if_requested(
+            &transaction,
+            &event,
+            Some(session_id),
+            protocol_turn_id,
+            protocol_sequence_no,
+        )?;
+        insert_part_in_transaction(
+            &transaction,
+            message_id,
+            NewPart {
+                kind: PartKind::ToolResult,
+                payload: MessagePart::ToolResult(ToolResultPart {
+                    tool_call_id,
+                    status: ToolCallStatus::Completed,
+                    title: title.to_string(),
+                    summary: output_text.to_string(),
+                    success: tool_success_from_metadata(&metadata_json),
+                    progress_effect: tool_progress_effect_from_metadata(&metadata_json),
+                    blocked_action: metadata_string(&metadata_json, &["blocked_action"]),
+                    result_hash: metadata_string(
+                        &metadata_json,
+                        &["tool_feedback_envelope", "result_hash"],
+                    )
+                    .or_else(|| metadata_string(&metadata_json, &["result_hash"])),
+                }),
+            },
+        )?;
+        transaction.commit()?;
+        Ok(event)
+    }
+
+    pub async fn fail_tool_call_with_protocol_bundle(
+        &self,
+        session_id: SessionId,
+        message_id: MessageId,
+        tool_call_id: ToolCallId,
+        tool_name: crate::tool::ToolName,
+        error_text: &str,
+        metadata_json: serde_json::Value,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<RunEvent, StorageError> {
+        let finished_at_ms = SystemClock::now_ms();
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE tool_calls
+             SET status = 'failed',
+                 error_text = ?2,
+                 finished_at_ms = ?3
+             WHERE id = ?1",
+            params![tool_call_id.to_string(), error_text, finished_at_ms],
+        )?;
+        let event = RunEvent::ToolCallFailed {
+            tool_call_id,
+            tool: tool_name,
+            error: error_text.to_string(),
+            metadata: metadata_json.clone(),
+        };
+        insert_protocol_projection_if_requested(
+            &transaction,
+            &event,
+            Some(session_id),
+            protocol_turn_id,
+            protocol_sequence_no,
+        )?;
+        insert_part_in_transaction(
+            &transaction,
+            message_id,
+            NewPart {
+                kind: PartKind::ToolResult,
+                payload: MessagePart::ToolResult(ToolResultPart {
+                    tool_call_id,
+                    status: ToolCallStatus::Failed,
+                    title: "Tool failed".to_string(),
+                    summary: error_text.to_string(),
+                    success: Some(false),
+                    progress_effect: ToolProgressEffect::Blocked,
+                    blocked_action: metadata_string(&metadata_json, &["blocked_action"]),
+                    result_hash: metadata_string(
+                        &metadata_json,
+                        &["tool_feedback_envelope", "result_hash"],
+                    )
+                    .or_else(|| metadata_string(&metadata_json, &["result_hash"])),
+                }),
+            },
+        )?;
+        transaction.commit()?;
+        Ok(event)
+    }
+
+    pub async fn update_message_metadata_and_status_with_protocol_event(
+        &self,
+        session_id: SessionId,
+        message_id: MessageId,
+        metadata: &MessageMetadata,
+        status: SessionStatus,
+        event: &RunEvent,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<(), StorageError> {
+        let now = SystemClock.now_ms();
+        let status_text = match status {
+            SessionStatus::Idle => "idle",
+            SessionStatus::Running => "running",
+            SessionStatus::Completed => "completed",
+            SessionStatus::AwaitingUser => "awaiting_user",
+            SessionStatus::Cancelled => "cancelled",
+            SessionStatus::Failed => "failed",
+        };
+        let completed_at_ms = if matches!(
+            status,
+            SessionStatus::Completed
+                | SessionStatus::AwaitingUser
+                | SessionStatus::Cancelled
+                | SessionStatus::Failed
+        ) {
+            Some(now)
+        } else {
+            None
+        };
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE messages SET metadata_json = ?2 WHERE id = ?1",
+            params![message_id.to_string(), serde_json::to_string(metadata)?],
+        )?;
+        transaction.execute(
+            "UPDATE sessions SET status = ?2, updated_at_ms = ?3, completed_at_ms = ?4 WHERE id = ?1",
+            params![session_id.to_string(), status_text, now, completed_at_ms],
+        )?;
+        insert_protocol_projection_if_requested(
+            &transaction,
+            event,
+            Some(session_id),
+            protocol_turn_id,
+            protocol_sequence_no,
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 }
@@ -423,10 +1013,11 @@ impl SessionRepository for SqliteSessionRepository {
     ) -> Result<MessageRecord, StorageError> {
         let id = MessageId::new();
         let now = SystemClock.now_ms();
-        let sequence_no = next_message_sequence(&self.connection, draft.session_id)?;
         let metadata_json = serde_json::to_string(&draft.metadata)?;
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let sequence_no = next_message_sequence_in_transaction(&transaction, draft.session_id)?;
+        transaction.execute(
             "INSERT INTO messages (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -442,9 +1033,12 @@ impl SessionRepository for SqliteSessionRepository {
                 now
             ],
         )?;
-        drop(connection);
+        for part in parts {
+            insert_part_in_transaction(&transaction, id, part)?;
+        }
+        transaction.commit()?;
 
-        let record = MessageRecord {
+        Ok(MessageRecord {
             id,
             session_id: draft.session_id,
             role: draft.role,
@@ -452,13 +1046,7 @@ impl SessionRepository for SqliteSessionRepository {
             sequence_no,
             created_at_ms: now,
             metadata: draft.metadata,
-        };
-
-        for part in parts {
-            self.append_part(id, part).await?;
-        }
-
-        Ok(record)
+        })
     }
 
     async fn append_part(
@@ -922,12 +1510,11 @@ fn part_kind_text(value: PartKind) -> &'static str {
     }
 }
 
-fn next_message_sequence(
-    connection: &Arc<Mutex<Connection>>,
+fn next_message_sequence_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
     session_id: SessionId,
 ) -> Result<i64, StorageError> {
-    let connection = connection.lock().expect("sqlite mutex poisoned");
-    let value: Option<i64> = connection.query_row(
+    let value: Option<i64> = transaction.query_row(
         "SELECT MAX(sequence_no) FROM messages WHERE session_id = ?1",
         params![session_id.to_string()],
         |row| row.get::<_, Option<i64>>(0),
@@ -946,6 +1533,136 @@ fn next_part_sequence(
         |row| row.get::<_, Option<i64>>(0),
     )?;
     Ok(value.unwrap_or(0) + 1)
+}
+
+fn next_part_sequence_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    message_id: MessageId,
+) -> Result<i64, StorageError> {
+    let value: Option<i64> = transaction.query_row(
+        "SELECT MAX(sequence_no) FROM message_parts WHERE message_id = ?1",
+        params![message_id.to_string()],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    Ok(value.unwrap_or(0) + 1)
+}
+
+fn insert_part_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    message_id: MessageId,
+    part: NewPart,
+) -> Result<PartRecord, StorageError> {
+    let id = crate::session::PartId::new();
+    let now = SystemClock.now_ms();
+    let sequence_no = next_part_sequence_in_transaction(transaction, message_id)?;
+    transaction.execute(
+        "INSERT INTO message_parts (id, message_id, sequence_no, part_kind, payload_json, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            id.to_string(),
+            message_id.to_string(),
+            sequence_no,
+            part_kind_text(part.kind),
+            serde_json::to_string(&part.payload)?,
+            now
+        ],
+    )?;
+    Ok(PartRecord {
+        id,
+        message_id,
+        sequence_no,
+        kind: part.kind,
+        payload: part.payload,
+    })
+}
+
+fn insert_protocol_projection_if_requested(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &RunEvent,
+    fallback_session_id: Option<SessionId>,
+    protocol_turn_id: TurnId,
+    protocol_sequence_no: Option<i64>,
+) -> Result<(), StorageError> {
+    let Some(protocol_sequence_no) = protocol_sequence_no else {
+        return Ok(());
+    };
+    let Some(projection) = project_protocol_run_event(
+        event,
+        fallback_session_id,
+        protocol_turn_id,
+        protocol_sequence_no,
+    ) else {
+        return Ok(());
+    };
+    crate::protocol::insert_event_bundle_in_transaction(
+        transaction,
+        &projection.runtime_event,
+        projection.history_item.as_ref(),
+        projection.turn_item.as_ref(),
+    )
+}
+
+fn tool_success_from_metadata(metadata: &serde_json::Value) -> Option<bool> {
+    if let Some(success) = metadata
+        .get("success")
+        .or_else(|| {
+            metadata
+                .get("tool_feedback_envelope")
+                .and_then(|feedback| feedback.get("success"))
+        })
+        .and_then(serde_json::Value::as_bool)
+    {
+        return Some(success);
+    }
+    if let Some(run) = metadata
+        .get("verification_run_result")
+        .and_then(|value| serde_json::from_value::<VerificationRunResult>(value.clone()).ok())
+    {
+        return Some(matches!(run.status, VerificationRunStatus::Passed));
+    }
+    Some(!matches!(
+        tool_progress_effect_from_metadata(metadata),
+        ToolProgressEffect::NoProgress
+            | ToolProgressEffect::Blocked
+            | ToolProgressEffect::VerificationFailed
+    ))
+}
+
+fn tool_progress_effect_from_metadata(metadata: &serde_json::Value) -> ToolProgressEffect {
+    if let Some(run) = metadata
+        .get("verification_run_result")
+        .and_then(|value| serde_json::from_value::<VerificationRunResult>(value.clone()).ok())
+    {
+        return match run.status {
+            VerificationRunStatus::Passed => ToolProgressEffect::VerificationPassed,
+            VerificationRunStatus::Failed | VerificationRunStatus::TimedOut => {
+                ToolProgressEffect::VerificationFailed
+            }
+            VerificationRunStatus::NotVerification => ToolProgressEffect::Unknown,
+        };
+    }
+    metadata
+        .get("tool_feedback_envelope")
+        .and_then(|feedback| feedback.get("progress_effect"))
+        .or_else(|| metadata.get("progress_effect"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| match value {
+            "made_progress" | "progress" => ToolProgressEffect::MadeProgress,
+            "no_progress" => ToolProgressEffect::NoProgress,
+            "blocked" => ToolProgressEffect::Blocked,
+            "verification_passed" => ToolProgressEffect::VerificationPassed,
+            "verification_failed" => ToolProgressEffect::VerificationFailed,
+            _ => ToolProgressEffect::Unknown,
+        })
+        .unwrap_or(ToolProgressEffect::Unknown)
+}
+
+fn metadata_string(metadata: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut value = metadata;
+    for key in path {
+        value = value.get(*key)?;
+    }
+    value.as_str().map(ToString::to_string)
 }
 
 fn upsert_session_state_row(
@@ -1231,11 +1948,127 @@ fn todo_priority_text(value: TodoPriority) -> &'static str {
     }
 }
 
+pub(crate) fn append_message_with_parts_uses_single_unit_of_work_fixture_passes() -> bool {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::Builder::new()
+            .name("moyai-append-message-unit-fixture".to_string())
+            .spawn(append_message_with_parts_uses_single_unit_of_work_fixture_inner)
+            .ok()
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or(false);
+    }
+    append_message_with_parts_uses_single_unit_of_work_fixture_inner()
+}
+
+fn append_message_with_parts_uses_single_unit_of_work_fixture_inner() -> bool {
+    let temp = match tempfile::tempdir() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let Some(data_dir) = Utf8Path::from_path(temp.path()) else {
+        return false;
+    };
+    let paths = crate::storage::StoragePaths {
+        data_dir: data_dir.to_path_buf(),
+        database_path: data_dir.join("moyai.sqlite3"),
+        truncation_dir: data_dir.join("truncation"),
+    };
+    let store = match crate::storage::SqliteStore::open(&paths) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if store.migrate().is_err() {
+        return false;
+    }
+    let project_repo = store.project_repo();
+    let session_repo = store.session_repo();
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+
+    runtime.block_on(async {
+        let project_id = crate::session::ProjectId::new();
+        let root = Utf8Path::new("C:/workspace/persistence-unit");
+        if project_repo
+            .upsert_project(project_id, root, "Persistence Unit", "none")
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let session = match session_repo
+            .create_session(NewSession {
+                project_id,
+                title: "message parts unit".to_string(),
+                cwd: root.to_path_buf(),
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+            })
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let message = match session_repo
+            .append_message(
+                NewMessage {
+                    session_id: session.id,
+                    parent_message_id: None,
+                    role: MessageRole::User,
+                    metadata: MessageMetadata::User(crate::session::UserMessageMeta {
+                        cwd: root.to_path_buf(),
+                        requested_model: None,
+                        editor_context: None,
+                    }),
+                },
+                vec![
+                    NewPart {
+                        kind: PartKind::Text,
+                        payload: MessagePart::Text(TextPart {
+                            text: "first".to_string(),
+                        }),
+                    },
+                    NewPart {
+                        kind: PartKind::Text,
+                        payload: MessagePart::Text(TextPart {
+                            text: "second".to_string(),
+                        }),
+                    },
+                ],
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let transcript = match session_repo.transcript(session.id).await {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let Some(stored) = transcript
+            .messages
+            .iter()
+            .find(|entry| entry.record.id == message.id)
+        else {
+            return false;
+        };
+        stored.parts.len() == 2
+            && stored.parts[0].sequence_no == 1
+            && stored.parts[1].sequence_no == 2
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{ProtocolEventStore, RuntimeEventMsg, TurnId};
     use crate::session::{
-        ProjectId, ProjectRepository, TokenAccountingSource, TokenAccountingState, TokenUsage,
+        AssistantMessageMeta, FinishReason, ProjectId, ProjectRepository, TokenAccountingSource,
+        TokenAccountingState, TokenUsage,
     };
     use crate::storage::{SqliteStore, StoragePaths};
     use camino::Utf8Path;
@@ -1315,6 +2148,128 @@ mod tests {
             assert_eq!(
                 loaded.token_accounting.source,
                 TokenAccountingSource::ProviderReported
+            );
+        });
+    }
+
+    #[test]
+    fn append_message_with_parts_uses_single_unit_of_work() {
+        assert!(super::append_message_with_parts_uses_single_unit_of_work_fixture_passes());
+    }
+
+    #[test]
+    fn assistant_terminal_status_and_protocol_projection_share_one_bundle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = Utf8Path::from_path(temp.path()).expect("utf8 tempdir");
+        let paths = StoragePaths {
+            data_dir: data_dir.to_path_buf(),
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+        };
+        let store = SqliteStore::open(&paths).expect("open sqlite");
+        store.migrate().expect("migrate sqlite");
+        let project_repo = store.project_repo();
+        let session_repo = store.session_repo();
+        let protocol_store = store.protocol_event_store();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let project_id = ProjectId::new();
+            let root = Utf8Path::new("C:/workspace/lifecycle-bundle");
+            project_repo
+                .upsert_project(project_id, root, "Lifecycle Bundle", "none")
+                .await
+                .expect("insert project");
+            let session = session_repo
+                .create_session(NewSession {
+                    project_id,
+                    title: "terminal bundle".to_string(),
+                    cwd: root.to_path_buf(),
+                    model: "model".to_string(),
+                    base_url: "http://localhost:1234".to_string(),
+                })
+                .await
+                .expect("insert session");
+            let turn_id = TurnId::new();
+            let (assistant, start_event) = session_repo
+                .append_assistant_message_with_protocol_start(
+                    NewMessage {
+                        session_id: session.id,
+                        parent_message_id: None,
+                        role: MessageRole::Assistant,
+                        metadata: MessageMetadata::Assistant(AssistantMessageMeta {
+                            model: "model".to_string(),
+                            base_url: "http://localhost:1234".to_string(),
+                            finish_reason: None,
+                            token_usage: None,
+                            summary: false,
+                        }),
+                    },
+                    turn_id,
+                    Some(0),
+                    "model".to_string(),
+                )
+                .await
+                .expect("append assistant start");
+            assert!(matches!(start_event, RunEvent::AssistantStarted { .. }));
+
+            let terminal_event = RunEvent::SessionCompleted {
+                session_id: session.id,
+                finish_reason: Some(FinishReason::Stop),
+            };
+            session_repo
+                .update_message_metadata_and_status_with_protocol_event(
+                    session.id,
+                    assistant.id,
+                    &MessageMetadata::Assistant(AssistantMessageMeta {
+                        model: "model".to_string(),
+                        base_url: "http://localhost:1234".to_string(),
+                        finish_reason: Some(FinishReason::Stop),
+                        token_usage: None,
+                        summary: false,
+                    }),
+                    SessionStatus::Completed,
+                    &terminal_event,
+                    turn_id,
+                    Some(1),
+                )
+                .await
+                .expect("update terminal bundle");
+
+            let stored_session = session_repo.get_session(session.id).await.expect("session");
+            assert_eq!(stored_session.status, SessionStatus::Completed);
+            let transcript = session_repo
+                .transcript(session.id)
+                .await
+                .expect("transcript");
+            let metadata = transcript
+                .messages
+                .iter()
+                .find(|message| message.record.id == assistant.id)
+                .map(|message| message.record.metadata.clone())
+                .expect("assistant message");
+            assert!(matches!(
+                metadata,
+                MessageMetadata::Assistant(AssistantMessageMeta {
+                    finish_reason: Some(FinishReason::Stop),
+                    ..
+                })
+            ));
+            let runtime_events = protocol_store
+                .list_runtime_events(session.id, turn_id)
+                .expect("runtime events");
+            assert!(
+                runtime_events
+                    .iter()
+                    .any(|event| matches!(event.msg, RuntimeEventMsg::AssistantStarted { .. }))
+            );
+            assert!(
+                runtime_events
+                    .iter()
+                    .any(|event| matches!(event.msg, RuntimeEventMsg::TurnCompleted { .. }))
             );
         });
     }

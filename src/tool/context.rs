@@ -42,9 +42,29 @@ impl<'a> ToolContext<'a> {
         outside_workspace: bool,
         risks: Vec<crate::tool::PermissionRisk>,
     ) -> Result<(), ToolError> {
+        self.confirm_if_needed_with_details(
+            access,
+            summary,
+            Vec::new(),
+            targets,
+            outside_workspace,
+            risks,
+        )
+    }
+
+    pub fn confirm_if_needed_with_details(
+        &mut self,
+        access: AccessKind,
+        summary: String,
+        details: Vec<String>,
+        targets: Vec<Utf8PathBuf>,
+        outside_workspace: bool,
+        risks: Vec<crate::tool::PermissionRisk>,
+    ) -> Result<(), ToolError> {
         let request = crate::tool::PermissionRequest {
             access,
             summary,
+            details,
             targets,
             outside_workspace,
             risks,
@@ -68,6 +88,13 @@ fn permission_preset_allows(
     access_mode: AccessMode,
     request: &crate::tool::PermissionRequest,
 ) -> bool {
+    if request
+        .risks
+        .iter()
+        .any(|risk| matches!(risk, crate::tool::PermissionRisk::ExternalConnection))
+    {
+        return false;
+    }
     match access_mode {
         AccessMode::FullAccess => true,
         AccessMode::AutoReview => auto_review_allows(request),

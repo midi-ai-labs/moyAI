@@ -350,6 +350,22 @@ fn insert_runtime_event(
     Ok(())
 }
 
+pub(crate) fn insert_event_bundle_in_transaction(
+    transaction: &Transaction<'_>,
+    event: &RuntimeEvent,
+    history_item: Option<&HistoryItem>,
+    turn_item: Option<&TurnItem>,
+) -> Result<(), StorageError> {
+    insert_runtime_event(transaction, event)?;
+    if let Some(history_item) = history_item {
+        insert_history_item(transaction, history_item)?;
+    }
+    if let Some(turn_item) = turn_item {
+        insert_turn_item(transaction, turn_item)?;
+    }
+    Ok(())
+}
+
 fn insert_history_item(
     connection: &impl ProtocolSqlExecutor,
     item: &HistoryItem,

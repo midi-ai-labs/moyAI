@@ -220,8 +220,27 @@ pub(crate) fn verification_freshness_targets_after_latest_user(
 }
 
 pub(crate) fn verification_command_identity_key(text: &str) -> Option<String> {
-    normalize_verification_command(text)
-        .map(|command| collapse_whitespace(&command).to_ascii_lowercase())
+    verification_command_satisfaction_keys(text)
+        .into_iter()
+        .next()
+}
+
+pub(crate) fn canonical_verification_command_identity_key(text: &str) -> Option<String> {
+    verification_command_identity_key(text).or_else(|| direct_shell_command_identity_key(text))
+}
+
+pub(crate) fn verification_command_satisfaction_keys(text: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    if let Some(command) = normalize_verification_command(text) {
+        keys.insert(collapse_whitespace(&command).to_ascii_lowercase());
+    }
+    for candidate in extract_inline_verification_command_candidates(text) {
+        let normalized = normalize_command_candidate(&candidate);
+        if looks_like_explicit_verification_command(&normalized) {
+            keys.insert(collapse_whitespace(&normalized).to_ascii_lowercase());
+        }
+    }
+    keys
 }
 
 pub(crate) fn latest_verification_repair_cycle(
@@ -977,15 +996,24 @@ fn split_backtick_spans(text: &str) -> Vec<String> {
 
 fn normalize_verification_command(text: &str) -> Option<String> {
     let normalized = normalize_command_candidate(text);
-    looks_like_explicit_verification_command(&normalized).then_some(normalized)
+    if looks_like_explicit_verification_command(&normalized) {
+        return Some(normalized);
+    }
+    extract_inline_verification_command_candidates(text)
+        .into_iter()
+        .map(|candidate| normalize_command_candidate(&candidate))
+        .find(|candidate| looks_like_explicit_verification_command(candidate))
 }
 
 fn extract_inline_verification_commands(line: &str) -> Vec<String> {
+    dedupe_commands(extract_inline_verification_command_candidates(line))
+}
+
+fn extract_inline_verification_command_candidates(line: &str) -> Vec<String> {
     const PREFIXES: &[&str] = &[
         "python -x utf8 -m unittest",
         "python -m py_compile",
         "python -m unittest",
-        "uv run pytest",
         "cargo test",
         "cargo check",
         "cargo build",
@@ -1005,7 +1033,7 @@ fn extract_inline_verification_commands(line: &str) -> Vec<String> {
             search_from = start + prefix.len();
         }
     }
-    dedupe_commands(candidates)
+    candidates
 }
 
 fn inline_command_end_index(text: &str) -> usize {
@@ -1019,6 +1047,7 @@ fn normalize_command_candidate(text: &str) -> String {
         .trim_start_matches(|ch: char| matches!(ch, '-' | '*' | '+' | '•'))
         .trim();
     let collapsed = collapse_whitespace(trimmed);
+    let collapsed = normalize_closed_network_verification_command(&collapsed);
     let collapsed = verification_command_suffix_boundary(&collapsed)
         .map(|index| collapsed[..index].trim().to_string())
         .unwrap_or(collapsed);
@@ -1114,11 +1143,61 @@ fn looks_like_explicit_verification_command(text: &str) -> bool {
         || lower.starts_with("python -x utf8 -m unittest")
         || lower.starts_with("python -m py_compile")
         || lower.starts_with("pytest")
-        || lower.starts_with("uv run pytest")
         || lower.starts_with("cargo test")
         || lower.starts_with("cargo check")
         || lower.starts_with("cargo build")
         || lower.starts_with("go test")
+}
+
+fn direct_shell_command_identity_key(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
+        return None;
+    }
+    let normalized = normalize_command_candidate(trimmed);
+    if !looks_like_direct_shell_verification_command(&normalized) {
+        return None;
+    }
+    Some(collapse_whitespace(&normalized).to_ascii_lowercase())
+}
+
+fn looks_like_direct_shell_verification_command(text: &str) -> bool {
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let Some(program) = tokens.first().map(|token| token.to_ascii_lowercase()) else {
+        return false;
+    };
+    match program.as_str() {
+        "python" | "python3" | "py" => {
+            let mut index = 1usize;
+            while index < tokens.len() {
+                let token = tokens[index].to_ascii_lowercase();
+                if token == "-x" && index + 1 < tokens.len() {
+                    index += 2;
+                    continue;
+                }
+                if token == "-m" {
+                    return false;
+                }
+                break;
+            }
+            tokens[index..]
+                .iter()
+                .any(|token| token.to_ascii_lowercase().ends_with(".py"))
+        }
+        "node" => tokens
+            .iter()
+            .skip(1)
+            .any(|token| token.to_ascii_lowercase().ends_with(".js")),
+        _ => false,
+    }
+}
+
+fn normalize_closed_network_verification_command(text: &str) -> String {
+    let collapsed = collapse_whitespace(text.trim());
+    if collapsed.to_ascii_lowercase().starts_with("uv run pytest") {
+        return collapsed["uv run ".len()..].to_string();
+    }
+    collapsed
 }
 
 fn collapse_whitespace(text: &str) -> String {
@@ -1129,7 +1208,7 @@ fn dedupe_commands(commands: Vec<String>) -> Vec<String> {
     let mut seen = HashMap::new();
     let mut deduped = Vec::new();
     for command in commands {
-        let key = verification_command_identity_key(&command)
+        let key = canonical_verification_command_identity_key(&command)
             .unwrap_or_else(|| collapse_whitespace(&command).to_ascii_lowercase());
         if seen.insert(key, ()).is_none() {
             deduped.push(command);

@@ -14,6 +14,14 @@ pub struct RunEventSubscriber {
 
 pub trait RunEventSink {
     fn emit(&mut self, event: RunEvent) -> Result<(), RuntimeError>;
+
+    fn reserve_protocol_sequence_no(&mut self) -> Option<i64> {
+        None
+    }
+
+    fn emit_pre_recorded(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
+        self.emit(event)
+    }
 }
 
 #[derive(Clone)]

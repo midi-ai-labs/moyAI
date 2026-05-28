@@ -95,6 +95,7 @@ Step4:
 ## 記録すべき証跡
 
 - `route_manifest.json`
+- `case_progress.json`
 - `verification_command_log.json`
 - `workspace_diff_manifest.json`
 - `run.jsonl`
@@ -107,5 +108,5 @@ Step4:
 
 - failure が出た場合は Extended Route D を停止する。Required / other Extended routes は別 route として扱う
 - direct cause と root cause を分け、compaction / continuation / focus drift / verification timing / close-out のどこで破綻したかを記録する
-- 修正は failure class 単位で行い、先に `Roo Code` と `opencode` の該当実装を確認する
+- 修正は failure class 単位で行い、`Codex` の Thread / Turn / Item protocol、compaction / continuation、tool lifecycle、harness engineering を第一比較基準にする。local LLM 起因に切り分けた場合のみ `Roo Code` を補助比較、`opencode` を第三比較基準にする
 - 修正後は fresh copy / fresh data dir で rerun する

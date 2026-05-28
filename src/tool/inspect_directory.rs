@@ -67,7 +67,7 @@ impl Tool for InspectDirectoryTool {
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<InspectDirectoryInput>(raw_arguments)?;
         let requested = input.path.unwrap_or_else(|| Utf8PathBuf::from("."));
-        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::List, true)?;
+        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::List)?;
         ctx.confirm_if_needed(
             AccessKind::List,
             format!("Inspect {}", guarded.absolute),

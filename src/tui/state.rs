@@ -1,5 +1,8 @@
 use crate::edit::ChangeSummary;
-use crate::protocol::{ToolLifecycleStatus, TurnItem, TurnItemPayload, TurnTerminalStatus};
+use crate::protocol::{
+    ToolLifecycleStatus, TurnItem, TurnItemPayload, TurnTerminalStatus,
+    turn_items_in_projection_order,
+};
 use crate::session::{
     DispatchTransformKind, MessageMetadata, MessagePart, MessageRole, PromptDispatchPart, RunEvent,
     RunSummary, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus, TodoItem,
@@ -87,6 +90,7 @@ pub struct ToolStatusView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionOverlayView {
     pub summary: String,
+    pub details: Vec<String>,
     pub targets: Vec<String>,
     pub outside_workspace: bool,
     pub risks: Vec<String>,
@@ -520,8 +524,9 @@ impl AppState {
                 self.progress.current_phase = "control".to_string();
                 self.progress.active_step = envelope
                     .action_authority
-                    .required_next_action
-                    .clone()
+                    .required_action
+                    .as_ref()
+                    .map(|action| action.projection_label().to_string())
                     .unwrap_or_else(|| "Control envelope prepared".to_string());
             }
             RunEvent::ModelRequestPrepared { diagnostics, .. } => {
@@ -568,6 +573,7 @@ impl AppState {
     pub fn set_permission(&mut self, request: &PermissionRequest) {
         self.permission = Some(PermissionOverlayView {
             summary: request.summary.clone(),
+            details: request.details.clone(),
             targets: request
                 .targets
                 .iter()
@@ -948,8 +954,8 @@ pub fn transcript_entries_from_transcript(transcript: &Transcript) -> Vec<Transc
 }
 
 pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<TranscriptEntry> {
-    turn_items
-        .iter()
+    turn_items_in_projection_order(turn_items)
+        .into_iter()
         .filter_map(|item| match &item.payload {
             TurnItemPayload::UserMessage { text } => Some(TranscriptEntry {
                 kind: TranscriptKind::User,
@@ -993,6 +999,7 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
                 tool,
                 title,
                 status,
+                summary,
             } => Some(TranscriptEntry {
                 kind: if *status == ToolLifecycleStatus::Failed {
                     TranscriptKind::Error
@@ -1004,7 +1011,11 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
                     TranscriptKind::Tool
                 },
                 title: tool_status_transcript_title(*tool, *status).to_string(),
-                body: format!("{title} [{status:?}]"),
+                body: if summary.trim().is_empty() {
+                    format!("{title} [{status:?}]")
+                } else {
+                    format!("{title} [{status:?}]\n{}", summary.trim())
+                },
                 message_id: None,
                 tool_call_id: Some(*call_id),
             }),
@@ -1051,12 +1062,13 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
 
 pub fn tool_statuses_from_turn_items(turn_items: &[TurnItem]) -> Vec<ToolStatusView> {
     let mut statuses = Vec::new();
-    for item in turn_items {
+    for item in turn_items_in_projection_order(turn_items) {
         if let TurnItemPayload::ToolStatus {
             call_id,
             tool,
             status,
             title,
+            summary,
         } = &item.payload
         {
             let status = session_tool_status_from_lifecycle(*status);
@@ -1066,12 +1078,100 @@ pub fn tool_statuses_from_turn_items(turn_items: &[TurnItem]) -> Vec<ToolStatusV
                 *tool,
                 title,
                 status,
-                (status == ToolCallStatus::Completed).then_some(title.clone()),
-                (status == ToolCallStatus::Failed).then_some(title.clone()),
+                (status == ToolCallStatus::Completed).then_some(if summary.trim().is_empty() {
+                    title.clone()
+                } else {
+                    summary.clone()
+                }),
+                (status == ToolCallStatus::Failed).then_some(if summary.trim().is_empty() {
+                    title.clone()
+                } else {
+                    summary.clone()
+                }),
             );
         }
     }
     statuses
+}
+
+pub(crate) fn tui_turn_item_projection_uses_turn_local_sequence_fixture_passes() -> bool {
+    let turn_id = crate::protocol::TurnId::new();
+    let session_id = SessionId::new();
+    let first_call = ToolCallId::new();
+    let second_call = ToolCallId::new();
+    let items = vec![
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 4,
+            payload: TurnItemPayload::AgentMessage {
+                text: "done".to_string(),
+            },
+        },
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 2,
+            payload: TurnItemPayload::ToolStatus {
+                call_id: first_call,
+                tool: ToolName::Write,
+                status: ToolLifecycleStatus::Completed,
+                title: "write a.txt".to_string(),
+                summary: "wrote a.txt".to_string(),
+            },
+        },
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 1,
+            payload: TurnItemPayload::UserMessage {
+                text: "make files".to_string(),
+            },
+        },
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 3,
+            payload: TurnItemPayload::ToolStatus {
+                call_id: second_call,
+                tool: ToolName::Shell,
+                status: ToolLifecycleStatus::Completed,
+                title: "cargo test".to_string(),
+                summary: "ok".to_string(),
+            },
+        },
+    ];
+    let entries = transcript_entries_from_turn_items(&items);
+    let statuses = tool_statuses_from_turn_items(&items);
+    let user = entries
+        .iter()
+        .position(|entry| entry.kind == TranscriptKind::User);
+    let first_tool = entries
+        .iter()
+        .position(|entry| entry.tool_call_id == Some(first_call));
+    let second_tool = entries
+        .iter()
+        .position(|entry| entry.tool_call_id == Some(second_call));
+    let assistant = entries
+        .iter()
+        .position(|entry| entry.kind == TranscriptKind::Assistant);
+    matches!(
+        (user, first_tool, second_tool, assistant),
+        (Some(user), Some(first_tool), Some(second_tool), Some(assistant))
+            if user < first_tool && first_tool < second_tool && second_tool < assistant
+    ) && statuses
+        .iter()
+        .map(|status| status.tool_call_id)
+        .collect::<Vec<_>>()
+        == vec![first_call, second_call]
 }
 
 fn session_tool_status_from_lifecycle(status: ToolLifecycleStatus) -> ToolCallStatus {
@@ -1090,6 +1190,14 @@ fn terminal_transcript_kind(status: TurnTerminalStatus) -> TranscriptKind {
     match status {
         TurnTerminalStatus::Failed | TurnTerminalStatus::Interrupted => TranscriptKind::Error,
         TurnTerminalStatus::Completed | TurnTerminalStatus::AwaitingUser => TranscriptKind::System,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tui_turn_item_projection_uses_turn_local_sequence() {
+        assert!(super::tui_turn_item_projection_uses_turn_local_sequence_fixture_passes());
     }
 }
 

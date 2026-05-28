@@ -22,6 +22,7 @@ impl ConfigModelCatalog {
             name,
             context_window: self.config.model.context_window,
             max_output_tokens: self.config.model.max_output_tokens,
+            provider_metadata_mode: self.config.model.provider_metadata_mode,
             capabilities: ModelCapabilities {
                 supports_tools: self.config.model.supports_tools,
                 supports_reasoning: self.config.model.supports_reasoning,

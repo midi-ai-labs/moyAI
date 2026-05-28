@@ -176,23 +176,14 @@ impl RunService {
 
         let user_message_id = if prepared.prompt.trim().is_empty() {
             let runtime_input = self.runtime_input_view(session_context.session.id).await?;
-            runtime_input
-                .history_items
-                .iter()
-                .rev()
-                .find_map(|item| match &item.payload {
-                    crate::protocol::HistoryItemPayload::UserTurn {
-                        message_id: Some(message_id),
-                        ..
-                    } => Some(*message_id),
-                    _ => None,
-                })
-                .ok_or_else(|| {
+            latest_user_message_id_from_history_items(&runtime_input.history_items).ok_or_else(
+                || {
                     AppRunError::Message(
                         "cannot resume a session without a prompt or prior user message"
                             .to_string(),
                     )
-                })?
+                },
+            )?
         } else {
             let thread_op = build_user_thread_op(
                 protocol_turn_id,
@@ -215,14 +206,16 @@ impl RunService {
             }
             let user_message = self
                 .session_service
-                .store_user_thread_op(
+                .store_user_thread_op_with_protocol_bundle(
                     &session_context,
                     user_turn,
                     Some(effective_config.model.model.clone()),
                     prepared.initial_state.clone(),
+                    protocol_turn_id,
+                    sink.reserve_sequence_no(),
                 )
                 .await?;
-            sink.emit(crate::session::RunEvent::UserTurnStored {
+            sink.emit_pre_recorded(crate::session::RunEvent::UserTurnStored {
                 session_id: session_context.session.id,
                 message_id: user_message.id,
                 turn: Box::new(user_turn.clone()),
@@ -239,17 +232,24 @@ impl RunService {
                 .await
                 {
                     if !is_placeholder_session_title(&title) {
+                        let title_event = crate::session::RunEvent::SessionTitleUpdated {
+                            session_id: session_context.session.id,
+                            title: title.clone(),
+                        };
                         if self
                             .store
                             .session_repo()
-                            .update_session_title(session_context.session.id, &title)
+                            .update_session_title_with_protocol_event(
+                                session_context.session.id,
+                                &title,
+                                &title_event,
+                                protocol_turn_id,
+                                Some(sink.reserve_sequence_no()),
+                            )
                             .await
                             .is_ok()
                         {
-                            sink.emit(crate::session::RunEvent::SessionTitleUpdated {
-                                session_id: session_context.session.id,
-                                title,
-                            })?;
+                            sink.emit_pre_recorded(title_event)?;
                         }
                     }
                 }
@@ -269,6 +269,7 @@ impl RunService {
                 AgentRunRequest {
                     session: session_context,
                     user_message_id,
+                    protocol_turn_id,
                     runtime_input,
                     state,
                     config: effective_config,
@@ -285,23 +286,37 @@ impl RunService {
                 let current = self.store.session_repo().get_session(session_id).await?;
                 if current.status == SessionStatus::Running {
                     if request.cancel.is_cancelled() {
-                        self.store
-                            .session_repo()
-                            .set_status(session_id, SessionStatus::Cancelled)
-                            .await?;
-                        sink.emit(crate::session::RunEvent::SessionInterrupted {
+                        let event = crate::session::RunEvent::SessionInterrupted {
                             session_id,
                             reason: "run cancelled by user".to_string(),
-                        })?;
-                    } else {
+                        };
                         self.store
                             .session_repo()
-                            .set_status(session_id, SessionStatus::Failed)
+                            .set_status_with_protocol_event(
+                                session_id,
+                                SessionStatus::Cancelled,
+                                &event,
+                                protocol_turn_id,
+                                Some(sink.reserve_sequence_no()),
+                            )
                             .await?;
-                        sink.emit(crate::session::RunEvent::SessionFailed {
+                        sink.emit_pre_recorded(event)?;
+                    } else {
+                        let event = crate::session::RunEvent::SessionFailed {
                             session_id,
                             message: error.to_string(),
-                        })?;
+                        };
+                        self.store
+                            .session_repo()
+                            .set_status_with_protocol_event(
+                                session_id,
+                                SessionStatus::Failed,
+                                &event,
+                                protocol_turn_id,
+                                Some(sink.reserve_sequence_no()),
+                            )
+                            .await?;
+                        sink.emit_pre_recorded(event)?;
                     }
                 }
                 return Err(error.into());
@@ -388,6 +403,64 @@ impl RunService {
             change_count: 0,
         })
     }
+}
+
+fn latest_user_message_id_from_history_items(
+    history_items: &[crate::protocol::HistoryItem],
+) -> Option<crate::session::MessageId> {
+    let mut ordered = history_items.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|item| (item.created_at_ms, item.sequence_no));
+    ordered.iter().rev().find_map(|item| match &item.payload {
+        crate::protocol::HistoryItemPayload::UserTurn {
+            message_id: Some(message_id),
+            ..
+        } => Some(*message_id),
+        _ => None,
+    })
+}
+
+pub(crate) fn resume_latest_user_message_uses_item_order_fixture_passes() -> bool {
+    use crate::protocol::{ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, TurnId};
+    use crate::session::{MessageId, SessionId};
+
+    let session_id = SessionId::new();
+    let old_message = MessageId::new();
+    let new_message = MessageId::new();
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: TurnId::new(),
+            sequence_no: 2,
+            created_at_ms: 10,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: Some(old_message),
+                content: vec![ContentPart::Text {
+                    text: "older request".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id: TurnId::new(),
+            sequence_no: 1,
+            created_at_ms: 20,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: Some(new_message),
+                content: vec![ContentPart::Text {
+                    text: "newer request".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+    ];
+    latest_user_message_id_from_history_items(&items) == Some(new_message)
 }
 
 fn build_user_thread_op(
@@ -595,7 +668,6 @@ fn build_initial_turn_context(
             summary: "Initial user turn context before reducer projection.".to_string(),
             active_targets: state.active_targets.clone(),
             operation_intents: Vec::new(),
-            required_next_action: None,
             required_verification_commands: state.verification.required_commands.clone(),
             allowed_tools: allowed_tools.clone(),
             forbidden_tools: Vec::new(),
@@ -751,4 +823,12 @@ fn strip_reasoning(mut transcript: Transcript) -> Transcript {
             .retain(|part| !matches!(part.kind, crate::session::PartKind::Reasoning));
     }
     transcript
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn resume_latest_user_message_uses_item_order() {
+        assert!(super::resume_latest_user_message_uses_item_order_fixture_passes());
+    }
 }

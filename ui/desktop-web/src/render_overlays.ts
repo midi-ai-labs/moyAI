@@ -11,17 +11,20 @@ export type LocalConfirmation = {
 export function renderConfirmation(state: DesktopWebState): string {
   const confirmation = state.confirmation ?? {
     summary: state.confirmation_text || "権限確認が必要です",
+    details: [],
     targets: [],
     outside_workspace: false,
     risks: [],
   };
   const targets = confirmation.targets.length > 0 ? confirmation.targets.join(", ") : "(なし)";
   const risks = confirmation.risks.length > 0 ? confirmation.risks.join(", ") : "なし";
+  const details = confirmation.details.length > 0 ? confirmation.details.join("\n") : "なし";
   return `
     <div class="modal-backdrop">
       <section class="modal confirmation" role="alertdialog" aria-modal="true">
         <h2>確認が必要です</h2>
         <div class="confirm-summary">${escapeHtml(confirmation.summary)}</div>
+        <div class="confirm-command" aria-label="実行内容">${escapeHtml(details)}</div>
         <dl class="confirm-details">
           <dt>対象</dt><dd>${escapeHtml(targets)}</dd>
           <dt>ワークスペース外</dt><dd>${escapeHtml(confirmation.outside_workspace ? "はい" : "いいえ")}</dd>

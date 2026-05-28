@@ -72,13 +72,32 @@ struct PromptEnhanceSink {
 impl LlmEventSink for PromptEnhanceSink {
     fn push(&mut self, event: LlmEvent) -> Result<(), LlmError> {
         match event {
-            LlmEvent::TextDelta(delta) | LlmEvent::ReasoningDelta(delta) => {
+            LlmEvent::TextDelta(delta) => {
                 self.output.push_str(&delta);
             }
+            LlmEvent::ReasoningDelta(_) => {}
             LlmEvent::ToolCallStart { .. }
             | LlmEvent::ToolCallArgsDelta { .. }
             | LlmEvent::Finished { .. } => {}
         }
         Ok(())
+    }
+}
+
+pub(crate) fn prompt_enhance_sink_excludes_reasoning_delta_fixture_passes() -> bool {
+    let mut sink = PromptEnhanceSink::default();
+    sink.push(LlmEvent::ReasoningDelta("hidden plan".to_string()))
+        .is_ok()
+        && sink
+            .push(LlmEvent::TextDelta("visible rewrite".to_string()))
+            .is_ok()
+        && sink.output == "visible rewrite"
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn prompt_enhance_sink_excludes_reasoning_delta() {
+        assert!(super::prompt_enhance_sink_excludes_reasoning_delta_fixture_passes());
     }
 }

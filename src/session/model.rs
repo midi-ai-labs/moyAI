@@ -198,8 +198,6 @@ pub struct ToolResultPart {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_hash: Option<String>,
 }
 
@@ -348,6 +346,8 @@ pub struct RequestMessageDiagnostic {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_markers: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub image_count: usize,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
@@ -377,8 +377,6 @@ pub struct RequestControlEnvelopeDiagnostic {
     pub envelope_id: String,
     pub projection_id: String,
     pub dispatch_policy: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_verification_commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -419,8 +417,6 @@ pub struct RequestControlObligationDiagnostic {
 pub struct RequestControlSurfaceDiagnostic {
     pub surface: String,
     pub projection_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -435,6 +431,14 @@ pub struct RequestDiagnosticsPart {
     pub base_url: String,
     pub request_timeout_ms: u64,
     pub stream_idle_timeout_ms: u64,
+    #[serde(default)]
+    pub stream_max_retries: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget_reason: Option<String>,
     pub system_prompt_chars: usize,
     pub tool_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -471,8 +475,6 @@ pub struct TurnDecisionDiagnostic {
     pub verification_pending: bool,
     #[serde(default)]
     pub closeout_ready: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_verification_commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -492,8 +494,6 @@ pub struct RepairLaneDiagnostic {
     pub subtype: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_target: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -546,8 +546,6 @@ pub struct RepairOperationTemplate {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden_stale_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_rerun_condition: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_markers: Vec<String>,
@@ -583,8 +581,6 @@ pub struct RepairControlSnapshotDiagnostic {
     pub operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_target: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_surface_snapshot: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -607,8 +603,6 @@ pub struct RepairRecoveryChoiceDiagnostic {
     pub rollback_depth: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_tools: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -685,8 +679,6 @@ pub struct ToolNoProgressSignature {
     pub result_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_action: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_surface_snapshot: Vec<String>,
     #[serde(default)]
@@ -896,10 +888,12 @@ pub enum RunEvent {
     },
     PermissionRequested {
         tool_call_id: ToolCallId,
+        tool: ToolName,
         summary: String,
     },
     PermissionResolved {
         tool_call_id: ToolCallId,
+        tool: ToolName,
         approved: bool,
     },
     RetryScheduled {

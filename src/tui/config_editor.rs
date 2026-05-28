@@ -6,7 +6,8 @@ use crate::config::loader::global_config_path;
 use crate::config::model::{
     AccessMode, McpServerConfig, PartialDoclingConfig, PartialFileGuardConfig,
     PartialInspectionConfig, PartialMcpConfig, PartialModelConfig, PartialPermissionsConfig,
-    PartialResolvedConfig, PartialSessionConfig, PromptProfile, ResolvedConfig,
+    PartialResolvedConfig, PartialSessionConfig, PromptProfile, ProviderMetadataMode,
+    ResolvedConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,7 @@ pub enum ConfigField {
     BaseUrl,
     Model,
     PromptProfile,
+    ProviderMetadataMode,
     AccessMode,
     Temperature,
     TopP,
@@ -61,10 +63,11 @@ pub enum ConfigField {
 }
 
 impl ConfigField {
-    pub const ALL: [ConfigField; 41] = [
+    pub const ALL: [ConfigField; 42] = [
         ConfigField::BaseUrl,
         ConfigField::Model,
         ConfigField::PromptProfile,
+        ConfigField::ProviderMetadataMode,
         ConfigField::AccessMode,
         ConfigField::Temperature,
         ConfigField::TopP,
@@ -110,6 +113,7 @@ impl ConfigField {
             ConfigField::BaseUrl => "model.base_url",
             ConfigField::Model => "model.model",
             ConfigField::PromptProfile => "model.prompt_profile",
+            ConfigField::ProviderMetadataMode => "model.provider_metadata_mode",
             ConfigField::AccessMode => "permissions.access_mode",
             ConfigField::Temperature => "model.temperature",
             ConfigField::TopP => "model.top_p",
@@ -160,6 +164,7 @@ impl ConfigField {
             ConfigField::BaseUrl => Some("MOYAI_BASE_URL"),
             ConfigField::Model => Some("MOYAI_MODEL"),
             ConfigField::PromptProfile => Some("MOYAI_PROMPT_PROFILE"),
+            ConfigField::ProviderMetadataMode => Some("MOYAI_PROVIDER_METADATA_MODE"),
             ConfigField::AccessMode => Some("MOYAI_ACCESS_MODE"),
             ConfigField::Temperature => Some("MOYAI_TEMPERATURE"),
             ConfigField::TopP => Some("MOYAI_TOP_P"),
@@ -342,6 +347,12 @@ fn parse_editor_patch(editor: &ConfigEditorState) -> Result<PartialResolvedConfi
                     None => None,
                 }
             }
+            ConfigField::ProviderMetadataMode => {
+                model.provider_metadata_mode = match parse_string(text) {
+                    Some(value) => Some(parse_provider_metadata_mode(&value)?),
+                    None => None,
+                }
+            }
             ConfigField::AccessMode => {
                 permissions.access_mode = match parse_string(text) {
                     Some(value) => Some(parse_access_mode(&value)?),
@@ -452,6 +463,7 @@ fn model_patch_is_empty(model: &PartialModelConfig) -> bool {
     model.base_url.is_none()
         && model.model.is_none()
         && model.prompt_profile.is_none()
+        && model.provider_metadata_mode.is_none()
         && model.api_key_env.is_none()
         && model.extra_headers.is_none()
         && model.request_timeout_ms.is_none()
@@ -525,6 +537,22 @@ fn parse_prompt_profile(value: &str) -> Result<PromptProfile, String> {
     }
 }
 
+fn parse_provider_metadata_mode(value: &str) -> Result<ProviderMetadataMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "lm_studio_native_required"
+        | "lm-studio-native-required"
+        | "lmstudio"
+        | "lm_studio"
+        | "lm-studio" => Ok(ProviderMetadataMode::LmStudioNativeRequired),
+        "openai_compatible_only"
+        | "openai-compatible-only"
+        | "openai"
+        | "openai_compat"
+        | "openai-compatible" => Ok(ProviderMetadataMode::OpenAiCompatibleOnly),
+        other => Err(format!("unsupported provider_metadata_mode `{other}`")),
+    }
+}
+
 fn parse_access_mode(value: &str) -> Result<AccessMode, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "default" | "normal" => Ok(AccessMode::Default),
@@ -586,6 +614,10 @@ fn field_value(key: ConfigField, config: &ResolvedConfig) -> String {
             PromptProfile::Auto => "auto".to_string(),
             PromptProfile::Default => "default".to_string(),
             PromptProfile::QwenCoder => "qwen_coder".to_string(),
+        },
+        ConfigField::ProviderMetadataMode => match config.model.provider_metadata_mode {
+            ProviderMetadataMode::LmStudioNativeRequired => "lm_studio_native_required".to_string(),
+            ProviderMetadataMode::OpenAiCompatibleOnly => "openai_compatible_only".to_string(),
         },
         ConfigField::AccessMode => match config.permissions.access_mode {
             AccessMode::Default => "default".to_string(),
@@ -688,5 +720,30 @@ trait ValueExt {
 impl ValueExt for serde_json::Value {
     fn to_json_string(&self) -> String {
         self.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigEditorState, ConfigField, parse_editor_patch};
+    use crate::config::{ProviderMetadataMode, ResolvedConfig};
+
+    #[test]
+    fn config_editor_projects_provider_metadata_mode_patch() {
+        let config = ResolvedConfig::default();
+        let mut editor = ConfigEditorState::from_config(&config);
+        let field = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::ProviderMetadataMode)
+            .expect("provider metadata mode field is present");
+        field.value = "openai_compatible_only".to_string();
+
+        let patch = parse_editor_patch(&editor).expect("provider mode parses");
+
+        assert_eq!(
+            patch.model.and_then(|model| model.provider_metadata_mode),
+            Some(ProviderMetadataMode::OpenAiCompatibleOnly)
+        );
     }
 }

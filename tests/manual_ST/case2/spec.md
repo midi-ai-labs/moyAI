@@ -117,6 +117,7 @@ case2b は scenario_contract、Contract Reconciliation、generated test subordin
 ## 記録すべき証跡
 
 - `route_manifest.json`
+- `case_progress.json`
 - `verification_command_log.json`
 - `contract_reconciliation_report.json`
 - `workspace_diff_manifest.json`

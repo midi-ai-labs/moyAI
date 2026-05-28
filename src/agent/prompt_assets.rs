@@ -12,6 +12,7 @@ const BASE_WORKFLOW_PROMPT: &str = "Workflow Rules\n\
 - For empty-workspace project creation tasks, create the required project files in a small number of editing steps before returning to repeated inspection.\n\
 - For empty-workspace project creation, create files directly under the current workspace root unless the user explicitly requested a nested project directory.\n\
 - Do not use scaffolding commands such as `cargo new`, `cargo init`, `npm init`, or similar generators when they would create a nested project folder, fresh `.git` metadata, or default stub files that still need replacement.\n\
+- External connection and environment setup review: commands that may download, install, sync dependencies, fetch repositories, bootstrap runtimes, or contact external networks are user-review gated before execution. Use already installed local tools when possible. If the user denies review or the environment is missing, explain the prerequisite and ask the user to prepare it outside moyAI.\n\
 - If the user asked for a Rust project in the current workspace, write `Cargo.toml` and the needed `src/*.rs` files directly instead of generating a separate child project folder.\n\
 - For Rust implementation tasks, run `cargo test` or at least `cargo check` before finishing. Do not claim the Rust work is done until a real verification command succeeded.\n\
 - If you already know which file must be created or updated next, make that change instead of rereading the same files.\n\
@@ -55,6 +56,14 @@ pub(crate) fn planning_prompt_keeps_todowrite_side_channel_fixture_passes() -> b
         && BASE_TODO_PROMPT.contains("Use `write` or `apply_patch` for the next step")
         && BASE_WORKFLOW_PROMPT.contains("use `todowrite` only as a progress side channel")
 }
+
+pub(crate) fn external_connection_prompt_projects_review_fixture_passes() -> bool {
+    BASE_WORKFLOW_PROMPT.contains("External connection and environment setup review")
+        && BASE_WORKFLOW_PROMPT.contains("user-review gated before execution")
+        && BASE_WORKFLOW_PROMPT.contains("Use already installed local tools")
+        && BASE_WORKFLOW_PROMPT.contains("ask the user to prepare it outside moyAI")
+        && !BASE_WORKFLOW_PROMPT.contains("do not run dependency installation")
+}
 const LOCALIZATION_PROMPT: &str = "Localization Rules\n\
 - The primary users of this product are Japanese. Unless the current user explicitly requests another language, write generated documentation, comments, README/help text, test descriptions, and user-facing strings in Japanese.\n\
 - Keep programming-language keywords, external protocol names, tool names, library identifiers, and file paths in their required original form, but explain them in Japanese when surrounding prose or comments are needed.\n\
@@ -80,7 +89,9 @@ Focus on clear code, precise explanations, and well-structured documentation.";
 const PYTHON_UTF8_PROMPT: &str = "Python UTF-8 Rules\n\
 - When generating Python that reads or writes text files, always specify `encoding=\"utf-8\"` explicitly.\n\
 - When generating Python subprocess calls that capture text, specify UTF-8 explicitly (for example `text=True, encoding=\"utf-8\"`).\n\
-- Do not rely on platform-default encodings for Python text I/O, logs, fixtures, or CLI-visible text.\n\
+- When generated tests start child commands with `subprocess.run(...)`, always pass a finite `timeout=` so verification cannot wait forever on interactive stdin or a stalled child process.\n\
+- Do not rely on platform-default encodings for Python text I/O, logs, fixtures, subprocess output, or CLI-visible text.\n\
+- When Python CLI code emits non-ASCII stdout/stderr, make the artifact itself UTF-8-safe (for example by configuring `sys.stdout` / `sys.stderr` when appropriate); do not rely only on the surrounding shell environment.\n\
 - If Python code emits or checks Japanese text, keep the entire path UTF-8-safe from file read/write through test assertions.\n\
 - For user-facing console output on Windows, avoid characters that commonly fail under cp932 consoles when plain ASCII or normal Japanese wording is enough. Use `approx`, `->`, `>=`, or Japanese text instead of symbols such as `≈`.";
 const QWEN_CODER_PROMPT: &str = "Model-Specific Rules\n\
@@ -96,6 +107,9 @@ const TOOL_CONTRACT_PROMPT: &str = "Tool Contract Rules\n\
 - Obey each tool JSON schema exactly and include required fields.\n\
 - If a tool call fails because of schema, patch format, or shell syntax, fix the next tool call.\n\
 - If a shell command fails because it used Linux or CMD syntax in the wrong environment, rewrite it immediately in the native shell for this environment instead of concluding.\n\
+- If a shell command exits non-zero, inspect its stdout/stderr, identify whether the command was malformed, and retry once with a corrected native command when local tools are already available. Do not stop after a single typo such as prose accidentally included in a command.\n\
+- When running commands that execute code, tests, scripts, or text-producing tools, make the command or artifact text encoding explicit. Do not depend on platform-default encodings or hidden shell bootstrap environment for UTF-8-sensitive verification.\n\
+- If an external-connection or environment-setup command is denied by the user or unavailable, do not retry the same command. Explain the required setup to the user or continue with already available local tools.\n\
 - Tool descriptions are part of the contract. Follow them literally.";
 const APPLY_PATCH_PROMPT: &str = "apply_patch Rules\n\
 - The `apply_patch` tool accepts one JSON field: `patch_text`.\n\
@@ -172,7 +186,7 @@ const FOLLOW_UP_SPEC_ALIGNMENT_REMINDER_PREFIX: &str =
     "This implementation turn is grounded in specification or documentation files.";
 const FOLLOW_UP_DOCUMENTATION_SCOPE_REMINDER_PREFIX: &str =
     "This turn is currently scoped to documentation artifacts.";
-const PUBLIC_CONTRACT_PRESERVATION_REMINDER: &str = "When a documentation or spec update starts from an existing workspace, preserve observed public function signatures, test call sites, CLI argv order, error classes/messages, and stdout/stderr behavior including numeric formatting unless the latest user explicitly requests a breaking migration. Treat future behavior as additive around that baseline contract, not as permission to replace it with a more convenient API. If you add unary CLI operations to an existing binary `<left> <operator> <right>` CLI, keep binary operations in that order and document/test unary calls as `<function> <value>` without dummy operands, unless executable evidence explicitly shows another established unary form. Treat two-argument unary CLI forms as unary only for the documented function tokens; binary-looking incomplete invocations such as `<left> <operator>` remain usage errors if the baseline binary CLI would have shown usage. Unknown two-token CLI commands such as `log 10` are not an unsupported-function route unless the spec explicitly adds unknown function tokens to the CLI grammar; omit that generated CLI test or expect usage error while keeping direct helper APIs free to raise unsupported-function errors. If the existing CLI prints integer-valued numeric results without trailing `.0`, keep examples and tests on that compact output or compare numerically. Preserve the positional meaning of an existing `calculate(left, operator, right)` API: `left` and `right` stay operands and `operator` stays the operation token. Do not document or test invented call sites such as `calculate(\"sin\", \"sin\", 0)`; use a consistent helper such as `calculate_unary(function, value)` or a clearly documented operand/operator form instead.";
+const PUBLIC_CONTRACT_PRESERVATION_REMINDER: &str = "When a documentation or spec update starts from an existing workspace, preserve observed public function signatures, test call sites, CLI argv order, error classes/messages, and stdout/stderr behavior including numeric formatting unless the latest user explicitly requests a breaking migration. Treat future behavior as additive around that baseline contract, not as permission to replace it with a more convenient API. Before finalizing a documentation/spec write, reconcile the draft against the latest user request and remove internal contradictions: required claims from the latest request must be present, and prohibited claims remain prohibited even when an older helper API has adjacent wording. If you add unary CLI operations to an existing binary `<left> <operator> <right>` CLI, keep binary operations in that order and document/test unary calls as `<function> <value>` without dummy operands, unless executable evidence explicitly shows another established unary form. Treat two-argument unary CLI forms as unary only for the documented function tokens; binary-looking incomplete invocations such as `<left> <operator>` remain usage errors if the baseline binary CLI would have shown usage. Unknown two-token CLI commands such as `log 10` are not an unsupported-function route unless the spec explicitly adds unknown function tokens to the CLI grammar; omit that generated CLI test or expect usage error while keeping direct helper APIs free to raise unsupported-function errors. If the existing CLI prints integer-valued numeric results without trailing `.0`, keep examples and tests on that compact output or compare numerically. Preserve the positional meaning of an existing `calculate(left, operator, right)` API: `left` and `right` stay operands and `operator` stays the operation token. Do not document or test invented call sites such as `calculate(\"sin\", \"sin\", 0)`; use a consistent helper such as `calculate_unary(function, value)` or a clearly documented operand/operator form instead.";
 const STAGED_TASK_EXECUTION_REMINDER_PREFIX: &str =
     "The staged task instructions were already captured in the runtime contract.";
 const STAGED_TASK_DOCUMENTATION_GROUNDING_REMINDER_PREFIX: &str =
@@ -535,7 +549,7 @@ pub(crate) fn staged_task_documentation_grounding_reminder(output_targets: &[Str
         output_targets.join(", ")
     };
     format!(
-        "{STAGED_TASK_DOCUMENTATION_GROUNDING_REMINDER_PREFIX}\nRequired deliverables: {outputs}\nBefore writing any deliverable, inspect concrete evidence under the existing repository areas and read the key support files that anchor the facts: backend project metadata, one backend source/config file, frontend package metadata, one frontend route/component file, one concrete test file, one examples file, and one data path when those areas exist. During the initial survey step, cover each existing major area once before drilling deeper. Ground every claim in files, config, tests, or existing sample outputs that you actually read in this run. Do not add generic setup steps, placeholder clone commands, license claims, roadmap language, or guessed versions unless the exact supporting file was read. If a detail is still unconfirmed after targeted inspection, write `不明` instead of guessing."
+        "{STAGED_TASK_DOCUMENTATION_GROUNDING_REMINDER_PREFIX}\nRequired deliverables: {outputs}\nBefore writing any deliverable, inspect concrete evidence under the repository areas named by the task or observed in the workspace, and read the support files that anchor the facts for those areas. During the initial survey step, cover each required area once before drilling deeper. Ground every claim in files, config, tests, sample outputs, or source files that you actually read in this run. Do not assume backend/frontend/data/example structure unless the task or workspace evidence names it. Do not add generic setup steps, placeholder clone commands, license claims, roadmap language, or guessed versions unless the exact supporting file was read. If a detail is still unconfirmed after targeted inspection, write `不明` instead of guessing."
     )
 }
 
@@ -757,13 +771,13 @@ fn staged_task_documentation_deliverable_expectation(active_targets: &[String]) 
         .next()
         .unwrap_or_default();
     if focus.ends_with("readme.md") {
-        return "Summarize the repository purpose and the concrete backend, frontend, tests, examples, and data areas using file-grounded facts instead of generic setup boilerplate. Keep nested inspected paths literal instead of collapsing them into root-level aliases like `tests` or `data`.";
+        return "Summarize the repository purpose and the concrete areas required by the task using file-grounded facts instead of generic setup boilerplate. Keep nested inspected paths literal instead of collapsing them into root-level aliases.";
     }
     if focus.ends_with("basic_design.md") {
         return "Explain the architecture boundary and responsibility split between the major areas, and anchor each section to concrete repository paths instead of only listing the tech stack.";
     }
     if focus.ends_with("detail_design.md") {
-        return "Explain module-level inputs, outputs, major data, and the main processing flow, grounded in concrete modules, endpoints, config, tests, examples, and data paths.";
+        return "Explain module-level inputs, outputs, major data, and the main processing flow, grounded in concrete modules, entrypoints, config, tests, examples, or data paths only when those areas were requested or observed.";
     }
     "Keep the deliverable tightly grounded in concrete repository files, paths, and inspected facts."
 }
@@ -796,7 +810,7 @@ pub(crate) fn docs_route_reminder(
         .map(|value| format!("\nContract repair: {value}"))
         .unwrap_or_default();
     format!(
-        "{DOCS_ROUTE_REMINDER_PREFIX}\nCurrent documentation focus: {focus}{survey_line}{contract_line}{repair_line}\nRepresentative survey is bounded: use the already listed backend, frontend, tests, data, and examples anchors as enough evidence to draft. Once pending deliverables are named here, the next productive lifecycle item is one `write` or `apply_patch` for a pending docs deliverable; do not continue broad read/list/search discovery. Prefer file-grounded prose over generic templates. Keep claims tied to inspected files, versions, scripts, routes, tests, and examples. If a detail is still unconfirmed, write `不明` instead of guessing. {PUBLIC_CONTRACT_PRESERVATION_REMINDER}"
+        "{DOCS_ROUTE_REMINDER_PREFIX}\nCurrent documentation focus: {focus}{survey_line}{contract_line}{repair_line}\nRepresentative survey is bounded by the route contract. Directory listings and path metadata can identify anchors, but exact write recovery is write-ready only after content-bearing repository evidence such as `read`, `grep`, `docling_convert`, or `mcp_call` output has grounded the relevant source, test, config, or document facts. If only metadata/tree evidence has been recorded, inspect one concrete file before drafting; if content evidence is already recorded, the next productive lifecycle item is one `write` or `apply_patch` for a pending docs deliverable. Do not continue broad read/list/search discovery after that boundary. Prefer file-grounded prose over generic templates. Keep claims tied to inspected files, versions, scripts, entrypoints, tests, examples, or data only when those facts are present in the route evidence. If a detail is still unconfirmed, write `不明` instead of guessing. {PUBLIC_CONTRACT_PRESERVATION_REMINDER}"
     )
 }
 
@@ -812,9 +826,15 @@ pub(crate) fn docs_route_reminder_projects_write_ready_boundary_fixture_passes()
         Some("Pending docs deliverables are README.md / basic_design.md / detail_design.md."),
     );
     rendered.contains("Representative survey is bounded")
+        && rendered.contains("route contract")
+        && rendered.contains("content-bearing repository evidence")
+        && rendered.contains("inspect one concrete file before drafting")
         && rendered.contains("one `write` or `apply_patch`")
-        && rendered.contains("do not continue broad read/list/search discovery")
+        && rendered.contains("Do not continue broad read/list/search discovery")
+        && rendered.contains("reconcile the draft against the latest user request")
+        && rendered.contains("prohibited claims remain prohibited")
         && rendered.contains("不明")
+        && !rendered.contains("backend, frontend, tests, data, and examples anchors")
 }
 
 pub(crate) fn structured_document_summary_reminder(targets: &[String]) -> String {

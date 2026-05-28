@@ -7,6 +7,7 @@ export function renderMarkdown(value: string): string {
   let listItems: string[] = [];
   let orderedItems: string[] = [];
   let quoteLines: string[] = [];
+  let tableLines: string[] = [];
   let codeLines: string[] = [];
   let inCode = false;
 
@@ -30,7 +31,33 @@ export function renderMarkdown(value: string): string {
     html += `<blockquote>${quoteLines.map((line) => `<p>${renderInlineMarkdown(line)}</p>`).join("")}</blockquote>`;
     quoteLines = [];
   };
+  const flushTable = () => {
+    if (tableLines.length < 2) {
+      if (tableLines.length > 0) paragraph.push(...tableLines);
+      tableLines = [];
+      return;
+    }
+    const rows = parseTableRows(tableLines);
+    tableLines = [];
+    if (rows.length < 2 || !isAlignmentRow(rows[1])) {
+      paragraph.push(...rows.map((row) => `| ${row.join(" | ")} |`));
+      return;
+    }
+    const headers = rows[0];
+    const bodyRows = rows.slice(2);
+    html += `<div class="md-table-wrap"><table class="md-table"><thead><tr>${headers
+      .map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`)
+      .join("")}</tr></thead><tbody>${bodyRows
+      .map(
+        (row) =>
+          `<tr>${headers
+            .map((_, index) => `<td>${renderInlineMarkdown(row[index] ?? "")}</td>`)
+            .join("")}</tr>`
+      )
+      .join("")}</tbody></table></div>`;
+  };
   const flushTextBlocks = () => {
+    flushTable();
     flushParagraph();
     flushList();
     flushQuote();
@@ -58,6 +85,14 @@ export function renderMarkdown(value: string): string {
       flushTextBlocks();
       continue;
     }
+    if (looksLikeTableLine(trimmed)) {
+      flushParagraph();
+      flushList();
+      flushQuote();
+      tableLines.push(trimmed);
+      continue;
+    }
+    flushTable();
     const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
     if (heading) {
       flushTextBlocks();
@@ -96,6 +131,21 @@ export function renderMarkdown(value: string): string {
   }
   flushTextBlocks();
   return html || `<p>${escapeHtml(value)}</p>`;
+}
+
+function looksLikeTableLine(line: string): boolean {
+  return line.includes("|") && line.split("|").length >= 3;
+}
+
+function parseTableRows(lines: string[]): string[][] {
+  return lines.map((line) => {
+    const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+    return trimmed.split("|").map((cell) => cell.trim());
+  });
+}
+
+function isAlignmentRow(row: string[]): boolean {
+  return row.length > 0 && row.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
 }
 
 function renderInlineMarkdown(value: string): string {

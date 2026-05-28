@@ -105,6 +105,9 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             set_local_search,
             insert_command,
             set_provider_base_url,
+            set_provider_metadata_mode,
+            set_provider_context_window,
+            set_provider_max_output_tokens,
             load_provider_models,
             select_provider_model,
             apply_provider_session,
@@ -657,6 +660,54 @@ async fn set_provider_base_url(
 ) -> Result<DesktopWebState, String> {
     mutate_controller(controller, |controller| {
         controller.state.set_provider_base_url_input(text);
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_provider_metadata_mode(
+    controller: State<'_, SharedController>,
+    mode: String,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        let parsed = match mode.as_str() {
+            "lm_studio_native_required"
+            | "lm-studio-native-required"
+            | "lm_studio"
+            | "lm-studio" => crate::config::ProviderMetadataMode::LmStudioNativeRequired,
+            "openai_compatible_only" | "openai-compatible-only" | "openai" => {
+                crate::config::ProviderMetadataMode::OpenAiCompatibleOnly
+            }
+            _ => {
+                controller
+                    .state
+                    .set_status_message(format!("unknown provider metadata mode: {mode}"));
+                return;
+            }
+        };
+        controller.state.set_provider_metadata_mode_input(parsed);
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_provider_context_window(
+    controller: State<'_, SharedController>,
+    text: String,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.set_provider_context_window_input(text);
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_provider_max_output_tokens(
+    controller: State<'_, SharedController>,
+    text: String,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.set_provider_max_output_tokens_input(text);
     })
     .await
 }

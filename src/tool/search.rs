@@ -73,7 +73,7 @@ impl Tool for ListTool {
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<ListInput>(raw_arguments)?;
         let requested = input.path.unwrap_or_else(|| Utf8PathBuf::from("."));
-        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::List, true)?;
+        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::List)?;
         ctx.confirm_if_needed(
             AccessKind::List,
             format!("List {}", guarded.absolute),
@@ -185,7 +185,7 @@ impl Tool for GlobTool {
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<GlobInput>(raw_arguments)?;
         let requested = input.path.unwrap_or_else(|| Utf8PathBuf::from("."));
-        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::Search, true)?;
+        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::Search)?;
         ctx.confirm_if_needed(
             AccessKind::Search,
             format!("Glob {}", guarded.absolute),
@@ -203,13 +203,16 @@ impl Tool for GlobTool {
             ToolError::Message(format!("failed to compile glob pattern: {error}"))
         })?;
         let mut matches = collect_file_metadata(&guarded.absolute, ctx.workspace)?;
-        matches.retain(|(path, _)| matcher.is_match(path.as_str()));
+        matches.retain(|(path, _)| {
+            let path = Utf8Path::new(path);
+            glob_matches_path(&matcher, path, &guarded.absolute, &ctx.workspace.root)
+        });
         matches.sort_by_key(|(_, modified)| Reverse(*modified));
         let limit = input.limit.unwrap_or(ctx.config.tool_output.max_results);
         let lines = matches
             .iter()
             .take(limit)
-            .map(|(path, _)| path.clone())
+            .map(|(path, _)| glob_output_label(path, &ctx.workspace.root))
             .collect::<Vec<_>>();
         let preview = ctx.services.truncator.preview(
             lines.join("\n"),
@@ -229,6 +232,47 @@ impl Tool for GlobTool {
             change_summaries: Vec::new(),
         })
     }
+}
+
+fn glob_matches_path(
+    matcher: &globset::GlobSet,
+    path: &Utf8Path,
+    search_root: &Utf8Path,
+    workspace_root: &Utf8Path,
+) -> bool {
+    matcher.is_match(path.as_str())
+        || path
+            .strip_prefix(search_root)
+            .ok()
+            .is_some_and(|relative| matcher.is_match(relative.as_str()))
+        || path
+            .strip_prefix(workspace_root)
+            .ok()
+            .is_some_and(|relative| matcher.is_match(relative.as_str()))
+}
+
+fn glob_output_label(path: &str, workspace_root: &Utf8Path) -> String {
+    let path = Utf8Path::new(path);
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .to_string()
+}
+
+pub(crate) fn glob_workspace_relative_pattern_fixture_passes() -> bool {
+    let mut builder = GlobSetBuilder::new();
+    let Ok(glob) = Glob::new("calculator.py") else {
+        return false;
+    };
+    builder.add(glob);
+    let Ok(matcher) = builder.build() else {
+        return false;
+    };
+    let workspace_root = Utf8Path::new("C:/workspace/project");
+    let search_root = workspace_root;
+    let file_path = Utf8Path::new("C:/workspace/project/calculator.py");
+
+    glob_matches_path(&matcher, file_path, search_root, workspace_root)
+        && glob_output_label(file_path.as_str(), workspace_root) == "calculator.py"
 }
 
 #[async_trait(?Send)]
@@ -258,7 +302,7 @@ impl Tool for GrepTool {
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<GrepInput>(raw_arguments)?;
         let requested = input.path.unwrap_or_else(|| Utf8PathBuf::from("."));
-        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::Search, true)?;
+        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::Search)?;
         ctx.confirm_if_needed(
             AccessKind::Search,
             format!("Grep {}", guarded.absolute),

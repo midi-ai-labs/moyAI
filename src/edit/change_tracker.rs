@@ -147,21 +147,37 @@ impl ChangeTracker {
 }
 
 pub(crate) fn path_for_change_storage(path: &Utf8Path, workspace_root: &Utf8Path) -> Utf8PathBuf {
+    if let Some(relative) = crate::workspace::project::workspace_relative_key_for_match(
+        path.as_str(),
+        workspace_root.as_str(),
+    ) {
+        if !relative.is_empty() {
+            return Utf8PathBuf::from(relative);
+        }
+    }
     path.strip_prefix(workspace_root)
         .map(|relative| relative.to_path_buf())
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub(crate) fn change_path_storage_uses_workspace_relative_authority() -> bool {
-    let root = Utf8Path::new("C:/runs/route/case1/workspace");
+    let root = Utf8Path::new("C:/runs/route/generic/workspace");
     path_for_change_storage(
-        Utf8Path::new("C:/runs/route/case1/workspace/calculator.py"),
+        Utf8Path::new("C:/runs/route/generic/workspace/component.py"),
         root,
-    ) == Utf8PathBuf::from("calculator.py")
+    ) == Utf8PathBuf::from("component.py")
         && path_for_change_storage(
-            Utf8Path::new("C:/runs/route/case1/workspace/test_calculator.py"),
+            Utf8Path::new("C:/runs/route/generic/workspace/test_component.py"),
             root,
-        ) == Utf8PathBuf::from("test_calculator.py")
+        ) == Utf8PathBuf::from("test_component.py")
+        && path_for_change_storage(
+            Utf8Path::new(r"C:\\runs\\route\\generic\\workspace\\docs\\design.md"),
+            root,
+        ) == Utf8PathBuf::from("docs/design.md")
+        && path_for_change_storage(
+            Utf8Path::new(r"C:\\runs\\route\\generic\\workspace2\\docs\\design.md"),
+            root,
+        ) == Utf8PathBuf::from(r"C:\\runs\\route\\generic\\workspace2\\docs\\design.md")
 }
 
 fn sha256_hex(text: &str) -> String {

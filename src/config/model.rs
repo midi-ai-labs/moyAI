@@ -84,6 +84,15 @@ impl PromptProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMetadataMode {
+    #[default]
+    LmStudioNativeRequired,
+    #[serde(rename = "openai_compatible_only")]
+    OpenAiCompatibleOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormatterRule {
     pub glob: String,
@@ -95,6 +104,7 @@ pub struct ModelConfig {
     pub base_url: String,
     pub model: String,
     pub prompt_profile: PromptProfile,
+    pub provider_metadata_mode: ProviderMetadataMode,
     pub api_key_env: Option<String>,
     pub extra_headers: BTreeMap<String, String>,
     pub request_timeout_ms: u64,
@@ -309,6 +319,7 @@ impl Default for ResolvedConfig {
                 base_url: "http://127.0.0.1:1234".to_string(),
                 model: "qwen/qwen3.6-35b-a3b".to_string(),
                 prompt_profile: PromptProfile::Auto,
+                provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
                 extra_headers: BTreeMap::new(),
                 request_timeout_ms: 600_000,
@@ -471,6 +482,7 @@ pub struct PartialModelConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub prompt_profile: Option<PromptProfile>,
+    pub provider_metadata_mode: Option<ProviderMetadataMode>,
     pub api_key_env: Option<Option<String>>,
     pub extra_headers: Option<BTreeMap<String, String>>,
     pub request_timeout_ms: Option<u64>,

@@ -28,8 +28,8 @@ use crate::agent::prompt_assets::{
 use crate::agent::repair_lane::project_repair_lane;
 use crate::agent::state::{
     ActiveWorkContract, active_work_contract_for_history_items, docs_route_pending_repair_targets,
-    latest_verification_failure_context, project_model_turn_state, render_active_work_contract,
-    render_model_turn_state, structured_document_summary_snapshot,
+    project_model_turn_state, render_active_work_contract, render_model_turn_state,
+    structured_document_summary_snapshot,
 };
 use crate::agent::verification::{
     explicit_verification_commands_from_text, latest_failed_verification_preceding_repair_targets,
@@ -41,7 +41,7 @@ use crate::config::{AgentConfig, PromptProfile, ResolvedConfig, ShellFamily};
 use crate::edit::PatchParser;
 use crate::error::AgentError;
 use crate::llm::{ModelContentPart, ModelMessage, ModelProfile, ModelToolCall, ToolSchema};
-use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload};
+use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload, RequiredAction};
 use crate::session::{
     FailureKind, MessageMetadata, MessagePart, MessageRole, ProcessPhase,
     RequestReplayPolicyDiagnostic, SessionRecord, SessionStateSnapshot, TaskRoute, TodoItem,
@@ -55,6 +55,7 @@ use crate::workspace::instruction_file_names;
 pub struct AgentRunRequest {
     pub session: crate::session::SessionContext,
     pub user_message_id: crate::session::MessageId,
+    pub protocol_turn_id: crate::protocol::TurnId,
     pub runtime_input: RuntimeInputView,
     pub state: SessionStateSnapshot,
     pub config: ResolvedConfig,
@@ -66,7 +67,6 @@ pub struct AgentRunRequest {
 pub struct RuntimeInputView {
     session: SessionRecord,
     pub history_items: Vec<HistoryItem>,
-    legacy_import_transcript: Option<Transcript>,
 }
 
 impl RuntimeInputView {
@@ -74,34 +74,14 @@ impl RuntimeInputView {
         Self {
             session: session.clone(),
             history_items,
-            legacy_import_transcript: None,
-        }
-    }
-
-    pub fn from_compatibility_transcript(transcript: Transcript) -> Self {
-        Self {
-            session: transcript.session.clone(),
-            history_items: Vec::new(),
-            legacy_import_transcript: Some(transcript),
         }
     }
 
     pub fn materialized_transcript_projection(&self) -> Transcript {
-        if self.history_items.is_empty() {
-            return self
-                .legacy_import_transcript
-                .clone()
-                .unwrap_or_else(|| transcript_from_history_items(&self.session, &[]));
-        }
         transcript_from_history_items(&self.session, &self.history_items)
     }
 
     pub fn into_compatibility_transcript(self) -> Transcript {
-        if self.history_items.is_empty() {
-            return self
-                .legacy_import_transcript
-                .unwrap_or_else(|| transcript_from_history_items(&self.session, &[]));
-        }
         transcript_from_history_items(&self.session, &self.history_items)
     }
 
@@ -466,6 +446,10 @@ fn prepare_prompt_tools(
     let skill_tool = tools.iter().find(|tool| tool.name == "skill").cloned();
     apply_candidate_tool_availability_for_prompt_state(&mut tools, signals, state);
     restore_skill_tool(&mut tools, skill_tool.as_ref(), state);
+    crate::agent::lifecycle_kernel::TurnLifecycleKernel::apply_codex_style_provider_edit_surface(
+        &mut tools, state,
+    );
+    apply_active_content_shape_to_write_schema(&mut tools, state);
     let tool_names = tools
         .iter()
         .map(|tool| tool.name.clone())
@@ -485,7 +469,7 @@ fn repair_lane_projection_for_prompt(
         .into_iter()
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
-    project_repair_lane(state, &allowed_tools, None)
+    project_repair_lane(state, &allowed_tools)
 }
 
 fn verification_repair_target_was_read(
@@ -879,9 +863,9 @@ fn directory_is_empty(path: &Utf8Path) -> Result<bool, AgentError> {
 }
 
 fn blocked_reason_mentions_missing_deliverables(reason: &str) -> bool {
-    reason
-        .to_ascii_lowercase()
-        .contains("requested deliverables are still missing from the workspace")
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("requested deliverables are still missing from the workspace")
+        || reason.contains("requested deliverables still require authoring in the workspace")
 }
 
 fn build_messages_with_state(
@@ -913,6 +897,11 @@ fn build_messages_with_state(
         result.push(ModelMessage::System {
             content: exact_write_target_contract(target),
         });
+    }
+    if let Some(contract) =
+        latest_content_shape_repair_contract(&history_items[start_index..], state)
+    {
+        result.push(ModelMessage::System { content: contract });
     }
     if let Some(contract) = active_work {
         result.push(ModelMessage::System {
@@ -1338,10 +1327,39 @@ fn build_provider_replay_projection_from_history_items(
             replay_context,
             &tool_output_index,
         );
+    let consumed_supporting_context_calls =
+        consumed_supporting_context_tool_call_targets_after_content_shape_rejection(
+            history_items,
+            replay_start,
+            replay_context,
+            &tool_output_index,
+        );
+    let suppressed_tool_call_ids = replay_prelude_suppressed_tool_call_ids(
+        &stale_inactive_authoring_calls,
+        &historical_progress_projection_calls,
+        &consumed_supporting_context_calls,
+    );
+    let suppressed_prelude_indices = stale_history_tool_call_prelude_indices(
+        history_items,
+        replay_start,
+        &suppressed_tool_call_ids,
+    );
+    for (target, note) in
+        inactive_filechange_reference_notes_after(history_items, replay_start, replay_context)
+    {
+        replay_policies.push(inactive_filechange_reference_snapshot_policy(
+            &target,
+            &replay_context.active_authoring_targets,
+        ));
+        result.push(ModelMessage::System { content: note });
+    }
     let mut emitted_outputs = BTreeSet::new();
     let mut emitted_tool_calls = BTreeSet::new();
 
     for index in selected_indices {
+        if suppressed_prelude_indices.contains(&index) {
+            continue;
+        }
         let Some(item) = history_items.get(index) else {
             continue;
         };
@@ -1382,8 +1400,22 @@ fn build_provider_replay_projection_from_history_items(
                         &tool_output_index,
                         &call_id_text,
                     );
+                let malformed_edit_arguments =
+                    matches!(tool, ToolName::Write | ToolName::ApplyPatch)
+                        && tool_call_has_invalid_edit_arguments_output(
+                            history_items,
+                            &tool_output_index,
+                            &call_id_text,
+                        );
                 let arguments_json = if content_shape_mismatch {
                     sanitized_content_shape_mismatch_arguments_json()
+                } else if malformed_edit_arguments {
+                    replay_policies.push(malformed_edit_arguments_replay_policy(
+                        &call_id_text,
+                        tool,
+                        &replay_context.active_authoring_targets,
+                    ));
+                    sanitized_malformed_edit_arguments_json(tool)
                 } else if let Some(stale_targets) =
                     failed_inactive_authoring_calls.get(&call_id_text)
                 {
@@ -1393,10 +1425,12 @@ fn build_provider_replay_projection_from_history_items(
                         stale_targets,
                         &replay_context.active_authoring_targets,
                     ));
-                    replay_tool_arguments_json(arguments, model_arguments, effective_arguments)
+                    sanitized_wrong_authoring_target_arguments_json(tool)
                 } else if let Some(stale_targets) =
                     stale_inactive_authoring_calls.get(&call_id_text)
                 {
+                    let arguments_json =
+                        replay_tool_arguments_json(arguments, model_arguments, effective_arguments);
                     replay_policies.push(stale_inactive_authoring_replay_policy(
                         &call_id_text,
                         tool,
@@ -1407,6 +1441,14 @@ fn build_provider_replay_projection_from_history_items(
                         content: stale_inactive_authoring_pair_replay_note(
                             stale_targets,
                             &replay_context.active_authoring_targets,
+                            inactive_authoring_reference_snapshot(
+                                history_items,
+                                &call_id_text,
+                                tool,
+                                &arguments_json,
+                                stale_targets,
+                            )
+                            .as_deref(),
                         ),
                     });
                     continue;
@@ -1421,6 +1463,22 @@ fn build_provider_replay_projection_from_history_items(
                     ));
                     result.push(ModelMessage::System {
                         content: progress_projection_pair_replay_note(
+                            &replay_context.active_authoring_targets,
+                        ),
+                    });
+                    continue;
+                } else if let Some(context_target) =
+                    consumed_supporting_context_calls.get(&call_id_text)
+                {
+                    replay_policies.push(consumed_supporting_context_replay_policy(
+                        &call_id_text,
+                        tool,
+                        context_target,
+                        &replay_context.active_authoring_targets,
+                    ));
+                    result.push(ModelMessage::System {
+                        content: consumed_supporting_context_pair_replay_note(
+                            context_target,
                             &replay_context.active_authoring_targets,
                         ),
                     });
@@ -1477,6 +1535,8 @@ fn build_provider_replay_projection_from_history_items(
                     continue;
                 } else if historical_progress_projection_calls.contains_key(&call_id_text) {
                     continue;
+                } else if consumed_supporting_context_calls.contains_key(&call_id_text) {
+                    continue;
                 } else {
                     output_text.clone()
                 };
@@ -1486,8 +1546,14 @@ fn build_provider_replay_projection_from_history_items(
                     result: result_text,
                 });
             }
+            HistoryItemPayload::RejectedToolProposal { proposal } => {
+                if proposal.semantic_class == "text_final_while_obligations_open" {
+                    result.push(ModelMessage::System {
+                        content: rejected_model_action_replay_note(proposal),
+                    });
+                }
+            }
             HistoryItemPayload::Reasoning { .. }
-            | HistoryItemPayload::RejectedToolProposal { .. }
             | HistoryItemPayload::CandidateRepairEdit { .. }
             | HistoryItemPayload::RequestDiagnostics { .. }
             | HistoryItemPayload::Continuation { .. }
@@ -1593,12 +1659,33 @@ fn latest_user_turn_index_before(history_items: &[HistoryItem], index: usize) ->
 }
 
 fn provider_replay_item_is_visible(payload: &HistoryItemPayload) -> bool {
-    matches!(
-        payload,
+    match payload {
         HistoryItemPayload::UserTurn { .. }
-            | HistoryItemPayload::Message { .. }
-            | HistoryItemPayload::ToolCall { .. }
-            | HistoryItemPayload::ToolOutput { .. }
+        | HistoryItemPayload::Message { .. }
+        | HistoryItemPayload::ToolCall { .. }
+        | HistoryItemPayload::ToolOutput { .. } => true,
+        HistoryItemPayload::RejectedToolProposal { proposal } => {
+            proposal.semantic_class == "text_final_while_obligations_open"
+        }
+        _ => false,
+    }
+}
+
+fn rejected_model_action_replay_note(proposal: &crate::protocol::RejectedToolProposal) -> String {
+    let allowed = proposal
+        .allowed_surface
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Rejected model action evidence: `{}` was rejected as `{}` before turn completion. Reason: {} Allowed tool surface: [{}]. Projection id: {}. Payload hash: {}. This item is no-progress lifecycle evidence; continue by using an allowed tool under the current TurnControlEnvelope, not by repeating a final answer.",
+        proposal.effective_tool,
+        proposal.semantic_class,
+        proposal.blocked_reason,
+        allowed,
+        proposal.projection_id,
+        proposal.payload_hash,
     )
 }
 
@@ -1632,6 +1719,70 @@ fn provider_replay_add_tool_pairs(
             }
         }
     }
+}
+
+fn replay_prelude_suppressed_tool_call_ids(
+    stale_inactive_authoring_calls: &BTreeMap<String, Vec<String>>,
+    historical_progress_projection_calls: &BTreeMap<String, Vec<String>>,
+    consumed_supporting_context_calls: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    stale_inactive_authoring_calls
+        .keys()
+        .chain(historical_progress_projection_calls.keys())
+        .chain(consumed_supporting_context_calls.keys())
+        .cloned()
+        .collect()
+}
+
+fn stale_history_tool_call_prelude_indices(
+    history_items: &[HistoryItem],
+    start: usize,
+    stale_tool_call_ids: &BTreeSet<String>,
+) -> BTreeSet<usize> {
+    let mut indices = BTreeSet::new();
+    if stale_tool_call_ids.is_empty() {
+        return indices;
+    }
+    for (index, item) in history_items.iter().enumerate().skip(start) {
+        if !history_item_has_suppressed_tool_call(item, stale_tool_call_ids) {
+            continue;
+        }
+        let mut cursor = index;
+        while cursor > start {
+            cursor -= 1;
+            let candidate = &history_items[cursor];
+            if !history_item_is_stale_tool_call_prelude(candidate) {
+                break;
+            }
+            indices.insert(cursor);
+        }
+    }
+    indices
+}
+
+fn history_item_has_suppressed_tool_call(
+    item: &HistoryItem,
+    stale_tool_call_ids: &BTreeSet<String>,
+) -> bool {
+    matches!(
+        &item.payload,
+        HistoryItemPayload::ToolCall { call_id, .. }
+            if stale_tool_call_ids.contains(&call_id.to_string())
+    )
+}
+
+fn history_item_is_stale_tool_call_prelude(item: &HistoryItem) -> bool {
+    matches!(
+        &item.payload,
+        HistoryItemPayload::Message {
+            role: MessageRole::Assistant,
+            content,
+            ..
+        } if content_parts_text(content).is_some()
+            && content
+                .iter()
+                .all(|part| matches!(part, ContentPart::Text { .. }))
+    )
 }
 
 fn tool_call_history_index_after(
@@ -1677,6 +1828,38 @@ fn tool_call_has_content_shape_mismatch_output(
     )
 }
 
+fn tool_call_has_invalid_edit_arguments_output(
+    history_items: &[HistoryItem],
+    output_index: &BTreeMap<String, usize>,
+    call_id: &str,
+) -> bool {
+    let Some(index) = output_index.get(call_id) else {
+        return false;
+    };
+    match history_items.get(*index).map(|item| &item.payload) {
+        Some(HistoryItemPayload::ToolOutput {
+            title, metadata, ..
+        }) => {
+            title == "Invalid tool arguments"
+                || metadata
+                    .get("operation_progress_class")
+                    .and_then(Value::as_str)
+                    == Some("invalid_edit_arguments")
+                || metadata
+                    .get("tool_feedback_envelope")
+                    .and_then(|feedback| feedback.get("operation_progress_class"))
+                    .and_then(Value::as_str)
+                    == Some("invalid_edit_arguments")
+                || metadata
+                    .get("tool_feedback_envelope")
+                    .and_then(|feedback| feedback.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("invalid_edit_arguments")
+        }
+        _ => false,
+    }
+}
+
 fn tool_call_has_wrong_authoring_target_output(
     history_items: &[HistoryItem],
     output_index: &BTreeMap<String, usize>,
@@ -1709,6 +1892,32 @@ fn sanitized_content_shape_mismatch_arguments_json() -> String {
         "content": "[omitted incompatible write payload; runtime rejected it before side effects. See the following tool result for the required content contract.]"
     })
     .to_string()
+}
+
+fn sanitized_malformed_edit_arguments_json(tool: &ToolName) -> String {
+    match tool {
+        ToolName::ApplyPatch => json!({
+            "patch_text": "[omitted malformed edit payload; runtime rejected it before side effects. See the following tool result for parser error, active target, and required edit action.]"
+        })
+        .to_string(),
+        _ => json!({
+            "content": "[omitted malformed edit payload; runtime rejected it before side effects. See the following tool result for parser error, active target, and required edit action.]"
+        })
+        .to_string(),
+    }
+}
+
+fn sanitized_wrong_authoring_target_arguments_json(tool: &ToolName) -> String {
+    match tool {
+        ToolName::ApplyPatch => json!({
+            "patch_text": "[omitted wrong-target patch payload; runtime rejected it before side effects. See the following tool result for submitted-target and active-target evidence. Use the current TurnControlEnvelope for the active target.]"
+        })
+        .to_string(),
+        _ => json!({
+            "content": "[omitted wrong-target write payload; runtime rejected it before side effects. See the following tool result for submitted-target and active-target evidence. Use the current TurnControlEnvelope for the active target.]"
+        })
+        .to_string(),
+    }
 }
 
 fn latest_user_turn_index_after(history_items: &[HistoryItem], start: usize) -> Option<usize> {
@@ -1772,13 +1981,11 @@ fn replay_tool_arguments_json(
     model_arguments: &Value,
     effective_arguments: &Value,
 ) -> String {
-    let value = if !effective_arguments.is_null() {
-        effective_arguments
-    } else if !model_arguments.is_null() {
-        model_arguments
-    } else {
-        arguments
-    };
+    let value = crate::protocol::canonical_tool_call_arguments(
+        arguments,
+        model_arguments,
+        effective_arguments,
+    );
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
@@ -1876,6 +2083,152 @@ fn historical_progress_projection_tool_call_targets_after(
         );
     }
     progress_calls
+}
+
+fn consumed_supporting_context_tool_call_targets_after_content_shape_rejection(
+    history_items: &[HistoryItem],
+    start: usize,
+    replay_context: &ProviderReplayContext,
+    output_index: &BTreeMap<String, usize>,
+) -> BTreeMap<String, String> {
+    if replay_context.active_authoring_targets.is_empty() {
+        return BTreeMap::new();
+    }
+    let Some(latest_rejection_index) =
+        latest_content_shape_rejection_for_active_target(history_items, start, replay_context)
+    else {
+        return BTreeMap::new();
+    };
+
+    let mut consumed_calls = BTreeMap::new();
+    for item in history_items
+        .iter()
+        .take(latest_rejection_index)
+        .skip(start)
+    {
+        let HistoryItemPayload::ToolCall {
+            call_id,
+            tool,
+            arguments,
+            model_arguments,
+            effective_arguments,
+            ..
+        } = &item.payload
+        else {
+            continue;
+        };
+        if !matches!(
+            tool,
+            ToolName::Read
+                | ToolName::List
+                | ToolName::Glob
+                | ToolName::Grep
+                | ToolName::InspectDirectory
+        ) {
+            continue;
+        }
+        let call_id_text = call_id.to_string();
+        let Some(output_position) = output_index.get(&call_id_text).copied() else {
+            continue;
+        };
+        if output_position >= latest_rejection_index {
+            continue;
+        }
+        if !tool_output_is_successful_supporting_context(history_items, output_position) {
+            continue;
+        }
+        let arguments_json =
+            replay_tool_arguments_json(arguments, model_arguments, effective_arguments);
+        let Some(target) = extract_readonly_target(&tool.to_string(), &arguments_json) else {
+            continue;
+        };
+        let normalized = normalize_prompt_target(&target);
+        if normalized.is_empty()
+            || prompt_target_matches_required_output(
+                &normalized,
+                &replay_context.active_authoring_targets,
+            )
+        {
+            continue;
+        }
+        consumed_calls.insert(call_id_text, normalized);
+    }
+    consumed_calls
+}
+
+fn latest_content_shape_rejection_for_active_target(
+    history_items: &[HistoryItem],
+    start: usize,
+    replay_context: &ProviderReplayContext,
+) -> Option<usize> {
+    let mut tool_targets = BTreeMap::new();
+    for item in history_items.iter().skip(start) {
+        let HistoryItemPayload::ToolCall {
+            call_id,
+            tool,
+            arguments,
+            model_arguments,
+            effective_arguments,
+            ..
+        } = &item.payload
+        else {
+            continue;
+        };
+        if !matches!(tool, ToolName::Write | ToolName::ApplyPatch) {
+            continue;
+        }
+        let arguments_json =
+            replay_tool_arguments_json(arguments, model_arguments, effective_arguments);
+        tool_targets.insert(
+            call_id.to_string(),
+            artifact_targets_from_tool_call(&tool.to_string(), &arguments_json),
+        );
+    }
+
+    history_items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .rev()
+        .find_map(|(index, item)| {
+            let HistoryItemPayload::ToolOutput { call_id, title, .. } = &item.payload else {
+                return None;
+            };
+            if title != "Required write content shape mismatch" {
+                return None;
+            }
+            let targets = tool_targets.get(&call_id.to_string())?;
+            targets
+                .iter()
+                .any(|target| {
+                    prompt_target_matches_required_output(
+                        target,
+                        &replay_context.active_authoring_targets,
+                    )
+                })
+                .then_some(index)
+        })
+}
+
+fn tool_output_is_successful_supporting_context(
+    history_items: &[HistoryItem],
+    output_position: usize,
+) -> bool {
+    matches!(
+        history_items.get(output_position).map(|item| &item.payload),
+        Some(HistoryItemPayload::ToolOutput {
+            status: crate::protocol::ToolLifecycleStatus::Completed,
+            success,
+            progress_effect,
+            ..
+        }) if success != &Some(false)
+            && !matches!(
+                progress_effect,
+                crate::protocol::ToolProgressEffect::NoProgress
+                    | crate::protocol::ToolProgressEffect::Blocked
+                    | crate::protocol::ToolProgressEffect::VerificationFailed
+            )
+    )
 }
 
 fn progress_projection_output_carries_current_feedback(
@@ -1979,6 +2332,7 @@ fn submitted_targets_intersect_active(submitted: &[String], active: &[String]) -
 fn stale_inactive_authoring_pair_replay_note(
     stale_targets: &[String],
     active_targets: &[String],
+    reference_snapshot: Option<&str>,
 ) -> String {
     let stale = stale_targets
         .iter()
@@ -1990,9 +2344,233 @@ fn stale_inactive_authoring_pair_replay_note(
         .map(|target| format!("`{target}`"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
+    let mut note = format!(
         "Previous authoring tool call/output pair for inactive target(s) {stale} is omitted from executable provider tool-call history because the current active requested-work target set is {active}. Treat this as non-executable historical context; use the current active-work projection and stable tool schema."
-    )
+    );
+    if let Some(snapshot) = reference_snapshot.filter(|value| !value.trim().is_empty()) {
+        note.push_str("\nReference-only accepted artifact snapshot for omitted inactive target. Do not rewrite this inactive target to satisfy progress; use it only as context for the current active target.\n");
+        note.push_str(snapshot);
+    }
+    note
+}
+
+fn inactive_filechange_reference_notes_after(
+    history_items: &[HistoryItem],
+    start: usize,
+    replay_context: &ProviderReplayContext,
+) -> Vec<(String, String)> {
+    let active_targets = &replay_context.active_authoring_targets;
+    if active_targets.is_empty() {
+        return Vec::new();
+    }
+    let active = active_targets
+        .iter()
+        .map(|target| format!("`{target}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut notes = BTreeMap::<String, String>::new();
+    for item in history_items.iter().skip(start) {
+        let HistoryItemPayload::FileChange { changes, .. } = &item.payload else {
+            continue;
+        };
+        for change in changes {
+            let Some(path) = change
+                .path_after
+                .as_ref()
+                .or(change.path_before.as_ref())
+                .map(|path| normalize_prompt_target(path.as_str()))
+            else {
+                continue;
+            };
+            if path.is_empty()
+                || active_targets.iter().any(|active_target| {
+                    let active_normalized = normalize_prompt_target(active_target);
+                    path == active_normalized
+                        || path.ends_with(&format!("/{active_normalized}"))
+                        || active_normalized.ends_with(&format!("/{path}"))
+                })
+            {
+                continue;
+            }
+            let mut note = format!(
+                "Reference-only accepted artifact snapshot for inactive target.\nartifact_path: `{}`\nThis artifact already exists from accepted FileChange evidence and must not be rewritten to satisfy progress. Current active requested-work target set is {active}. Do not rewrite this inactive target; use it only as context for the current active target.\nsummary: {}",
+                path, change.summary
+            );
+            if let Some(content) = filechange_history_reference_content(history_items, &path)
+                .filter(|content| !content.trim().is_empty())
+            {
+                note.push_str("\n```text\n");
+                note.push_str(&clip_reference_snapshot(&content, 2400));
+                note.push_str("\n```");
+            }
+            notes.insert(path, note);
+        }
+    }
+    notes.into_iter().collect()
+}
+
+fn inactive_authoring_reference_snapshot(
+    history_items: &[HistoryItem],
+    call_id: &str,
+    tool: &ToolName,
+    arguments_json: &str,
+    stale_targets: &[String],
+) -> Option<String> {
+    if tool == &ToolName::Write {
+        return inactive_write_reference_snapshot(arguments_json, stale_targets);
+    }
+    inactive_filechange_reference_snapshot(history_items, call_id, stale_targets)
+}
+
+fn inactive_write_reference_snapshot(
+    arguments_json: &str,
+    stale_targets: &[String],
+) -> Option<String> {
+    let value = serde_json::from_str::<Value>(arguments_json).ok()?;
+    let path = value.get("path").and_then(Value::as_str)?.trim();
+    let content = value.get("content").and_then(Value::as_str)?;
+    if path.is_empty()
+        || content.trim().is_empty()
+        || !stale_targets.iter().any(|target| target == path)
+    {
+        return None;
+    }
+    let clipped = clip_reference_snapshot(content, 2400);
+    Some(format!("artifact_path: `{path}`\n```text\n{clipped}\n```"))
+}
+
+fn inactive_filechange_reference_snapshot(
+    history_items: &[HistoryItem],
+    call_id: &str,
+    stale_targets: &[String],
+) -> Option<String> {
+    let output = history_items.iter().find_map(|item| {
+        let HistoryItemPayload::ToolOutput {
+            call_id: output_call_id,
+            output_text,
+            metadata,
+            success,
+            ..
+        } = &item.payload
+        else {
+            return None;
+        };
+        (output_call_id.to_string() == call_id && success == &Some(true))
+            .then_some((output_text.as_str(), metadata))
+    })?;
+    let target = filechange_reference_target(output.1, stale_targets)
+        .or_else(|| filechange_history_reference_target(history_items, stale_targets))?;
+    let content = filechange_reference_content(output.1, &target)
+        .or_else(|| filechange_history_reference_content(history_items, &target))
+        .unwrap_or_else(|| output.0.to_string());
+    let clipped = clip_reference_snapshot(&content, 2400);
+    Some(format!(
+        "artifact_path: `{target}`\n```text\n{clipped}\n```"
+    ))
+}
+
+fn filechange_reference_target(metadata: &Value, stale_targets: &[String]) -> Option<String> {
+    metadata
+        .get("changes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|change| {
+            change
+                .get("path_after")
+                .or_else(|| change.get("path_before"))
+                .and_then(Value::as_str)
+        })
+        .find_map(|path| stale_target_for_path(path, stale_targets))
+}
+
+fn filechange_history_reference_target(
+    history_items: &[HistoryItem],
+    stale_targets: &[String],
+) -> Option<String> {
+    history_items.iter().find_map(|item| {
+        let HistoryItemPayload::FileChange { changes, .. } = &item.payload else {
+            return None;
+        };
+        changes.iter().find_map(|change| {
+            change
+                .path_after
+                .as_ref()
+                .or(change.path_before.as_ref())
+                .and_then(|path| stale_target_for_path(path.as_str(), stale_targets))
+        })
+    })
+}
+
+fn stale_target_for_path(path: &str, stale_targets: &[String]) -> Option<String> {
+    let normalized = normalize_prompt_target(path);
+    stale_targets
+        .iter()
+        .find(|target| {
+            let target_normalized = normalize_prompt_target(target);
+            normalized == target_normalized
+                || normalized.ends_with(&format!("/{target_normalized}"))
+                || prompt_target_matches_required_output(&normalized, &[target.to_string()])
+        })
+        .cloned()
+}
+
+fn filechange_reference_content(metadata: &Value, target: &str) -> Option<String> {
+    metadata
+        .get("diff_text")
+        .and_then(Value::as_str)
+        .and_then(|diff| added_content_from_diff(diff, target))
+}
+
+fn filechange_history_reference_content(
+    history_items: &[HistoryItem],
+    target: &str,
+) -> Option<String> {
+    history_items.iter().find_map(|item| {
+        let HistoryItemPayload::ToolOutput { metadata, .. } = &item.payload else {
+            return None;
+        };
+        filechange_reference_content(metadata, target)
+    })
+}
+
+fn added_content_from_diff(diff: &str, target: &str) -> Option<String> {
+    if !diff_mentions_target(diff, target) {
+        return None;
+    }
+    let content = diff
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix('+')
+                .filter(|_| !line.starts_with("+++"))
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!content.trim().is_empty()).then_some(content)
+}
+
+fn diff_mentions_target(diff: &str, target: &str) -> bool {
+    diff.lines().any(|line| {
+        if !(line.starts_with("+++ ") || line.starts_with("--- ")) {
+            return false;
+        }
+        stale_target_for_path(
+            line.trim_start_matches(['+', '-', ' ']).trim(),
+            &[target.to_string()],
+        )
+        .is_some()
+    })
+}
+
+fn clip_reference_snapshot(content: &str, limit: usize) -> String {
+    let normalized = content.replace("\r\n", "\n");
+    if normalized.chars().count() <= limit {
+        return normalized;
+    }
+    let mut clipped = normalized.chars().take(limit).collect::<String>();
+    clipped.push_str("\n[reference snapshot truncated]");
+    clipped
 }
 
 fn progress_projection_pair_replay_note(active_targets: &[String]) -> String {
@@ -2003,6 +2581,20 @@ fn progress_projection_pair_replay_note(active_targets: &[String]) -> String {
         .join(", ");
     format!(
         "Historical progress-projection tool call/output pair is omitted from executable provider tool-call history because content-changing authoring is still active. Treat this as non-executable planning context only; the current active requested-work target set is {active}."
+    )
+}
+
+fn consumed_supporting_context_pair_replay_note(
+    context_target: &str,
+    active_targets: &[String],
+) -> String {
+    let active = active_targets
+        .iter()
+        .map(|target| format!("`{target}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Prior supporting-context tool call/output for `{context_target}` is omitted from executable provider tool-call history because the current exact repair target is {active}. Treat that content as already-consumed evidence; do not call read/list/search again for it. Use the provider-visible edit tool, usually apply_patch, for the active target."
     )
 }
 
@@ -2022,6 +2614,20 @@ fn stale_inactive_authoring_replay_policy(
     }
 }
 
+fn inactive_filechange_reference_snapshot_policy(
+    target: &str,
+    active_targets: &[String],
+) -> RequestReplayPolicyDiagnostic {
+    RequestReplayPolicyDiagnostic {
+        policy: "inactive_filechange_reference_snapshot_projected".to_string(),
+        call_id: None,
+        tool_name: None,
+        omitted_targets: vec![target.to_string()],
+        active_targets: active_targets.to_vec(),
+        reason: "accepted inactive FileChange evidence is projected as non-executable provider-visible context even when its original content-changing tool call is not replayable under the current effective surface".to_string(),
+    }
+}
+
 fn failed_inactive_authoring_replay_policy(
     call_id: &str,
     tool: &ToolName,
@@ -2035,6 +2641,37 @@ fn failed_inactive_authoring_replay_policy(
         omitted_targets: stale_targets.to_vec(),
         active_targets: active_targets.to_vec(),
         reason: "failed wrong-target authoring remains a call-id-scoped ToolCall/ToolOutput pair in provider replay so the model sees the previous rejected call result; successful stale inactive authoring payloads remain summary-only".to_string(),
+    }
+}
+
+fn malformed_edit_arguments_replay_policy(
+    call_id: &str,
+    tool: &ToolName,
+    active_targets: &[String],
+) -> RequestReplayPolicyDiagnostic {
+    RequestReplayPolicyDiagnostic {
+        policy: "malformed_edit_arguments_payload_sanitized_output_preserved".to_string(),
+        call_id: Some(call_id.to_string()),
+        tool_name: Some(tool.to_string()),
+        omitted_targets: Vec::new(),
+        active_targets: active_targets.to_vec(),
+        reason: "malformed edit arguments are sanitized into a non-authoritative replay placeholder while the matching invalid_edit_arguments ToolOutput remains call-id-scoped provider-visible evidence".to_string(),
+    }
+}
+
+fn consumed_supporting_context_replay_policy(
+    call_id: &str,
+    tool: &ToolName,
+    context_target: &str,
+    active_targets: &[String],
+) -> RequestReplayPolicyDiagnostic {
+    RequestReplayPolicyDiagnostic {
+        policy: "consumed_supporting_context_pair_omitted".to_string(),
+        call_id: Some(call_id.to_string()),
+        tool_name: Some(tool.to_string()),
+        omitted_targets: vec![context_target.to_string()],
+        active_targets: active_targets.to_vec(),
+        reason: "canonical supporting-context ToolCall/ToolOutput items are preserved, but after a content-shape rejection for the active write target they are replayed as consumed evidence instead of executable provider tool-call history".to_string(),
     }
 }
 
@@ -2122,7 +2759,7 @@ pub fn vision_input_provider_projection_fixture_passes() -> bool {
         updated_at_ms: 1,
         completed_at_ms: None,
     };
-    let source_path = camino::Utf8PathBuf::from("C:/diagnostic/source/js-space_invaders01.jpg");
+    let source_path = camino::Utf8PathBuf::from("C:/diagnostic/source/js-arcade_games01.jpg");
     let history_items = vec![HistoryItem {
         id: crate::protocol::HistoryItemId::new(),
         session_id: session.id.clone(),
@@ -2168,7 +2805,7 @@ pub fn vision_input_provider_projection_fixture_passes() -> bool {
     rendered_text.contains("[Image #1]")
         && rendered_text.contains("<image name=[Image #1]>")
         && rendered_text.contains("</image>")
-        && !rendered_text.contains("js-space_invaders01.jpg")
+        && !rendered_text.contains("js-arcade_games01.jpg")
         && !rendered_text.contains("C:/diagnostic/source")
         && matches!(
             parts.get(2),
@@ -2779,8 +3416,9 @@ fn detect_prompt_signals_with_config(
                 .or_else(|| verification_repair_feedback_focus_target.clone())
         })
         .flatten();
-    let verification_repair_active_targets = latest_verification_failure_context(transcript)
-        .map(|failure| failure.targets)
+    let verification_repair_active_targets = state
+        .and_then(|state| state.failure.as_ref())
+        .map(|failure| failure.targets.clone())
         .unwrap_or_default();
     let verification_repair_contract_refs = requested_contract
         .reference_inputs
@@ -2925,6 +3563,67 @@ fn apply_candidate_tool_availability_for_prompt_state(
     }
 }
 
+fn apply_active_content_shape_to_write_schema(
+    tools: &mut [ToolSchema],
+    state: &SessionStateSnapshot,
+) {
+    if state.completion.closeout_ready
+        || !matches!(
+            state.process_phase,
+            ProcessPhase::Author | ProcessPhase::Repair
+        )
+        || state.active_targets.len() != 1
+    {
+        return;
+    }
+    let target = state.active_targets[0].as_str();
+    apply_write_content_shape_to_write_schema_for_target(tools, target);
+}
+
+pub(crate) fn apply_write_content_shape_to_write_schema_for_required_action(
+    tools: &mut [ToolSchema],
+    required_action: Option<&RequiredAction>,
+) {
+    let Some(target) = required_action
+        .filter(|action| action.tool == ToolName::Write)
+        .and_then(RequiredAction::edit_target)
+        .map(Utf8Path::as_str)
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return;
+    };
+    apply_write_content_shape_to_write_schema_for_target(tools, target);
+}
+
+fn apply_write_content_shape_to_write_schema_for_target(tools: &mut [ToolSchema], target: &str) {
+    let description = if target_is_test_like(target) {
+        crate::agent::content_shape_contract::python_source_for_test_target(target)
+            .map(|contract| contract.tool_schema_description())
+    } else if crate::agent::content_shape_contract::text_artifact_target_requires_readable_shape(
+        target,
+    ) {
+        Some(crate::agent::content_shape_contract::text_artifact_tool_schema_description(target))
+    } else if crate::agent::content_shape_contract::python_source_target_requires_executable_shape(
+        target,
+    ) {
+        Some(crate::agent::content_shape_contract::python_source_tool_schema_description(target))
+    } else {
+        None
+    };
+    let Some(description) = description else {
+        return;
+    };
+    for tool in tools.iter_mut().filter(|tool| tool.name == "write") {
+        if let Some(content_description) = tool
+            .input_schema
+            .pointer_mut("/properties/content/description")
+        {
+            *content_description = Value::String(description.clone());
+        }
+    }
+}
+
 fn exact_active_authoring_write_required(state: &SessionStateSnapshot) -> Option<String> {
     if state.completion.verification_pending
         || state.completion.closeout_ready
@@ -2941,6 +3640,53 @@ fn exact_active_authoring_write_required(state: &SessionStateSnapshot) -> Option
         return None;
     }
     Some(target.to_string())
+}
+
+fn latest_content_shape_repair_contract(
+    history_items: &[HistoryItem],
+    state: &SessionStateSnapshot,
+) -> Option<String> {
+    let active_targets = state
+        .active_targets
+        .iter()
+        .map(|target| target.as_str().to_string())
+        .collect::<Vec<_>>();
+    if active_targets.is_empty() {
+        return None;
+    }
+    history_items.iter().rev().find_map(|item| {
+        let HistoryItemPayload::ToolOutput {
+            title, metadata, ..
+        } = &item.payload
+        else {
+            return None;
+        };
+        if title != "Required write content shape mismatch" {
+            return None;
+        }
+        let contract = metadata
+            .get("content_shape_contract")
+            .or_else(|| metadata.pointer("/tool_feedback_envelope/content_shape_contract"))?;
+        let target = contract
+            .get("target")
+            .and_then(Value::as_str)
+            .filter(|target| {
+                prompt_target_matches_required_output(target, &active_targets)
+                    || active_targets.iter().any(|active| {
+                        prompt_target_matches_required_output(active, &[target.to_string()])
+                    })
+            })?;
+        match contract.get("kind").and_then(Value::as_str) {
+            Some("text_artifact_readable_content_shape") => {
+                Some(crate::agent::content_shape_contract::text_artifact_prompt_contract(target))
+            }
+            Some("python_test_module_content_shape") => Some(exact_write_target_contract(target)),
+            Some("python_source_executable_content_shape") => {
+                Some(crate::agent::content_shape_contract::python_source_prompt_contract(target))
+            }
+            _ => None,
+        }
+    })
 }
 
 fn prompt_target_is_test_like(target: &str) -> bool {
@@ -3356,13 +4102,11 @@ fn docs_area_label(area: crate::session::DocsArea) -> &'static str {
 
 fn docs_area_fallback_path(area: crate::session::DocsArea) -> &'static str {
     match area {
-        crate::session::DocsArea::Backend => "backend/app/core/config.py",
-        crate::session::DocsArea::Frontend => "frontend/app/(workspace)/scenarios/page.tsx",
-        crate::session::DocsArea::Tests => "backend/tests/integration/test_health_api.py",
-        crate::session::DocsArea::Data => {
-            "data/runs/2025-04-05T14-30-00Z-ripplefish-simulation-001/log.txt"
-        }
-        crate::session::DocsArea::Examples => "examples/phase2-sample-bundle.json",
+        crate::session::DocsArea::Backend => "backend/",
+        crate::session::DocsArea::Frontend => "frontend/",
+        crate::session::DocsArea::Tests => "tests/",
+        crate::session::DocsArea::Data => "data/",
+        crate::session::DocsArea::Examples => "examples/",
     }
 }
 
@@ -3677,14 +4421,36 @@ pub(crate) fn staged_task_artifact_targets_from_text(text: &str) -> Vec<String> 
 
 pub(crate) fn requested_work_contract_from_instruction_text(text: &str) -> RequestedWorkContract {
     let mut contract = RequestedWorkContract::default();
-    for raw_line in text.lines() {
+    let mut reference_authority_section_active = false;
+    for raw_line in instruction_authority_lines(text) {
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
         }
 
         let (line_without_code, code_spans) = split_backtick_spans(line);
-        let line_intent = classify_requested_line_intent(line, &line_without_code, &code_spans);
+        let normalized_line = line.to_ascii_lowercase().replace('`', "");
+        let reference_section_header = reference_authority_section_header(&normalized_line);
+        let reference_section_item = reference_authority_section_active
+            && (reference_section_list_item(line)
+                || reference_section_header
+                || line_has_harness_owned_marker(&normalized_line));
+        if reference_authority_section_active
+            && !reference_section_item
+            && !reference_section_header
+        {
+            reference_authority_section_active = false;
+        }
+        if reference_section_header {
+            reference_authority_section_active = true;
+        }
+        let line_intent = if reference_authority_section_active
+            && (reference_section_item || reference_section_header)
+        {
+            RequestedLineIntent::Reference
+        } else {
+            classify_requested_line_intent(line, &line_without_code, &code_spans)
+        };
         contract
             .verification_commands
             .extend(explicit_verification_commands_from_text(line));
@@ -3745,13 +4511,54 @@ fn promote_same_document_reference_updates(text: &str, contract: &mut RequestedW
     }
 
     for reference in &contract.reference_inputs {
-        if classify_artifact_target(reference) == ArtifactTargetKind::Documentation {
+        if classify_artifact_target(reference) == ArtifactTargetKind::Documentation
+            && !matches!(
+                Utf8Path::new(reference).file_name(),
+                Some("scenario_contract.md" | "scenario_contract.json")
+            )
+        {
             contract.deliverable_targets.push(reference.clone());
         }
     }
 }
 
-fn same_document_update_alias_requested(text: &str) -> bool {
+fn reference_authority_section_header(normalized_line: &str) -> bool {
+    let header = normalized_line
+        .trim()
+        .trim_start_matches("- ")
+        .trim_end_matches(':')
+        .trim();
+    matches!(
+        header,
+        "scenario contract authority"
+            | "scenario contract"
+            | "contract authority"
+            | "contract references"
+            | "reference inputs"
+            | "reference input"
+            | "context references"
+            | "context inputs"
+    ) || (header.contains("contract")
+        && header.contains("reference")
+        && !header.contains("deliverable"))
+}
+
+fn reference_section_list_item(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_digit())
+            && trimmed
+                .chars()
+                .skip_while(|ch| ch.is_ascii_digit())
+                .next()
+                .is_some_and(|ch| ch == '.' || ch == ')')
+}
+
+pub(crate) fn same_document_update_alias_requested(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let references_existing_document = [
         "based on",
@@ -3759,12 +4566,17 @@ fn same_document_update_alias_requested(text: &str) -> bool {
         "from the previous",
         "existing document",
         "same document",
+        "just-created document",
+        "just created document",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
         || text.contains("をもとに")
         || text.contains("を基に")
         || text.contains("前回作成")
+        || text.contains("いま作成")
+        || text.contains("今作成")
+        || text.contains("作成した")
         || text.contains("既存")
         || text.contains("現在の");
     let updates_same_document = [
@@ -3778,10 +4590,13 @@ fn same_document_update_alias_requested(text: &str) -> bool {
         || text.contains("設計書だけを更新")
         || text.contains("設計書のみを更新")
         || text.contains("設計書を更新")
+        || (text.contains("設計書") && text.contains("更新"))
         || text.contains("文書だけを更新")
         || text.contains("文書のみを更新")
+        || (text.contains("文書") && text.contains("更新"))
         || text.contains("ドキュメントだけを更新")
-        || text.contains("ドキュメントのみを更新");
+        || text.contains("ドキュメントのみを更新")
+        || (text.contains("ドキュメント") && text.contains("更新"));
     references_existing_document && updates_same_document
 }
 
@@ -3791,7 +4606,7 @@ fn explicit_artifact_targets_in_text(text: &str) -> Vec<String> {
 
 fn artifact_targets_from_instruction_text(text: &str, include_unknown: bool) -> Vec<String> {
     let mut targets = Vec::new();
-    for raw_line in text.lines() {
+    for raw_line in instruction_authority_lines(text) {
         let (line_without_code, code_spans) = split_backtick_spans(raw_line);
         for code_span in code_spans {
             for target in artifact_tokens_from_instruction_segment(code_span.trim()) {
@@ -3813,6 +4628,158 @@ fn artifact_targets_from_instruction_text(text: &str, include_unknown: bool) -> 
         );
     }
     dedupe_targets(targets)
+}
+
+fn instruction_authority_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut skipping_non_authority_section = false;
+    let expected_artifacts_are_continuation_evidence =
+        manual_st_continuation_expected_artifacts_are_evidence(text);
+
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            lines.push(raw_line);
+            continue;
+        }
+        if non_authority_context_section_header(
+            trimmed,
+            expected_artifacts_are_continuation_evidence,
+        ) {
+            skipping_non_authority_section = true;
+            continue;
+        }
+        if skipping_non_authority_section {
+            if non_diagnostic_authority_section_header(trimmed) {
+                skipping_non_authority_section = false;
+            } else {
+                continue;
+            }
+        }
+        if diagnostic_traceback_line(trimmed) {
+            continue;
+        }
+        lines.push(raw_line);
+    }
+
+    lines
+}
+
+fn manual_st_continuation_expected_artifacts_are_evidence(text: &str) -> bool {
+    let mut has_expected_artifacts = false;
+    let mut has_actionable_continuation_section = false;
+    for raw_line in text.lines() {
+        let normalized = normalized_instruction_section_header(raw_line);
+        match normalized.as_str() {
+            "repair targets"
+            | "missing expected artifacts"
+            | "open obligations"
+            | "required verification still missing" => has_actionable_continuation_section = true,
+            "expected artifacts" => has_expected_artifacts = true,
+            "failed required verification commands"
+            | "required verification failed in the latest evidence"
+            | "latest verification failure evidence"
+            | "verification failure evidence" => has_actionable_continuation_section = true,
+            _ => {}
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    has_actionable_continuation_section
+        && has_expected_artifacts
+        && (lower.contains("manual st") && lower.contains("continuation")
+            || lower.contains("verification-repair continuation")
+            || lower.contains("closeout continuation")
+            || lower.contains("verification continuation")
+            || lower.contains("repair continuation")
+            || lower.contains("latest required verification command failed")
+            || lower.contains("rerun the failed required verification")
+            || lower.contains("after the repair edit"))
+}
+
+fn normalized_instruction_section_header(line: &str) -> String {
+    line.trim()
+        .trim_start_matches("- ")
+        .trim_end_matches(':')
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn non_authority_context_section_header(
+    line: &str,
+    expected_artifacts_are_continuation_evidence: bool,
+) -> bool {
+    if diagnostic_evidence_section_header(line) {
+        return true;
+    }
+    let normalized = normalized_instruction_section_header(line);
+    if expected_artifacts_are_continuation_evidence && normalized == "expected artifacts" {
+        return true;
+    }
+    matches!(
+        normalized.as_str(),
+        "previous final assistant message"
+            | "previous assistant message"
+            | "previous final assistant response"
+            | "previous final response"
+            | "previous assistant response"
+            | "prior final assistant message"
+            | "prior assistant message"
+            | "prior final response"
+            | "previous final answer"
+            | "prior final answer"
+            | "assistant summary"
+            | "previous assistant summary"
+            | "prior assistant summary"
+            | "previous closeout message"
+            | "prior closeout message"
+    )
+}
+
+fn diagnostic_evidence_section_header(line: &str) -> bool {
+    let normalized = normalized_instruction_section_header(line);
+    matches!(
+        normalized.as_str(),
+        "latest verification failure evidence"
+            | "verification failure evidence"
+            | "latest failure evidence"
+            | "failure evidence"
+            | "request diagnostics"
+            | "diagnostics"
+            | "stdout"
+            | "stderr"
+            | "traceback"
+    )
+}
+
+fn non_diagnostic_authority_section_header(line: &str) -> bool {
+    let normalized = normalized_instruction_section_header(line);
+    matches!(
+        normalized.as_str(),
+        "repair targets"
+            | "expected artifacts"
+            | "open obligations"
+            | "required verification still missing"
+            | "failed required verification commands"
+            | "required verification failed in the latest evidence"
+            | "required verification commands"
+            | "case"
+            | "stage"
+            | "verification-repair attempt"
+            | "verification attempt"
+    )
+}
+
+fn diagnostic_traceback_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("file \"")
+        || lower.starts_with("file '")
+        || lower.starts_with("traceback (most recent call last)")
+        || lower.starts_with("unicodeerror:")
+        || lower.starts_with("unicodedecodeerror:")
+        || lower.starts_with("typeerror:")
+        || lower.starts_with("assertionerror:")
+        || lower.starts_with("importerror:")
+        || lower.starts_with("modulenotfounderror:")
 }
 
 fn staged_task_verification_commands(
@@ -3923,7 +4890,7 @@ pub(crate) fn documentation_change_may_lead_implementation(text: &str) -> bool {
         "confirmed facts only",
         "document the current implementation",
         "describe the current implementation",
-        "document the current calculator design",
+        "document the current component design",
         "current implementation only",
     ]
     .iter()
@@ -3952,7 +4919,7 @@ pub(crate) fn documentation_change_may_lead_implementation(text: &str) -> bool {
     let spec_shift = [
         "specification becomes",
         "update the specification",
-        "becomes a scientific calculator",
+        "becomes a scientific component",
         "support sin",
         "support cos",
         "support sqrt",
@@ -4402,15 +5369,9 @@ fn classify_requested_line_intent(
         || code_spans
             .iter()
             .any(|span| instruction_contains_verification_command(span))
-        || [
-            "pytest",
-            "cargo test",
-            "python -m unittest",
-            "uv run",
-            "verification",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker));
+        || ["pytest", "cargo test", "python -m unittest", "verification"]
+            .iter()
+            .any(|marker| lower.contains(marker));
 
     if has_reference_markers && !has_output_markers {
         RequestedLineIntent::Reference
@@ -5261,7 +6222,7 @@ fn verification_repair_rotated_focus_target(
     state: Option<&SessionStateSnapshot>,
 ) -> Option<String> {
     latest_user_index(transcript, start_index)?;
-    let failure = latest_verification_failure_context(transcript)?;
+    let failure = state.and_then(|state| state.failure.as_ref())?;
     let preceding_repair_targets = latest_failed_verification_preceding_repair_targets(transcript);
     let public_behavior_contract = state
         .and_then(|state| state.verification.failure_cluster.as_ref())
@@ -5802,7 +6763,6 @@ pub(crate) fn stale_inactive_authoring_replay_uses_live_builder() -> bool {
                 success: Some(true),
                 progress_effect: crate::protocol::ToolProgressEffect::MadeProgress,
                 blocked_action: None,
-                required_next_action: None,
                 result_hash: Some("fixture-source-write".to_string()),
                 verification_run: None,
             },
@@ -5814,6 +6774,7 @@ pub(crate) fn stale_inactive_authoring_replay_uses_live_builder() -> bool {
     let projection =
         build_provider_replay_projection_from_history_items(&session, &history_items, 32, &context);
     let mut saw_omission_note = false;
+    let mut saw_reference_snapshot = false;
     let mut saw_stale_tool_call = false;
     let mut saw_stale_tool_output = false;
     for message in &projection.messages {
@@ -5824,9 +6785,15 @@ pub(crate) fn stale_inactive_authoring_replay_uses_live_builder() -> bool {
                     && content.contains("test_source.py")
                     && !content.contains("[omitted inactive authoring target]")
                     && !content.contains("[omitted stale inactive authoring payload")
-                    && !content.contains(stale_payload)
                 {
                     saw_omission_note = true;
+                }
+                if content.contains("Reference-only accepted artifact snapshot")
+                    && content.contains("artifact_path: `source.py`")
+                    && content.contains("implementation_only")
+                    && content.contains("Do not rewrite this inactive target")
+                {
+                    saw_reference_snapshot = true;
                 }
             }
             ModelMessage::AssistantToolCalls { tool_calls, .. } => {
@@ -5849,11 +6816,11 @@ pub(crate) fn stale_inactive_authoring_replay_uses_live_builder() -> bool {
     }
     let serialized = serde_json::to_string(&projection.messages).unwrap_or_default();
     saw_omission_note
+        && saw_reference_snapshot
         && !saw_stale_tool_call
         && !saw_stale_tool_output
         && !serialized.contains("[omitted inactive authoring target]")
         && !serialized.contains("[omitted stale inactive authoring payload")
-        && !serialized.contains(stale_payload)
         && projection.replay_policies.iter().any(|policy| {
             policy.policy == "stale_inactive_authoring_payload_omitted"
                 && policy.call_id.as_deref() == Some(&call_id.to_string())
@@ -5864,6 +6831,368 @@ pub(crate) fn stale_inactive_authoring_replay_uses_live_builder() -> bool {
 
 pub fn stale_inactive_authoring_replay_omits_fake_executable_arguments() -> bool {
     stale_inactive_authoring_replay_uses_live_builder()
+        && stale_inactive_apply_patch_filechange_replay_uses_reference_snapshot()
+        && stale_inactive_filechange_without_replayable_tool_call_uses_reference_snapshot()
+        && provider_replay_omits_stale_inactive_authoring_prelude_text()
+}
+
+pub(crate) fn provider_replay_omits_stale_inactive_authoring_prelude_text() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let call_id = crate::session::ToolCallId::new();
+    let stale_prelude = "`source.py` を作成します。";
+    let stale_payload = "def implementation_only():\n    return 'old source'\n";
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "stale inactive prelude replay".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        completed_at_ms: None,
+    };
+    let history_items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create source.py and test_source.py".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::Message {
+                message_id: None,
+                role: MessageRole::Assistant,
+                content: vec![ContentPart::Text {
+                    text: stale_prelude.to_string(),
+                }],
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolCall {
+                call_id,
+                tool: ToolName::Write,
+                arguments: json!({
+                    "path": "source.py",
+                    "content": stale_payload,
+                }),
+                model_arguments: Value::Null,
+                effective_arguments: json!({
+                    "path": "source.py",
+                    "content": stale_payload,
+                }),
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![ToolName::Write],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id,
+                status: crate::protocol::ToolLifecycleStatus::Completed,
+                title: "Wrote Added source.py".to_string(),
+                output_text: format!("Added source.py\n{stale_payload}"),
+                metadata: Value::Null,
+                success: Some(true),
+                progress_effect: crate::protocol::ToolProgressEffect::MadeProgress,
+                blocked_action: None,
+                result_hash: Some("fixture-source-write".to_string()),
+                verification_run: None,
+            },
+        },
+    ];
+    let context = ProviderReplayContext {
+        active_authoring_targets: vec!["test_source.py".to_string()],
+    };
+    let projection =
+        build_provider_replay_projection_from_history_items(&session, &history_items, 32, &context);
+    let serialized = serde_json::to_string(&projection.messages).unwrap_or_default();
+    !serialized.contains(stale_prelude)
+        && serialized.contains("Reference-only accepted artifact snapshot")
+        && serialized.contains("artifact_path: `source.py`")
+        && serialized.contains("test_source.py")
+        && !serialized.contains(stale_payload)
+        && projection.replay_policies.iter().any(|policy| {
+            policy.policy == "stale_inactive_authoring_payload_omitted"
+                && policy.call_id.as_deref() == Some(&call_id.to_string())
+                && policy.omitted_targets == vec!["source.py".to_string()]
+                && policy.active_targets == vec!["test_source.py".to_string()]
+        })
+}
+
+pub(crate) fn stale_inactive_apply_patch_filechange_replay_uses_reference_snapshot() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let call_id = crate::session::ToolCallId::new();
+    let change_id = crate::session::ChangeId::new();
+    let source_content = "def implementation_only():\n    return 'accepted source'\n";
+    let patch_text = "*** Begin Patch\n*** Add File: source.py\n+def implementation_only():\n+    return 'accepted source'\n*** End Patch";
+    let diff_text = "--- /dev/null\n+++ source.py\n@@ -0,0 +1,2 @@\n+def implementation_only():\n+    return 'accepted source'\n";
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "stale inactive apply_patch replay".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        completed_at_ms: None,
+    };
+    let history_items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create source.py and test_source.py".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolCall {
+                call_id,
+                tool: ToolName::ApplyPatch,
+                arguments: json!({ "patch_text": patch_text }),
+                model_arguments: Value::Null,
+                effective_arguments: json!({ "patch_text": patch_text }),
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![ToolName::ApplyPatch],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id,
+                status: crate::protocol::ToolLifecycleStatus::Completed,
+                title: "Applied 1 change(s)".to_string(),
+                output_text: "Added source.py".to_string(),
+                metadata: json!({
+                    "changes": [{
+                        "kind": "add",
+                        "path_after": "source.py",
+                        "summary": "Added source.py"
+                    }],
+                    "diff_text": diff_text,
+                    "operation_progress_class": "content_changing_progress",
+                    "progress_effect": "made_progress",
+                    "tool_feedback_envelope": {
+                        "operation_progress_class": "content_changing_progress",
+                        "progress_effect": "made_progress",
+                        "side_effects_applied": true
+                    }
+                }),
+                success: Some(true),
+                progress_effect: crate::protocol::ToolProgressEffect::MadeProgress,
+                blocked_action: None,
+                result_hash: Some("fixture-source-apply-patch".to_string()),
+                verification_run: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![change_id],
+                changes: vec![crate::protocol::FileChangeEvidence {
+                    change_id,
+                    kind: crate::session::ChangeKind::Add,
+                    path_before: None,
+                    path_after: Some(Utf8PathBuf::from("source.py")),
+                    summary: "Added source.py".to_string(),
+                }],
+                summary: "Added source.py".to_string(),
+            },
+        },
+    ];
+    let context = ProviderReplayContext {
+        active_authoring_targets: vec!["test_source.py".to_string()],
+    };
+    let projection =
+        build_provider_replay_projection_from_history_items(&session, &history_items, 32, &context);
+    let call_id_text = call_id.to_string();
+    let mut saw_omission_note = false;
+    let mut saw_reference_snapshot = false;
+    let mut saw_reference_source_content = false;
+    let mut saw_stale_tool_call = false;
+    let mut saw_stale_tool_output = false;
+    for message in &projection.messages {
+        match message {
+            ModelMessage::System { content } => {
+                if content.contains("inactive target")
+                    && content.contains("non-executable historical context")
+                    && content.contains("test_source.py")
+                {
+                    saw_omission_note = true;
+                }
+                if content.contains("Reference-only accepted artifact snapshot")
+                    && content.contains("artifact_path: `source.py`")
+                    && content.contains("implementation_only")
+                    && content.contains("Do not rewrite this inactive target")
+                {
+                    saw_reference_snapshot = true;
+                }
+                if source_content
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .all(|line| content.contains(line))
+                {
+                    saw_reference_source_content = true;
+                }
+            }
+            ModelMessage::AssistantToolCalls { tool_calls, .. } => {
+                if tool_calls
+                    .iter()
+                    .any(|tool_call| tool_call.call_id == call_id_text)
+                {
+                    saw_stale_tool_call = true;
+                }
+            }
+            ModelMessage::Tool {
+                call_id: replayed_call_id,
+                ..
+            } => {
+                if replayed_call_id == &call_id_text {
+                    saw_stale_tool_output = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let serialized = serde_json::to_string(&projection.messages).unwrap_or_default();
+    saw_omission_note
+        && saw_reference_snapshot
+        && saw_reference_source_content
+        && !saw_stale_tool_call
+        && !saw_stale_tool_output
+        && !serialized.contains(patch_text)
+        && projection.replay_policies.iter().any(|policy| {
+            policy.policy == "stale_inactive_authoring_payload_omitted"
+                && policy.call_id.as_deref() == Some(call_id_text.as_str())
+                && policy.omitted_targets == vec!["source.py".to_string()]
+                && policy.active_targets == vec!["test_source.py".to_string()]
+        })
+}
+
+pub(crate) fn stale_inactive_filechange_without_replayable_tool_call_uses_reference_snapshot()
+-> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let change_id = crate::session::ChangeId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "stale inactive filechange-only replay".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        completed_at_ms: None,
+    };
+    let history_items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create source.py and test_source.py".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                change_ids: vec![change_id],
+                changes: vec![crate::protocol::FileChangeEvidence {
+                    change_id,
+                    kind: crate::session::ChangeKind::Add,
+                    path_before: None,
+                    path_after: Some(Utf8PathBuf::from("source.py")),
+                    summary: "Added source.py".to_string(),
+                }],
+                summary: "Added source.py".to_string(),
+            },
+        },
+    ];
+    let context = ProviderReplayContext {
+        active_authoring_targets: vec!["test_source.py".to_string()],
+    };
+    let projection =
+        build_provider_replay_projection_from_history_items(&session, &history_items, 32, &context);
+    let serialized = serde_json::to_string(&projection.messages).unwrap_or_default();
+    serialized.contains("Reference-only accepted artifact snapshot")
+        && serialized.contains("artifact_path: `source.py`")
+        && serialized.contains("already exists")
+        && serialized.contains("Do not rewrite this inactive target")
+        && serialized.contains("test_source.py")
+        && !serialized.contains("source.py and test_source.py are both open")
 }
 
 pub(crate) fn failed_inactive_authoring_replay_uses_call_scoped_summary() -> bool {
@@ -5946,7 +7275,6 @@ pub(crate) fn failed_inactive_authoring_replay_uses_call_scoped_summary() -> boo
                 success: Some(false),
                 progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
                 blocked_action: None,
-                required_next_action: None,
                 result_hash: Some("fixture-wrong-target".to_string()),
                 verification_run: None,
             },
@@ -5960,16 +7288,26 @@ pub(crate) fn failed_inactive_authoring_replay_uses_call_scoped_summary() -> boo
     let call_id_text = call_id.to_string();
     let mut saw_failed_tool_call = false;
     let mut saw_failed_tool_output = false;
+    let mut saw_raw_stale_arguments = false;
     for message in &projection.messages {
         match message {
             ModelMessage::AssistantToolCalls { tool_calls, .. } => {
                 if tool_calls.iter().any(|tool_call| {
                     tool_call.call_id == call_id_text
                         && tool_call.tool_name == "write"
-                        && tool_call.arguments_json.contains("\"path\":\"source.py\"")
-                        && tool_call.arguments_json.contains("implementation_only")
+                        && tool_call
+                            .arguments_json
+                            .contains("omitted wrong-target write payload")
+                        && !tool_call.arguments_json.contains("\"path\"")
+                        && !tool_call.arguments_json.contains("implementation_only")
                 }) {
                     saw_failed_tool_call = true;
+                }
+                if tool_calls
+                    .iter()
+                    .any(|tool_call| tool_call.arguments_json.contains("implementation_only"))
+                {
+                    saw_raw_stale_arguments = true;
                 }
             }
             ModelMessage::Tool {
@@ -5991,7 +7329,8 @@ pub(crate) fn failed_inactive_authoring_replay_uses_call_scoped_summary() -> boo
     let serialized = serde_json::to_string(&projection.messages).unwrap_or_default();
     saw_failed_tool_call
         && saw_failed_tool_output
-        && serialized.contains("implementation_only")
+        && !saw_raw_stale_arguments
+        && !serialized.contains(stale_payload)
         && projection.replay_policies.iter().any(|policy| {
             policy.policy == "failed_inactive_authoring_call_output_preserved"
                 && policy.call_id.as_deref() == Some(call_id_text.as_str())
@@ -6001,8 +7340,145 @@ pub(crate) fn failed_inactive_authoring_replay_uses_call_scoped_summary() -> boo
         })
 }
 
+pub(crate) fn failed_inactive_apply_patch_replay_uses_call_scoped_summary() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let call_id = crate::session::ToolCallId::new();
+    let stale_payload = "*** Begin Patch\n*** Add File: source.py\n+def implementation_only():\n+    return 'wrong target rewrite'\n*** End Patch";
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "failed inactive apply_patch replay".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        completed_at_ms: None,
+    };
+    let history_items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create source.py and test_source.py".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolCall {
+                call_id,
+                tool: ToolName::ApplyPatch,
+                arguments: json!({ "patch_text": stale_payload }),
+                model_arguments: Value::Null,
+                effective_arguments: json!({ "patch_text": stale_payload }),
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![ToolName::ApplyPatch],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id,
+                status: crate::protocol::ToolLifecycleStatus::Completed,
+                title: "Wrong authoring target".to_string(),
+                output_text: "The submitted content-changing `apply_patch` call targets `source.py`, but the current active requested deliverables are `test_source.py`.".to_string(),
+                metadata: json!({
+                    "operation_progress_class": "wrong_authoring_target",
+                    "progress_effect": "no_progress",
+                    "submitted_targets": ["source.py"],
+                    "active_authoring_targets": ["test_source.py"],
+                }),
+                success: Some(false),
+                progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
+                blocked_action: None,
+                result_hash: Some("fixture-wrong-target-patch".to_string()),
+                verification_run: None,
+            },
+        },
+    ];
+    let context = ProviderReplayContext {
+        active_authoring_targets: vec!["test_source.py".to_string()],
+    };
+    let projection =
+        build_provider_replay_projection_from_history_items(&session, &history_items, 32, &context);
+    let call_id_text = call_id.to_string();
+    let mut saw_failed_tool_call = false;
+    let mut saw_failed_tool_output = false;
+    let mut saw_raw_stale_arguments = false;
+    for message in &projection.messages {
+        match message {
+            ModelMessage::AssistantToolCalls { tool_calls, .. } => {
+                if tool_calls.iter().any(|tool_call| {
+                    tool_call.call_id == call_id_text
+                        && tool_call.tool_name == "apply_patch"
+                        && tool_call
+                            .arguments_json
+                            .contains("omitted wrong-target patch payload")
+                        && !tool_call.arguments_json.contains("implementation_only")
+                }) {
+                    saw_failed_tool_call = true;
+                }
+                if tool_calls
+                    .iter()
+                    .any(|tool_call| tool_call.arguments_json.contains("implementation_only"))
+                {
+                    saw_raw_stale_arguments = true;
+                }
+            }
+            ModelMessage::Tool {
+                call_id: replayed_call_id,
+                result,
+                ..
+            } => {
+                if replayed_call_id == &call_id_text
+                    && result.contains("source.py")
+                    && result.contains("test_source.py")
+                {
+                    saw_failed_tool_output = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let serialized = serde_json::to_string(&projection.messages).unwrap_or_default();
+    saw_failed_tool_call
+        && saw_failed_tool_output
+        && !saw_raw_stale_arguments
+        && !serialized.contains(stale_payload)
+        && projection.replay_policies.iter().any(|policy| {
+            policy.policy == "failed_inactive_authoring_call_output_preserved"
+                && policy.call_id.as_deref() == Some(call_id_text.as_str())
+                && policy.omitted_targets == vec!["source.py".to_string()]
+                && policy.active_targets == vec!["test_source.py".to_string()]
+        })
+}
+
 pub fn provider_replay_preserves_failed_inactive_authoring_feedback() -> bool {
     failed_inactive_authoring_replay_uses_call_scoped_summary()
+        && failed_inactive_apply_patch_replay_uses_call_scoped_summary()
 }
 
 pub(crate) fn stale_progress_projection_replay_uses_live_builder() -> bool {
@@ -6021,7 +7497,7 @@ pub(crate) fn stale_progress_projection_replay_uses_live_builder() -> bool {
         updated_at_ms: 2,
         completed_at_ms: None,
     };
-    let stale_plan_text = "space_invader.py 作成";
+    let stale_plan_text = "arcade_game.py 作成";
     let history_items = vec![
         HistoryItem {
             id: crate::protocol::HistoryItemId::new(),
@@ -6055,7 +7531,7 @@ pub(crate) fn stale_progress_projection_replay_uses_live_builder() -> bool {
                             "content": stale_plan_text,
                             "status": "in_progress",
                             "priority": "high",
-                            "targets": ["space_invader.py"]
+                            "targets": ["arcade_game.py"]
                         }
                     ]
                 }),
@@ -6080,23 +7556,19 @@ pub(crate) fn stale_progress_projection_replay_uses_live_builder() -> bool {
                 status: crate::protocol::ToolLifecycleStatus::Completed,
                 title: "Plan updated".to_string(),
                 output_text:
-                    "Plan updated [tool feedback] progress_projection no_progress space_invader.py"
+                    "Plan updated [tool feedback] progress_projection no_progress arcade_game.py"
                         .to_string(),
                 metadata: Value::Null,
                 success: Some(true),
                 progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
                 blocked_action: None,
-                required_next_action: None,
                 result_hash: Some("fixture-plan".to_string()),
                 verification_run: None,
             },
         },
     ];
     let context = ProviderReplayContext {
-        active_authoring_targets: vec![
-            "README.md".to_string(),
-            "test_space_invader.py".to_string(),
-        ],
+        active_authoring_targets: vec!["README.md".to_string(), "test_arcade_game.py".to_string()],
     };
     let projection =
         build_provider_replay_projection_from_history_items(&session, &history_items, 32, &context);
@@ -6109,7 +7581,7 @@ pub(crate) fn stale_progress_projection_replay_uses_live_builder() -> bool {
                 if content.contains("Historical progress-projection tool call/output pair")
                     && content.contains("non-executable planning context")
                     && content.contains("README.md")
-                    && content.contains("test_space_invader.py")
+                    && content.contains("test_arcade_game.py")
                     && !content.contains(stale_plan_text)
                 {
                     saw_omission_note = true;
@@ -6143,9 +7615,9 @@ pub(crate) fn stale_progress_projection_replay_uses_live_builder() -> bool {
             policy.policy == "progress_projection_payload_omitted"
                 && policy.call_id.as_deref() == Some(&call_id.to_string())
                 && policy.tool_name.as_deref() == Some("todowrite")
-                && policy.omitted_targets == vec!["space_invader.py".to_string()]
+                && policy.omitted_targets == vec!["arcade_game.py".to_string()]
                 && policy.active_targets
-                    == vec!["README.md".to_string(), "test_space_invader.py".to_string()]
+                    == vec!["README.md".to_string(), "test_arcade_game.py".to_string()]
         })
 }
 
@@ -6181,7 +7653,7 @@ pub(crate) fn current_progress_projection_feedback_replay_preserves_call_output(
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create README.md and test_space_invader.py.".to_string(),
+                    text: "Create README.md and test_arcade_game.py.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -6200,9 +7672,9 @@ pub(crate) fn current_progress_projection_feedback_replay_preserves_call_output(
                 arguments: json!({
                     "todos": [{
                         "id": "step1",
-                        "content": "space_invader.py 作成",
+                        "content": "arcade_game.py 作成",
                         "status": "in_progress",
-                        "targets": ["space_invader.py"]
+                        "targets": ["arcade_game.py"]
                     }]
                 }),
                 model_arguments: Value::Null,
@@ -6225,13 +7697,12 @@ pub(crate) fn current_progress_projection_feedback_replay_preserves_call_output(
                 call_id: stale_call_id,
                 status: crate::protocol::ToolLifecycleStatus::Completed,
                 title: "Plan updated".to_string(),
-                output_text: "Plan updated [tool feedback] progress_projection no_progress space_invader.py"
+                output_text: "Plan updated [tool feedback] progress_projection no_progress arcade_game.py"
                     .to_string(),
                 metadata: Value::Null,
                 success: Some(true),
                 progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
                 blocked_action: None,
-                required_next_action: None,
                 result_hash: Some("stale-plan".to_string()),
                 verification_run: None,
             },
@@ -6248,9 +7719,9 @@ pub(crate) fn current_progress_projection_feedback_replay_preserves_call_output(
                 arguments: json!({
                     "todos": [{
                         "id": "step2",
-                        "content": "test_space_invader.py の作成",
+                        "content": "test_arcade_game.py の作成",
                         "status": "in_progress",
-                        "targets": ["test_space_invader.py"]
+                        "targets": ["test_arcade_game.py"]
                     }, {
                         "id": "step3",
                         "content": "README.md の作成",
@@ -6279,29 +7750,25 @@ pub(crate) fn current_progress_projection_feedback_replay_preserves_call_output(
                 status: crate::protocol::ToolLifecycleStatus::Completed,
                 title: "Plan updated".to_string(),
                 output_text:
-                    "Plan updated\n\n[tool feedback]\noperation_progress_class: progress_projection\nprogress_effect: no_progress\nactive_targets: README.md, test_space_invader.py\nContinue with a file-changing tool output."
+                    "Plan updated\n\n[tool feedback]\noperation_progress_class: progress_projection\nprogress_effect: no_progress\nactive_targets: README.md, test_arcade_game.py\nContinue with a file-changing tool output."
                         .to_string(),
                 metadata: json!({
                     "tool_feedback_envelope": {
                         "operation_progress_class": "progress_projection",
                         "progress_effect": "no_progress",
-                        "active_targets": ["README.md", "test_space_invader.py"]
+                        "active_targets": ["README.md", "test_arcade_game.py"]
                     }
                 }),
                 success: Some(true),
                 progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
                 blocked_action: None,
-                required_next_action: None,
                 result_hash: Some("current-plan".to_string()),
                 verification_run: None,
             },
         },
     ];
     let context = ProviderReplayContext {
-        active_authoring_targets: vec![
-            "README.md".to_string(),
-            "test_space_invader.py".to_string(),
-        ],
+        active_authoring_targets: vec!["README.md".to_string(), "test_arcade_game.py".to_string()],
     };
     let projection =
         build_provider_replay_projection_from_history_items(&session, &history_items, 32, &context);
@@ -6328,7 +7795,7 @@ pub(crate) fn current_progress_projection_feedback_replay_preserves_call_output(
                 if call_id == &current_call_id
                     && result.contains("progress_projection")
                     && result.contains("README.md")
-                    && result.contains("test_space_invader.py")
+                    && result.contains("test_arcade_game.py")
         )
     });
     stale_pair_omitted
@@ -6383,7 +7850,7 @@ pub(crate) fn content_shape_mismatch_replay_preserves_tool_lifecycle_without_pay
                     sequence_no: 1,
                     kind: crate::session::PartKind::Text,
                     payload: MessagePart::Text(crate::session::TextPart {
-                        text: "create calculator.py and test_calculator.py".to_string(),
+                        text: "create component.py and test_component.py".to_string(),
                     }),
                 }],
             },
@@ -6413,7 +7880,7 @@ pub(crate) fn content_shape_mismatch_replay_preserves_tool_lifecycle_without_pay
                             tool_call_id: call_id,
                             tool_name: ToolName::Write,
                             arguments_json: json!({
-                                "path": "calculator.py",
+                                "path": "component.py",
                                 "content": stale_payload,
                             })
                             .to_string(),
@@ -6430,11 +7897,10 @@ pub(crate) fn content_shape_mismatch_replay_preserves_tool_lifecycle_without_pay
                             tool_call_id: call_id,
                             status: ToolCallStatus::Completed,
                             title: "Required write content shape mismatch".to_string(),
-                            summary: "The submitted `write` call targeted `calculator.py`, but current active work requires test content in `test_calculator.py` that imports `calculator`.".to_string(),
+                            summary: "The submitted `write` call targeted `component.py`, but current active work requires test content in `test_component.py` that imports `component`.".to_string(),
                             success: Some(false),
                             progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
                             blocked_action: None,
-                            required_next_action: None,
                             result_hash: Some("fixture-required-write-content-shape-mismatch".to_string()),
                         }),
                     },
@@ -6444,7 +7910,7 @@ pub(crate) fn content_shape_mismatch_replay_preserves_tool_lifecycle_without_pay
     };
     let state = SessionStateSnapshot {
         process_phase: ProcessPhase::Author,
-        active_targets: vec![Utf8PathBuf::from("test_calculator.py")],
+        active_targets: vec![Utf8PathBuf::from("test_component.py")],
         ..SessionStateSnapshot::default()
     };
     let turn_id = crate::protocol::TurnId::new();
@@ -6458,7 +7924,7 @@ pub(crate) fn content_shape_mismatch_replay_preserves_tool_lifecycle_without_pay
             payload: HistoryItemPayload::UserTurn {
                 message_id: Some(user_message_id),
                 content: vec![ContentPart::Text {
-                    text: "create calculator.py and test_calculator.py".to_string(),
+                    text: "create component.py and test_component.py".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -6475,12 +7941,12 @@ pub(crate) fn content_shape_mismatch_replay_preserves_tool_lifecycle_without_pay
                 call_id,
                 tool: ToolName::Write,
                 arguments: json!({
-                    "path": "calculator.py",
+                    "path": "component.py",
                     "content": stale_payload,
                 }),
                 model_arguments: Value::Null,
                 effective_arguments: json!({
-                    "path": "calculator.py",
+                    "path": "component.py",
                     "content": stale_payload,
                 }),
                 adjusted_arguments: None,
@@ -6501,12 +7967,11 @@ pub(crate) fn content_shape_mismatch_replay_preserves_tool_lifecycle_without_pay
                 call_id,
                 status: crate::protocol::ToolLifecycleStatus::Completed,
                 title: "Required write content shape mismatch".to_string(),
-                output_text: "The submitted `write` call targeted `calculator.py`, but current active work requires test content in `test_calculator.py` that imports `calculator`.".to_string(),
+                output_text: "The submitted `write` call targeted `component.py`, but current active work requires test content in `test_component.py` that imports `component`.".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
                 blocked_action: None,
-                required_next_action: None,
                 result_hash: Some("fixture-required-write-content-shape-mismatch".to_string()),
                 verification_run: None,
             },
@@ -6536,7 +8001,7 @@ pub(crate) fn content_shape_mismatch_replay_preserves_tool_lifecycle_without_pay
                             .arguments_json
                             .contains("omitted incompatible write payload")
                         && !call.arguments_json.contains(stale_payload)
-                        && !call.arguments_json.contains("calculator.py")
+                        && !call.arguments_json.contains("component.py")
                     {
                         saw_sanitized_tool_call = true;
                     }
@@ -6559,6 +8024,402 @@ pub(crate) fn content_shape_mismatch_replay_preserves_tool_lifecycle_without_pay
         }
     }
     saw_sanitized_tool_call && saw_tool_output
+}
+
+pub(crate) fn exact_write_repair_omits_consumed_supporting_context_replay() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let source_read_id = crate::session::ToolCallId::new();
+    let test_read_id = crate::session::ToolCallId::new();
+    let write_id = crate::session::ToolCallId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "consumed supporting context replay".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: "fixture-model".to_string(),
+        base_url: "http://fixture".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Write docs/component-design.md from component.py and test_component.py"
+                        .to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolCall {
+                call_id: source_read_id,
+                tool: ToolName::Read,
+                arguments: json!({ "path": "component.py" }),
+                model_arguments: Value::Null,
+                effective_arguments: json!({ "path": "component.py" }),
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![ToolName::Read],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: source_read_id,
+                status: crate::protocol::ToolLifecycleStatus::Completed,
+                title: "Read component.py".to_string(),
+                output_text: "1: def calculate(value):\n2:     return value + 1".to_string(),
+                metadata: Value::Null,
+                success: Some(true),
+                progress_effect: crate::protocol::ToolProgressEffect::MadeProgress,
+                blocked_action: None,
+                result_hash: Some("component-read".to_string()),
+                verification_run: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::ToolCall {
+                call_id: test_read_id,
+                tool: ToolName::Read,
+                arguments: json!({ "path": "test_component.py" }),
+                model_arguments: Value::Null,
+                effective_arguments: json!({ "path": "test_component.py" }),
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![ToolName::Read],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 5,
+            created_at_ms: 5,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: test_read_id,
+                status: crate::protocol::ToolLifecycleStatus::Completed,
+                title: "Read test_component.py".to_string(),
+                output_text: "1: import component\n2: def test_calculate(): pass".to_string(),
+                metadata: Value::Null,
+                success: Some(true),
+                progress_effect: crate::protocol::ToolProgressEffect::MadeProgress,
+                blocked_action: None,
+                result_hash: Some("test-component-read".to_string()),
+                verification_run: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 6,
+            created_at_ms: 6,
+            payload: HistoryItemPayload::ToolCall {
+                call_id: write_id,
+                tool: ToolName::Write,
+                arguments: json!({
+                    "path": "docs/component-design.md",
+                    "content": "\"# Component design\\n\\nSerialized markdown\""
+                }),
+                model_arguments: Value::Null,
+                effective_arguments: json!({
+                    "path": "docs/component-design.md",
+                    "content": "\"# Component design\\n\\nSerialized markdown\""
+                }),
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![ToolName::Write],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 7,
+            created_at_ms: 7,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: write_id,
+                status: crate::protocol::ToolLifecycleStatus::Completed,
+                title: "Required write content shape mismatch".to_string(),
+                output_text: "The submitted content does not match `docs/component-design.md`'s contract. Required positive text artifact shape: real newline-separated Markdown.".to_string(),
+                metadata: json!({
+                    "content_shape_contract": {
+                        "kind": "text_artifact_readable_content_shape",
+                        "target": "docs/component-design.md"
+                    }
+                }),
+                success: Some(false),
+                progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
+                blocked_action: None,
+                result_hash: Some("docs-shape-mismatch".to_string()),
+                verification_run: None,
+            },
+        },
+    ];
+    let context = ProviderReplayContext {
+        active_authoring_targets: vec!["docs/component-design.md".to_string()],
+    };
+    let projection =
+        build_provider_replay_projection_from_history_items(&session, &items, 32, &context);
+    let source_read_id = source_read_id.to_string();
+    let test_read_id = test_read_id.to_string();
+    let write_id = write_id.to_string();
+    let read_pairs_omitted = !projection.messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::AssistantToolCalls { tool_calls, .. }
+                if tool_calls.iter().any(|call| {
+                    call.call_id == source_read_id || call.call_id == test_read_id
+                })
+        ) || matches!(
+            message,
+            ModelMessage::Tool { call_id, .. }
+                if call_id == &source_read_id || call_id == &test_read_id
+        )
+    });
+    let evidence_notes_present = projection.messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::System { content }
+                if content.contains("already-consumed evidence")
+                    && content.contains("component.py")
+                    && content.contains("provider-visible edit tool")
+        )
+    }) && projection.messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::System { content }
+                if content.contains("already-consumed evidence")
+                    && content.contains("test_component.py")
+        )
+    });
+    let rejected_write_pair_preserved = projection.messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::AssistantToolCalls { tool_calls, .. }
+                if tool_calls.iter().any(|call| {
+                    call.call_id == write_id
+                        && call.tool_name == "write"
+                        && call
+                            .arguments_json
+                            .contains("omitted incompatible write payload")
+                        && !call.arguments_json.contains("Serialized markdown")
+                })
+        )
+    }) && projection.messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::Tool { call_id, result, .. }
+                if call_id == &write_id
+                    && result.contains("Required positive text artifact shape")
+        )
+    });
+    let policies_present = projection
+        .replay_policies
+        .iter()
+        .filter(|policy| policy.policy == "consumed_supporting_context_pair_omitted")
+        .count()
+        == 2;
+    read_pairs_omitted
+        && evidence_notes_present
+        && rejected_write_pair_preserved
+        && policies_present
+}
+
+pub fn provider_replay_preserves_current_invalid_edit_argument_feedback() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let call_id = crate::session::ToolCallId::new();
+    let orphan_call_id = crate::session::ToolCallId::new();
+    let raw_malformed_payload =
+        r#"{"content":"def parse_input(text):\n    return text", "path":"component.py"#;
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "malformed edit replay".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: "fixture-model".to_string(),
+        base_url: "http://fixture".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "repair component.py after verification failure".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolCall {
+                call_id,
+                tool: ToolName::Write,
+                arguments: Value::String(raw_malformed_payload.to_string()),
+                model_arguments: Value::Null,
+                effective_arguments: Value::Null,
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![ToolName::Write, ToolName::ApplyPatch],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id,
+                status: crate::protocol::ToolLifecycleStatus::Completed,
+                title: "Invalid tool arguments".to_string(),
+                output_text: "Invalid tool arguments for `write`: EOF while parsing a string at line 1 column 74.\n\n[tool feedback]\noperation_progress_class: invalid_edit_arguments\nprogress_effect: no_progress\nparser_error_family: json_eof\nraw_argument_shape_hash: malformed-fixture-hash\nactive_targets: component.py\nRequired action: write:component.py".to_string(),
+                metadata: json!({
+                    "operation_progress_class": "invalid_edit_arguments",
+                    "tool_feedback_envelope": {
+                        "kind": "invalid_edit_arguments",
+                        "operation_progress_class": "invalid_edit_arguments",
+                        "parser_error": "EOF while parsing a string at line 1 column 74",
+                        "raw_argument_shape_hash": "malformed-fixture-hash",
+                        "active_targets": ["component.py"],
+                        "allowed_surface": ["write", "apply_patch"],
+                        "required_action": {
+                            "kind": "edit_target",
+                            "tool": "write",
+                            "target": "component.py",
+                            "projection_text": "write:component.py"
+                        },
+                        "side_effects_applied": false
+                    }
+                }),
+                success: Some(false),
+                progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
+                blocked_action: Some("write".to_string()),
+                result_hash: Some("malformed-fixture-hash".to_string()),
+                verification_run: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: orphan_call_id,
+                status: crate::protocol::ToolLifecycleStatus::Completed,
+                title: "Orphan output".to_string(),
+                output_text: "orphan malformed edit output must not be provider-visible"
+                    .to_string(),
+                metadata: json!({
+                    "operation_progress_class": "invalid_edit_arguments"
+                }),
+                success: Some(false),
+                progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
+                blocked_action: None,
+                result_hash: None,
+                verification_run: None,
+            },
+        },
+    ];
+    let context = ProviderReplayContext {
+        active_authoring_targets: vec!["component.py".to_string()],
+    };
+    let projection =
+        build_provider_replay_projection_from_history_items(&session, &items, 32, &context);
+    let serialized = serde_json::to_string(&projection.messages).unwrap_or_default();
+    let call_id_text = call_id.to_string();
+    let call_index = projection.messages.iter().position(|message| {
+        matches!(
+            message,
+            ModelMessage::AssistantToolCalls { tool_calls, .. }
+                if tool_calls.iter().any(|tool_call| {
+                    tool_call.call_id == call_id_text
+                        && tool_call.tool_name == "write"
+                        && tool_call
+                            .arguments_json
+                            .contains("omitted malformed edit payload")
+                        && !tool_call.arguments_json.contains(raw_malformed_payload)
+                        && !tool_call.arguments_json.contains("component.py")
+                })
+        )
+    });
+    let output_index = projection.messages.iter().position(|message| {
+        matches!(
+            message,
+            ModelMessage::Tool {
+                call_id: replayed,
+                tool_name,
+                result,
+            } if replayed == &call_id_text
+                && tool_name == "write"
+                && result.contains("invalid_edit_arguments")
+                && result.contains("EOF while parsing")
+                && result.contains("Required action: write:component.py")
+        )
+    });
+    matches!((call_index, output_index), (Some(call), Some(output)) if call < output)
+        && !serialized.contains(raw_malformed_payload)
+        && !serialized.contains("orphan malformed edit output must not be provider-visible")
+        && projection.replay_policies.iter().any(|policy| {
+            policy.policy == "malformed_edit_arguments_payload_sanitized_output_preserved"
+                && policy.call_id.as_deref() == Some(&call_id_text)
+                && policy.tool_name.as_deref() == Some("write")
+        })
 }
 
 pub(crate) fn stale_write_prelude_replay_omits_text(
@@ -6728,14 +8589,14 @@ pub(crate) fn stale_todo_progress_replay_omits_prior_plan(
                             "todos": [
                                 {
                                     "id": "source",
-                                    "content": "write calculator.py",
+                                    "content": "write component.py",
                                     "status": "in_progress",
                                     "priority": "high",
-                                    "targets": ["calculator.py"]
+                                    "targets": ["component.py"]
                                 },
                                 {
                                     "id": "test",
-                                    "content": "write test_calculator.py",
+                                    "content": "write test_component.py",
                                     "status": "pending",
                                     "priority": "high",
                                     "targets": [required_target]
@@ -6774,15 +8635,15 @@ pub(crate) fn stale_todo_progress_replay_omits_prior_plan(
 
 pub(crate) fn exact_write_target_contract_projects_content_authority(target: &str) -> bool {
     let contract = exact_write_target_contract(target);
-    contract.contains("write")
-        && contract.contains(&format!("`path` set to `{target}`"))
-        && contract
-            .contains("The provider-visible tool schema remains the stable `write` interface")
+    contract.contains("apply_patch")
+        && contract.contains("patch_text")
+        && contract.contains(target)
+        && contract.contains("provider-visible stable code edit surface is `apply_patch`")
         && !contract.contains("ActionAuthority")
         && contract.contains("Older assistant narration")
         && if target_is_test_like(target) {
             contract.contains("test module")
-                && contract.contains("Required positive shape")
+                && contract.contains("Required positive test-module shape")
                 && contract.contains("Forbidden shape")
                 && crate::agent::content_shape_contract::python_source_for_test_target(target)
                     .is_none_or(|shape| {
@@ -6791,26 +8652,464 @@ pub(crate) fn exact_write_target_contract_projects_content_authority(target: &st
                             shape.source_path
                         )) && contract.contains(&format!("import `{}`", shape.module_name))
                             && contract.contains(&format!("do not rewrite `{}`", shape.source_path))
-                            && contract
-                                .contains(&format!("{}(unittest.TestCase)", shape.class_name))
+                            && contract.contains("Test*")
+                            && contract.contains("unittest.TestCase")
                     })
+        } else if target_is_python_source_like(target) {
+            contract.contains("Required positive Python source shape")
+                && contract.contains("real newline-separated source structure")
+                && contract.contains("quote-wrapped whole-file source string")
         } else {
             contract.contains("active target only")
         }
 }
 
+pub(crate) fn text_artifact_content_shape_repair_projection_carries_positive_contract() -> bool {
+    let target = "docs/component-design.md";
+    let session_id = crate::session::SessionId::new();
+    let user_message_id = crate::session::MessageId::new();
+    let assistant_message_id = crate::session::MessageId::new();
+    let call_id = crate::session::ToolCallId::new();
+    let serialized_markdown =
+        "\"# Component Design\\n\\n## Tests\\n\\n- `test_component.py` covers behavior.\\n\"";
+    let transcript = Transcript {
+        session: SessionRecord {
+            id: session_id,
+            project_id: crate::session::ProjectId::new(),
+            title: "text artifact content-shape repair".to_string(),
+            status: crate::session::SessionStatus::Running,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "local".to_string(),
+            base_url: "http://localhost:1234".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            completed_at_ms: None,
+        },
+        messages: vec![
+            crate::session::TranscriptMessage {
+                record: crate::session::MessageRecord {
+                    id: user_message_id,
+                    session_id,
+                    role: MessageRole::User,
+                    parent_message_id: None,
+                    sequence_no: 1,
+                    created_at_ms: 1,
+                    metadata: MessageMetadata::User(crate::session::UserMessageMeta {
+                        cwd: Utf8PathBuf::from("C:/workspace"),
+                        requested_model: None,
+                        editor_context: None,
+                    }),
+                },
+                parts: vec![crate::session::PartRecord {
+                    id: crate::session::PartId::new(),
+                    message_id: user_message_id,
+                    sequence_no: 1,
+                    kind: crate::session::PartKind::Text,
+                    payload: MessagePart::Text(crate::session::TextPart {
+                        text: format!("Create `{target}` from repository evidence."),
+                    }),
+                }],
+            },
+            crate::session::TranscriptMessage {
+                record: crate::session::MessageRecord {
+                    id: assistant_message_id,
+                    session_id,
+                    role: MessageRole::Assistant,
+                    parent_message_id: None,
+                    sequence_no: 2,
+                    created_at_ms: 2,
+                    metadata: MessageMetadata::Assistant(crate::session::AssistantMessageMeta {
+                        model: "local".to_string(),
+                        base_url: "http://localhost:1234".to_string(),
+                        finish_reason: None,
+                        token_usage: None,
+                        summary: false,
+                    }),
+                },
+                parts: vec![
+                    crate::session::PartRecord {
+                        id: crate::session::PartId::new(),
+                        message_id: assistant_message_id,
+                        sequence_no: 1,
+                        kind: crate::session::PartKind::ToolCall,
+                        payload: MessagePart::ToolCall(crate::session::ToolCallPart {
+                            tool_call_id: call_id,
+                            tool_name: ToolName::Write,
+                            arguments_json: json!({
+                                "path": target,
+                                "content": serialized_markdown,
+                            })
+                            .to_string(),
+                            model_arguments_json: None,
+                            effective_arguments_json: None,
+                        }),
+                    },
+                    crate::session::PartRecord {
+                        id: crate::session::PartId::new(),
+                        message_id: assistant_message_id,
+                        sequence_no: 2,
+                        kind: crate::session::PartKind::ToolResult,
+                        payload: MessagePart::ToolResult(crate::session::ToolResultPart {
+                            tool_call_id: call_id,
+                            status: ToolCallStatus::Completed,
+                            title: "Required write content shape mismatch".to_string(),
+                            summary: crate::agent::content_shape_contract::text_artifact_positive_shape_guidance(target),
+                            success: Some(false),
+                            progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
+                            blocked_action: None,
+                            result_hash: Some("fixture-text-artifact-content-shape".to_string()),
+                        }),
+                    },
+                ],
+            },
+        ],
+    };
+    let mut state = SessionStateSnapshot {
+        route: TaskRoute::Docs,
+        process_phase: ProcessPhase::Author,
+        active_targets: vec![Utf8PathBuf::from(target)],
+        ..SessionStateSnapshot::default()
+    };
+    state.completion.open_work_count = 1;
+    state.completion.route_contract_pending = true;
+    let turn_id = crate::protocol::TurnId::new();
+    let history_items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: Some(user_message_id),
+                content: vec![ContentPart::Text {
+                    text: format!("Create `{target}` from repository evidence."),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolCall {
+                call_id,
+                tool: ToolName::Write,
+                arguments: json!({"path": target, "content": serialized_markdown}),
+                model_arguments: Value::Null,
+                effective_arguments: json!({"path": target, "content": serialized_markdown}),
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![ToolName::Write],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id,
+                status: crate::protocol::ToolLifecycleStatus::Completed,
+                title: "Required write content shape mismatch".to_string(),
+                output_text:
+                    crate::agent::content_shape_contract::text_artifact_positive_shape_guidance(
+                        target,
+                    ),
+                metadata: json!({
+                    "content_shape_contract": crate::agent::content_shape_contract::text_artifact_content_shape_metadata(target),
+                    "tool_feedback_envelope": {
+                        "operation_progress_class": "no_progress",
+                        "progress_effect": "no_progress",
+                        "content_shape_contract": crate::agent::content_shape_contract::text_artifact_content_shape_metadata(target)
+                    }
+                }),
+                success: Some(false),
+                progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
+                blocked_action: None,
+                result_hash: Some("fixture-text-artifact-content-shape".to_string()),
+                verification_run: None,
+            },
+        },
+    ];
+    let messages = build_messages_with_state(
+        &transcript,
+        &transcript.session,
+        &history_items,
+        &state,
+        &[],
+        50,
+        &["apply_patch".to_string(), "write".to_string()],
+        &PromptSignals::default(),
+        None,
+    )
+    .messages;
+    let system_contract_present = messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::System { content }
+                if content.contains("Active write target contract")
+                    && content.contains(target)
+                    && content.contains("Required positive text artifact shape")
+                    && content.contains("real newline-separated document structure")
+                    && content.contains("quote-wrapped whole-document string")
+        )
+    });
+    let projection = crate::protocol::ProjectionSurface {
+        surface: crate::protocol::ProjectionSurfaceKind::Prompt,
+        projection_id: crate::protocol::ProjectionId::new(),
+        required_action: Some(crate::protocol::RequiredAction {
+            kind: crate::protocol::RequiredActionKind::EditTarget,
+            tool: ToolName::Write,
+            target: Some(camino::Utf8PathBuf::from(target)),
+            command: None,
+            projection_text: format!("write:{target}"),
+        }),
+        allowed_tools: vec![ToolName::ApplyPatch, ToolName::Write],
+        forbidden_tools: Vec::new(),
+        operation_intents: vec![crate::protocol::OperationIntent::ContentChangingAuthoringRequired],
+        obligation_ids: vec!["active_work".to_string(), "control_projection".to_string()],
+        contract_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+    };
+    let rendered_projection = projection.render_prompt_block();
+    let mut tools = vec![ToolSchema {
+        name: "write".to_string(),
+        description: "write a file".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string", "description": "Complete final file contents."}
+            }
+        }),
+        strict: false,
+    }];
+    apply_active_content_shape_to_write_schema(&mut tools, &state);
+    let schema_description = tools
+        .first()
+        .and_then(|tool| tool.input_schema.pointer("/properties/content/description"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    system_contract_present
+        && rendered_projection.contains("Required positive text artifact shape")
+        && rendered_projection.contains("real newline-separated document structure")
+        && rendered_projection.contains("quote-wrapped whole-document string")
+        && schema_description.contains("Complete final Markdown/text contents")
+        && schema_description.contains("real newline-separated structure")
+        && schema_description.contains("quote-wrapped whole-document string")
+}
+
+pub(crate) fn python_source_content_shape_repair_projection_carries_positive_contract() -> bool {
+    let target = "component.py";
+    let session_id = crate::session::SessionId::new();
+    let user_message_id = crate::session::MessageId::new();
+    let call_id = crate::session::ToolCallId::new();
+    let escaped_source = "\"import math\\n\\ndef square(value):\\n    return value * value\\n\\nif __name__ == \\\"__main__\\\":\\n    print(square(3))\\n\"";
+    let transcript = Transcript {
+        session: SessionRecord {
+            id: session_id,
+            project_id: crate::session::ProjectId::new(),
+            title: "source content-shape repair".to_string(),
+            status: crate::session::SessionStatus::Running,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "local".to_string(),
+            base_url: "http://localhost:1234".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            completed_at_ms: None,
+        },
+        messages: vec![crate::session::TranscriptMessage {
+            record: crate::session::MessageRecord {
+                id: user_message_id,
+                session_id,
+                role: MessageRole::User,
+                parent_message_id: None,
+                sequence_no: 1,
+                created_at_ms: 1,
+                metadata: MessageMetadata::User(crate::session::UserMessageMeta {
+                    cwd: Utf8PathBuf::from("C:/workspace"),
+                    requested_model: None,
+                    editor_context: None,
+                }),
+            },
+            parts: vec![crate::session::PartRecord {
+                id: crate::session::PartId::new(),
+                message_id: user_message_id,
+                sequence_no: 1,
+                kind: crate::session::PartKind::Text,
+                payload: MessagePart::Text(crate::session::TextPart {
+                    text: format!("Repair `{target}` after verification failure."),
+                }),
+            }],
+        }],
+    };
+    let mut state = SessionStateSnapshot {
+        route: TaskRoute::Code,
+        process_phase: ProcessPhase::Repair,
+        active_targets: vec![Utf8PathBuf::from(target)],
+        ..SessionStateSnapshot::default()
+    };
+    state.completion.open_work_count = 1;
+    state.completion.verification_pending = true;
+    let turn_id = crate::protocol::TurnId::new();
+    let history_items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: Some(user_message_id),
+                content: vec![ContentPart::Text {
+                    text: format!("Repair `{target}` after verification failure."),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolCall {
+                call_id,
+                tool: ToolName::Write,
+                arguments: json!({"path": target, "content": escaped_source}),
+                model_arguments: Value::Null,
+                effective_arguments: json!({"path": target, "content": escaped_source}),
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![ToolName::Write],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id,
+                status: crate::protocol::ToolLifecycleStatus::Completed,
+                title: "Required write content shape mismatch".to_string(),
+                output_text:
+                    crate::agent::content_shape_contract::python_source_positive_shape_guidance(
+                        target,
+                    ),
+                metadata: json!({
+                    "content_shape_contract": crate::agent::content_shape_contract::python_source_content_shape_metadata(target),
+                    "tool_feedback_envelope": {
+                        "operation_progress_class": "no_progress",
+                        "progress_effect": "no_progress",
+                        "content_shape_contract": crate::agent::content_shape_contract::python_source_content_shape_metadata(target)
+                    }
+                }),
+                success: Some(false),
+                progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
+                blocked_action: None,
+                result_hash: Some("fixture-python-source-content-shape".to_string()),
+                verification_run: None,
+            },
+        },
+    ];
+    let messages = build_messages_with_state(
+        &transcript,
+        &transcript.session,
+        &history_items,
+        &state,
+        &[],
+        50,
+        &["apply_patch".to_string(), "write".to_string()],
+        &PromptSignals::default(),
+        None,
+    )
+    .messages;
+    let system_contract_present = messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::System { content }
+                if content.contains("Active write target contract")
+                    && content.contains(target)
+                    && content.contains("Required positive Python source shape")
+                    && content.contains("real newline-separated source structure")
+                    && content.contains("quote-wrapped whole-file source string")
+        )
+    });
+    let projection = crate::protocol::ProjectionSurface {
+        surface: crate::protocol::ProjectionSurfaceKind::Prompt,
+        projection_id: crate::protocol::ProjectionId::new(),
+        required_action: Some(crate::protocol::RequiredAction {
+            kind: crate::protocol::RequiredActionKind::EditTarget,
+            tool: ToolName::Write,
+            target: Some(camino::Utf8PathBuf::from(target)),
+            command: None,
+            projection_text: format!("write:{target}"),
+        }),
+        allowed_tools: vec![ToolName::ApplyPatch, ToolName::Write],
+        forbidden_tools: Vec::new(),
+        operation_intents: vec![crate::protocol::OperationIntent::ContentChangingAuthoringRequired],
+        obligation_ids: vec!["active_work".to_string(), "control_projection".to_string()],
+        contract_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+    };
+    let rendered_projection = projection.render_prompt_block();
+    let mut tools = vec![ToolSchema {
+        name: "write".to_string(),
+        description: "write a file".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string", "description": "Complete final file contents."}
+            }
+        }),
+        strict: false,
+    }];
+    apply_active_content_shape_to_write_schema(&mut tools, &state);
+    let schema_description = tools
+        .first()
+        .and_then(|tool| tool.input_schema.pointer("/properties/content/description"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    system_contract_present
+        && rendered_projection.contains("Required positive source shape")
+        && rendered_projection.contains("real newline-separated source structure")
+        && rendered_projection.contains("quote-wrapped serialized source")
+        && schema_description.contains("Complete final Python source contents")
+        && schema_description.contains("real newline-separated source structure")
+        && schema_description.contains("quote-wrapped whole-file source string")
+}
+
 pub(crate) fn exact_authoring_write_required_preserves_source_progress_projection() -> bool {
     let mut source_state = SessionStateSnapshot {
         process_phase: ProcessPhase::Author,
-        active_targets: vec![Utf8PathBuf::from("calculator.py")],
+        active_targets: vec![Utf8PathBuf::from("component.py")],
         ..SessionStateSnapshot::default()
     };
     source_state.completion.open_work_count = 1;
     let mut test_state = source_state.clone();
-    test_state.active_targets = vec![Utf8PathBuf::from("test_calculator.py")];
+    test_state.active_targets = vec![Utf8PathBuf::from("test_component.py")];
     exact_active_authoring_write_required(&source_state).is_none()
         && exact_active_authoring_write_required(&test_state).as_deref()
-            == Some("test_calculator.py")
+            == Some("test_component.py")
 }
 
 pub fn provider_replay_preserves_latest_user_across_trailing_compaction() -> bool {
@@ -6829,8 +9128,8 @@ pub fn provider_replay_preserves_latest_user_across_trailing_compaction() -> boo
         completed_at_ms: None,
     };
     let call_id = crate::session::ToolCallId::new();
-    let original_user_text = "create calculator.py and test_calculator.py";
-    let current_hook_text = "Manual verification-repair continuation: repair calculator.py, then rerun python -m unittest.";
+    let original_user_text = "create component.py and test_component.py";
+    let current_hook_text = "Manual verification-repair continuation: repair component.py, then rerun python -m unittest.";
     let items = vec![
         HistoryItem {
             id: crate::protocol::HistoryItemId::new(),
@@ -6884,7 +9183,6 @@ pub fn provider_replay_preserves_latest_user_across_trailing_compaction() -> boo
                 success: Some(false),
                 progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
                 blocked_action: None,
-                required_next_action: None,
                 result_hash: Some("old-verification".to_string()),
                 verification_run: None,
             },
@@ -6920,10 +9218,9 @@ pub fn provider_replay_preserves_latest_user_across_trailing_compaction() -> boo
                     process_phase: "repair".to_string(),
                     active_work_kind: Some("typed_continuation".to_string()),
                     active_work_summary: Some(
-                        "repair calculator.py then rerun python -m unittest".to_string(),
+                        "repair component.py then rerun python -m unittest".to_string(),
                     ),
-                    required_next_action: None,
-                    target_files: vec![Utf8PathBuf::from("calculator.py")],
+                    target_files: vec![Utf8PathBuf::from("component.py")],
                     verification_commands: vec!["python -m unittest".to_string()],
                     failure_kind: Some("VerificationFailed".to_string()),
                     failure_summary: Some("unit test failed".to_string()),
@@ -7000,7 +9297,6 @@ pub fn provider_replay_after_compaction_repairs_orphan_assistant_before_user() -
                     process_phase: "discover".to_string(),
                     active_work_kind: Some("typed_continuation".to_string()),
                     active_work_summary: Some("continue the chat".to_string()),
-                    required_next_action: None,
                     target_files: Vec::new(),
                     verification_commands: Vec::new(),
                     failure_kind: None,
@@ -7072,7 +9368,7 @@ pub fn provider_replay_preserves_tool_pair_symmetry_with_model_arguments() -> bo
         updated_at_ms: 1,
         completed_at_ms: None,
     };
-    let hook_text = "Manual ST closeout continuation: create test_space_invader.py.";
+    let hook_text = "Manual ST closeout continuation: create test_arcade_game.py.";
     let items = vec![
         HistoryItem {
             id: crate::protocol::HistoryItemId::new(),
@@ -7100,7 +9396,7 @@ pub fn provider_replay_preserves_tool_pair_symmetry_with_model_arguments() -> bo
                 call_id,
                 tool: ToolName::Read,
                 arguments: Value::Null,
-                model_arguments: json!({"path": "space_invader.py"}),
+                model_arguments: json!({"path": "arcade_game.py"}),
                 effective_arguments: Value::Null,
                 adjusted_arguments: None,
                 permission_decision: None,
@@ -7119,13 +9415,12 @@ pub fn provider_replay_preserves_tool_pair_symmetry_with_model_arguments() -> bo
             payload: HistoryItemPayload::ToolOutput {
                 call_id,
                 status: crate::protocol::ToolLifecycleStatus::Completed,
-                title: "Read space_invader.py".to_string(),
+                title: "Read arcade_game.py".to_string(),
                 output_text: "class Player: pass".to_string(),
                 metadata: json!({"success": true}),
                 success: Some(true),
                 progress_effect: crate::protocol::ToolProgressEffect::Unknown,
                 blocked_action: None,
-                required_next_action: None,
                 result_hash: Some("read-hash".to_string()),
                 verification_run: None,
             },
@@ -7145,7 +9440,6 @@ pub fn provider_replay_preserves_tool_pair_symmetry_with_model_arguments() -> bo
                 success: Some(true),
                 progress_effect: crate::protocol::ToolProgressEffect::Unknown,
                 blocked_action: None,
-                required_next_action: None,
                 result_hash: None,
                 verification_run: None,
             },
@@ -7178,7 +9472,7 @@ pub fn provider_replay_preserves_tool_pair_symmetry_with_model_arguments() -> bo
                 if tool_calls.iter().any(|tool_call| {
                     tool_call.call_id == call_id_text
                         && tool_call.tool_name == "read"
-                        && tool_call.arguments_json.contains("space_invader.py")
+                        && tool_call.arguments_json.contains("arcade_game.py")
                 })
         )
     });
@@ -7195,6 +9489,92 @@ pub fn provider_replay_preserves_tool_pair_symmetry_with_model_arguments() -> bo
 
     matches!((call_index, output_index, user_index), (Some(call), Some(output), Some(user)) if call < output && output < user)
         && !serialized.contains("orphan output must not be provider-visible")
+}
+
+pub fn provider_replay_projects_rejected_final_message_evidence() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let source_call_id = crate::session::ToolCallId::new();
+    let projection_id = crate::protocol::ProjectionId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "rejected final replay fixture".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: "fixture-model".to_string(),
+        base_url: "http://fixture".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "create component.py and test_component.py".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::RejectedToolProposal {
+                proposal: crate::protocol::RejectedToolProposal {
+                    proposal_id: crate::protocol::ToolProposalId::new(),
+                    source_call_id,
+                    requested_tool: "final_assistant_message".to_string(),
+                    effective_tool: "final_assistant_message".to_string(),
+                    resolved_tool: ToolName::Invalid,
+                    original_arguments: json!({}),
+                    adjusted_arguments: None,
+                    allowed_surface: vec![ToolName::ApplyPatch, ToolName::Write, ToolName::Shell],
+                    blocked_reason:
+                        "The provider emitted a final message while obligations remain open."
+                            .to_string(),
+                    projection_id,
+                    semantic_class: "text_final_while_obligations_open".to_string(),
+                    candidate_repair_id: None,
+                    payload_hash: "payload-hash".to_string(),
+                    contract_refs: vec!["contract:open_obligation".to_string()],
+                    evidence_refs: vec!["artifact:run".to_string()],
+                },
+            },
+        },
+    ];
+
+    let replay = build_provider_replay_messages_from_history_items(&session, &items, 32);
+    let user_index = replay.iter().position(|message| {
+        matches!(
+            message,
+            ModelMessage::User { content }
+                if content.contains("create component.py and test_component.py")
+        )
+    });
+    let evidence_index = replay.iter().position(|message| {
+        matches!(
+            message,
+            ModelMessage::System { content }
+                if content.contains("Rejected model action evidence")
+                    && content.contains("final_assistant_message")
+                    && content.contains("text_final_while_obligations_open")
+                    && content.contains("current TurnControlEnvelope")
+                    && content.contains("Allowed tool surface: [apply_patch, write, shell]")
+        )
+    });
+    matches!((user_index, evidence_index), (Some(user), Some(evidence)) if user < evidence)
 }
 
 fn stale_write_tool_result_replay_note(stale_target: &str, required_target: &str) -> String {
@@ -7641,25 +10021,6 @@ fn summarize_staged_task_read_evidence(target: &str, summary: &str) -> Option<St
         }
         return (!details.is_empty()).then(|| details.join(", "));
     }
-    if lower.ends_with("backend/app/core/config.py") {
-        let mut details = Vec::new();
-        for marker in [
-            "database_url",
-            "memory_storage_path",
-            "run_artifact_root",
-            "report_output_dir",
-            "document_storage_path",
-            "scenario_template_dir",
-            "llm_provider",
-            "default_locale",
-        ] {
-            if summary.contains(marker) {
-                details.push(marker);
-            }
-        }
-        return (!details.is_empty()).then(|| format!("settings include {}", details.join(", ")));
-    }
-
     let lines = summary
         .lines()
         .filter_map(strip_numbered_summary_line)
@@ -7748,18 +10109,24 @@ fn exact_write_target_contract(target: &str) -> String {
         if let Some(contract) =
             crate::agent::content_shape_contract::python_source_for_test_target(target)
         {
-            return contract.prompt_contract();
+            format!(
+                "`{}` is the inferred production source under test; do not rewrite `{}` in this turn. The patch must create or update `{target}` as a complete test module only.{}",
+                contract.source_path,
+                contract.source_path,
+                contract.positive_shape_guidance()
+            )
+        } else {
+            "The patch must create or update the active target as a test module only: import the production module, define unittest or pytest-style tests, and assert the requested behavior. Do not define production functions, CLI entrypoints, or paste implementation code from a completed source file.".to_string()
         }
-        "The `content` must be a test module for the active target only: import the production module, define unittest or pytest-style tests, and assert the requested behavior. Do not define production functions, CLI entrypoints, or paste implementation code from a completed source file."
     } else if target_is_documentation_like(target) {
-        "The `content` must be Markdown documentation/design text for the active target only. Do not write Python, Rust, JavaScript, imports, functions, CLI loops, or paste implementation code from a completed source file."
+        crate::agent::content_shape_contract::text_artifact_positive_shape_guidance(target)
     } else if target_is_python_source_like(target) {
-        "The `content` must be complete Python source code for the active implementation target only. Do not write tests, Markdown, or a different deliverable."
+        crate::agent::content_shape_contract::python_source_positive_shape_guidance(target)
     } else {
-        "The `content` must be complete final contents for the active target only. Do not paste content from a completed or inactive target."
+        "The patch must create or update the active target only. Do not paste content from a completed or inactive target.".to_string()
     };
     format!(
-        "Active write target contract:\n- Use the `write` tool with `path` set to `{target}` and `content` set to the complete replacement content for that file.\n- The provider-visible tool schema remains the stable `write` interface; target validation belongs to the tool lifecycle for the submitted call.\n- {content_contract}\n- Older assistant narration, previous tool arguments, and prior progress output are not tool-call authority for this turn."
+        "Active apply_patch target contract:\n- Use the `apply_patch` tool with `patch_text` that adds or updates `{target}`.\n- The provider-visible stable code edit surface is `apply_patch`; target validation belongs to the tool lifecycle for the submitted call.\n- {content_contract}\n- Older assistant narration, previous tool arguments, and prior progress output are not tool-call authority for this turn."
     )
 }
 
@@ -8151,6 +10518,18 @@ mod tests {
     }
 
     #[test]
+    fn stale_inactive_filechange_only_reference_snapshot_fixture_passes() {
+        assert!(
+            super::stale_inactive_filechange_without_replayable_tool_call_uses_reference_snapshot()
+        );
+    }
+
+    #[test]
+    fn stale_inactive_authoring_prelude_replay_fixture_passes() {
+        assert!(super::provider_replay_omits_stale_inactive_authoring_prelude_text());
+    }
+
+    #[test]
     fn stale_progress_projection_replay_live_builder_fixture_passes() {
         assert!(super::stale_progress_projection_replay_uses_live_builder());
     }
@@ -8158,6 +10537,21 @@ mod tests {
     #[test]
     fn failed_inactive_authoring_replay_live_builder_fixture_passes() {
         assert!(super::failed_inactive_authoring_replay_uses_call_scoped_summary());
+    }
+
+    #[test]
+    fn malformed_edit_argument_replay_live_builder_fixture_passes() {
+        assert!(super::provider_replay_preserves_current_invalid_edit_argument_feedback());
+    }
+
+    #[test]
+    fn rejected_final_message_replay_fixture_passes() {
+        assert!(super::provider_replay_projects_rejected_final_message_evidence());
+    }
+
+    #[test]
+    fn exact_write_repair_omits_consumed_supporting_context_fixture_passes() {
+        assert!(super::exact_write_repair_omits_consumed_supporting_context_replay());
     }
 }
 

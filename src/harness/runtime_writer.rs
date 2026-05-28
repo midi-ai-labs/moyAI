@@ -244,6 +244,10 @@ impl<'a, S: RunEventSink + ?Sized> HarnessRecordingSink<'a, S> {
 }
 
 impl<S: RunEventSink + ?Sized> RunEventSink for HarnessRecordingSink<'_, S> {
+    fn reserve_protocol_sequence_no(&mut self) -> Option<i64> {
+        self.inner.reserve_protocol_sequence_no()
+    }
+
     fn emit(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
         self.recorder.record_run_event(&event)?;
         self.inner.emit(event)
@@ -316,7 +320,6 @@ fn enrich_payload(
                         json!({
                             "allowed_tools": turn_decision.get("allowed_tools").cloned().unwrap_or_else(|| json!([])),
                             "tool_choice": turn_decision.get("tool_choice").cloned().unwrap_or(Value::Null),
-                            "required_next_action": turn_decision.get("required_next_action").cloned().unwrap_or(Value::Null),
                             "active_targets": turn_decision.get("active_targets").cloned().unwrap_or_else(|| json!([])),
                         })
                     });

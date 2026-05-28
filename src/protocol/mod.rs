@@ -21,21 +21,27 @@ mod recording;
 mod runtime;
 mod store;
 
+pub(crate) use control::canonicalize_workspace_targets;
 pub use control::{
     ActionAuthority, ControlEnvelopeIssue, ControlEnvelopeIssueCode, ControlEnvelopeIssueSeverity,
     ControlEnvelopeValidation, DispatchPolicy, EvidenceRef, ObligationKind, ObligationSet,
     ObligationStatus, ProjectionBundle, ProjectionSurface, ProjectionSurfaceKind,
-    RenderedProjectionSurface, TurnControlEnvelope, TurnObligation,
+    RenderedProjectionSurface, RequiredAction, RequiredActionKind, TurnControlEnvelope,
+    TurnObligation,
     content_changing_projection_text_separates_availability_from_satisfying_progress_fixture_passes,
+    singleton_missing_target_stable_surface_projects_apply_patch_action_fixture_passes,
     verification_only_authority_narrows_to_exact_shell_fixture_passes,
 };
 pub use projection::{
     ProtocolRunEventProjection, project_protocol_run_event, project_turn_item_for_run_event,
 };
 pub use recording::ProtocolRecordingSink;
+pub(crate) use recording::pre_recorded_protocol_sequence_reservation_fixture_passes;
 pub use runtime::{
     CompiledTurn, ObligationCompiler, TurnEngine, TurnEngineInput, WorkOrder, WorkOrderState,
+    repair_target_identity_aliases_compile_exact_write_action_fixture_passes,
 };
+pub(crate) use store::insert_event_bundle_in_transaction;
 pub use store::{ProtocolEventStore, SqliteProtocolEventStore};
 
 macro_rules! protocol_id {
@@ -283,7 +289,6 @@ pub struct ActiveWorkContractProjection {
     pub active_targets: Vec<Utf8PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operation_intents: Vec<OperationIntent>,
-    pub required_next_action: Option<String>,
     pub required_verification_commands: Vec<String>,
     pub allowed_tools: Vec<ToolName>,
     pub forbidden_tools: Vec<ToolName>,
@@ -372,10 +377,12 @@ pub enum RuntimeEventMsg {
     },
     ApprovalRequested {
         call_id: ToolCallId,
+        tool: ToolName,
         summary: String,
     },
     ApprovalResolved {
         call_id: ToolCallId,
+        tool: ToolName,
         decision: PermissionDecision,
     },
     ContextCompacted {
@@ -517,8 +524,6 @@ pub enum HistoryItemPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         blocked_action: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        required_next_action: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         result_hash: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         verification_run: Option<VerificationRunResult>,
@@ -567,6 +572,20 @@ pub enum HistoryItemPayload {
     },
 }
 
+pub fn canonical_tool_call_arguments<'a>(
+    arguments: &'a Value,
+    model_arguments: &'a Value,
+    effective_arguments: &'a Value,
+) -> &'a Value {
+    if !effective_arguments.is_null() {
+        effective_arguments
+    } else if !model_arguments.is_null() {
+        model_arguments
+    } else {
+        arguments
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ContentPart {
@@ -585,8 +604,6 @@ pub struct RejectedToolProposal {
     pub adjusted_arguments: Option<Value>,
     pub allowed_surface: Vec<ToolName>,
     pub blocked_reason: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action: Option<String>,
     pub projection_id: ProjectionId,
     pub semantic_class: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -611,8 +628,6 @@ pub struct CandidateRepairEdit {
     pub semantic_class: String,
     pub validity: CandidateRepairValidity,
     pub payload_hash: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action_after_acceptance: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aligned_failure_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -643,6 +658,24 @@ pub struct TurnItem {
     pub payload: TurnItemPayload,
 }
 
+pub fn turn_items_in_projection_order(turn_items: &[TurnItem]) -> Vec<&TurnItem> {
+    let mut turn_order = Vec::new();
+    for item in turn_items {
+        if !turn_order.contains(&item.turn_id) {
+            turn_order.push(item.turn_id);
+        }
+    }
+    let mut ordered = turn_items.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|item| {
+        let turn_index = turn_order
+            .iter()
+            .position(|turn_id| *turn_id == item.turn_id)
+            .unwrap_or(usize::MAX);
+        (turn_index, item.sequence_no, item.id.0)
+    });
+    ordered
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnItemPayload {
@@ -669,6 +702,8 @@ pub enum TurnItemPayload {
         tool: ToolName,
         status: ToolLifecycleStatus,
         title: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
     },
     FileChange {
         change_ids: Vec<ChangeId>,
@@ -717,7 +752,6 @@ pub struct ToolLifecycleEnvelope {
     pub candidate_validity: Option<CandidateRepairValidity>,
     pub result_hash: Option<String>,
     pub blocked_action: Option<String>,
-    pub required_next_action: Option<String>,
     pub projection_id: ProjectionId,
     pub contract_refs: Vec<String>,
     pub artifact_refs: Vec<String>,
@@ -771,6 +805,8 @@ pub struct VerificationRunResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_cluster: Option<VerificationFailureCluster>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub satisfies_command_identities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifact_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requirement_refs: Vec<String>,
@@ -778,7 +814,7 @@ pub struct VerificationRunResult {
 
 impl ToolLifecycleEnvelope {
     pub fn projects_required_action(&self) -> bool {
-        self.required_next_action.is_some() && self.result_hash.is_some()
+        self.result_hash.is_some()
     }
 }
 

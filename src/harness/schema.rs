@@ -44,6 +44,7 @@ pub fn exported_schemas() -> Vec<(&'static str, Value)> {
             tool_no_progress_signature_schema(),
         ),
         ("manual_st.route_manifest.v1.json", route_manifest_schema()),
+        ("manual_st.case_progress.v1.json", case_progress_schema()),
         (
             "manual_st.verification_command_log.v1.json",
             verification_command_log_schema(),
@@ -254,7 +255,6 @@ fn repair_operation_template_schema() -> Value {
             "source_test_ownership": {"type": "string", "minLength": 1},
             "required_edit_surface": {"type": "array", "items": {"type": "string"}},
             "forbidden_stale_tools": {"type": "array", "items": {"type": "string"}},
-            "required_next_action": {"type": ["string", "null"]},
             "verification_rerun_condition": {"type": ["string", "null"]},
             "evidence_markers": {"type": "array", "items": {"type": "string"}},
             "sibling_obligations": {"type": "array", "items": {"type": "string"}},
@@ -317,7 +317,6 @@ fn repair_control_snapshot_schema() -> Value {
             "rollback_depth": {"type": "string", "minLength": 1},
             "operation_id": {"type": ["string", "null"]},
             "required_target": {"type": ["string", "null"]},
-            "required_next_action": {"type": ["string", "null"]},
             "allowed_surface_snapshot": {"type": "array", "items": {"type": "string"}},
             "hard_invariants": {"type": "array", "items": {"type": "string"}},
             "recovery_choices": {
@@ -330,7 +329,6 @@ fn repair_control_snapshot_schema() -> Value {
                         "recovery_action": {"type": "string"},
                         "rollback_depth": {"type": "string"},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}},
-                        "required_next_action": {"type": ["string", "null"]},
                         "required_evidence": {"type": "array", "items": {"type": "string"}},
                         "forbidden_directions": {"type": "array", "items": {"type": "string"}},
                         "progress_evidence": {"type": "array", "items": {"type": "string"}}
@@ -429,8 +427,77 @@ fn route_manifest_schema() -> Value {
             "session_id": {"type": ["string", "null"]},
             "start_time": {"type": "string", "minLength": 1},
             "end_time": {"type": "string", "minLength": 1},
-            "route_level_verdict": {"type": "string", "enum": ["pass", "fail", "blocked", "not_run"]},
+            "route_level_verdict": {"type": "string", "enum": ["pass", "fail", "blocked", "running", "not_run"]},
+            "active_case_id": {"type": ["string", "null"]},
+            "progress_status": {"type": ["string", "null"]},
+            "last_progress_at": {"type": ["string", "null"]},
             "evidence_artifacts": {"type": "array", "items": {"type": "string"}}
+        }),
+    )
+}
+
+fn case_progress_schema() -> Value {
+    base_schema(
+        "moyai.manual_st.case_progress.v1",
+        "ManualStCaseProgress",
+        &[
+            "route_id",
+            "route_type",
+            "route_level_verdict",
+            "active_case_id",
+            "stage_index",
+            "stage_label",
+            "session_id",
+            "progress_status",
+            "last_progress_at",
+            "workspace_path",
+            "case_artifact_root",
+            "harness_event_root",
+            "evidence_artifact_schema_version",
+        ],
+        json!({
+            "route_id": {"type": "string", "minLength": 1},
+            "route_type": {
+                "type": "string",
+                "enum": [
+                    "required_core",
+                    "required_vision",
+                    "targeted_support",
+                    "extended",
+                    "probe"
+                ]
+            },
+            "route_level_verdict": {"type": "string", "enum": ["pass", "fail", "blocked", "running", "not_run"]},
+            "active_case_id": {"type": ["string", "null"]},
+            "stage_index": {"type": ["integer", "null"], "minimum": 1},
+            "stage_label": {"type": ["string", "null"]},
+            "session_id": {"type": ["string", "null"]},
+            "progress_status": {
+                "type": "string",
+                "enum": [
+                    "route_artifact_written",
+                    "route_running",
+                    "case_running",
+                    "case_started",
+                    "model_request_inflight",
+                    "runtime_completed",
+                    "runtime_non_completed",
+                    "runtime_error",
+                    "turn_timeout",
+                    "route_verification_evaluating",
+                    "closeout_continuation_pending",
+                    "stage_clean_closeout",
+                    "case_completed",
+                    "case_terminalized",
+                    "route_terminalized"
+                ]
+            },
+            "last_progress_at": {"type": "string", "minLength": 1},
+            "workspace_path": {"type": ["string", "null"]},
+            "case_artifact_root": {"type": ["string", "null"]},
+            "harness_event_root": {"type": ["string", "null"]},
+            "evidence_artifact_schema_version": {"type": "string", "const": "manual_st.case_progress.v1"},
+            "note": {"type": ["string", "null"]}
         }),
     )
 }
@@ -690,7 +757,6 @@ fn tool_no_progress_signature_schema() -> Value {
         json!({
             "result_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
             "blocked_action": {"type": ["string", "null"]},
-            "required_next_action": {"type": ["string", "null"]},
             "allowed_surface_snapshot": {"type": "array", "items": {"type": "string"}},
             "repeat_count": {"type": "integer", "minimum": 0}
         }),

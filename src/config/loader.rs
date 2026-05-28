@@ -105,6 +105,7 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             base_url: Some(config.model.base_url.clone()),
             model: Some(config.model.model.clone()),
             prompt_profile: Some(config.model.prompt_profile),
+            provider_metadata_mode: Some(config.model.provider_metadata_mode),
             api_key_env: Some(config.model.api_key_env.clone()),
             extra_headers: Some(config.model.extra_headers.clone()),
             request_timeout_ms: Some(config.model.request_timeout_ms),
@@ -251,6 +252,11 @@ fn env_patch() -> PartialResolvedConfig {
     if let Ok(value) = env::var("MOYAI_PROMPT_PROFILE") {
         if let Some(parsed) = parse_prompt_profile(&value) {
             patch.model.get_or_insert_default().prompt_profile = Some(parsed);
+        }
+    }
+    if let Ok(value) = env::var("MOYAI_PROVIDER_METADATA_MODE") {
+        if let Some(parsed) = parse_provider_metadata_mode(&value) {
+            patch.model.get_or_insert_default().provider_metadata_mode = Some(parsed);
         }
     }
     if let Ok(value) = env::var("MOYAI_API_KEY_ENV") {
@@ -558,6 +564,24 @@ fn parse_prompt_profile(value: &str) -> Option<crate::config::model::PromptProfi
         "default" => Some(crate::config::model::PromptProfile::Default),
         "qwen_coder" | "qwen-coder" | "qwen" => {
             Some(crate::config::model::PromptProfile::QwenCoder)
+        }
+        _ => None,
+    }
+}
+
+fn parse_provider_metadata_mode(value: &str) -> Option<crate::config::model::ProviderMetadataMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "lm_studio_native_required"
+        | "lm-studio-native-required"
+        | "lmstudio"
+        | "lm_studio"
+        | "lm-studio" => Some(crate::config::model::ProviderMetadataMode::LmStudioNativeRequired),
+        "openai_compatible_only"
+        | "openai-compatible-only"
+        | "openai"
+        | "openai_compat"
+        | "openai-compatible" => {
+            Some(crate::config::model::ProviderMetadataMode::OpenAiCompatibleOnly)
         }
         _ => None,
     }

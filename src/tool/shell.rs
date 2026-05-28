@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::process::ExitStatus;
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -90,17 +91,19 @@ impl Tool for ShellTool {
         });
         let requested_workdir = input.workdir.unwrap_or_else(|| Utf8PathBuf::from("."));
         let guarded =
-            PathGuard::require_path(ctx.workspace, &requested_workdir, AccessKind::Shell, false)?;
-        if let Some(summary) = shell_contract_violation(&input.command, family) {
+            PathGuard::require_path(ctx.workspace, &requested_workdir, AccessKind::Shell)?;
+        if let Some(violation) = shell_contract_violation(&input.command, family) {
             return Ok(ToolResult {
-                title: "Correct shell invocation".to_string(),
-                output_text: summary,
+                title: violation.title,
+                output_text: violation.output_text,
                 metadata: json!({
                     "exit_code": null,
                     "timeout": false,
                     "truncated": false,
                     "changed_files": [],
                     "corrective_result": true,
+                    "contract_violation": violation.kind,
+                    "command_text_encoding_review": violation.encoding_review,
                 }),
                 truncated_output_path: None,
                 recorded_changes: Vec::new(),
@@ -114,10 +117,12 @@ impl Tool for ShellTool {
         } else {
             input.description.clone()
         };
+        let encoding_review = command_text_encoding_review(&input.command, family);
         let risks = shell_permission_risks(ctx.workspace, &input.command);
-        ctx.confirm_if_needed(
+        ctx.confirm_if_needed_with_details(
             AccessKind::Shell,
             description.clone(),
+            shell_permission_details(&input.command, guarded.absolute.as_path()),
             vec![guarded.absolute.clone()],
             outside_workspace,
             risks,
@@ -144,6 +149,8 @@ impl Tool for ShellTool {
             &shell_changes,
         )?;
         let changes = shell_changes.changes;
+        let file_change_content_evidence =
+            file_change_content_evidence(&changes, &ctx.workspace.root);
         let change_ids = ctx
             .services
             .store
@@ -159,13 +166,13 @@ impl Tool for ShellTool {
                 path_after: change.path_after.clone(),
             })
             .collect::<Vec<_>>();
-        let merged_output = if output.stderr.is_empty() {
-            output.stdout
-        } else if output.stdout.is_empty() {
-            output.stderr
-        } else {
-            format!("{}\n{}", output.stdout, output.stderr)
-        };
+        let merged_output = format_shell_output_for_display(
+            &input.command,
+            &output.stdout,
+            &output.stderr,
+            output.exit_code,
+            output.timed_out,
+        );
         let preview = ctx.services.truncator.preview(
             merged_output,
             &ctx.config.tool_output,
@@ -180,6 +187,45 @@ impl Tool for ShellTool {
                 "timeout": output.timed_out,
                 "truncated": preview.truncated,
                 "changed_files": change_ids,
+                "file_change_content_evidence": file_change_content_evidence,
+                "success": output.exit_code == Some(0) && !output.timed_out,
+                "progress_effect": if output.exit_code == Some(0) && !output.timed_out { "made_progress" } else { "blocked" },
+                "shell_output_projection": {
+                    "command": input.command.clone(),
+                    "stdout_present": !output.stdout.trim().is_empty(),
+                    "stderr_present": !output.stderr.trim().is_empty(),
+                    "exit_code": output.exit_code,
+                    "timeout": output.timed_out,
+                    "command_text_encoding_review": encoding_review.metadata(),
+                    "retry_guidance": if output.exit_code == Some(0) && !output.timed_out {
+                        "command_succeeded"
+                    } else {
+                        "review_stdout_stderr_and_retry_corrected_command_when_the_command_was_malformed"
+                    }
+                },
+                "tool_feedback_envelope": {
+                    "kind": "shell_execution_result",
+                    "success": output.exit_code == Some(0) && !output.timed_out,
+                    "progress_effect": if output.exit_code == Some(0) && !output.timed_out { "made_progress" } else { "blocked" },
+                    "submitted_command": input.command.clone(),
+                    "exit_code": output.exit_code,
+                    "timeout": output.timed_out,
+                    "stdout_present": !output.stdout.trim().is_empty(),
+                    "stderr_present": !output.stderr.trim().is_empty(),
+                    "command_text_encoding_review": encoding_review.metadata(),
+                    "next_action_guidance": if output.exit_code == Some(0) && !output.timed_out {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String("If the command was malformed, inspect stdout/stderr, correct the command, and retry once with the native shell syntax. Do not stop solely because one shell command failed.".to_string())
+                    },
+                    "result_hash": crate::harness::artifact::hash_bytes(format!(
+                        "shell|{}|{:?}|{}|{}",
+                        input.command.clone(),
+                        output.exit_code,
+                        output.timed_out,
+                        output.stderr
+                    ).as_bytes())
+                }
             }),
             truncated_output_path: preview.truncated_output_path,
             recorded_changes: change_ids,
@@ -188,48 +234,109 @@ impl Tool for ShellTool {
     }
 }
 
-fn shell_contract_violation(command: &str, family: ShellFamily) -> Option<String> {
+struct ShellContractViolation {
+    title: String,
+    output_text: String,
+    kind: &'static str,
+    encoding_review: serde_json::Value,
+}
+
+fn shell_contract_violation(command: &str, family: ShellFamily) -> Option<ShellContractViolation> {
     let trimmed = command.trim();
     if matches!(family, ShellFamily::PowerShell) {
         if trimmed.contains("&&") {
-            return Some(
-                "This `shell` tool is running Windows PowerShell, and PowerShell 5.1 does not support `&&`. Rewrite the call using raw PowerShell syntax only. Prefer the `workdir` field instead of `cd ... && ...`, and if command chaining must depend on prior success, use `cmd1; if ($?) { cmd2 }`."
-                    .to_string(),
-            );
+            return Some(shell_syntax_violation(
+                "This `shell` tool is running Windows PowerShell, and PowerShell 5.1 does not support `&&`. Rewrite the call using raw PowerShell syntax only. Prefer the `workdir` field instead of `cd ... && ...`, and if command chaining must depend on prior success, use `cmd1; if ($?) { cmd2 }`.",
+            ));
         }
         if trimmed.contains("2>&1") {
-            return Some(
-                "Do not append `2>&1` when using this `shell` tool on Windows PowerShell. moyai already captures both stdout and stderr for you, and PowerShell 5.1 can turn native stderr redirection into `NativeCommandError` noise. Send the raw command directly, for example `python -m unittest`."
-                    .to_string(),
-            );
+            return Some(shell_syntax_violation(
+                "Do not append `2>&1` when using this `shell` tool on Windows PowerShell. moyai already captures both stdout and stderr for you, and PowerShell 5.1 can turn native stderr redirection into `NativeCommandError` noise. Send the raw command directly, for example `python -m unittest`.",
+            ));
         }
         if trimmed
             .to_ascii_lowercase()
             .starts_with("powershell -command")
         {
-            return Some(
-                "Do not wrap the command in `powershell -Command` when using this tool. Send the raw PowerShell command text directly, and use the `workdir` field to choose the directory."
-                    .to_string(),
-            );
+            return Some(shell_syntax_violation(
+                "Do not wrap the command in `powershell -Command` when using this tool. Send the raw PowerShell command text directly, and use the `workdir` field to choose the directory.",
+            ));
         }
         let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("dir /") || lower.starts_with("dir\t/") {
-            return Some(
-                "This `shell` tool is running Windows PowerShell, and `dir /s /b` is CMD-style syntax. Do not use CMD switches here. Use targeted PowerShell syntax for a specific directory, or prefer `list`, `glob`, `grep`, and `read` for repository inspection instead of a broad shell relist."
-                    .to_string(),
-            );
+            return Some(shell_syntax_violation(
+                "This `shell` tool is running Windows PowerShell, and `dir /s /b` is CMD-style syntax. Do not use CMD switches here. Use targeted PowerShell syntax for a specific directory, or prefer `list`, `glob`, `grep`, and `read` for repository inspection instead of a broad shell relist.",
+            ));
         }
         if starts_with_linux_diagnostic(trimmed)
             || lower.contains("| head")
             || lower.contains("| tail")
         {
-            return Some(
-                "This `shell` tool is running Windows PowerShell. Do not use Linux diagnostics such as `top`, `htop`, `free`, `uptime`, or pipes to `head` / `tail` here. Rewrite the command in native PowerShell. For read-only Windows system diagnostics requested by the user, prefer commands such as `Get-CimInstance Win32_Processor | Select-Object Name, LoadPercentage`, `Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory`, `Get-Process`, or a short `Get-Process` CPU delta sample."
-                    .to_string(),
-            );
+            return Some(shell_syntax_violation(
+                "This `shell` tool is running Windows PowerShell. Do not use Linux diagnostics such as `top`, `htop`, `free`, `uptime`, or pipes to `head` / `tail` here. Rewrite the command in native PowerShell. For read-only Windows system diagnostics requested by the user, prefer commands such as `Get-CimInstance Win32_Processor | Select-Object Name, LoadPercentage`, `Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory`, `Get-Process`, or a short `Get-Process` CPU delta sample.",
+            ));
         }
     }
+    let encoding_review = command_text_encoding_review(command, family);
+    if encoding_review.requires_correction {
+        return Some(ShellContractViolation {
+            title: "Clarify command text encoding".to_string(),
+            output_text: encoding_review.feedback_text(command),
+            kind: "command_text_encoding_contract",
+            encoding_review: encoding_review.metadata(),
+        });
+    }
     None
+}
+
+fn shell_syntax_violation(output_text: &str) -> ShellContractViolation {
+    ShellContractViolation {
+        title: "Correct shell invocation".to_string(),
+        output_text: output_text.to_string(),
+        kind: "shell_syntax_contract",
+        encoding_review: serde_json::Value::Null,
+    }
+}
+
+fn format_shell_output_for_display(
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+    timed_out: bool,
+) -> String {
+    let mut sections = Vec::new();
+    sections.push(format!("Command: {}", command.trim()));
+    sections.push(format!(
+        "Exit code: {}{}",
+        exit_code
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        if timed_out { " (timeout)" } else { "" }
+    ));
+    sections.push(format!(
+        "Stdout:\n{}",
+        if stdout.trim().is_empty() {
+            "(empty)"
+        } else {
+            stdout.trim_end()
+        }
+    ));
+    sections.push(format!(
+        "Stderr:\n{}",
+        if stderr.trim().is_empty() {
+            "(empty)"
+        } else {
+            stderr.trim_end()
+        }
+    ));
+    if exit_code != Some(0) || timed_out {
+        sections.push(
+            "Recovery: inspect the stdout/stderr above. If the command was malformed, retry with a corrected native-shell command instead of stopping after this single failure."
+                .to_string(),
+        );
+    }
+    sections.join("\n\n")
 }
 
 fn starts_with_linux_diagnostic(command: &str) -> bool {
@@ -241,6 +348,267 @@ fn starts_with_linux_diagnostic(command: &str) -> bool {
     .any(|value| {
         lower.starts_with(value) && lower[value.len()..].starts_with([' ', '\t', '|', ';'])
     })
+}
+
+#[derive(Clone, Debug)]
+struct CommandTextEncodingReview {
+    status: &'static str,
+    io_profile: &'static str,
+    evidence: Vec<&'static str>,
+    required_action: Option<&'static str>,
+    suggested_command: Option<String>,
+    requires_correction: bool,
+}
+
+impl CommandTextEncodingReview {
+    fn metadata(&self) -> serde_json::Value {
+        json!({
+            "contract": "command_text_encoding_contract",
+            "status": self.status,
+            "io_profile": self.io_profile,
+            "evidence": self.evidence,
+            "required_action": self.required_action,
+            "suggested_command": self.suggested_command,
+            "requires_correction": self.requires_correction,
+        })
+    }
+
+    fn feedback_text(&self, command: &str) -> String {
+        let mut lines = vec![
+            "Command text encoding contract review failed before execution.".to_string(),
+            format!("Command: {}", command.trim()),
+            format!("Status: {}", self.status),
+            format!("I/O profile: {}", self.io_profile),
+            "Reason: this command can execute code or tests that read, write, capture, or print text, but the submitted command relies on platform defaults or moyai's tool-owned UTF-8 bootstrap instead of an explicit command/artifact text-encoding contract.".to_string(),
+        ];
+        if let Some(action) = self.required_action {
+            lines.push(format!("Required action: {action}"));
+        }
+        if let Some(suggestion) = &self.suggested_command {
+            lines.push(format!("One acceptable corrected command: {suggestion}"));
+        }
+        lines.push(
+            "Do not proceed with a text-producing verification command until the command or the generated artifact makes the text encoding contract explicit.".to_string(),
+        );
+        lines.join("\n")
+    }
+}
+
+fn command_text_encoding_review(command: &str, family: ShellFamily) -> CommandTextEncodingReview {
+    let trimmed = command.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let tokens = command_tokens(trimmed);
+    let mut evidence = Vec::new();
+
+    if !command_has_text_io_surface(&tokens, &lower) {
+        return CommandTextEncodingReview {
+            status: "not_text_io_command",
+            io_profile: "no_known_text_io_surface",
+            evidence,
+            required_action: None,
+            suggested_command: None,
+            requires_correction: false,
+        };
+    }
+
+    evidence.push("known_text_io_command_surface");
+    if command_has_explicit_encoding_control(&lower) {
+        evidence.push("explicit_encoding_control");
+        return CommandTextEncodingReview {
+            status: "encoding_explicit",
+            io_profile: command_text_io_profile(&tokens),
+            evidence,
+            required_action: None,
+            suggested_command: None,
+            requires_correction: false,
+        };
+    }
+
+    let inherited_from_tool_env = cfg!(windows)
+        && matches!(family, ShellFamily::PowerShell)
+        && command_inherits_tool_encoding_bootstrap(&tokens);
+    if inherited_from_tool_env {
+        evidence.push("moyai_shell_bootstrap_will_inject_utf8_environment");
+    }
+
+    let suggested_command = command_encoding_correction(trimmed, &tokens, &lower, family);
+    let requires_correction = true;
+    CommandTextEncodingReview {
+        status: if inherited_from_tool_env {
+            "encoding_inherited_from_tool_environment"
+        } else {
+            "encoding_unspecified"
+        },
+        io_profile: command_text_io_profile(&tokens),
+        evidence,
+        required_action: Some(
+            "make the command or generated artifact text encoding explicit before execution",
+        ),
+        suggested_command,
+        requires_correction,
+    }
+}
+
+pub(crate) fn command_text_encoding_suggested_command(
+    command: &str,
+    family: ShellFamily,
+) -> Option<String> {
+    command_text_encoding_review(command, family).suggested_command
+}
+
+fn command_has_text_io_surface(tokens: &[String], lower: &str) -> bool {
+    if lower.contains("encoding=")
+        || lower.contains("stdout")
+        || lower.contains("stderr")
+        || lower.contains("read-host")
+        || lower.contains("write-host")
+        || lower.contains("write-output")
+        || lower.contains("set-content")
+        || lower.contains("get-content")
+        || lower.contains("out-file")
+        || lower.contains("tee-object")
+    {
+        return true;
+    }
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "python"
+                | "python3"
+                | "py"
+                | "pytest"
+                | "unittest"
+                | "node"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "ruby"
+                | "perl"
+                | "php"
+                | "java"
+                | "javac"
+                | "dotnet"
+                | "go"
+                | "cargo"
+                | "rustc"
+                | "powershell"
+                | "pwsh"
+        )
+    })
+}
+
+fn command_text_io_profile(tokens: &[String]) -> &'static str {
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "get-content" | "set-content" | "out-file" | "tee-object" | "write-output"
+        )
+    }) {
+        return "text_producing_or_text_consuming_command";
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "test" | "tests" | "pytest" | "unittest"))
+    {
+        "test_or_verification_runner"
+    } else if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "python" | "python3" | "py" | "node" | "ruby" | "perl" | "php"
+        )
+    }) {
+        "language_runtime_execution"
+    } else {
+        "text_producing_or_text_consuming_command"
+    }
+}
+
+fn command_has_explicit_encoding_control(lower: &str) -> bool {
+    [
+        "utf-8",
+        "utf8",
+        "pythonutf8",
+        "pythonioencoding",
+        "-x utf8",
+        "outputencoding",
+        "console]::inputencoding",
+        "console]::outputencoding",
+        "chcp 65001",
+        "encoding=",
+        "charset",
+        "lang=c.utf8",
+        "lang=c.utf-8",
+        "lc_all=c.utf8",
+        "lc_all=c.utf-8",
+    ]
+    .into_iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn command_inherits_tool_encoding_bootstrap(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "python" | "python3" | "py" | "pytest" | "unittest"
+        )
+    })
+}
+
+fn command_encoding_correction(
+    command: &str,
+    tokens: &[String],
+    lower: &str,
+    family: ShellFamily,
+) -> Option<String> {
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "python" | "python3" | "py" | "pytest"))
+    {
+        return Some(correct_python_command_for_utf8(command, lower, family));
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "powershell" | "pwsh"))
+    {
+        return Some(format!(
+            "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new(); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); {command}"
+        ));
+    }
+    Some(match family {
+        ShellFamily::PowerShell => format!(
+            "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new(); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); $env:LANG='C.UTF-8'; $env:LC_ALL='C.UTF-8'; {command}"
+        ),
+        ShellFamily::Bash => format!("LC_ALL=C.UTF-8 LANG=C.UTF-8 {command}"),
+    })
+}
+
+fn correct_python_command_for_utf8(command: &str, lower: &str, family: ShellFamily) -> String {
+    if lower.starts_with("python ") {
+        return format!("python -X utf8 {}", command["python ".len()..].trim_start());
+    }
+    if lower.starts_with("python3 ") {
+        return format!(
+            "python3 -X utf8 {}",
+            command["python3 ".len()..].trim_start()
+        );
+    }
+    if lower.starts_with("py ") {
+        return format!("py -X utf8 {}", command["py ".len()..].trim_start());
+    }
+    if lower.starts_with("pytest") {
+        return match family {
+            ShellFamily::PowerShell => {
+                format!("$env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; {command}")
+            }
+            ShellFamily::Bash => format!("PYTHONUTF8=1 PYTHONIOENCODING=utf-8 {command}"),
+        };
+    }
+    match family {
+        ShellFamily::PowerShell => {
+            format!("$env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; {command}")
+        }
+        ShellFamily::Bash => format!("PYTHONUTF8=1 PYTHONIOENCODING=utf-8 {command}"),
+    }
 }
 
 struct CommandOutput {
@@ -304,27 +672,19 @@ async fn execute_shell_command(
 
     let (status, timed_out) = tokio::select! {
         _ = cancel.cancelled() => {
-            let _ = child.start_kill();
-            kill_process_tree(pid).await?;
-            let _ = timeout(Duration::from_secs(5), child.wait()).await;
+            let _ = terminate_shell_child(&mut child, pid).await;
             return Err(ToolError::Message("shell command cancelled by user".to_string()));
         }
         result = timeout(Duration::from_millis(timeout_ms), child.wait()) => match result {
             Ok(result) => (result?, false),
             Err(_) => {
-                let _ = child.start_kill();
-                kill_process_tree(pid).await?;
-                let status = timeout(Duration::from_secs(5), child.wait())
-                    .await
-                    .map_err(|_| {
-                        ToolError::Message(
-                            "shell command timed out and could not be terminated cleanly".to_string(),
-                        )
-                    })??;
+                let status = terminate_shell_child(&mut child, pid).await?;
                 (status, true)
             }
         }
     };
+
+    cleanup_shell_process_tree_after_parent_exit(pid).await?;
 
     let stdout = decode_shell_bytes_for_display(&join_pipe(stdout_task, "stdout").await?);
     let stderr_bytes = join_pipe(stderr_task, "stderr").await?;
@@ -469,12 +829,150 @@ async fn kill_process_tree(pid: u32) -> Result<(), ToolError> {
         .stderr(Stdio::null())
         .status()
         .await;
+    kill_process_descendants_by_parent_id(pid).await?;
     Ok(())
+}
+
+#[cfg(windows)]
+async fn cleanup_shell_process_tree_after_parent_exit(pid: u32) -> Result<(), ToolError> {
+    kill_process_descendants_by_parent_id(pid).await
+}
+
+#[cfg(windows)]
+async fn kill_process_descendants_by_parent_id(pid: u32) -> Result<(), ToolError> {
+    let script = format!(
+        r#"
+$root = {pid}
+$processes = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId
+$known = @{{}}
+$known[$root] = $true
+$descendants = New-Object System.Collections.Generic.List[int]
+do {{
+    $found = $false
+    foreach ($process in $processes) {{
+        $processId = [int]$process.ProcessId
+        $parentId = [int]$process.ParentProcessId
+        if ($known.ContainsKey($parentId) -and -not $known.ContainsKey($processId)) {{
+            $known[$processId] = $true
+            $descendants.Add($processId)
+            $found = $true
+        }}
+    }}
+}} while ($found)
+foreach ($processId in ($descendants | Sort-Object -Descending)) {{
+    try {{ Stop-Process -Id $processId -Force -ErrorAction Stop }} catch {{ }}
+}}
+"#
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn cleanup_shell_process_tree_after_parent_exit(pid: u32) -> Result<(), ToolError> {
+    kill_process_tree(pid).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn cleanup_shell_process_tree_after_parent_exit(_pid: u32) -> Result<(), ToolError> {
+    Ok(())
+}
+
+async fn terminate_shell_child(
+    child: &mut tokio::process::Child,
+    pid: u32,
+) -> Result<ExitStatus, ToolError> {
+    for step in shell_timeout_termination_plan() {
+        match step {
+            ShellTerminationStep::ProcessTreeKill => {
+                kill_process_tree(pid).await?;
+            }
+            ShellTerminationStep::ParentStartKill => {
+                let _ = child.start_kill();
+            }
+            ShellTerminationStep::WaitForParent => {
+                return timeout(Duration::from_secs(5), child.wait())
+                    .await
+                    .map_err(|_| {
+                        ToolError::Message(
+                            "shell command timed out and could not be terminated cleanly"
+                                .to_string(),
+                        )
+                    })?
+                    .map_err(ToolError::from);
+            }
+        }
+    }
+    Err(ToolError::Message(
+        "shell command timed out and no termination wait step was configured".to_string(),
+    ))
 }
 
 #[cfg(not(any(unix, windows)))]
 async fn kill_process_tree(_pid: u32) -> Result<(), ToolError> {
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellTerminationStep {
+    ParentStartKill,
+    ProcessTreeKill,
+    WaitForParent,
+}
+
+fn shell_timeout_termination_plan() -> Vec<ShellTerminationStep> {
+    vec![
+        ShellTerminationStep::ProcessTreeKill,
+        ShellTerminationStep::ParentStartKill,
+        ShellTerminationStep::WaitForParent,
+    ]
+}
+
+pub(crate) fn shell_timeout_process_tree_termination_order_fixture_passes() -> bool {
+    let plan = shell_timeout_termination_plan();
+    let process_tree_position = plan
+        .iter()
+        .position(|step| *step == ShellTerminationStep::ProcessTreeKill);
+    let parent_position = plan
+        .iter()
+        .position(|step| *step == ShellTerminationStep::ParentStartKill);
+
+    matches!(
+        (process_tree_position, parent_position),
+        (Some(process_tree), Some(parent)) if process_tree < parent
+    ) && plan.last() == Some(&ShellTerminationStep::WaitForParent)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellCompletionCleanupStep {
+    DescendantProcessTreeCleanup,
+    JoinCapturedPipes,
+}
+
+fn shell_completion_cleanup_plan() -> Vec<ShellCompletionCleanupStep> {
+    vec![
+        ShellCompletionCleanupStep::DescendantProcessTreeCleanup,
+        ShellCompletionCleanupStep::JoinCapturedPipes,
+    ]
+}
+
+pub(crate) fn shell_completion_process_tree_cleanup_fixture_passes() -> bool {
+    let plan = shell_completion_cleanup_plan();
+    let cleanup_position = plan
+        .iter()
+        .position(|step| *step == ShellCompletionCleanupStep::DescendantProcessTreeCleanup);
+    let pipe_join_position = plan
+        .iter()
+        .position(|step| *step == ShellCompletionCleanupStep::JoinCapturedPipes);
+    matches!(
+        (cleanup_position, pipe_join_position),
+        (Some(cleanup), Some(pipe_join)) if cleanup < pipe_join
+    )
 }
 
 fn references_outside_workspace(workspace: &crate::workspace::Workspace, command: &str) -> bool {
@@ -531,6 +1029,13 @@ fn default_description(command: &str) -> String {
     format!("Run shell command: {shortened}")
 }
 
+fn shell_permission_details(command: &str, workdir: &Utf8Path) -> Vec<String> {
+    vec![
+        format!("Command: {}", command.trim()),
+        format!("Workdir: {}", workdir),
+    ]
+}
+
 fn shell_permission_risks(
     workspace: &crate::workspace::Workspace,
     command: &str,
@@ -544,6 +1049,9 @@ fn shell_permission_risks(
     }
     if shell_has_network_risk(command) {
         risks.push(PermissionRisk::Network);
+    }
+    if shell_requires_external_connection_review(command) {
+        risks.push(PermissionRisk::ExternalConnection);
     }
     if command_mentions_protected_target(workspace, command) {
         risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
@@ -598,6 +1106,69 @@ fn shell_has_network_risk(command: &str) -> bool {
     ]
     .into_iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn shell_requires_external_connection_review(command: &str) -> bool {
+    if shell_has_network_risk(command) {
+        return true;
+    }
+    let tokens = command_tokens(command);
+    let has_setup_action = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "install"
+                | "add"
+                | "sync"
+                | "fetch"
+                | "update"
+                | "upgrade"
+                | "restore"
+                | "download"
+                | "pull"
+                | "clone"
+                | "ci"
+                | "dlx"
+        )
+    });
+    if !has_setup_action {
+        return tokens.iter().any(|token| matches!(token.as_str(), "npx"))
+            || (tokens.iter().any(|token| token == "uv")
+                && tokens.iter().any(|token| token == "run"));
+    }
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "pip"
+                | "pip3"
+                | "uv"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "poetry"
+                | "pipenv"
+                | "cargo"
+                | "rustup"
+                | "pyenv"
+                | "conda"
+                | "mamba"
+                | "winget"
+                | "choco"
+                | "scoop"
+                | "apt"
+                | "apt-get"
+                | "brew"
+                | "git"
+        )
+    })
+}
+
+fn command_tokens(command: &str) -> Vec<String> {
+    command
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn command_mentions_protected_target(
@@ -772,6 +1343,66 @@ fn build_shell_changes(
     })
 }
 
+fn file_change_content_evidence(
+    changes: &[crate::edit::FileChange],
+    workspace_root: &Utf8Path,
+) -> serde_json::Value {
+    let mut content_bearing_change_ids = Vec::new();
+    let mut non_satisfying_change_ids = Vec::new();
+    let mut content_bearing_paths = Vec::new();
+    let mut non_satisfying_paths = Vec::new();
+
+    for change in changes {
+        let path = change
+            .path_after
+            .as_ref()
+            .or(change.path_before.as_ref())
+            .map(|path| render_change_path(path, workspace_root))
+            .unwrap_or_default();
+        if file_change_has_content_bearing_after_state(change) {
+            content_bearing_change_ids.push(change.id.to_string());
+            if !path.is_empty() {
+                content_bearing_paths.push(path);
+            }
+        } else {
+            non_satisfying_change_ids.push(change.id.to_string());
+            if !path.is_empty() {
+                non_satisfying_paths.push(path);
+            }
+        }
+    }
+
+    serde_json::json!({
+        "kind": "file_change_content_evidence",
+        "content_bearing": !content_bearing_change_ids.is_empty(),
+        "all_changes_content_bearing": !changes.is_empty() && non_satisfying_change_ids.is_empty(),
+        "content_bearing_change_ids": content_bearing_change_ids,
+        "non_satisfying_change_ids": non_satisfying_change_ids,
+        "content_bearing_paths": content_bearing_paths,
+        "non_satisfying_paths": non_satisfying_paths,
+    })
+}
+
+fn file_change_has_content_bearing_after_state(change: &crate::edit::FileChange) -> bool {
+    if matches!(change.kind, crate::session::ChangeKind::Delete) {
+        return false;
+    }
+    change.diff_text.lines().any(|line| {
+        line.starts_with('+')
+            && !line.starts_with("+++")
+            && line.trim_start_matches('+').trim().len() > 0
+    })
+}
+
+fn render_change_path(path: &Utf8Path, workspace_root: &Utf8Path) -> String {
+    crate::workspace::project::workspace_relative_key_for_match(
+        path.as_str(),
+        workspace_root.as_str(),
+    )
+    .filter(|relative| !relative.is_empty())
+    .unwrap_or_else(|| path.as_str().replace('\\', "/"))
+}
+
 pub(crate) fn shell_change_set_syncs_confirmed_edit_baseline_fixture_passes() -> bool {
     let temp = match tempfile::tempdir() {
         Ok(value) => value,
@@ -842,6 +1473,98 @@ pub(crate) fn shell_output_encoding_fixture_passes() -> bool {
     }
 }
 
+pub fn command_text_encoding_contract_fixture_passes() -> bool {
+    let python_plain = command_text_encoding_review("python -m unittest", ShellFamily::PowerShell);
+    if python_plain.status != "encoding_inherited_from_tool_environment"
+        || !python_plain.requires_correction
+        || python_plain.suggested_command.as_deref() != Some("python -X utf8 -m unittest")
+    {
+        return false;
+    }
+
+    let python_explicit =
+        command_text_encoding_review("python -X utf8 -m unittest", ShellFamily::PowerShell);
+    if python_explicit.status != "encoding_explicit" || python_explicit.requires_correction {
+        return false;
+    }
+
+    let node_plain = command_text_encoding_review("node test.js", ShellFamily::PowerShell);
+    if !matches!(
+        node_plain.io_profile,
+        "language_runtime_execution" | "test_or_verification_runner"
+    ) || !node_plain.requires_correction
+        || node_plain.status != "encoding_unspecified"
+        || node_plain.suggested_command.as_deref()
+            != Some(
+                "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new(); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); $env:LANG='C.UTF-8'; $env:LC_ALL='C.UTF-8'; node test.js",
+            )
+    {
+        return false;
+    }
+
+    let diagnostic = command_text_encoding_review(
+        "Get-Process | Select-Object -First 5",
+        ShellFamily::PowerShell,
+    );
+    if diagnostic.status != "not_text_io_command" || diagnostic.requires_correction {
+        return false;
+    }
+
+    let get_content_utf8 = command_text_encoding_review(
+        "Get-Content calculator.py -Encoding UTF8",
+        ShellFamily::PowerShell,
+    );
+    if get_content_utf8.status != "encoding_explicit"
+        || get_content_utf8.requires_correction
+        || get_content_utf8.io_profile != "text_producing_or_text_consuming_command"
+    {
+        return false;
+    }
+
+    let metadata = python_plain.metadata();
+    metadata.get("contract").and_then(|value| value.as_str())
+        == Some("command_text_encoding_contract")
+        && metadata.get("status").and_then(|value| value.as_str())
+            == Some("encoding_inherited_from_tool_environment")
+}
+
+pub fn external_connection_shell_review_fixture_passes() -> bool {
+    let reviewed = [
+        "pip install requests",
+        "python -m pip install rich",
+        "uv add pytest",
+        "uv run pytest",
+        "npm install",
+        "pnpm add vite",
+        "cargo fetch",
+        "Invoke-WebRequest https://www.python.org/ftp/python.exe",
+        "curl https://example.com/script.ps1",
+        "git clone https://example.com/repo.git",
+    ];
+    reviewed
+        .iter()
+        .all(|command| shell_requires_external_connection_review(command))
+        && shell_permission_details(
+            "pip install pygame",
+            Utf8Path::new("C:/Users/example/project"),
+        )
+        .iter()
+        .any(|detail| detail == "Command: pip install pygame")
+        && !shell_requires_external_connection_review("python -m unittest")
+        && !shell_requires_external_connection_review("Get-Process | Select-Object -First 5")
+}
+
+pub fn shell_output_projection_fixture_passes() -> bool {
+    let output =
+        format_shell_output_for_display("Get-Process", "powershell  123", "", Some(0), false);
+    let failed = format_shell_output_for_display("uv add ということ", "", "error", Some(1), false);
+    output.contains("Command: Get-Process")
+        && output.contains("Stdout:\npowershell  123")
+        && output.contains("Stderr:\n(empty)")
+        && failed.contains("Exit code: 1")
+        && failed.contains("Recovery:")
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -852,5 +1575,20 @@ mod tests {
     #[test]
     fn shell_output_encoding_preserves_japanese_text() {
         assert!(super::shell_output_encoding_fixture_passes());
+    }
+
+    #[test]
+    fn command_text_encoding_contract_reviews_text_io_commands() {
+        assert!(super::command_text_encoding_contract_fixture_passes());
+    }
+
+    #[test]
+    fn external_connection_shell_commands_require_review() {
+        assert!(super::external_connection_shell_review_fixture_passes());
+    }
+
+    #[test]
+    fn shell_output_projection_includes_stdout_stderr_and_recovery() {
+        assert!(super::shell_output_projection_fixture_passes());
     }
 }

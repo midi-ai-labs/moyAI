@@ -1281,40 +1281,55 @@ impl TuiController {
         let area = centered_rect(70, 40, frame.area());
         frame.render_widget(Clear, area);
         if let Some(permission) = &self.state.permission {
+            let mut lines = vec![
+                Line::from(permission.summary.clone()),
+                Line::from(""),
+                Line::from("Details:"),
+            ];
+            if permission.details.is_empty() {
+                lines.push(Line::from("  (none)"));
+            } else {
+                lines.extend(
+                    permission
+                        .details
+                        .iter()
+                        .map(|detail| Line::from(format!("  {detail}"))),
+                );
+            }
+            lines.extend([
+                Line::from(""),
+                Line::from(format!(
+                    "Targets: {}",
+                    if permission.targets.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        permission.targets.join(", ")
+                    }
+                )),
+                Line::from(format!(
+                    "Outside workspace: {}",
+                    permission.outside_workspace
+                )),
+                Line::from(format!(
+                    "Risks: {}",
+                    if permission.risks.is_empty() {
+                        "none".to_string()
+                    } else {
+                        permission.risks.join(", ")
+                    }
+                )),
+                Line::from(format!(
+                    "Access mode: {}",
+                    self.effective_config.permissions.access_mode.as_str()
+                )),
+                Line::from(""),
+                Line::from("a = allow once"),
+                Line::from("d / Esc = reject"),
+            ]);
             frame.render_widget(
-                Paragraph::new(Text::from(vec![
-                    Line::from(permission.summary.clone()),
-                    Line::from(""),
-                    Line::from(format!(
-                        "Targets: {}",
-                        if permission.targets.is_empty() {
-                            "(none)".to_string()
-                        } else {
-                            permission.targets.join(", ")
-                        }
-                    )),
-                    Line::from(format!(
-                        "Outside workspace: {}",
-                        permission.outside_workspace
-                    )),
-                    Line::from(format!(
-                        "Risks: {}",
-                        if permission.risks.is_empty() {
-                            "none".to_string()
-                        } else {
-                            permission.risks.join(", ")
-                        }
-                    )),
-                    Line::from(format!(
-                        "Access mode: {}",
-                        self.effective_config.permissions.access_mode.as_str()
-                    )),
-                    Line::from(""),
-                    Line::from("a = allow once"),
-                    Line::from("d / Esc = reject"),
-                ]))
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title("Confirmation")),
+                Paragraph::new(Text::from(lines))
+                    .wrap(Wrap { trim: false })
+                    .block(Block::default().borders(Borders::ALL).title("Confirmation")),
                 area,
             );
         }
@@ -1415,6 +1430,7 @@ fn full_effective_override(config: &ResolvedConfig) -> crate::config::model::Par
             base_url: Some(config.model.base_url.clone()),
             model: Some(config.model.model.clone()),
             prompt_profile: Some(config.model.prompt_profile),
+            provider_metadata_mode: Some(config.model.provider_metadata_mode),
             api_key_env: None,
             extra_headers: Some(config.model.extra_headers.clone()),
             request_timeout_ms: Some(config.model.request_timeout_ms),

@@ -281,8 +281,7 @@ export function renderThreadContent(state: DesktopWebState): string {
   if ((state.transcript_rows.length === 0 || onlyEmptyPlaceholder || state.selected_session_index < 0) && state.file_change_rows.length === 0) {
     return renderEmptyThread(state);
   }
-  const visibleTranscriptRows = state.transcript_rows.filter((row) => !shouldHidePseudoToolCallTranscriptRow(row));
-  return visibleTranscriptRows.map(renderTranscriptCard).join("");
+  return state.transcript_rows.map(renderTranscriptCard).join("");
 }
 
 function renderEmptyThread(state: DesktopWebState): string {
@@ -323,7 +322,7 @@ function renderTranscriptCard(row: TranscriptRow): string {
 }
 
 function renderFileChangesTranscriptCard(row: TranscriptRow): string {
-  const changes = normalizedTranscriptFileChanges(row);
+  const changes = row.file_changes;
   const body = changes.length === 0 ? `<div class="markdown-body">${renderMarkdown(row.body)}</div>` : renderTranscriptFileChangeTable(changes);
   return `
     <article class="message file_changes">
@@ -334,26 +333,6 @@ function renderFileChangesTranscriptCard(row: TranscriptRow): string {
       </div>
     </article>
   `;
-}
-
-function normalizedTranscriptFileChanges(row: TranscriptRow): FileChangeRow[] {
-  if (Array.isArray(row.file_changes) && row.file_changes.length > 0) {
-    return row.file_changes;
-  }
-  return parseFileChangesFromTranscriptBody(row.body);
-}
-
-function parseFileChangesFromTranscriptBody(body: string): FileChangeRow[] {
-  return body
-    .split(/\r?\n/)
-    .map((line) => line.trim().match(/^[-*]\s+\[([^\]]+)\]\s+(.+?)(?:\s+-\s+(.+))?$/))
-    .filter((match): match is RegExpMatchArray => match !== null)
-    .map((match) => ({
-      action: match[1].trim(),
-      path: match[2].trim(),
-      label: fileName(match[2].trim()),
-      summary: (match[3] ?? "").trim(),
-    }));
 }
 
 function renderTranscriptFileChangeTable(changes: FileChangeRow[]): string {
@@ -380,44 +359,63 @@ function renderTranscriptFileChangeTable(changes: FileChangeRow[]): string {
   `;
 }
 
-function shouldHidePseudoToolCallTranscriptRow(row: TranscriptRow): boolean {
-  if (row.kind === "user") {
-    return false;
-  }
-  const body = row.body.toLowerCase();
-  return (
-    body.includes("<tool_call>") ||
-    body.includes("</tool_call>") ||
-    body.includes("&lt;tool_call") ||
-    body.includes("&lt;/tool_call") ||
-    body.includes("<function=") ||
-    body.includes("</function>") ||
-    body.includes("&lt;function=") ||
-    body.includes("&lt;/function") ||
-    body.includes("<parameter=command>") ||
-    body.includes("<parameter=path>") ||
-    body.includes("&lt;parameter=command") ||
-    body.includes("&lt;parameter=path")
-  );
-}
-
 function renderWorkSummaryCard(row: TranscriptRow): string {
-  const open = row.kind === "work_summary_running" ? "open" : "";
+  const running = row.kind === "work_summary_running";
+  const open = running ? "open" : "";
   const statusText = row.kind === "work_summary_running" ? "実行中" : "作業サマリ";
+  const summary = extractMarkdownSections(row.body, ["作業サマリ", "完了"]);
+  const history = removeMarkdownSections(row.body, ["作業サマリ", "完了"]);
+  const visibleSummary = !running && summary.trim().length > 0 ? summary : "";
+  const detailBody = visibleSummary.length > 0 && history.trim().length > 0 ? history : row.body;
   return `
     <article class="message work-summary ${escapeHtml(row.kind)}">
       <div class="message-step">${escapeHtml(row.step)}</div>
       <div class="message-body">
+        ${
+          visibleSummary.length > 0
+            ? `<h2>${escapeHtml(row.title)}</h2><div class="markdown-body work-summary-visible">${renderMarkdown(visibleSummary)}</div>`
+            : ""
+        }
         <details ${open}>
           <summary>
-            <span>${escapeHtml(row.title)}</span>
+            <span>${escapeHtml(visibleSummary.length > 0 ? "作業履歴" : row.title)}</span>
             <small>${escapeHtml(statusText)}</small>
           </summary>
-          <div class="markdown-body">${renderMarkdown(row.body)}</div>
+          <div class="markdown-body">${renderMarkdown(detailBody)}</div>
         </details>
       </div>
     </article>
   `;
+}
+
+function extractMarkdownSections(body: string, headings: string[]): string {
+  const wanted = new Set(headings);
+  const lines = body.replace(/\r\n/g, "\n").split("\n");
+  const result: string[] = [];
+  let taking = false;
+  for (const line of lines) {
+    const heading = line.match(/^###\s+(.+)$/);
+    if (heading) {
+      taking = wanted.has(heading[1].trim());
+    }
+    if (taking) result.push(line);
+  }
+  return result.join("\n").trim();
+}
+
+function removeMarkdownSections(body: string, headings: string[]): string {
+  const unwanted = new Set(headings);
+  const lines = body.replace(/\r\n/g, "\n").split("\n");
+  const result: string[] = [];
+  let dropping = false;
+  for (const line of lines) {
+    const heading = line.match(/^###\s+(.+)$/);
+    if (heading) {
+      dropping = unwanted.has(heading[1].trim());
+    }
+    if (!dropping) result.push(line);
+  }
+  return result.join("\n").trim();
 }
 
 export function renderComposer(state: DesktopWebState): string {
@@ -587,12 +585,37 @@ export function renderOverlay(state: DesktopWebState): string {
 
 function renderProviderOverlay(state: DesktopWebState): string {
   const selectedSummary = state.provider_selected_model_summary.length > 0 ? state.provider_selected_model_summary : ["モデル metadata は未取得です。"];
+  const providerModeOptions = [
+    ["lm_studio_native_required", "LM Studio native"],
+    ["openai_compatible_only", "OpenAI互換のみ"],
+  ] as const;
   return `
     <div class="modal-backdrop" data-action="close-overlay">
       <section class="modal wide" data-modal>
         <h2>LLM URL</h2>
         <label class="field-label">ベースURL</label>
         <input id="provider-url" value="${escapeHtml(state.provider_base_url)}" />
+        <label class="field-label">Provider mode</label>
+        <div class="segmented-control provider-mode-control">
+          ${providerModeOptions
+            .map(
+              ([mode, label]) => `
+                <button class="${state.provider_metadata_mode === mode ? "selected" : ""}" data-action="set-provider-mode" data-mode="${mode}">
+                  ${escapeHtml(label)}
+                </button>`
+            )
+            .join("")}
+        </div>
+        <div class="provider-limit-grid">
+          <div>
+            <label class="field-label" for="provider-context-window">Context window</label>
+            <input id="provider-context-window" inputmode="numeric" value="${escapeHtml(state.provider_context_window)}" />
+          </div>
+          <div>
+            <label class="field-label" for="provider-max-output-tokens">Max output tokens</label>
+            <input id="provider-max-output-tokens" inputmode="numeric" value="${escapeHtml(state.provider_max_output_tokens)}" />
+          </div>
+        </div>
         <div class="split-actions">
           <button data-action="load-provider-models" ${state.provider_loading ? "disabled" : ""}>${state.provider_loading ? "読込中" : "モデル読込"}</button>
           <button data-action="apply-provider-session" ${state.provider_apply_enabled ? "" : "disabled"}>セッションに適用</button>

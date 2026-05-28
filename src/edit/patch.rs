@@ -61,8 +61,11 @@ impl PatchParser {
                 index += 1;
                 let mut contents = Vec::new();
                 while index < lines.len() - 1 && !lines[index].starts_with("*** ") {
-                    let body = lines[index].strip_prefix('+').ok_or_else(|| {
-                        PatchError::Message("add file body must start with `+`".to_string())
+                    let raw_line = lines[index];
+                    let body = raw_line.strip_prefix('+').ok_or_else(|| {
+                        PatchError::Message(format!(
+                            "add file body line `{raw_line}` must start with `+`; every added content line, including blank lines and top-level `def`/`class`/`import` lines, must be prefixed with `+`"
+                        ))
                     })?;
                     contents.push(body.to_string());
                     index += 1;
@@ -165,7 +168,7 @@ fn normalize_patch_text(text: &str) -> String {
     let without_fence = strip_code_fence(normalized_newlines.trim());
     let without_heredoc = strip_heredoc_wrapper(without_fence.trim());
     let extracted = extract_marked_patch(without_heredoc.trim());
-    repair_patch_structure(extracted.trim())
+    extracted.trim().to_string()
 }
 
 fn strip_code_fence(text: &str) -> String {
@@ -225,158 +228,6 @@ fn extract_marked_patch(text: &str) -> String {
         (Some(begin), Some(end)) if begin <= end => lines[begin..=end].join("\n"),
         _ => text.to_string(),
     }
-}
-
-fn repair_patch_structure(text: &str) -> String {
-    let mut lines = text
-        .lines()
-        .map(|line| line.trim_end().to_string())
-        .collect::<Vec<_>>();
-    if lines.first().map(String::as_str) == Some("*** Begin Patch")
-        && lines.last().map(String::as_str) != Some("*** End Patch")
-    {
-        lines.push("*** End Patch".to_string());
-    }
-
-    let mut repaired = Vec::new();
-    let mut index = 0usize;
-    while index < lines.len() {
-        let line = lines[index].clone();
-        repaired.push(line.clone());
-        index += 1;
-
-        if line.starts_with("*** Add File: ") {
-            while index < lines.len() && !lines[index].starts_with("*** ") {
-                if let Some(header) = escaped_patch_header(&lines[index]) {
-                    lines[index] = header;
-                    normalize_embedded_add_section_body(&mut lines, index + 1);
-                    break;
-                }
-                if is_stray_patch_end_line(&lines[index]) {
-                    index += 1;
-                    continue;
-                }
-                repaired.push(prefix_add_body_line(&lines[index]));
-                index += 1;
-            }
-            continue;
-        }
-
-        if line.starts_with("*** Update File: ") {
-            if index < lines.len() && lines[index].starts_with("*** Move to: ") {
-                repaired.push(lines[index].clone());
-                index += 1;
-            }
-
-            let section_start = index;
-            while index < lines.len() && !lines[index].starts_with("*** ") {
-                if let Some(header) = escaped_patch_header(&lines[index]) {
-                    lines[index] = header;
-                    normalize_embedded_add_section_body(&mut lines, index + 1);
-                    break;
-                }
-                index += 1;
-            }
-            let body = lines[section_start..index]
-                .iter()
-                .filter(|entry| !is_stray_patch_end_line(entry))
-                .cloned()
-                .collect::<Vec<_>>();
-            let has_explicit_hunk = body.iter().any(|entry| {
-                entry.starts_with("@@")
-                    || entry
-                        .chars()
-                        .next()
-                        .is_some_and(|ch| matches!(ch, ' ' | '+' | '-'))
-            });
-
-            let has_nonempty_body = body.iter().any(|entry| !entry.is_empty());
-            if has_explicit_hunk {
-                repaired.extend(body.iter().map(|entry| normalize_explicit_hunk_line(entry)));
-            } else if has_nonempty_body {
-                repaired.extend(body.iter().map(|entry| format!("+{entry}")));
-            }
-            continue;
-        }
-    }
-
-    repaired.join("\n")
-}
-
-fn prefix_add_body_line(line: &str) -> String {
-    let repaired = strip_patch_pipe_prefix(line);
-    if repaired.starts_with('+') {
-        repaired
-    } else {
-        format!("+{repaired}")
-    }
-}
-
-fn normalize_explicit_hunk_line(line: &str) -> String {
-    if let Some(rest) = line.strip_prefix("| ") {
-        return format!("+{rest}");
-    }
-    if line == "|" {
-        return "+".to_string();
-    }
-    let repaired = strip_patch_pipe_prefix(line);
-    if repaired.starts_with("@@")
-        || repaired == "*** End of File"
-        || repaired
-            .chars()
-            .next()
-            .is_some_and(|ch| matches!(ch, ' ' | '+' | '-'))
-    {
-        repaired
-    } else {
-        format!("+{repaired}")
-    }
-}
-
-fn strip_patch_pipe_prefix(line: &str) -> String {
-    if line.starts_with("| ") {
-        line[2..].to_string()
-    } else if line == "|" {
-        String::new()
-    } else {
-        line.to_string()
-    }
-}
-
-fn escaped_patch_header(line: &str) -> Option<String> {
-    let repaired = strip_patch_pipe_prefix(line);
-    let unescaped = repaired.trim_start_matches('+').trim_start();
-
-    if unescaped == "*** Begin Patch"
-        || unescaped.starts_with("*** Add File: ")
-        || unescaped.starts_with("*** Update File: ")
-        || unescaped.starts_with("*** Delete File: ")
-    {
-        return Some(unescaped.to_string());
-    }
-
-    None
-}
-
-fn normalize_embedded_add_section_body(lines: &mut [String], start: usize) {
-    let mut index = start;
-    while index < lines.len() && !lines[index].starts_with("*** ") {
-        if let Some(rest) = lines[index].strip_prefix('+') {
-            lines[index] = rest.to_string();
-        }
-        index += 1;
-    }
-}
-
-fn is_stray_patch_end_line(line: &str) -> bool {
-    let normalized = strip_patch_pipe_prefix(line);
-    let trimmed = normalized
-        .strip_prefix('+')
-        .or_else(|| normalized.strip_prefix('-'))
-        .or_else(|| normalized.strip_prefix(' '))
-        .unwrap_or(&normalized)
-        .trim();
-    trimmed == "*** End Patch"
 }
 
 fn locate_hunk_start(
@@ -460,12 +311,6 @@ fn segment_matches_at(lines: &[String], pattern: &[String], start_index: usize) 
 
     matches_with(lines, pattern, start_index, |actual, expected| {
         actual == expected
-    }) || matches_with(lines, pattern, start_index, |actual, expected| {
-        actual.trim_end() == expected.trim_end()
-    }) || matches_with(lines, pattern, start_index, |actual, expected| {
-        actual.trim() == expected.trim()
-    }) || matches_with(lines, pattern, start_index, |actual, expected| {
-        normalize_unicode(actual.trim()) == normalize_unicode(expected.trim())
     })
 }
 
@@ -477,20 +322,6 @@ where
         let actual = &lines[start_index + offset];
         compare(actual, expected)
     })
-}
-
-fn normalize_unicode(value: &str) -> String {
-    value
-        .replace(['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'], "'")
-        .replace(['\u{201C}', '\u{201D}', '\u{201E}', '\u{201F}'], "\"")
-        .replace(
-            [
-                '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}',
-            ],
-            "-",
-        )
-        .replace('\u{2026}', "...")
-        .replace('\u{00A0}', " ")
 }
 
 fn parse_hunk(header: &str, lines: &[&str], index: &mut usize) -> Result<PatchChunk, PatchError> {
@@ -620,4 +451,47 @@ fn parse_range(value: &str) -> Result<(usize, usize), PatchError> {
         .parse::<usize>()
         .map_err(|error| PatchError::Message(format!("invalid range length: {error}")))?;
     Ok((start, lines))
+}
+
+pub(crate) fn patch_context_matching_is_exact_fixture_passes() -> bool {
+    let patch = r#"*** Begin Patch
+*** Update File: sample.txt
+@@
+-alpha
++beta
+ gamma_mismatch
+*** End Patch"#;
+    let operations = match PatchParser::parse(patch) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let [PatchOperation::Update { hunks, .. }] = operations.as_slice() else {
+        return false;
+    };
+    PatchParser::apply_to_text("alpha\ngamma\n", hunks).is_err()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PatchOperation, PatchParser};
+
+    #[test]
+    fn patch_context_matching_is_exact() {
+        assert!(super::patch_context_matching_is_exact_fixture_passes());
+
+        let patch = r#"*** Begin Patch
+*** Update File: sample.txt
+@@
+-alpha
++beta
+ gamma
+*** End Patch"#;
+        let operations = PatchParser::parse(patch).expect("patch parses");
+        let [PatchOperation::Update { hunks, .. }] = operations.as_slice() else {
+            panic!("expected update patch");
+        };
+        let updated =
+            PatchParser::apply_to_text("alpha\ngamma\n", hunks).expect("exact context applies");
+        assert_eq!(updated, "beta\ngamma");
+    }
 }

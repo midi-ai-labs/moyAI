@@ -61,8 +61,20 @@ export function wireEvents(state: DesktopWebState, context: EventContext): void 
     if (currentState) {
       currentState.draft_prompt = text;
       currentState.can_submit = text.trim().length > 0 && !currentState.busy;
+      currentState.enhance_enabled = text.trim().length > 0 && !currentState.busy;
       const send = document.querySelector<HTMLButtonElement>('[data-action="send"]');
       if (send) send.disabled = !currentState.can_submit;
+      const enhance = document.querySelector<HTMLButtonElement>('[data-action="enhance-prompt"]');
+      if (enhance) {
+        enhance.disabled = !currentState.enhance_enabled;
+        const title = currentState.busy
+          ? "実行中はEnhanceできません"
+          : text.trim().length === 0
+            ? "依頼文を入力してください"
+            : "Enhance";
+        enhance.title = title;
+        enhance.setAttribute("aria-label", title);
+      }
     }
     void command<DesktopWebState>("set_prompt", { text })
       .then(context.setCurrentState)
@@ -78,6 +90,20 @@ export function wireEvents(state: DesktopWebState, context: EventContext): void 
   });
   document.querySelector<HTMLInputElement>("#provider-url")?.addEventListener("input", (event) => {
     void command<DesktopWebState>("set_provider_base_url", {
+      text: (event.currentTarget as HTMLInputElement).value,
+    })
+      .then(context.setCurrentState)
+      .catch((error) => context.renderError(String(error)));
+  });
+  document.querySelector<HTMLInputElement>("#provider-context-window")?.addEventListener("input", (event) => {
+    void command<DesktopWebState>("set_provider_context_window", {
+      text: (event.currentTarget as HTMLInputElement).value,
+    })
+      .then(context.setCurrentState)
+      .catch((error) => context.renderError(String(error)));
+  });
+  document.querySelector<HTMLInputElement>("#provider-max-output-tokens")?.addEventListener("input", (event) => {
+    void command<DesktopWebState>("set_provider_max_output_tokens", {
       text: (event.currentTarget as HTMLInputElement).value,
     })
       .then(context.setCurrentState)
@@ -131,7 +157,8 @@ export function wireEvents(state: DesktopWebState, context: EventContext): void 
       }
       const action = node.dataset.action ?? "";
       const index = Number(node.dataset.index ?? "-1");
-      dispatchAction(action, index, state, context);
+      const value = node.dataset.mode ?? "";
+      dispatchAction(action, index, value, state, context);
     });
   });
   document.querySelectorAll<HTMLElement>("[data-drag-region], [data-tauri-drag-region]").forEach((node) => {
@@ -175,7 +202,7 @@ async function flushOpacityPreview(context: EventContext): Promise<void> {
   }
 }
 
-function dispatchAction(action: string, index: number, state: DesktopWebState, context: EventContext): void {
+function dispatchAction(action: string, index: number, value: string, state: DesktopWebState, context: EventContext): void {
   if (action === "minimize-window") void context.desktopWindow.minimize();
   if (action === "toggle-maximize-window") void context.desktopWindow.toggleMaximize();
   if (action === "close-window") void command("hide_to_tray").catch(() => context.desktopWindow.hide());
@@ -234,6 +261,9 @@ function dispatchAction(action: string, index: number, state: DesktopWebState, c
   if (action === "open-typed-path") void context.mutate("open_typed_path");
   if (action === "open-artifact-folder") void context.mutate("open_artifact_folder");
   if (action === "load-provider-models") void context.mutate("load_provider_models");
+  if (action === "set-provider-mode") {
+    void context.mutate("set_provider_metadata_mode", { mode: value });
+  }
   if (action === "select-provider-model") void context.mutate("select_provider_model", { index });
   if (action === "apply-provider-session") void context.mutate("apply_provider_session");
   if (action === "save-provider-global") void context.mutate("save_provider_global");

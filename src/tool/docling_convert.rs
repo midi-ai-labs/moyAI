@@ -118,8 +118,7 @@ impl Tool for DoclingConvertTool {
                 .filter(|value| !value.is_empty()),
         ) {
             (Some(path), None) => {
-                let guarded =
-                    PathGuard::require_path(ctx.workspace, &path, AccessKind::Read, true)?;
+                let guarded = PathGuard::require_path(ctx.workspace, &path, AccessKind::Read)?;
                 ctx.confirm_if_needed(
                     AccessKind::Read,
                     format!("Upload {} to Docling Serve", guarded.absolute),

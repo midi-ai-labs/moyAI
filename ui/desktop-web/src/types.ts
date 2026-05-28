@@ -40,6 +40,7 @@ export type RunStatusKey = "idle" | "running" | "confirming" | "completed" | "aw
 
 export interface PermissionProjection {
   summary: string;
+  details: string[];
   targets: string[];
   outside_workspace: boolean;
   risks: string[];
@@ -107,6 +108,9 @@ export interface DesktopWebState {
   local_search_results_text: string;
   command_rows: Array<{ name: string; label: string; path: string }>;
   provider_base_url: string;
+  provider_metadata_mode: "lm_studio_native_required" | "openai_compatible_only";
+  provider_context_window: string;
+  provider_max_output_tokens: string;
   provider_models: string[];
   provider_selected_index: number;
   provider_status_text: string;

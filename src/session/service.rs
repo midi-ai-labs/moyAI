@@ -193,6 +193,53 @@ impl SessionService {
         .await
     }
 
+    pub async fn store_user_thread_op_with_protocol_bundle(
+        &self,
+        ctx: &SessionContext,
+        turn: &UserTurn,
+        requested_model: Option<String>,
+        initial_state: SessionStateSnapshot,
+        protocol_turn_id: crate::protocol::TurnId,
+        protocol_sequence_no: i64,
+    ) -> Result<crate::session::MessageRecord, SessionError> {
+        let repository = self.store.session_repo();
+        let mut parts = vec![NewPart {
+            kind: PartKind::Text,
+            payload: MessagePart::Text(crate::session::TextPart { text: turn.text() }),
+        }];
+        for image in turn.images() {
+            parts.push(NewPart {
+                kind: PartKind::Image,
+                payload: MessagePart::Image(image),
+            });
+        }
+        if let Some(prompt_dispatch) = turn.prompt_dispatch.clone() {
+            parts.push(NewPart {
+                kind: PartKind::PromptDispatch,
+                payload: MessagePart::PromptDispatch(prompt_dispatch),
+            });
+        }
+        Ok(repository
+            .append_user_message_with_protocol_bundle(
+                NewMessage {
+                    session_id: ctx.session.id,
+                    parent_message_id: None,
+                    role: MessageRole::User,
+                    metadata: MessageMetadata::User(UserMessageMeta {
+                        cwd: ctx.workspace.cwd.clone(),
+                        requested_model,
+                        editor_context: turn.editor_context.clone(),
+                    }),
+                },
+                parts,
+                &initial_state,
+                turn,
+                protocol_turn_id,
+                protocol_sequence_no,
+            )
+            .await?)
+    }
+
     pub async fn mark_interrupted_running_sessions(
         &self,
         session_id: crate::session::SessionId,

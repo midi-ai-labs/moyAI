@@ -53,6 +53,7 @@ moyAI is designed around those constraints:
 | Evidence-oriented | Keeps transcript, file changes, tool output, and session history inspectable. |
 | GUI and terminal | Offers Desktop, CLI, and TUI entrypoints over the same Rust core. |
 | Closed-network friendly | Release builds run without npm, Rust toolchain, internet, or a dev server on the target machine. |
+| No self-bootstrap | The agent does not run dependency installs, runtime downloads, package-manager setup, external URL fetches, or external git fetches. It asks the user to prepare missing environments outside moyAI. |
 
 ## Highlights
 
@@ -139,9 +140,14 @@ Example:
 [model]
 base_url = "http://127.0.0.1:1234"
 model = "qwen/qwen3.6-35b-a3b"
+provider_metadata_mode = "lm_studio_native_required"
 context_window = 131072
 supports_tools = true
 supports_images = true
+max_output_tokens = 8192
+
+[model.extra_body_json]
+num_ctx = 131072
 
 [permissions]
 access_mode = "auto_review"
@@ -158,6 +164,7 @@ Common environment variables:
 
 - `MOYAI_BASE_URL`
 - `MOYAI_MODEL`
+- `MOYAI_PROVIDER_METADATA_MODE`
 - `MOYAI_CONFIG_PATH`
 - `MOYAI_DATA_DIR`
 - `MOYAI_ACCESS_MODE`
@@ -168,6 +175,18 @@ Common environment variables:
 - `MOYAI_SUPPORTS_IMAGES`
 - `MOYAI_DOCLING_ENABLED`
 - `MOYAI_MCP_ENABLED`
+
+Use `provider_metadata_mode = "openai_compatible_only"` or
+`MOYAI_PROVIDER_METADATA_MODE=openai_compatible_only` for OpenAI-compatible servers that do not
+provide LM Studio's native `/api/v1/models` metadata endpoint, such as vLLM/vLLM-MLX.
+In this mode, every OpenAI-compatible chat request prefixes the configured system prompt with the
+language / no-thinking policy required for qwen3.6 hosted behind vLLM-compatible servers.
+The Tauri Desktop `LLM URL` overlay exposes the same mode switch beside the provider URL and model list.
+It also owns `context_window` and `max_output_tokens` inputs so vLLM/vLLM-MLX limits can be managed
+inside moyAI instead of relying on shell environment variables. Current vLLM-MLX `/health` and
+`/v1/status` responses expose the hosted model name, but not the server startup `--max-tokens` /
+`--max-request-tokens` values, so moyAI auto-detects the model and keeps request limits as managed
+config unless a provider exposes those fields in `/v1/models`.
 
 ## Startup Checks
 

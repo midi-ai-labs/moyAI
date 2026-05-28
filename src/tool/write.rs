@@ -53,7 +53,7 @@ impl Tool for WriteTool {
         mut ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<WriteInput>(raw_arguments)?;
-        let guarded = PathGuard::require_path(ctx.workspace, &input.path, AccessKind::Edit, true)?;
+        let guarded = PathGuard::require_path(ctx.workspace, &input.path, AccessKind::Edit)?;
         let mut risks = Vec::new();
         if is_protected_workspace_authority_path(&ctx.workspace.root, &guarded.absolute) {
             risks.push(PermissionRisk::ProtectedWorkspaceAuthority);

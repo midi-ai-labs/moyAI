@@ -39,6 +39,29 @@ function Get-RelativePathForRelease([string]$BasePath, [string]$FullPath) {
   return [Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()).Replace("/", "\")
 }
 
+function Assert-ReleaseOutputPath([string]$OutputRootPath, [string]$CandidatePath, [string]$Label) {
+  $root = [System.IO.Path]::GetFullPath($OutputRootPath).TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar
+  $candidate = [System.IO.Path]::GetFullPath($CandidatePath)
+  if (-not $candidate.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "$Label must stay under release output root: $candidate"
+  }
+  return $candidate
+}
+
+function Remove-ReleaseOutputFile([string]$OutputRootPath, [string]$Path, [string]$Label) {
+  $boundedPath = Assert-ReleaseOutputPath $OutputRootPath $Path $Label
+  if (Test-Path -LiteralPath $boundedPath -PathType Leaf) {
+    Remove-Item -LiteralPath $boundedPath -Force
+  }
+}
+
+function Remove-ReleaseOutputDirectory([string]$OutputRootPath, [string]$Path, [string]$Label) {
+  $boundedPath = Assert-ReleaseOutputPath $OutputRootPath $Path $Label
+  if (Test-Path -LiteralPath $boundedPath -PathType Container) {
+    Remove-Item -LiteralPath $boundedPath -Recurse -Force
+  }
+}
+
 $repoRoot = Resolve-RepoRoot
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
   $OutputRoot = Join-Path (Split-Path -Parent $repoRoot) "project_sandbox\releases"
@@ -46,10 +69,10 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 
 $releaseName = "moyAI-v$Version-$Target"
-$releaseRoot = Join-Path $OutputRoot $releaseName
-$zipPath = Join-Path $OutputRoot "$releaseName.zip"
-$manifestPath = Join-Path $OutputRoot "$releaseName.manifest.json"
-$zipShaPath = "$zipPath.sha256"
+$releaseRoot = Assert-ReleaseOutputPath $OutputRoot (Join-Path $OutputRoot $releaseName) "release directory"
+$zipPath = Assert-ReleaseOutputPath $OutputRoot (Join-Path $OutputRoot "$releaseName.zip") "release zip"
+$manifestPath = Assert-ReleaseOutputPath $OutputRoot (Join-Path $OutputRoot "$releaseName.manifest.json") "release manifest"
+$zipShaPath = Assert-ReleaseOutputPath $OutputRoot "$zipPath.sha256" "release checksum"
 
 Push-Location $repoRoot
 try {
@@ -86,18 +109,10 @@ try {
     throw "Desktop web asset directory not found: $desktopDist"
   }
 
-  if (Test-Path -LiteralPath $releaseRoot) {
-    Remove-Item -LiteralPath $releaseRoot -Recurse -Force
-  }
-  if (Test-Path -LiteralPath $zipPath) {
-    Remove-Item -LiteralPath $zipPath -Force
-  }
-  if (Test-Path -LiteralPath $manifestPath) {
-    Remove-Item -LiteralPath $manifestPath -Force
-  }
-  if (Test-Path -LiteralPath $zipShaPath) {
-    Remove-Item -LiteralPath $zipShaPath -Force
-  }
+  Remove-ReleaseOutputDirectory $OutputRoot $releaseRoot "release directory"
+  Remove-ReleaseOutputFile $OutputRoot $zipPath "release zip"
+  Remove-ReleaseOutputFile $OutputRoot $manifestPath "release manifest"
+  Remove-ReleaseOutputFile $OutputRoot $zipShaPath "release checksum"
   New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
 
   Copy-RequiredFile $cliExe (Join-Path $releaseRoot "bin\moyai.exe")
@@ -128,8 +143,8 @@ timeout_ms = 30000
 "@
   Write-Utf8File (Join-Path $releaseRoot "config.example.toml") $configExample
 
-  $notes = @"
-# moyAI v$Version
+  $notesTemplate = @'
+# moyAI v{0}
 
 This release module contains the Windows CLI and Tauri Desktop binaries.
 
@@ -148,7 +163,8 @@ This release module contains the Windows CLI and Tauri Desktop binaries.
 3. Open `LLM URL`, set base URL and model, then send a Quick Chat or select a Project workspace.
 
 The app stores user-wide config under the Windows user profile by default. No npm, Rust toolchain, internet access, or local dev server is required on the target machine.
-"@
+'@
+  $notes = $notesTemplate -f $Version
   Write-Utf8File (Join-Path $releaseRoot "RELEASE_NOTES.md") $notes
 
   $fileHashes = Get-ChildItem -LiteralPath $releaseRoot -Recurse -File |

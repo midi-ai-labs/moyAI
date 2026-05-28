@@ -120,7 +120,6 @@ pub fn project_history_item_for_run_event(
                 ToolLifecycleStatus::Completed,
             ),
             blocked_action: blocked_action_from_metadata(metadata),
-            required_next_action: required_next_action_from_metadata(metadata),
             result_hash: result_hash_from_metadata(metadata),
             verification_run: verification_run_result_from_metadata(metadata),
         },
@@ -141,7 +140,6 @@ pub fn project_history_item_for_run_event(
                 ToolLifecycleStatus::Failed,
             ),
             blocked_action: blocked_action_from_metadata(metadata),
-            required_next_action: required_next_action_from_metadata(metadata),
             result_hash: result_hash_from_metadata(metadata),
             verification_run: verification_run_result_from_metadata(metadata),
         },
@@ -184,6 +182,7 @@ pub fn project_history_item_for_run_event(
         },
         RunEvent::PermissionResolved {
             tool_call_id,
+            tool: _,
             approved,
         } => HistoryItemPayload::ApprovalDecision {
             call_id: *tool_call_id,
@@ -264,17 +263,20 @@ pub fn project_turn_item_for_run_event(
             tool: tool.clone(),
             status: ToolLifecycleStatus::Pending,
             title: title.clone(),
+            summary: String::new(),
         },
         RunEvent::ToolCallCompleted {
             tool_call_id,
             tool,
             title,
+            summary,
             ..
         } => TurnItemPayload::ToolStatus {
             call_id: *tool_call_id,
             tool: tool.clone(),
             status: ToolLifecycleStatus::Completed,
             title: title.clone(),
+            summary: summary.clone(),
         },
         RunEvent::ToolCallFailed {
             tool_call_id,
@@ -286,6 +288,7 @@ pub fn project_turn_item_for_run_event(
             tool: tool.clone(),
             status: ToolLifecycleStatus::Failed,
             title: error.clone(),
+            summary: error.clone(),
         },
         RunEvent::ToolProposalRejected { .. } | RunEvent::CandidateRepairEditRecorded { .. } => {
             return None;
@@ -312,6 +315,7 @@ pub fn project_turn_item_for_run_event(
         },
         RunEvent::PermissionRequested {
             tool_call_id,
+            tool: _,
             summary,
         } => TurnItemPayload::ApprovalRequest {
             call_id: *tool_call_id,
@@ -319,10 +323,11 @@ pub fn project_turn_item_for_run_event(
         },
         RunEvent::PermissionResolved {
             tool_call_id,
+            tool,
             approved,
         } => TurnItemPayload::ToolStatus {
             call_id: *tool_call_id,
-            tool: ToolName::Shell,
+            tool: *tool,
             status: if *approved {
                 ToolLifecycleStatus::Deferred
             } else {
@@ -333,6 +338,7 @@ pub fn project_turn_item_for_run_event(
             } else {
                 "Permission denied".to_string()
             },
+            summary: String::new(),
         },
         RunEvent::SessionCompleted { .. } => TurnItemPayload::Terminal {
             status: TurnTerminalStatus::Completed,
@@ -407,11 +413,9 @@ fn runtime_msg_for_run_event(
         RunEvent::SessionTitleUpdated { title, .. } => RuntimeEventMsg::Warning {
             message: format!("thread title updated: {title}"),
         },
-        RunEvent::UserMessageStored { message_id } => RuntimeEventMsg::UserMessageStored {
-            message_id: *message_id,
-        },
-        RunEvent::UserTurnStored { message_id, .. } => RuntimeEventMsg::UserMessageStored {
-            message_id: *message_id,
+        RunEvent::UserMessageStored { .. } => RuntimeEventMsg::UserInputAccepted { item_count: 1 },
+        RunEvent::UserTurnStored { turn, .. } => RuntimeEventMsg::TurnStarted {
+            context: turn.context.clone(),
         },
         RunEvent::AssistantStarted { message_id, model } => RuntimeEventMsg::AssistantStarted {
             message_id: *message_id,
@@ -446,7 +450,6 @@ fn runtime_msg_for_run_event(
                 tool.clone(),
                 ToolLifecycleStatus::Pending,
                 None,
-                None,
                 Some(title.clone()),
             );
             apply_tool_route_metadata(&mut envelope, metadata);
@@ -479,7 +482,6 @@ fn runtime_msg_for_run_event(
                 tool.clone(),
                 ToolLifecycleStatus::Failed,
                 Some(error),
-                None,
                 Some(error.clone()),
             );
             apply_completed_tool_metadata(&mut envelope, metadata);
@@ -513,16 +515,20 @@ fn runtime_msg_for_run_event(
         },
         RunEvent::PermissionRequested {
             tool_call_id,
+            tool,
             summary,
         } => RuntimeEventMsg::ApprovalRequested {
             call_id: *tool_call_id,
+            tool: *tool,
             summary: summary.clone(),
         },
         RunEvent::PermissionResolved {
             tool_call_id,
+            tool,
             approved,
         } => RuntimeEventMsg::ApprovalResolved {
             call_id: *tool_call_id,
+            tool: *tool,
             decision: if *approved {
                 PermissionDecision::Approved
             } else {
@@ -602,7 +608,6 @@ fn tool_envelope(
     tool: crate::tool::ToolName,
     status: ToolLifecycleStatus,
     hash_source: Option<&str>,
-    required_next_action: Option<String>,
     blocked_action: Option<String>,
 ) -> ToolLifecycleEnvelope {
     ToolLifecycleEnvelope {
@@ -625,7 +630,6 @@ fn tool_envelope(
         candidate_validity: None,
         result_hash: hash_source.map(|value| hash_text(value)),
         blocked_action,
-        required_next_action,
         projection_id: ProjectionId::new(),
         contract_refs: vec!["thread_turn_item_protocol".to_string()],
         artifact_refs: Vec::new(),
@@ -644,7 +648,6 @@ fn completed_tool_envelope(
         tool.clone(),
         ToolLifecycleStatus::Completed,
         Some(summary),
-        None,
         None,
     );
     apply_completed_tool_metadata(&mut envelope, metadata);
@@ -783,11 +786,6 @@ fn tool_progress_effect_from_metadata(
             | ToolLifecycleStatus::Rejected => ToolProgressEffect::Blocked,
             _ => ToolProgressEffect::Unknown,
         })
-}
-
-fn required_next_action_from_metadata(metadata: &Value) -> Option<String> {
-    let _ = metadata;
-    None
 }
 
 fn blocked_action_from_metadata(metadata: &Value) -> Option<String> {

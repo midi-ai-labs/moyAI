@@ -31,7 +31,7 @@ Desktop GUI e2e route taxonomy:
 - Targeted Support Route: `case2b`。scenario_contract、Contract Reconciliation、generated test subordinate policy 変更時、または case2c が source/test/contract/codegen mismatch で落ちた場合に実行する
 - Extended Route C/D/E: `case4`、`case5`、`case7`
 - Probe Route F: `case6`。Phase12 exit blocker ではない
-- route 内では fail-stop する。独立 route は fresh workspace / fresh session / `route_manifest.json` 付きで個別に観測し、Phase12 final verdict は route-level harness-owned gate result を集約する
+- route 内では fail-stop する。独立 route は fresh workspace / fresh session / `route_manifest.json` と in-flight `case_progress.json` 付きで個別に観測し、Phase12 final verdict は route-level harness-owned gate result を集約する
 - case2c は Required Vision Route B に残し、LM Studio model metadata で vision-capable と確認できる model に対して画像添付付き chat を送る
 - case2c は harness-owned `scenario_contract.md` / `scenario_contract.json` を workspace へ事前配置し、generated test を oracle ではなく scenario contract の従属物として扱う
 - representative rerun は `moyai desktop --directory <workspace>` 相当の Desktop GUI e2e driver で実行する
@@ -47,7 +47,7 @@ Desktop GUI e2e route taxonomy:
 - failure が出た場合は同一 route 内の次 case へ進まず、その場で直接原因と根本原因を調査し、`worklog.md`、`manual-st-history.md`、必要に応じて `Kanban.md` を更新してから修正する
 - final verdict の優先順位は route contract / harness-owned gate result、workspace isolation / artifact manifest、required verification command result、request diagnostics / provider metadata、`session_completed`、generated tests とする
 - 局所ハック、case 専用 patch、理由の弱い hardcode は採らない
-- residual fix は先に `Roo Code` と `opencode` の該当 runtime / prompt / tool 実装を確認してから行う
+- residual fix は `Codex` の Thread / Turn / Item protocol、tool lifecycle、control-plane、harness engineering を第一比較基準にし、local LLM 起因に切り分けた場合のみ `Roo Code` を補助比較、`opencode` を第三比較基準にする
 - prompt も製品機能として扱い、仮 wording のまま放置しない
 - 各 case の合格条件は scenario / user-visible contract と harness evidence の gate として扱う。failure handling や detailed regression signal は、そのまま e2e assertion に昇格させず、Failure Registry 登録後に下位 deterministic test へ分解してから固定する
-- 今後の representative manual ST failure は `FR10-YYYY-MM-DD-NNN` prefix で登録する。既存 `FR-...` / `FR2-...` / `FR03-...` は historical evidence として保持する
+- 現在の FR21 convergence loop で出た representative manual ST failure は `FR21-xxx` prefix で登録する。既存 `FR-...` / `FR2-...` / `FR03-...` / `FR10-...` は historical evidence として保持する

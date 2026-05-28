@@ -66,8 +66,6 @@ pub struct ContinuationContract {
     pub active_work_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_work_summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_next_action: Option<String>,
     #[serde(default)]
     pub target_files: Vec<Utf8PathBuf>,
     #[serde(default)]

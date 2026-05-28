@@ -214,10 +214,10 @@ pub(crate) fn progress_projection_payload_drops_authority_fields() -> bool {
     let raw = json!({
         "todos": [{
             "id": "step1",
-            "content": "write calculator.py",
+            "content": "write component.py",
             "kind": "verification",
             "status": "in_progress",
-            "targets": ["calculator.py"],
+            "targets": ["component.py"],
             "depends_on": ["prior"],
             "success_criteria": ["python -m unittest"]
         }]

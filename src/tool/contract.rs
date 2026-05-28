@@ -72,6 +72,8 @@ pub struct TruncatedToolOutput {
 pub struct PermissionRequest {
     pub access: AccessKind,
     pub summary: String,
+    #[serde(default)]
+    pub details: Vec<String>,
     pub targets: Vec<Utf8PathBuf>,
     pub outside_workspace: bool,
     pub risks: Vec<PermissionRisk>,
@@ -83,6 +85,7 @@ pub enum PermissionRisk {
     DestructiveDelete,
     MoveOrRename,
     Network,
+    ExternalConnection,
     ProtectedWorkspaceAuthority,
 }
 
@@ -92,6 +95,7 @@ impl PermissionRisk {
             Self::DestructiveDelete => "delete",
             Self::MoveOrRename => "move/rename",
             Self::Network => "network",
+            Self::ExternalConnection => "external connection/setup",
             Self::ProtectedWorkspaceAuthority => "protected workspace authority",
         }
     }

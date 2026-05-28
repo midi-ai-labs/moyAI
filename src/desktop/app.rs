@@ -13,10 +13,14 @@ use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::docling::{normalize_docling_base_url, probe_docling_readiness};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 use crate::llm::{
-    ProviderModelInfo, apply_provider_model_info_to_config, fetch_provider_model_infos,
-    normalize_provider_base_url,
+    ProviderModelInfo, apply_provider_model_info_to_config, extra_body_with_num_ctx,
+    fetch_provider_model_infos, normalize_provider_base_url,
 };
 use crate::runtime::{SystemClock, build_cancel_token};
+use crate::session::markdown::{
+    MarkdownExportEvent, MarkdownMetadataLine, MarkdownTerminalStatus,
+    render_codex_turn_block_markdown,
+};
 use crate::session::{
     EditorContext, ProjectId, ProjectRecord, RunEvent, RunSummary, SessionId, SessionRecord,
     SessionStatus, TodoItem, history_items_to_markdown, history_markdown_file_name,
@@ -1276,13 +1280,42 @@ impl DesktopController {
         let mut hydrated_model_config = self.state.provider_config.effective_config.model.clone();
         hydrated_model_config.base_url = base_url.clone();
         hydrated_model_config.model = model.clone();
+        hydrated_model_config.provider_metadata_mode =
+            self.state.provider_config.provider_metadata_mode_input;
         if let Some(info) = self.state.selected_provider_model_info() {
             apply_provider_model_info_to_config(&mut hydrated_model_config, info);
         }
+        let context_window = match parse_provider_limit_input(
+            "context_window",
+            &self.state.provider_config.provider_context_window_input,
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                self.state.set_status_message(message);
+                return None;
+            }
+        };
+        let max_output_tokens = match parse_provider_limit_input(
+            "max_output_tokens",
+            &self.state.provider_config.provider_max_output_tokens_input,
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                self.state.set_status_message(message);
+                return None;
+            }
+        };
+        hydrated_model_config.context_window = context_window;
+        hydrated_model_config.max_output_tokens = max_output_tokens;
+        hydrated_model_config.extra_body_json = Some(extra_body_with_num_ctx(
+            hydrated_model_config.extra_body_json.clone(),
+            context_window,
+        ));
         Some(PartialResolvedConfig {
             model: Some(PartialModelConfig {
                 base_url: Some(base_url),
                 model: Some(model),
+                provider_metadata_mode: Some(hydrated_model_config.provider_metadata_mode),
                 context_window: Some(hydrated_model_config.context_window),
                 max_output_tokens: Some(hydrated_model_config.max_output_tokens),
                 supports_tools: Some(hydrated_model_config.supports_tools),
@@ -1973,112 +2006,148 @@ fn open_transcript_rows_to_markdown(
     rows: &[DesktopTranscriptRow],
     file_changes: &[super::models::DesktopFileChangeRow],
 ) -> String {
-    let mut markdown = String::new();
-    markdown.push_str("# ");
-    markdown.push_str(&markdown_heading_text(title));
-    markdown.push_str("\n\n");
-
-    if let Some(user) = rows.iter().find(|row| row.kind == "user") {
-        markdown.push_str("> ");
-        markdown.push_str(&user.body.trim().replace('\n', "\n> "));
-        markdown.push_str("\n\n");
+    let mut events = Vec::new();
+    for row in rows {
+        events.extend(markdown_events_for_transcript_row(row));
     }
-
-    let final_assistant_index = rows.iter().rposition(|row| row.kind == "assistant");
-    let detail_rows = rows
-        .iter()
-        .enumerate()
-        .filter(|(index, row)| Some(*index) != final_assistant_index && row.kind != "user")
-        .collect::<Vec<_>>();
-    if !detail_rows.is_empty() {
-        markdown.push_str("<details><summary>");
-        markdown.push_str(&format!("{} previous messages", detail_rows.len()));
-        markdown.push_str("</summary>\n\n");
-        for (_, row) in detail_rows {
-            append_transcript_detail_row(&mut markdown, row);
-        }
-        markdown.push_str("</details>\n\n");
-    }
-
-    if let Some(index) = final_assistant_index {
-        let body = rows[index].body.trim();
-        if !body.is_empty() && !assistant_body_is_pseudo_tool_call_closeout(body) {
-            markdown.push_str(body);
-            markdown.push_str("\n\n");
-        }
-    }
-    if final_assistant_index
-        .and_then(|index| rows.get(index))
-        .is_some_and(|row| assistant_body_is_pseudo_tool_call_closeout(row.body.trim()))
-    {
-        markdown.push_str("完了しました。\n\n");
-    }
-
     if !file_changes.is_empty() && !rows.iter().any(|row| row.kind == "file_changes") {
-        markdown.push_str("<details><summary>ファイル変更履歴</summary>\n\n");
-        for change in file_changes {
-            markdown.push_str("- ");
-            markdown.push_str(&markdown_heading_text(&format!(
-                "[{}] {}",
-                change.action, change.path
-            )));
-            if !change.summary.trim().is_empty() {
-                markdown.push_str(" - ");
-                markdown.push_str(&markdown_heading_text(&change.summary));
-            }
-            markdown.push('\n');
-        }
-        markdown.push_str("\n</details>\n\n");
+        events.push(MarkdownExportEvent::detail(
+            "ファイル変更履歴",
+            render_file_change_markdown_lines(file_changes),
+        ));
     }
-
-    markdown.push_str("<details><summary>実行情報</summary>\n\n");
-    markdown.push_str(&format!("- Workspace: `{}`\n", workspace));
-    markdown.push_str(&format!("- Session: `{}`\n", session_id));
-    markdown.push_str(&format!("- Provider: `{}`\n", provider_base_url));
-    markdown.push_str(&format!("- Model: `{}`\n", model));
-    markdown.push_str("</details>\n");
-    markdown
+    let metadata = vec![
+        MarkdownMetadataLine::new("Workspace", format!("`{workspace}`")),
+        MarkdownMetadataLine::new("Session", format!("`{session_id}`")),
+        MarkdownMetadataLine::new("Provider", format!("`{provider_base_url}`")),
+        MarkdownMetadataLine::new("Model", format!("`{model}`")),
+    ];
+    render_codex_turn_block_markdown(title, &events, &metadata)
 }
 
-fn assistant_body_is_pseudo_tool_call_closeout(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    lower.contains("<tool_call>")
-        || lower.contains("<function=")
-        || lower.contains("<parameter=command>")
-}
-
-fn append_transcript_detail_row(markdown: &mut String, row: &DesktopTranscriptRow) {
+fn markdown_events_for_transcript_row(row: &DesktopTranscriptRow) -> Vec<MarkdownExportEvent> {
     match row.kind.as_str() {
-        "assistant" => {
-            let body = export_visible_body(&row.body);
-            if !body.is_empty() {
-                markdown.push_str("> ");
-                markdown.push_str(&body.replace('\n', "\n> "));
-                markdown.push_str("\n\n");
-            }
-        }
+        "user" => vec![MarkdownExportEvent::user(export_visible_body(&row.body))],
+        "assistant" => vec![MarkdownExportEvent::assistant(export_visible_body(
+            &row.body,
+        ))],
+        "file_changes" => vec![MarkdownExportEvent::detail(
+            row.title.clone(),
+            transcript_detail_body(row),
+        )],
+        "work_summary_failed" => vec![
+            MarkdownExportEvent::detail(row.title.clone(), transcript_detail_body(row)),
+            MarkdownExportEvent::terminal(
+                MarkdownTerminalStatus::Failed,
+                transcript_terminal_summary(row),
+            ),
+        ],
+        "work_summary_cancelled" => vec![
+            MarkdownExportEvent::detail(row.title.clone(), transcript_detail_body(row)),
+            MarkdownExportEvent::terminal(
+                MarkdownTerminalStatus::Interrupted,
+                transcript_terminal_summary(row),
+            ),
+        ],
+        "work_summary_awaiting_user" => vec![
+            MarkdownExportEvent::detail(row.title.clone(), transcript_detail_body(row)),
+            MarkdownExportEvent::terminal(
+                MarkdownTerminalStatus::AwaitingUser,
+                transcript_terminal_summary(row),
+            ),
+        ],
+        "work_summary_completed" => vec![
+            MarkdownExportEvent::detail(row.title.clone(), transcript_detail_body(row)),
+            MarkdownExportEvent::terminal(
+                transcript_terminal_status_from_body(row)
+                    .unwrap_or(MarkdownTerminalStatus::Completed),
+                transcript_terminal_summary(row),
+            ),
+        ],
         "tool" | "editing" | "diff" | "summary" => {
-            markdown.push_str("<details><summary>");
-            markdown.push_str(&markdown_heading_text(&row.title));
-            markdown.push_str("</summary>\n\n");
-            let body = export_visible_body(&row.body);
-            if body.is_empty() {
-                markdown.push_str("_内容はありません。_\n\n");
-            } else {
-                markdown.push_str(&body);
-                markdown.push_str("\n\n");
-            }
-            markdown.push_str("</details>\n\n");
+            vec![MarkdownExportEvent::detail(
+                row.title.clone(),
+                transcript_detail_body(row),
+            )]
+        }
+        _ => vec![MarkdownExportEvent::detail(
+            row.title.clone(),
+            transcript_detail_body(row),
+        )],
+    }
+}
+
+fn transcript_detail_body(row: &DesktopTranscriptRow) -> String {
+    match row.kind.as_str() {
+        "file_changes" if !row.file_changes.is_empty() => {
+            render_file_change_markdown_lines(&row.file_changes)
         }
         _ => {
-            markdown.push_str("> ");
-            markdown.push_str(&markdown_heading_text(&row.title));
-            if !row.body.trim().is_empty() {
-                markdown.push_str("\n> ");
-                markdown.push_str(&row.body.trim().replace('\n', "\n> "));
+            let body = export_visible_body(&row.body);
+            if body.is_empty() {
+                "_内容はありません。_".to_string()
+            } else {
+                body
             }
-            markdown.push_str("\n\n");
         }
+    }
+}
+
+fn render_file_change_markdown_lines(changes: &[super::models::DesktopFileChangeRow]) -> String {
+    let mut body = String::new();
+    for change in changes {
+        body.push_str("- ");
+        body.push_str(&markdown_heading_text(&format!(
+            "{} `{}`",
+            codex_change_verb(&change.action),
+            change.path
+        )));
+        if !change.summary.trim().is_empty() {
+            body.push_str(" - ");
+            body.push_str(&markdown_heading_text(&change.summary));
+        }
+        body.push('\n');
+    }
+    body
+}
+
+fn transcript_terminal_status_from_body(
+    row: &DesktopTranscriptRow,
+) -> Option<MarkdownTerminalStatus> {
+    let lower = row.body.to_ascii_lowercase();
+    if lower.contains("cancelled") || row.body.contains("停止しました") {
+        Some(MarkdownTerminalStatus::Interrupted)
+    } else if lower.contains("failed") || row.body.contains("失敗しました") {
+        Some(MarkdownTerminalStatus::Failed)
+    } else if lower.contains("awaiting user") || row.body.contains("確認待ち") {
+        Some(MarkdownTerminalStatus::AwaitingUser)
+    } else {
+        None
+    }
+}
+
+fn transcript_terminal_summary(row: &DesktopTranscriptRow) -> String {
+    row.body
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("- 結果:")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| row.body.trim().to_string())
+}
+
+fn codex_change_verb(action: &str) -> &'static str {
+    let normalized = action.trim().to_ascii_lowercase();
+    if normalized.contains("add") || action.contains("追加") || action.contains("作成") {
+        "Wrote"
+    } else if normalized.contains("delete") || action.contains("削除") {
+        "Deleted"
+    } else {
+        "Edited"
     }
 }
 
@@ -2634,12 +2703,26 @@ mod tests {
                 kind: "user".to_string(),
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
-                body: "Create a report.".to_string(),
+                body: "Older request.".to_string(),
                 file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
                 kind: "assistant".to_string(),
                 step: "02".to_string(),
+                title: "Previous response".to_string(),
+                body: "Earlier answer.".to_string(),
+                file_changes: Vec::new(),
+            },
+            DesktopTranscriptRow {
+                kind: "user".to_string(),
+                step: "03".to_string(),
+                title: "Prompt".to_string(),
+                body: "Create a report.".to_string(),
+                file_changes: Vec::new(),
+            },
+            DesktopTranscriptRow {
+                kind: "assistant".to_string(),
+                step: "04".to_string(),
                 title: "Response".to_string(),
                 body: "Done.\nSaved files.".to_string(),
                 file_changes: Vec::new(),
@@ -2657,7 +2740,17 @@ mod tests {
         );
 
         assert!(markdown.contains("# Session \\#1"));
+        assert!(
+            markdown.find("> Older request.").unwrap()
+                < markdown.find("> Create a report.").unwrap(),
+            "visible transcript export should preserve chronological user turn blocks"
+        );
         assert!(markdown.contains("> Create a report."));
+        assert!(
+            markdown.find("Earlier answer.").unwrap()
+                < markdown.find("> Create a report.").unwrap(),
+            "assistant closeout for an earlier turn should not be folded under the latest user request"
+        );
         assert!(markdown.contains("<details><summary>実行情報</summary>"));
         assert!(markdown.contains("- Provider: `http://localhost:1234`"));
         assert!(markdown.contains("Done.\nSaved files."));
@@ -2689,8 +2782,7 @@ mod tests {
                 kind: "summary".to_string(),
                 step: "03".to_string(),
                 title: "File changes".to_string(),
-                body: "Added README.md\nAdded __pycache__\\space_invader.cpython-313.pyc"
-                    .to_string(),
+                body: "Added README.md\nAdded __pycache__\\arcade_game.cpython-313.pyc".to_string(),
                 file_changes: Vec::new(),
             },
         ];
@@ -2720,6 +2812,53 @@ mod tests {
     }
 
     #[test]
+    fn open_transcript_markdown_uses_terminal_outcome_for_cancelled_turn() {
+        let session_id = crate::session::SessionId::new();
+        let rows = vec![
+            DesktopTranscriptRow {
+                kind: "user".to_string(),
+                step: "01".to_string(),
+                title: "Prompt".to_string(),
+                body: "Update the implementation.".to_string(),
+                file_changes: Vec::new(),
+            },
+            DesktopTranscriptRow {
+                kind: "assistant".to_string(),
+                step: "02".to_string(),
+                title: "Response".to_string(),
+                body: "テストの期待値を修正します。".to_string(),
+                file_changes: Vec::new(),
+            },
+            DesktopTranscriptRow {
+                kind: "work_summary_cancelled".to_string(),
+                step: "03".to_string(),
+                title: "作業履歴 / 作業サマリ".to_string(),
+                body: "### 作業サマリ\n- 結果: run cancelled by user".to_string(),
+                file_changes: Vec::new(),
+            },
+        ];
+
+        let markdown = open_transcript_rows_to_markdown(
+            "Cancelled Session",
+            &Utf8PathBuf::from("C:/workspace"),
+            session_id,
+            "http://localhost:1234",
+            "local-model",
+            &rows,
+            &[],
+        );
+
+        assert!(markdown.contains("停止しました: run cancelled by user"));
+        assert!(
+            markdown.find("テストの期待値を修正します。").unwrap()
+                < markdown
+                    .find("停止しました: run cancelled by user")
+                    .unwrap(),
+            "intermediate assistant intent must remain folded before terminal outcome"
+        );
+    }
+
+    #[test]
     fn completion_notification_body_summarizes_terminal_run() {
         let summary = RunSummary {
             session_id: crate::session::SessionId::new(),
@@ -2731,9 +2870,9 @@ mod tests {
             change_count: 2,
         };
 
-        let body = run_completion_notification_body("  case2 GUI  ", &summary);
+        let body = run_completion_notification_body("  vision GUI  ", &summary);
 
-        assert!(body.contains("case2 GUI が完了しました。"));
+        assert!(body.contains("vision GUI が完了しました。"));
         assert!(body.contains("変更: 2件"));
         assert!(body.contains("ツール: 3件 / 失敗 1件"));
         assert_eq!(notification_session_title(""), "タスク");
@@ -2742,7 +2881,7 @@ mod tests {
     #[test]
     fn terminal_event_notification_body_uses_terminal_state() {
         let body = run_terminal_event_notification_body(
-            "case2 GUI",
+            "vision GUI",
             &RunEvent::SessionInterrupted {
                 session_id: crate::session::SessionId::new(),
                 reason: "user requested stop\nsecond line".to_string(),
@@ -2750,7 +2889,7 @@ mod tests {
         )
         .expect("terminal event should produce a notification");
 
-        assert_eq!(body, "case2 GUI を停止しました: user requested stop");
+        assert_eq!(body, "vision GUI を停止しました: user requested stop");
     }
 
     #[cfg(target_os = "windows")]
@@ -2940,6 +3079,17 @@ fn fallback_workspace_after_project_delete(
         .unwrap_or_else(|| data_dir.join("desktop-workspace-after-delete-2"))
 }
 
+fn parse_provider_limit_input(label: &str, value: &str) -> Result<u32, String> {
+    let trimmed = value.trim();
+    let parsed = trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("{label} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{label} must be greater than 0"));
+    }
+    Ok(parsed)
+}
+
 fn is_quick_chat_workspace_path(path: &Utf8Path) -> bool {
     quick_chat_workspace_directory().as_deref() == Some(path)
 }
@@ -3016,6 +3166,7 @@ fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig {
             base_url: Some(config.model.base_url.clone()),
             model: Some(config.model.model.clone()),
             prompt_profile: Some(config.model.prompt_profile),
+            provider_metadata_mode: Some(config.model.provider_metadata_mode),
             api_key_env: None,
             extra_headers: Some(config.model.extra_headers.clone()),
             request_timeout_ms: Some(config.model.request_timeout_ms),

@@ -2,6 +2,7 @@ use camino::Utf8PathBuf;
 
 use crate::session::{
     ContractReconciliationDiagnostic, SessionStateSnapshot, VerificationFailureCluster,
+    VerificationFailureEvidence,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,9 +141,12 @@ pub(crate) fn generic_scenario_contract_profile(
     if contract_refs.is_empty() && !has_visible_contract_ref(active_targets) {
         return None;
     }
-    let source_target = first_mutable_source_target(active_targets)?;
-    let generated_test_target = first_test_target(active_targets)
-        .unwrap_or_else(|| format!("test_{}", file_name(&source_target)));
+    let generated_test_target = first_test_target(active_targets).or_else(|| {
+        first_mutable_source_target(active_targets)
+            .map(|source| format!("test_{}", file_name(&source)))
+    })?;
+    let source_target = first_mutable_source_target(active_targets)
+        .or_else(|| source_target_for_generated_test_target(&generated_test_target))?;
     let contract_targets = contract_refs
         .iter()
         .map(|path| file_name(path.as_str()).to_string())
@@ -175,8 +179,8 @@ pub(crate) fn contract_reconciliation_ignores_diagnostic_label_targets_fixture_p
     let label_target = "BEH-4: bullet overlap assertion message";
     let active_targets = vec![
         Utf8PathBuf::from(label_target),
-        Utf8PathBuf::from("space_invader.py"),
-        Utf8PathBuf::from("test_space_invader.py"),
+        Utf8PathBuf::from("arcade_game.py"),
+        Utf8PathBuf::from("test_arcade_game.py"),
     ];
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -185,8 +189,694 @@ pub(crate) fn contract_reconciliation_ignores_diagnostic_label_targets_fixture_p
         &["BEH-4".to_string()],
     );
     decision.owner == ContractFailureOwner::SourceViolatesContract
-        && decision.required_target.as_deref() == Some("space_invader.py")
+        && decision.required_target.as_deref() == Some("arcade_game.py")
         && decision.required_target.as_deref() != Some(label_target)
+}
+
+pub(crate) fn generated_test_constructor_misuse_is_test_owned_fixture_passes() -> bool {
+    let active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-constructor-misuse".to_string(),
+        failing_labels: vec!["test_widget_cli_error".to_string()],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: vec![crate::session::VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_constructor_signature_mismatch".to_string()),
+            label: Some("test_widget_cli_error".to_string()),
+            target: Some("test_widget.py".to_string()),
+            symbol: None,
+            call_site: Some(
+                "subprocess.Popen([sys.executable, '-c', 'import widget'], capture_output=True)"
+                    .to_string(),
+            ),
+            exception: Some(
+                "Popen.__init__() got an unexpected keyword argument 'capture_output'".to_string(),
+            ),
+            expected: None,
+            observed: Some("unexpected keyword `capture_output`".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "Popen.__init__()".to_string(),
+                "constructor keyword compatibility for `Popen`".to_string(),
+                "unexpected keyword `capture_output`".to_string(),
+                "public_constructor_signature_mismatch".to_string(),
+            ],
+            sibling_obligations: vec![
+                "constructor keyword compatibility for `Popen`".to_string(),
+                "unexpected keyword `capture_output`".to_string(),
+            ],
+            requirement_refs: Vec::new(),
+            source_refs: vec!["-c".to_string(), "utf-8".to_string()],
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: vec![
+            "constructor keyword compatibility for `Popen`".to_string(),
+            "unexpected keyword `capture_output`".to_string(),
+        ],
+        source_refs: vec!["-c".to_string(), "utf-8".to_string()],
+        test_refs: vec!["test_widget.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        None,
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::GeneratedTestOutOfScope
+        && decision.required_target.as_deref() == Some("test_widget.py")
+        && decision.permits_generated_test_repair()
+        && !decision.source_repair_allowed
+}
+
+pub(crate) fn source_constructor_misuse_remains_source_owned_fixture_passes() -> bool {
+    let active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-source-constructor-misuse".to_string(),
+        failing_labels: vec!["test_widget_constructor".to_string()],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: vec![crate::session::VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_constructor_signature_mismatch".to_string()),
+            label: Some("test_widget_constructor".to_string()),
+            target: Some("test_widget.py".to_string()),
+            symbol: Some("Widget".to_string()),
+            call_site: Some("Widget(bad=True)".to_string()),
+            exception: Some(
+                "Widget.__init__() got an unexpected keyword argument 'bad'".to_string(),
+            ),
+            expected: None,
+            observed: Some("unexpected keyword `bad`".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "Widget.__init__()".to_string(),
+                "unexpected keyword `bad`".to_string(),
+                "public_constructor_signature_mismatch".to_string(),
+            ],
+            sibling_obligations: vec!["unexpected keyword `bad`".to_string()],
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: vec!["unexpected keyword `bad`".to_string()],
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        None,
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::SourceViolatesContract
+        && decision.required_target.as_deref() == Some("widget.py")
+        && decision.source_repair_allowed
+}
+
+pub(crate) fn generated_test_parse_defect_is_test_owned_fixture_passes() -> bool {
+    let active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-parse-defect".to_string(),
+        failing_labels: vec!["test_widget".to_string()],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: vec![crate::session::VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("source_parse_defect".to_string()),
+            label: Some("test_widget".to_string()),
+            target: Some("test_widget.py".to_string()),
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: None,
+            observed: Some("SyntaxError: expected ':'".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "source parse defect `SyntaxError: expected ':'`".to_string(),
+                "source parse frame `test_widget.py`".to_string(),
+                "source_parse_defect".to_string(),
+            ],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        None,
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::TestViolatesContract
+        && decision.required_target.as_deref() == Some("test_widget.py")
+        && decision.permits_generated_test_repair()
+        && !decision.source_repair_allowed
+}
+
+pub(crate) fn source_parse_defect_is_source_owned_without_requirement_id_fixture_passes() -> bool {
+    let active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    let profile = scenario_contract_profile(
+        "scenario_contract.visible_contract.v1",
+        "widget.py",
+        "test_widget.py",
+        vec!["scenario_contract.md".to_string()],
+        Vec::new(),
+        Vec::new(),
+    );
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-source-parse-defect".to_string(),
+        failing_labels: vec!["test_widget".to_string()],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: vec![crate::session::VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("source_parse_defect".to_string()),
+            label: Some("test_widget".to_string()),
+            target: Some("C:/workspace/widget.py".to_string()),
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: None,
+            observed: Some("SyntaxError: expected 'except' or 'finally' block".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "source parse defect `SyntaxError: expected 'except' or 'finally' block`"
+                    .to_string(),
+                "source parse frame `C:/workspace/widget.py`".to_string(),
+                "source_parse_defect".to_string(),
+            ],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: vec!["widget.py".to_string()],
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["widget.py".to_string()],
+        test_refs: vec!["test_widget.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        Some(&profile),
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::SourceViolatesContract
+        && decision.strict_contract_active
+        && decision.required_target.as_deref() == Some("widget.py")
+        && decision.source_repair_allowed
+        && !decision.fail_closed()
+}
+
+pub(crate) fn generated_test_name_resolution_self_defect_without_source_public_api_is_test_owned_fixture_passes()
+-> bool {
+    let active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    let cluster = VerificationFailureCluster {
+        cluster_id: "mixed-generated-test-name-resolution".to_string(),
+        failing_labels: vec!["test_cli_widget".to_string(), "test_widget_api".to_string()],
+        primary_failure: Some(
+            "NameError: name 'envlib' is not defined in generated test helper".to_string(),
+        ),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generic_verification_failure".to_string()),
+            label: Some("test_cli_widget".to_string()),
+            target: Some("test_widget.py".to_string()),
+            symbol: Some("envlib".to_string()),
+            call_site: Some("env = dict(envlib.environ)".to_string()),
+            exception: Some("NameError: name 'envlib' is not defined".to_string()),
+            expected: None,
+            observed: Some("missing generated-test helper name `envlib`".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "generated test helper unresolved name".to_string(),
+                "generated test artifact name resolution defect".to_string(),
+            ],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        None,
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::TestViolatesContract
+        && decision.required_target.as_deref() == Some("test_widget.py")
+        && decision.permits_generated_test_repair()
+        && !decision.source_repair_allowed
+}
+
+pub(crate) fn generated_test_api_misuse_without_source_public_api_is_test_owned_fixture_passes()
+-> bool {
+    let active_targets = vec![
+        Utf8PathBuf::from("calculator.py"),
+        Utf8PathBuf::from("test_calculator.py"),
+    ];
+    let cluster = VerificationFailureCluster {
+        cluster_id: "generated-test-api-misuse".to_string(),
+        failing_labels: vec!["test_main_guard".to_string()],
+        primary_failure: Some(
+            "TypeError: module, class, method, function, traceback, frame, or code object was expected, got str".to_string(),
+        ),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generic_verification_failure".to_string()),
+            label: Some("test_main_guard".to_string()),
+            target: Some("test_calculator.py".to_string()),
+            symbol: Some("inspect.getsource".to_string()),
+            call_site: Some("source = inspect.getsource(main.__module__)".to_string()),
+            exception: Some("TypeError: code object was expected, got str".to_string()),
+            expected: None,
+            observed: Some("generated test invalid reflection subject `inspect.getsource(__module__ string)`".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "generated_test_artifact_api_misuse".to_string(),
+                "generated test invalid reflection subject `inspect.getsource(__module__ string)`".to_string(),
+            ],
+            sibling_obligations: Vec::new(),
+            requirement_refs: vec!["API-5".to_string()],
+            source_refs: Vec::new(),
+            test_refs: vec!["test_calculator.py".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_calculator.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        None,
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::TestViolatesContract
+        && decision.required_target.as_deref() == Some("test_calculator.py")
+        && decision.permits_generated_test_repair()
+        && !decision.source_repair_allowed
+}
+
+pub(crate) fn mixed_generated_test_name_resolution_source_public_api_is_source_test_mismatch_fixture_passes()
+-> bool {
+    let active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    let cluster = VerificationFailureCluster {
+        cluster_id: "mixed-generated-test-name-resolution-source-public-api".to_string(),
+        failing_labels: vec!["test_cli_widget".to_string(), "test_widget_api".to_string()],
+        primary_failure: Some(
+            "NameError: name 'envlib' is not defined in generated test helper".to_string(),
+        ),
+        evidence: vec![
+            VerificationFailureEvidence {
+                evidence_kind: "verification_failure".to_string(),
+                subtype: Some("generic_verification_failure".to_string()),
+                label: Some("test_cli_widget".to_string()),
+                target: Some("test_widget.py".to_string()),
+                symbol: Some("envlib".to_string()),
+                call_site: Some("env = dict(envlib.environ)".to_string()),
+                exception: Some("NameError: name 'envlib' is not defined".to_string()),
+                expected: None,
+                observed: Some("missing generated-test helper name `envlib`".to_string()),
+                public_state_assertions: Vec::new(),
+                public_missing_attributes: Vec::new(),
+                evidence_markers: vec![
+                    "generated test helper unresolved name".to_string(),
+                    "generated test artifact name resolution defect".to_string(),
+                ],
+                sibling_obligations: Vec::new(),
+                requirement_refs: Vec::new(),
+                source_refs: Vec::new(),
+                test_refs: vec!["test_widget.py".to_string()],
+            },
+            VerificationFailureEvidence {
+                evidence_kind: "verification_failure".to_string(),
+                subtype: Some("public_class_attribute_mismatch".to_string()),
+                label: Some("test_widget_api".to_string()),
+                target: None,
+                symbol: Some("widget.calculate_binary".to_string()),
+                call_site: Some("widget.calculate_binary(2, '+', 3)".to_string()),
+                exception: Some(
+                    "AttributeError: module 'widget' has no attribute 'calculate_binary'"
+                        .to_string(),
+                ),
+                expected: Some("5".to_string()),
+                observed: Some("missing public API".to_string()),
+                public_state_assertions: vec!["widget.calculate_binary(2, '+', 3)".to_string()],
+                public_missing_attributes: vec!["widget.calculate_binary".to_string()],
+                evidence_markers: vec![
+                    "public_class_attribute_mismatch".to_string(),
+                    "public missing method `widget.calculate_binary`".to_string(),
+                ],
+                sibling_obligations: vec!["`widget.calculate_binary` is missing".to_string()],
+                requirement_refs: Vec::new(),
+                source_refs: Vec::new(),
+                test_refs: vec!["test_widget.py".to_string()],
+            },
+        ],
+        sibling_obligations: vec!["`widget.calculate_binary` is missing".to_string()],
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        None,
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::SourceTestContractMismatch
+        && decision.required_target.as_deref() == Some("widget.py")
+        && decision.permits_generated_test_repair()
+        && decision.source_repair_allowed
+}
+
+pub(crate) fn generated_test_local_binding_contradiction_is_test_owned_fixture_passes() -> bool {
+    let active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-local-binding-contradiction".to_string(),
+        failing_labels: vec!["test_public_tuple_contract".to_string()],
+        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_state_assertion_mismatch".to_string()),
+            label: Some("test_public_tuple_contract".to_string()),
+            target: Some("test_widget.py".to_string()),
+            symbol: None,
+            call_site: Some("first, operator, first = widget.public_tuple()".to_string()),
+            exception: None,
+            expected: Some("first public tuple value".to_string()),
+            observed: Some("local `first` overwritten by duplicate destructuring".to_string()),
+            public_state_assertions: vec!["first".to_string()],
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "generated_test_local_binding_contradiction".to_string(),
+                "generated test local binding contradiction".to_string(),
+                "public_state_assertion_mismatch".to_string(),
+            ],
+            sibling_obligations: vec!["generated test local binding contradiction".to_string()],
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: vec!["generated test local binding contradiction".to_string()],
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        None,
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::TestViolatesContract
+        && decision.required_target.as_deref() == Some("test_widget.py")
+        && decision.permits_generated_test_repair()
+        && !decision.source_repair_allowed
+}
+
+pub(crate) fn generic_generated_test_only_failure_preserves_active_test_target_fixture_passes()
+-> bool {
+    let active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-generic-generated-test-only".to_string(),
+        failing_labels: vec!["test_invalid_visible_contract".to_string()],
+        primary_failure: Some("AssertionError: stale literal expectation".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generic_verification_failure".to_string()),
+            label: Some("test_invalid_visible_contract".to_string()),
+            target: None,
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: Some("old visible literal".to_string()),
+            observed: Some("current visible literal".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec!["generic_verification_failure".to_string()],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        None,
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::SourceTestContractMismatch
+        && decision.required_target.as_deref() == Some("test_widget.py")
+        && decision.source_repair_allowed
+        && decision.test_repair_allowed
+}
+
+pub(crate) fn contract_visible_public_exception_failure_is_source_owned_fixture_passes() -> bool {
+    let active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    let profile = generic_scenario_contract_profile(
+        &active_targets,
+        &[
+            Utf8PathBuf::from("scenario_contract.md"),
+            Utf8PathBuf::from("scenario_contract.json"),
+        ],
+    );
+    let Some(profile) = profile else {
+        return false;
+    };
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-contract-visible-public-exception".to_string(),
+        failing_labels: vec!["test_invalid_public_input".to_string()],
+        primary_failure: Some("AssertionError: ValueError not raised".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_exception_mismatch".to_string()),
+            label: Some("test_invalid_public_input".to_string()),
+            target: Some("test_widget.py".to_string()),
+            symbol: None,
+            call_site: Some("with self.assertRaises(ValueError):".to_string()),
+            exception: Some("ValueError not raised".to_string()),
+            expected: Some("ValueError".to_string()),
+            observed: Some("no exception was raised".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "public_exception_mismatch".to_string(),
+                "source_public_behavior_assertion".to_string(),
+            ],
+            sibling_obligations: vec![
+                "source_public_behavior_assertion".to_string(),
+                "expected public exception `ValueError`".to_string(),
+            ],
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: vec![
+            "source_public_behavior_assertion".to_string(),
+            "expected public exception `ValueError`".to_string(),
+        ],
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        Some(&profile),
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::SourceViolatesContract
+        && decision.strict_contract_active
+        && decision.required_target.as_deref() == Some("widget.py")
+        && decision.source_repair_allowed
+        && !decision.test_repair_allowed
+        && !decision.fail_closed()
+}
+
+pub(crate) fn generated_test_exception_type_overreach_is_test_owned_fixture_passes() -> bool {
+    let active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    let profile = generic_scenario_contract_profile(
+        &active_targets,
+        &[
+            Utf8PathBuf::from("scenario_contract.md"),
+            Utf8PathBuf::from("scenario_contract.json"),
+        ],
+    );
+    let Some(profile) = profile else {
+        return false;
+    };
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-exception-type-overreach".to_string(),
+        failing_labels: vec!["test_divide_by_zero".to_string()],
+        primary_failure: Some("ValueError: division by zero".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_exception_mismatch".to_string()),
+            label: Some("test_divide_by_zero".to_string()),
+            target: Some("widget.py".to_string()),
+            symbol: None,
+            call_site: Some("widget.divide(10, 0)".to_string()),
+            exception: Some("ValueError".to_string()),
+            expected: Some("ZeroDivisionError".to_string()),
+            observed: Some("ValueError".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "public_exception_mismatch".to_string(),
+                "generated_test_contract_overreach".to_string(),
+                "generated-test exception type assertion overreach".to_string(),
+            ],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: vec!["widget.py".to_string()],
+            test_refs: vec!["test_widget.py".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["widget.py".to_string()],
+        test_refs: vec!["test_widget.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        Some(&profile),
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::TestViolatesContract
+        && decision.strict_contract_active
+        && decision.required_target.as_deref() == Some("test_widget.py")
+        && !decision.source_repair_allowed
+        && decision.test_repair_allowed
+        && !decision.fail_closed()
+}
+
+pub(crate) fn mixed_generated_test_validity_and_public_behavior_preserves_source_test_mismatch_fixture_passes()
+-> bool {
+    let active_targets = vec![
+        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("test_widget.py"),
+    ];
+    let profile = generic_scenario_contract_profile(
+        &active_targets,
+        &[
+            Utf8PathBuf::from("scenario_contract.md"),
+            Utf8PathBuf::from("scenario_contract.json"),
+        ],
+    );
+    let Some(profile) = profile else {
+        return false;
+    };
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-mixed-generated-test-validity-public-behavior".to_string(),
+        failing_labels: vec![
+            "test_generated_helper_import".to_string(),
+            "test_invalid_public_input".to_string(),
+        ],
+        primary_failure: Some(
+            "NameError: name 'envlib' is not defined; AssertionError: ValueError not raised"
+                .to_string(),
+        ),
+        evidence: vec![
+            VerificationFailureEvidence {
+                evidence_kind: "verification_failure".to_string(),
+                subtype: Some("generic_verification_failure".to_string()),
+                label: Some("test_generated_helper_import".to_string()),
+                target: Some("test_widget.py".to_string()),
+                symbol: Some("envlib".to_string()),
+                call_site: Some("env = dict(envlib.environ)".to_string()),
+                exception: Some("NameError: name 'envlib' is not defined".to_string()),
+                expected: None,
+                observed: Some("missing generated-test helper name `envlib`".to_string()),
+                public_state_assertions: Vec::new(),
+                public_missing_attributes: Vec::new(),
+                evidence_markers: vec![
+                    "generated test helper unresolved name".to_string(),
+                    "generated test artifact name resolution defect".to_string(),
+                ],
+                sibling_obligations: Vec::new(),
+                requirement_refs: Vec::new(),
+                source_refs: Vec::new(),
+                test_refs: vec!["test_widget.py".to_string()],
+            },
+            VerificationFailureEvidence {
+                evidence_kind: "verification_failure".to_string(),
+                subtype: Some("public_exception_mismatch".to_string()),
+                label: Some("test_invalid_public_input".to_string()),
+                target: Some("test_widget.py".to_string()),
+                symbol: None,
+                call_site: Some("with self.assertRaises(ValueError): widget.parse('')".to_string()),
+                exception: Some("ValueError not raised".to_string()),
+                expected: Some("ValueError".to_string()),
+                observed: Some("no exception was raised".to_string()),
+                public_state_assertions: Vec::new(),
+                public_missing_attributes: Vec::new(),
+                evidence_markers: vec![
+                    "public_exception_mismatch".to_string(),
+                    "source_public_behavior_assertion".to_string(),
+                ],
+                sibling_obligations: vec![
+                    "source_public_behavior_assertion".to_string(),
+                    "expected public exception `ValueError`".to_string(),
+                ],
+                requirement_refs: Vec::new(),
+                source_refs: Vec::new(),
+                test_refs: vec!["test_widget.py".to_string()],
+            },
+        ],
+        sibling_obligations: vec![
+            "source_public_behavior_assertion".to_string(),
+            "expected public exception `ValueError`".to_string(),
+        ],
+        source_refs: Vec::new(),
+        test_refs: vec!["test_widget.py".to_string()],
+    };
+    let decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        Some(&profile),
+        Some(&cluster),
+        &[],
+    );
+    decision.owner == ContractFailureOwner::SourceTestContractMismatch
+        && decision.strict_contract_active
+        && decision.required_target.as_deref() == Some("widget.py")
+        && decision.source_repair_allowed
+        && decision.test_repair_allowed
+        && !decision.fail_closed()
 }
 
 pub(crate) fn reconcile_failure_with_profile_and_typed_evidence(
@@ -195,14 +885,25 @@ pub(crate) fn reconcile_failure_with_profile_and_typed_evidence(
     failure_cluster: Option<&VerificationFailureCluster>,
     requirement_refs: &[String],
 ) -> ContractReconciliationDecision {
-    let evidence_stream =
-        ContractEvidenceItemStream::from_typed_evidence(failure_cluster, requirement_refs, profile);
+    let generic_generated_test_only_failure =
+        generic_generated_test_only_failure_without_source_evidence(failure_cluster);
+    let evidence_stream = ContractEvidenceItemStream::from_typed_evidence(
+        active_targets,
+        failure_cluster,
+        requirement_refs,
+        profile,
+    );
     let generated_test_target = profile
         .map(|profile| profile.generated_test_target.clone())
         .or_else(|| first_test_target(active_targets));
     let source_target = profile
         .map(|profile| profile.source_target.clone())
-        .or_else(|| first_mutable_source_target(active_targets));
+        .or_else(|| first_mutable_source_target(active_targets))
+        .or_else(|| {
+            generated_test_target
+                .as_deref()
+                .and_then(source_target_for_generated_test_target)
+        });
     let strict_contract_active = profile.is_some();
 
     reconcile_failure_with_evidence_stream(
@@ -212,6 +913,7 @@ pub(crate) fn reconcile_failure_with_profile_and_typed_evidence(
         generated_test_target,
         source_target,
         strict_contract_active,
+        generic_generated_test_only_failure && requirement_refs.is_empty(),
     )
 }
 
@@ -222,6 +924,7 @@ fn reconcile_failure_with_evidence_stream(
     generated_test_target: Option<String>,
     source_target: Option<String>,
     strict_contract_active: bool,
+    generic_generated_test_only_failure: bool,
 ) -> ContractReconciliationDecision {
     if evidence_stream.has_classification_marker("provider_capability_mismatch") {
         return decision(
@@ -276,6 +979,74 @@ fn reconcile_failure_with_evidence_stream(
 
     let requirement_ids = evidence_stream.requirement_ids();
 
+    let generated_test_executable_validity = evidence_stream
+        .has_classification_marker("generated_test_artifact_parse_defect")
+        || evidence_stream
+            .has_classification_marker("generated_test_artifact_name_resolution_defect")
+        || evidence_stream.has_classification_marker("generated_test_artifact_api_misuse")
+        || evidence_stream.has_classification_marker("generated_test_subprocess_encoding_missing")
+        || evidence_stream
+            .has_classification_marker("generated_test_subprocess_output_capture_missing");
+    if generated_test_executable_validity
+        && evidence_stream.has_contract_valid_public_behavior_assertion()
+    {
+        return decision_with_target(
+            ContractFailureOwner::SourceTestContractMismatch,
+            strict_contract_active,
+            requirement_ids.clone(),
+            source_target,
+            "verification cluster contains both generated-test executable validity defects and contract-visible source public behavior evidence; preserve mixed ownership instead of collapsing to test-only repair",
+            vec![
+                "generated test artifact executable validity defect marker found".to_string(),
+                "contract-visible public behavior assertion found".to_string(),
+            ],
+        );
+    }
+    if generated_test_executable_validity && evidence_stream.has_source_public_callable_obligation()
+    {
+        return decision_with_target(
+            ContractFailureOwner::SourceTestContractMismatch,
+            strict_contract_active,
+            requirement_ids.clone(),
+            source_target,
+            "verification cluster contains both generated-test executable validity defects and source-owned public callable obligations; preserve bounded source/test reconciliation instead of collapsing to test-only repair",
+            vec![
+                "generated test artifact executable validity defect marker found".to_string(),
+                "source public callable obligation found".to_string(),
+            ],
+        );
+    }
+    if generated_test_executable_validity {
+        return decision_with_target(
+            ContractFailureOwner::TestViolatesContract,
+            strict_contract_active,
+            requirement_ids.clone(),
+            generated_test_target,
+            "generated test artifact has a parse/import/name-resolution/stdout-capture defect and must be repaired as generated-test-owned executable artifact validity",
+            vec!["generated test artifact executable validity defect marker found".to_string()],
+        );
+    }
+    if evidence_stream.has_classification_marker("generated_test_contract_overreach") {
+        return decision_with_target(
+            ContractFailureOwner::TestViolatesContract,
+            strict_contract_active,
+            requirement_ids.clone(),
+            generated_test_target,
+            "generated test asserted behavior or side effects beyond the visible source contract and must be repaired as generated-test-owned contract overreach",
+            vec!["generated test contract overreach marker found".to_string()],
+        );
+    }
+    if evidence_stream.has_classification_marker("generated_test_local_binding_contradiction") {
+        return decision_with_target(
+            ContractFailureOwner::TestViolatesContract,
+            strict_contract_active,
+            requirement_ids.clone(),
+            generated_test_target,
+            "generated test artifact has a local binding/assertion contradiction and must be repaired as generated-test-owned executable artifact validity",
+            vec!["generated test local binding contradiction marker found".to_string()],
+        );
+    }
+
     let unlisted_constructor_keyword_evidence =
         evidence_stream.unlisted_constructor_keyword_evidence();
     let generated_test_ownership_evidence = evidence_stream
@@ -322,6 +1093,37 @@ fn reconcile_failure_with_evidence_stream(
             generated_test_target,
             "generated test introduced a public API or behavior not listed in the scenario contract",
             evidence,
+        );
+    }
+
+    if evidence_stream.has_classification_marker("source_parse_defect_in_source")
+        && let Some(target) = source_target.clone()
+    {
+        return decision_with_target(
+            ContractFailureOwner::SourceViolatesContract,
+            strict_contract_active,
+            requirement_ids.clone(),
+            Some(target),
+            "source artifact has a typed parse defect; executable source validity repair does not require a scenario requirement id",
+            vec!["source parse defect in mutable source artifact".to_string()],
+        );
+    }
+
+    if strict_contract_active
+        && requirement_ids.is_empty()
+        && evidence_stream.has_contract_valid_public_behavior_assertion()
+        && let Some(target) = source_target.clone()
+    {
+        return decision_with_target(
+            ContractFailureOwner::SourceViolatesContract,
+            true,
+            Vec::new(),
+            Some(target),
+            "generated test observed a contract-visible public behavior failure; missing requirement ids do not make the generated-test file the repair target",
+            vec![
+                "contract-visible public behavior assertion found".to_string(),
+                "generated test remains evidence for source behavior".to_string(),
+            ],
         );
     }
 
@@ -379,6 +1181,42 @@ fn reconcile_failure_with_evidence_stream(
         }
     }
 
+    if evidence_stream.has_classification_marker("no_tests_ran")
+        && let Some(target) = generated_test_target
+    {
+        return decision_with_target(
+            ContractFailureOwner::TestViolatesContract,
+            strict_contract_active,
+            requirement_ids.clone(),
+            Some(target),
+            "no tests were collected while a generated-test target is still the active repair surface",
+            vec!["no_tests_ran generated test target remains uncollected".to_string()],
+        );
+    }
+
+    if !strict_contract_active
+        && requirement_ids.is_empty()
+        && generic_generated_test_only_failure
+        && !evidence_stream.has_source_public_callable_obligation()
+        && let Some(target) = evidence_scoped_uncontracted_repair_target(
+            active_targets,
+            generated_test_target.as_deref(),
+            source_target.as_deref(),
+        )
+    {
+        return decision_with_target(
+            ContractFailureOwner::SourceTestContractMismatch,
+            false,
+            Vec::new(),
+            Some(target),
+            "no strict scenario contract or source-owned typed evidence is active; preserve the current item-stream repair target instead of promoting generated-test-only evidence to source-owned repair",
+            vec![
+                "generic verification failure has no source-owned contract evidence".to_string(),
+                "repair target authority remains scoped to current active work".to_string(),
+            ],
+        );
+    }
+
     decision_with_target(
         ContractFailureOwner::SourceViolatesContract,
         strict_contract_active,
@@ -391,6 +1229,62 @@ fn reconcile_failure_with_evidence_stream(
             requirement_ids
         },
     )
+}
+
+fn generic_generated_test_only_failure_without_source_evidence(
+    failure_cluster: Option<&VerificationFailureCluster>,
+) -> bool {
+    let Some(cluster) = failure_cluster else {
+        return false;
+    };
+    let has_test_ref = cluster
+        .test_refs
+        .iter()
+        .chain(
+            cluster
+                .evidence
+                .iter()
+                .flat_map(|evidence| evidence.test_refs.iter()),
+        )
+        .any(|target| target_is_test_like(target));
+    if !has_test_ref {
+        return false;
+    }
+    let has_source_ref = cluster
+        .source_refs
+        .iter()
+        .chain(
+            cluster
+                .evidence
+                .iter()
+                .flat_map(|evidence| evidence.source_refs.iter()),
+        )
+        .any(|target| target_is_mutable_source_like(target));
+    if has_source_ref
+        || has_source_public_callable_obligation_from_cluster(Some(cluster))
+        || has_contract_valid_public_behavior_assertion_from_cluster(Some(cluster))
+    {
+        return false;
+    }
+    !cluster.evidence.is_empty()
+        && cluster.evidence.iter().all(|evidence| {
+            evidence.subtype.as_deref() == Some("generic_verification_failure")
+                && evidence.public_state_assertions.is_empty()
+                && evidence.public_missing_attributes.is_empty()
+        })
+}
+
+fn evidence_scoped_uncontracted_repair_target(
+    active_targets: &[Utf8PathBuf],
+    generated_test_target: Option<&str>,
+    source_target: Option<&str>,
+) -> Option<String> {
+    let active_source_target = first_mutable_source_target(active_targets);
+    let active_test_target = first_test_target(active_targets);
+    active_source_target
+        .or(active_test_target)
+        .or_else(|| generated_test_target.map(str::to_string))
+        .or_else(|| source_target.map(str::to_string))
 }
 
 fn profile_for_state(state: &SessionStateSnapshot) -> Option<ScenarioContractProfile> {
@@ -470,62 +1364,73 @@ enum ContractEvidenceKind {
 
 impl ContractEvidenceItemStream {
     fn from_typed_evidence(
+        active_targets: &[Utf8PathBuf],
         failure_cluster: Option<&VerificationFailureCluster>,
         requirement_refs: &[String],
         profile: Option<&ScenarioContractProfile>,
     ) -> Self {
-        let Some(profile) = profile.cloned() else {
-            return Self {
-                items: Vec::new(),
-                profile: None,
-            };
-        };
         let mut stream = Self {
             items: Vec::new(),
-            profile: Some(profile.clone()),
+            profile: profile.cloned(),
         };
-        for requirement_id in typed_requirement_ids(requirement_refs, &profile) {
-            stream.push(
-                ContractEvidenceKind::RequirementRef,
-                vec![requirement_id.clone()],
-                requirement_id,
-            );
+        if let Some(profile) = profile.cloned() {
+            for requirement_id in typed_requirement_ids(requirement_refs, &profile) {
+                stream.push(
+                    ContractEvidenceKind::RequirementRef,
+                    vec![requirement_id.clone()],
+                    requirement_id,
+                );
+            }
+            if failure_cluster.is_some_and(|cluster| {
+                cluster_refs_contain(&cluster.source_refs, &profile.source_target)
+            }) {
+                stream.push(
+                    ContractEvidenceKind::SourceTracebackFrame,
+                    stream.requirement_ids(),
+                    format!("source traceback frame in {}", profile.source_target),
+                );
+            }
+            if has_contract_owned_public_behavior_assertion_from_cluster(
+                failure_cluster,
+                &profile,
+                &stream.requirement_ids(),
+            ) {
+                stream.push(
+                    ContractEvidenceKind::SourcePublicBehaviorAssertion,
+                    stream.requirement_ids(),
+                    "typed source-owned public behavior/state assertion".to_string(),
+                );
+            }
+            for symbol in typed_unknown_public_symbol_references(failure_cluster, &profile) {
+                stream.push(
+                    ContractEvidenceKind::GeneratedTestUnknownPublicSymbol,
+                    stream.requirement_ids(),
+                    format!("unknown public symbol `{symbol}`"),
+                );
+            }
+            for evidence in typed_unlisted_constructor_keyword_evidence(failure_cluster, &profile) {
+                stream.push(
+                    ContractEvidenceKind::GeneratedTestConstructorObligation,
+                    stream.requirement_ids(),
+                    evidence,
+                );
+            }
         }
-        if failure_cluster.is_some_and(|cluster| {
-            cluster_refs_contain(&cluster.source_refs, &profile.source_target)
-        }) {
-            stream.push(
-                ContractEvidenceKind::SourceTracebackFrame,
-                stream.requirement_ids(),
-                format!("source traceback frame in {}", profile.source_target),
-            );
-        }
-        if has_contract_owned_public_behavior_assertion_from_cluster(
-            failure_cluster,
-            &profile,
-            &stream.requirement_ids(),
-        ) {
+        if has_source_public_callable_obligation_from_cluster(failure_cluster) {
             stream.push(
                 ContractEvidenceKind::SourcePublicBehaviorAssertion,
-                stream.requirement_ids(),
-                "typed source-owned public behavior/state assertion".to_string(),
+                Vec::new(),
+                "source public callable obligation".to_string(),
             );
         }
-        for symbol in typed_unknown_public_symbol_references(failure_cluster, &profile) {
+        if has_contract_valid_public_behavior_assertion_from_cluster(failure_cluster) {
             stream.push(
-                ContractEvidenceKind::GeneratedTestUnknownPublicSymbol,
-                stream.requirement_ids(),
-                format!("unknown public symbol `{symbol}`"),
+                ContractEvidenceKind::SourcePublicBehaviorAssertion,
+                Vec::new(),
+                "contract-visible public behavior assertion".to_string(),
             );
         }
-        for evidence in typed_unlisted_constructor_keyword_evidence(failure_cluster, &profile) {
-            stream.push(
-                ContractEvidenceKind::GeneratedTestConstructorObligation,
-                stream.requirement_ids(),
-                evidence,
-            );
-        }
-        for marker in typed_contract_classification_markers(failure_cluster) {
+        for marker in typed_contract_classification_markers(failure_cluster, active_targets) {
             stream.push(
                 ContractEvidenceKind::ClassificationMarker,
                 Vec::new(),
@@ -580,6 +1485,19 @@ impl ContractEvidenceItemStream {
     fn has_classification_marker(&self, marker: &str) -> bool {
         self.items.iter().any(|item| {
             item.kind == ContractEvidenceKind::ClassificationMarker && item.marker == marker
+        })
+    }
+
+    fn has_source_public_callable_obligation(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.kind == ContractEvidenceKind::SourcePublicBehaviorAssertion)
+    }
+
+    fn has_contract_valid_public_behavior_assertion(&self) -> bool {
+        self.items.iter().any(|item| {
+            item.kind == ContractEvidenceKind::SourcePublicBehaviorAssertion
+                && item.marker == "contract-visible public behavior assertion"
         })
     }
 
@@ -720,6 +1638,7 @@ fn typed_unlisted_constructor_keyword_evidence(
 
 fn typed_contract_classification_markers(
     failure_cluster: Option<&VerificationFailureCluster>,
+    active_targets: &[Utf8PathBuf],
 ) -> Vec<String> {
     let Some(cluster) = failure_cluster else {
         return Vec::new();
@@ -738,12 +1657,373 @@ fn typed_contract_classification_markers(
                     | "oracle_conflict"
                     | "generated_test_insufficient"
                     | "generated_test_out_of_scope"
+                    | "generated_test_artifact_name_resolution_defect"
+                    | "generated_test_artifact_api_misuse"
+                    | "generated_test_subprocess_encoding_missing"
+                    | "generated_test_subprocess_output_capture_missing"
+                    | "generated_test_contract_overreach"
+                    | "generated_test_local_binding_contradiction"
+                    | "no_tests_ran"
             )
         })
         .collect::<Vec<_>>();
+    if generated_test_constructor_signature_misuse_without_source_target(cluster, active_targets) {
+        markers.push("generated_test_out_of_scope".to_string());
+    }
+    if generated_test_parse_defect_without_source_target(cluster) {
+        markers.push("generated_test_artifact_parse_defect".to_string());
+    }
+    if source_parse_defect_source_target(Some(cluster), None).is_some() {
+        markers.push("source_parse_defect_in_source".to_string());
+    }
+    if generated_test_name_resolution_defect_in_cluster(cluster) {
+        markers.push("generated_test_artifact_name_resolution_defect".to_string());
+    }
+    if generated_test_api_misuse_in_cluster(cluster) {
+        markers.push("generated_test_artifact_api_misuse".to_string());
+    }
+    if generated_test_contract_overreach_in_cluster(cluster) {
+        markers.push("generated_test_contract_overreach".to_string());
+    }
+    if generated_test_local_binding_contradiction_in_cluster(cluster) {
+        markers.push("generated_test_local_binding_contradiction".to_string());
+    }
     markers.sort();
     markers.dedup();
     markers
+}
+
+fn has_source_public_callable_obligation_from_cluster(
+    failure_cluster: Option<&VerificationFailureCluster>,
+) -> bool {
+    let Some(cluster) = failure_cluster else {
+        return false;
+    };
+    cluster.evidence.iter().any(|evidence| {
+        !evidence.public_missing_attributes.is_empty()
+            || evidence.subtype.as_deref() == Some("public_class_attribute_mismatch")
+            || evidence.evidence_markers.iter().any(|marker| {
+                let marker = marker.to_ascii_lowercase();
+                marker.contains("public missing method")
+                    || marker.contains("public missing attribute")
+                    || marker.contains("public_class_attribute_mismatch")
+            })
+    })
+}
+
+fn has_contract_valid_public_behavior_assertion_from_cluster(
+    failure_cluster: Option<&VerificationFailureCluster>,
+) -> bool {
+    let Some(cluster) = failure_cluster else {
+        return false;
+    };
+    let has_generated_test_ref = cluster
+        .test_refs
+        .iter()
+        .chain(
+            cluster
+                .evidence
+                .iter()
+                .flat_map(|evidence| evidence.test_refs.iter()),
+        )
+        .any(|target| target_is_test_like(target));
+    has_generated_test_ref
+        && cluster.evidence.iter().any(|evidence| {
+            let evidence_has_source_behavior = evidence.subtype.as_deref()
+                == Some("public_exception_mismatch")
+                || evidence
+                    .evidence_markers
+                    .iter()
+                    .chain(evidence.sibling_obligations.iter())
+                    .chain(cluster.sibling_obligations.iter())
+                    .any(|marker| {
+                        let marker = marker.to_ascii_lowercase();
+                        marker == "source_public_behavior_assertion"
+                            || marker.contains("source public behavior assertion")
+                    });
+            evidence_has_source_behavior
+                && !evidence_is_generated_test_artifact_validity_defect(evidence)
+        })
+}
+
+fn evidence_is_generated_test_artifact_validity_defect(
+    evidence: &crate::session::VerificationFailureEvidence,
+) -> bool {
+    evidence_is_parse_defect(evidence)
+        || evidence
+            .evidence_markers
+            .iter()
+            .chain(evidence.observed.iter())
+            .chain(evidence.exception.iter())
+            .any(|marker| {
+                let marker = marker.to_ascii_lowercase();
+                marker.contains("generated test artifact name resolution defect")
+                    || marker.contains("generated_test_artifact_name_resolution_defect")
+                    || marker.contains("generated_test_artifact_api_misuse")
+                    || marker.contains("generated test invalid reflection subject")
+                    || marker.contains("generated_test_subprocess_encoding_missing")
+                    || marker.contains("generated test subprocess child encoding missing")
+                    || marker.contains("generated test helper unresolved name")
+                    || (marker.contains("nameerror:") && marker.contains(" is not defined"))
+                    || marker.contains("generated_test_subprocess_output_capture_missing")
+                    || marker.contains("generated_test_subprocess_encoding_missing")
+                    || marker.contains("generated test subprocess child encoding missing")
+                    || marker.contains("subprocess output capture missing")
+            })
+}
+
+fn generated_test_local_binding_contradiction_in_cluster(
+    cluster: &VerificationFailureCluster,
+) -> bool {
+    cluster.evidence.iter().any(|evidence| {
+        evidence_points_to_generated_test(evidence, cluster)
+            && evidence
+                .evidence_markers
+                .iter()
+                .chain(evidence.sibling_obligations.iter())
+                .chain(cluster.sibling_obligations.iter())
+                .any(|marker| {
+                    let marker = marker.to_ascii_lowercase();
+                    marker.contains("generated_test_local_binding_contradiction")
+                        || marker.contains("generated test local binding contradiction")
+                        || marker.contains("generated-test local binding contradiction")
+                })
+    })
+}
+
+fn generated_test_contract_overreach_in_cluster(cluster: &VerificationFailureCluster) -> bool {
+    cluster.evidence.iter().any(|evidence| {
+        evidence_points_to_generated_test(evidence, cluster)
+            && (evidence.subtype.as_deref() == Some("generated_test_logging_contract_overreach")
+                || evidence.evidence_markers.iter().any(|marker| {
+                    let marker = marker.to_ascii_lowercase();
+                    marker.contains("generated_test_logging_contract_overreach")
+                        || marker.contains("generated_test_contract_overreach")
+                        || marker.contains("generated-test contract overreach")
+                        || marker.contains("generated-test logging side-effect assertion")
+                }))
+    })
+}
+
+fn generated_test_name_resolution_defect_in_cluster(cluster: &VerificationFailureCluster) -> bool {
+    cluster.evidence.iter().any(|evidence| {
+        evidence_points_to_generated_test(evidence, cluster)
+            && evidence
+                .evidence_markers
+                .iter()
+                .chain(evidence.observed.iter())
+                .chain(evidence.exception.iter())
+                .any(|marker| {
+                    let marker = marker.to_ascii_lowercase();
+                    marker.contains("generated test artifact name resolution defect")
+                        || marker.contains("generated_test_artifact_name_resolution_defect")
+                        || marker.contains("generated_test_artifact_api_misuse")
+                        || marker.contains("generated test invalid reflection subject")
+                        || marker.contains("generated test helper unresolved name")
+                        || (marker.contains("nameerror:") && marker.contains(" is not defined"))
+                })
+    })
+}
+
+fn generated_test_api_misuse_in_cluster(cluster: &VerificationFailureCluster) -> bool {
+    cluster.evidence.iter().any(|evidence| {
+        evidence_points_to_generated_test(evidence, cluster)
+            && evidence
+                .evidence_markers
+                .iter()
+                .chain(evidence.observed.iter())
+                .chain(evidence.exception.iter())
+                .any(|marker| {
+                    let marker = marker.to_ascii_lowercase();
+                    marker.contains("generated_test_artifact_api_misuse")
+                        || marker.contains("generated test invalid reflection subject")
+                })
+    })
+}
+
+fn generated_test_parse_defect_without_source_target(cluster: &VerificationFailureCluster) -> bool {
+    if cluster_has_mutable_source_ref(cluster) {
+        return false;
+    }
+    cluster.evidence.iter().any(|evidence| {
+        evidence_is_parse_defect(evidence) && evidence_points_to_generated_test(evidence, cluster)
+    })
+}
+
+fn evidence_is_parse_defect(evidence: &crate::session::VerificationFailureEvidence) -> bool {
+    evidence.subtype.as_deref() == Some("source_parse_defect")
+        || evidence
+            .evidence_markers
+            .iter()
+            .any(|marker| marker == "source_parse_defect")
+}
+
+fn source_parse_defect_source_target(
+    failure_cluster: Option<&VerificationFailureCluster>,
+    source_target: Option<&str>,
+) -> Option<String> {
+    let cluster = failure_cluster?;
+    if !cluster_has_mutable_source_ref(cluster) {
+        return None;
+    }
+    let target = cluster
+        .evidence
+        .iter()
+        .filter(|evidence| evidence_is_parse_defect(evidence))
+        .filter_map(|evidence| {
+            evidence
+                .source_refs
+                .iter()
+                .chain(evidence.target.iter())
+                .find(|target| target_is_mutable_source_like(target))
+                .cloned()
+        })
+        .chain(
+            cluster
+                .source_refs
+                .iter()
+                .filter(|target| target_is_mutable_source_like(target))
+                .cloned(),
+        )
+        .next()?;
+    source_target
+        .filter(|source_target| file_name(&target).eq_ignore_ascii_case(source_target))
+        .map(str::to_string)
+        .or_else(|| Some(file_name(&target).to_string()))
+}
+
+fn generated_test_constructor_signature_misuse_without_source_target(
+    cluster: &VerificationFailureCluster,
+    active_targets: &[Utf8PathBuf],
+) -> bool {
+    if cluster_has_mutable_source_ref(cluster) {
+        return false;
+    }
+    let source_stems = active_targets
+        .iter()
+        .filter(|target| target_is_mutable_source_like(target.as_str()))
+        .filter_map(|target| file_stem(target.as_str()))
+        .map(|stem| stem.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    cluster.evidence.iter().any(|evidence| {
+        evidence_is_constructor_signature_mismatch(evidence)
+            && evidence_points_to_generated_test(evidence, cluster)
+            && evidence_has_constructor_keyword_misuse(evidence, cluster)
+            && !evidence_callable_matches_source_target(evidence, &source_stems)
+    })
+}
+
+fn cluster_has_mutable_source_ref(cluster: &VerificationFailureCluster) -> bool {
+    cluster
+        .source_refs
+        .iter()
+        .chain(
+            cluster
+                .evidence
+                .iter()
+                .flat_map(|evidence| evidence.source_refs.iter()),
+        )
+        .chain(
+            cluster
+                .evidence
+                .iter()
+                .filter_map(|evidence| evidence.target.as_ref()),
+        )
+        .any(|target| target_is_mutable_source_like(target))
+}
+
+fn evidence_is_constructor_signature_mismatch(
+    evidence: &crate::session::VerificationFailureEvidence,
+) -> bool {
+    evidence.subtype.as_deref() == Some("public_constructor_signature_mismatch")
+        || evidence
+            .evidence_markers
+            .iter()
+            .any(|marker| marker == "public_constructor_signature_mismatch")
+}
+
+fn evidence_points_to_generated_test(
+    evidence: &crate::session::VerificationFailureEvidence,
+    cluster: &VerificationFailureCluster,
+) -> bool {
+    evidence.target.as_deref().is_some_and(target_is_test_like)
+        || evidence
+            .test_refs
+            .iter()
+            .any(|target| target_is_test_like(target))
+        || cluster
+            .test_refs
+            .iter()
+            .any(|target| target_is_test_like(target))
+}
+
+fn evidence_has_constructor_keyword_misuse(
+    evidence: &crate::session::VerificationFailureEvidence,
+    cluster: &VerificationFailureCluster,
+) -> bool {
+    evidence
+        .evidence_markers
+        .iter()
+        .chain(evidence.sibling_obligations.iter())
+        .chain(cluster.sibling_obligations.iter())
+        .chain(evidence.exception.iter())
+        .chain(evidence.observed.iter())
+        .any(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("unexpected keyword")
+                || value.contains("got an unexpected keyword argument")
+                || value.contains("constructor keyword compatibility")
+        })
+}
+
+fn evidence_callable_matches_source_target(
+    evidence: &crate::session::VerificationFailureEvidence,
+    source_stems: &[String],
+) -> bool {
+    if source_stems.is_empty() {
+        return false;
+    }
+    let mut callables = Vec::new();
+    if let Some(symbol) = evidence.symbol.as_deref() {
+        callables.push(symbol.to_ascii_lowercase());
+    }
+    callables.extend(
+        evidence
+            .evidence_markers
+            .iter()
+            .filter_map(|marker| constructor_subject_from_marker(marker))
+            .map(|subject| subject.to_ascii_lowercase()),
+    );
+    if let Some(call_site) = evidence.call_site.as_deref() {
+        if let Some(expr) = callable_expr_from_call_site(call_site) {
+            callables.push(expr.to_ascii_lowercase());
+        }
+    }
+    callables.iter().any(|callable| {
+        source_stems.iter().any(|stem| {
+            callable == stem
+                || callable.ends_with(&format!(".{stem}"))
+                || callable.rsplit('.').next().is_some_and(|last| last == stem)
+        })
+    })
+}
+
+fn constructor_subject_from_marker(marker: &str) -> Option<&str> {
+    if let Some((_, rest)) = marker.split_once("constructor keyword compatibility for `") {
+        return rest.split_once('`').map(|(subject, _)| subject.trim());
+    }
+    marker
+        .split_once(".__init__")
+        .map(|(subject, _)| subject.trim())
+        .filter(|subject| !subject.is_empty())
+}
+
+fn callable_expr_from_call_site(call_site: &str) -> Option<&str> {
+    let (head, _) = call_site.split_once('(')?;
+    head.split_whitespace()
+        .last()
+        .map(str::trim)
+        .filter(|expr| !expr.is_empty())
 }
 
 fn mixed_source_test_evidence(
@@ -780,6 +2060,25 @@ fn first_mutable_source_target(targets: &[Utf8PathBuf]) -> Option<String> {
         .map(|target| target.as_str().to_string())
 }
 
+fn source_target_for_generated_test_target(target: &str) -> Option<String> {
+    let normalized = target.replace('\\', "/");
+    let (dir, name) = normalized
+        .rsplit_once('/')
+        .map(|(dir, name)| (Some(dir), name))
+        .unwrap_or((None, normalized.as_str()));
+    let source_name = if let Some(rest) = name.strip_prefix("test_") {
+        rest.to_string()
+    } else if let Some(stem) = name.strip_suffix("_test.py") {
+        format!("{stem}.py")
+    } else {
+        return None;
+    };
+    match dir {
+        Some(dir) if !dir.is_empty() => Some(format!("{dir}/{source_name}")),
+        _ => Some(source_name),
+    }
+}
+
 fn target_is_test_like(target: &str) -> bool {
     let name = file_name(target).to_ascii_lowercase();
     name.starts_with("test_") || name.ends_with("_test.py")
@@ -801,6 +2100,14 @@ fn target_is_mutable_source_like(target: &str) -> bool {
 
 fn file_name(target: &str) -> &str {
     target.rsplit(['/', '\\']).next().unwrap_or(target)
+}
+
+fn file_stem(target: &str) -> Option<&str> {
+    file_name(target)
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .or_else(|| Some(file_name(target)))
+        .filter(|stem| !stem.is_empty())
 }
 
 fn strings(values: &[&str]) -> Vec<String> {

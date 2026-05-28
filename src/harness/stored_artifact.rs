@@ -159,22 +159,81 @@ fn collect_artifacts(
 }
 
 fn classify_artifact(path: &str, tags: &mut BTreeSet<ArtifactTag>) -> ArtifactKind {
-    if path.ends_with("result.json") {
+    let normalized_path = path.replace('\\', "/");
+    let file_name = normalized_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(normalized_path.as_str());
+    if file_name == "result.json" {
         tags.insert(ArtifactTag::Replay);
         ArtifactKind::ReplayReport
-    } else if path.contains("request") || path.contains("diagnostic") {
+    } else if is_request_diagnostics_artifact(&normalized_path, file_name) {
         tags.insert(ArtifactTag::Diagnostics);
         ArtifactKind::RequestDiagnostics
-    } else if path.contains("transcript") {
+    } else if artifact_name_has_role_token(file_name, "transcript") {
         ArtifactKind::Transcript
-    } else if path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg") {
+    } else if file_name.ends_with(".png")
+        || file_name.ends_with(".jpg")
+        || file_name.ends_with(".jpeg")
+    {
         tags.insert(ArtifactTag::ImageTransport);
         ArtifactKind::ImageAttachment
-    } else if path.ends_with(".log") || path.contains("unittest") || path.contains("py_compile") {
+    } else if file_name.ends_with(".log")
+        || artifact_name_has_role_token(file_name, "unittest")
+        || artifact_name_has_role_token(file_name, "py_compile")
+    {
         tags.insert(ArtifactTag::Verification);
         ArtifactKind::VerificationLog
     } else {
         tags.insert(ArtifactTag::ScenarioOutput);
         ArtifactKind::WorkspaceFile
+    }
+}
+
+fn is_request_diagnostics_artifact(path: &str, file_name: &str) -> bool {
+    path.split('/')
+        .any(|segment| segment == "request_diagnostics")
+        || artifact_name_has_role_token(file_name, "diagnostic")
+        || artifact_name_has_role_token(file_name, "diagnostics")
+        || file_name == "model_request.json"
+        || file_name.ends_with("_model_request.json")
+        || file_name == "request.json"
+}
+
+fn artifact_name_has_role_token(file_name: &str, token: &str) -> bool {
+    let stem = file_name
+        .strip_suffix(".json")
+        .or_else(|| file_name.strip_suffix(".md"))
+        .or_else(|| file_name.strip_suffix(".txt"))
+        .or_else(|| file_name.strip_suffix(".log"))
+        .unwrap_or(file_name);
+    stem.split(['.', '-', '_']).any(|part| part == token)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::harness::{ArtifactKind, ArtifactTag};
+
+    use super::classify_artifact;
+
+    #[test]
+    fn stored_artifact_classifier_does_not_treat_request_named_outputs_as_diagnostics() {
+        let mut tags = BTreeSet::new();
+        let kind = classify_artifact("workspace/request_handler.py", &mut tags);
+
+        assert_eq!(kind, ArtifactKind::WorkspaceFile);
+        assert!(tags.contains(&ArtifactTag::ScenarioOutput));
+        assert!(!tags.contains(&ArtifactTag::Diagnostics));
+    }
+
+    #[test]
+    fn stored_artifact_classifier_keeps_explicit_request_diagnostics() {
+        let mut tags = BTreeSet::new();
+        let kind = classify_artifact("events/000001_model_request.json", &mut tags);
+
+        assert_eq!(kind, ArtifactKind::RequestDiagnostics);
+        assert!(tags.contains(&ArtifactTag::Diagnostics));
     }
 }

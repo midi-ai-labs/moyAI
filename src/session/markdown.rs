@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload, ToolLifecycleStatus};
 use crate::session::{
     MessageMetadata, MessagePart, MessageRole, PartRecord, RequestDiagnosticsPart, SessionId,
-    ToolCallStatus, Transcript, TranscriptMessage,
+    SessionStatus, ToolCallStatus, Transcript, TranscriptMessage,
 };
 
 pub fn transcript_to_markdown(transcript: &Transcript) -> String {
@@ -47,39 +47,357 @@ pub fn history_items_to_markdown(
     session: &crate::session::SessionRecord,
     items: &[HistoryItem],
 ) -> String {
+    let mut events = Vec::new();
+    let mut ordered = items.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|item| (item.sequence_no, item.created_at_ms));
+    for item in ordered {
+        match &item.payload {
+            HistoryItemPayload::UserTurn { .. }
+            | HistoryItemPayload::Message {
+                role: MessageRole::User,
+                ..
+            } => {
+                let mut body = String::new();
+                push_history_user_quote_body(&mut body, item);
+                events.push(MarkdownExportEvent::user(body));
+            }
+            HistoryItemPayload::Message {
+                role: MessageRole::Assistant,
+                ..
+            } => {
+                let mut body = String::new();
+                push_history_payload(&mut body, &item.payload);
+                events.push(MarkdownExportEvent::assistant(body));
+            }
+            HistoryItemPayload::Error { message, .. } => {
+                events.push(MarkdownExportEvent::detail(
+                    "Error",
+                    render_history_item_detail(item),
+                ));
+                events.push(MarkdownExportEvent::terminal(
+                    MarkdownTerminalStatus::Failed,
+                    message,
+                ));
+            }
+            _ => {
+                events.push(MarkdownExportEvent::detail(
+                    history_item_detail_title(item),
+                    render_history_item_detail(item),
+                ));
+            }
+        }
+    }
+    if let Some(status) = markdown_terminal_status_from_session_status(session.status) {
+        events.push(MarkdownExportEvent::terminal(
+            status,
+            markdown_session_terminal_summary(session.status),
+        ));
+    }
+    let metadata = history_metadata_lines(session);
+    render_codex_turn_block_markdown(&session.title, &events, &metadata)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownTerminalStatus {
+    Completed,
+    AwaitingUser,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone)]
+pub struct MarkdownExportEvent {
+    pub kind: MarkdownExportEventKind,
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum MarkdownExportEventKind {
+    User,
+    Assistant,
+    Detail,
+    Terminal(MarkdownTerminalStatus),
+}
+
+impl MarkdownExportEvent {
+    pub fn user(body: impl Into<String>) -> Self {
+        Self {
+            kind: MarkdownExportEventKind::User,
+            title: "User".to_string(),
+            body: body.into(),
+        }
+    }
+
+    pub fn assistant(body: impl Into<String>) -> Self {
+        Self {
+            kind: MarkdownExportEventKind::Assistant,
+            title: "Assistant".to_string(),
+            body: body.into(),
+        }
+    }
+
+    pub fn detail(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            kind: MarkdownExportEventKind::Detail,
+            title: title.into(),
+            body: body.into(),
+        }
+    }
+
+    pub fn terminal(status: MarkdownTerminalStatus, body: impl Into<String>) -> Self {
+        Self {
+            kind: MarkdownExportEventKind::Terminal(status),
+            title: "Terminal".to_string(),
+            body: body.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MarkdownMetadataLine {
+    pub label: String,
+    pub value: String,
+}
+
+impl MarkdownMetadataLine {
+    pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MarkdownTurnBlock {
+    user_body: String,
+    details: Vec<MarkdownExportEvent>,
+    assistant_bodies: Vec<String>,
+    terminal: Option<(MarkdownTerminalStatus, String)>,
+}
+
+impl MarkdownTurnBlock {
+    fn has_content(&self) -> bool {
+        !self.user_body.trim().is_empty()
+            || !self.details.is_empty()
+            || !self.assistant_bodies.is_empty()
+            || self.terminal.is_some()
+    }
+}
+
+pub fn render_codex_turn_block_markdown(
+    title: &str,
+    events: &[MarkdownExportEvent],
+    metadata: &[MarkdownMetadataLine],
+) -> String {
+    let mut blocks = Vec::new();
+    let mut current = MarkdownTurnBlock::default();
+    for event in events {
+        match &event.kind {
+            MarkdownExportEventKind::User => {
+                if current.has_content() {
+                    blocks.push(current);
+                    current = MarkdownTurnBlock::default();
+                }
+                current.user_body = event.body.trim().to_string();
+            }
+            MarkdownExportEventKind::Assistant => {
+                if !event.body.trim().is_empty() {
+                    current.assistant_bodies.push(event.body.trim().to_string());
+                }
+            }
+            MarkdownExportEventKind::Detail => {
+                if !event.body.trim().is_empty() || !event.title.trim().is_empty() {
+                    current.details.push(event.clone());
+                }
+            }
+            MarkdownExportEventKind::Terminal(status) => {
+                current.terminal = Some((*status, event.body.trim().to_string()));
+            }
+        }
+    }
+    if current.has_content() {
+        blocks.push(current);
+    }
+
     let mut output = String::new();
     output.push_str("# ");
-    output.push_str(&session.title);
+    output.push_str(&markdown_heading_text(title));
     output.push_str("\n\n");
-    push_metadata_line(&mut output, "Session ID", &session.id.to_string());
-    push_metadata_line(&mut output, "Status", &format!("{:?}", session.status));
-    push_metadata_line(&mut output, "Workspace", session.cwd.as_str());
-    push_metadata_line(&mut output, "Model", &session.model);
-    push_metadata_line(&mut output, "Base URL", &session.base_url);
-    push_metadata_line(
-        &mut output,
-        "Created At (ms)",
-        &session.created_at_ms.to_string(),
+    for block in &blocks {
+        push_turn_block(&mut output, block);
+    }
+    output.push_str("<details><summary>実行情報</summary>\n\n");
+    for line in metadata {
+        push_metadata_line(&mut output, &line.label, &line.value);
+    }
+    output.push_str("</details>\n");
+    output
+}
+
+pub fn codex_turn_block_markdown_fixture_passes() -> bool {
+    let events = vec![
+        MarkdownExportEvent::user("first request"),
+        MarkdownExportEvent::assistant("first final answer"),
+        MarkdownExportEvent::user("second request"),
+        MarkdownExportEvent::assistant("I will keep working."),
+        MarkdownExportEvent::detail("Work Summary", "- 結果: run cancelled by user"),
+        MarkdownExportEvent::terminal(MarkdownTerminalStatus::Interrupted, "run cancelled by user"),
+    ];
+    let markdown = render_codex_turn_block_markdown(
+        "projection fixture",
+        &events,
+        &[MarkdownMetadataLine::new("Session", "`fixture`")],
     );
-    push_metadata_line(
-        &mut output,
-        "Updated At (ms)",
-        &session.updated_at_ms.to_string(),
-    );
-    if let Some(completed_at_ms) = session.completed_at_ms {
-        push_metadata_line(
-            &mut output,
-            "Completed At (ms)",
-            &completed_at_ms.to_string(),
+    let Some(first_user) = markdown.find("> first request") else {
+        return false;
+    };
+    let Some(first_final) = markdown.find("first final answer") else {
+        return false;
+    };
+    let Some(second_user) = markdown.find("> second request") else {
+        return false;
+    };
+    let Some(intent) = markdown.find("I will keep working.") else {
+        return false;
+    };
+    let Some(terminal) = markdown.find("停止しました: run cancelled by user") else {
+        return false;
+    };
+    first_user < first_final
+        && first_final < second_user
+        && second_user < intent
+        && intent < terminal
+}
+
+fn push_turn_block(output: &mut String, block: &MarkdownTurnBlock) {
+    if !block.user_body.trim().is_empty() {
+        output.push_str("> ");
+        output.push_str(&block.user_body.trim().replace('\n', "\n> "));
+        output.push_str("\n\n");
+    }
+
+    let (final_outcome, assistant_detail_count) = turn_final_outcome(block);
+    let detail_count = block.details.len() + assistant_detail_count;
+    if detail_count > 0 {
+        output.push_str("<details><summary>");
+        output.push_str(&format!("{detail_count} previous messages"));
+        output.push_str("</summary>\n\n");
+        for body in assistant_detail_bodies(block) {
+            output.push_str("> ");
+            output.push_str(&body.replace('\n', "\n> "));
+            output.push_str("\n\n");
+        }
+        for detail in &block.details {
+            push_markdown_detail_event(output, detail);
+        }
+        output.push_str("</details>\n\n");
+    }
+
+    if let Some(final_outcome) = final_outcome {
+        if !final_outcome.trim().is_empty() {
+            output.push_str(final_outcome.trim());
+            output.push_str("\n\n");
+        }
+    }
+}
+
+fn turn_final_outcome(block: &MarkdownTurnBlock) -> (Option<String>, usize) {
+    if let Some((status, summary)) = &block.terminal
+        && *status != MarkdownTerminalStatus::Completed
+    {
+        return (
+            Some(terminal_outcome_text(*status, summary)),
+            block.assistant_bodies.len(),
         );
     }
-    output.push('\n');
-
-    for item in items {
-        push_history_item(&mut output, item);
+    let assistant_bodies = block
+        .assistant_bodies
+        .iter()
+        .map(|body| body.trim())
+        .filter(|body| !body.is_empty())
+        .collect::<Vec<_>>();
+    if let Some(last) = assistant_bodies.last() {
+        if markdown_body_is_pseudo_tool_call_closeout(last) {
+            return (
+                Some("完了しました。".to_string()),
+                assistant_bodies.len().saturating_sub(1),
+            );
+        }
+        return (
+            Some((*last).to_string()),
+            assistant_bodies.len().saturating_sub(1),
+        );
     }
+    if let Some((status, summary)) = &block.terminal {
+        return (Some(terminal_outcome_text(*status, summary)), 0);
+    }
+    (None, 0)
+}
 
-    output
+fn assistant_detail_bodies(block: &MarkdownTurnBlock) -> Vec<String> {
+    let assistant_bodies = block
+        .assistant_bodies
+        .iter()
+        .map(|body| body.trim())
+        .filter(|body| !body.is_empty())
+        .collect::<Vec<_>>();
+    if block
+        .terminal
+        .as_ref()
+        .is_some_and(|(status, _)| *status != MarkdownTerminalStatus::Completed)
+    {
+        return assistant_bodies.into_iter().map(str::to_string).collect();
+    }
+    assistant_bodies
+        .into_iter()
+        .take(block.assistant_bodies.len().saturating_sub(1))
+        .map(str::to_string)
+        .collect()
+}
+
+fn terminal_outcome_text(status: MarkdownTerminalStatus, summary: &str) -> String {
+    let summary = summary.trim();
+    match status {
+        MarkdownTerminalStatus::Completed
+            if summary.is_empty() || summary == "session completed" =>
+        {
+            "完了しました。".to_string()
+        }
+        MarkdownTerminalStatus::Completed => summary.to_string(),
+        MarkdownTerminalStatus::AwaitingUser
+            if summary.is_empty() || summary == "session awaiting user" =>
+        {
+            "ユーザー確認待ちで停止しました。".to_string()
+        }
+        MarkdownTerminalStatus::AwaitingUser => {
+            format!("ユーザー確認待ちで停止しました: {summary}")
+        }
+        MarkdownTerminalStatus::Failed if summary.is_empty() => "失敗しました。".to_string(),
+        MarkdownTerminalStatus::Failed => format!("失敗しました: {summary}"),
+        MarkdownTerminalStatus::Interrupted if summary.is_empty() => "停止しました。".to_string(),
+        MarkdownTerminalStatus::Interrupted => format!("停止しました: {summary}"),
+    }
+}
+
+fn push_markdown_detail_event(output: &mut String, event: &MarkdownExportEvent) {
+    let title = event.title.trim();
+    let body = event.body.trim();
+    output.push_str("<details><summary>");
+    output.push_str(&markdown_heading_text(if title.is_empty() {
+        "作業履歴"
+    } else {
+        title
+    }));
+    output.push_str("</summary>\n\n");
+    if body.is_empty() {
+        output.push_str("_内容はありません。_\n\n");
+    } else {
+        output.push_str(body);
+        output.push_str("\n\n");
+    }
+    output.push_str("</details>\n\n");
 }
 
 pub fn history_markdown_file_name(title: &str, session_id: SessionId) -> String {
@@ -180,6 +498,88 @@ fn push_history_item(output: &mut String, item: &HistoryItem) {
     push_history_payload(output, &item.payload);
 }
 
+fn render_history_item_detail(item: &HistoryItem) -> String {
+    let mut output = String::new();
+    push_history_item(&mut output, item);
+    output.trim().to_string()
+}
+
+fn history_item_detail_title(item: &HistoryItem) -> &'static str {
+    match &item.payload {
+        HistoryItemPayload::ToolCall { .. } => "Tool Call",
+        HistoryItemPayload::ToolOutput { .. } => "Tool Result",
+        HistoryItemPayload::RequestDiagnostics { .. } => "Request Diagnostics",
+        HistoryItemPayload::FileChange { .. } => "File Changes",
+        HistoryItemPayload::Reasoning { .. } => "Reasoning",
+        HistoryItemPayload::PromptDispatch { .. } => "Prompt Dispatch",
+        HistoryItemPayload::RejectedToolProposal { .. } => "Rejected Tool Proposal",
+        HistoryItemPayload::CandidateRepairEdit { .. } => "Candidate Repair Edit",
+        HistoryItemPayload::Continuation { .. } => "Continuation",
+        HistoryItemPayload::StateProjection { .. } | HistoryItemPayload::SessionState { .. } => {
+            "State"
+        }
+        HistoryItemPayload::ApprovalDecision { .. } => "Approval Decision",
+        HistoryItemPayload::RetryDecision { .. } => "Retry Decision",
+        HistoryItemPayload::ControlEnvelope { .. } => "Control Envelope",
+        HistoryItemPayload::Compaction { .. } => "Compaction",
+        HistoryItemPayload::Error { .. } => "Error",
+        HistoryItemPayload::UserTurn { .. } | HistoryItemPayload::Message { .. } => "Message",
+    }
+}
+
+fn push_history_user_quote_body(output: &mut String, item: &HistoryItem) {
+    match &item.payload {
+        HistoryItemPayload::UserTurn { content, .. }
+        | HistoryItemPayload::Message {
+            role: MessageRole::User,
+            content,
+            ..
+        } => push_content_parts(output, content),
+        _ => {}
+    }
+}
+
+fn history_metadata_lines(session: &crate::session::SessionRecord) -> Vec<MarkdownMetadataLine> {
+    let mut lines = vec![
+        MarkdownMetadataLine::new("Session ID", session.id.to_string()),
+        MarkdownMetadataLine::new("Status", format!("{:?}", session.status)),
+        MarkdownMetadataLine::new("Workspace", session.cwd.as_str()),
+        MarkdownMetadataLine::new("Model", session.model.clone()),
+        MarkdownMetadataLine::new("Base URL", session.base_url.clone()),
+        MarkdownMetadataLine::new("Created At (ms)", session.created_at_ms.to_string()),
+        MarkdownMetadataLine::new("Updated At (ms)", session.updated_at_ms.to_string()),
+    ];
+    if let Some(completed_at_ms) = session.completed_at_ms {
+        lines.push(MarkdownMetadataLine::new(
+            "Completed At (ms)",
+            completed_at_ms.to_string(),
+        ));
+    }
+    lines
+}
+
+fn markdown_terminal_status_from_session_status(
+    status: SessionStatus,
+) -> Option<MarkdownTerminalStatus> {
+    match status {
+        SessionStatus::Completed => Some(MarkdownTerminalStatus::Completed),
+        SessionStatus::AwaitingUser => Some(MarkdownTerminalStatus::AwaitingUser),
+        SessionStatus::Cancelled => Some(MarkdownTerminalStatus::Interrupted),
+        SessionStatus::Failed => Some(MarkdownTerminalStatus::Failed),
+        SessionStatus::Running | SessionStatus::Idle => None,
+    }
+}
+
+fn markdown_session_terminal_summary(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Completed => "session completed",
+        SessionStatus::AwaitingUser => "session awaiting user",
+        SessionStatus::Cancelled => "run cancelled by user",
+        SessionStatus::Failed => "session failed",
+        SessionStatus::Running | SessionStatus::Idle => "",
+    }
+}
+
 fn materialized_history_payload_for_part(
     message: &TranscriptMessage,
     part: &PartRecord,
@@ -236,7 +636,6 @@ fn materialized_history_payload_for_part(
             success: value.success,
             progress_effect: value.progress_effect.clone(),
             blocked_action: value.blocked_action.clone(),
-            required_next_action: value.required_next_action.clone(),
             result_hash: value.result_hash.clone(),
             verification_run: None,
         }),
@@ -378,7 +777,6 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
             success,
             progress_effect,
             blocked_action,
-            required_next_action,
             result_hash,
             ..
         } => {
@@ -399,7 +797,7 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
             output.push_str("- Progress effect: `");
             output.push_str(&format!("{progress_effect:?}"));
             output.push_str("`\n");
-            let _ = (blocked_action, required_next_action);
+            let _ = blocked_action;
             if let Some(hash) = result_hash {
                 output.push_str("- Result hash: `");
                 output.push_str(hash);
@@ -579,6 +977,11 @@ fn push_request_diagnostics(output: &mut String, value: &RequestDiagnosticsPart)
         "Stream Idle Timeout (ms)",
         &value.stream_idle_timeout_ms.to_string(),
     );
+    push_metadata_line(
+        output,
+        "Stream Max Retries",
+        &value.stream_max_retries.to_string(),
+    );
     push_metadata_line(output, "Tool Count", &value.tool_count.to_string());
     push_metadata_line(
         output,
@@ -636,6 +1039,32 @@ fn push_fenced(output: &mut String, language: &str, value: &str) {
     }
     output.push_str(&fence);
     output.push_str("\n\n");
+}
+
+pub fn markdown_body_is_pseudo_tool_call_closeout(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("<tool_call>")
+        || lower.contains("</tool_call>")
+        || lower.contains("&lt;tool_call")
+        || lower.contains("&lt;/tool_call")
+        || lower.contains("<function=")
+        || lower.contains("</function>")
+        || lower.contains("&lt;function=")
+        || lower.contains("&lt;/function")
+        || lower.contains("<parameter=command>")
+        || lower.contains("<parameter=path>")
+        || lower.contains("&lt;parameter=command")
+        || lower.contains("&lt;parameter=path")
+}
+
+fn markdown_heading_text(value: &str) -> String {
+    value
+        .lines()
+        .next()
+        .unwrap_or("Transcript")
+        .replace('#', "\\#")
+        .trim()
+        .to_string()
 }
 
 fn markdown_fence_for(value: &str) -> String {

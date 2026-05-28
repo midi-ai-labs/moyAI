@@ -10,8 +10,9 @@ pub use contract::{
     ModelContentPart, ModelMessage, ModelProfile, ModelToolCall, ToolSchema,
 };
 pub use model_probe::{
-    ModelAvailabilityReport, ModelAvailabilityStatus, ProviderModelInfo,
+    ModelAvailabilityReport, ModelAvailabilityStatus, ProviderModelInfo, ToolCallProbeReport,
     apply_provider_model_info_to_config, check_model_availability, ensure_openai_model_available,
-    fetch_openai_models, fetch_provider_model_infos, normalize_provider_base_url,
+    extra_body_with_num_ctx, fetch_openai_models, fetch_provider_model_infos,
+    normalize_provider_base_url,
 };
 pub use openai_compat::OpenAiCompatClient;

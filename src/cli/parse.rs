@@ -95,6 +95,7 @@ pub struct ModelAvailabilityArgs {
     pub base_url_override: Option<String>,
     pub output: Option<Utf8PathBuf>,
     pub require_vision: bool,
+    pub openai_compatible_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +117,9 @@ pub struct ManualStRouteArgs {
     pub preflight_report: Utf8PathBuf,
     pub model_override: Option<String>,
     pub base_url_override: Option<String>,
+    pub openai_compatible_only: bool,
+    pub context_window: Option<u32>,
+    pub max_output_tokens: Option<u32>,
     pub max_turn_seconds: u64,
     pub dry_run: bool,
 }
@@ -274,6 +278,7 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                     base_url_override: args.base_url_override,
                     output: args.output,
                     require_vision: args.require_vision,
+                    openai_compatible_only: args.openai_compatible_only,
                 }))
             }
         },
@@ -298,6 +303,9 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                 preflight_report: args.preflight_report,
                 model_override: args.model_override,
                 base_url_override: args.base_url_override,
+                openai_compatible_only: args.openai_compatible_only,
+                context_window: args.context_window,
+                max_output_tokens: args.max_output_tokens,
                 max_turn_seconds: args.max_turn_seconds,
                 dry_run: args.dry_run,
             })),
@@ -519,6 +527,8 @@ struct ModelAvailabilityCommand {
     output: Option<Utf8PathBuf>,
     #[arg(long = "require-vision")]
     require_vision: bool,
+    #[arg(long = "openai-compatible-only")]
+    openai_compatible_only: bool,
 }
 
 #[derive(Args)]
@@ -549,6 +559,12 @@ struct ManualStRouteCommand {
     model_override: Option<String>,
     #[arg(long = "base-url")]
     base_url_override: Option<String>,
+    #[arg(long = "openai-compatible-only")]
+    openai_compatible_only: bool,
+    #[arg(long = "context-window")]
+    context_window: Option<u32>,
+    #[arg(long = "max-output-tokens")]
+    max_output_tokens: Option<u32>,
     #[arg(long = "max-turn-seconds", default_value_t = 7200)]
     max_turn_seconds: u64,
     #[arg(long = "dry-run")]

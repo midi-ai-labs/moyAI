@@ -19,9 +19,11 @@ pub fn flatten_text_parts(transcript: &Transcript) -> Vec<String> {
 }
 
 pub fn transcript_from_history_items(session: &SessionRecord, items: &[HistoryItem]) -> Transcript {
-    let messages = items
+    let mut ordered = items.iter().enumerate().collect::<Vec<_>>();
+    ordered.sort_by_key(|(index, item)| (item.created_at_ms, item.sequence_no, *index));
+    let messages = ordered
         .iter()
-        .filter_map(|item| {
+        .filter_map(|(_, item)| {
             let role = history_item_role(&item.payload);
             let message_id = MessageId::new();
             let parts = history_item_parts(message_id, &item.payload);
@@ -138,7 +140,6 @@ fn history_item_parts(message_id: MessageId, payload: &HistoryItemPayload) -> Ve
             success,
             progress_effect,
             blocked_action,
-            required_next_action,
             result_hash,
             ..
         } => parts.push(part_record(
@@ -153,7 +154,6 @@ fn history_item_parts(message_id: MessageId, payload: &HistoryItemPayload) -> Ve
                 success: *success,
                 progress_effect: progress_effect.clone(),
                 blocked_action: blocked_action.clone(),
-                required_next_action: required_next_action.clone(),
                 result_hash: result_hash.clone(),
             }),
         )),
@@ -255,5 +255,67 @@ fn tool_status_from_lifecycle(status: ToolLifecycleStatus) -> ToolCallStatus {
         | ToolLifecycleStatus::Blocked
         | ToolLifecycleStatus::Rejected
         | ToolLifecycleStatus::Deferred => ToolCallStatus::Failed,
+    }
+}
+
+pub(crate) fn transcript_from_history_items_uses_item_sequence_fixture_passes() -> bool {
+    let session = SessionRecord {
+        id: crate::session::SessionId::new(),
+        project_id: crate::session::ProjectId::new(),
+        title: "sequence fixture".to_string(),
+        status: crate::session::SessionStatus::Completed,
+        cwd: camino::Utf8PathBuf::from("C:/workspace"),
+        model: "model".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 3,
+        completed_at_ms: Some(3),
+    };
+    let later = HistoryItem {
+        id: crate::protocol::HistoryItemId::new(),
+        session_id: session.id,
+        turn_id: crate::protocol::TurnId::new(),
+        sequence_no: 2,
+        created_at_ms: 2,
+        payload: HistoryItemPayload::Message {
+            message_id: None,
+            role: MessageRole::Assistant,
+            content: vec![ContentPart::Text {
+                text: "assistant after user".to_string(),
+            }],
+        },
+    };
+    let earlier = HistoryItem {
+        id: crate::protocol::HistoryItemId::new(),
+        session_id: session.id,
+        turn_id: crate::protocol::TurnId::new(),
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::Message {
+            message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentPart::Text {
+                text: "user request".to_string(),
+            }],
+        },
+    };
+    let transcript = transcript_from_history_items(&session, &[later, earlier]);
+    let Some(first) = transcript.messages.first() else {
+        return false;
+    };
+    let Some(second) = transcript.messages.get(1) else {
+        return false;
+    };
+    first.record.role == MessageRole::User
+        && second.record.role == MessageRole::Assistant
+        && first.record.sequence_no == 1
+        && second.record.sequence_no == 2
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn transcript_from_history_items_uses_item_sequence() {
+        assert!(super::transcript_from_history_items_uses_item_sequence_fixture_passes());
     }
 }

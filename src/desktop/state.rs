@@ -15,6 +15,7 @@ use super::provider_config_state::DesktopProviderConfigState;
 use super::query::build_session_detail_from_app_state_with_session;
 use super::startup::DesktopStartupState;
 use super::view_state::DesktopViewState;
+use crate::config::ProviderMetadataMode;
 use crate::config::ResolvedConfig;
 use crate::llm::{ProviderModelInfo, normalize_provider_base_url};
 
@@ -625,6 +626,30 @@ impl DesktopState {
             "Load the model list for this provider.".to_string();
     }
 
+    pub fn set_provider_metadata_mode_input(&mut self, mode: ProviderMetadataMode) {
+        self.provider_config.provider_metadata_mode_input = mode;
+        self.provider_config.provider_status_text = match mode {
+            ProviderMetadataMode::LmStudioNativeRequired => {
+                "Provider mode: LM Studio native metadata is required.".to_string()
+            }
+            ProviderMetadataMode::OpenAiCompatibleOnly => {
+                "Provider mode: OpenAI-compatible /v1 metadata only.".to_string()
+            }
+        };
+    }
+
+    pub fn set_provider_context_window_input(&mut self, text: String) {
+        self.provider_config.provider_context_window_input = text;
+        self.provider_config.provider_status_text =
+            "Context window override will be applied with provider settings.".to_string();
+    }
+
+    pub fn set_provider_max_output_tokens_input(&mut self, text: String) {
+        self.provider_config.provider_max_output_tokens_input = text;
+        self.provider_config.provider_status_text =
+            "Max output tokens override will be applied with provider settings.".to_string();
+    }
+
     pub fn load_open_session(
         &mut self,
         session: &SessionRecord,
@@ -834,6 +859,23 @@ impl DesktopState {
     pub fn show_provider_editor(&mut self) {
         self.provider_config.provider_base_url_input =
             self.provider_config.effective_config.model.base_url.clone();
+        self.provider_config.provider_metadata_mode_input = self
+            .provider_config
+            .effective_config
+            .model
+            .provider_metadata_mode;
+        self.provider_config.provider_context_window_input = self
+            .provider_config
+            .effective_config
+            .model
+            .context_window
+            .to_string();
+        self.provider_config.provider_max_output_tokens_input = self
+            .provider_config
+            .effective_config
+            .model
+            .max_output_tokens
+            .to_string();
         self.provider_config.provider_models = ensure_current_model(
             self.provider_config.provider_models.clone(),
             &self.provider_config.effective_config.model.model,
@@ -1121,6 +1163,23 @@ impl DesktopState {
     fn with_provider_fields(mut self) -> Self {
         self.provider_config.provider_base_url_input =
             self.provider_config.effective_config.model.base_url.clone();
+        self.provider_config.provider_metadata_mode_input = self
+            .provider_config
+            .effective_config
+            .model
+            .provider_metadata_mode;
+        self.provider_config.provider_context_window_input = self
+            .provider_config
+            .effective_config
+            .model
+            .context_window
+            .to_string();
+        self.provider_config.provider_max_output_tokens_input = self
+            .provider_config
+            .effective_config
+            .model
+            .max_output_tokens
+            .to_string();
         self.provider_config.provider_loaded_base_url = Some(normalize_provider_base_url(
             &self.provider_config.effective_config.model.base_url,
         ));
@@ -1404,6 +1463,7 @@ mod tests {
                     tool: crate::tool::ToolName::Shell,
                     status: crate::protocol::ToolLifecycleStatus::Completed,
                     title: "workspace scan".to_string(),
+                    summary: "Command: Get-ChildItem\n\nStdout:\nREADME.md".to_string(),
                 },
             },
             TurnItem {

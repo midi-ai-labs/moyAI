@@ -111,6 +111,7 @@ Probe Route F の verdict は observation quality を示す。live host state de
 ## evidence
 
 - `route_manifest.json`
+- `case_progress.json`
 - `workspace_diff_manifest.json`
 - 必要なら `timeout_classification.json`
 - transcript / `run.jsonl`

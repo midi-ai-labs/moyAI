@@ -10,7 +10,7 @@ use moyai::cli::{
     CliCommand, EventRenderer, HumanRenderer, JsonRenderer, ModelAvailabilityArgs, OutputMode,
     RunArgs, StdConfirmationPrompt,
 };
-use moyai::config::{ConfigLoader, ShellFamily};
+use moyai::config::{ConfigLoader, ProviderMetadataMode, ShellFamily};
 #[cfg(feature = "tauri-desktop")]
 use moyai::desktop;
 use moyai::harness::artifact::hash_file;
@@ -145,6 +145,11 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
                 preflight_report: args.preflight_report,
                 model_override: args.model_override,
                 base_url_override: args.base_url_override,
+                provider_metadata_mode_override: args
+                    .openai_compatible_only
+                    .then_some(moyai::config::ProviderMetadataMode::OpenAiCompatibleOnly),
+                context_window_override: args.context_window,
+                max_output_tokens_override: args.max_output_tokens,
                 max_turn_seconds: args.max_turn_seconds,
                 dry_run: args.dry_run,
             },
@@ -393,8 +398,11 @@ async fn run_model_availability_command(args: ModelAvailabilityArgs) -> Result<(
         visible_files: Vec::new(),
         image_paths: Vec::new(),
     };
-    let config = ConfigLoader::load(&start_dir, Some(&config_args))
+    let mut config = ConfigLoader::load(&start_dir, Some(&config_args))
         .map_err(|error| (3, error.to_string()))?;
+    if args.openai_compatible_only {
+        config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+    }
     let report = moyai::llm::check_model_availability(
         &config,
         args.model_override.as_deref(),

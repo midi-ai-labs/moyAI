@@ -3,20 +3,15 @@ use std::time::Duration;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::config::ResolvedConfig;
+use crate::config::{ProviderMetadataMode, ResolvedConfig};
 use crate::error::LlmError;
 
 #[derive(Debug, Deserialize)]
 struct OpenAiModelsResponse {
     #[serde(default)]
-    data: Vec<OpenAiModelEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiModelEntry {
-    id: String,
+    data: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,17 +36,34 @@ pub enum ModelAvailabilityStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallProbeReport {
+    pub probe: String,
+    pub status: ModelAvailabilityStatus,
+    pub tool_choice: String,
+    pub finish_reason: Option<String>,
+    pub tool_call_received: bool,
+    pub tool_name: Option<String>,
+    pub tool_arguments: Option<String>,
+    pub arguments_valid: bool,
+    pub content: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelAvailabilityReport {
     pub gate: String,
     pub status: ModelAvailabilityStatus,
     pub generated_by: String,
     pub model: String,
     pub base_url: String,
+    pub provider_metadata_mode: ProviderMetadataMode,
     pub v1_present: bool,
     pub native_present: bool,
     pub require_vision: bool,
     pub vision_capable: bool,
     pub tool_use_capable: Option<bool>,
+    pub tool_call_probe_passed: bool,
+    pub tool_call_probes: Vec<ToolCallProbeReport>,
     pub reasoning_capable: Option<bool>,
     pub context: Option<u32>,
     pub max_output_tokens: Option<u32>,
@@ -103,8 +115,17 @@ pub async fn fetch_provider_model_infos(
         .map(|model| (model.id.clone(), model))
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    if let Ok(native_models) = fetch_lmstudio_model_infos(&client, &base_url, headers).await {
+    if let Ok(native_models) = fetch_lmstudio_model_infos(&client, &base_url, headers.clone()).await
+    {
         for model in native_models {
+            models
+                .entry(model.id.clone())
+                .and_modify(|existing| existing.enrich_from(&model))
+                .or_insert(model);
+        }
+    }
+    if let Ok(vllm_mlx_models) = fetch_vllm_mlx_model_infos(&client, &base_url, headers).await {
+        for model in vllm_mlx_models {
             models
                 .entry(model.id.clone())
                 .and_modify(|existing| existing.enrich_from(&model))
@@ -136,14 +157,17 @@ pub async fn check_model_availability(
     let mut report = ModelAvailabilityReport {
         gate: "model_availability".to_string(),
         status: ModelAvailabilityStatus::Fail,
-        generated_by: "moyai_model_availability_v1".to_string(),
+        generated_by: "moyai_model_availability_v2".to_string(),
         model,
         base_url,
+        provider_metadata_mode: config.model.provider_metadata_mode,
         v1_present: false,
         native_present: false,
         require_vision,
         vision_capable: false,
         tool_use_capable: None,
+        tool_call_probe_passed: false,
+        tool_call_probes: Vec::new(),
         reasoning_capable: None,
         context: None,
         max_output_tokens: None,
@@ -194,13 +218,19 @@ pub async fn check_model_availability(
                 Vec::new()
             }
         };
-    let native_models = match fetch_lmstudio_model_infos(&client, &report.base_url, headers).await {
-        Ok(models) => models,
-        Err(error) => {
-            report.native_error = Some(error.to_string());
-            Vec::new()
-        }
-    };
+    let native_models =
+        match fetch_lmstudio_model_infos(&client, &report.base_url, headers.clone()).await {
+            Ok(models) => models,
+            Err(error) => {
+                report.native_error = Some(error.to_string());
+                Vec::new()
+            }
+        };
+    let vllm_mlx_models =
+        match fetch_vllm_mlx_model_infos(&client, &report.base_url, headers.clone()).await {
+            Ok(models) => models,
+            Err(_) => Vec::new(),
+        };
 
     report.v1_present = openai_models.iter().any(|entry| entry.id == report.model);
     report.native_present = native_models.iter().any(|entry| entry.id == report.model);
@@ -222,10 +252,22 @@ pub async fn check_model_availability(
                 .iter()
                 .find(|entry| entry.id == report.model)
                 .cloned()
+        })
+        .or_else(|| {
+            vllm_mlx_models
+                .iter()
+                .find(|entry| entry.id == report.model)
+                .cloned()
         });
     if let Some(existing) = matched_model.as_mut() {
         if let Some(native) = native_models.iter().find(|entry| entry.id == report.model) {
             existing.enrich_from(native);
+        }
+        if let Some(vllm_mlx) = vllm_mlx_models
+            .iter()
+            .find(|entry| entry.id == report.model)
+        {
+            existing.enrich_from(vllm_mlx);
         }
     }
 
@@ -239,11 +281,267 @@ pub async fn check_model_availability(
     }
     report.matched_model = matched_model;
 
-    let vision_ok = !report.require_vision || report.vision_capable;
-    if report.v1_present && report.native_present && vision_ok {
+    if report.v1_present {
+        report.tool_call_probes =
+            run_tool_call_probe_suite(&client, &report.base_url, headers, &report.model).await;
+        report.tool_call_probe_passed = !report.tool_call_probes.is_empty()
+            && report
+                .tool_call_probes
+                .iter()
+                .all(|probe| matches!(probe.status, ModelAvailabilityStatus::Pass));
+        if report.tool_call_probe_passed && report.tool_use_capable.is_none() {
+            report.tool_use_capable = Some(true);
+        }
+    }
+
+    if model_availability_passes(
+        report.provider_metadata_mode,
+        report.v1_present,
+        report.native_present,
+        report.require_vision,
+        report.vision_capable,
+        report.tool_call_probe_passed,
+    ) {
         report.status = ModelAvailabilityStatus::Pass;
     }
     report
+}
+
+fn model_availability_passes(
+    provider_metadata_mode: ProviderMetadataMode,
+    v1_present: bool,
+    native_present: bool,
+    require_vision: bool,
+    vision_capable: bool,
+    tool_call_probe_passed: bool,
+) -> bool {
+    let provider_ok = match provider_metadata_mode {
+        ProviderMetadataMode::LmStudioNativeRequired => v1_present && native_present,
+        ProviderMetadataMode::OpenAiCompatibleOnly => v1_present,
+    };
+    let vision_ok = !require_vision || vision_capable;
+    provider_ok && vision_ok && tool_call_probe_passed
+}
+
+async fn run_tool_call_probe_suite(
+    client: &reqwest::Client,
+    base_url: &str,
+    headers: HeaderMap,
+    model: &str,
+) -> Vec<ToolCallProbeReport> {
+    let probes = [
+        ("tool_choice_required", "required", json!("required"), false),
+        (
+            "tool_choice_named",
+            "named_function",
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "echo_word"
+                }
+            }),
+            false,
+        ),
+        ("tool_choice_auto_strong", "auto", json!("auto"), true),
+    ];
+    let mut reports = Vec::with_capacity(probes.len());
+    for (probe, tool_choice_label, tool_choice, strong_instruction) in probes {
+        reports.push(
+            run_tool_call_probe(
+                client,
+                base_url,
+                headers.clone(),
+                model,
+                probe,
+                tool_choice_label,
+                tool_choice,
+                strong_instruction,
+            )
+            .await,
+        );
+    }
+    reports
+}
+
+async fn run_tool_call_probe(
+    client: &reqwest::Client,
+    base_url: &str,
+    headers: HeaderMap,
+    model: &str,
+    probe: &str,
+    tool_choice_label: &str,
+    tool_choice: Value,
+    strong_instruction: bool,
+) -> ToolCallProbeReport {
+    let endpoint = format!("{}/v1/chat/completions", base_url);
+    let messages = if strong_instruction {
+        json!([
+            {
+                "role": "system",
+                "content": "You are connected to tools. When a tool is available and the user requests using it, respond only by calling the tool. Never answer directly."
+            },
+            {
+                "role": "user",
+                "content": "Call echo_word with word ping now."
+            }
+        ])
+    } else {
+        json!([
+            {
+                "role": "user",
+                "content": "Call echo_word with word ping now."
+            }
+        ])
+    };
+    let body = json!({
+        "model": model,
+        "messages": messages,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo_word",
+                    "description": "Echoes a single word for provider tool-call capability probing.",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "word": {
+                                "type": "string"
+                            }
+                        },
+                        "required": ["word"]
+                    }
+                }
+            }
+        ],
+        "tool_choice": tool_choice,
+        "temperature": 0,
+        "max_tokens": 128
+    });
+
+    let response = match client
+        .post(&endpoint)
+        .headers(headers)
+        .json(&body)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return failed_tool_call_probe_report(
+                probe,
+                tool_choice_label,
+                format!("tool-call probe request failed: {error}"),
+            );
+        }
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<response body unavailable>".to_string());
+        return failed_tool_call_probe_report(
+            probe,
+            tool_choice_label,
+            format!(
+                "tool-call probe request failed with status {}: {}",
+                status,
+                summarize_body(&body)
+            ),
+        );
+    }
+    let payload = match response.json::<Value>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            return failed_tool_call_probe_report(
+                probe,
+                tool_choice_label,
+                format!("tool-call probe response was not valid JSON: {error}"),
+            );
+        }
+    };
+    tool_call_probe_report_from_response(probe, tool_choice_label, &payload)
+}
+
+fn tool_call_probe_report_from_response(
+    probe: &str,
+    tool_choice_label: &str,
+    payload: &Value,
+) -> ToolCallProbeReport {
+    let choice = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first());
+    let finish_reason = choice.and_then(|choice| string_field(choice, &["finish_reason"]));
+    let message = choice.and_then(|choice| choice.get("message"));
+    let content = message
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let first_tool_call = message
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(Value::as_array)
+        .and_then(|tool_calls| tool_calls.first());
+    let function = first_tool_call.and_then(|tool_call| tool_call.get("function"));
+    let tool_name = function.and_then(|function| string_field(function, &["name"]));
+    let tool_arguments = function
+        .and_then(|function| function.get("arguments"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let arguments_valid = tool_arguments
+        .as_deref()
+        .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+        .and_then(|arguments| {
+            arguments
+                .get("word")
+                .and_then(Value::as_str)
+                .map(|word| word == "ping")
+        })
+        .unwrap_or(false);
+    let tool_call_received = first_tool_call.is_some();
+    let passed = tool_call_received && tool_name.as_deref() == Some("echo_word") && arguments_valid;
+    ToolCallProbeReport {
+        probe: probe.to_string(),
+        status: if passed {
+            ModelAvailabilityStatus::Pass
+        } else {
+            ModelAvailabilityStatus::Fail
+        },
+        tool_choice: tool_choice_label.to_string(),
+        finish_reason,
+        tool_call_received,
+        tool_name,
+        tool_arguments,
+        arguments_valid,
+        content,
+        error: if passed {
+            None
+        } else {
+            Some("expected echo_word tool call with arguments {\"word\":\"ping\"}".to_string())
+        },
+    }
+}
+
+fn failed_tool_call_probe_report(
+    probe: &str,
+    tool_choice_label: &str,
+    error: String,
+) -> ToolCallProbeReport {
+    ToolCallProbeReport {
+        probe: probe.to_string(),
+        status: ModelAvailabilityStatus::Fail,
+        tool_choice: tool_choice_label.to_string(),
+        finish_reason: None,
+        tool_call_received: false,
+        tool_name: None,
+        tool_arguments: None,
+        arguments_valid: false,
+        content: None,
+        error: Some(error),
+    }
 }
 
 pub async fn ensure_openai_model_available(config: &ResolvedConfig) -> Result<(), LlmError> {
@@ -352,12 +650,155 @@ async fn fetch_openai_model_infos(
     }
 
     let payload = response.json::<OpenAiModelsResponse>().await?;
-    let mut models = payload
+    let mut models = parse_openai_compatible_model_infos(&payload);
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.dedup_by(|left, right| left.id == right.id);
+    Ok(models)
+}
+
+fn parse_openai_compatible_model_infos(payload: &OpenAiModelsResponse) -> Vec<ProviderModelInfo> {
+    payload
         .data
+        .iter()
+        .filter_map(|entry| {
+            let id = string_field(entry, &["id"])?;
+            let id = id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            Some(ProviderModelInfo {
+                id: id.to_string(),
+                display_name: string_field(entry, &["display_name", "displayName", "name"]),
+                context_window: number_field_u32(
+                    entry,
+                    &[
+                        "context_length",
+                        "contextLength",
+                        "context_window",
+                        "contextWindow",
+                        "max_context_length",
+                        "maxContextLength",
+                        "max_model_len",
+                        "maxModelLen",
+                        "max_request_tokens",
+                        "maxRequestTokens",
+                    ],
+                ),
+                max_output_tokens: number_field_u32(
+                    entry,
+                    &[
+                        "max_output_tokens",
+                        "maxOutputTokens",
+                        "max_tokens",
+                        "maxTokens",
+                        "max_completion_tokens",
+                        "maxCompletionTokens",
+                        "max_new_tokens",
+                        "maxNewTokens",
+                        "max_prediction_tokens",
+                        "maxPredictionTokens",
+                    ],
+                ),
+                supports_images: bool_field_nested(
+                    entry,
+                    &[
+                        &["capabilities", "vision"],
+                        &["capabilities", "images"],
+                        &["vision"],
+                        &["supports_images"],
+                    ],
+                ),
+                supports_tools: bool_field_nested(
+                    entry,
+                    &[
+                        &["capabilities", "tools"],
+                        &["capabilities", "trained_for_tool_use"],
+                        &["supports_tools"],
+                        &["tools"],
+                    ],
+                ),
+                supports_reasoning: bool_field_nested(
+                    entry,
+                    &[
+                        &["capabilities", "reasoning"],
+                        &["reasoning"],
+                        &["supports_reasoning"],
+                    ],
+                ),
+                max_parallel_predictions: number_field_u32(
+                    entry,
+                    &[
+                        "max_parallel_predictions",
+                        "maxParallelPredictions",
+                        "parallel_predictions",
+                        "parallelPredictions",
+                    ],
+                ),
+                loaded: false,
+                source: "openai_compat".to_string(),
+            })
+        })
+        .collect()
+}
+
+async fn fetch_vllm_mlx_model_infos(
+    client: &reqwest::Client,
+    base_url: &str,
+    headers: HeaderMap,
+) -> Result<Vec<ProviderModelInfo>, LlmError> {
+    let health_endpoint = format!("{}/health", base_url);
+    let health = client
+        .get(&health_endpoint)
+        .headers(headers.clone())
+        .send()
+        .await?;
+    if health.status().is_success() {
+        let payload = health.json::<Value>().await?;
+        let models = parse_vllm_mlx_health_model_infos(&payload);
+        if !models.is_empty() {
+            return Ok(models);
+        }
+    }
+
+    let status_endpoint = format!("{}/v1/status", base_url);
+    let status = client.get(&status_endpoint).headers(headers).send().await?;
+    if !status.status().is_success() {
+        return Ok(Vec::new());
+    }
+    let payload = status.json::<Value>().await?;
+    Ok(parse_vllm_mlx_status_model_infos(&payload))
+}
+
+fn parse_vllm_mlx_health_model_infos(payload: &Value) -> Vec<ProviderModelInfo> {
+    let loaded_model = string_field(payload, &["model_name", "model"]);
+    let model_loaded = payload
+        .get("model_loaded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut ids = payload
+        .get("available_models")
+        .and_then(Value::as_array)
         .into_iter()
-        .map(|entry| entry.id.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if let Some(model) = loaded_model.as_ref().map(|value| value.trim().to_string()) {
+        if !model.is_empty() && !ids.iter().any(|id| id == &model) {
+            ids.push(model);
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids.into_iter()
         .map(|id| ProviderModelInfo {
+            loaded: model_loaded
+                && loaded_model
+                    .as_deref()
+                    .map(|model| model.trim() == id)
+                    .unwrap_or(false),
             id,
             display_name: None,
             context_window: None,
@@ -366,13 +807,31 @@ async fn fetch_openai_model_infos(
             supports_tools: None,
             supports_reasoning: None,
             max_parallel_predictions: None,
-            loaded: false,
-            source: "openai_compat".to_string(),
+            source: "vllm_mlx_health".to_string(),
         })
-        .collect::<Vec<_>>();
-    models.sort_by(|left, right| left.id.cmp(&right.id));
-    models.dedup_by(|left, right| left.id == right.id);
-    Ok(models)
+        .collect()
+}
+
+fn parse_vllm_mlx_status_model_infos(payload: &Value) -> Vec<ProviderModelInfo> {
+    let Some(model) = string_field(payload, &["model"]) else {
+        return Vec::new();
+    };
+    let model = model.trim();
+    if model.is_empty() {
+        return Vec::new();
+    }
+    vec![ProviderModelInfo {
+        id: model.to_string(),
+        display_name: None,
+        context_window: None,
+        max_output_tokens: None,
+        supports_images: None,
+        supports_tools: None,
+        supports_reasoning: None,
+        max_parallel_predictions: None,
+        loaded: true,
+        source: "vllm_mlx_status".to_string(),
+    }]
 }
 
 async fn fetch_lmstudio_model_infos(
@@ -588,7 +1047,7 @@ fn bool_field_nested(value: &Value, paths: &[&[&str]]) -> Option<bool> {
     None
 }
 
-fn extra_body_with_num_ctx(extra_body: Option<Value>, num_ctx: u32) -> Value {
+pub fn extra_body_with_num_ctx(extra_body: Option<Value>, num_ctx: u32) -> Value {
     let mut value = extra_body.unwrap_or_else(|| serde_json::json!({}));
     match &mut value {
         Value::Object(map) => {
@@ -625,7 +1084,10 @@ impl ProviderModelInfo {
             .max_parallel_predictions
             .or(self.max_parallel_predictions);
         self.loaded = other.loaded || self.loaded;
-        if other.source == "lmstudio_api" {
+        if matches!(
+            other.source.as_str(),
+            "lmstudio_api" | "vllm_mlx_health" | "vllm_mlx_status"
+        ) {
             self.source = other.source.clone();
         }
     }
@@ -704,5 +1166,139 @@ mod tests {
         assert_eq!(models[0].context_window, Some(131_072));
         assert_eq!(models[0].max_output_tokens, Some(8_192));
         assert!(models[0].loaded);
+    }
+
+    #[test]
+    fn openai_compatible_parser_uses_extended_metadata_when_provider_exposes_it() {
+        let payload = OpenAiModelsResponse {
+            data: vec![serde_json::json!({
+                "id": "qwen3.6-35b-a3b-4bit",
+                "max_model_len": 131072,
+                "max_output_tokens": 8192,
+                "capabilities": {
+                    "tools": true,
+                    "reasoning": false
+                }
+            })],
+        };
+
+        let models = parse_openai_compatible_model_infos(&payload);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].context_window, Some(131_072));
+        assert_eq!(models[0].max_output_tokens, Some(8_192));
+        assert_eq!(models[0].supports_tools, Some(true));
+        assert_eq!(models[0].supports_reasoning, Some(false));
+    }
+
+    #[test]
+    fn vllm_mlx_health_parser_marks_loaded_model_without_request_limits() {
+        let payload = serde_json::json!({
+            "status": "healthy",
+            "model_loaded": true,
+            "model_name": "qwen3.6-35b-a3b-4bit",
+            "available_models": ["qwen3.6-35b-a3b-4bit"],
+            "engine_type": "batched"
+        });
+
+        let models = parse_vllm_mlx_health_model_infos(&payload);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen3.6-35b-a3b-4bit");
+        assert!(models[0].loaded);
+        assert_eq!(models[0].context_window, None);
+        assert_eq!(models[0].max_output_tokens, None);
+    }
+
+    #[test]
+    fn openai_compatible_only_availability_does_not_require_native_metadata() {
+        assert!(model_availability_passes(
+            ProviderMetadataMode::OpenAiCompatibleOnly,
+            true,
+            false,
+            false,
+            false,
+            true
+        ));
+        assert!(!model_availability_passes(
+            ProviderMetadataMode::LmStudioNativeRequired,
+            true,
+            false,
+            false,
+            false,
+            true
+        ));
+        assert!(!model_availability_passes(
+            ProviderMetadataMode::OpenAiCompatibleOnly,
+            true,
+            false,
+            true,
+            false,
+            true
+        ));
+        assert!(!model_availability_passes(
+            ProviderMetadataMode::OpenAiCompatibleOnly,
+            true,
+            false,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn tool_call_probe_report_accepts_openai_tool_calls() {
+        let payload = serde_json::json!({
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "echo_word",
+                                    "arguments": "{\"word\":\"ping\"}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let report =
+            tool_call_probe_report_from_response("tool_choice_required", "required", &payload);
+
+        assert_eq!(report.status, ModelAvailabilityStatus::Pass);
+        assert!(report.tool_call_received);
+        assert_eq!(report.tool_name.as_deref(), Some("echo_word"));
+        assert!(report.arguments_valid);
+        assert_eq!(report.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn tool_call_probe_report_rejects_plain_text_answers() {
+        let payload = serde_json::json!({
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "ping"
+                    }
+                }
+            ]
+        });
+
+        let report =
+            tool_call_probe_report_from_response("tool_choice_auto_strong", "auto", &payload);
+
+        assert_eq!(report.status, ModelAvailabilityStatus::Fail);
+        assert!(!report.tool_call_received);
+        assert_eq!(report.content.as_deref(), Some("ping"));
+        assert!(report.error.is_some());
     }
 }

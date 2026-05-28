@@ -39,6 +39,12 @@ impl ConfirmationPrompt for StdConfirmationPrompt {
                     .join(", ")
             }
         )?;
+        if !request.details.is_empty() {
+            writeln!(stderr, "details:")?;
+            for detail in &request.details {
+                writeln!(stderr, "  - {detail}")?;
+            }
+        }
         write!(stderr, "Proceed? [y/N] ")?;
         stderr.flush()?;
 

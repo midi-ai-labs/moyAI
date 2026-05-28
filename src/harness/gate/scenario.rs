@@ -69,8 +69,67 @@ pub fn evaluate(
 
 fn contract_matches_scenario(contract: &ContractRecord, scenario_id: &str) -> bool {
     let contract_id = contract.id.to_string();
-    contract_id == scenario_id
-        || contract_id.contains(scenario_id)
-        || contract_id.ends_with(&format!(".{scenario_id}"))
-        || contract.source_path.as_str().contains(scenario_id)
+    identifier_has_scenario_segment(&contract_id, scenario_id)
+        || path_has_scenario_segment(contract.source_path.as_str(), scenario_id)
+}
+
+fn identifier_has_scenario_segment(value: &str, scenario_id: &str) -> bool {
+    if scenario_id.is_empty() {
+        return false;
+    }
+    let mut offset = 0;
+    while let Some(relative_start) = value[offset..].find(scenario_id) {
+        let start = offset + relative_start;
+        let end = start + scenario_id.len();
+        let left_boundary = value[..start]
+            .chars()
+            .next_back()
+            .is_none_or(is_contract_boundary);
+        let right_boundary = value[end..].chars().next().is_none_or(is_contract_boundary);
+        if left_boundary && right_boundary {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
+fn path_has_scenario_segment(path: &str, scenario_id: &str) -> bool {
+    path.split(['/', '\\']).any(|segment| {
+        segment == scenario_id
+            || segment
+                .strip_suffix(".md")
+                .or_else(|| segment.strip_suffix(".json"))
+                .or_else(|| segment.strip_suffix(".toml"))
+                .is_some_and(|stem| stem == scenario_id)
+    })
+}
+
+fn is_contract_boundary(character: char) -> bool {
+    !character.is_ascii_alphanumeric() && character != '_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::identifier_has_scenario_segment;
+
+    #[test]
+    fn scenario_contract_matching_requires_identifier_boundaries() {
+        assert!(identifier_has_scenario_segment(
+            "manual_st.required_core.case1",
+            "case1"
+        ));
+        assert!(identifier_has_scenario_segment(
+            "manual-st-required-core-case1",
+            "case1"
+        ));
+        assert!(!identifier_has_scenario_segment(
+            "manual_st.required_core.case10",
+            "case1"
+        ));
+        assert!(!identifier_has_scenario_segment(
+            "manual_st.required_core.case1_extra",
+            "case1"
+        ));
+    }
 }

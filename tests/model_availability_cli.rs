@@ -27,11 +27,16 @@ fn model_availability_cli_writes_fail_closed_report() {
         .expect("model availability report json");
     assert_eq!(report["gate"], "model_availability");
     assert_eq!(report["status"], "fail");
-    assert_eq!(report["generated_by"], "moyai_model_availability_v1");
+    assert_eq!(report["generated_by"], "moyai_model_availability_v2");
     assert_eq!(report["model"], "missing-model");
     assert_eq!(report["base_url"], "http://127.0.0.1:9");
     assert_eq!(report["v1_present"], false);
     assert_eq!(report["native_present"], false);
+    assert_eq!(report["tool_call_probe_passed"], false);
+    assert_eq!(
+        report["tool_call_probes"].as_array().expect("probes").len(),
+        0
+    );
     assert!(report["openai_error"].is_string());
     assert!(report["native_error"].is_string());
 }

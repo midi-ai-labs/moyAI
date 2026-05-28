@@ -77,7 +77,9 @@ impl ToolRegistry {
 
     pub(crate) fn unknown_tool_message(&self, name: &str) -> String {
         let available = self.available_tool_names().join(", ");
-        format!("unknown tool `{name}`. Available tools: {available}. Use `shell` to run commands.")
+        format!(
+            "unknown tool `{name}`. Available tools registered in this runtime: {available}. Treat this as no-progress tool lifecycle feedback and retry only with a tool currently allowed by the active turn control envelope."
+        )
     }
 
     fn unknown_tool_error(&self, name: &str) -> ToolError {
@@ -95,5 +97,24 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| self.unknown_tool_error(name))?;
         tool.execute(raw_arguments, ctx).await
+    }
+}
+
+pub(crate) fn unknown_tool_feedback_does_not_restore_shell_surface_fixture_passes() -> bool {
+    let registry = ToolRegistry {
+        tools: HashMap::new(),
+    };
+    let message = registry.unknown_tool_message("python");
+    message.contains("unknown tool `python`")
+        && message.contains("active turn control envelope")
+        && message.contains("no-progress tool lifecycle feedback")
+        && !message.contains("Use `shell`")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unknown_tool_feedback_does_not_restore_shell_surface() {
+        assert!(super::unknown_tool_feedback_does_not_restore_shell_surface_fixture_passes());
     }
 }
