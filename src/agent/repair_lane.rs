@@ -9,10 +9,10 @@ use crate::agent::contract_reconciliation::{
     reconcile_session_state_failure_with_cluster,
 };
 use crate::session::{
-    ContractReconciliationDiagnostic, FailureKind, ProcessPhase, RepairControlSnapshotDiagnostic,
-    RepairIntentDiagnostic, RepairLaneDiagnostic, RepairOperationTemplate,
-    RepairRecoveryChoiceDiagnostic, SessionStateSnapshot, VerificationFailureCluster,
-    VerificationFailureEvidence,
+    ContractReconciliationDiagnostic, DocsPendingDeliverable, DocsRouteState, FailureKind,
+    ProcessPhase, RepairControlSnapshotDiagnostic, RepairIntentDiagnostic, RepairLaneDiagnostic,
+    RepairOperationTemplate, RepairRecoveryChoiceDiagnostic, SessionStateSnapshot, TaskRoute,
+    VerificationFailureCluster, VerificationFailureEvidence,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +33,7 @@ pub(crate) struct RepairLaneProjection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RepairLaneSubtype {
+    DocsRouteContractRepair,
     GeneratedTestSubprocessEncodingMissing,
     GeneratedTestSubprocessOutputCaptureMissing,
     GeneratedTestLoggingContractOverreach,
@@ -58,6 +59,7 @@ pub(crate) enum RepairLaneSubtype {
 impl RepairLaneSubtype {
     fn as_str(&self) -> &'static str {
         match self {
+            Self::DocsRouteContractRepair => "docs_route_contract_repair",
             Self::GeneratedTestSubprocessEncodingMissing => {
                 "generated_test_subprocess_encoding_missing"
             }
@@ -128,6 +130,11 @@ pub(crate) fn project_repair_lane(
     }
 
     let verification_cluster = verification_failure_cluster(state);
+    if let Some(projection) =
+        docs_route_contract_repair_projection(state, allowed_tools, verification_cluster.clone())
+    {
+        return Some(projection);
+    }
     let subtype = repair_lane_subtype(failure.kind, verification_cluster.as_ref());
     let typed_required_target =
         required_target_for_subtype(state, &subtype, verification_cluster.as_ref());
@@ -234,6 +241,83 @@ pub(crate) fn project_repair_lane(
     })
 }
 
+fn docs_route_contract_repair_projection(
+    state: &SessionStateSnapshot,
+    allowed_tools: &BTreeSet<String>,
+    verification_cluster: Option<VerificationFailureCluster>,
+) -> Option<RepairLaneProjection> {
+    if !state.completion.route_contract_pending || state.docs_route.is_none() {
+        return None;
+    }
+    let required_target = docs_route_required_target(state)?;
+    let subtype = RepairLaneSubtype::DocsRouteContractRepair;
+    let allowed = allowed_tools.iter().cloned().collect::<Vec<_>>();
+    let forbidden = forbidden_tools_for_projection(&allowed);
+    let repair_intent = repair_intent_projection(
+        &subtype,
+        Some(required_target.as_str()),
+        None,
+        None,
+        &[],
+        &[],
+        verification_cluster.as_ref(),
+        None,
+    );
+    let operation_template = repair_operation_template(
+        &subtype,
+        Some(required_target.as_str()),
+        None,
+        &allowed,
+        &forbidden,
+        &[],
+        &[],
+        verification_cluster.as_ref(),
+        repair_intent.as_ref(),
+        None,
+    );
+    let repair_control_snapshot = repair_control_snapshot_projection(
+        &subtype,
+        Some(required_target.as_str()),
+        &allowed,
+        &forbidden,
+        repair_intent.as_ref(),
+        operation_template.as_ref(),
+        verification_cluster.as_ref(),
+    );
+    Some(RepairLaneProjection {
+        subtype,
+        required_target: Some(required_target),
+        allowed_tools: allowed,
+        forbidden_tools: forbidden,
+        missing_symbol: None,
+        public_state_assertions: Vec::new(),
+        public_missing_attributes: Vec::new(),
+        contract_reconciliation: None,
+        operation_template,
+        verification_cluster,
+        repair_intent,
+        repair_control_snapshot,
+    })
+}
+
+fn docs_route_required_target(state: &SessionStateSnapshot) -> Option<String> {
+    let docs = state.docs_route.as_ref()?;
+    docs.pending_deliverables
+        .iter()
+        .map(|item| item.target.as_str().to_string())
+        .next()
+        .or_else(|| {
+            docs.active_deliverable
+                .as_ref()
+                .map(|target| target.as_str().to_string())
+        })
+        .or_else(|| {
+            docs.deliverables
+                .first()
+                .map(|deliverable| deliverable.target.as_str().to_string())
+        })
+}
+
 fn active_targets_contain_repair_target(state: &SessionStateSnapshot, target: &str) -> bool {
     let normalized_target = target.replace('\\', "/");
     state.active_targets.iter().any(|active| {
@@ -285,6 +369,84 @@ pub(crate) fn source_owned_verification_repair_lane_fixture_passes() -> bool {
         && snapshot.repair_owner == "source"
         && snapshot.selected_recovery_action == "targeted_edit_then_exact_verification"
         && !snapshot.selected_recovery_action.starts_with("fail_closed")
+}
+
+pub(crate) fn docs_route_pending_verification_failure_projects_docs_repair_lane_fixture_passes()
+-> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Docs;
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![Utf8PathBuf::from("calculator.py")];
+    state.completion.route_contract_pending = true;
+    state.completion.verification_pending = true;
+    state.docs_route = Some(DocsRouteState {
+        active_deliverable: Some(Utf8PathBuf::from("docs/calculator-design.md")),
+        pending_deliverables: vec![DocsPendingDeliverable {
+            target: Utf8PathBuf::from("docs/calculator-design.md"),
+            summary: "same-document docs update remains pending".to_string(),
+        }],
+        ..DocsRouteState::default()
+    });
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: calculator.py mentioned in docs command output".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: vec![Utf8PathBuf::from("calculator.py")],
+    });
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-docs-route-source-pollution".to_string(),
+        failing_labels: vec!["docs semantic check".to_string()],
+        primary_failure: Some("Command: python -X utf8 -c".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generic_verification_failure".to_string()),
+            label: None,
+            target: Some("calculator.py".to_string()),
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: None,
+            observed: None,
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec!["generic_verification_failure".to_string()],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: vec!["calculator.py".to_string()],
+            test_refs: Vec::new(),
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["calculator.py".to_string()],
+        test_refs: Vec::new(),
+    });
+
+    let allowed_tools = BTreeSet::from([
+        "apply_patch".to_string(),
+        "read".to_string(),
+        "shell".to_string(),
+        "write".to_string(),
+    ]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
+        return false;
+    };
+    projection.subtype == RepairLaneSubtype::DocsRouteContractRepair
+        && projection.required_target.as_deref() == Some("docs/calculator-design.md")
+        && projection
+            .operation_template
+            .as_ref()
+            .is_some_and(|template| {
+                template.operation_kind == "docs_route_contract_repair"
+                    && template.source_test_ownership == "docs_route"
+            })
+        && snapshot.repair_owner == "docs_route"
+        && snapshot.selected_recovery_action == "targeted_docs_edit_then_exact_verification"
+        && snapshot
+            .hard_invariants
+            .iter()
+            .any(|item| item == "forbid_source_or_test_repair_while_docs_route_pending")
 }
 
 pub(crate) fn source_owned_repair_lane_rejects_diagnostic_label_targets_fixture_passes() -> bool {
@@ -2216,6 +2378,7 @@ fn required_target_for_subtype(
     cluster: Option<&VerificationFailureCluster>,
 ) -> Option<String> {
     match subtype {
+        RepairLaneSubtype::DocsRouteContractRepair => docs_route_required_target(state),
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
         | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
         | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
@@ -2314,6 +2477,7 @@ fn typed_repair_target_outranks_required_action(
         | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
         | RepairLaneSubtype::NoTestsRan
         | RepairLaneSubtype::PatchMismatch
+        | RepairLaneSubtype::DocsRouteContractRepair
         | RepairLaneSubtype::GenericVerificationFailure => false,
     }
 }
@@ -2749,7 +2913,9 @@ fn typed_evidence_target_from_summary(
         | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
         | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
         | RepairLaneSubtype::NoTestsRan => test_refs_from_summary(summary).into_iter().next(),
-        RepairLaneSubtype::PatchMismatch | RepairLaneSubtype::GenericVerificationFailure => None,
+        RepairLaneSubtype::PatchMismatch
+        | RepairLaneSubtype::DocsRouteContractRepair
+        | RepairLaneSubtype::GenericVerificationFailure => None,
     }
 }
 
@@ -5326,6 +5492,17 @@ fn repair_intent_projection(
                     "stale_shell_before_source_contract_repair",
                 ],
             ),
+            RepairLaneSubtype::DocsRouteContractRepair => (
+                "docs_route",
+                "same_docs_deliverable_repair",
+                "targeted_docs_edit_then_exact_verification",
+                "repair the active docs deliverable while preserving the route-owned docs contract authority",
+                vec![
+                    "source_repair_while_docs_route_pending",
+                    "test_rewrite_while_docs_route_pending",
+                    "verification_rerun_without_docs_file_change",
+                ],
+            ),
             RepairLaneSubtype::PublicMissingAttributeMismatch
             | RepairLaneSubtype::PublicOutputStreamAssertionMismatch
             | RepairLaneSubtype::PublicStateAssertionMismatch => (
@@ -5586,6 +5763,8 @@ fn repair_control_snapshot_projection(
             .push("forbid_test_weakening_without_contract_conflict_evidence".to_string()),
         "generated_test" => hard_invariants
             .push("forbid_source_repair_for_generated_test_contract_owner".to_string()),
+        "docs_route" => hard_invariants
+            .push("forbid_source_or_test_repair_while_docs_route_pending".to_string()),
         "contract" => hard_invariants
             .push("contract_insufficient_must_not_dispatch_source_repair".to_string()),
         "harness" => hard_invariants
@@ -5667,6 +5846,7 @@ fn repair_operation_kind(subtype: &RepairLaneSubtype) -> &'static str {
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing => {
             "generated_test_subprocess_encoding_repair"
         }
+        RepairLaneSubtype::DocsRouteContractRepair => "docs_route_contract_repair",
         RepairLaneSubtype::GeneratedTestLoggingContractOverreach => {
             "generated_test_logging_contract_repair"
         }
@@ -5734,6 +5914,9 @@ fn repair_source_test_ownership(
         )
     {
         return "generated_test_by_contract_evidence";
+    }
+    if matches!(subtype, RepairLaneSubtype::DocsRouteContractRepair) {
+        return "docs_route";
     }
     if matches!(
         subtype,

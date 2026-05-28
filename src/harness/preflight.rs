@@ -1469,6 +1469,13 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
                 "docs-only closeout continuation can still degrade a missing docs artifact into generic requested-work authoring".to_string(),
             );
         }
+        if !crate::agent::state::docs_route_verification_failure_preserves_docs_active_target_fixture_passes()
+            || !crate::agent::repair_lane::docs_route_pending_verification_failure_projects_docs_repair_lane_fixture_passes()
+        {
+            diagnostics.push(
+                "docs-only route verification failures can still replace the active docs deliverable with generic source/test repair authority".to_string(),
+            );
+        }
         if !crate::agent::loop_impl::provider_replay_preserves_supporting_context_evidence_after_surface_narrowing_fixture_passes()
         {
             diagnostics.push(
@@ -3341,7 +3348,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
         PreflightFixture {
             fixture_id: "fixture.state_reducer.docs_route_contract_authority".to_string(),
             family: PreflightGateFamily::StateReducerAuthority,
-            authority_source: "CodexHistoryItemStream TaskRoute::Docs DocsRouteState DocsRepair route_contract_pending route_contract_satisfied_typed_closeout docs_only_mutation_boundary docs_route_closeout_continuation_preserves_docs_authority same_document_docs_update_route_authority same_document_update_requires_latest_file_change prior_authored_document_update_target dynamic_docs_area_contract flat_test_artifact_area_coverage generated_dependency_evidence_excluded RequestedWorkAuthoring_not_primary localized_docs_topic_completion docs_route_semantic_no_progress_guard docs_spec_semantic_reconciliation_no_progress_terminal_guard docs_supporting_context_budget_exhausted_corrective_tool_output docs_budget_exhausted_recovery_surface_narrowed docs_budget_exhaustion_survives_partial_write supporting_context_evidence_survives_surface_narrowing docs_content_grounding_before_exact_write_recovery docs_required_topic_content_grounding docs_completed_deliverable_regression_rejected write_ready_prompt_projection docs_spec_semantic_reconciliation".to_string(),
+            authority_source: "CodexHistoryItemStream TaskRoute::Docs DocsRouteState DocsRepair route_contract_pending route_contract_satisfied_typed_closeout docs_only_mutation_boundary docs_route_closeout_continuation_preserves_docs_authority docs_route_verification_failure_preserves_docs_active_target docs_route_repair_lane_target_authority same_document_docs_update_route_authority same_document_update_requires_latest_file_change prior_authored_document_update_target dynamic_docs_area_contract flat_test_artifact_area_coverage generated_dependency_evidence_excluded RequestedWorkAuthoring_not_primary localized_docs_topic_completion docs_route_semantic_no_progress_guard docs_spec_semantic_reconciliation_no_progress_terminal_guard docs_supporting_context_budget_exhausted_corrective_tool_output docs_budget_exhausted_recovery_surface_narrowed docs_budget_exhaustion_survives_partial_write supporting_context_evidence_survives_surface_narrowing docs_content_grounding_before_exact_write_recovery docs_required_topic_content_grounding docs_completed_deliverable_regression_rejected write_ready_prompt_projection docs_spec_semantic_reconciliation".to_string(),
             required_refs: vec![
                 "CodexHistoryItemStream".to_string(),
                 "TaskRoute::Docs".to_string(),
@@ -3358,6 +3365,8 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "localized_docs_topic_completion".to_string(),
                 "docs_route_semantic_no_progress_guard".to_string(),
                 "docs_route_closeout_continuation_preserves_docs_authority".to_string(),
+                "docs_route_verification_failure_preserves_docs_active_target".to_string(),
+                "docs_route_repair_lane_target_authority".to_string(),
                 "docs_spec_semantic_reconciliation_no_progress_terminal_guard".to_string(),
                 "docs_supporting_context_budget_exhausted_corrective_tool_output".to_string(),
                 "docs_budget_exhausted_recovery_surface_narrowed".to_string(),

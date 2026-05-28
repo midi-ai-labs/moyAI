@@ -251,6 +251,9 @@ pub fn reduce_session_state_from_history_items(
     else {
         return state;
     };
+    if state.completion.route_contract_pending && state.docs_route.is_some() {
+        return apply_docs_route_verification_failure_authority(state, typed_evidence);
+    }
 
     let repair_authority_targets =
         repair_progress_authority_targets(&typed_evidence, session.cwd.as_path());
@@ -369,6 +372,44 @@ pub fn reduce_session_state_from_history_items(
     {
         state.active_targets = reconciled_targets;
     }
+    state
+}
+
+fn apply_docs_route_verification_failure_authority(
+    mut state: SessionStateSnapshot,
+    typed_evidence: TypedVerificationFailureEvidence,
+) -> SessionStateSnapshot {
+    let mut docs_targets = docs_route_pending_repair_targets(state.docs_route.as_ref());
+    if docs_targets.is_empty()
+        && let Some(target) = state
+            .docs_route
+            .as_ref()
+            .and_then(|docs| docs.active_deliverable.clone())
+    {
+        docs_targets.push(target);
+    }
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = docs_targets;
+    state.failure = Some(typed_evidence.failure.clone());
+    state.verification.failing_labels = if typed_evidence.failing_labels.is_empty() {
+        extract_verification_failure_labels(&typed_evidence.failure.summary)
+    } else {
+        typed_evidence.failing_labels
+    };
+    state.verification.last_evidence_summary = Some(typed_evidence.failure.summary.clone());
+    state.verification.failure_cluster = typed_evidence.failure_cluster;
+    state.verification.requirement_refs = typed_evidence.requirement_refs;
+    merge_required_commands(
+        &mut state.verification.required_commands,
+        &typed_evidence.required_commands,
+    );
+    state.completion.open_work_count = 0;
+    state.completion.closeout_ready = false;
+    state.completion.verification_pending = true;
+    state.completion.blocked_reason = Some(format!(
+        "verification failed under docs route authority: {}",
+        typed_evidence.failure.summary
+    ));
     state
 }
 
@@ -12607,6 +12648,116 @@ fn is_test_focus_target(path: &Utf8Path) -> bool {
             .next()
             .unwrap_or_default()
             .starts_with("test_")
+}
+
+pub(crate) fn docs_route_verification_failure_preserves_docs_active_target_fixture_passes() -> bool
+{
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let call_id = ToolCallId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: ProjectId::new(),
+        title: "docs route verification target authority".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        completed_at_ms: None,
+    };
+    let mut previous = SessionStateSnapshot::default();
+    previous.route = TaskRoute::Docs;
+    previous.process_phase = ProcessPhase::Repair;
+    previous.active_targets = vec![Utf8PathBuf::from("docs/calculator-design.md")];
+    previous.completion.route_contract_pending = true;
+    previous.docs_route = Some(DocsRouteState {
+        active_deliverable: Some(Utf8PathBuf::from("docs/calculator-design.md")),
+        pending_deliverables: vec![DocsPendingDeliverable {
+            target: Utf8PathBuf::from("docs/calculator-design.md"),
+            summary: "same-document docs update remains pending".to_string(),
+        }],
+        ..DocsRouteState::default()
+    });
+    let history_items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Update `docs/calculator-design.md` only; do not edit calculator.py or test_calculator.py.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id,
+                status: ToolLifecycleStatus::Completed,
+                title: "Docs write command failed".to_string(),
+                output_text: "verification failed: calculator.py appeared in docs command output".to_string(),
+                metadata: Value::Null,
+                success: Some(false),
+                progress_effect: ToolProgressEffect::VerificationFailed,
+                blocked_action: None,
+                result_hash: Some("fixture-docs-route-verification-target-authority".to_string()),
+                verification_run: Some(VerificationRunResult {
+                    command: "python -X utf8 -c \"write docs\"".to_string(),
+                    status: VerificationRunStatus::Failed,
+                    exit_code: Some(1),
+                    timed_out: false,
+                    output_summary: "AssertionError: calculator.py should not become the repair target for docs/calculator-design.md".to_string(),
+                    failure_cluster: Some(VerificationFailureCluster {
+                        cluster_id: "fixture-docs-route-verification-target-authority".to_string(),
+                        failing_labels: vec!["docs semantic check".to_string()],
+                        primary_failure: Some("docs command failed".to_string()),
+                        evidence: vec![VerificationFailureEvidence {
+                            evidence_kind: "verification_failure".to_string(),
+                            subtype: Some("generic_verification_failure".to_string()),
+                            label: Some("docs semantic check".to_string()),
+                            target: Some("calculator.py".to_string()),
+                            symbol: None,
+                            call_site: None,
+                            exception: None,
+                            expected: None,
+                            observed: None,
+                            public_state_assertions: Vec::new(),
+                            public_missing_attributes: Vec::new(),
+                            evidence_markers: vec!["generic_verification_failure".to_string()],
+                            sibling_obligations: Vec::new(),
+                            requirement_refs: Vec::new(),
+                            source_refs: vec!["calculator.py".to_string()],
+                            test_refs: Vec::new(),
+                        }],
+                        sibling_obligations: Vec::new(),
+                        source_refs: vec!["calculator.py".to_string()],
+                        test_refs: Vec::new(),
+                    }),
+                    satisfies_command_identities: Vec::new(),
+                    artifact_refs: Vec::new(),
+                    requirement_refs: Vec::new(),
+                }),
+            },
+        },
+    ];
+    let state = reduce_session_state_from_history_items(&session, &history_items, &[], &previous);
+    state.route == TaskRoute::Docs
+        && state.process_phase == ProcessPhase::Repair
+        && state.completion.route_contract_pending
+        && state.completion.verification_pending
+        && state.active_targets == vec![Utf8PathBuf::from("docs/calculator-design.md")]
 }
 
 #[cfg(test)]
