@@ -10484,6 +10484,98 @@ pub(crate) fn generated_test_api_misuse_active_work_targets_test_fixture_passes(
         })
 }
 
+pub(crate) fn generated_test_module_attribute_api_misuse_active_work_targets_test_fixture_passes()
+-> bool {
+    let session = SessionRecord {
+        id: crate::session::SessionId::new(),
+        project_id: crate::session::ProjectId::new(),
+        title: "generated-test module attribute api misuse active work authority".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: "local".to_string(),
+        base_url: "http://localhost:1234".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let summary = r#"ERROR: test_cli_addition (test_calculator.TestCalculatorCli.test_cli_addition)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\workspace\test_calculator.py", line 151, in test_cli_addition
+    proc = self._run_calculator("3 + 4\n")
+  File "C:\workspace\test_calculator.py", line 134, in _run_calculator
+    env = dict(sys.environ)
+AttributeError: module 'sys' has no attribute 'environ'
+
+----------------------------------------------------------------------
+Ran 21 tests in 0.003s
+
+FAILED (errors=1)"#;
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("calculator.py"),
+        Utf8PathBuf::from("test_calculator.py"),
+    ];
+    state.failure = Some(FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: generated test used invalid module attribute".to_string(),
+        tool_name: Some(ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.failing_labels = vec!["test_cli_addition".to_string()];
+    state
+        .verification
+        .required_commands
+        .push("python -m unittest".to_string());
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-module-attribute-api-misuse-active-work".to_string(),
+        failing_labels: state.verification.failing_labels.clone(),
+        primary_failure: Some("Command: python -m unittest".to_string()),
+        evidence: crate::agent::repair_lane::verification_failure_evidence_from_summary(
+            FailureKind::VerificationFailed,
+            summary,
+        ),
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_calculator.py".to_string()],
+    });
+
+    let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
+    let allowed_tools = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+    let repair_lane = crate::agent::repair_lane::project_repair_lane(&state, &allowed_tools);
+
+    matches!(
+        active,
+        Some(ActiveWorkContract::Verification {
+            repair_required: true,
+            targets,
+            ..
+        }) if targets == vec![Utf8PathBuf::from("test_calculator.py")]
+    ) && state
+        .verification
+        .failure_cluster
+        .as_ref()
+        .is_some_and(|cluster| {
+            cluster.evidence.iter().any(|evidence| {
+                evidence.subtype.as_deref() == Some("generated_test_artifact_api_misuse")
+                    && evidence.public_missing_attributes.is_empty()
+                    && evidence
+                        .evidence_markers
+                        .iter()
+                        .any(|marker| marker == "generated_test_artifact_api_misuse")
+            })
+        })
+        && repair_lane
+            .as_ref()
+            .and_then(|lane| lane.repair_control_snapshot.as_ref())
+            .is_some_and(|snapshot| {
+                snapshot.repair_owner == "generated_test"
+                    && snapshot.required_target.as_deref() == Some("test_calculator.py")
+            })
+}
+
 pub(crate) fn generated_test_exception_type_overreach_active_work_targets_test_fixture_passes()
 -> bool {
     let session = SessionRecord {

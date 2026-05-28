@@ -36,6 +36,7 @@ pub(crate) enum RepairLaneSubtype {
     GeneratedTestSubprocessEncodingMissing,
     GeneratedTestSubprocessOutputCaptureMissing,
     GeneratedTestLoggingContractOverreach,
+    GeneratedTestArtifactApiMisuse,
     ImportExportMissingExport,
     NoTestsRan,
     PublicClassAttributeMismatch,
@@ -66,6 +67,7 @@ impl RepairLaneSubtype {
             Self::GeneratedTestLoggingContractOverreach => {
                 "generated_test_logging_contract_overreach"
             }
+            Self::GeneratedTestArtifactApiMisuse => "generated_test_artifact_api_misuse",
             Self::ImportExportMissingExport => "import_export_missing_export",
             Self::NoTestsRan => "no_tests_ran",
             Self::PublicClassAttributeMismatch => "public_class_attribute_mismatch",
@@ -999,6 +1001,84 @@ FAILED (errors=1)"#;
             })
 }
 
+pub(crate) fn generated_test_module_attribute_api_misuse_projects_test_repair_fixture_passes()
+-> bool {
+    let summary = r#"ERROR: test_cli_addition (test_calculator.TestCalculatorCli.test_cli_addition)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\workspace\test_calculator.py", line 151, in test_cli_addition
+    proc = self._run_calculator("3 + 4\n")
+  File "C:\workspace\test_calculator.py", line 134, in _run_calculator
+    env = dict(sys.environ)
+               ^^^^^^^^^^^
+AttributeError: module 'sys' has no attribute 'environ'
+
+----------------------------------------------------------------------
+Ran 21 tests in 0.003s
+
+FAILED (errors=1)"#;
+    let evidence =
+        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
+    let Some(item) = evidence.first() else {
+        return false;
+    };
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-module-attribute-api-misuse".to_string(),
+        failing_labels: vec!["test_cli_addition".to_string()],
+        primary_failure: Some("Command: python -m unittest".to_string()),
+        evidence: evidence.clone(),
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["test_calculator.py".to_string()],
+    };
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("calculator.py"),
+        Utf8PathBuf::from("test_calculator.py"),
+    ];
+    state.completion.verification_pending = true;
+    state.verification.failure_cluster = Some(cluster);
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: summary.to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+
+    item.subtype.as_deref() == Some("generated_test_artifact_api_misuse")
+        && item.public_missing_attributes.is_empty()
+        && item.test_refs == vec!["test_calculator.py".to_string()]
+        && item
+            .evidence_markers
+            .iter()
+            .any(|marker| marker == "generated_test_artifact_api_misuse")
+        && item
+            .evidence_markers
+            .iter()
+            .any(|marker| marker.contains("generated test invalid module attribute `sys.environ`"))
+        && projection.required_target.as_deref() == Some("test_calculator.py")
+        && projection
+            .contract_reconciliation
+            .as_ref()
+            .is_some_and(|decision| {
+                decision.owner == "TestViolatesContract"
+                    && decision.test_repair_allowed
+                    && !decision.source_repair_allowed
+            })
+        && projection
+            .repair_control_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| {
+                snapshot.repair_owner.contains("generated_test")
+                    && snapshot.required_target.as_deref() == Some("test_calculator.py")
+            })
+}
+
 pub(crate) fn repair_intent_defers_verification_command_evidence_fixture_passes() -> bool {
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
@@ -1724,6 +1804,10 @@ fn repair_lane_subtype_from_summary(kind: FailureKind, summary: &str) -> RepairL
         RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
     } else if generated_test_logging_contract_overreach(summary).is_some() {
         RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+    } else if generated_test_module_attribute_api_misuse(summary).is_some()
+        || generated_test_reflection_api_misuse(summary).is_some()
+    {
+        RepairLaneSubtype::GeneratedTestArtifactApiMisuse
     } else if lower.contains("cannot import name") {
         RepairLaneSubtype::ImportExportMissingExport
     } else if lower.contains("no tests ran") {
@@ -2134,6 +2218,7 @@ fn required_target_for_subtype(
     match subtype {
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
         | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
+        | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
         | RepairLaneSubtype::GeneratedTestLoggingContractOverreach => {
             first_test_target(&state.active_targets).or_else(|| first_target(&state.active_targets))
         }
@@ -2225,6 +2310,7 @@ fn typed_repair_target_outranks_required_action(
         | RepairLaneSubtype::SourceParseDefect => true,
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
         | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
+        | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
         | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
         | RepairLaneSubtype::NoTestsRan
         | RepairLaneSubtype::PatchMismatch
@@ -2475,6 +2561,10 @@ pub(crate) fn verification_failure_evidence_from_summary(
     evidence_markers.extend(contract_classification_markers_from_summary(summary));
     let mut public_state_assertions = public_state_assertions(summary);
     let mut public_missing_attributes = public_missing_attributes(summary);
+    if matches!(subtype, RepairLaneSubtype::GeneratedTestArtifactApiMisuse) {
+        public_missing_attributes.clear();
+        public_state_assertions.clear();
+    }
     let sibling_obligations = repair_sibling_obligations_from_summary(
         &subtype,
         summary,
@@ -2603,6 +2693,23 @@ fn typed_evidence_observed_from_summary(
             generated_test_subprocess_output_capture_missing(summary)
                 .map(|mismatch| mismatch.observed_output)
         }
+        RepairLaneSubtype::GeneratedTestArtifactApiMisuse => {
+            generated_test_module_attribute_api_misuse(summary)
+                .map(|defect| {
+                    format!(
+                        "generated test invalid module attribute `{}`",
+                        defect.missing_name
+                    )
+                })
+                .or_else(|| {
+                    generated_test_reflection_api_misuse(summary).map(|defect| {
+                        format!(
+                            "generated test invalid reflection subject `{}`",
+                            defect.missing_name
+                        )
+                    })
+                })
+        }
         _ => None,
     }
 }
@@ -2640,6 +2747,7 @@ fn typed_evidence_target_from_summary(
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
         | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
         | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+        | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
         | RepairLaneSubtype::NoTestsRan => test_refs_from_summary(summary).into_iter().next(),
         RepairLaneSubtype::PatchMismatch | RepairLaneSubtype::GenericVerificationFailure => None,
     }
@@ -2669,6 +2777,13 @@ fn typed_evidence_call_site_from_summary(
         RepairLaneSubtype::PublicCommandContractFailure => {
             public_command_contract_failure(summary).and_then(|failure| failure.command)
         }
+        RepairLaneSubtype::GeneratedTestArtifactApiMisuse => {
+            generated_test_module_attribute_api_misuse(summary)
+                .map(|defect| defect.missing_name)
+                .or_else(|| {
+                    generated_test_reflection_api_misuse(summary).map(|defect| defect.missing_name)
+                })
+        }
         _ => None,
     }
 }
@@ -2688,6 +2803,7 @@ fn source_refs_for_evidence(
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
             | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
             | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+            | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
     ) {
         return Vec::new();
     }
@@ -4769,6 +4885,98 @@ fn generated_test_reflection_api_misuse(
     None
 }
 
+fn generated_test_module_attribute_api_misuse(
+    summary: &str,
+) -> Option<SourceImportTimeNameResolutionDefect> {
+    let lower = summary.to_ascii_lowercase();
+    if !lower.contains("attributeerror:")
+        || !lower.contains(" has no attribute ")
+        || !lower.contains("file \"")
+    {
+        return None;
+    }
+    let logical_lines = failure_summary_logical_lines(summary);
+    for (index, line) in logical_lines.iter().enumerate() {
+        let Some((receiver, member)) = module_attribute_error_detail(line) else {
+            continue;
+        };
+        if !generated_test_non_source_module_receiver(&receiver) {
+            continue;
+        }
+        let (path, line_number) = source_parse_defect_location_before(&logical_lines[..index]);
+        if !path.as_deref().is_some_and(target_is_test_like) {
+            continue;
+        }
+        return Some(SourceImportTimeNameResolutionDefect {
+            missing_name: format!("{receiver}.{member}"),
+            suggested_name: None,
+            path,
+            line: line_number,
+        });
+    }
+    None
+}
+
+fn module_attribute_error_detail(line: &str) -> Option<(String, String)> {
+    let detail = line.split("AttributeError:").nth(1)?.trim();
+    if !detail.starts_with("module ") || !detail.contains(" has no attribute ") {
+        return None;
+    }
+    let quoted = quoted_segments(detail);
+    if quoted.len() < 2 {
+        return None;
+    }
+    let receiver = quoted[0].trim();
+    let member = quoted[1].trim();
+    if receiver.is_empty() || member.is_empty() {
+        return None;
+    }
+    Some((receiver.to_string(), member.to_string()))
+}
+
+fn generated_test_non_source_module_receiver(receiver: &str) -> bool {
+    let receiver = receiver.trim();
+    if receiver.is_empty() || receiver.contains('.') {
+        return false;
+    }
+    matches!(
+        receiver,
+        "abc"
+            | "argparse"
+            | "asyncio"
+            | "collections"
+            | "contextlib"
+            | "csv"
+            | "datetime"
+            | "decimal"
+            | "enum"
+            | "functools"
+            | "glob"
+            | "inspect"
+            | "io"
+            | "itertools"
+            | "json"
+            | "logging"
+            | "math"
+            | "operator"
+            | "os"
+            | "pathlib"
+            | "random"
+            | "re"
+            | "shutil"
+            | "statistics"
+            | "string"
+            | "subprocess"
+            | "sys"
+            | "tempfile"
+            | "textwrap"
+            | "time"
+            | "types"
+            | "typing"
+            | "unittest"
+    )
+}
+
 fn source_import_time_name_error_detail(line: &str) -> Option<(String, Option<String>)> {
     let trimmed = line.trim();
     if !trimmed.contains("NameError:") || !trimmed.contains(" is not defined") {
@@ -5061,6 +5269,17 @@ fn repair_intent_projection(
                 vec![
                     "source_public_output_patch_for_test_owned_capture_defect",
                     "weakening_stdout_stderr_assertion_without_capture",
+                    "stale_read_or_shell_before_test_contract_repair",
+                ],
+            ),
+            RepairLaneSubtype::GeneratedTestArtifactApiMisuse => (
+                "generated_test",
+                "generated_test_contract_reconciliation",
+                "targeted_test_contract_edit_then_verification",
+                "repair the generated test module/API usage so executable test code asserts only the visible contract",
+                vec![
+                    "source_public_api_patch_for_test_owned_module_api_misuse",
+                    "weakening_source_contract_without_generated_test_conflict",
                     "stale_read_or_shell_before_test_contract_repair",
                 ],
             ),
@@ -5451,6 +5670,9 @@ fn repair_operation_kind(subtype: &RepairLaneSubtype) -> &'static str {
         RepairLaneSubtype::GeneratedTestLoggingContractOverreach => {
             "generated_test_logging_contract_repair"
         }
+        RepairLaneSubtype::GeneratedTestArtifactApiMisuse => {
+            "generated_test_artifact_api_misuse_repair"
+        }
         RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing => {
             "generated_test_subprocess_output_capture_repair"
         }
@@ -5518,6 +5740,7 @@ fn repair_source_test_ownership(
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
             | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
             | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+            | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
     ) {
         return "generated_test_by_contract_evidence";
     }
@@ -5657,6 +5880,9 @@ fn repair_evidence_markers_from_summary(
     markers.extend(source_import_time_name_resolution_markers(failure_summary));
     markers.extend(generated_test_name_resolution_markers(failure_summary));
     markers.extend(generated_test_reflection_api_misuse_markers(
+        failure_summary,
+    ));
+    markers.extend(generated_test_module_attribute_api_misuse_markers(
         failure_summary,
     ));
     markers.extend(generated_test_logging_contract_markers(failure_summary));
@@ -5984,6 +6210,26 @@ fn generated_test_reflection_api_misuse_markers(failure_summary: &str) -> Vec<St
         "generated_test_artifact_api_misuse".to_string(),
         format!(
             "generated test invalid reflection subject `{}`",
+            defect.missing_name
+        ),
+    ];
+    if let Some(path) = defect.path {
+        markers.push(format!("generated test api-misuse frame `{path}`"));
+    }
+    if let Some(line) = defect.line {
+        markers.push(format!("generated test api-misuse frame line {line}"));
+    }
+    markers
+}
+
+fn generated_test_module_attribute_api_misuse_markers(failure_summary: &str) -> Vec<String> {
+    let Some(defect) = generated_test_module_attribute_api_misuse(failure_summary) else {
+        return Vec::new();
+    };
+    let mut markers = vec![
+        "generated_test_artifact_api_misuse".to_string(),
+        format!(
+            "generated test invalid module attribute `{}`",
             defect.missing_name
         ),
     ];

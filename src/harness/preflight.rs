@@ -966,6 +966,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::agent::state::mixed_source_public_api_and_generated_test_name_resolution_active_work_fixture_passes()
             || !crate::agent::state::generated_test_parse_defect_active_work_matches_repair_lane_fixture_passes()
             || !crate::agent::state::generated_test_api_misuse_active_work_targets_test_fixture_passes()
+            || !crate::agent::state::generated_test_module_attribute_api_misuse_active_work_targets_test_fixture_passes()
             || !crate::agent::state::generated_test_exception_type_overreach_active_work_targets_test_fixture_passes()
             || !crate::agent::state::no_tests_ran_recent_generated_test_filechange_preserves_target_fixture_passes()
             || !crate::agent::state::generated_test_local_binding_contradiction_active_work_fixture_passes()
@@ -977,6 +978,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::agent::repair_lane::generated_test_subprocess_output_capture_missing_projects_test_repair_fixture_passes()
             || !crate::agent::repair_lane::generated_test_import_nameerror_projects_test_repair_fixture_passes()
             || !crate::agent::repair_lane::generated_test_reflection_api_misuse_projects_test_repair_fixture_passes()
+            || !crate::agent::repair_lane::generated_test_module_attribute_api_misuse_projects_test_repair_fixture_passes()
             || !crate::agent::repair_lane::repair_intent_defers_verification_command_evidence_fixture_passes()
             || !crate::agent::repair_lane::generated_test_contract_overreach_projects_test_repair_fixture_passes()
             || !crate::agent::repair_lane::contract_visible_public_exception_projects_source_repair_fixture_passes()
@@ -1018,6 +1020,11 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
         {
             failed_fixtures.push("generated_test_api_misuse_active_work_targets_test");
         }
+        if !crate::agent::state::generated_test_module_attribute_api_misuse_active_work_targets_test_fixture_passes()
+        {
+            failed_fixtures
+                .push("generated_test_module_attribute_api_misuse_active_work_targets_test");
+        }
         if !crate::agent::state::generated_test_exception_type_overreach_active_work_targets_test_fixture_passes() {
             failed_fixtures
                 .push("generated_test_exception_type_overreach_active_work_targets_test");
@@ -1054,6 +1061,11 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
         }
         if !crate::agent::repair_lane::generated_test_reflection_api_misuse_projects_test_repair_fixture_passes() {
             failed_fixtures.push("generated_test_reflection_api_misuse_projects_test_repair");
+        }
+        if !crate::agent::repair_lane::generated_test_module_attribute_api_misuse_projects_test_repair_fixture_passes() {
+            failed_fixtures.push(
+                "generated_test_module_attribute_api_misuse_projects_test_repair",
+            );
         }
         if !crate::agent::repair_lane::repair_intent_defers_verification_command_evidence_fixture_passes() {
             failed_fixtures.push("repair_intent_defers_verification_command_evidence");
@@ -1214,6 +1226,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::agent::state::generated_test_validity_active_work_outranks_source_sibling_fixture_passes()
             || !crate::agent::state::generated_test_parse_defect_active_work_matches_repair_lane_fixture_passes()
             || !crate::agent::state::generated_test_api_misuse_active_work_targets_test_fixture_passes()
+            || !crate::agent::state::generated_test_module_attribute_api_misuse_active_work_targets_test_fixture_passes()
             || !crate::agent::state::generated_test_exception_type_overreach_active_work_targets_test_fixture_passes()
             || !crate::agent::state::generated_test_local_binding_contradiction_active_work_fixture_passes()
             || !crate::agent::state::post_repair_generated_test_public_output_overreach_enters_test_repair_fixture_passes()
@@ -1228,6 +1241,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::agent::repair_lane::generated_test_subprocess_output_capture_missing_projects_test_repair_fixture_passes()
             || !crate::agent::repair_lane::generated_test_import_nameerror_projects_test_repair_fixture_passes()
             || !crate::agent::repair_lane::generated_test_reflection_api_misuse_projects_test_repair_fixture_passes()
+            || !crate::agent::repair_lane::generated_test_module_attribute_api_misuse_projects_test_repair_fixture_passes()
             || !crate::agent::repair_lane::repair_intent_defers_verification_command_evidence_fixture_passes()
             || !crate::agent::repair_lane::public_command_contract_failure_projects_compact_source_repair_fixture_passes()
             || !crate::agent::repair_lane::generated_test_contract_overreach_projects_test_repair_fixture_passes()
@@ -1334,6 +1348,10 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
                 crate::agent::state::generated_test_api_misuse_active_work_targets_test_fixture_passes,
             ),
             (
+                "generated_test_module_attribute_api_misuse_active_work_targets_test",
+                crate::agent::state::generated_test_module_attribute_api_misuse_active_work_targets_test_fixture_passes,
+            ),
+            (
                 "generated_test_exception_type_overreach_active_work_targets_test",
                 crate::agent::state::generated_test_exception_type_overreach_active_work_targets_test_fixture_passes,
             ),
@@ -1356,6 +1374,10 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             (
                 "generated_test_reflection_api_misuse_projects_test_repair",
                 crate::agent::repair_lane::generated_test_reflection_api_misuse_projects_test_repair_fixture_passes,
+            ),
+            (
+                "generated_test_module_attribute_api_misuse_projects_test_repair",
+                crate::agent::repair_lane::generated_test_module_attribute_api_misuse_projects_test_repair_fixture_passes,
             ),
             (
                 "generated_test_exception_type_overreach_projects_test_repair",
@@ -3261,7 +3283,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "fixture.state_reducer.verification_failure_preserves_repair_target_authority"
                     .to_string(),
             family: PreflightGateFamily::StateReducerAuthority,
-            authority_source: "CodexHistoryItemStream session_state_projection_not_sequence_floor VerificationRunResult VerificationFailureCluster VerificationFailureEvidence public_output_stream_assertion_mismatch public_command_contract_failure_projection active_obligation_targets source_owned_repair_control_snapshot source_owned_recent_file_change_target_preserved source_owned_repair_test_to_source_target_normalization source_owned_active_work_exact_target_projection source_owned_public_output_stream_active_work_exact_target_projection source_owned_requirement_refs_align_active_work_with_repair_lane contract_visible_public_exception_owner_authority generated_test_constructor_api_misuse_owner_authority generated_test_parse_defect_owner_authority generated_test_reflection_api_misuse_owner_authority generated_test_exception_type_overreach_owner_authority source_parse_defect_owner_authority generated_test_name_resolution_owner_authority generated_test_import_nameerror_owner_authority mixed_source_test_contract_reconciliation_owner_authority generated_test_contract_overreach_owner_projection_alignment generic_generated_test_only_owner_target_authority ungrounded_generated_public_output_assertion_owner_authority generated_test_local_binding_contradiction_owner_authority source_constructor_mismatch_counterexample verification_timeout_recent_source_target_preserved targetless_unclassified_repair_dispatch_blocked verification_labels_not_file_targets python_runtime_traceback_frames_excluded import_error_module_target_authority diagnostic_scalar_values_are_not_repair_targets".to_string(),
+            authority_source: "CodexHistoryItemStream session_state_projection_not_sequence_floor VerificationRunResult VerificationFailureCluster VerificationFailureEvidence public_output_stream_assertion_mismatch public_command_contract_failure_projection active_obligation_targets source_owned_repair_control_snapshot source_owned_recent_file_change_target_preserved source_owned_repair_test_to_source_target_normalization source_owned_active_work_exact_target_projection source_owned_public_output_stream_active_work_exact_target_projection source_owned_requirement_refs_align_active_work_with_repair_lane contract_visible_public_exception_owner_authority generated_test_constructor_api_misuse_owner_authority generated_test_parse_defect_owner_authority generated_test_reflection_api_misuse_owner_authority generated_test_module_attribute_api_misuse_owner_authority generated_test_exception_type_overreach_owner_authority source_parse_defect_owner_authority generated_test_name_resolution_owner_authority generated_test_import_nameerror_owner_authority mixed_source_test_contract_reconciliation_owner_authority generated_test_contract_overreach_owner_projection_alignment generic_generated_test_only_owner_target_authority ungrounded_generated_public_output_assertion_owner_authority generated_test_local_binding_contradiction_owner_authority source_constructor_mismatch_counterexample verification_timeout_recent_source_target_preserved targetless_unclassified_repair_dispatch_blocked verification_labels_not_file_targets python_runtime_traceback_frames_excluded import_error_module_target_authority diagnostic_scalar_values_are_not_repair_targets".to_string(),
             required_refs: vec![
                 "CodexHistoryItemStream".to_string(),
                 "session_state_projection_not_sequence_floor".to_string(),
@@ -3283,6 +3305,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "generated_test_constructor_api_misuse_owner_authority".to_string(),
                 "generated_test_parse_defect_owner_authority".to_string(),
                 "generated_test_reflection_api_misuse_owner_authority".to_string(),
+                "generated_test_module_attribute_api_misuse_owner_authority".to_string(),
                 "generated_test_exception_type_overreach_owner_authority".to_string(),
                 "source_parse_defect_owner_authority".to_string(),
                 "generated_test_contract_overreach_owner_projection_alignment".to_string(),
@@ -4283,7 +4306,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.turn_decision.active_work_edit_before_verification_rerun"
                 .to_string(),
             family: PreflightGateFamily::ControlEnvelopeProjection,
-            authority_source: "CodexHistoryItemStream VerificationFailureCluster ActiveWorkContract Verification repair_required_active_work SourceViolatesContract SourceTestContractMismatch TestViolatesContract source_owned_requirement_refs_align_active_work_with_repair_lane contract_visible_public_exception_owner_authority generated_test_parse_defect_owner_authority generated_test_reflection_api_misuse_owner_authority generated_test_exception_type_overreach_owner_authority source_parse_defect_owner_authority no_tests_ran_recent_generated_test_target_authority generated_test_subprocess_encoding_owner_authority generated_test_subprocess_output_capture_owner_authority generated_test_name_resolution_owner_authority generated_test_import_nameerror_owner_authority mixed_source_test_contract_reconciliation_owner_authority generated_test_contract_overreach_owner_projection_alignment generic_generated_test_only_owner_target_authority ungrounded_generated_public_output_assertion_owner_authority generated_test_local_binding_contradiction_owner_authority deferred_verification_command_not_progress_evidence failed_patch_context_mismatch_target_grounding patch_context_mismatch_recovery_augments_read_surface ActionAuthority repair_lane_diagnostic_only stable_tool_schema call_id_scoped_outputs".to_string(),
+            authority_source: "CodexHistoryItemStream VerificationFailureCluster ActiveWorkContract Verification repair_required_active_work SourceViolatesContract SourceTestContractMismatch TestViolatesContract source_owned_requirement_refs_align_active_work_with_repair_lane contract_visible_public_exception_owner_authority generated_test_parse_defect_owner_authority generated_test_reflection_api_misuse_owner_authority generated_test_module_attribute_api_misuse_owner_authority generated_test_exception_type_overreach_owner_authority source_parse_defect_owner_authority no_tests_ran_recent_generated_test_target_authority generated_test_subprocess_encoding_owner_authority generated_test_subprocess_output_capture_owner_authority generated_test_name_resolution_owner_authority generated_test_import_nameerror_owner_authority mixed_source_test_contract_reconciliation_owner_authority generated_test_contract_overreach_owner_projection_alignment generic_generated_test_only_owner_target_authority ungrounded_generated_public_output_assertion_owner_authority generated_test_local_binding_contradiction_owner_authority deferred_verification_command_not_progress_evidence failed_patch_context_mismatch_target_grounding patch_context_mismatch_recovery_augments_read_surface ActionAuthority repair_lane_diagnostic_only stable_tool_schema call_id_scoped_outputs".to_string(),
             required_refs: vec![
                 "CodexHistoryItemStream".to_string(),
                 "VerificationFailureCluster".to_string(),
@@ -4298,6 +4321,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "contract_visible_public_exception_owner_authority".to_string(),
                 "generated_test_parse_defect_owner_authority".to_string(),
                 "generated_test_reflection_api_misuse_owner_authority".to_string(),
+                "generated_test_module_attribute_api_misuse_owner_authority".to_string(),
                 "generated_test_exception_type_overreach_owner_authority".to_string(),
                 "source_parse_defect_owner_authority".to_string(),
                 "no_tests_ran_recent_generated_test_target_authority".to_string(),
