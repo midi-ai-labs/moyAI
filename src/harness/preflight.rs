@@ -1146,6 +1146,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::harness::manual_st::run_error_open_obligation_uses_closeout_continuation_budget_fixture_passes()
             || !crate::harness::manual_st::runtime_terminal_status_uses_closeout_continuation_budget_fixture_passes()
             || !crate::harness::manual_st::closeout_continuation_budget_blocks_same_workspace_stall_fixture_passes()
+            || !crate::harness::manual_st::terminalized_session_continuation_ledger_bounds_same_stage_recovery_fixture_passes()
             || !crate::harness::manual_st::successful_closeout_continuation_rematerializes_case_verdict_fixture_passes()
             || !crate::harness::manual_st::route_terminal_verdict_rematerializes_from_case_results_fixture_passes()
             || !crate::harness::manual_st::completed_expected_artifact_clears_stale_authoring_obligation_fixture_passes()
@@ -1153,7 +1154,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::agent::state::manual_st_closeout_expected_artifacts_inventory_does_not_reopen_fixture_passes())
     {
         diagnostics.push(
-            "runtime-completed, runtime-error, or runtime-terminal final assistant messages with open obligations are not converted into explicit text-only continuation user-turn items, expected artifact inventory can reopen non-stage authoring targets, current workspace artifacts fail to clear stale authoring obligations, satisfied docs repair can reopen route closeout, route verification can run before authored artifacts exist, closeout evidence can leak across stages, closeout verification does not use latest command evidence, verification pass evidence remains fresh after later content changes, runtime failures can keep stale missing-artifact closeout evidence, runtime open obligations bypass the closeout continuation budget, same-workspace no-progress continuations are not bounded, a successful closeout continuation does not re-materialize the case verdict from latest terminal evidence, or route-level verdict/stop_reason is not re-materialized from current case results".to_string(),
+            "runtime-completed, runtime-error, or runtime-terminal final assistant messages with open obligations are not converted into explicit text-only continuation user-turn items, expected artifact inventory can reopen non-stage authoring targets, current workspace artifacts fail to clear stale authoring obligations, satisfied docs repair can reopen route closeout, route verification can run before authored artifacts exist, closeout evidence can leak across stages, closeout verification does not use latest command evidence, verification pass evidence remains fresh after later content changes, runtime failures can keep stale missing-artifact closeout evidence, runtime open obligations bypass the closeout continuation budget, same-workspace no-progress continuations are not bounded, terminalized same-stage session continuations are not ledgered into bounded route failure, a successful closeout continuation does not re-materialize the case verdict from latest terminal evidence, or route-level verdict/stop_reason is not re-materialized from current case results".to_string(),
         );
     }
 
@@ -4381,7 +4382,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.closeout.open_obligation_final_assistant_continuation_hook"
                 .to_string(),
             family: PreflightGateFamily::ManualStEvidenceSchema,
-            authority_source: "CodexTurnComplete StopRequest hook_prompt_message text_only_hook_prompt RuntimeCompleted RuntimeDidNotComplete final_assistant_message OpenObligation ManualStCloseoutEvidence CloseoutContinuationUserTurn missing_artifacts file_changing_tool_call_required expected_artifacts_inventory_non_authoring current_workspace_artifact_clears_stale_authoring_obligation satisfied_docs_repair_not_open_closeout route_verification_waits_for_artifact_authoring latest_verification_command_evidence current_run_error_closeout_projection runtime_error_open_obligation_continuation_budget runtime_terminal_status_open_obligation_continuation_budget same_workspace_continuation_budget successful_continuation_case_verdict_materialization route_terminal_verdict_case_result_materialization open_obligation_final_message_surface_insensitive_guard bounded_route_failure".to_string(),
+            authority_source: "CodexTurnComplete StopRequest hook_prompt_message text_only_hook_prompt RuntimeCompleted RuntimeDidNotComplete final_assistant_message OpenObligation ManualStCloseoutEvidence CloseoutContinuationUserTurn missing_artifacts file_changing_tool_call_required expected_artifacts_inventory_non_authoring current_workspace_artifact_clears_stale_authoring_obligation satisfied_docs_repair_not_open_closeout route_verification_waits_for_artifact_authoring latest_verification_command_evidence current_run_error_closeout_projection runtime_error_open_obligation_continuation_budget runtime_terminal_status_open_obligation_continuation_budget same_workspace_continuation_budget terminalized_session_continuation_ledger terminal_cluster_signature stage_terminal_continuation_cap successful_continuation_case_verdict_materialization route_terminal_verdict_case_result_materialization open_obligation_final_message_surface_insensitive_guard bounded_route_failure".to_string(),
             required_refs: vec![
                 "CodexTurnComplete".to_string(),
                 "StopRequest".to_string(),
@@ -4404,6 +4405,9 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "runtime_error_open_obligation_continuation_budget".to_string(),
                 "runtime_terminal_status_open_obligation_continuation_budget".to_string(),
                 "same_workspace_continuation_budget".to_string(),
+                "terminalized_session_continuation_ledger".to_string(),
+                "terminal_cluster_signature".to_string(),
+                "stage_terminal_continuation_cap".to_string(),
                 "successful_continuation_case_verdict_materialization".to_string(),
                 "route_terminal_verdict_case_result_materialization".to_string(),
                 "open_obligation_final_message_surface_insensitive_guard".to_string(),

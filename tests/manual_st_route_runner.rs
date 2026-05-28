@@ -19,6 +19,7 @@ use moyai::harness::manual_st::{
     satisfied_docs_repair_does_not_reopen_route_closeout_fixture_passes,
     stage_scoped_verification_commands_are_spec_owned_fixture_passes,
     successful_closeout_continuation_rematerializes_case_verdict_fixture_passes,
+    terminalized_session_continuation_ledger_bounds_same_stage_recovery_fixture_passes,
     verification_evidence_after_content_change_invalidated_fixture_passes,
     verification_failed_closeout_builds_repair_hook_prompt_fixture_passes,
     verification_failure_labels_do_not_become_authoring_obligations_fixture_passes,
@@ -159,6 +160,11 @@ fn closeout_continuation_budget_is_failure_signature_scoped() {
 #[test]
 fn closeout_continuation_budget_blocks_same_workspace_stall() {
     assert!(closeout_continuation_budget_blocks_same_workspace_stall_fixture_passes());
+}
+
+#[test]
+fn terminalized_session_continuation_ledger_bounds_same_stage_recovery() {
+    assert!(terminalized_session_continuation_ledger_bounds_same_stage_recovery_fixture_passes());
 }
 
 #[test]

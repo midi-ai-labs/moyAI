@@ -33,6 +33,8 @@ use crate::tool::PermissionRequest;
 const FIXTURE_VERSION: &str = "manual_st_route_runner.v1";
 const MAX_CLOSEOUT_CONTINUATIONS_PER_STAGE: usize = 6;
 const MAX_CLOSEOUT_CONTINUATIONS_WITHOUT_WORKSPACE_PROGRESS: usize = 3;
+const MAX_TERMINALIZED_CLOSEOUT_CONTINUATIONS_PER_STAGE: usize = 3;
+const MAX_TERMINALIZED_CLOSEOUT_CONTINUATIONS_PER_CLUSTER: usize = 2;
 const MANUAL_ST_ROUTE_COMMAND_TIMEOUT_SECONDS: u64 = 120;
 
 #[derive(Debug, Clone)]
@@ -365,6 +367,7 @@ async fn run_case(
         let mut stage_verification_commands = Vec::new();
         let mut closeout_continuation_turns = 0usize;
         let mut closeout_budget = CloseoutContinuationBudget::default();
+        let mut terminal_continuation_ledger = RouteStageTerminalContinuationLedger::default();
         loop {
             let continuation = manual_st_stage_session_continuation(session_id);
             write_case_progress_artifact(
@@ -472,10 +475,15 @@ async fn run_case(
                         );
                         if !provider_terminal {
                             if let Some(evidence) = closeout_evidence.as_ref() {
-                                if let Some(closeout_attempt) = closeout_budget
-                                    .next_attempt_with_workspace_fingerprint(
+                                let workspace_fingerprint =
+                                    workspace_content_fingerprint(workspace)?;
+                                if let Some(closeout_attempt) =
+                                    next_stage_closeout_continuation_attempt(
+                                        &mut closeout_budget,
+                                        &mut terminal_continuation_ledger,
                                         evidence,
-                                        &workspace_content_fingerprint(workspace)?,
+                                        &workspace_fingerprint,
+                                        Some(&reason),
                                     )
                                 {
                                     closeout_continuation_turns += 1;
@@ -619,12 +627,14 @@ async fn run_case(
                     || is_provider_transport_stream_error_reason(&reason);
                 if !provider_terminal {
                     if let Some(evidence) = closeout_evidence.as_ref() {
-                        if let Some(closeout_attempt) = closeout_budget
-                            .next_attempt_with_workspace_fingerprint(
-                                evidence,
-                                &workspace_content_fingerprint(workspace)?,
-                            )
-                        {
+                        let workspace_fingerprint = workspace_content_fingerprint(workspace)?;
+                        if let Some(closeout_attempt) = next_stage_closeout_continuation_attempt(
+                            &mut closeout_budget,
+                            &mut terminal_continuation_ledger,
+                            evidence,
+                            &workspace_fingerprint,
+                            Some(&reason),
+                        ) {
                             closeout_continuation_turns += 1;
                             stage_prompt = build_closeout_continuation_prompt(
                                 &case_spec.case_id,
@@ -698,12 +708,14 @@ async fn run_case(
             )
             .await?;
             if !manual_st_route_verification_may_run(&pre_verification_closeout) {
-                if let Some(closeout_attempt) = closeout_budget
-                    .next_attempt_with_workspace_fingerprint(
-                        &pre_verification_closeout,
-                        &workspace_content_fingerprint(workspace)?,
-                    )
-                {
+                let workspace_fingerprint = workspace_content_fingerprint(workspace)?;
+                if let Some(closeout_attempt) = next_stage_closeout_continuation_attempt(
+                    &mut closeout_budget,
+                    &mut terminal_continuation_ledger,
+                    &pre_verification_closeout,
+                    &workspace_fingerprint,
+                    None,
+                ) {
                     closeout_continuation_turns += 1;
                     stage_prompt = build_closeout_continuation_prompt(
                         &case_spec.case_id,
@@ -822,9 +834,13 @@ async fn run_case(
                 continue 'stages;
             }
 
-            if let Some(closeout_attempt) = closeout_budget.next_attempt_with_workspace_fingerprint(
+            let workspace_fingerprint = workspace_content_fingerprint(workspace)?;
+            if let Some(closeout_attempt) = next_stage_closeout_continuation_attempt(
+                &mut closeout_budget,
+                &mut terminal_continuation_ledger,
                 &closeout,
-                &workspace_content_fingerprint(workspace)?,
+                &workspace_fingerprint,
+                None,
             ) {
                 closeout_continuation_turns += 1;
                 stage_prompt = build_closeout_continuation_prompt(
@@ -1447,6 +1463,104 @@ impl CloseoutContinuationBudget {
         self.total_attempts += 1;
         Some(*attempts)
     }
+}
+
+#[derive(Default)]
+struct RouteStageTerminalContinuationLedger {
+    attempts_by_cluster: BTreeMap<String, usize>,
+    last_workspace_fingerprint_by_cluster: BTreeMap<String, String>,
+    total_attempts: usize,
+}
+
+impl RouteStageTerminalContinuationLedger {
+    fn admit(
+        &mut self,
+        closeout: &ManualStCloseoutEvidence,
+        workspace_fingerprint: &str,
+        terminal_reason: Option<&str>,
+    ) -> bool {
+        let Some(reason) = terminal_reason else {
+            return true;
+        };
+        let Some(cluster) = route_stage_terminal_continuation_cluster(closeout, reason) else {
+            return true;
+        };
+        if self.total_attempts >= MAX_TERMINALIZED_CLOSEOUT_CONTINUATIONS_PER_STAGE {
+            return false;
+        }
+        let prior_attempts = self.attempts_by_cluster.get(&cluster).copied().unwrap_or(0);
+        if prior_attempts >= MAX_TERMINALIZED_CLOSEOUT_CONTINUATIONS_PER_CLUSTER {
+            return false;
+        }
+        let same_workspace = self
+            .last_workspace_fingerprint_by_cluster
+            .get(&cluster)
+            .is_some_and(|fingerprint| fingerprint == workspace_fingerprint);
+        if prior_attempts > 0 && same_workspace {
+            return false;
+        }
+        self.attempts_by_cluster
+            .insert(cluster.clone(), prior_attempts + 1);
+        self.last_workspace_fingerprint_by_cluster
+            .insert(cluster, workspace_fingerprint.to_string());
+        self.total_attempts += 1;
+        true
+    }
+}
+
+fn next_stage_closeout_continuation_attempt(
+    closeout_budget: &mut CloseoutContinuationBudget,
+    terminal_ledger: &mut RouteStageTerminalContinuationLedger,
+    closeout: &ManualStCloseoutEvidence,
+    workspace_fingerprint: &str,
+    terminal_reason: Option<&str>,
+) -> Option<usize> {
+    if !terminal_ledger.admit(closeout, workspace_fingerprint, terminal_reason) {
+        return None;
+    }
+    closeout_budget.next_attempt_with_workspace_fingerprint(closeout, workspace_fingerprint)
+}
+
+fn route_stage_terminal_continuation_cluster(
+    closeout: &ManualStCloseoutEvidence,
+    reason: &str,
+) -> Option<String> {
+    let lower = reason.to_ascii_lowercase();
+    let failure_family = if lower.contains("model returned a final assistant message") {
+        Some("final_assistant_with_open_obligation".to_string())
+    } else if let Some(tool) =
+        terminal_reason_word_after(reason, "Provider repeated invalid arguments for ")
+    {
+        Some(format!("invalid_tool_arguments:{tool}"))
+    } else if let Some(cluster) =
+        terminal_reason_backtick_after(reason, "lifecycle adjudication cluster `")
+    {
+        Some(format!("lifecycle_cluster:{cluster}"))
+    } else if let Some(cluster) = terminal_reason_backtick_after(reason, "no-progress cluster `") {
+        Some(format!("no_progress_cluster:{cluster}"))
+    } else {
+        None
+    }?;
+    let closeout_signature = closeout_continuation_signature(closeout)
+        .unwrap_or_else(|| "no_closeout_signature".to_string());
+    Some(format!("{failure_family}|{closeout_signature}"))
+}
+
+fn terminal_reason_word_after(reason: &str, marker: &str) -> Option<String> {
+    let start = reason.find(marker)? + marker.len();
+    reason[start..]
+        .split_whitespace()
+        .next()
+        .map(|word| word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_'))
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_ascii_lowercase())
+}
+
+fn terminal_reason_backtick_after(reason: &str, marker: &str) -> Option<String> {
+    let start = reason.find(marker)? + marker.len();
+    let end = reason[start..].find('`')?;
+    let cluster = reason[start..start + end].trim();
+    (!cluster.is_empty()).then(|| cluster.to_string())
 }
 
 fn closeout_continuation_signature(closeout: &ManualStCloseoutEvidence) -> Option<String> {
@@ -4990,6 +5104,92 @@ pub fn runtime_terminal_status_uses_closeout_continuation_budget_fixture_passes(
         && !is_provider_stream_stall_reason(reason)
         && !is_provider_transport_stream_error_reason(reason)
         && is_provider_stream_stall_reason(transport_reason)
+}
+
+pub fn terminalized_session_continuation_ledger_bounds_same_stage_recovery_fixture_passes() -> bool
+{
+    let evidence = classify_manual_st_closeout_from_evidence(
+        false,
+        None,
+        Some(&ActiveWorkContract::RequestedWorkAuthoring {
+            pending_targets: vec![Utf8PathBuf::from("test_widget.py")],
+            verification_commands: vec!["python -m unittest".to_string()],
+        }),
+        &["widget.py".to_string(), "test_widget.py".to_string()],
+        &["widget.py".to_string()],
+        &[],
+    );
+    let invalid_read_reason = "caseX stage1 ended with session status Failed: Provider repeated invalid arguments for read while typed work remained open.";
+    let final_message_reason = "caseX stage1 ended with session status Failed: model returned a final assistant message 3 time(s) while typed work remained open.";
+    let lifecycle_reason = "caseX stage1 ended with session status Failed: Runtime stopped on the lifecycle adjudication cluster `provider_ignored_edit_only_surface` before applying side effects.";
+    let invalid_write_reason = "caseX stage1 ended with session status Failed: Provider repeated invalid arguments for write while typed work remained open.";
+
+    let mut plain_budget = CloseoutContinuationBudget::default();
+    let plain_first =
+        plain_budget.next_attempt_with_workspace_fingerprint(&evidence, "workspace-a");
+    let plain_second =
+        plain_budget.next_attempt_with_workspace_fingerprint(&evidence, "workspace-a");
+
+    let mut budget = CloseoutContinuationBudget::default();
+    let mut ledger = RouteStageTerminalContinuationLedger::default();
+    let first = next_stage_closeout_continuation_attempt(
+        &mut budget,
+        &mut ledger,
+        &evidence,
+        "workspace-a",
+        Some(invalid_read_reason),
+    );
+    let repeated_same_cluster = next_stage_closeout_continuation_attempt(
+        &mut budget,
+        &mut ledger,
+        &evidence,
+        "workspace-a",
+        Some(invalid_read_reason),
+    );
+
+    let mut stage_budget = CloseoutContinuationBudget::default();
+    let mut stage_ledger = RouteStageTerminalContinuationLedger::default();
+    let first_cluster = next_stage_closeout_continuation_attempt(
+        &mut stage_budget,
+        &mut stage_ledger,
+        &evidence,
+        "workspace-a",
+        Some(invalid_read_reason),
+    );
+    let second_cluster = next_stage_closeout_continuation_attempt(
+        &mut stage_budget,
+        &mut stage_ledger,
+        &evidence,
+        "workspace-b",
+        Some(final_message_reason),
+    );
+    let third_cluster = next_stage_closeout_continuation_attempt(
+        &mut stage_budget,
+        &mut stage_ledger,
+        &evidence,
+        "workspace-c",
+        Some(lifecycle_reason),
+    );
+    let stage_blocked = next_stage_closeout_continuation_attempt(
+        &mut stage_budget,
+        &mut stage_ledger,
+        &evidence,
+        "workspace-d",
+        Some(invalid_write_reason),
+    );
+
+    plain_first == Some(1)
+        && plain_second == Some(2)
+        && first == Some(1)
+        && repeated_same_cluster.is_none()
+        && first_cluster == Some(1)
+        && second_cluster == Some(2)
+        && third_cluster == Some(3)
+        && stage_blocked.is_none()
+        && route_stage_terminal_continuation_cluster(&evidence, invalid_read_reason)
+            == route_stage_terminal_continuation_cluster(&evidence, invalid_read_reason)
+        && route_stage_terminal_continuation_cluster(&evidence, invalid_read_reason)
+            != route_stage_terminal_continuation_cluster(&evidence, final_message_reason)
 }
 
 pub fn completed_expected_artifact_clears_stale_authoring_obligation_fixture_passes() -> bool {
