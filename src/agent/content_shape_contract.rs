@@ -59,6 +59,7 @@ pub(crate) fn python_test_module_content_has_executable_shape(target: &str, cont
     has_test_definition
         && has_test_context
         && !test_target_has_invalid_test_class_base(&executable)
+        && !test_target_has_missing_module_import_for_qualified_reference(&executable)
         && !test_target_has_opaque_subprocess_returncode_assertion(content)
 }
 
@@ -748,10 +749,39 @@ fn test_target_has_opaque_subprocess_returncode_assertion(content: &str) -> bool
     false
 }
 
+fn test_target_has_missing_module_import_for_qualified_reference(executable: &str) -> bool {
+    ["sys", "os", "subprocess", "unittest"]
+        .iter()
+        .any(|module| {
+            executable.contains(&format!("{module}."))
+                && !python_module_imported_as_module(executable, module)
+        })
+}
+
+fn python_module_imported_as_module(executable: &str, module: &str) -> bool {
+    executable.lines().any(|line| {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("import ") else {
+            return false;
+        };
+        rest.split(',').any(|item| {
+            let imported = item
+                .trim()
+                .split(" as ")
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            imported == module || imported.starts_with(&format!("{module}."))
+        })
+    })
+}
+
 impl TestTargetContentShapeContract {
     pub(crate) fn positive_shape_guidance(&self) -> String {
         format!(
-            " Required positive test-module shape for `{target}`: import `unittest`; import `{module}` or public functions from `{source}`; define one or more `Test*` classes extending `unittest.TestCase`; define one or more `def test_...` methods; assert behavior by calling `{module}.<public_function>(...)` or imported public functions. If the current request/spec includes public command examples for `{source}`, cover them with subprocess-style argv tests that assert return code and observable stdout/stderr; every generated `subprocess.run(...)` child command must pass a finite `timeout=`, any assertion that reads `CompletedProcess.stdout` or `.stderr` must use `capture_output=True` or explicit `stdout=subprocess.PIPE` / `stderr=subprocess.PIPE`, every returncode assertion for a subprocess result must include captured stdout/stderr diagnostics in its failure message, and parent-side UTF-8 text decoding such as `encoding=\"utf-8\"` must give the child explicit UTF-8 output authority with `PYTHONUTF8=1` plus `PYTHONIOENCODING=utf-8` or `python -X utf8`. Optional launch block is allowed only as `if __name__ == \"__main__\": unittest.main()`. Forbidden shape: do not define production functions at module top level, do not define `main()`, do not use requirement ids such as `FILE_ID` / `API_ID` / `BEH_ID` as Python class bases, do not over-specify concrete exception classes or localized exception messages unless the current contract names them, do not directly call `input(...)` as implementation logic, and do not paste implementation code from `{source}`.",
+            " Required positive test-module shape for `{target}`: import `unittest`; import `{module}` or public functions from `{source}`; define one or more `Test*` classes extending `unittest.TestCase`; define one or more `def test_...` methods; assert behavior by calling `{module}.<public_function>(...)` or imported public functions. If the current request/spec includes public command examples for `{source}`, cover them with subprocess-style argv tests that assert return code and observable stdout/stderr; every generated `subprocess.run(...)` child command must pass a finite `timeout=`, any assertion that reads `CompletedProcess.stdout` or `.stderr` must use `capture_output=True` or explicit `stdout=subprocess.PIPE` / `stderr=subprocess.PIPE`, every returncode assertion for a subprocess result must include captured stdout/stderr diagnostics in its failure message, module-qualified helper references such as `sys.executable` must import that module, and parent-side UTF-8 text decoding such as `encoding=\"utf-8\"` must give the child explicit UTF-8 output authority with `PYTHONUTF8=1` plus `PYTHONIOENCODING=utf-8` or `python -X utf8`. Optional launch block is allowed only as `if __name__ == \"__main__\": unittest.main()`. Forbidden shape: do not define production functions at module top level, do not define `main()`, do not use requirement ids such as `FILE_ID` / `API_ID` / `BEH_ID` as Python class bases, do not over-specify concrete exception classes or localized exception messages unless the current contract names them, do not directly call `input(...)` as implementation logic, and do not paste implementation code from `{source}`.",
             target = self.target,
             module = self.module_name,
             source = self.source_path
@@ -760,7 +790,7 @@ impl TestTargetContentShapeContract {
 
     pub(crate) fn prompt_contract(&self) -> String {
         format!(
-            "Active write target contract:\n- Use the `write` tool with `path` set to `{target}` and `content` set to the complete replacement content for that file.\n- The provider-visible tool schema remains the stable `write` interface; target validation belongs to the tool lifecycle for the submitted call.\n- `{source}` is the inferred production source under test; do not rewrite `{source}` in this turn.\n- The `content` must be a complete test module for `{target}` only.\n- Required positive shape: import `unittest`; import `{module}` or public functions from `{source}`; define one or more `Test*` classes extending `unittest.TestCase`; define one or more `def test_...` methods; assert requested behavior by calling `{module}.<public_function>(...)` or imported public functions.\n- Public command coverage: when the prompt/spec includes public command examples for `{source}`, add subprocess-style tests that execute the requested argv forms and assert return code plus stdout/stderr behavior. Every generated `subprocess.run(...)` child command must pass a finite `timeout=` so verification cannot block indefinitely, any test that reads `CompletedProcess.stdout` or `.stderr` must capture those streams with `capture_output=True` or explicit `stdout=subprocess.PIPE` / `stderr=subprocess.PIPE`, every returncode assertion for a subprocess result must include captured stdout/stderr diagnostics in its failure message, and parent-side UTF-8 text decoding such as `encoding=\"utf-8\"` must pass explicit child UTF-8 output authority with `PYTHONUTF8=1` plus `PYTHONIOENCODING=utf-8` or `python -X utf8`.\n- Allowed launch block: `if __name__ == \"__main__\": unittest.main()`.\n- Forbidden shape: do not define production functions at module top level, do not define `main()`, do not use requirement ids such as `FILE_ID` / `API_ID` / `BEH_ID` as Python class bases, do not over-specify concrete exception classes or localized exception messages unless the current contract names them, do not directly call `input(...)` as implementation logic, and do not paste implementation code from `{source}`.\n- Older assistant narration, previous tool arguments, and prior progress output are not tool-call authority for this turn.",
+            "Active write target contract:\n- Use the `write` tool with `path` set to `{target}` and `content` set to the complete replacement content for that file.\n- The provider-visible tool schema remains the stable `write` interface; target validation belongs to the tool lifecycle for the submitted call.\n- `{source}` is the inferred production source under test; do not rewrite `{source}` in this turn.\n- The `content` must be a complete test module for `{target}` only.\n- Required positive shape: import `unittest`; import `{module}` or public functions from `{source}`; define one or more `Test*` classes extending `unittest.TestCase`; define one or more `def test_...` methods; assert requested behavior by calling `{module}.<public_function>(...)` or imported public functions.\n- Public command coverage: when the prompt/spec includes public command examples for `{source}`, add subprocess-style tests that execute the requested argv forms and assert return code plus stdout/stderr behavior. Every generated `subprocess.run(...)` child command must pass a finite `timeout=` so verification cannot block indefinitely, any test that reads `CompletedProcess.stdout` or `.stderr` must capture those streams with `capture_output=True` or explicit `stdout=subprocess.PIPE` / `stderr=subprocess.PIPE`, every returncode assertion for a subprocess result must include captured stdout/stderr diagnostics in its failure message, module-qualified helper references such as `sys.executable` must import that module, and parent-side UTF-8 text decoding such as `encoding=\"utf-8\"` must pass explicit child UTF-8 output authority with `PYTHONUTF8=1` plus `PYTHONIOENCODING=utf-8` or `python -X utf8`.\n- Allowed launch block: `if __name__ == \"__main__\": unittest.main()`.\n- Forbidden shape: do not define production functions at module top level, do not define `main()`, do not use requirement ids such as `FILE_ID` / `API_ID` / `BEH_ID` as Python class bases, do not over-specify concrete exception classes or localized exception messages unless the current contract names them, do not directly call `input(...)` as implementation logic, and do not paste implementation code from `{source}`.\n- Older assistant narration, previous tool arguments, and prior progress output are not tool-call authority for this turn.",
             target = self.target,
             source = self.source_path,
             module = self.module_name
@@ -769,7 +799,7 @@ impl TestTargetContentShapeContract {
 
     pub(crate) fn tool_schema_description(&self) -> String {
         format!(
-            "Complete final test module contents for `{target}`. Required positive shape: import `unittest`; import `{module}` or public functions from `{source}`; define one or more `Test*` classes extending `unittest.TestCase`; define one or more `def test_...` methods; assert requested behavior by calling `{module}.<public_function>(...)` or imported public functions. If public command examples for `{source}` are part of the current request/spec, cover them with subprocess-style argv tests that assert return code and stdout/stderr, pass a finite `timeout=` to every generated `subprocess.run(...)` child command, capture stdout/stderr before asserting `CompletedProcess.stdout` or `.stderr`, include captured stdout/stderr diagnostics in every subprocess returncode assertion failure message, and when parent-side UTF-8 text decoding is used pass explicit child UTF-8 output authority with `PYTHONUTF8=1` plus `PYTHONIOENCODING=utf-8` or `python -X utf8`. Optional launch block may be `if __name__ == \"__main__\": unittest.main()`. `{source}` is the production source under test; do not send production source code, top-level production function definitions, `def main()`, requirement ids as Python class bases, over-specific exception classes/messages not named by the current contract, or direct implementation `input(...)` calls for this test-target turn.",
+            "Complete final test module contents for `{target}`. Required positive shape: import `unittest`; import `{module}` or public functions from `{source}`; define one or more `Test*` classes extending `unittest.TestCase`; define one or more `def test_...` methods; assert requested behavior by calling `{module}.<public_function>(...)` or imported public functions. If public command examples for `{source}` are part of the current request/spec, cover them with subprocess-style argv tests that assert return code and stdout/stderr, pass a finite `timeout=` to every generated `subprocess.run(...)` child command, capture stdout/stderr before asserting `CompletedProcess.stdout` or `.stderr`, include captured stdout/stderr diagnostics in every subprocess returncode assertion failure message, import every module used by module-qualified helper references such as `sys.executable`, and when parent-side UTF-8 text decoding is used pass explicit child UTF-8 output authority with `PYTHONUTF8=1` plus `PYTHONIOENCODING=utf-8` or `python -X utf8`. Optional launch block may be `if __name__ == \"__main__\": unittest.main()`. `{source}` is the production source under test; do not send production source code, top-level production function definitions, `def main()`, requirement ids as Python class bases, over-specific exception classes/messages not named by the current contract, or direct implementation `input(...)` calls for this test-target turn.",
             target = self.target,
             module = self.module_name,
             source = self.source_path
@@ -792,6 +822,7 @@ impl TestTargetContentShapeContract {
                 "subprocess.run child commands include finite timeout",
                 "CompletedProcess stdout/stderr assertions capture the asserted stream",
                 "subprocess returncode assertions include captured stdout/stderr failure diagnostics",
+                "module-qualified helper references import the referenced module",
                 "parent UTF-8 subprocess decoding includes explicit child UTF-8 output authority"
             ],
             "allowed_launch_block": "if __name__ == \"__main__\": unittest.main()",
@@ -1029,12 +1060,14 @@ pub(crate) fn test_target_content_shape_projection_is_positive_and_forbidden() -
         && prompt.contains("Public command coverage")
         && prompt.contains("capture those streams")
         && prompt.contains("returncode assertion")
+        && prompt.contains("module-qualified helper references")
         && prompt.contains("Forbidden shape")
         && schema.contains("Required positive shape")
         && schema.contains("subprocess-style argv tests")
         && schema.contains("timeout=")
         && schema.contains("capture stdout/stderr")
         && schema.contains("returncode assertion")
+        && schema.contains("module-qualified helper references")
         && schema.contains("do not send production source code")
         && schema.contains("requirement ids as Python class bases")
         && schema.contains("over-specific exception classes")
@@ -1051,6 +1084,10 @@ pub(crate) fn test_target_content_shape_projection_is_positive_and_forbidden() -
                 items.iter().any(|item| {
                     item.as_str().is_some_and(|value| {
                         value.contains("returncode assertions include captured")
+                    })
+                }) && items.iter().any(|item| {
+                    item.as_str().is_some_and(|value| {
+                        value.contains("module-qualified helper references import")
                     })
                 })
             })
@@ -1112,6 +1149,73 @@ class TestComponentCli(unittest.TestCase):
         && !python_test_module_content_has_executable_shape("test_component.py", bad)
         && test_target_has_opaque_subprocess_returncode_assertion(bad)
         && !test_target_has_opaque_subprocess_returncode_assertion(good)
+}
+
+pub(crate) fn test_target_module_qualified_reference_import_fixture_passes() -> bool {
+    let good = r#"
+import os
+import subprocess
+import sys
+import unittest
+import component
+
+class TestComponentCli(unittest.TestCase):
+    def test_invalid_cli(self):
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8", os.path.join(".", "component.py")],
+            input="bad input\nquit\n",
+            text=True,
+            encoding="utf-8",
+            env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout!r} stderr={result.stderr!r}")
+"#;
+    let missing_sys = r#"
+import os
+import subprocess
+import unittest
+import component
+
+class TestComponentCli(unittest.TestCase):
+    def test_invalid_cli(self):
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8", os.path.join(".", "component.py")],
+            input="bad input\nquit\n",
+            text=True,
+            encoding="utf-8",
+            env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout!r} stderr={result.stderr!r}")
+"#;
+    let missing_os = r#"
+import subprocess
+import sys
+import unittest
+import component
+
+class TestComponentCli(unittest.TestCase):
+    def test_invalid_cli(self):
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8", os.path.join(".", "component.py")],
+            input="bad input\nquit\n",
+            text=True,
+            encoding="utf-8",
+            env={},
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout!r} stderr={result.stderr!r}")
+"#;
+    python_test_module_content_has_executable_shape("test_component.py", good)
+        && !python_test_module_content_has_executable_shape("test_component.py", missing_sys)
+        && !python_test_module_content_has_executable_shape("test_component.py", missing_os)
+        && !test_target_has_missing_module_import_for_qualified_reference(good)
+        && test_target_has_missing_module_import_for_qualified_reference(missing_sys)
+        && test_target_has_missing_module_import_for_qualified_reference(missing_os)
 }
 
 pub(crate) fn test_target_executable_shape_rejects_string_literal_wrapper_fixture_passes() -> bool {

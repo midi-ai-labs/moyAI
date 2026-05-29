@@ -2034,6 +2034,9 @@ fn prompt_replay_stale_write_failed_fixtures() -> Vec<String> {
             "test_target_subprocess_returncode_assertion_diagnostics_contract".to_string(),
         );
     }
+    if !crate::agent::content_shape_contract::test_target_module_qualified_reference_import_fixture_passes() {
+        failed.push("test_target_module_qualified_reference_import_contract".to_string());
+    }
     if !crate::agent::loop_impl::content_shape_mismatch_feedback_carries_positive_test_contract() {
         failed.push("content_shape_mismatch_feedback_carries_positive_test_contract".to_string());
     }
@@ -3501,7 +3504,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.prompt_replay.stale_write_arguments_summary_projection"
                 .to_string(),
             family: PreflightGateFamily::PromptReplayAuthority,
-            authority_source: "CanonicalHistoryItem PromptProjection current_lifecycle_state current_todo_focus_projection write_content_test_contract stable_provider_tool_schema provider_owned_tool_arguments final_dispatch_source_schema_projection positive_test_module_shape_contract executable_test_module_shape_contract test_class_base_contract subprocess_returncode_diagnostics_contract string_literal_test_module_rejected source_executable_artifact_shape_contract escaped_source_string_rejected escaped_source_write_candidate_normalized source_test_module_payload_rejected corrective_content_shape_no_progress_terminal_guard python_source_repair_positive_contract text_artifact_readable_content_shape serialized_markdown_rejected text_artifact_repair_positive_contract content_shape_workspace_target_normalization consumed_supporting_context_replay_omitted post_patch_test_module_shape_contract observed_forbidden_marker_feedback unittest_main_test_content_allowed failed_write_content_shape_nonprogress sanitized_failed_write_tool_call_lifecycle summary_only_tool_call_replay omitted_corrective_output_latest_recovery stale_arguments_suppressed stale_payload_omitted stale_prelude_omitted stale_todo_progress_replay_omitted internal_control_items_not_provider_visible".to_string(),
+            authority_source: "CanonicalHistoryItem PromptProjection current_lifecycle_state current_todo_focus_projection write_content_test_contract stable_provider_tool_schema provider_owned_tool_arguments final_dispatch_source_schema_projection positive_test_module_shape_contract executable_test_module_shape_contract test_class_base_contract subprocess_returncode_diagnostics_contract module_qualified_reference_import_contract string_literal_test_module_rejected source_executable_artifact_shape_contract escaped_source_string_rejected escaped_source_write_candidate_normalized source_test_module_payload_rejected corrective_content_shape_no_progress_terminal_guard python_source_repair_positive_contract text_artifact_readable_content_shape serialized_markdown_rejected text_artifact_repair_positive_contract content_shape_workspace_target_normalization consumed_supporting_context_replay_omitted post_patch_test_module_shape_contract observed_forbidden_marker_feedback unittest_main_test_content_allowed failed_write_content_shape_nonprogress sanitized_failed_write_tool_call_lifecycle summary_only_tool_call_replay omitted_corrective_output_latest_recovery stale_arguments_suppressed stale_payload_omitted stale_prelude_omitted stale_todo_progress_replay_omitted internal_control_items_not_provider_visible".to_string(),
             required_refs: vec![
                 "CanonicalHistoryItem".to_string(),
                 "PromptProjection".to_string(),
@@ -3518,6 +3521,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "executable_test_module_shape_contract".to_string(),
                 "test_class_base_contract".to_string(),
                 "subprocess_returncode_diagnostics_contract".to_string(),
+                "module_qualified_reference_import_contract".to_string(),
                 "string_literal_test_module_rejected".to_string(),
                 "source_executable_artifact_shape_contract".to_string(),
                 "escaped_source_string_rejected".to_string(),
