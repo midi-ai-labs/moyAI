@@ -3900,7 +3900,7 @@ pub(crate) fn test_target_content_shape_write_lifecycle_enforced_fixture_passes(
     });
     let input_named_api_test_arguments = json!({
         "path": "test_widget.py",
-        "content": "import subprocess\nimport sys\nimport unittest\nimport widget\n\nclass TestWidgetBehavior(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        cls.python = sys.executable\n\n    def test_parse_input(self):\n        self.assertEqual(widget.parse_input('2 + 3'), (2.0, '+', 3.0))\n\n    def test_cli_stdin(self):\n        result = subprocess.run([self.python, 'widget.py'], input='2 + 3\\nquit\\n', text=True, capture_output=True)\n        self.assertEqual(result.returncode, 0)\n"
+        "content": "import subprocess\nimport sys\nimport unittest\nimport widget\n\nclass TestWidgetBehavior(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        cls.python = sys.executable\n\n    def test_parse_input(self):\n        self.assertEqual(widget.parse_input('2 + 3'), (2.0, '+', 3.0))\n\n    def test_cli_stdin(self):\n        result = subprocess.run([self.python, 'widget.py'], input='2 + 3\\nquit\\n', text=True, capture_output=True)\n        self.assertEqual(result.returncode, 0, f'stdout={result.stdout!r} stderr={result.stderr!r}')\n"
     });
     let mut state = SessionStateSnapshot::default();
     state.route = TaskRoute::Code;
