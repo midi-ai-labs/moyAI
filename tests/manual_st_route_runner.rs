@@ -7,8 +7,11 @@ use moyai::harness::manual_st::{
     final_assistant_open_obligation_continuation_hook_fixture_passes,
     final_assistant_open_obligation_not_clean_closeout_fixture_passes,
     latest_verification_result_drives_closeout_fixture_passes,
-    manual_st_default_output_root_uses_workspace_sandbox_fixture_passes, manual_st_route_plan,
+    manual_st_default_output_root_uses_workspace_sandbox_fixture_passes,
+    manual_st_route_omits_provider_defaults_without_explicit_override_fixture_passes,
+    manual_st_route_plan,
     open_obligation_continuation_expected_inventory_is_non_authoring_fixture_passes,
+    post_repair_route_verification_clears_stale_repair_fixture_passes,
     route_case_progress_phase_boundaries_fixture_passes,
     route_inflight_case_progress_artifact_fixture_passes,
     route_owned_command_timeout_fixture_passes,
@@ -80,6 +83,11 @@ fn open_obligation_continuation_expected_inventory_is_not_authoring_scope() {
 #[test]
 fn route_verification_waits_for_artifact_authoring_closeout() {
     assert!(route_verification_waits_for_authored_artifacts_fixture_passes());
+}
+
+#[test]
+fn post_repair_route_verification_clears_stale_repair_authority() {
+    assert!(post_repair_route_verification_clears_stale_repair_fixture_passes());
 }
 
 #[test]
@@ -175,6 +183,11 @@ fn verification_failure_labels_do_not_become_authoring_obligations() {
 #[test]
 fn manual_st_default_output_root_is_outside_moyai_git_root() {
     assert!(manual_st_default_output_root_uses_workspace_sandbox_fixture_passes());
+}
+
+#[test]
+fn manual_st_route_inherits_provider_config_without_explicit_override() {
+    assert!(manual_st_route_omits_provider_defaults_without_explicit_override_fixture_passes());
 }
 
 #[test]

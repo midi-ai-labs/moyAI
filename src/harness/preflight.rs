@@ -890,6 +890,10 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
                 crate::agent::loop_impl::provider_required_tool_choice_final_message_recovery_fixture_passes(),
             ),
             (
+                "provider_metadata_mode_serializes_named_tool_choice",
+                crate::agent::loop_impl::provider_metadata_mode_serializes_named_tool_choice_fixture_passes(),
+            ),
+            (
                 "multi_target_open_authoring_final_message_correction_names_targets",
                 crate::agent::loop_impl::multi_target_open_authoring_final_message_correction_names_targets_fixture_passes(),
             ),
@@ -1135,6 +1139,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::harness::manual_st::final_assistant_open_obligation_continuation_hook_fixture_passes()
             || !crate::harness::manual_st::open_obligation_continuation_expected_inventory_is_non_authoring_fixture_passes()
             || !crate::harness::manual_st::route_verification_waits_for_authored_artifacts_fixture_passes()
+            || !crate::harness::manual_st::post_repair_route_verification_clears_stale_repair_fixture_passes()
             || !crate::harness::manual_st::closeout_continuation_is_text_only_fixture_passes()
             || !crate::harness::manual_st::stage_scoped_closeout_evidence_is_invalidated_fixture_passes()
             || !crate::harness::manual_st::latest_verification_result_drives_closeout_fixture_passes()
@@ -1154,7 +1159,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::agent::state::manual_st_closeout_expected_artifacts_inventory_does_not_reopen_fixture_passes())
     {
         diagnostics.push(
-            "runtime-completed, runtime-error, or runtime-terminal final assistant messages with open obligations are not converted into explicit text-only continuation user-turn items, expected artifact inventory can reopen non-stage authoring targets, current workspace artifacts fail to clear stale authoring obligations, satisfied docs repair can reopen route closeout, route verification can run before authored artifacts exist, closeout evidence can leak across stages, closeout verification does not use latest command evidence, verification pass evidence remains fresh after later content changes, runtime failures can keep stale missing-artifact closeout evidence, runtime open obligations bypass the closeout continuation budget, same-workspace no-progress continuations are not bounded, terminalized same-stage session continuations are not ledgered into bounded route failure, a successful closeout continuation does not re-materialize the case verdict from latest terminal evidence, or route-level verdict/stop_reason is not re-materialized from current case results".to_string(),
+            "runtime-completed, runtime-error, or runtime-terminal final assistant messages with open obligations are not converted into explicit text-only continuation user-turn items, expected artifact inventory can reopen non-stage authoring targets, current workspace artifacts fail to clear stale authoring obligations, satisfied docs repair can reopen route closeout, route verification can run before authored artifacts exist, post-repair route verification can leave stale repair authority active, closeout evidence can leak across stages, closeout verification does not use latest command evidence, verification pass evidence remains fresh after later content changes, runtime failures can keep stale missing-artifact closeout evidence, runtime open obligations bypass the closeout continuation budget, same-workspace no-progress continuations are not bounded, terminalized same-stage session continuations are not ledgered into bounded route failure, a successful closeout continuation does not re-materialize the case verdict from latest terminal evidence, or route-level verdict/stop_reason is not re-materialized from current case results".to_string(),
         );
     }
 
@@ -1198,11 +1203,12 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::harness::manual_st::route_result_progress_fields_fixture_passes()
             || !crate::harness::manual_st::route_inflight_case_progress_artifact_fixture_passes()
             || !crate::harness::manual_st::route_case_progress_phase_boundaries_fixture_passes()
+            || !crate::harness::manual_st::manual_st_route_omits_provider_defaults_without_explicit_override_fixture_passes()
             || !crate::harness::manual_st::stage_scoped_verification_commands_are_spec_owned_fixture_passes()
             || !crate::harness::manual_st::manual_st_visible_scenario_contract_prompt_fixture_passes())
     {
         diagnostics.push(
-            "manual ST route evidence can still lose explicit session continuation, in-flight case progress phase boundaries, provider stream timeout classification, route-owned command timeout/wait policy, stage-scoped verification command ownership, fresh output-root ownership, bounded workspace manifest filtering, or prompt-visible scenario contract authority".to_string(),
+            "manual ST route evidence can still lose explicit session continuation, in-flight case progress phase boundaries, provider config inheritance, provider stream timeout classification, route-owned command timeout/wait policy, stage-scoped verification command ownership, fresh output-root ownership, bounded workspace manifest filtering, or prompt-visible scenario contract authority".to_string(),
         );
     }
 
@@ -2066,6 +2072,10 @@ fn prompt_replay_stale_write_failed_fixtures() -> Vec<String> {
     }
     if !crate::agent::loop_impl::source_content_shape_rejects_raw_prose_line_fixture_passes() {
         failed.push("source_content_shape_rejects_raw_prose_line".to_string());
+    }
+    if !crate::agent::loop_impl::source_content_shape_rejects_duplicate_entrypoint_fixture_passes()
+    {
+        failed.push("source_content_shape_rejects_duplicate_entrypoint".to_string());
     }
     if !crate::agent::loop_impl::corrective_content_shape_no_progress_terminal_guard_fixture_passes(
     ) {
@@ -3504,7 +3514,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.prompt_replay.stale_write_arguments_summary_projection"
                 .to_string(),
             family: PreflightGateFamily::PromptReplayAuthority,
-            authority_source: "CanonicalHistoryItem PromptProjection current_lifecycle_state current_todo_focus_projection write_content_test_contract stable_provider_tool_schema provider_owned_tool_arguments final_dispatch_source_schema_projection positive_test_module_shape_contract executable_test_module_shape_contract test_class_base_contract subprocess_returncode_diagnostics_contract module_qualified_reference_import_contract string_literal_test_module_rejected source_executable_artifact_shape_contract escaped_source_string_rejected escaped_source_write_candidate_normalized source_test_module_payload_rejected corrective_content_shape_no_progress_terminal_guard python_source_repair_positive_contract text_artifact_readable_content_shape serialized_markdown_rejected text_artifact_repair_positive_contract content_shape_workspace_target_normalization consumed_supporting_context_replay_omitted post_patch_test_module_shape_contract observed_forbidden_marker_feedback unittest_main_test_content_allowed failed_write_content_shape_nonprogress sanitized_failed_write_tool_call_lifecycle summary_only_tool_call_replay omitted_corrective_output_latest_recovery stale_arguments_suppressed stale_payload_omitted stale_prelude_omitted stale_todo_progress_replay_omitted internal_control_items_not_provider_visible".to_string(),
+            authority_source: "CanonicalHistoryItem PromptProjection current_lifecycle_state current_todo_focus_projection write_content_test_contract stable_provider_tool_schema provider_owned_tool_arguments final_dispatch_source_schema_projection positive_test_module_shape_contract executable_test_module_shape_contract test_class_base_contract subprocess_returncode_diagnostics_contract module_qualified_reference_import_contract string_literal_test_module_rejected source_executable_artifact_shape_contract source_duplicate_entrypoint_rejected escaped_source_string_rejected escaped_source_write_candidate_normalized source_test_module_payload_rejected corrective_content_shape_no_progress_terminal_guard python_source_repair_positive_contract text_artifact_readable_content_shape serialized_markdown_rejected text_artifact_repair_positive_contract content_shape_workspace_target_normalization consumed_supporting_context_replay_omitted post_patch_test_module_shape_contract observed_forbidden_marker_feedback unittest_main_test_content_allowed failed_write_content_shape_nonprogress sanitized_failed_write_tool_call_lifecycle summary_only_tool_call_replay omitted_corrective_output_latest_recovery stale_arguments_suppressed stale_payload_omitted stale_prelude_omitted stale_todo_progress_replay_omitted internal_control_items_not_provider_visible".to_string(),
             required_refs: vec![
                 "CanonicalHistoryItem".to_string(),
                 "PromptProjection".to_string(),
@@ -3524,6 +3534,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "module_qualified_reference_import_contract".to_string(),
                 "string_literal_test_module_rejected".to_string(),
                 "source_executable_artifact_shape_contract".to_string(),
+                "source_duplicate_entrypoint_rejected".to_string(),
                 "escaped_source_string_rejected".to_string(),
                 "escaped_source_write_candidate_normalized".to_string(),
                 "source_test_module_payload_rejected".to_string(),
@@ -4276,7 +4287,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.turn_decision.codex_stable_tool_surface_authority"
                 .to_string(),
             family: PreflightGateFamily::ControlEnvelopeProjection,
-            authority_source: "CodexResponsesRequest ActiveWorkContract RequestedWorkAuthoring candidate_tool_surface ActionAuthority workspace_target_identity_normalization stable_tool_schema tool_choice_auto requested_work_singleton_stable_surface singleton_missing_target_apply_patch_action_auto_choice codex_style_code_authoring_omits_whole_file_write codex_style_code_authoring_omits_json_discovery_surface codex_style_docs_authoring_omits_non_codex_json_surface generated_test_source_reference_grounding_after_source_change singleton_missing_target_source_reference_or_create_authority generated_test_consumed_source_reference_active_target_grounding repair_target_aliases_collapse_to_singleton_write_action typed_required_action_rendered_text open_work_lifecycle_evidence normal_authoring_final_message_recovery_stable_surface failed_edit_final_message_recovery_keeps_failed_edit_surface docs_open_obligation_required_edit_recovery open_obligation_final_message_recovery_persists_across_no_progress_tool authoring_final_message_target_grounding_read docs_patch_context_final_message_grounding docs_existing_target_update_exact_read_grounding source_repair_exact_write_final_message_recovery hard_repair_recovery_executable_schema_surface harness_closeout_guard open_obligation_final_message_guard open_obligation_final_message_guard_context_key".to_string(),
+            authority_source: "CodexResponsesRequest ActiveWorkContract RequestedWorkAuthoring candidate_tool_surface ActionAuthority workspace_target_identity_normalization stable_tool_schema tool_choice_auto provider_metadata_mode_tool_choice_serialization requested_work_singleton_stable_surface singleton_missing_target_apply_patch_action_auto_choice codex_style_code_authoring_omits_whole_file_write codex_style_code_authoring_omits_json_discovery_surface codex_style_docs_authoring_omits_non_codex_json_surface generated_test_source_reference_grounding_after_source_change singleton_missing_target_source_reference_or_create_authority generated_test_consumed_source_reference_active_target_grounding repair_target_aliases_collapse_to_singleton_write_action typed_required_action_rendered_text open_work_lifecycle_evidence normal_authoring_final_message_recovery_stable_surface failed_edit_final_message_recovery_keeps_failed_edit_surface docs_open_obligation_required_edit_recovery open_obligation_final_message_recovery_persists_across_no_progress_tool authoring_final_message_target_grounding_read docs_patch_context_final_message_grounding docs_existing_target_update_exact_read_grounding source_repair_exact_write_final_message_recovery hard_repair_recovery_executable_schema_surface harness_closeout_guard open_obligation_final_message_guard open_obligation_final_message_guard_context_key".to_string(),
             required_refs: vec![
                 "CodexResponsesRequest".to_string(),
                 "ActiveWorkContract".to_string(),
@@ -4285,6 +4296,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "workspace_target_identity_normalization".to_string(),
                 "stable_tool_schema".to_string(),
                 "tool_choice_auto".to_string(),
+                "provider_metadata_mode_tool_choice_serialization".to_string(),
                 "requested_work_singleton_stable_surface".to_string(),
                 "singleton_missing_target_apply_patch_action_auto_choice".to_string(),
                 "codex_style_code_authoring_omits_whole_file_write".to_string(),
@@ -4401,7 +4413,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
             fixture_id: "fixture.closeout.open_obligation_final_assistant_continuation_hook"
                 .to_string(),
             family: PreflightGateFamily::ManualStEvidenceSchema,
-            authority_source: "CodexTurnComplete StopRequest hook_prompt_message text_only_hook_prompt RuntimeCompleted RuntimeDidNotComplete final_assistant_message OpenObligation ManualStCloseoutEvidence CloseoutContinuationUserTurn missing_artifacts file_changing_tool_call_required expected_artifacts_inventory_non_authoring current_workspace_artifact_clears_stale_authoring_obligation satisfied_docs_repair_not_open_closeout route_verification_waits_for_artifact_authoring latest_verification_command_evidence current_run_error_closeout_projection runtime_error_open_obligation_continuation_budget runtime_terminal_status_open_obligation_continuation_budget same_workspace_continuation_budget terminalized_session_continuation_ledger terminal_cluster_signature stage_terminal_continuation_cap successful_continuation_case_verdict_materialization route_terminal_verdict_case_result_materialization open_obligation_final_message_surface_insensitive_guard bounded_route_failure".to_string(),
+            authority_source: "CodexTurnComplete StopRequest hook_prompt_message text_only_hook_prompt RuntimeCompleted RuntimeDidNotComplete final_assistant_message OpenObligation ManualStCloseoutEvidence CloseoutContinuationUserTurn missing_artifacts file_changing_tool_call_required expected_artifacts_inventory_non_authoring current_workspace_artifact_clears_stale_authoring_obligation satisfied_docs_repair_not_open_closeout route_verification_waits_for_artifact_authoring post_repair_route_verification_clears_stale_repair latest_verification_command_evidence current_run_error_closeout_projection runtime_error_open_obligation_continuation_budget runtime_terminal_status_open_obligation_continuation_budget same_workspace_continuation_budget terminalized_session_continuation_ledger terminal_cluster_signature stage_terminal_continuation_cap successful_continuation_case_verdict_materialization route_terminal_verdict_case_result_materialization open_obligation_final_message_surface_insensitive_guard bounded_route_failure".to_string(),
             required_refs: vec![
                 "CodexTurnComplete".to_string(),
                 "StopRequest".to_string(),
@@ -4419,6 +4431,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "current_workspace_artifact_clears_stale_authoring_obligation".to_string(),
                 "satisfied_docs_repair_not_open_closeout".to_string(),
                 "route_verification_waits_for_artifact_authoring".to_string(),
+                "post_repair_route_verification_clears_stale_repair".to_string(),
                 "latest_verification_command_evidence".to_string(),
                 "current_run_error_closeout_projection".to_string(),
                 "runtime_error_open_obligation_continuation_budget".to_string(),
@@ -4566,7 +4579,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
         PreflightFixture {
             fixture_id: "fixture.manual_st.route_evidence_schema".to_string(),
             family: PreflightGateFamily::ManualStEvidenceSchema,
-            authority_source: "route_manifest case_progress verification_command_log workspace_diff_manifest request_payload_summary timeout_classification active_case_progress_status inflight_case_session_progress case_progress_phase_boundaries prompt_visible_scenario_contract_authority stage_scoped_verification_spec_authority explicit_session_continuation no_continue_last_with_session provider_stream_idle_timeout_classification provider_stream_retry_exhausted_classification provider_transport_stream_error_classification semantic_no_progress_terminal_classification route_owned_command_timeout route_command_stdin_closed".to_string(),
+            authority_source: "route_manifest case_progress verification_command_log workspace_diff_manifest request_payload_summary timeout_classification active_case_progress_status inflight_case_session_progress case_progress_phase_boundaries prompt_visible_scenario_contract_authority stage_scoped_verification_spec_authority explicit_session_continuation no_continue_last_with_session provider_config_inheritance provider_stream_idle_timeout_classification provider_stream_retry_exhausted_classification provider_transport_stream_error_classification semantic_no_progress_terminal_classification route_owned_command_timeout route_command_stdin_closed".to_string(),
             required_refs: vec![
                 "route_manifest".to_string(),
                 "case_progress".to_string(),
@@ -4579,6 +4592,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "stage_scoped_verification_spec_authority".to_string(),
                 "explicit_session_continuation".to_string(),
                 "no_continue_last_with_session".to_string(),
+                "provider_config_inheritance".to_string(),
                 "provider_stream_idle_timeout_classification".to_string(),
                 "provider_stream_retry_exhausted_classification".to_string(),
                 "provider_transport_stream_error_classification".to_string(),

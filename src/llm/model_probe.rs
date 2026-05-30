@@ -40,6 +40,7 @@ pub struct ToolCallProbeReport {
     pub probe: String,
     pub status: ModelAvailabilityStatus,
     pub tool_choice: String,
+    pub required_for_gate: bool,
     pub finish_reason: Option<String>,
     pub tool_call_received: bool,
     pub tool_name: Option<String>,
@@ -282,12 +283,19 @@ pub async fn check_model_availability(
     report.matched_model = matched_model;
 
     if report.v1_present {
-        report.tool_call_probes =
-            run_tool_call_probe_suite(&client, &report.base_url, headers, &report.model).await;
+        report.tool_call_probes = run_tool_call_probe_suite(
+            &client,
+            &report.base_url,
+            headers,
+            &report.model,
+            report.provider_metadata_mode,
+        )
+        .await;
         report.tool_call_probe_passed = !report.tool_call_probes.is_empty()
             && report
                 .tool_call_probes
                 .iter()
+                .filter(|probe| probe.required_for_gate)
                 .all(|probe| matches!(probe.status, ModelAvailabilityStatus::Pass));
         if report.tool_call_probe_passed && report.tool_use_capable.is_none() {
             report.tool_use_capable = Some(true);
@@ -328,9 +336,16 @@ async fn run_tool_call_probe_suite(
     base_url: &str,
     headers: HeaderMap,
     model: &str,
+    provider_metadata_mode: ProviderMetadataMode,
 ) -> Vec<ToolCallProbeReport> {
     let probes = [
-        ("tool_choice_required", "required", json!("required"), false),
+        (
+            "tool_choice_required",
+            "required",
+            json!("required"),
+            false,
+            true,
+        ),
         (
             "tool_choice_named",
             "named_function",
@@ -341,11 +356,12 @@ async fn run_tool_call_probe_suite(
                 }
             }),
             false,
+            provider_metadata_mode == ProviderMetadataMode::OpenAiCompatibleOnly,
         ),
-        ("tool_choice_auto_strong", "auto", json!("auto"), true),
+        ("tool_choice_auto_strong", "auto", json!("auto"), true, true),
     ];
     let mut reports = Vec::with_capacity(probes.len());
-    for (probe, tool_choice_label, tool_choice, strong_instruction) in probes {
+    for (probe, tool_choice_label, tool_choice, strong_instruction, required_for_gate) in probes {
         reports.push(
             run_tool_call_probe(
                 client,
@@ -356,6 +372,7 @@ async fn run_tool_call_probe_suite(
                 tool_choice_label,
                 tool_choice,
                 strong_instruction,
+                required_for_gate,
             )
             .await,
         );
@@ -372,6 +389,7 @@ async fn run_tool_call_probe(
     tool_choice_label: &str,
     tool_choice: Value,
     strong_instruction: bool,
+    required_for_gate: bool,
 ) -> ToolCallProbeReport {
     let endpoint = format!("{}/v1/chat/completions", base_url);
     let messages = if strong_instruction {
@@ -433,6 +451,7 @@ async fn run_tool_call_probe(
             return failed_tool_call_probe_report(
                 probe,
                 tool_choice_label,
+                required_for_gate,
                 format!("tool-call probe request failed: {error}"),
             );
         }
@@ -446,6 +465,7 @@ async fn run_tool_call_probe(
         return failed_tool_call_probe_report(
             probe,
             tool_choice_label,
+            required_for_gate,
             format!(
                 "tool-call probe request failed with status {}: {}",
                 status,
@@ -459,16 +479,18 @@ async fn run_tool_call_probe(
             return failed_tool_call_probe_report(
                 probe,
                 tool_choice_label,
+                required_for_gate,
                 format!("tool-call probe response was not valid JSON: {error}"),
             );
         }
     };
-    tool_call_probe_report_from_response(probe, tool_choice_label, &payload)
+    tool_call_probe_report_from_response(probe, tool_choice_label, required_for_gate, &payload)
 }
 
 fn tool_call_probe_report_from_response(
     probe: &str,
     tool_choice_label: &str,
+    required_for_gate: bool,
     payload: &Value,
 ) -> ToolCallProbeReport {
     let choice = payload
@@ -511,6 +533,7 @@ fn tool_call_probe_report_from_response(
             ModelAvailabilityStatus::Fail
         },
         tool_choice: tool_choice_label.to_string(),
+        required_for_gate,
         finish_reason,
         tool_call_received,
         tool_name,
@@ -528,12 +551,14 @@ fn tool_call_probe_report_from_response(
 fn failed_tool_call_probe_report(
     probe: &str,
     tool_choice_label: &str,
+    required_for_gate: bool,
     error: String,
 ) -> ToolCallProbeReport {
     ToolCallProbeReport {
         probe: probe.to_string(),
         status: ModelAvailabilityStatus::Fail,
         tool_choice: tool_choice_label.to_string(),
+        required_for_gate,
         finish_reason: None,
         tool_call_received: false,
         tool_name: None,
@@ -1269,10 +1294,15 @@ mod tests {
             ]
         });
 
-        let report =
-            tool_call_probe_report_from_response("tool_choice_required", "required", &payload);
+        let report = tool_call_probe_report_from_response(
+            "tool_choice_required",
+            "required",
+            true,
+            &payload,
+        );
 
         assert_eq!(report.status, ModelAvailabilityStatus::Pass);
+        assert!(report.required_for_gate);
         assert!(report.tool_call_received);
         assert_eq!(report.tool_name.as_deref(), Some("echo_word"));
         assert!(report.arguments_valid);
@@ -1294,11 +1324,63 @@ mod tests {
         });
 
         let report =
-            tool_call_probe_report_from_response("tool_choice_auto_strong", "auto", &payload);
+            tool_call_probe_report_from_response("tool_choice_auto_strong", "auto", true, &payload);
 
         assert_eq!(report.status, ModelAvailabilityStatus::Fail);
         assert!(!report.tool_call_received);
         assert_eq!(report.content.as_deref(), Some("ping"));
         assert!(report.error.is_some());
+    }
+
+    #[test]
+    fn lm_studio_availability_can_ignore_named_tool_choice_object_probe() {
+        let required = ToolCallProbeReport {
+            probe: "tool_choice_required".to_string(),
+            status: ModelAvailabilityStatus::Pass,
+            tool_choice: "required".to_string(),
+            required_for_gate: true,
+            finish_reason: Some("tool_calls".to_string()),
+            tool_call_received: true,
+            tool_name: Some("echo_word".to_string()),
+            tool_arguments: Some("{\"word\":\"ping\"}".to_string()),
+            arguments_valid: true,
+            content: None,
+            error: None,
+        };
+        let named = ToolCallProbeReport {
+            probe: "tool_choice_named".to_string(),
+            status: ModelAvailabilityStatus::Fail,
+            tool_choice: "named_function".to_string(),
+            required_for_gate: false,
+            finish_reason: None,
+            tool_call_received: false,
+            tool_name: None,
+            tool_arguments: None,
+            arguments_valid: false,
+            content: None,
+            error: Some("LM Studio does not accept object tool_choice".to_string()),
+        };
+        let auto = ToolCallProbeReport {
+            probe: "tool_choice_auto_strong".to_string(),
+            status: ModelAvailabilityStatus::Pass,
+            tool_choice: "auto".to_string(),
+            required_for_gate: true,
+            finish_reason: Some("tool_calls".to_string()),
+            tool_call_received: true,
+            tool_name: Some("echo_word".to_string()),
+            tool_arguments: Some("{\"word\":\"ping\"}".to_string()),
+            arguments_valid: true,
+            content: None,
+            error: None,
+        };
+        let reports = [required, named, auto];
+
+        assert!(
+            !reports.is_empty()
+                && reports
+                    .iter()
+                    .filter(|probe| probe.required_for_gate)
+                    .all(|probe| matches!(probe.status, ModelAvailabilityStatus::Pass))
+        );
     }
 }

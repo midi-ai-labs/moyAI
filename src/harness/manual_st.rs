@@ -393,14 +393,8 @@ async fn run_case(
                 continue_last: continuation.continue_last,
                 title: Some(format!("manual ST {} {}", case_spec.case_id, stage.label)),
                 cwd: workspace.to_path_buf(),
-                model: config
-                    .model_override
-                    .clone()
-                    .unwrap_or_else(default_model_id),
-                base_url: config
-                    .base_url_override
-                    .clone()
-                    .unwrap_or_else(default_provider_base_url),
+                model: manual_st_run_request_model(config),
+                base_url: manual_st_run_request_base_url(config),
                 config_override: Some(PartialResolvedConfig {
                     model: model_override_patch,
                     permissions: Some(PartialPermissionsConfig {
@@ -605,6 +599,31 @@ async fn run_case(
                     &mut stage_verification_commands,
                 )
                 .await?;
+                if all_expected_artifacts_present(
+                    &case_spec.expected_artifacts,
+                    &actual_files_after_stage,
+                ) {
+                    run_stage_route_verification(
+                        stage,
+                        workspace,
+                        &case_spec.case_id,
+                        &mut verification_commands,
+                        &mut stage_verification_commands,
+                    )
+                    .await?;
+                    refresh_case_verification_evidence_freshness(
+                        &app,
+                        session_id,
+                        &mut verification_commands,
+                    )
+                    .await?;
+                    refresh_case_verification_evidence_freshness(
+                        &app,
+                        session_id,
+                        &mut stage_verification_commands,
+                    )
+                    .await?;
+                }
                 closeout_evidence = Some(
                     classify_manual_st_closeout(
                         &app,
@@ -625,6 +644,31 @@ async fn run_case(
                     .unwrap_or(reason);
                 let provider_terminal = is_provider_stream_stall_reason(&reason)
                     || is_provider_transport_stream_error_reason(&reason);
+                if let Some(evidence) = closeout_evidence.as_ref()
+                    && route_owned_contract_satisfied_after_verification(evidence)
+                {
+                    write_case_progress_artifact(
+                        route_root,
+                        &ManualStCaseProgress::new(
+                            config,
+                            case_spec,
+                            Some(stage_index + 1),
+                            Some(&stage.label),
+                            Some(summary.session_id.to_string()),
+                            workspace,
+                            case_root,
+                            data_dir,
+                            RouteVerdict::Running,
+                            "stage_route_verified_after_runtime_terminal",
+                            Some(
+                                "route-owned verification passed against the latest workspace after runtime terminalization",
+                            ),
+                        ),
+                    )?;
+                    write_stage_events(case_root, stage_index + 1, &renderer.events)?;
+                    renderer.events.clear();
+                    continue 'stages;
+                }
                 if !provider_terminal {
                     if let Some(evidence) = closeout_evidence.as_ref() {
                         let workspace_fingerprint = workspace_content_fingerprint(workspace)?;
@@ -775,18 +819,14 @@ async fn run_case(
                     ),
                 ),
             )?;
-            for command in &stage.verification_commands {
-                let verification =
-                    run_verification_command(command, workspace, &case_spec.case_id).await?;
-                stage_verification_commands.push(verification.clone());
-                verification_commands.push(verification);
-            }
-            for contract in &stage.public_command_contracts {
-                let verification =
-                    run_public_command_contract(contract, workspace, &case_spec.case_id).await?;
-                stage_verification_commands.push(verification.clone());
-                verification_commands.push(verification);
-            }
+            run_stage_route_verification(
+                stage,
+                workspace,
+                &case_spec.case_id,
+                &mut verification_commands,
+                &mut stage_verification_commands,
+            )
+            .await?;
 
             let actual_files_after_stage = list_workspace_files(workspace)?;
             refresh_case_verification_evidence_freshness(
@@ -1003,6 +1043,12 @@ fn materialize_manual_st_route_terminal_verdict(
         RouteVerdict::Fail,
         Some("route ended before all cases completed".to_string()),
     )
+}
+
+fn all_expected_artifacts_present(expected_artifacts: &[String], actual_files: &[String]) -> bool {
+    expected_artifacts
+        .iter()
+        .all(|expected| actual_files.contains(expected))
 }
 
 async fn refresh_case_verification_evidence_freshness(
@@ -1281,6 +1327,14 @@ fn latest_verification_evidence_by_command(
 
 fn verification_evidence_passed(evidence: &VerificationCommandEvidence) -> bool {
     evidence.normalized_failure_class.is_none()
+}
+
+fn route_owned_contract_satisfied_after_verification(closeout: &ManualStCloseoutEvidence) -> bool {
+    closeout.missing_artifacts.is_empty()
+        && closeout.open_obligations.is_empty()
+        && closeout.verification_required.is_empty()
+        && closeout.verification_failed.is_empty()
+        && !closeout.verification_passed.is_empty()
 }
 
 fn mark_stale_verification_evidence_after_content_change(
@@ -1846,7 +1900,11 @@ fn open_obligations_from_active_work(
             targets,
             ..
         } => {
-            if *repair_required {
+            let route_verification_passed = !commands.is_empty()
+                && commands
+                    .iter()
+                    .all(|command| verification_command_was_passed(command, verification_passed));
+            if *repair_required && !route_verification_passed {
                 open_obligations.extend(
                     targets
                         .iter()
@@ -2799,6 +2857,26 @@ async fn run_public_command_contract(
     })
 }
 
+async fn run_stage_route_verification(
+    stage: &ManualStStage,
+    workspace: &Utf8Path,
+    case_id: &str,
+    verification_commands: &mut Vec<VerificationCommandEvidence>,
+    stage_verification_commands: &mut Vec<VerificationCommandEvidence>,
+) -> Result<(), String> {
+    for command in &stage.verification_commands {
+        let verification = run_verification_command(command, workspace, case_id).await?;
+        stage_verification_commands.push(verification.clone());
+        verification_commands.push(verification);
+    }
+    for contract in &stage.public_command_contracts {
+        let verification = run_public_command_contract(contract, workspace, case_id).await?;
+        stage_verification_commands.push(verification.clone());
+        verification_commands.push(verification);
+    }
+    Ok(())
+}
+
 enum ManualStRouteCommandOutput {
     Completed(std::process::Output),
     TimedOut { timeout_seconds: u64 },
@@ -3720,11 +3798,54 @@ impl ManualStRouteResult {
 }
 
 fn default_model_id() -> String {
-    ResolvedConfig::default().model.model
+    configured_model_config()
+        .map(|config| config.model)
+        .unwrap_or_else(|| ResolvedConfig::default().model.model)
 }
 
 fn default_provider_base_url() -> String {
-    ResolvedConfig::default().model.base_url
+    configured_model_config()
+        .map(|config| config.base_url)
+        .unwrap_or_else(|| ResolvedConfig::default().model.base_url)
+}
+
+fn configured_model_config() -> Option<crate::config::ModelConfig> {
+    crate::config::ConfigLoader::load(&Utf8PathBuf::from("."), None)
+        .ok()
+        .map(|config| config.model)
+}
+
+fn manual_st_run_request_model(config: &ManualStRouteRunConfig) -> String {
+    config.model_override.clone().unwrap_or_default()
+}
+
+fn manual_st_run_request_base_url(config: &ManualStRouteRunConfig) -> String {
+    config.base_url_override.clone().unwrap_or_default()
+}
+
+pub fn manual_st_route_omits_provider_defaults_without_explicit_override_fixture_passes() -> bool {
+    let without_override = ManualStRouteRunConfig {
+        route: ManualStRouteKind::RequiredCore,
+        output_root: None,
+        preflight_report: Utf8PathBuf::from("preflight.json"),
+        model_override: None,
+        base_url_override: None,
+        provider_metadata_mode_override: None,
+        context_window_override: None,
+        max_output_tokens_override: None,
+        max_turn_seconds: 7200,
+        dry_run: false,
+    };
+    let with_override = ManualStRouteRunConfig {
+        model_override: Some("custom-model".to_string()),
+        base_url_override: Some("http://provider.example:1234".to_string()),
+        ..without_override.clone()
+    };
+
+    manual_st_run_request_model(&without_override).is_empty()
+        && manual_st_run_request_base_url(&without_override).is_empty()
+        && manual_st_run_request_model(&with_override) == "custom-model"
+        && manual_st_run_request_base_url(&with_override) == "http://provider.example:1234"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3911,6 +4032,74 @@ pub fn route_verification_waits_for_authored_artifacts_fixture_passes() -> bool 
         && manual_st_route_verification_may_run(&verification_only_closeout)
         && verification_only_closeout.verification_required
             == vec!["python -m unittest".to_string()]
+}
+
+pub fn post_repair_route_verification_clears_stale_repair_fixture_passes() -> bool {
+    let verification_work = ActiveWorkContract::Verification {
+        commands: vec![
+            "python -X utf8 tool.py ok".to_string(),
+            "python -X utf8 tool.py bad".to_string(),
+        ],
+        failing_labels: vec!["failed command: python -X utf8 tool.py ok".to_string()],
+        repair_required: true,
+        targets: vec![Utf8PathBuf::from("tool.py")],
+    };
+    let stale_failure = VerificationCommandEvidence {
+        command: "python -X utf8 tool.py ok".to_string(),
+        working_directory: "workspace".to_string(),
+        start_time: "100".to_string(),
+        end_time: "110".to_string(),
+        exit_code: Some(0),
+        stdout_summary: "interactive prompt".to_string(),
+        stderr_summary: String::new(),
+        normalized_failure_class: Some(
+            "public_command_contract_failed: stdout had no line ending with `ok`".to_string(),
+        ),
+        required: true,
+        case_id: "caseX".to_string(),
+        requirement_id: Some("public_command_contract".to_string()),
+    };
+    let post_repair_pass = VerificationCommandEvidence {
+        command: "python -X utf8 tool.py ok".to_string(),
+        working_directory: "workspace".to_string(),
+        start_time: "200".to_string(),
+        end_time: "210".to_string(),
+        exit_code: Some(0),
+        stdout_summary: "ok".to_string(),
+        stderr_summary: String::new(),
+        normalized_failure_class: None,
+        required: true,
+        case_id: "caseX".to_string(),
+        requirement_id: Some("public_command_contract".to_string()),
+    };
+    let second_post_repair_pass = VerificationCommandEvidence {
+        command: "python -X utf8 tool.py bad".to_string(),
+        working_directory: "workspace".to_string(),
+        start_time: "211".to_string(),
+        end_time: "220".to_string(),
+        exit_code: Some(1),
+        stdout_summary: String::new(),
+        stderr_summary: "usage".to_string(),
+        normalized_failure_class: None,
+        required: true,
+        case_id: "caseX".to_string(),
+        requirement_id: Some("public_command_contract".to_string()),
+    };
+    let evidence = classify_manual_st_closeout_from_evidence(
+        false,
+        None,
+        Some(&verification_work),
+        &["tool.py".to_string()],
+        &["tool.py".to_string()],
+        &[stale_failure, post_repair_pass, second_post_repair_pass],
+    );
+
+    evidence.closeout_class == ManualStCloseoutClass::RuntimeDidNotComplete
+        && evidence.open_obligations.is_empty()
+        && evidence.verification_required.is_empty()
+        && evidence.verification_failed.is_empty()
+        && evidence.verification_passed.len() == 2
+        && route_owned_contract_satisfied_after_verification(&evidence)
 }
 
 pub fn closeout_continuation_is_text_only_fixture_passes() -> bool {

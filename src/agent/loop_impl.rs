@@ -954,6 +954,7 @@ impl<'a> TurnRuntime<'a> {
                     step_request.config.model.extra_body_json.clone(),
                     tool_names.len(),
                     &dispatch_tool_choice,
+                    step_request.config.model.provider_metadata_mode,
                 ),
             };
             let terminal_response_timeout_ms = terminal_response_timeout_ms_for_state(
@@ -4145,6 +4146,10 @@ pub(crate) fn source_content_shape_rejects_markdown_payload_fixture_passes() -> 
 
 pub(crate) fn source_content_shape_rejects_raw_prose_line_fixture_passes() -> bool {
     crate::agent::content_shape_contract::python_source_executable_shape_rejects_raw_prose_line_fixture_passes()
+}
+
+pub(crate) fn source_content_shape_rejects_duplicate_entrypoint_fixture_passes() -> bool {
+    crate::agent::content_shape_contract::python_source_executable_shape_rejects_duplicate_entrypoint_fixture_passes()
 }
 
 pub(crate) fn corrective_content_shape_no_progress_terminal_guard_fixture_passes() -> bool {
@@ -12101,6 +12106,7 @@ fn extra_body_with_tool_choice(
     extra_body: Option<Value>,
     tool_count: usize,
     tool_choice: &ToolChoice,
+    provider_metadata_mode: crate::config::ProviderMetadataMode,
 ) -> Option<Value> {
     if tool_count == 0 || matches!(tool_choice, ToolChoice::Auto | ToolChoice::None) {
         return extra_body;
@@ -12116,20 +12122,51 @@ fn extra_body_with_tool_choice(
                 map.insert("tool_choice".to_string(), json!("required"));
             }
             ToolChoice::Named(name) => {
-                map.insert(
-                    "tool_choice".to_string(),
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": name.to_string()
-                        }
-                    }),
-                );
+                let tool_choice_value = match provider_metadata_mode {
+                    crate::config::ProviderMetadataMode::LmStudioNativeRequired => {
+                        json!("required")
+                    }
+                    crate::config::ProviderMetadataMode::OpenAiCompatibleOnly => {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": name.to_string()
+                            }
+                        })
+                    }
+                };
+                map.insert("tool_choice".to_string(), tool_choice_value);
             }
             ToolChoice::Auto | ToolChoice::None => {}
         }
     }
     Some(body)
+}
+
+pub(crate) fn provider_metadata_mode_serializes_named_tool_choice_fixture_passes() -> bool {
+    let lm_studio = extra_body_with_tool_choice(
+        None,
+        1,
+        &ToolChoice::Named(ToolName::Shell),
+        crate::config::ProviderMetadataMode::LmStudioNativeRequired,
+    );
+    let openai_compatible = extra_body_with_tool_choice(
+        None,
+        1,
+        &ToolChoice::Named(ToolName::Shell),
+        crate::config::ProviderMetadataMode::OpenAiCompatibleOnly,
+    );
+
+    lm_studio
+        .as_ref()
+        .and_then(|body| body.get("tool_choice"))
+        .is_some_and(|value| value == "required")
+        && openai_compatible
+            .as_ref()
+            .and_then(|body| body.get("tool_choice"))
+            .and_then(|value| value.get("function"))
+            .and_then(|function| function.get("name"))
+            .is_some_and(|value| value == "shell")
 }
 
 fn normalized_target_keys(target: &str, workspace_root: &Utf8Path) -> Vec<String> {

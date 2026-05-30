@@ -181,6 +181,12 @@ Use `provider_metadata_mode = "openai_compatible_only"` or
 provide LM Studio's native `/api/v1/models` metadata endpoint, such as vLLM/vLLM-MLX.
 In this mode, every OpenAI-compatible chat request prefixes the configured system prompt with the
 language / no-thinking policy required for qwen3.6 hosted behind vLLM-compatible servers.
+The same mode is also the provider profile boundary for tool-choice serialization and model
+availability gates. LM Studio mode keeps named tool requests provider-portable by sending
+`tool_choice = "required"` and gates on `required` / strong `auto` tool-call probes; OpenAI-compatible
+mode sends OpenAI named function `tool_choice` objects and requires the named probe to pass.
+Saved profile examples live under `../docs/testing/provider-profiles/` and can be selected with
+`MOYAI_CONFIG_PATH` without overwriting each other.
 The Tauri Desktop `LLM URL` overlay exposes the same mode switch beside the provider URL and model list.
 It also owns `context_window` and `max_output_tokens` inputs so vLLM/vLLM-MLX limits can be managed
 inside moyAI instead of relying on shell environment variables. Current vLLM-MLX `/health` and

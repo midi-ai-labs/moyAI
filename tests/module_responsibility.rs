@@ -198,6 +198,9 @@ fn docs_spec_semantic_reconciliation_rejects_contradictory_docs_before_handoff()
 fn public_command_contract_coverage_is_not_unittest_only() {
     assert!(moyai::agent::public_command_contract::public_command_contract_fixture_passes());
     assert!(moyai::harness::manual_st::public_command_contract_route_evidence_fixture_passes());
+    assert!(
+        moyai::harness::manual_st::post_repair_route_verification_clears_stale_repair_fixture_passes()
+    );
 }
 
 #[test]

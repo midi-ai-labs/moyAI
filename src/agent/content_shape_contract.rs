@@ -76,6 +76,7 @@ pub(crate) fn python_source_content_has_executable_shape(target: &str, content: 
         && !python_source_content_is_test_module_payload(content)
         && !python_source_content_is_markdown_or_prose_payload(content)
         && !python_source_content_has_raw_prose_line(content)
+        && !python_source_content_has_duplicate_executable_entrypoint(content)
         && python_source_content_has_code_shape(content)
 }
 
@@ -360,7 +361,7 @@ pub(crate) fn required_write_target_mismatch_content_shape_guidance(
 ) -> String {
     let Some(contract) = python_source_for_test_target(required_target) else {
         if python_source_target_requires_executable_shape(required_target) {
-            return " Required positive source shape: submit effective Python module text with real newline-separated source structure. Forbidden shape: do not send a quote-wrapped whole-file source string, JSON/Python-escaped serialized source, content dominated by literal `\\n` escape sequences instead of real newlines, or a unittest/pytest test module payload.".to_string();
+            return " Required positive source shape: submit effective Python module text with real newline-separated source structure. Forbidden shape: do not send a quote-wrapped whole-file source string, JSON/Python-escaped serialized source, content dominated by literal `\\n` escape sequences instead of real newlines, a unittest/pytest test module payload, multiple executable entrypoint guards, or concatenated module copies.".to_string();
         }
         if text_artifact_target_requires_readable_shape(required_target) {
             return " Required positive text artifact shape: submit effective Markdown/text with real newline-separated document structure. Forbidden shape: do not send a quote-wrapped whole-document string, JSON/Python-escaped serialized Markdown, or content dominated by literal `\\n` escape sequences instead of real newlines.".to_string();
@@ -566,6 +567,20 @@ fn python_source_content_has_raw_prose_line(content: &str) -> bool {
             && !python_source_line_can_be_executable_python(trimmed)
             && python_source_line_looks_like_prose(trimmed)
     })
+}
+
+fn python_source_content_has_duplicate_executable_entrypoint(content: &str) -> bool {
+    content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start().to_ascii_lowercase();
+            trimmed.starts_with("if ")
+                && trimmed.contains("__name__")
+                && trimmed.contains("__main__")
+        })
+        .take(2)
+        .count()
+        > 1
 }
 
 fn python_source_content_has_code_shape(content: &str) -> bool {
@@ -851,14 +866,15 @@ pub(crate) fn python_source_content_shape_metadata(target: &str) -> Value {
             "quote-wrapped whole-file source string",
             "dominant literal \\\\n escape sequences instead of real newlines",
             "JSON/Python-escaped serialized source snapshot",
-            "test module payload such as unittest/pytest tests"
+            "test module payload such as unittest/pytest tests",
+            "multiple executable entrypoint guards or concatenated module copies"
         ]
     })
 }
 
 pub(crate) fn python_source_positive_shape_guidance(target: &str) -> String {
     format!(
-        "Required positive Python source shape for `{}`: submit effective Python module text with real newline-separated source structure, imports/functions/classes/CLI entrypoint as required by the current task, and syntax that can be parsed before semantic verification. Forbidden shape: do not send a quote-wrapped whole-file source string, JSON/Python-escaped serialized source, content dominated by literal `\\n` escape sequences instead of real newlines, or a unittest/pytest test module payload. Do not send tests, Markdown, or a different deliverable for this source-target turn.",
+        "Required positive Python source shape for `{}`: submit effective Python module text with real newline-separated source structure, imports/functions/classes/CLI entrypoint as required by the current task, and syntax that can be parsed before semantic verification. Forbidden shape: do not send a quote-wrapped whole-file source string, JSON/Python-escaped serialized source, content dominated by literal `\\n` escape sequences instead of real newlines, a unittest/pytest test module payload, multiple executable entrypoint guards, or concatenated module copies. Do not send tests, Markdown, or a different deliverable for this source-target turn.",
         target.replace('\\', "/")
     )
 }
@@ -866,13 +882,13 @@ pub(crate) fn python_source_positive_shape_guidance(target: &str) -> String {
 pub(crate) fn python_source_prompt_contract(target: &str) -> String {
     let target = target.replace('\\', "/");
     format!(
-        "Active write target contract:\n- Use the `write` tool with `path` set to `{target}` and `content` set to the complete replacement content for that file.\n- The provider-visible tool schema remains the stable `write` interface; target validation belongs to the tool lifecycle for the submitted call.\n- The `content` must be Python source code for `{target}` only.\n- Required positive Python source shape: submit effective Python module text with real newline-separated source structure, imports/functions/classes/CLI entrypoint as required by the current task, and syntax that can be parsed before semantic verification.\n- Forbidden shape: do not send a quote-wrapped whole-file source string, JSON/Python-escaped serialized source, content dominated by literal `\\n` escape sequences instead of real newlines, or a unittest/pytest test module payload.\n- Do not write tests, Markdown, or a different deliverable in this source-target turn.\n- Older assistant narration, previous tool arguments, and prior progress output are not tool-call authority for this turn."
+        "Active write target contract:\n- Use the `write` tool with `path` set to `{target}` and `content` set to the complete replacement content for that file.\n- The provider-visible tool schema remains the stable `write` interface; target validation belongs to the tool lifecycle for the submitted call.\n- The `content` must be Python source code for `{target}` only.\n- Required positive Python source shape: submit effective Python module text with real newline-separated source structure, imports/functions/classes/CLI entrypoint as required by the current task, and syntax that can be parsed before semantic verification.\n- Forbidden shape: do not send a quote-wrapped whole-file source string, JSON/Python-escaped serialized source, content dominated by literal `\\n` escape sequences instead of real newlines, a unittest/pytest test module payload, multiple executable entrypoint guards, or concatenated module copies.\n- Do not write tests, Markdown, or a different deliverable in this source-target turn.\n- Older assistant narration, previous tool arguments, and prior progress output are not tool-call authority for this turn."
     )
 }
 
 pub(crate) fn python_source_tool_schema_description(target: &str) -> String {
     format!(
-        "Complete final Python source contents for `{}`. Required positive shape: effective Python module text with real newline-separated source structure, imports/functions/classes/CLI entrypoint as required by the current task, and syntax that can be parsed before semantic verification. Do not send a quote-wrapped whole-file source string, JSON/Python-escaped serialized source, content dominated by literal `\\n` escape sequences instead of real newlines, unittest/pytest test module payloads, tests, Markdown, or a different deliverable.",
+        "Complete final Python source contents for `{}`. Required positive shape: effective Python module text with real newline-separated source structure, imports/functions/classes/CLI entrypoint as required by the current task, and syntax that can be parsed before semantic verification. Do not send a quote-wrapped whole-file source string, JSON/Python-escaped serialized source, content dominated by literal `\\n` escape sequences instead of real newlines, unittest/pytest test module payloads, multiple executable entrypoint guards, concatenated module copies, tests, Markdown, or a different deliverable.",
         target.replace('\\', "/")
     )
 }
@@ -1045,6 +1061,95 @@ Usage:
     python component.py 1 + 2
 "#,
         )
+}
+
+pub(crate) fn python_source_executable_shape_rejects_duplicate_entrypoint_fixture_passes() -> bool {
+    let good = r#"
+import sys
+
+def main():
+    print("ok")
+
+if __name__ == "__main__":
+    main()
+"#;
+    let concatenated = r#"
+import sys
+
+def main():
+    print("first")
+
+if __name__ == "__main__":
+    main()
+
+import sys
+
+def main():
+    print("second")
+
+if __name__ == "__main__":
+    main()
+"#;
+    let write_arguments = json!({
+        "path": "component.py",
+        "content": concatenated,
+    });
+    let Some(write_result) =
+        artifact_content_shape_violation_result("write", &write_arguments, None)
+    else {
+        return false;
+    };
+    let root_path = std::env::temp_dir().join(format!(
+        "moyai-source-duplicate-entrypoint-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    ));
+    let Ok(root) = camino::Utf8PathBuf::from_path_buf(root_path) else {
+        return false;
+    };
+    if std::fs::create_dir_all(root.as_std_path()).is_err()
+        || std::fs::write(root.join("component.py").as_std_path(), good).is_err()
+    {
+        let _ = std::fs::remove_dir_all(root.as_std_path());
+        return false;
+    }
+    let patch_arguments = json!({
+        "patch_text": "*** Begin Patch\n*** Update File: component.py\n@@\n if __name__ == \"__main__\":\n     main()\n+\n+if __name__ == \"__main__\":\n+    main()\n*** End Patch"
+    });
+    let patch_result =
+        artifact_content_shape_violation_result("apply_patch", &patch_arguments, Some(&root));
+    let patch_left_workspace_clean =
+        std::fs::read_to_string(root.join("component.py").as_std_path())
+            .ok()
+            .as_deref()
+            == Some(good);
+    let _ = std::fs::remove_dir_all(root.as_std_path());
+    python_source_content_has_executable_shape("component.py", good)
+        && python_artifact_content_has_executable_shape("component.py", good)
+        && !python_source_content_has_executable_shape("component.py", concatenated)
+        && !python_artifact_content_has_executable_shape("component.py", concatenated)
+        && !python_source_content_has_duplicate_executable_entrypoint(good)
+        && python_source_content_has_duplicate_executable_entrypoint(concatenated)
+        && write_result
+            .metadata
+            .pointer("/content_shape_contract/forbidden_shape")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|item| item.contains("multiple executable entrypoint guards"))
+            })
+        && write_result
+            .metadata
+            .pointer("/tool_feedback_envelope/side_effects_applied")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && patch_result.is_some()
+        && patch_left_workspace_clean
 }
 
 pub(crate) fn test_target_content_shape_projection_is_positive_and_forbidden() -> bool {
