@@ -6,6 +6,7 @@ pub mod docs_semantic_contract;
 pub(crate) mod edit_recovery;
 pub mod event;
 pub(crate) mod grounding_evidence;
+pub(crate) mod language_evidence;
 pub(crate) mod lifecycle_kernel;
 pub mod loop_impl;
 pub mod prompt;

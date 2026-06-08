@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::json;
 
+use crate::agent::language_evidence::language_verification_artifact_role_stem;
 use crate::error::RuntimeError;
 use crate::harness::artifact::{ArtifactKind, ArtifactManifest, ArtifactTag, hash_file};
 use crate::harness::contract::{ContractKind, ContractRecord};
@@ -178,16 +179,23 @@ fn classify_artifact(path: &str, tags: &mut BTreeSet<ArtifactTag>) -> ArtifactKi
     {
         tags.insert(ArtifactTag::ImageTransport);
         ArtifactKind::ImageAttachment
-    } else if file_name.ends_with(".log")
-        || artifact_name_has_role_token(file_name, "unittest")
-        || artifact_name_has_role_token(file_name, "py_compile")
-    {
+    } else if file_name.ends_with(".log") || artifact_name_has_verification_role(file_name) {
         tags.insert(ArtifactTag::Verification);
         ArtifactKind::VerificationLog
     } else {
         tags.insert(ArtifactTag::ScenarioOutput);
         ArtifactKind::WorkspaceFile
     }
+}
+
+fn artifact_name_has_verification_role(file_name: &str) -> bool {
+    let stem = file_name
+        .strip_suffix(".json")
+        .or_else(|| file_name.strip_suffix(".md"))
+        .or_else(|| file_name.strip_suffix(".txt"))
+        .or_else(|| file_name.strip_suffix(".log"))
+        .unwrap_or(file_name);
+    language_verification_artifact_role_stem(stem)
 }
 
 fn is_request_diagnostics_artifact(path: &str, file_name: &str) -> bool {
@@ -221,7 +229,7 @@ mod tests {
     #[test]
     fn stored_artifact_classifier_does_not_treat_request_named_outputs_as_diagnostics() {
         let mut tags = BTreeSet::new();
-        let kind = classify_artifact("workspace/request_handler.py", &mut tags);
+        let kind = classify_artifact("workspace/request-handler.source", &mut tags);
 
         assert_eq!(kind, ArtifactKind::WorkspaceFile);
         assert!(tags.contains(&ArtifactTag::ScenarioOutput));
@@ -235,5 +243,22 @@ mod tests {
 
         assert_eq!(kind, ArtifactKind::RequestDiagnostics);
         assert!(tags.contains(&ArtifactTag::Diagnostics));
+    }
+
+    #[test]
+    fn stored_artifact_classifier_uses_generic_verification_role_stems() {
+        let mut tags = BTreeSet::new();
+        let kind = classify_artifact("verification/vitest.txt", &mut tags);
+
+        assert_eq!(kind, ArtifactKind::VerificationLog);
+        assert!(tags.contains(&ArtifactTag::Verification));
+
+        let mut non_verification_tags = BTreeSet::new();
+        let non_verification =
+            classify_artifact("workspace/test_plan.txt", &mut non_verification_tags);
+
+        assert_eq!(non_verification, ArtifactKind::WorkspaceFile);
+        assert!(non_verification_tags.contains(&ArtifactTag::ScenarioOutput));
+        assert!(!non_verification_tags.contains(&ArtifactTag::Verification));
     }
 }

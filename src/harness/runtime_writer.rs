@@ -10,7 +10,7 @@ use crate::harness::{
     HarnessEventStore, HarnessRunId, HarnessRunRecord, HarnessRunStatus, HarnessRunStore,
     SqliteArtifactStore, SqliteHarnessEventStore, SqliteHarnessRunStore, artifact::hash_bytes,
 };
-use crate::protocol::{ProtocolEventStore, SqliteProtocolEventStore, TurnId};
+use crate::protocol::TurnId;
 use crate::runtime::{RunEventSink, SystemClock};
 use crate::session::{RunEvent, SessionId};
 use crate::storage::StoreBundle;
@@ -20,15 +20,12 @@ pub struct NativeHarnessRecorder {
     session_id: Option<SessionId>,
     run_store: SqliteHarnessRunStore,
     event_store: SqliteHarnessEventStore,
-    protocol_event_store: SqliteProtocolEventStore,
     artifact_store: SqliteArtifactStore,
     workspace_root: Utf8PathBuf,
     artifact_root: Utf8PathBuf,
     started_at_ms: i64,
     next_sequence_no: i64,
     protocol_turn_id: TurnId,
-    next_protocol_sequence_no: i64,
-    record_protocol_projection: bool,
 }
 
 impl NativeHarnessRecorder {
@@ -37,22 +34,13 @@ impl NativeHarnessRecorder {
         session_id: Option<SessionId>,
         workspace_root: Utf8PathBuf,
     ) -> Result<Self, RuntimeError> {
-        Self::start_with_protocol_projection(store, session_id, workspace_root, true)
+        Self::start_harness_only(store, session_id, workspace_root)
     }
 
     pub fn start_harness_only(
         store: &StoreBundle,
         session_id: Option<SessionId>,
         workspace_root: Utf8PathBuf,
-    ) -> Result<Self, RuntimeError> {
-        Self::start_with_protocol_projection(store, session_id, workspace_root, false)
-    }
-
-    fn start_with_protocol_projection(
-        store: &StoreBundle,
-        session_id: Option<SessionId>,
-        workspace_root: Utf8PathBuf,
-        record_protocol_projection: bool,
     ) -> Result<Self, RuntimeError> {
         let run_id = HarnessRunId::new();
         let artifact_root = store
@@ -62,7 +50,6 @@ impl NativeHarnessRecorder {
             .join(run_id.to_string());
         let run_store = store.harness_run_store();
         let event_store = store.harness_event_store();
-        let protocol_event_store = store.protocol_event_store();
         let artifact_store = store.harness_artifact_store();
         let started_at_ms = SystemClock::now_ms();
         std::fs::create_dir_all(artifact_root.as_std_path()).map_err(runtime_error)?;
@@ -83,15 +70,12 @@ impl NativeHarnessRecorder {
             session_id,
             run_store,
             event_store,
-            protocol_event_store,
             artifact_store,
             workspace_root,
             artifact_root,
             started_at_ms,
             next_sequence_no: 0,
             protocol_turn_id: TurnId::new(),
-            next_protocol_sequence_no: 0,
-            record_protocol_projection,
         })
     }
 
@@ -107,7 +91,6 @@ impl NativeHarnessRecorder {
         let kind = harness_kind_for_run_event(event);
         let payload = payload_for_run_event(event, &self.workspace_root, &self.artifact_root)?;
         self.append(kind, payload)?;
-        self.record_protocol_projection(event)?;
         if let Some(status) = terminal_status_for_run_event(event) {
             self.run_store
                 .upsert_run(&HarnessRunRecord {
@@ -122,29 +105,6 @@ impl NativeHarnessRecorder {
                 })
                 .map_err(runtime_error)?;
         }
-        Ok(())
-    }
-
-    fn record_protocol_projection(&mut self, event: &RunEvent) -> Result<(), RuntimeError> {
-        if !self.record_protocol_projection {
-            return Ok(());
-        }
-        let Some(projection) = crate::protocol::project_protocol_run_event(
-            event,
-            self.session_id,
-            self.protocol_turn_id,
-            self.next_protocol_sequence_no,
-        ) else {
-            return Ok(());
-        };
-        self.protocol_event_store
-            .append_event_bundle(
-                &projection.runtime_event,
-                projection.history_item.as_ref(),
-                projection.turn_item.as_ref(),
-            )
-            .map_err(runtime_error)?;
-        self.next_protocol_sequence_no += 1;
         Ok(())
     }
 
@@ -254,6 +214,28 @@ impl<S: RunEventSink + ?Sized> RunEventSink for HarnessRecordingSink<'_, S> {
     }
 }
 
+pub(crate) fn native_harness_recorder_is_harness_only_fixture_passes() -> bool {
+    let runtime_writer = include_str!("runtime_writer.rs");
+    let run_service = include_str!("../app/run_service.rs");
+    let stale_protocol_store_type = ["Sqlite", "Protocol", "EventStore"].concat();
+    let stale_protocol_store_field = ["protocol", "_event", "_store"].concat();
+    let stale_projection_method = ["record", "_protocol", "_projection"].concat();
+    let start_block = runtime_writer
+        .split("pub fn start(")
+        .nth(1)
+        .and_then(|tail| tail.split("pub fn start_harness_only(").next())
+        .unwrap_or_default();
+
+    !runtime_writer.contains(&stale_protocol_store_type)
+        && !runtime_writer.contains(&stale_protocol_store_field)
+        && !runtime_writer.contains(&stale_projection_method)
+        && start_block.contains("Self::start_harness_only")
+        && run_service.contains("NativeHarnessRecorder::start_harness_only")
+        && run_service.contains("let mut harness_sink = HarnessRecordingSink::new")
+        && run_service.contains("let mut sink = ProtocolRecordingSink::new")
+        && run_service.contains("&mut harness_sink")
+}
+
 fn harness_kind_for_run_event(event: &RunEvent) -> HarnessEventKind {
     match event {
         RunEvent::SessionStarted { .. } => HarnessEventKind::RunStarted,
@@ -280,7 +262,9 @@ fn harness_kind_for_run_event(event: &RunEvent) -> HarnessEventKind {
         RunEvent::RetryScheduled { .. } | RunEvent::RecoverableRuntimeFeedback { .. } => {
             HarnessEventKind::CorrectiveResultEmitted
         }
-        RunEvent::StateUpdated { .. } => HarnessEventKind::StateSnapshotRecorded,
+        RunEvent::StateUpdated { .. } | RunEvent::LifecycleGuardUpdated { .. } => {
+            HarnessEventKind::StateSnapshotRecorded
+        }
         RunEvent::SessionCompleted { .. }
         | RunEvent::SessionAwaitingUser { .. }
         | RunEvent::SessionInterrupted { .. }
@@ -426,12 +410,7 @@ fn enrich_payload(
                         .unwrap_or_else(|| hash_bytes(signature_source.as_bytes()));
                     map.insert(
                         "no_progress_signature".to_string(),
-                        json!({
-                            "result_hash": result_hash,
-                            "tool": map.get("tool").cloned().unwrap_or(Value::Null),
-                            "allowed_surface_snapshot": map.get("allowed_surface_snapshot").cloned().unwrap_or_else(|| json!([])),
-                            "repeat_count": 1
-                        }),
+                        no_progress_signature_projection(map, result_hash),
                     );
                 }
             }
@@ -506,6 +485,44 @@ fn apply_tool_lifecycle_metadata_projection(map: &mut serde_json::Map<String, Va
     }
 
     applied
+}
+
+fn no_progress_signature_projection(
+    map: &serde_json::Map<String, Value>,
+    result_hash: String,
+) -> Value {
+    let tool_feedback = map.get("tool_feedback_envelope").and_then(Value::as_object);
+    let blocked_action = map
+        .get("blocked_action")
+        .cloned()
+        .or_else(|| tool_feedback.and_then(|feedback| feedback.get("blocked_action").cloned()))
+        .unwrap_or(Value::Null);
+    json!({
+        "result_hash": result_hash,
+        "tool": map.get("tool").cloned().unwrap_or(Value::Null),
+        "progress_effect": map.get("progress_effect").cloned().unwrap_or_else(|| json!("no_progress")),
+        "blocked_action": blocked_action,
+        "allowed_surface_snapshot": map.get("allowed_surface_snapshot").cloned().unwrap_or_else(|| json!([])),
+        "repeat_count": 1
+    })
+}
+
+pub(crate) fn no_progress_signature_projection_matches_schema_fixture_passes() -> bool {
+    let mut map = serde_json::Map::new();
+    map.insert("tool".to_string(), json!("shell"));
+    map.insert("progress_effect".to_string(), json!("no_progress"));
+    map.insert("blocked_action".to_string(), json!("invalid_command"));
+    map.insert("allowed_surface_snapshot".to_string(), json!(["shell"]));
+    let signature = no_progress_signature_projection(&map, "a".repeat(64));
+    signature.get("result_hash").and_then(Value::as_str) == Some(&"a".repeat(64))
+        && signature.get("tool").and_then(Value::as_str) == Some("shell")
+        && signature.get("progress_effect").and_then(Value::as_str) == Some("no_progress")
+        && signature.get("blocked_action").and_then(Value::as_str) == Some("invalid_command")
+        && signature
+            .get("allowed_surface_snapshot")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("shell")))
+        && signature.get("repeat_count").and_then(Value::as_i64) == Some(1)
 }
 
 fn stored_text_projection_seen(metadata: &Value) -> bool {

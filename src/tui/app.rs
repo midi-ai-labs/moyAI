@@ -668,13 +668,8 @@ impl TuiController {
 
     async fn open_session(&mut self, session_id: SessionId) -> Result<(), AppRunError> {
         let view = session_view(&self.app.session_service, session_id).await?;
-        if view.turn_items.is_empty() {
-            self.state
-                .load_transcript(&view.transcript, view.state, view.todos);
-        } else {
-            self.state
-                .load_turn_items(&view.session, &view.turn_items, view.state, view.todos);
-        }
+        self.state
+            .load_turn_items(&view.session, &view.turn_items, view.state, view.todos);
         self.state.modal = Modal::None;
         Ok(())
     }
@@ -692,11 +687,8 @@ impl TuiController {
         self.preview_state = None;
         if let Some(session) = self.state.selected_session() {
             let view = session_view(&self.app.session_service, session.id).await?;
-            self.preview_entries = if view.turn_items.is_empty() {
-                super::state::transcript_entries_from_transcript(&view.transcript)
-            } else {
-                super::state::transcript_entries_from_turn_items(&view.turn_items)
-            };
+            self.preview_entries =
+                super::state::transcript_entries_from_turn_items(&view.turn_items);
             self.preview_todos = view.todos;
             self.preview_state = Some(view.state);
         }
@@ -1379,7 +1371,7 @@ impl EventRenderer for TuiRenderer {
         &mut self,
         _session: &SessionRecord,
         _history_items: &[crate::protocol::HistoryItem],
-        _transcript: &crate::session::Transcript,
+        _show_reasoning: bool,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }

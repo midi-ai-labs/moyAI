@@ -1,8 +1,10 @@
 use std::fs;
+use std::io::Write;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use directories_next::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 
 const DESKTOP_PREFS_ENV: &str = "MOYAI_DESKTOP_PREFS_PATH";
 
@@ -30,16 +32,15 @@ impl DesktopPreferences {
 
     pub fn save(&self) -> Result<(), String> {
         let path = preferences_path()?;
+        self.save_to_path(&path)
+    }
+
+    fn save_to_path(&self, path: &Utf8Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         let text = toml::to_string_pretty(self).map_err(|error| error.to_string())?;
-        let temp_path = path.with_extension("tmp");
-        fs::write(&temp_path, text).map_err(|error| error.to_string())?;
-        if path.exists() {
-            let _ = fs::remove_file(&path);
-        }
-        fs::rename(&temp_path, &path).map_err(|error| error.to_string())
+        persist_desktop_preferences_tempfile(path, &text)
     }
 
     pub fn mark_project_deleted(&mut self, root: &Utf8Path) {
@@ -62,6 +63,49 @@ impl DesktopPreferences {
     pub fn is_project_deleted(&self, root: &Utf8Path) -> bool {
         self.deleted_project_roots.iter().any(|path| path == root)
     }
+}
+
+fn persist_desktop_preferences_tempfile(path: &Utf8Path, text: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("desktop preferences path `{path}` has no parent directory"))?;
+    let mut temp =
+        NamedTempFile::new_in(parent.as_std_path()).map_err(|error| error.to_string())?;
+    temp.write_all(text.as_bytes())
+        .map_err(|error| error.to_string())?;
+    temp.as_file_mut()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temp.persist(path.as_std_path())
+        .map(|_| ())
+        .map_err(|error| error.error.to_string())
+}
+
+pub(crate) fn desktop_preferences_save_atomic_commit_fixture_passes() -> bool {
+    let Ok(temp_dir) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(path) = Utf8PathBuf::from_path_buf(temp_dir.path().join("desktop.toml")) else {
+        return false;
+    };
+    if fs::write(&path, "last_workspace = \"C:/old\"\n").is_err() {
+        return false;
+    }
+    let root = Utf8PathBuf::from("C:/workspace/deleted");
+    let preferences = DesktopPreferences {
+        last_workspace: None,
+        window_opacity_percent: Some(91),
+        deleted_project_roots: vec![root.clone()],
+    };
+    if preferences.save_to_path(&path).is_err() {
+        return false;
+    }
+    let Ok(saved) = fs::read_to_string(&path) else {
+        return false;
+    };
+    saved.contains("window_opacity_percent = 91")
+        && saved.contains("deleted_project_roots")
+        && saved.contains(root.as_str())
 }
 
 fn preferences_path() -> Result<Utf8PathBuf, String> {

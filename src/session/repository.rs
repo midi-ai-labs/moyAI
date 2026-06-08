@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use crate::error::StorageError;
 
 use super::{
-    ChangeId, MessageId, NewMessage, NewPart, NewSession, PartRecord, ProjectId, ProjectRecord,
-    SessionId, SessionRecord, SessionStateSnapshot, SessionStatus, TodoItem, Transcript,
+    ChangeId, NewSession, ProjectId, ProjectRecord, SessionId, SessionRecord, SessionStateSnapshot,
+    TodoItem,
 };
 
 #[async_trait(?Send)]
@@ -22,25 +22,7 @@ pub trait SessionRepository: Send + Sync {
     ) -> Result<Vec<SessionRecord>, StorageError>;
     async fn list_recent_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>, StorageError>;
     async fn delete_session(&self, id: SessionId) -> Result<(), StorageError>;
-    async fn update_session_title(&self, id: SessionId, title: &str) -> Result<(), StorageError>;
-    async fn set_status(&self, id: SessionId, status: SessionStatus) -> Result<(), StorageError>;
-    async fn append_message(
-        &self,
-        draft: NewMessage,
-        parts: Vec<NewPart>,
-    ) -> Result<super::MessageRecord, StorageError>;
-    async fn append_part(
-        &self,
-        message_id: MessageId,
-        part: NewPart,
-    ) -> Result<PartRecord, StorageError>;
-    async fn transcript(&self, session_id: SessionId) -> Result<Transcript, StorageError>;
     async fn get_state(&self, session_id: SessionId) -> Result<SessionStateSnapshot, StorageError>;
-    async fn update_state(
-        &self,
-        session_id: SessionId,
-        state: &SessionStateSnapshot,
-    ) -> Result<(), StorageError>;
     async fn update_todos(
         &self,
         session_id: SessionId,

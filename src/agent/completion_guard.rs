@@ -2,6 +2,10 @@ use std::fs;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
+use crate::agent::language_evidence::{
+    ArtifactRole, classify_artifact_target as classify_language_artifact_target,
+};
+
 // These setup-like files are intentionally hardcoded because completion gating
 // must distinguish "project scaffold exists" from "runtime artifact exists".
 // opencode and Roo Code also hardcode runtime guardrails and prompt budgets;
@@ -69,17 +73,13 @@ const CREATION_HINTS: &[&str] = &[
     "書",
 ];
 
-const CODE_EXTENSIONS: &[&str] = &[
-    "c", "cc", "cpp", "cs", "go", "h", "hpp", "java", "js", "jsx", "kt", "php", "ps1", "py", "rb",
-    "rs", "scala", "sh", "swift", "ts", "tsx",
-];
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct WorkspaceArtifactSummary {
     file_count: usize,
     has_runtime_artifact: bool,
     only_setup_like_files: bool,
-    has_rust_manifest: bool,
+    runtime_artifact_count: usize,
+    default_scaffold_runtime_artifacts: Vec<String>,
 }
 
 pub(crate) fn requires_workspace_changes(user_text: &str) -> bool {
@@ -97,11 +97,17 @@ pub(crate) fn completion_workspace_blocked_reason(
     }
 
     let summary = inspect_workspace(cwd);
-    let lower = user_text.to_ascii_lowercase();
-    if summary.has_rust_manifest {
-        if let Some(reason) = rust_workspace_blocked_reason(cwd, &lower) {
-            return Some(reason);
-        }
+    let request_requires_workspace_change = requires_workspace_changes(user_text);
+    if summary.has_runtime_artifact
+        && summary.runtime_artifact_count == summary.default_scaffold_runtime_artifacts.len()
+        && request_requires_workspace_change
+        && !user_text.to_ascii_lowercase().contains("hello world")
+        && !user_text.to_ascii_lowercase().contains("hello, world")
+    {
+        let targets = summary.default_scaffold_runtime_artifacts.join(", ");
+        return Some(format!(
+            "completion blocked: runtime artifacts still look like default scaffold stubs (`{targets}`). Replace generated placeholder code with the requested implementation before finishing."
+        ));
     }
 
     if summary.file_count == 0
@@ -112,152 +118,13 @@ pub(crate) fn completion_workspace_blocked_reason(
         return None;
     }
 
-    if summary.has_rust_manifest && lower.contains("rust") {
-        return Some(
-            "completion blocked: the workspace still only contains Rust setup files. After creating `Cargo.toml`, also create `src/main.rs` or `src/lib.rs` before finishing.".to_string(),
-        );
-    }
-
-    if requires_workspace_changes(user_text) {
+    if request_requires_workspace_change {
         return Some(
             "completion blocked: the workspace still only contains setup or documentation files. Create the requested implementation files before finishing.".to_string(),
         );
     }
 
     None
-}
-
-fn rust_workspace_blocked_reason(cwd: &Utf8Path, lower_user_text: &str) -> Option<String> {
-    if !lower_user_text.contains("rust") || lower_user_text.contains("hello world") {
-        return None;
-    }
-
-    for project_root in candidate_rust_project_roots(cwd) {
-        if rust_project_lacks_source(&project_root) {
-            if project_root == cwd {
-                return Some(
-                    "completion blocked: the workspace still only contains Rust setup files. After creating `Cargo.toml`, also create `src/main.rs` or `src/lib.rs` before finishing.".to_string(),
-                );
-            }
-
-            let manifest_path = workspace_relative_hint(cwd, &project_root.join("Cargo.toml"));
-            let main_path = workspace_relative_hint(cwd, &project_root.join("src/main.rs"));
-            let lib_path = workspace_relative_hint(cwd, &project_root.join("src/lib.rs"));
-            let project_label = workspace_relative_hint(cwd, &project_root);
-            return Some(format!(
-                "completion blocked: the Rust project at `{project_label}/` still only contains setup files. After creating `{manifest_path}`, also create `{main_path}` or `{lib_path}` before finishing."
-            ));
-        }
-
-        if rust_project_looks_like_cargo_init_scaffold(&project_root) {
-            if project_root == cwd {
-                return Some(
-                    "completion blocked: the workspace is still the default `cargo init` scaffold. Replace the `Hello, world!` stub with the requested Rust implementation before finishing.".to_string(),
-                );
-            }
-
-            let project_label = workspace_relative_hint(cwd, &project_root);
-            let main_path = workspace_relative_hint(cwd, &project_root.join("src/main.rs"));
-            return Some(format!(
-                "completion blocked: the Rust project at `{project_label}/` is still the default `cargo init` scaffold. Replace the `Hello, world!` stub in `{main_path}` with the requested Rust implementation before finishing."
-            ));
-        }
-    }
-
-    None
-}
-
-fn rust_project_looks_like_cargo_init_scaffold(project_root: &Utf8Path) -> bool {
-    let main_rs = project_root.join("src/main.rs");
-    let main_text = fs::read_to_string(&main_rs)
-        .ok()
-        .map(|value| value.replace("\r\n", "\n"))
-        .unwrap_or_default();
-    if main_text.trim() != "fn main() {\n    println!(\"Hello, world!\");\n}" {
-        return false;
-    }
-
-    rust_project_source_files(project_root) == vec!["src/main.rs".to_string()]
-}
-
-fn rust_project_lacks_source(project_root: &Utf8Path) -> bool {
-    rust_project_source_files(project_root).is_empty()
-}
-
-fn rust_project_source_files(project_root: &Utf8Path) -> Vec<String> {
-    let mut files = Vec::new();
-    for relative_dir in ["src", "tests", "examples", "benches"] {
-        collect_rust_source_files(project_root, &project_root.join(relative_dir), &mut files);
-    }
-
-    let build_rs = project_root.join("build.rs");
-    if build_rs.is_file() {
-        files.push("build.rs".to_string());
-    }
-
-    files.sort();
-    files.dedup();
-    files
-}
-
-fn collect_rust_source_files(project_root: &Utf8Path, current: &Utf8Path, files: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(current) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = match Utf8PathBuf::from_path_buf(entry.path()) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            if should_skip_directory(project_root, &path) {
-                continue;
-            }
-            collect_rust_source_files(project_root, &path, files);
-            continue;
-        }
-        if file_type.is_file()
-            && path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
-        {
-            files.push(relative_lowercase(project_root, &path));
-        }
-    }
-}
-
-fn candidate_rust_project_roots(cwd: &Utf8Path) -> Vec<Utf8PathBuf> {
-    let mut roots = Vec::new();
-    if cwd.join("Cargo.toml").is_file() {
-        roots.push(cwd.to_path_buf());
-    }
-
-    let Ok(entries) = fs::read_dir(cwd) else {
-        return roots;
-    };
-    for entry in entries.flatten() {
-        let path = match Utf8PathBuf::from_path_buf(entry.path()) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() || should_skip_directory(cwd, &path) {
-            continue;
-        }
-        if path.join("Cargo.toml").is_file() {
-            roots.push(path);
-        }
-    }
-
-    roots.sort();
-    roots.dedup();
-    roots
 }
 
 fn request_is_documentation_focused(user_text: &str) -> bool {
@@ -279,8 +146,14 @@ fn contains_explicit_file_target(text: &str) -> bool {
             })
             .trim_end_matches(|ch: char| matches!(ch, '.' | ':' | ';' | '!' | '?'))
             .trim_start_matches(|ch: char| matches!(ch, '*' | '-' | '+'));
-        !candidate.is_empty()
-            && (candidate.contains('/') || candidate.contains('\\') || candidate.contains('.'))
+        if candidate.is_empty() {
+            return false;
+        }
+        if candidate.contains('/') || candidate.contains('\\') {
+            return true;
+        }
+        let lower = candidate.to_ascii_lowercase();
+        SETUP_LIKE_FILENAMES.contains(&lower.as_str())
     })
 }
 
@@ -327,14 +200,15 @@ fn collect_workspace_artifacts(
         summary.file_count += 1;
         if is_runtime_artifact(root, &path) {
             summary.has_runtime_artifact = true;
+            summary.runtime_artifact_count += 1;
             summary.only_setup_like_files = false;
+            if runtime_artifact_looks_like_default_scaffold_stub(root, &path) {
+                summary
+                    .default_scaffold_runtime_artifacts
+                    .push(workspace_relative_hint(root, &path));
+            }
         } else if !is_setup_like_artifact(root, &path) {
             summary.only_setup_like_files = false;
-        }
-
-        let relative = relative_lowercase(root, &path);
-        if relative == "cargo.toml" || relative.ends_with("/cargo.toml") {
-            summary.has_rust_manifest = true;
         }
     }
 }
@@ -350,16 +224,39 @@ fn should_skip_directory(root: &Utf8Path, path: &Utf8Path) -> bool {
 
 fn is_runtime_artifact(root: &Utf8Path, path: &Utf8Path) -> bool {
     let relative = relative_lowercase(root, path);
+    if is_setup_like_artifact(root, path) {
+        return false;
+    }
     if relative.starts_with("src/") || relative.starts_with("tests/") {
         return true;
     }
-    let filename = relative.rsplit('/').next().unwrap_or(relative.as_str());
-    if filename.starts_with("test_") {
-        return true;
+    let spec = classify_language_artifact_target(&relative);
+    matches!(spec.role, ArtifactRole::Source | ArtifactRole::Test)
+}
+
+fn runtime_artifact_looks_like_default_scaffold_stub(root: &Utf8Path, path: &Utf8Path) -> bool {
+    let relative = relative_lowercase(root, path);
+    let spec = classify_language_artifact_target(&relative);
+    if !matches!(spec.role, ArtifactRole::Source | ArtifactRole::Test) {
+        return false;
     }
-    path.extension()
-        .map(|extension| CODE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let normalized = text.replace("\r\n", "\n").to_ascii_lowercase();
+    let non_empty_line_count = normalized
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    let compact = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let has_small_hello_world_stub = non_empty_line_count <= 12
+        && (compact.contains("hello, world") || compact.contains("hello world"));
+    let has_frontend_generator_stub = compact.contains("vite")
+        && (compact.contains("count is") || compact.contains("edit src/"))
+        || compact.contains("learn react")
+        || compact.contains("reactlogo")
+        || compact.contains("app.css") && compact.contains("main.tsx");
+    has_small_hello_world_stub || has_frontend_generator_stub
 }
 
 fn is_setup_like_artifact(root: &Utf8Path, path: &Utf8Path) -> bool {
@@ -395,5 +292,125 @@ fn workspace_relative_hint(root: &Utf8Path, path: &Utf8Path) -> String {
         ".".to_string()
     } else {
         relative
+    }
+}
+
+pub(crate) fn generic_scaffold_completion_guard_fixture_passes() -> bool {
+    let root_path = std::env::temp_dir().join(format!(
+        "moyai-generic-completion-guard-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    ));
+    let Ok(root) = Utf8PathBuf::from_path_buf(root_path) else {
+        return false;
+    };
+    let setup_only = root.join("setup-only");
+    let default_stub = root.join("default-stub");
+    let implemented = root.join("implemented");
+    let result = (|| {
+        fs::create_dir_all(setup_only.as_std_path()).ok()?;
+        fs::write(
+            setup_only.join("package.json").as_std_path(),
+            r#"{"scripts":{"test":"node --test"}}"#,
+        )
+        .ok()?;
+        let setup_reason = completion_workspace_blocked_reason(
+            setup_only.as_path(),
+            Some("Create a todo CLI application"),
+        )?;
+
+        fs::create_dir_all(default_stub.join("src").as_std_path()).ok()?;
+        fs::write(
+            default_stub.join("package.json").as_std_path(),
+            r#"{"scripts":{"test":"node --test"}}"#,
+        )
+        .ok()?;
+        fs::write(
+            default_stub.join("src/main.js").as_std_path(),
+            "console.log(\"Hello, world!\");\n",
+        )
+        .ok()?;
+        let stub_reason = completion_workspace_blocked_reason(
+            default_stub.as_path(),
+            Some("Create a todo CLI application"),
+        )?;
+
+        fs::create_dir_all(implemented.join("src").as_std_path()).ok()?;
+        fs::write(
+            implemented.join("package.json").as_std_path(),
+            r#"{"scripts":{"test":"node --test"}}"#,
+        )
+        .ok()?;
+        fs::write(
+            implemented.join("src/main.js").as_std_path(),
+            "export function addTodo(items, title) {\n  return [...items, { title, done: false }];\n}\n",
+        )
+        .ok()?;
+        let implemented_reason = completion_workspace_blocked_reason(
+            implemented.as_path(),
+            Some("Create a todo CLI application"),
+        );
+        Some(
+            setup_reason.contains("setup or documentation files")
+                && stub_reason.contains("default scaffold stubs")
+                && stub_reason.contains("src/main.js")
+                && implemented_reason.is_none(),
+        )
+    })()
+    .unwrap_or(false);
+    let _ = fs::remove_dir_all(root.as_std_path());
+    result
+}
+
+pub(crate) fn completion_guard_does_not_treat_dotted_technology_token_as_file_target_fixture_passes()
+-> bool {
+    let root_path = std::env::temp_dir().join(format!(
+        "moyai-dotted-technology-completion-guard-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    ));
+    let Ok(root) = Utf8PathBuf::from_path_buf(root_path) else {
+        return false;
+    };
+    let result = (|| {
+        fs::create_dir_all(root.as_std_path()).ok()?;
+        fs::write(
+            root.join("package.json").as_std_path(),
+            r#"{"scripts":{"test":"node --test"}}"#,
+        )
+        .ok()?;
+
+        let dotted_technology_reason = completion_workspace_blocked_reason(
+            root.as_path(),
+            Some("Create a Node.js todo CLI application"),
+        )?;
+        let explicit_file_reason =
+            completion_workspace_blocked_reason(root.as_path(), Some("Create src/main.js"));
+
+        Some(
+            dotted_technology_reason.contains("setup or documentation files")
+                && explicit_file_reason.is_none(),
+        )
+    })()
+    .unwrap_or(false);
+    let _ = fs::remove_dir_all(root.as_std_path());
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_guard_does_not_treat_dotted_technology_token_as_file_target() {
+        assert!(
+            completion_guard_does_not_treat_dotted_technology_token_as_file_target_fixture_passes()
+        );
     }
 }

@@ -3,6 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
 
 use crate::agent::event::CompletedToolCall;
+use crate::agent::language_evidence::{
+    ArtifactRole, classify_artifact_target as classify_language_artifact_target,
+};
 use crate::agent::prompt::PromptPolicy;
 use crate::agent::state::ActiveWorkContract;
 use crate::edit::ChangeSummary;
@@ -17,6 +20,10 @@ use crate::session::RequestReplayPolicyDiagnostic;
 use crate::session::ToolCallId;
 use crate::session::{ProcessPhase, SessionStateSnapshot, TaskRoute};
 use crate::tool::{ToolName, ToolResult};
+
+const LIFECYCLE_FIXTURE_PROVIDER: &str = "openai_compat";
+const LIFECYCLE_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
+const LIFECYCLE_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ModelActionProposal {
@@ -238,8 +245,9 @@ impl TurnLifecycleKernel {
                     envelope,
                 )
             }
-            ModelActionProposal::TextFinalWhileObligationsOpen(_proposal) => {
-                Self::reject_non_tool_action(
+            ModelActionProposal::TextFinalWhileObligationsOpen(proposal) => {
+                Self::reject_text_final_action(
+                    proposal,
                     "final_assistant_message".to_string(),
                     "text_final_while_obligations_open",
                     "The provider emitted a final message while obligations remain open.",
@@ -290,6 +298,20 @@ impl TurnLifecycleKernel {
                 .retain(|tool| Self::provider_noncompliance_edit_recovery_tool_visible(&tool.name));
             return;
         }
+        if input.recovery.malformed_apply_patch_write_recovery_active {
+            augment_tools_from_stable_surface(tools, stable_tools, |name| name == "apply_patch");
+            tools.retain(|tool| tool.name == "apply_patch");
+            return;
+        }
+        if input.recovery.malformed_write_patch_recovery_active
+            || input.code_authoring_final_message_hard_edit_recovery_active
+        {
+            augment_tools_from_stable_surface(tools, stable_tools, |name| {
+                matches!(name, "apply_patch" | "write")
+            });
+            tools.retain(|tool| matches!(tool.name.as_str(), "apply_patch" | "write"));
+            return;
+        }
         if input.recovery.wrong_target_authoring_edit_recovery_active {
             if input
                 .recovery
@@ -307,11 +329,9 @@ impl TurnLifecycleKernel {
                 augment_tools_from_stable_surface(
                     tools,
                     stable_tools,
-                    Self::provider_noncompliance_edit_recovery_tool_visible,
+                    wrong_target_authoring_recovery_tool_visible,
                 );
-                tools.retain(|tool| {
-                    Self::provider_noncompliance_edit_recovery_tool_visible(&tool.name)
-                });
+                tools.retain(|tool| wrong_target_authoring_recovery_tool_visible(&tool.name));
             }
             return;
         }
@@ -324,6 +344,15 @@ impl TurnLifecycleKernel {
                 failed_edit_final_message_recovery_tool_visible,
             );
             tools.retain(|tool| failed_edit_final_message_recovery_tool_visible(&tool.name));
+            return;
+        }
+        if input.recovery.authoring_target_grounding_recovery_edit_only {
+            augment_tools_from_stable_surface(
+                tools,
+                stable_tools,
+                edit_only_authoring_grounding_recovery_tool_visible,
+            );
+            tools.retain(|tool| edit_only_authoring_grounding_recovery_tool_visible(&tool.name));
             return;
         }
         if input.recovery.verification_target_grounding_active {
@@ -354,16 +383,6 @@ impl TurnLifecycleKernel {
         {
             augment_tools_from_stable_surface(tools, stable_tools, |name| name == "write");
             tools.retain(|tool| tool.name == "write");
-            return;
-        }
-        if input.recovery.malformed_write_patch_recovery_active
-            || input.recovery.malformed_apply_patch_write_recovery_active
-            || input.code_authoring_final_message_hard_edit_recovery_active
-        {
-            augment_tools_from_stable_surface(tools, stable_tools, |name| {
-                matches!(name, "apply_patch" | "write")
-            });
-            tools.retain(|tool| matches!(tool.name.as_str(), "apply_patch" | "write"));
             return;
         }
         if input.recovery.docs_content_grounding_recovery_active {
@@ -452,6 +471,11 @@ impl TurnLifecycleKernel {
             );
             tools
                 .retain(|tool| Self::provider_noncompliance_edit_recovery_tool_visible(&tool.name));
+        } else if input.recovery.malformed_apply_patch_write_recovery_active {
+            augment_tools_from_stable_surface(tools, stable_tools, |tool_name| {
+                tool_name == "apply_patch"
+            });
+            tools.retain(|tool| tool.name == "apply_patch");
         } else if input.recovery.wrong_target_authoring_edit_recovery_active {
             if input
                 .recovery
@@ -469,11 +493,9 @@ impl TurnLifecycleKernel {
                 augment_tools_from_stable_surface(
                     tools,
                     stable_tools,
-                    Self::provider_noncompliance_edit_recovery_tool_visible,
+                    wrong_target_authoring_recovery_tool_visible,
                 );
-                tools.retain(|tool| {
-                    Self::provider_noncompliance_edit_recovery_tool_visible(&tool.name)
-                });
+                tools.retain(|tool| wrong_target_authoring_recovery_tool_visible(&tool.name));
             }
         } else if input
             .recovery
@@ -492,16 +514,18 @@ impl TurnLifecycleKernel {
                 failed_edit_final_message_recovery_tool_visible,
             );
             tools.retain(|tool| failed_edit_final_message_recovery_tool_visible(&tool.name));
-        } else if input.recovery.malformed_apply_patch_write_recovery_active {
-            augment_tools_from_stable_surface(tools, stable_tools, |tool_name| {
-                matches!(tool_name, "apply_patch" | "write")
-            });
-            tools.retain(|tool| matches!(tool.name.as_str(), "apply_patch" | "write"));
         } else if input.code_authoring_final_message_hard_edit_recovery_active {
             augment_tools_from_stable_surface(tools, stable_tools, |tool_name| {
                 matches!(tool_name, "apply_patch" | "write")
             });
             tools.retain(|tool| matches!(tool.name.as_str(), "apply_patch" | "write"));
+        } else if input.recovery.authoring_target_grounding_recovery_edit_only {
+            augment_tools_from_stable_surface(
+                tools,
+                stable_tools,
+                edit_only_authoring_grounding_recovery_tool_visible,
+            );
+            tools.retain(|tool| edit_only_authoring_grounding_recovery_tool_visible(&tool.name));
         } else if input.code_authoring_final_message_recovery_stable_surface_active
             || input.code_repair_final_message_recovery_stable_surface_active
         {
@@ -807,7 +831,7 @@ impl TurnLifecycleKernel {
     }
 
     pub(crate) fn provider_noncompliance_edit_recovery_tool_visible(tool_name: &str) -> bool {
-        matches!(tool_name, "apply_patch" | "write")
+        tool_name == "write"
     }
 
     pub(crate) fn progress_projection_edit_recovery_tool_visible(
@@ -831,7 +855,7 @@ impl TurnLifecycleKernel {
             tool_name: None,
             omitted_targets: Vec::new(),
             active_targets: active_target_strings(state),
-            reason: "a provider model action outside the compiled edit-only repair surface was preserved as typed ProviderNoncompliance evidence; the next recovery request keeps only write/apply_patch executable with provider-portable required tool_choice".to_string(),
+            reason: "a provider model action outside the compiled edit-only repair surface was preserved as typed ProviderNoncompliance evidence; the next recovery request uses exact-target whole-file write authority instead of replaying ambiguous edit proposals".to_string(),
         }
     }
 
@@ -844,7 +868,7 @@ impl TurnLifecycleKernel {
             tool_name: None,
             omitted_targets: Vec::new(),
             active_targets: active_target_strings(state),
-            reason: "a content-changing edit targeted inactive deliverables and was rejected before side effects; the next recovery request keeps only write/apply_patch executable for the current active target set with provider-portable required tool_choice".to_string(),
+            reason: "a content-changing edit targeted inactive deliverables and was rejected before side effects; the next Code Authoring recovery request keeps patch-oriented executable authority for the current active target set with provider-portable required tool_choice, adding bounded read only when source grounding is still required".to_string(),
         }
     }
 
@@ -870,7 +894,7 @@ impl TurnLifecycleKernel {
             tool_name: Some("apply_patch".to_string()),
             omitted_targets: Vec::new(),
             active_targets: active_target_strings(state),
-            reason: "a side-effect-free malformed apply_patch call was preserved as invalid_edit_arguments evidence; the next OpenAI-compatible recovery request keeps the same active edit target but exposes a bounded apply_patch/write surface so whole-file write can substitute for JSON-wrapped freeform patch text corruption".to_string(),
+            reason: "a side-effect-free malformed apply_patch call was preserved as invalid_edit_arguments evidence; the next recovery request keeps the same active edit target and exposes only the required apply_patch action surface so equivalent mutation tools cannot drift to a different target".to_string(),
         }
     }
 
@@ -1068,6 +1092,36 @@ impl TurnLifecycleKernel {
             envelope,
         ))
     }
+
+    fn reject_text_final_action(
+        proposal: TextFinalProposal,
+        action_name: String,
+        semantic_class: &'static str,
+        blocked_reason: impl Into<String>,
+        allowed_tools: &BTreeSet<String>,
+        envelope: &TurnControlEnvelope,
+    ) -> ActionAdjudication {
+        let arguments_json = serde_json::to_string(&json!({
+            "text": proposal.text.clone(),
+            "projection_id": proposal.projection_id.to_string(),
+            "proposal_id": proposal.proposal_id.clone(),
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        let synthetic = ModelToolCallProposal {
+            call_id: proposal.proposal_id,
+            requested_tool: action_name.clone(),
+            effective_tool: action_name,
+            arguments_json,
+        };
+        ActionAdjudication::RejectedModelAction(ModelActionRejection::new(
+            ModelActionRejectionClass::ProviderNoncompliance,
+            semantic_class,
+            blocked_reason,
+            &synthetic,
+            allowed_tools,
+            envelope,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1124,6 +1178,7 @@ pub(crate) struct TurnLifecycleRecoveryContext {
     pub(crate) generated_test_source_reference_grounding_active: bool,
     pub(crate) generated_test_reference_consumed_target_grounding_active: bool,
     pub(crate) verification_target_grounding_active: bool,
+    pub(crate) authoring_target_grounding_recovery_edit_only: bool,
     pub(crate) patch_context_mismatch_grounding_active: bool,
     pub(crate) authoring_target_grounding_final_message_recovery_active: bool,
     pub(crate) existing_target_grounding_recovery_active: bool,
@@ -1156,6 +1211,12 @@ fn lifecycle_tool_choice(input: &TurnLifecyclePlanInput<'_>) -> ToolChoice {
     if recovery.provider_noncompliance_edit_recovery_active {
         return ToolChoice::Required;
     }
+    if recovery.malformed_write_patch_recovery_active {
+        return ToolChoice::Required;
+    }
+    if recovery.malformed_apply_patch_write_recovery_active {
+        return ToolChoice::Required;
+    }
     if recovery.wrong_target_authoring_edit_recovery_active {
         return ToolChoice::Required;
     }
@@ -1164,15 +1225,12 @@ fn lifecycle_tool_choice(input: &TurnLifecyclePlanInput<'_>) -> ToolChoice {
     {
         return ToolChoice::Required;
     }
+    if recovery.authoring_target_grounding_recovery_edit_only {
+        return ToolChoice::Required;
+    }
     if recovery.provider_required_tool_choice_final_message_recovery_active
         && tools.contains("write")
     {
-        return ToolChoice::Required;
-    }
-    if recovery.malformed_write_patch_recovery_active {
-        return ToolChoice::Required;
-    }
-    if recovery.malformed_apply_patch_write_recovery_active {
         return ToolChoice::Required;
     }
     if recovery.code_authoring_final_message_hard_edit_recovery_active {
@@ -1227,6 +1285,12 @@ fn lifecycle_plan_reason(input: &TurnLifecyclePlanInput<'_>) -> &'static str {
     if recovery.provider_noncompliance_edit_recovery_active {
         return "provider_noncompliance_edit_recovery";
     }
+    if recovery.malformed_write_patch_recovery_active {
+        return "malformed_write_patch_recovery";
+    }
+    if recovery.malformed_apply_patch_write_recovery_active {
+        return "malformed_apply_patch_write_recovery";
+    }
     if recovery.wrong_target_authoring_edit_recovery_active {
         return "wrong_target_authoring_edit_recovery";
     }
@@ -1235,14 +1299,11 @@ fn lifecycle_plan_reason(input: &TurnLifecyclePlanInput<'_>) -> &'static str {
     {
         return "failed_edit_final_message_recovery";
     }
+    if recovery.authoring_target_grounding_recovery_edit_only {
+        return "authoring_target_grounding_edit_only_recovery";
+    }
     if recovery.provider_required_tool_choice_final_message_recovery_active {
         return "provider_required_tool_choice_final_message_recovery";
-    }
-    if recovery.malformed_write_patch_recovery_active {
-        return "malformed_write_patch_recovery";
-    }
-    if recovery.malformed_apply_patch_write_recovery_active {
-        return "malformed_apply_patch_write_recovery";
     }
     if recovery.code_authoring_final_message_hard_edit_recovery_active {
         return "code_authoring_final_message_hard_edit_recovery";
@@ -1295,6 +1356,7 @@ fn lifecycle_replay_policy(plan_reason: &str) -> &'static str {
         | "malformed_write_patch_recovery"
         | "malformed_apply_patch_write_recovery"
         | "code_authoring_final_message_hard_edit_recovery"
+        | "authoring_target_grounding_edit_only_recovery"
         | "progress_projection_edit_recovery" => "sanitize_failed_or_stale_tool_pairs",
         "docs_content_grounding_progress_projection_recovery" => {
             "sanitize_plan_projection_and_preserve_grounding_context"
@@ -1322,7 +1384,8 @@ fn lifecycle_corrective_policy(plan_reason: &str) -> &'static str {
         | "provider_required_tool_choice_final_message_recovery"
         | "malformed_write_patch_recovery"
         | "malformed_apply_patch_write_recovery"
-        | "code_authoring_final_message_hard_edit_recovery" => "hard_recovery_corrective_outputs",
+        | "code_authoring_final_message_hard_edit_recovery"
+        | "authoring_target_grounding_edit_only_recovery" => "hard_recovery_corrective_outputs",
         "generated_test_source_reference_grounding"
         | "generated_test_reference_consumed_target_grounding"
         | "verification_target_grounding"
@@ -1351,7 +1414,8 @@ fn lifecycle_proposal_policy(plan_reason: &str) -> &'static str {
         | "provider_required_tool_choice_final_message_recovery"
         | "malformed_write_patch_recovery"
         | "malformed_apply_patch_write_recovery"
-        | "code_authoring_final_message_hard_edit_recovery" => {
+        | "code_authoring_final_message_hard_edit_recovery"
+        | "authoring_target_grounding_edit_only_recovery" => {
             "tool_call_required_or_provider_noncompliance"
         }
         "generated_test_source_reference_grounding"
@@ -1381,7 +1445,8 @@ fn lifecycle_terminal_policy(plan_reason: &str) -> &'static str {
         | "provider_required_tool_choice_final_message_recovery"
         | "malformed_write_patch_recovery"
         | "malformed_apply_patch_write_recovery"
-        | "code_authoring_final_message_hard_edit_recovery" => {
+        | "code_authoring_final_message_hard_edit_recovery"
+        | "authoring_target_grounding_edit_only_recovery" => {
             "same_hard_recovery_no_progress_terminal"
         }
         "generated_test_source_reference_grounding"
@@ -1443,12 +1508,7 @@ fn active_target_strings(state: &SessionStateSnapshot) -> Vec<String> {
 }
 
 fn generated_test_target_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    normalized.rsplit('/').next().is_some_and(|file_name| {
-        file_name.starts_with("test_")
-            || file_name.ends_with("_test.py")
-            || file_name.ends_with(".test.py")
-    }) || normalized.contains("/tests/")
+    classify_language_artifact_target(path).role == ArtifactRole::Test
 }
 
 fn docs_authoring_uses_codex_style_provider_surface(state: &SessionStateSnapshot) -> bool {
@@ -1505,8 +1565,16 @@ fn verification_repair_target_grounding_surface_tool_visible(tool_name: &str) ->
     matches!(tool_name, "read" | "write" | "apply_patch" | "todowrite")
 }
 
+fn edit_only_authoring_grounding_recovery_tool_visible(tool_name: &str) -> bool {
+    tool_name == "apply_patch"
+}
+
 fn wrong_target_generated_test_source_reference_recovery_tool_visible(tool_name: &str) -> bool {
-    matches!(tool_name, "apply_patch" | "read" | "write")
+    matches!(tool_name, "apply_patch" | "read")
+}
+
+fn wrong_target_authoring_recovery_tool_visible(tool_name: &str) -> bool {
+    tool_name == "apply_patch"
 }
 
 fn generated_test_source_reference_grounding_tool_visible(
@@ -1755,7 +1823,7 @@ impl ModelActionRejection {
             .required_action
             .as_ref()
             .map(crate::protocol::RequiredAction::projection_label)
-            .unwrap_or("");
+            .unwrap_or_default();
         let payload_shape_hash =
             crate::harness::artifact::hash_bytes(proposal.arguments_json.as_bytes());
         let payload_key = if semantic_class == "malformed_tool_arguments"
@@ -1817,7 +1885,7 @@ impl ModelActionRejection {
             "projection_id": control_surface.projection_id.to_string(),
             "result_hash": self.result_hash,
         });
-        let output_text = control_surface
+        let mut output_text = control_surface
             .render_model_action_rejection_feedback(
                 &proposal.requested_tool,
                 &proposal.effective_tool,
@@ -1825,6 +1893,18 @@ impl ModelActionRejection {
                 Some(&self.blocked_reason),
             )
             .text;
+        output_text.push_str("\n\n[tool feedback]\n");
+        output_text.push_str(&format!("semantic_class: {}\n", self.semantic_class));
+        output_text.push_str(&format!("progress_effect: no_progress\n"));
+        output_text.push_str(&format!("side_effects_applied: false\n"));
+        output_text.push_str(&format!("blocked_action: {}\n", proposal.effective_tool));
+        if let Some(required_action) = control_surface
+            .required_action
+            .as_ref()
+            .map(crate::protocol::RequiredAction::projection_label)
+        {
+            output_text.push_str(&format!("required_action: {required_action}\n"));
+        }
 
         ToolResult {
             title: rejection_title(self.classification).to_string(),
@@ -1993,6 +2073,7 @@ impl ReplayNormalizer {
                     call_id,
                     tool_name,
                     result,
+                    metadata,
                 } if omitted_call_ids.contains(&call_id)
                     || !effective_tools.contains(&tool_name) =>
                 {
@@ -2000,11 +2081,11 @@ impl ReplayNormalizer {
                     replay_policies.push(provider_replay_omitted_tool_output_policy(
                         &call_id,
                         &tool_name,
-                        &result,
+                        &metadata,
                         effective_tools,
                     ));
                     omitted_notes.push(provider_replay_omitted_tool_output_note(
-                        &tool_name, &result,
+                        &tool_name, &result, &metadata,
                     ));
                 }
                 other => filtered.push(other),
@@ -2038,14 +2119,18 @@ impl ReplayNormalizer {
     }
 }
 
-fn provider_replay_omitted_tool_output_note(tool_name: &str, result: &str) -> String {
-    if provider_replay_result_is_supporting_context(result) {
+fn provider_replay_omitted_tool_output_note(
+    tool_name: &str,
+    result: &str,
+    metadata: &Value,
+) -> String {
+    if provider_replay_metadata_is_supporting_context(metadata) {
         return format!(
             "Non-executable supporting-context evidence from omitted `{tool_name}` call. This historical output remains available as evidence for the current edit step, but `{tool_name}` is not in the current effective tool surface. Do not repeat that omitted tool call; use the provider-visible edit tool, usually apply_patch, for the active target.\nEvidence excerpt:\n{}",
             clip_provider_replay_evidence(result, 4096)
         );
     }
-    if result.contains("provider_ignored_edit_only_surface") {
+    if provider_replay_metadata_is_provider_noncompliance(metadata) {
         return format!(
             "Non-executable corrective output from omitted `{tool_name}` call: the provider proposal was rejected by the lifecycle kernel because it ignored the current edit-only surface. Do not repeat that omitted tool call. Follow the current effective tool surface and use the provider-visible edit tool, usually apply_patch, for the active repair target. Result excerpt: {}",
             clip_provider_replay_note(result, 1200)
@@ -2192,8 +2277,8 @@ pub(crate) fn progress_projection_recovery_narrows_to_edit_surface_fixture_passe
         ..SessionStateSnapshot::default()
     };
     state.active_targets = vec![
-        camino::Utf8PathBuf::from("component.py"),
-        camino::Utf8PathBuf::from("test_component.py"),
+        camino::Utf8PathBuf::from("src/workflow.rs"),
+        camino::Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.completion.open_work_count = 2;
     let stable_tools = ["apply_patch", "shell", "todowrite"]
@@ -2238,6 +2323,7 @@ pub(crate) fn progress_projection_recovery_narrows_to_edit_surface_fixture_passe
         && plan.plan_reason == "progress_projection_edit_recovery"
         && !tool_names.contains("todowrite")
         && !tool_names.contains("shell")
+        && !tool_names.contains("write")
 }
 
 pub(crate) fn progress_projection_recovery_preserves_target_grounding_fixture_passes() -> bool {
@@ -2246,7 +2332,7 @@ pub(crate) fn progress_projection_recovery_preserves_target_grounding_fixture_pa
         process_phase: ProcessPhase::Author,
         ..SessionStateSnapshot::default()
     };
-    state.active_targets = vec![camino::Utf8PathBuf::from("component.py")];
+    state.active_targets = vec![camino::Utf8PathBuf::from("src/workflow.rs")];
     state.completion.open_work_count = 1;
     state.completion.closeout_ready = false;
     let stable_tools = ["apply_patch", "read", "shell", "todowrite", "write"]
@@ -2293,6 +2379,72 @@ pub(crate) fn progress_projection_recovery_preserves_target_grounding_fixture_pa
         && !tool_names.contains("shell")
 }
 
+pub(crate) fn edit_only_authoring_grounding_overrides_repair_grounding_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot {
+        route: TaskRoute::Code,
+        process_phase: ProcessPhase::Repair,
+        ..SessionStateSnapshot::default()
+    };
+    state.active_targets = vec![camino::Utf8PathBuf::from("src/workflow.rs")];
+    state.completion.verification_pending = true;
+    let stable_tools = ["apply_patch", "read", "shell", "todowrite", "write"]
+        .into_iter()
+        .map(|name| ToolSchema {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: json!({"type":"object"}),
+            strict: false,
+        })
+        .collect::<Vec<_>>();
+    let mut tools = stable_tools.clone();
+    let recovery = TurnLifecycleRecoveryContext {
+        authoring_target_grounding_recovery_edit_only: true,
+        verification_target_grounding_active: true,
+        ..TurnLifecycleRecoveryContext::default()
+    };
+
+    TurnLifecycleKernel::apply_pre_normalization_recovery_surface(
+        &mut tools,
+        &stable_tools,
+        TurnLifecyclePreNormalizationSurfaceInput {
+            state: &state,
+            recovery,
+            code_authoring_final_message_hard_edit_recovery_active: false,
+            code_authoring_final_message_recovery_stable_surface_active: false,
+            code_repair_final_message_recovery_stable_surface_active: false,
+        },
+    );
+    TurnLifecycleKernel::apply_post_normalization_recovery_surface(
+        &mut tools,
+        &stable_tools,
+        TurnLifecycleRecoverySurfaceInput {
+            state: &state,
+            recovery,
+            code_authoring_final_message_hard_edit_recovery_active: false,
+            generated_test_orientation_allowed: false,
+        },
+    );
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
+    let plan = TurnLifecycleKernel::compile_turn_lifecycle_plan(TurnLifecyclePlanInput {
+        policy: &PromptPolicy::default(),
+        state: &state,
+        tool_names: &tool_names,
+        recovery,
+    });
+
+    tool_names == BTreeSet::from(["apply_patch".to_string()])
+        && matches!(plan.tool_choice, ToolChoice::Required)
+        && plan.plan_reason == "authoring_target_grounding_edit_only_recovery"
+        && plan.proposal_policy == "tool_call_required_or_provider_noncompliance"
+        && !tool_names.contains("read")
+        && !tool_names.contains("todowrite")
+        && !tool_names.contains("shell")
+        && !tool_names.contains("write")
+}
+
 pub(crate) fn docs_content_grounding_progress_projection_preserves_grounding_surface_fixture_passes()
 -> bool {
     let mut state = SessionStateSnapshot {
@@ -2300,7 +2452,7 @@ pub(crate) fn docs_content_grounding_progress_projection_preserves_grounding_sur
         process_phase: ProcessPhase::Author,
         ..SessionStateSnapshot::default()
     };
-    state.active_targets = vec![camino::Utf8PathBuf::from("docs/component-design.md")];
+    state.active_targets = vec![camino::Utf8PathBuf::from("docs/workflow-design.md")];
     state.completion.open_work_count = 1;
     state.completion.route_contract_pending = true;
     let stable_tools = [
@@ -2377,7 +2529,7 @@ pub(crate) fn provider_noncompliance_recovery_overrides_grounding_fixture_passes
         process_phase: ProcessPhase::Repair,
         ..SessionStateSnapshot::default()
     };
-    state.active_targets = vec![camino::Utf8PathBuf::from("component.py")];
+    state.active_targets = vec![camino::Utf8PathBuf::from("src/workflow.rs")];
     state.completion.verification_pending = true;
     state.completion.closeout_ready = false;
     let stable_tools = ["apply_patch", "read", "shell", "todowrite", "write"]
@@ -2428,7 +2580,7 @@ pub(crate) fn provider_noncompliance_recovery_overrides_grounding_fixture_passes
         recovery,
     });
 
-    tool_names == BTreeSet::from(["apply_patch".to_string(), "write".to_string()])
+    tool_names == BTreeSet::from(["write".to_string()])
         && matches!(plan.tool_choice, ToolChoice::Required)
         && plan.plan_reason == "provider_noncompliance_edit_recovery"
         && plan.replay_policy == "sanitize_failed_or_stale_tool_pairs"
@@ -2444,11 +2596,11 @@ pub(crate) fn wrong_target_authoring_recovery_hardens_active_target_fixture_pass
         process_phase: ProcessPhase::Author,
         ..SessionStateSnapshot::default()
     };
-    state.active_targets = vec![camino::Utf8PathBuf::from("test_component.py")];
+    state.active_targets = vec![camino::Utf8PathBuf::from("tests/workflow.spec.ts")];
     state.completion.open_work_count = 1;
     state.completion.closeout_ready = false;
     let wrong_target_counts = BTreeMap::from([(
-        "wrong_authoring_target|apply_patch|calculator.py|test_component.py".to_string(),
+        "wrong_authoring_target|apply_patch|src/workflow.rs|tests/workflow.spec.ts".to_string(),
         1,
     )]);
     let stable_tools = ["apply_patch", "read", "shell", "todowrite", "write"]
@@ -2546,27 +2698,93 @@ pub(crate) fn wrong_target_authoring_recovery_hardens_active_target_fixture_pass
             recovery: generated_test_recovery,
         });
 
-    tool_names == BTreeSet::from(["apply_patch".to_string(), "write".to_string()])
+    tool_names == BTreeSet::from(["apply_patch".to_string()])
         && matches!(plan.tool_choice, ToolChoice::Required)
         && plan.plan_reason == "wrong_target_authoring_edit_recovery"
         && plan.replay_policy == "sanitize_failed_or_stale_tool_pairs"
         && plan.proposal_policy == "tool_call_required_or_provider_noncompliance"
         && plan.terminal_policy == "same_hard_recovery_no_progress_terminal"
         && policy.policy == "wrong_target_authoring_edit_recovery_surface"
-        && policy.active_targets == vec!["test_component.py".to_string()]
+        && policy.active_targets == vec!["tests/workflow.spec.ts".to_string()]
         && !tool_names.contains("read")
         && !tool_names.contains("todowrite")
         && !tool_names.contains("shell")
         && generated_test_tool_names
-            == BTreeSet::from([
-                "apply_patch".to_string(),
-                "read".to_string(),
-                "write".to_string(),
-            ])
+            == BTreeSet::from(["apply_patch".to_string(), "read".to_string()])
         && matches!(generated_test_plan.tool_choice, ToolChoice::Required)
         && generated_test_plan.plan_reason == "wrong_target_authoring_edit_recovery"
+        && !generated_test_tool_names.contains("write")
         && !generated_test_tool_names.contains("shell")
         && !generated_test_tool_names.contains("todowrite")
+}
+
+pub(crate) fn malformed_apply_patch_recovery_overrides_stale_wrong_target_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot {
+        route: TaskRoute::Code,
+        process_phase: ProcessPhase::Author,
+        ..SessionStateSnapshot::default()
+    };
+    state.active_targets = vec![
+        camino::Utf8PathBuf::from("src/workflow.rs"),
+        camino::Utf8PathBuf::from("tests/workflow.spec.ts"),
+    ];
+    state.completion.open_work_count = 2;
+    state.completion.closeout_ready = false;
+    let stable_tools = ["apply_patch", "read", "shell", "todowrite", "write"]
+        .into_iter()
+        .map(|name| ToolSchema {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: json!({"type":"object"}),
+            strict: false,
+        })
+        .collect::<Vec<_>>();
+    let mut tools = stable_tools.clone();
+    let recovery = TurnLifecycleRecoveryContext {
+        wrong_target_authoring_edit_recovery_active: true,
+        malformed_apply_patch_write_recovery_active: true,
+        ..TurnLifecycleRecoveryContext::default()
+    };
+
+    TurnLifecycleKernel::apply_pre_normalization_recovery_surface(
+        &mut tools,
+        &stable_tools,
+        TurnLifecyclePreNormalizationSurfaceInput {
+            state: &state,
+            recovery,
+            code_authoring_final_message_hard_edit_recovery_active: false,
+            code_authoring_final_message_recovery_stable_surface_active: false,
+            code_repair_final_message_recovery_stable_surface_active: false,
+        },
+    );
+    TurnLifecycleKernel::apply_post_normalization_recovery_surface(
+        &mut tools,
+        &stable_tools,
+        TurnLifecycleRecoverySurfaceInput {
+            state: &state,
+            recovery,
+            code_authoring_final_message_hard_edit_recovery_active: false,
+            generated_test_orientation_allowed: false,
+        },
+    );
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
+    let plan = TurnLifecycleKernel::compile_turn_lifecycle_plan(TurnLifecyclePlanInput {
+        policy: &PromptPolicy::default(),
+        state: &state,
+        tool_names: &tool_names,
+        recovery,
+    });
+
+    tool_names == BTreeSet::from(["apply_patch".to_string()])
+        && matches!(plan.tool_choice, ToolChoice::Required)
+        && plan.plan_reason == "malformed_apply_patch_write_recovery"
+        && tool_names.contains("apply_patch")
+        && !tool_names.contains("read")
+        && !tool_names.contains("shell")
+        && !tool_names.contains("todowrite")
 }
 
 fn provider_replay_omitted_tool_call_policy(
@@ -2594,13 +2812,13 @@ fn provider_replay_omitted_tool_call_policy(
 fn provider_replay_omitted_tool_output_policy(
     call_id: &str,
     tool_name: &str,
-    result: &str,
+    metadata: &Value,
     effective_tools: &BTreeSet<String>,
 ) -> crate::session::RequestReplayPolicyDiagnostic {
     crate::session::RequestReplayPolicyDiagnostic {
-        policy: if provider_replay_result_is_supporting_context(result) {
+        policy: if provider_replay_metadata_is_supporting_context(metadata) {
             "supporting_context_evidence_preserved".to_string()
-        } else if result.contains("provider_ignored_edit_only_surface") {
+        } else if provider_replay_metadata_is_provider_noncompliance(metadata) {
             "provider_noncompliance_tool_output_omitted_outside_effective_surface".to_string()
         } else {
             "tool_output_omitted_outside_effective_surface".to_string()
@@ -2609,7 +2827,7 @@ fn provider_replay_omitted_tool_output_policy(
         tool_name: Some(tool_name.to_string()),
         omitted_targets: Vec::new(),
         active_targets: Vec::new(),
-        reason: if provider_replay_result_is_supporting_context(result) {
+        reason: if provider_replay_metadata_is_supporting_context(metadata) {
             format!(
                 "historical supporting-context ToolOutput is omitted from executable tool replay because it is outside the current effective tool surface ({}) but preserved as non-executable provider-visible evidence for the current action authority",
                 effective_tools
@@ -2631,11 +2849,34 @@ fn provider_replay_omitted_tool_output_policy(
     }
 }
 
-pub(crate) fn provider_replay_result_is_supporting_context(result: &str) -> bool {
-    result.contains("supporting_context")
-        || result.contains("Supporting context")
-        || result.contains("grounding")
-        || result.contains("Evidence excerpt")
+pub(crate) fn provider_replay_metadata_is_supporting_context(metadata: &Value) -> bool {
+    metadata
+        .get("operation_progress_class")
+        .and_then(Value::as_str)
+        == Some("supporting_context")
+        || metadata
+            .get("tool_feedback_envelope")
+            .and_then(|feedback| feedback.get("operation_progress_class"))
+            .and_then(Value::as_str)
+            == Some("supporting_context")
+        || metadata
+            .get("tool_feedback_envelope")
+            .and_then(|feedback| feedback.get("kind"))
+            .and_then(Value::as_str)
+            == Some("supporting_context")
+}
+
+pub(crate) fn provider_replay_metadata_is_provider_noncompliance(metadata: &Value) -> bool {
+    metadata
+        .get("tool_feedback_envelope")
+        .and_then(|feedback| feedback.get("semantic_class"))
+        .and_then(Value::as_str)
+        == Some("provider_ignored_edit_only_surface")
+        || metadata
+            .get("model_action_adjudication")
+            .and_then(|feedback| feedback.get("semantic_class"))
+            .and_then(Value::as_str)
+            == Some("provider_ignored_edit_only_surface")
 }
 
 pub(crate) fn provider_surface_filter_omits_orphan_assistant_prelude_fixture_passes() -> bool {
@@ -2644,7 +2885,7 @@ pub(crate) fn provider_surface_filter_omits_orphan_assistant_prelude_fixture_pas
         tool_calls: vec![ModelToolCall {
             call_id: "call_shell".to_string(),
             tool_name: "shell".to_string(),
-            arguments_json: r#"{"command":"python -m unittest"}"#.to_string(),
+            arguments_json: r#"{"command":"verify-contract --behavior"}"#.to_string(),
         }],
     }];
     let effective_tools = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
@@ -2675,12 +2916,12 @@ pub(crate) fn provider_surface_filter_omits_mixed_stale_assistant_prelude_fixtur
             ModelToolCall {
                 call_id: "call_shell".to_string(),
                 tool_name: "shell".to_string(),
-                arguments_json: r#"{"command":"python -m unittest"}"#.to_string(),
+                arguments_json: r#"{"command":"verify-contract --behavior"}"#.to_string(),
             },
             ModelToolCall {
                 call_id: "call_patch".to_string(),
                 tool_name: "apply_patch".to_string(),
-                arguments_json: r#"{"patch":"*** Begin Patch\n*** Update File: component.py\n@@\n-print(1)\n+print(2)\n*** End Patch\n"}"#.to_string(),
+                arguments_json: r#"{"patch":"*** Begin Patch\n*** Update File: src/workflow.rs\n@@\n-pub fn workflow_state() -> &'static str { \"draft\" }\n+pub fn workflow_state() -> &'static str { \"ready\" }\n*** End Patch\n"}"#.to_string(),
             },
         ],
     }];
@@ -2717,6 +2958,94 @@ pub(crate) fn provider_surface_filter_omits_mixed_stale_assistant_prelude_fixtur
                     if content.contains("inspect with shell")
             )
         })
+}
+
+pub(crate) fn provider_surface_filter_requires_typed_supporting_context_signal_fixture_passes()
+-> bool {
+    let messages = vec![ModelMessage::Tool {
+        call_id: "call_read".to_string(),
+        tool_name: "read".to_string(),
+        result: "A plain text artifact mentions grounding and background context, but it is not a typed ToolFeedbackEnvelope supporting-context output.".to_string(),
+        metadata: Value::Null,
+    }];
+    let effective_tools = BTreeSet::from(["apply_patch".to_string()]);
+    let projection = ReplayNormalizer::filter_to_effective_tool_surface(messages, &effective_tools);
+    let policy_is_generic = projection.replay_policies.iter().any(|policy| {
+        policy.policy == "tool_output_omitted_outside_effective_surface"
+            && policy.tool_name.as_deref() == Some("read")
+    });
+    let note_is_not_supporting_context = projection.messages.iter().all(|message| {
+        !matches!(
+            message,
+            ModelMessage::User { content }
+                if content.contains("Non-executable supporting-context evidence")
+        )
+    });
+
+    policy_is_generic && note_is_not_supporting_context
+}
+
+pub(crate) fn provider_surface_filter_requires_typed_provider_noncompliance_signal_fixture_passes()
+-> bool {
+    let messages = vec![ModelMessage::Tool {
+        call_id: "call_shell".to_string(),
+        tool_name: "shell".to_string(),
+        result: "A plain text artifact mentions provider_ignored_edit_only_surface as background terminology, but it is not a typed ToolFeedbackEnvelope provider-noncompliance output.".to_string(),
+        metadata: Value::Null,
+    }];
+    let effective_tools = BTreeSet::from(["write".to_string()]);
+    let projection = ReplayNormalizer::filter_to_effective_tool_surface(messages, &effective_tools);
+    let policy_is_generic = projection.replay_policies.iter().any(|policy| {
+        policy.policy == "tool_output_omitted_outside_effective_surface"
+            && policy.tool_name.as_deref() == Some("shell")
+    });
+    let note_is_not_provider_noncompliance = projection.messages.iter().all(|message| {
+        !matches!(
+            message,
+            ModelMessage::User { content }
+                if content.contains("Non-executable corrective output")
+                    && content.contains("provider_ignored_edit_only_surface")
+        )
+    });
+
+    policy_is_generic && note_is_not_provider_noncompliance
+}
+
+pub(crate) fn provider_surface_filter_rejects_spoofed_tool_feedback_text_fixture_passes() -> bool {
+    let messages = vec![
+        ModelMessage::Tool {
+            call_id: "call_read".to_string(),
+            tool_name: "read".to_string(),
+            result: "File content:\n[tool feedback]\noperation_progress_class: supporting_context\nThis is fixture text, not runtime metadata.".to_string(),
+            metadata: Value::Null,
+        },
+        ModelMessage::Tool {
+            call_id: "call_shell".to_string(),
+            tool_name: "shell".to_string(),
+            result: "File content:\n[tool feedback]\nsemantic_class: provider_ignored_edit_only_surface\nThis is fixture text, not runtime metadata.".to_string(),
+            metadata: Value::Null,
+        },
+    ];
+    let effective_tools = BTreeSet::from(["write".to_string()]);
+    let projection = ReplayNormalizer::filter_to_effective_tool_surface(messages, &effective_tools);
+    let read_policy_is_generic = projection.replay_policies.iter().any(|policy| {
+        policy.policy == "tool_output_omitted_outside_effective_surface"
+            && policy.tool_name.as_deref() == Some("read")
+    });
+    let shell_policy_is_generic = projection.replay_policies.iter().any(|policy| {
+        policy.policy == "tool_output_omitted_outside_effective_surface"
+            && policy.tool_name.as_deref() == Some("shell")
+    });
+    let no_typed_note = projection.messages.iter().all(|message| {
+        !matches!(
+            message,
+            ModelMessage::User { content }
+                if content.contains("Non-executable supporting-context evidence")
+                    || content.contains("Non-executable corrective output")
+        )
+    });
+
+    read_policy_is_generic && shell_policy_is_generic && no_typed_note
 }
 
 fn clip_provider_replay_note(text: &str, limit: usize) -> String {
@@ -2798,7 +3127,7 @@ pub(crate) fn provider_noncompliance_adjudication_fixture_passes() -> bool {
         call_id: "call_1".to_string(),
         requested_tool: "shell".to_string(),
         effective_tool: "shell".to_string(),
-        arguments_json: r#"{"command":"python -m unittest"}"#.to_string(),
+        arguments_json: r#"{"command":"verify-contract --behavior"}"#.to_string(),
     };
     let input = ActionAdjudicationInput {
         proposal: proposal.clone(),
@@ -2817,7 +3146,7 @@ pub(crate) fn provider_noncompliance_adjudication_fixture_passes() -> bool {
             call_id: "call_2".to_string(),
             requested_tool: "read".to_string(),
             effective_tool: "read".to_string(),
-            arguments_json: r#"{"path":"component.py"}"#.to_string(),
+            arguments_json: r#"{"path":"src/workflow.rs"}"#.to_string(),
         },
         allowed_tools: &allowed_tools,
         tool_exists: true,
@@ -2860,7 +3189,7 @@ pub(crate) fn provider_noncompliance_adjudication_fixture_passes() -> bool {
         ProviderActionAdapter::adapt_tool_call(&CompletedToolCall {
             call_id: "call_malformed_a".to_string(),
             tool_name: "write".to_string(),
-            arguments_json: r#"{"path":"component.py","content":"source v1""#.to_string(),
+            arguments_json: r#"{"path":"src/workflow.rs","content":"source v1""#.to_string(),
         }),
         &allowed_tools,
         true,
@@ -2871,7 +3200,7 @@ pub(crate) fn provider_noncompliance_adjudication_fixture_passes() -> bool {
         ProviderActionAdapter::adapt_tool_call(&CompletedToolCall {
             call_id: "call_malformed_b".to_string(),
             tool_name: "write".to_string(),
-            arguments_json: r#"{"path":"component.py","content":"source v2""#.to_string(),
+            arguments_json: r#"{"path":"src/workflow.rs","content":"source v2""#.to_string(),
         }),
         &allowed_tools,
         true,
@@ -2950,20 +3279,74 @@ pub(crate) fn provider_noncompliance_adjudication_fixture_passes() -> bool {
             .required_action
             .as_ref()
             .map(|action| action.projection_label())
-            == Some("write:component.py")
+            == Some("write:src/workflow.rs".to_string())
+}
+
+pub(crate) fn lifecycle_kernel_fixtures_are_workflow_neutral_fixture_passes() -> bool {
+    let messages = vec![ModelMessage::AssistantToolCalls {
+        content: Some(
+            "I will inspect with shell first, then patch the active file.".to_string(),
+        ),
+        tool_calls: vec![
+            ModelToolCall {
+                call_id: "call_shell".to_string(),
+                tool_name: "shell".to_string(),
+                arguments_json: r#"{"command":"verify-contract --behavior"}"#.to_string(),
+            },
+            ModelToolCall {
+                call_id: "call_patch".to_string(),
+                tool_name: "apply_patch".to_string(),
+                arguments_json: r#"{"patch":"*** Begin Patch\n*** Update File: src/workflow.rs\n@@\n-pub fn workflow_state() -> &'static str { \"draft\" }\n+pub fn workflow_state() -> &'static str { \"ready\" }\n*** End Patch\n"}"#.to_string(),
+            },
+        ],
+    }];
+    let effective_tools = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+    let projection = ReplayNormalizer::filter_to_effective_tool_surface(messages, &effective_tools);
+    let Some(ModelMessage::AssistantToolCalls { tool_calls, .. }) = projection.messages.first()
+    else {
+        return false;
+    };
+    let Some(patch_call) = tool_calls.first() else {
+        return false;
+    };
+
+    let envelope = edit_only_repair_fixture_envelope(vec![ToolName::Write, ToolName::ApplyPatch]);
+    let allowed_tools = ["write".to_string(), "apply_patch".to_string()]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let input = ActionAdjudicationInput {
+        proposal: ModelToolCallProposal {
+            call_id: "call_write".to_string(),
+            requested_tool: "write".to_string(),
+            effective_tool: "write".to_string(),
+            arguments_json:
+                r#"{"path":"src/workflow.rs","content":"pub fn workflow_state() -> &'static str { \"ready\" }\n"}"#.to_string(),
+        },
+        allowed_tools: &allowed_tools,
+        tool_exists: true,
+        tool_allowed: true,
+        envelope: &envelope,
+    };
+
+    patch_call.tool_name == "apply_patch"
+        && patch_call.arguments_json.contains("workflow_state")
+        && patch_call.arguments_json.contains("ready")
+        && !patch_call.arguments_json.contains("print(")
+        && matches!(
+            ActionAdjudicator::adjudicate_tool_call(&input),
+            ActionAdjudication::AcceptedToolCall(_)
+        )
 }
 
 fn edit_only_repair_fixture_envelope(allowed_tools: Vec<ToolName>) -> TurnControlEnvelope {
     let projection_id = ProjectionId::new();
     let authority = ActionAuthority {
         projection_id,
-        required_action: Some(crate::protocol::RequiredAction {
-            kind: crate::protocol::RequiredActionKind::EditTarget,
-            tool: ToolName::Write,
-            target: Some(camino::Utf8PathBuf::from("component.py")),
-            command: None,
-            projection_text: "write:component.py".to_string(),
-        }),
+        required_action: Some(crate::protocol::RequiredAction::edit(
+            ToolName::Write,
+            camino::Utf8PathBuf::from("src/workflow.rs"),
+        )),
+        required_action_conflicts: Vec::new(),
         required_verification_commands: Vec::new(),
         operation_intents: vec![OperationIntent::ContentChangingAuthoringRequired],
         allowed_tools: allowed_tools.clone(),
@@ -2972,14 +3355,17 @@ fn edit_only_repair_fixture_envelope(allowed_tools: Vec<ToolName>) -> TurnContro
     };
     let obligations = ObligationSet {
         items: vec![TurnObligation {
-            obligation_id: "repair:component".to_string(),
+            obligation_id: "repair:workflow-source".to_string(),
             kind: ObligationKind::Repair,
-            summary: "repair component.py".to_string(),
-            targets: vec![camino::Utf8PathBuf::from("component.py")],
+            summary: "repair src/workflow.rs".to_string(),
+            targets: vec![camino::Utf8PathBuf::from("src/workflow.rs")],
             operation_intents: vec![OperationIntent::ContentChangingAuthoringRequired],
-            required_actions: vec!["write:component.py".to_string()],
+            required_actions: vec![crate::protocol::RequiredAction::edit(
+                ToolName::Write,
+                camino::Utf8PathBuf::from("src/workflow.rs"),
+            )],
             verification_commands: Vec::new(),
-            contract_refs: vec!["contract:repair".to_string()],
+            contract_refs: vec!["workflow-source-contract".to_string()],
             evidence_refs: vec![EvidenceRef {
                 source: "verification".to_string(),
                 reference: "failed-run".to_string(),
@@ -3021,9 +3407,9 @@ fn edit_only_repair_fixture_envelope(allowed_tools: Vec<ToolName>) -> TurnContro
         session_id,
         cwd: camino::Utf8PathBuf::from("."),
         workspace_root: camino::Utf8PathBuf::from("."),
-        provider: "test-provider".to_string(),
-        model: "test-model".to_string(),
-        base_url: "http://localhost".to_string(),
+        provider: LIFECYCLE_FIXTURE_PROVIDER.to_string(),
+        model: LIFECYCLE_FIXTURE_MODEL.to_string(),
+        base_url: LIFECYCLE_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
         sandbox: SandboxProfile::WorkspaceWrite,
         shell_family: crate::config::ShellFamily::PowerShell,
@@ -3041,8 +3427,8 @@ fn edit_only_repair_fixture_envelope(allowed_tools: Vec<ToolName>) -> TurnContro
             route: crate::session::TaskRoute::Code,
             process_phase: crate::session::ProcessPhase::Repair,
             active_work_kind: Some("verification_repair".to_string()),
-            summary: "repair component.py".to_string(),
-            active_targets: vec![camino::Utf8PathBuf::from("component.py")],
+            summary: "repair src/workflow.rs".to_string(),
+            active_targets: vec![camino::Utf8PathBuf::from("src/workflow.rs")],
             operation_intents: vec![OperationIntent::ContentChangingAuthoringRequired],
             required_verification_commands: Vec::new(),
             allowed_tools: allowed_tools.clone(),
@@ -3080,7 +3466,7 @@ mod tests {
         let action = ProviderActionAdapter::adapt_tool_call(&CompletedToolCall {
             call_id: "call_malformed".to_string(),
             tool_name: "write".to_string(),
-            arguments_json: r#"{"path":"component.py","#.to_string(),
+            arguments_json: r#"{"path":"src/workflow.rs","#.to_string(),
         });
 
         let ModelActionProposal::MalformedToolArguments(proposal) = action else {
@@ -3096,7 +3482,7 @@ mod tests {
         let action = ProviderActionAdapter::adapt_tool_call(&CompletedToolCall {
             call_id: "call_schema_outside".to_string(),
             tool_name: "write".to_string(),
-            arguments_json: r#""component.py""#.to_string(),
+            arguments_json: r#""src/workflow.rs""#.to_string(),
         });
 
         let ModelActionProposal::SchemaOutsideToolProposal(proposal) = action else {
@@ -3104,7 +3490,7 @@ mod tests {
         };
         assert_eq!(proposal.source_call_id, "call_schema_outside");
         assert_eq!(proposal.requested_tool, "write");
-        assert_eq!(proposal.raw_payload, r#""component.py""#);
+        assert_eq!(proposal.raw_payload, r#""src/workflow.rs""#);
     }
 
     #[test]
@@ -3117,7 +3503,7 @@ mod tests {
         let action = ProviderActionAdapter::adapt_tool_call(&CompletedToolCall {
             call_id: "call_schema_outside".to_string(),
             tool_name: "write".to_string(),
-            arguments_json: r#""component.py""#.to_string(),
+            arguments_json: r#""src/workflow.rs""#.to_string(),
         });
 
         let ActionAdjudication::RejectedModelAction(rejection) =
@@ -3133,7 +3519,7 @@ mod tests {
         };
 
         assert_eq!(rejection.proposal.call_id, "call_schema_outside");
-        assert_eq!(rejection.proposal.arguments_json, r#""component.py""#);
+        assert_eq!(rejection.proposal.arguments_json, r#""src/workflow.rs""#);
         let result = rejection.to_tool_result(
             ToolCallId::new(),
             &allowed_tools,
@@ -3146,7 +3532,7 @@ mod tests {
                 .metadata
                 .get("original_arguments_json")
                 .and_then(Value::as_str),
-            Some(r#""component.py""#)
+            Some(r#""src/workflow.rs""#)
         );
     }
 
@@ -3162,7 +3548,7 @@ mod tests {
                 call_id: "call_1".to_string(),
                 requested_tool: "shell".to_string(),
                 effective_tool: "shell".to_string(),
-                arguments_json: r#"{"command":"python -m unittest"}"#.to_string(),
+                arguments_json: r#"{"command":"verify-contract --behavior"}"#.to_string(),
             },
             allowed_tools: &allowed_tools,
             tool_exists: true,
@@ -3252,13 +3638,20 @@ mod tests {
         assert_eq!(proposal.effective_tool, "final_assistant_message");
         assert_eq!(proposal.resolved_tool, ToolName::Invalid);
         assert_eq!(
+            proposal
+                .original_arguments
+                .get("text")
+                .and_then(Value::as_str),
+            Some("done")
+        );
+        assert_eq!(
             envelope
                 .projection_bundle
                 .tool_result_feedback
                 .required_action
                 .as_ref()
                 .map(|action| action.projection_label()),
-            Some("write:component.py")
+            Some("write:src/workflow.rs".to_string())
         );
         assert!(proposal.allowed_surface.contains(&ToolName::Write));
         assert!(!proposal.payload_hash.is_empty());
@@ -3278,7 +3671,7 @@ mod tests {
                 call_id: "call_1".to_string(),
                 requested_tool: "read".to_string(),
                 effective_tool: "read".to_string(),
-                arguments_json: r#"{"path":"component.py"}"#.to_string(),
+                arguments_json: r#"{"path":"src/workflow.rs"}"#.to_string(),
             },
             allowed_tools: &allowed_tools,
             tool_exists: true,
@@ -3327,7 +3720,7 @@ mod tests {
                 call_id: "call_1".to_string(),
                 requested_tool: "read".to_string(),
                 effective_tool: "read".to_string(),
-                arguments_json: r#"{"path":"component.py"}"#.to_string(),
+                arguments_json: r#"{"path":"src/workflow.rs"}"#.to_string(),
             },
             allowed_tools: &allowed_tools,
             tool_exists: true,
@@ -3339,7 +3732,7 @@ mod tests {
                 call_id: "call_2".to_string(),
                 requested_tool: "read".to_string(),
                 effective_tool: "read".to_string(),
-                arguments_json: r#"{"path":"other.py"}"#.to_string(),
+                arguments_json: r#"{"path":"src/other_workflow.rs"}"#.to_string(),
             },
             allowed_tools: &allowed_tools,
             tool_exists: true,
@@ -3373,7 +3766,8 @@ mod tests {
                 call_id: "call_1".to_string(),
                 requested_tool: "write".to_string(),
                 effective_tool: "write".to_string(),
-                arguments_json: r#"{"path":"component.py","content":"print(1)\n"}"#.to_string(),
+                arguments_json:
+                    r#"{"path":"src/workflow.rs","content":"pub fn workflow_state() -> &'static str { \"ready\" }\n"}"#.to_string(),
             },
             allowed_tools: &allowed_tools,
             tool_exists: true,

@@ -30,6 +30,8 @@ const V18_SESSIONS_CANCELLED_STATUS: &str =
     include_str!("../../migrations/V18__sessions_cancelled_status.sql");
 const V19_SESSION_STATE_TOKEN_ACCOUNTING: &str =
     include_str!("../../migrations/V19__session_state_token_accounting.sql");
+const V20_PROTOCOL_ITEM_APPEND_ORDER: &str =
+    include_str!("../../migrations/V20__protocol_item_append_order.sql");
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
     connection.execute_batch(V1_INIT)?;
@@ -75,6 +77,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     if needs_session_state_token_accounting_migration(connection)? {
         connection.execute_batch(V19_SESSION_STATE_TOKEN_ACCOUNTING)?;
     }
+    connection.execute_batch(V20_PROTOCOL_ITEM_APPEND_ORDER)?;
     Ok(())
 }
 

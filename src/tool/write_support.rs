@@ -16,9 +16,6 @@ pub(crate) fn write_text_file(path: &Utf8Path, text: &str) -> Result<(), EditErr
     let mut temp = NamedTempFile::new_in(parent)?;
     temp.write_all(text.as_bytes())?;
     temp.flush()?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
     temp.persist(path)
         .map_err(|error| EditError::Io(error.error))?;
     Ok(())
@@ -44,5 +41,48 @@ pub(crate) fn to_summary(change: &FileChange) -> ChangeSummary {
         kind: change.kind,
         path_before: change.path_before.clone(),
         path_after: change.path_after.clone(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteCommitStep {
+    WriteTempFile,
+    PersistTempToTarget,
+}
+
+fn write_text_file_commit_plan() -> Vec<WriteCommitStep> {
+    vec![
+        WriteCommitStep::WriteTempFile,
+        WriteCommitStep::PersistTempToTarget,
+    ]
+}
+
+pub(crate) fn write_text_file_commit_plan_avoids_pre_remove_fixture_passes() -> bool {
+    let temp = match tempfile::tempdir() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let path = match Utf8PathBuf::from_path_buf(temp.path().join("target.txt")) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if std::fs::write(&path, "before").is_err() {
+        return false;
+    }
+    if write_text_file(&path, "after").is_err() {
+        return false;
+    }
+    let plan = write_text_file_commit_plan();
+    plan == vec![
+        WriteCommitStep::WriteTempFile,
+        WriteCommitStep::PersistTempToTarget,
+    ] && matches!(std::fs::read_to_string(&path), Ok(value) if value == "after")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn write_text_file_commit_plan_avoids_pre_remove() {
+        assert!(super::write_text_file_commit_plan_avoids_pre_remove_fixture_passes());
     }
 }

@@ -2,7 +2,7 @@ use crate::protocol::TurnItem;
 use crate::session::{SessionRecord, SessionStateSnapshot, TodoItem, Transcript};
 use crate::tui::state::{AppState, RunStatus};
 
-use super::models::DesktopSessionDetail;
+use super::models::{DesktopSessionDetail, DesktopTranscriptRowKind};
 use super::query::{build_session_detail, build_session_detail_from_app_state_with_session};
 
 #[derive(Debug, Clone)]
@@ -59,11 +59,11 @@ impl OpenSessionView {
             .stored_detail
             .transcript_rows
             .iter()
-            .any(|row| row.kind == "file_changes");
+            .any(|row| row.row_kind == DesktopTranscriptRowKind::FileChanges);
         let live_missing_turn_scoped_file_changes = !detail
             .transcript_rows
             .iter()
-            .any(|row| row.kind == "file_changes");
+            .any(|row| row.row_kind == DesktopTranscriptRowKind::FileChanges);
         if stored_has_turn_scoped_file_changes
             && live_missing_turn_scoped_file_changes
             && !matches!(app_state.run_status, RunStatus::Running)

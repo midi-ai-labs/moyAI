@@ -1,8 +1,69 @@
-use crate::session::{ProjectId, SessionId, SessionRecord, SessionStatus};
+use crate::session::{ChangeKind, ProjectId, SessionId, SessionRecord, SessionStatus, ToolCallId};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopTranscriptRowKind {
+    EmptyPlaceholder,
+    User,
+    Assistant,
+    Reasoning,
+    Editing,
+    Tool,
+    Summary,
+    Diff,
+    System,
+    Error,
+    WorkSummaryRunning,
+    WorkSummaryCompleted,
+    WorkSummaryFailed,
+    WorkSummaryCancelled,
+    WorkSummaryAwaitingUser,
+    FileChanges,
+}
+
+impl DesktopTranscriptRowKind {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::EmptyPlaceholder => "empty_placeholder",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Reasoning => "reasoning",
+            Self::Editing => "editing",
+            Self::Tool => "tool",
+            Self::Summary => "summary",
+            Self::Diff => "diff",
+            Self::System => "system",
+            Self::Error => "error",
+            Self::WorkSummaryRunning => "work_summary_running",
+            Self::WorkSummaryCompleted => "work_summary_completed",
+            Self::WorkSummaryFailed => "work_summary_failed",
+            Self::WorkSummaryCancelled => "work_summary_cancelled",
+            Self::WorkSummaryAwaitingUser => "work_summary_awaiting_user",
+            Self::FileChanges => "file_changes",
+        }
+    }
+
+    pub fn is_work_summary(self) -> bool {
+        matches!(
+            self,
+            Self::WorkSummaryRunning
+                | Self::WorkSummaryCompleted
+                | Self::WorkSummaryFailed
+                | Self::WorkSummaryCancelled
+                | Self::WorkSummaryAwaitingUser
+        )
+    }
+}
+
+fn default_desktop_transcript_row_kind() -> DesktopTranscriptRowKind {
+    DesktopTranscriptRowKind::System
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopTranscriptRow {
+    #[serde(default = "default_desktop_transcript_row_kind")]
+    pub row_kind: DesktopTranscriptRowKind,
     pub kind: String,
     pub step: String,
     pub title: String,
@@ -23,8 +84,11 @@ pub struct DesktopArtifactRow {
 pub struct DesktopFileChangeRow {
     pub label: String,
     pub path: String,
+    pub kind: ChangeKind,
     pub action: String,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_call_ids: Vec<ToolCallId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +109,7 @@ pub struct DesktopProjectRow {
 pub struct DesktopSessionRow {
     pub session_id: SessionId,
     pub title: String,
+    pub status_kind: SessionStatus,
     pub status: String,
     pub short_id: String,
     pub label: String,
@@ -56,7 +121,7 @@ impl DesktopSessionRow {
     }
 
     pub(crate) fn set_title_preserving_status(&mut self, title: &str) {
-        let status = session_status_from_key(&self.status).unwrap_or(SessionStatus::Running);
+        let status = self.status_kind;
         self.apply_parts(title, status);
     }
 
@@ -69,6 +134,7 @@ impl DesktopSessionRow {
         let mut row = Self {
             session_id,
             title: String::new(),
+            status_kind: status,
             status: String::new(),
             short_id: short_session_id(session_id),
             label: String::new(),
@@ -79,6 +145,7 @@ impl DesktopSessionRow {
 
     fn apply_parts(&mut self, title: &str, status: SessionStatus) {
         self.title = truncate_text(title.trim(), 24);
+        self.status_kind = status;
         self.status = session_status_key(status).to_string();
         self.short_id = short_session_id(self.session_id);
         self.label = format_session_row_parts(title, status, self.session_id);
@@ -88,6 +155,7 @@ impl DesktopSessionRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopSessionDetail {
     pub session_id: SessionId,
+    pub thread_empty: bool,
     pub transcript_text: String,
     pub transcript_rows: Vec<DesktopTranscriptRow>,
     pub tool_status_text: String,
@@ -98,6 +166,7 @@ pub struct DesktopSessionDetail {
     pub artifacts: Vec<DesktopArtifactRow>,
     pub file_changes: Vec<DesktopFileChangeRow>,
     pub file_change_summary_text: String,
+    pub artifact_preview_available: bool,
     pub artifact_preview_text: String,
 }
 
@@ -154,18 +223,6 @@ pub(crate) fn format_session_row_parts(
     )
 }
 
-fn session_status_from_key(key: &str) -> Option<SessionStatus> {
-    match key {
-        "idle" => Some(SessionStatus::Idle),
-        "running" => Some(SessionStatus::Running),
-        "completed" => Some(SessionStatus::Completed),
-        "awaiting_user" => Some(SessionStatus::AwaitingUser),
-        "cancelled" => Some(SessionStatus::Cancelled),
-        "failed" => Some(SessionStatus::Failed),
-        _ => None,
-    }
-}
-
 fn session_status_key(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Idle => "idle",
@@ -202,6 +259,19 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     format!("{shortened}…")
 }
 
+pub(crate) fn desktop_session_row_status_typed_projection_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let mut row = DesktopSessionRow::from_parts(session_id, "initial", SessionStatus::Completed);
+    row.status = "running".to_string();
+
+    row.set_title_preserving_status("renamed");
+
+    row.status_kind == SessionStatus::Completed
+        && row.status == "completed"
+        && row.label == format_session_row_parts("renamed", SessionStatus::Completed, session_id)
+        && !row.label.contains("[実行中]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +302,10 @@ mod tests {
         assert!(row.label.contains("ワークスペースの資材"));
         assert!(row.label.contains("[実行中]"));
         assert!(row.label.ends_with(&short_session_id(session_id)));
+    }
+
+    #[test]
+    fn desktop_session_row_status_typed_projection() {
+        assert!(desktop_session_row_status_typed_projection_fixture_passes());
     }
 }

@@ -7,11 +7,19 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::agent::completion_guard::completion_workspace_blocked_reason;
-use crate::agent::content_shape_contract::python_source_for_test_target;
+use crate::agent::language_evidence::{
+    ArtifactRole, LanguageLocalBindingContradiction,
+    classify_artifact_target as classify_language_artifact_target,
+    language_failure_assertion_contexts_from_sources, language_failure_labels_from_summary,
+    language_failure_paths_from_summary, language_failure_requirement_contexts_from_sources,
+    language_generated_test_local_binding_contradictions, language_source_targets_from_text,
+    language_verification_failure_summary_evidence, language_verification_repair_authority_target,
+    language_verification_runner_byproduct_or_dependency, language_verification_target_candidates,
+};
 use crate::agent::prompt::{
-    extract_protected_artifact_targets, looks_like_structured_document_work,
-    requested_work_contract_from_instruction_text, same_document_update_alias_requested,
-    staged_task_artifact_targets_from_text,
+    extract_protected_artifact_targets, extract_requested_artifact_targets,
+    looks_like_structured_document_work, requested_work_contract_from_instruction_text,
+    same_document_update_alias_requested, staged_task_artifact_targets_from_text,
 };
 use crate::agent::verification::{
     canonical_verification_command_identity_key, explicit_verification_commands_from_text,
@@ -26,7 +34,7 @@ use crate::session::{
     CompletionState, ContractStatus, DocsArea, DocsAreaCoverage, DocsDeliverableCoverage,
     DocsDeliverableKind, DocsFactCheck, DocsFactCheckKind, DocsGroundingCoverage,
     DocsGroundingRequirement, DocsPendingDeliverable, DocsRouteState, FailureKind, FailureState,
-    MessagePart, MessageRole, ProcessPhase, SessionStateSnapshot, TaskRoute, TodoItem, Transcript,
+    MessageRole, ProcessPhase, SessionStateSnapshot, TaskRoute, TodoItem,
     VerificationFailureCluster, VerificationFailureEvidence,
 };
 use crate::tool::ToolName;
@@ -35,6 +43,8 @@ use crate::tool::truncate::clip_text_with_ellipsis;
 const MAX_VERIFICATION_FAILURE_LABELS: usize = 8;
 const MAX_VERIFICATION_FAILURE_DETAIL_LINES: usize = 28;
 const MAX_VERIFICATION_FAILURE_DETAIL_CHARS: usize = 2600;
+const STATE_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
+const STATE_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ModelTurnState {
@@ -229,6 +239,37 @@ struct RequestedWorkDiscipline {
     verification_commands: Vec<String>,
     pending_targets: Vec<Utf8PathBuf>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateAuthorityOwner {
+    RequestedWorkAuthoring,
+    DocsRepair,
+    Verification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateAuthorityDecision {
+    owner: StateAuthorityOwner,
+    active_work: ActiveWorkContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateAuthorityCandidate {
+    owner: StateAuthorityOwner,
+    active_work: ActiveWorkContract,
+    precedence: u8,
+    invariant_ref: &'static str,
+}
+
+impl StateAuthorityCandidate {
+    fn into_decision(self) -> StateAuthorityDecision {
+        StateAuthorityDecision {
+            owner: self.owner,
+            active_work: self.active_work,
+        }
+    }
+}
+
 pub fn reduce_session_state_from_history_items(
     session: &SessionRecord,
     history_items: &[HistoryItem],
@@ -241,22 +282,34 @@ pub fn reduce_session_state_from_history_items(
     state = promote_docs_route_contract_authority(session, history_items, state);
     state = promote_requested_work_authoring_authority(session, history_items, state);
     state = promote_requested_work_verification_authority(session, history_items, state);
+    if let Some(typed_evidence) = latest_typed_verification_failure_context(session, history_items)
+    {
+        state = apply_verification_failure_authority(session, history_items, state, typed_evidence);
+    }
+    materialize_state_authority_projection(session, history_items, state)
+}
+
+fn apply_verification_failure_authority(
+    session: &SessionRecord,
+    history_items: &[HistoryItem],
+    mut state: SessionStateSnapshot,
+    typed_evidence: TypedVerificationFailureEvidence,
+) -> SessionStateSnapshot {
     let post_failure_written_targets = observed_written_targets_since_latest_verification_failure(
         history_items,
         session.cwd.as_path(),
     );
-    let post_failure_content_progress =
-        content_changing_progress_since_latest_verification_failure(history_items);
-    let Some(typed_evidence) = latest_typed_verification_failure_context(session, history_items)
-    else {
-        return state;
-    };
-    if state.completion.route_contract_pending && state.docs_route.is_some() {
-        return apply_docs_route_verification_failure_authority(state, typed_evidence);
-    }
+    let post_failure_content_progress = content_changing_progress_since_latest_verification_failure(
+        history_items,
+        session.cwd.as_path(),
+    );
 
     let repair_authority_targets =
         repair_progress_authority_targets(&typed_evidence, session.cwd.as_path());
+    let docs_route_owns_failure =
+        docs_route_failure_matches_current_requested_docs_contract(session, &state, history_items);
+    let verification_targets_override_docs_route =
+        !repair_authority_targets.is_empty() && !docs_route_owns_failure;
     let active_repair_target_progress_observed =
         matches!(state.process_phase, ProcessPhase::Repair)
             && state.active_targets.iter().any(|target| {
@@ -316,7 +369,7 @@ pub fn reduce_session_state_from_history_items(
             session.cwd.as_path(),
         );
     }
-    let remaining_failure_targets = if repair_progress_observed {
+    let mut remaining_failure_targets = if repair_progress_observed {
         Vec::new()
     } else {
         repair_authority_targets
@@ -333,6 +386,15 @@ pub fn reduce_session_state_from_history_items(
             })
             .collect::<Vec<_>>()
     };
+    if !repair_progress_observed && docs_route_owns_failure {
+        remaining_failure_targets = docs_route_pending_repair_targets(state.docs_route.as_ref());
+    } else if remaining_failure_targets.is_empty()
+        && !repair_progress_observed
+        && state.completion.route_contract_pending
+        && state.docs_route.is_some()
+    {
+        remaining_failure_targets = docs_route_pending_repair_targets(state.docs_route.as_ref());
+    }
     state.active_targets =
         if verification_cluster_has_no_tests_ran(typed_evidence.failure_cluster.as_ref())
             && !remaining_failure_targets.is_empty()
@@ -362,6 +424,9 @@ pub fn reduce_session_state_from_history_items(
     state.completion.open_work_count = 0;
     state.completion.closeout_ready = false;
     state.completion.verification_pending = true;
+    if verification_targets_override_docs_route {
+        state.completion.route_contract_pending = false;
+    }
     state.completion.blocked_reason = Some(format!(
         "verification failed: {}",
         typed_evidence.failure.summary
@@ -375,42 +440,77 @@ pub fn reduce_session_state_from_history_items(
     state
 }
 
-fn apply_docs_route_verification_failure_authority(
-    mut state: SessionStateSnapshot,
-    typed_evidence: TypedVerificationFailureEvidence,
-) -> SessionStateSnapshot {
-    let mut docs_targets = docs_route_pending_repair_targets(state.docs_route.as_ref());
-    if docs_targets.is_empty()
-        && let Some(target) = state
-            .docs_route
-            .as_ref()
-            .and_then(|docs| docs.active_deliverable.clone())
-    {
-        docs_targets.push(target);
+fn docs_route_failure_matches_current_requested_docs_contract(
+    session: &SessionRecord,
+    state: &SessionStateSnapshot,
+    history_items: &[HistoryItem],
+) -> bool {
+    if !(state.completion.route_contract_pending && state.docs_route.is_some()) {
+        return false;
     }
-    state.process_phase = ProcessPhase::Repair;
-    state.active_targets = docs_targets;
-    state.failure = Some(typed_evidence.failure.clone());
-    state.verification.failing_labels = if typed_evidence.failing_labels.is_empty() {
-        extract_verification_failure_labels(&typed_evidence.failure.summary)
-    } else {
-        typed_evidence.failing_labels
+    let Some(latest_user) = latest_user_text_from_history_items(history_items) else {
+        return false;
     };
-    state.verification.last_evidence_summary = Some(typed_evidence.failure.summary.clone());
-    state.verification.failure_cluster = typed_evidence.failure_cluster;
-    state.verification.requirement_refs = typed_evidence.requirement_refs;
-    merge_required_commands(
-        &mut state.verification.required_commands,
-        &typed_evidence.required_commands,
+    let docs_targets = docs_route_pending_deliverables_from_state(state.docs_route.as_ref())
+        .into_iter()
+        .map(|item| canonical_target_key(item.target.as_str()))
+        .filter(|target| !target.is_empty())
+        .collect::<BTreeSet<_>>();
+    if docs_targets.is_empty() {
+        return false;
+    }
+    let explicit_required_commands = explicit_required_verification_commands_from_history_items(
+        session.cwd.as_path(),
+        Some(latest_user.as_str()),
     );
-    state.completion.open_work_count = 0;
-    state.completion.closeout_ready = false;
-    state.completion.verification_pending = true;
-    state.completion.blocked_reason = Some(format!(
-        "verification failed under docs route authority: {}",
-        typed_evidence.failure.summary
-    ));
-    state
+    let requested_work = requested_work_discipline_from_history_items(
+        session.cwd.as_path(),
+        history_items,
+        Some(latest_user.as_str()),
+        &explicit_required_commands,
+        None,
+    );
+    let requested_targets = requested_work
+        .required_targets
+        .iter()
+        .chain(requested_work.pending_targets.iter())
+        .map(|target| canonical_target_key(target.as_str()))
+        .filter(|target| !target.is_empty())
+        .collect::<BTreeSet<_>>();
+    let mentioned_targets = extract_requested_artifact_targets(&latest_user)
+        .into_iter()
+        .map(|target| canonical_target_key(target.as_str()))
+        .filter(|target| !target.is_empty())
+        .collect::<BTreeSet<_>>();
+    let protected_or_reference_targets = requested_work
+        .reference_inputs
+        .iter()
+        .chain(requested_work.protected_targets.iter())
+        .map(|target| canonical_target_key(target.as_str()))
+        .chain(
+            extract_protected_artifact_targets(&latest_user)
+                .into_iter()
+                .map(|target| canonical_target_key(target.as_str())),
+        )
+        .filter(|target| !target.is_empty())
+        .collect::<BTreeSet<_>>();
+    if mentioned_targets.iter().any(|target| {
+        !docs_targets.contains(target) && !protected_or_reference_targets.contains(target)
+    }) {
+        return false;
+    }
+    if requested_targets.is_empty() {
+        return docs_route_authority_matches_active_targets(state)
+            && mentioned_targets
+                .iter()
+                .all(|target| docs_targets.contains(target));
+    }
+    requested_targets
+        .iter()
+        .all(|target| docs_targets.contains(target))
+        && requested_targets
+            .iter()
+            .any(|target| docs_targets.contains(target))
 }
 
 fn reset_prior_closeout_for_new_user_turn(
@@ -729,24 +829,24 @@ fn verification_run_satisfaction_keys(run: &VerificationRunResult) -> BTreeSet<S
 pub(crate) fn public_verification_command_identity_dedupes_required_commands_fixture_passes() -> bool
 {
     let mut required = vec![
-        "python -X utf8 component.py 8 +".to_string(),
-        "python -X utf8 component.py log 10".to_string(),
+        "verify-workflow --behavior draft".to_string(),
+        "verify-workflow --behavior review".to_string(),
     ];
     merge_required_commands(
         &mut required,
         &[
-            "python -X utf8 component.py 8 +".to_string(),
-            "python -X utf8 component.py log 10".to_string(),
-            "python -X utf8 component.py 8 +".to_string(),
+            "verify-workflow --behavior draft".to_string(),
+            "verify-workflow --behavior review".to_string(),
+            "verify-workflow --behavior draft".to_string(),
         ],
     );
 
     let run = VerificationRunResult {
-        command: "python -X utf8 component.py 8 +".to_string(),
+        command: "verify-workflow --behavior draft".to_string(),
         status: VerificationRunStatus::Passed,
         exit_code: Some(0),
         timed_out: false,
-        output_summary: "8".to_string(),
+        output_summary: "workflow behavior draft verified".to_string(),
         failure_cluster: None,
         satisfies_command_identities: Vec::new(),
         artifact_refs: Vec::new(),
@@ -755,7 +855,7 @@ pub(crate) fn public_verification_command_identity_dedupes_required_commands_fix
     let run_keys = verification_run_satisfaction_keys(&run);
 
     required.len() == 2
-        && run_keys.contains("python -x utf8 component.py 8 +")
+        && run_keys.contains("verify-workflow --behavior draft")
         && canonical_verification_command_identity_key(&required[0])
             .is_some_and(|key| run_keys.contains(&key))
 }
@@ -810,11 +910,6 @@ fn latest_content_change_sequence_since_latest_user(
             {
                 Some(history_item_order_scalar(item))
             }
-            HistoryItemPayload::ToolOutput { metadata, .. }
-                if metadata_has_authoring_content_change(metadata, workspace_root) =>
-            {
-                Some(history_item_order_scalar(item))
-            }
             _ => None,
         })
         .max()
@@ -850,17 +945,9 @@ fn apply_typed_item_stream_authority(
             HistoryItemPayload::ToolOutput {
                 success,
                 progress_effect,
-                metadata,
                 verification_run,
                 ..
             } => {
-                for path in changed_paths_from_tool_output_metadata(metadata) {
-                    if let Some(normalized) = normalize_target_path(&path, workspace_root)
-                        .filter(|path| is_authoring_content_change_path(path.as_path()))
-                    {
-                        observed_written_targets.insert(normalized);
-                    }
-                }
                 if latest_content_change_sequence
                     .is_some_and(|sequence| history_item_order_scalar(item) <= sequence)
                 {
@@ -897,11 +984,11 @@ fn apply_typed_item_stream_authority(
                 normalize_target_path(target.as_str(), workspace_root)
                     .is_none_or(|target| !observed_written_targets.contains(&target))
             });
-            handoff.remaining.retain(|item| {
-                !observed_written_targets
-                    .iter()
-                    .any(|target| item.contains(target.as_str()))
-            });
+            retain_implementation_handoff_remaining_without_observed_target_progress(
+                &mut handoff.remaining,
+                &observed_written_targets,
+                workspace_root,
+            );
         }
     }
 
@@ -934,9 +1021,128 @@ fn apply_typed_item_stream_authority(
     state
 }
 
+fn retain_implementation_handoff_remaining_without_observed_target_progress(
+    remaining: &mut Vec<String>,
+    observed_written_targets: &BTreeSet<Utf8PathBuf>,
+    workspace_root: &Utf8Path,
+) {
+    if observed_written_targets.is_empty() {
+        return;
+    }
+    let observed_target_keys = observed_written_targets
+        .iter()
+        .map(|target| canonical_target_key(target.as_str()))
+        .filter(|key| !key.is_empty())
+        .collect::<BTreeSet<_>>();
+    remaining.retain(|item| {
+        !implementation_handoff_remaining_item_satisfied_by_observed_targets(
+            item,
+            &observed_target_keys,
+            workspace_root,
+        )
+    });
+}
+
+fn implementation_handoff_remaining_item_satisfied_by_observed_targets(
+    item: &str,
+    observed_target_keys: &BTreeSet<String>,
+    workspace_root: &Utf8Path,
+) -> bool {
+    let item_target_keys = implementation_handoff_remaining_item_target_keys(item, workspace_root);
+    !item_target_keys.is_empty()
+        && item_target_keys
+            .iter()
+            .all(|key| observed_target_keys.contains(key))
+}
+
+fn implementation_handoff_remaining_item_target_keys(
+    item: &str,
+    workspace_root: &Utf8Path,
+) -> BTreeSet<String> {
+    implementation_handoff_remaining_target_tokens(item)
+        .into_iter()
+        .filter_map(|target| normalize_target_path(&target, workspace_root))
+        .map(|target| canonical_target_key(target.as_str()))
+        .filter(|key| !key.is_empty())
+        .collect()
+}
+
+fn implementation_handoff_remaining_target_tokens(item: &str) -> Vec<String> {
+    item.split(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | '='
+            )
+    })
+    .filter_map(implementation_handoff_remaining_target_token)
+    .collect()
+}
+
+fn implementation_handoff_remaining_target_token(raw: &str) -> Option<String> {
+    let token = raw.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+        )
+    });
+    let token = if let Some((prefix, suffix)) = token.rsplit_once(':') {
+        if prefix.len() != 1 && (suffix.contains('/') || suffix.contains('\\')) {
+            suffix
+        } else {
+            token
+        }
+    } else {
+        token
+    }
+    .trim_end_matches(':');
+    let has_path_shape = token.contains('/') || token.contains('\\') || token.contains('.');
+    (!token.is_empty() && has_path_shape).then(|| token.to_string())
+}
+
+pub(crate) fn state_handoff_remaining_exact_target_identity_fixture_passes() -> bool {
+    let workspace_root = Utf8Path::new("C:/workspace/project");
+    let Some(observed_target) = normalize_target_path("src/workflow.rs", workspace_root) else {
+        return false;
+    };
+    let observed_targets = [observed_target].into_iter().collect::<BTreeSet<_>>();
+    let satisfied_item = "finish src/workflow.rs";
+    let sibling_item = "finish sibling/src/workflow.rs";
+    let suffix_item = "finish src/workflow.rs.backup";
+    let multi_target_item = "finish src/workflow.rs and tests/workflow.contract";
+    let untargeted_item = "finish workflow source without target token";
+    let mut remaining = vec![
+        satisfied_item.to_string(),
+        sibling_item.to_string(),
+        suffix_item.to_string(),
+        multi_target_item.to_string(),
+        untargeted_item.to_string(),
+    ];
+
+    retain_implementation_handoff_remaining_without_observed_target_progress(
+        &mut remaining,
+        &observed_targets,
+        workspace_root,
+    );
+
+    !remaining.iter().any(|item| item == satisfied_item)
+        && remaining.iter().any(|item| item == sibling_item)
+        && remaining.iter().any(|item| item == suffix_item)
+        && remaining.iter().any(|item| item == multi_target_item)
+        && remaining.iter().any(|item| item == untargeted_item)
+        && implementation_handoff_remaining_item_satisfied_by_observed_targets(
+            "finish C:/workspace/project/src/workflow.rs",
+            &observed_targets
+                .iter()
+                .map(|target| canonical_target_key(target.as_str()))
+                .collect::<BTreeSet<_>>(),
+            workspace_root,
+        )
+}
+
 fn history_items_in_sequence(history_items: &[HistoryItem]) -> Vec<&HistoryItem> {
     let mut ordered = history_items.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|item| (history_item_order_scalar(item), item.sequence_no));
+    ordered.sort_by_key(|item| item.sequence_no);
     ordered
 }
 
@@ -968,11 +1174,81 @@ fn latest_user_turn_sequence(history_items: &[HistoryItem]) -> Option<i64> {
 }
 
 fn history_item_order_scalar(item: &HistoryItem) -> i64 {
-    if item.created_at_ms > 0 {
-        item.created_at_ms.saturating_mul(1_000_000) + item.sequence_no
-    } else {
-        item.sequence_no
-    }
+    item.sequence_no
+}
+
+pub(crate) fn state_history_item_sequence_primary_order_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 400,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "old request".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 500,
+            payload: HistoryItemPayload::Error {
+                message_id: None,
+                message: "old error evidence".to_string(),
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 100,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "latest request by sequence".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 4,
+            created_at_ms: 200,
+            payload: HistoryItemPayload::Error {
+                message_id: None,
+                message: "latest request evidence".to_string(),
+            },
+        },
+    ];
+
+    let ordered_sequences = history_items_in_sequence(&items)
+        .into_iter()
+        .map(|item| item.sequence_no)
+        .collect::<Vec<_>>();
+    let latest_window_sequences = history_items_since_latest_user_turn(&items)
+        .into_iter()
+        .map(|item| item.sequence_no)
+        .collect::<Vec<_>>();
+
+    ordered_sequences == vec![1, 2, 3, 4]
+        && latest_user_turn_sequence(&items) == Some(3)
+        && latest_window_sequences == vec![3, 4]
 }
 
 pub fn project_model_turn_state(
@@ -1021,7 +1297,10 @@ pub fn project_model_turn_state(
 }
 
 fn state_native_active_work_contract(state: &SessionStateSnapshot) -> Option<ActiveWorkContract> {
-    if state.completion.route_contract_pending && state.docs_route.is_some() {
+    if state.completion.route_contract_pending
+        && state.docs_route.is_some()
+        && docs_route_authority_matches_active_targets(state)
+    {
         let pending_summary = state
             .completion
             .route_contract_summary
@@ -1051,15 +1330,42 @@ fn state_native_active_work_contract(state: &SessionStateSnapshot) -> Option<Act
         });
     }
 
+    if state.completion.route_contract_pending && state.docs_route.is_some() {
+        let pending_summary = state
+            .completion
+            .route_contract_summary
+            .clone()
+            .or_else(|| state.completion.blocked_reason.clone())
+            .unwrap_or_else(|| "Docs route contract is still pending.".to_string());
+        return Some(ActiveWorkContract::DocsRepair {
+            deliverable: docs_route_pending_repair_target(state.docs_route.as_ref()),
+            pending_deliverables: docs_route_pending_deliverables_from_state(
+                state.docs_route.as_ref(),
+            ),
+            pending_summary,
+            route_contract_satisfied: false,
+        });
+    }
+
     None
 }
 
-pub(crate) fn active_work_contract_for_history_items(
+fn state_authority_decision_for_history_items(
     session: &SessionRecord,
     history_items: &[HistoryItem],
     state: &SessionStateSnapshot,
-    _todos: &[TodoItem],
-) -> Option<ActiveWorkContract> {
+) -> Option<StateAuthorityDecision> {
+    state_authority_candidates_for_history_items(session, history_items, state)
+        .into_iter()
+        .min_by_key(|candidate| (candidate.precedence, candidate.invariant_ref))
+        .map(StateAuthorityCandidate::into_decision)
+}
+
+fn state_authority_candidates_for_history_items(
+    session: &SessionRecord,
+    history_items: &[HistoryItem],
+    state: &SessionStateSnapshot,
+) -> Vec<StateAuthorityCandidate> {
     let latest_user = latest_user_text_from_history_items(history_items);
     let explicit_required_commands = explicit_required_verification_commands_from_history_items(
         session.cwd.as_path(),
@@ -1074,10 +1380,7 @@ pub(crate) fn active_work_contract_for_history_items(
         &explicit_required_commands,
         workspace_blocked_reason.as_deref(),
     );
-
-    if state.completion.route_contract_pending && state.docs_route.is_some() {
-        return state_native_active_work_contract(state);
-    }
+    let mut candidates = Vec::new();
 
     if let Some(snapshot) = structured_document_summary_snapshot_from_history_items(
         session.cwd.as_path(),
@@ -1085,16 +1388,61 @@ pub(crate) fn active_work_contract_for_history_items(
         latest_user.as_deref(),
     ) {
         if !snapshot.missing_files.is_empty() {
-            return Some(ActiveWorkContract::RequestedWorkAuthoring {
-                pending_targets: vec![Utf8PathBuf::from(snapshot.output_target)],
-                verification_commands: Vec::new(),
+            candidates.push(StateAuthorityCandidate {
+                owner: StateAuthorityOwner::RequestedWorkAuthoring,
+                active_work: ActiveWorkContract::RequestedWorkAuthoring {
+                    pending_targets: vec![Utf8PathBuf::from(snapshot.output_target)],
+                    verification_commands: Vec::new(),
+                },
+                precedence: 10,
+                invariant_ref: "structured_document_summary_remaining_sources",
+            });
+        }
+    }
+
+    if !state.completion.verification_pending
+        && state.failure.is_none()
+        && !requested_work.pending_targets.is_empty()
+        && !requested_work_targets_are_docs_route_deliverables(
+            &requested_work.pending_targets,
+            state,
+        )
+    {
+        candidates.push(StateAuthorityCandidate {
+            owner: StateAuthorityOwner::RequestedWorkAuthoring,
+            active_work: ActiveWorkContract::RequestedWorkAuthoring {
+                pending_targets: requested_work.pending_targets.clone(),
+                verification_commands: requested_work.verification_commands.clone(),
+            },
+            precedence: 20,
+            invariant_ref: "latest_requested_work_authoring",
+        });
+    }
+
+    if state.completion.route_contract_pending
+        && state.docs_route.is_some()
+        && docs_route_authority_matches_active_targets(state)
+    {
+        if let Some(active_work) = state_native_active_work_contract(state) {
+            candidates.push(StateAuthorityCandidate {
+                owner: StateAuthorityOwner::DocsRepair,
+                active_work,
+                precedence: 30,
+                invariant_ref: "docs_route_active_target_authority",
             });
         }
     }
 
     if state.completion.verification_pending && matches!(state.process_phase, ProcessPhase::Verify)
     {
-        return state_native_active_work_contract(state);
+        if let Some(active_work) = state_native_active_work_contract(state) {
+            candidates.push(StateAuthorityCandidate {
+                owner: StateAuthorityOwner::Verification,
+                active_work,
+                precedence: 40,
+                invariant_ref: "verification_pending_authority",
+            });
+        }
     }
 
     if state.completion.verification_pending
@@ -1104,20 +1452,55 @@ pub(crate) fn active_work_contract_for_history_items(
             Some(FailureKind::VerificationFailed | FailureKind::PatchMismatch)
         )
     {
-        return Some(ActiveWorkContract::Verification {
-            commands: verification_commands_for_active_repair(state, &requested_work),
-            failing_labels: state.verification.failing_labels.clone(),
-            repair_required: true,
-            targets: contract_reconciled_verification_repair_targets(state, session.cwd.as_path())
+        candidates.push(StateAuthorityCandidate {
+            owner: StateAuthorityOwner::Verification,
+            active_work: ActiveWorkContract::Verification {
+                commands: verification_commands_for_active_repair(state, &requested_work),
+                failing_labels: state.verification.failing_labels.clone(),
+                repair_required: true,
+                targets: contract_reconciled_verification_repair_targets(
+                    state,
+                    session.cwd.as_path(),
+                )
                 .or_else(|| verification_repair_targets_from_state(state))
                 .unwrap_or_else(|| state.active_targets.clone()),
+            },
+            precedence: 50,
+            invariant_ref: "verification_repair_authority",
         });
     }
 
+    if state.completion.verification_pending {
+        if let Some(active_work) = state_native_active_work_contract(state) {
+            candidates.push(StateAuthorityCandidate {
+                owner: StateAuthorityOwner::Verification,
+                active_work,
+                precedence: 60,
+                invariant_ref: "verification_pending_fallback",
+            });
+        }
+    }
+
+    if state.completion.route_contract_pending && state.docs_route.is_some() {
+        if let Some(active_work) = state_native_active_work_contract(state) {
+            candidates.push(StateAuthorityCandidate {
+                owner: StateAuthorityOwner::DocsRepair,
+                active_work,
+                precedence: 70,
+                invariant_ref: "docs_route_pending_fallback",
+            });
+        }
+    }
+
     if !requested_work.pending_targets.is_empty() {
-        return Some(ActiveWorkContract::RequestedWorkAuthoring {
-            pending_targets: requested_work.pending_targets,
-            verification_commands: requested_work.verification_commands,
+        candidates.push(StateAuthorityCandidate {
+            owner: StateAuthorityOwner::RequestedWorkAuthoring,
+            active_work: ActiveWorkContract::RequestedWorkAuthoring {
+                pending_targets: requested_work.pending_targets.clone(),
+                verification_commands: requested_work.verification_commands.clone(),
+            },
+            precedence: 80,
+            invariant_ref: "requested_work_authoring_fallback",
         });
     }
 
@@ -1125,15 +1508,319 @@ pub(crate) fn active_work_contract_for_history_items(
         && !requested_work.verification_commands.is_empty()
         && !requested_work_verification_passed(session, history_items)
     {
-        return Some(ActiveWorkContract::Verification {
-            commands: requested_work.verification_commands,
-            failing_labels: Vec::new(),
-            repair_required: false,
-            targets: Vec::new(),
+        candidates.push(StateAuthorityCandidate {
+            owner: StateAuthorityOwner::Verification,
+            active_work: ActiveWorkContract::Verification {
+                commands: requested_work.verification_commands.clone(),
+                failing_labels: Vec::new(),
+                repair_required: false,
+                targets: Vec::new(),
+            },
+            precedence: 90,
+            invariant_ref: "requested_work_verification_obligation",
         });
     }
 
-    state_native_active_work_contract(state)
+    if let Some(active_work) = state_native_active_work_contract(state) {
+        let owner = match active_work {
+            ActiveWorkContract::RequestedWorkAuthoring { .. } => {
+                StateAuthorityOwner::RequestedWorkAuthoring
+            }
+            ActiveWorkContract::DocsRepair { .. } => StateAuthorityOwner::DocsRepair,
+            ActiveWorkContract::Verification { .. } => StateAuthorityOwner::Verification,
+        };
+        candidates.push(StateAuthorityCandidate {
+            owner,
+            active_work,
+            precedence: 100,
+            invariant_ref: "state_native_projection_fallback",
+        });
+    }
+
+    candidates
+}
+
+fn requested_work_targets_are_docs_route_deliverables(
+    targets: &[Utf8PathBuf],
+    state: &SessionStateSnapshot,
+) -> bool {
+    if targets.is_empty() {
+        return false;
+    }
+    let docs_targets = docs_route_pending_deliverables_from_state(state.docs_route.as_ref())
+        .into_iter()
+        .map(|item| canonical_target_key(item.target.as_str()))
+        .filter(|target| !target.is_empty())
+        .collect::<BTreeSet<_>>();
+    !docs_targets.is_empty()
+        && targets
+            .iter()
+            .all(|target| docs_targets.contains(&canonical_target_key(target.as_str())))
+}
+
+fn materialize_state_authority_projection(
+    session: &SessionRecord,
+    history_items: &[HistoryItem],
+    mut state: SessionStateSnapshot,
+) -> SessionStateSnapshot {
+    let Some(decision) = state_authority_decision_for_history_items(session, history_items, &state)
+    else {
+        return state;
+    };
+    let StateAuthorityDecision { owner, active_work } = decision;
+    match active_work {
+        ActiveWorkContract::RequestedWorkAuthoring {
+            pending_targets,
+            verification_commands,
+        } => {
+            debug_assert_eq!(owner, StateAuthorityOwner::RequestedWorkAuthoring);
+            let active_work = ActiveWorkContract::RequestedWorkAuthoring {
+                pending_targets: pending_targets.clone(),
+                verification_commands: verification_commands.clone(),
+            };
+            state.route = TaskRoute::Code;
+            state.process_phase = ProcessPhase::Author;
+            state.active_targets = pending_targets.clone();
+            state.verification.required_commands = verification_commands;
+            state.completion.open_work_count = pending_targets.len().max(1);
+            state.completion.closeout_ready = false;
+            state.completion.verification_pending = false;
+            state.completion.route_contract_pending = false;
+            state.completion.route_contract_summary = None;
+            state.docs_route = None;
+            state.completion.blocked_reason =
+                selected_owner_blocked_reason(state.completion.blocked_reason.take(), &active_work);
+        }
+        ActiveWorkContract::DocsRepair {
+            deliverable,
+            pending_deliverables,
+            pending_summary,
+            route_contract_satisfied: _,
+        } => {
+            debug_assert_eq!(owner, StateAuthorityOwner::DocsRepair);
+            state.route = TaskRoute::Docs;
+            state.process_phase = if matches!(
+                state.process_phase,
+                ProcessPhase::Author | ProcessPhase::Repair
+            ) {
+                state.process_phase
+            } else {
+                ProcessPhase::Author
+            };
+            state.active_targets = if pending_deliverables.is_empty() {
+                deliverable.into_iter().collect()
+            } else {
+                pending_deliverables
+                    .iter()
+                    .map(|item| item.target.clone())
+                    .collect()
+            };
+            state.completion.open_work_count = state.active_targets.len().max(1);
+            state.completion.closeout_ready = false;
+            state.completion.route_contract_pending = true;
+            state.completion.route_contract_summary = Some(pending_summary.clone());
+            let active_work = ActiveWorkContract::DocsRepair {
+                deliverable: state.active_targets.first().cloned(),
+                pending_deliverables,
+                pending_summary,
+                route_contract_satisfied: false,
+            };
+            state.completion.blocked_reason =
+                selected_owner_blocked_reason(state.completion.blocked_reason.take(), &active_work);
+        }
+        ActiveWorkContract::Verification {
+            commands,
+            failing_labels,
+            repair_required,
+            targets,
+        } => {
+            debug_assert_eq!(owner, StateAuthorityOwner::Verification);
+            let current_docs_route_context = state.route == TaskRoute::Docs
+                && state.docs_route.is_some()
+                && (!state.completion.route_contract_pending
+                    || docs_route_failure_matches_current_requested_docs_contract(
+                        session,
+                        &state,
+                        history_items,
+                    ));
+            if !current_docs_route_context
+                && !docs_route_failure_matches_current_requested_docs_contract(
+                    session,
+                    &state,
+                    history_items,
+                )
+            {
+                state.route = TaskRoute::Code;
+                state.completion.route_contract_pending = false;
+                state.completion.route_contract_summary = None;
+                state.docs_route = None;
+            }
+            state.process_phase = if repair_required {
+                ProcessPhase::Repair
+            } else {
+                ProcessPhase::Verify
+            };
+            let active_work = ActiveWorkContract::Verification {
+                commands: commands.clone(),
+                failing_labels: failing_labels.clone(),
+                repair_required,
+                targets: targets.clone(),
+            };
+            state.active_targets = targets;
+            merge_required_commands(&mut state.verification.required_commands, &commands);
+            if !failing_labels.is_empty() {
+                state.verification.failing_labels = failing_labels;
+            }
+            state.completion.open_work_count = 0;
+            state.completion.closeout_ready = false;
+            state.completion.verification_pending = true;
+            state.completion.blocked_reason =
+                selected_owner_blocked_reason(state.completion.blocked_reason.take(), &active_work);
+        }
+    }
+    state
+}
+
+fn selected_owner_blocked_reason(
+    current: Option<String>,
+    active_work: &ActiveWorkContract,
+) -> Option<String> {
+    if current
+        .as_deref()
+        .is_some_and(|reason| blocked_reason_matches_selected_owner(reason, active_work))
+    {
+        current
+    } else {
+        Some(active_work.summary())
+    }
+}
+
+fn blocked_reason_matches_selected_owner(reason: &str, active_work: &ActiveWorkContract) -> bool {
+    let reason_lower = reason.to_ascii_lowercase();
+    let active_target_keys = active_work
+        .targets()
+        .iter()
+        .map(|target| canonical_target_key(target.as_str()))
+        .filter(|target| !target.is_empty())
+        .collect::<BTreeSet<_>>();
+    let reason_target_keys = blocked_reason_target_keys(reason);
+    if !reason_target_keys.is_empty() {
+        if !active_target_keys.is_empty()
+            && reason_target_keys
+                .iter()
+                .all(|target| active_target_keys.contains(target))
+        {
+            return true;
+        }
+    }
+    if !active_target_keys.is_empty()
+        && active_target_keys
+            .iter()
+            .any(|target| reason_lower == target.to_ascii_lowercase())
+    {
+        return true;
+    }
+    match active_work {
+        ActiveWorkContract::RequestedWorkAuthoring { .. } => {
+            if reason_lower.contains("structured document summary") {
+                return true;
+            }
+            reason_target_keys.is_empty()
+                && (reason_lower.contains("requested deliverable")
+                    || reason_lower.contains("requested-work"))
+        }
+        ActiveWorkContract::DocsRepair {
+            pending_summary, ..
+        } => {
+            reason_lower.contains("docs route")
+                || reason_lower.contains("docs contract")
+                || reason_lower.contains("same-document docs")
+                || !pending_summary.trim().is_empty()
+                    && reason_lower.contains(&pending_summary.to_ascii_lowercase())
+        }
+        ActiveWorkContract::Verification {
+            failing_labels,
+            commands,
+            repair_required,
+            ..
+        } => {
+            reason_lower.contains("verification")
+                || (*repair_required && reason_lower.contains("repair"))
+                || failing_labels
+                    .iter()
+                    .any(|label| reason_lower.contains(&label.to_ascii_lowercase()))
+                || commands
+                    .iter()
+                    .any(|command| reason_lower.contains(&command.to_ascii_lowercase()))
+        }
+    }
+}
+
+fn blocked_reason_target_keys(reason: &str) -> BTreeSet<String> {
+    implementation_handoff_remaining_target_tokens(reason)
+        .into_iter()
+        .filter_map(|target| normalize_target_path(&target, Utf8Path::new("")))
+        .map(|target| canonical_target_key(target.as_str()))
+        .filter(|key| !key.is_empty())
+        .collect()
+}
+
+pub(crate) fn state_blocked_reason_exact_target_identity_fixture_passes() -> bool {
+    let active_work = ActiveWorkContract::RequestedWorkAuthoring {
+        pending_targets: vec![Utf8PathBuf::from("src/workflow.rs")],
+        verification_commands: Vec::new(),
+    };
+    let stale_suffix_reason = "requested-work remains for sibling/src/workflow.rs";
+    let exact_reason = "requested-work remains for src/workflow.rs";
+    let untargeted_owner_reason = "requested-work remains";
+    let structured_dependency_reason =
+        "structured document summary still needs docs/workflow-source.md";
+
+    let stale_result =
+        selected_owner_blocked_reason(Some(stale_suffix_reason.to_string()), &active_work);
+    let exact_result = selected_owner_blocked_reason(Some(exact_reason.to_string()), &active_work);
+    let untargeted_result =
+        selected_owner_blocked_reason(Some(untargeted_owner_reason.to_string()), &active_work);
+    let structured_dependency_result = selected_owner_blocked_reason(
+        Some(structured_dependency_reason.to_string()),
+        &ActiveWorkContract::RequestedWorkAuthoring {
+            pending_targets: vec![Utf8PathBuf::from("docs/workflow-summary.md")],
+            verification_commands: Vec::new(),
+        },
+    );
+
+    stale_result.as_deref() != Some(stale_suffix_reason)
+        && stale_result
+            .as_deref()
+            .is_some_and(|reason| reason.contains("src/workflow.rs"))
+        && exact_result.as_deref() == Some(exact_reason)
+        && untargeted_result.as_deref() == Some(untargeted_owner_reason)
+        && structured_dependency_result.as_deref() == Some(structured_dependency_reason)
+}
+
+fn docs_route_authority_matches_active_targets(state: &SessionStateSnapshot) -> bool {
+    let docs_targets = docs_route_pending_deliverables_from_state(state.docs_route.as_ref())
+        .into_iter()
+        .map(|item| canonical_target_key(item.target.as_str()))
+        .collect::<BTreeSet<_>>();
+    if docs_targets.is_empty() {
+        return false;
+    }
+    !state.active_targets.is_empty()
+        && state
+            .active_targets
+            .iter()
+            .all(|target| docs_targets.contains(&canonical_target_key(target.as_str())))
+}
+
+pub(crate) fn active_work_contract_for_history_items(
+    session: &SessionRecord,
+    history_items: &[HistoryItem],
+    state: &SessionStateSnapshot,
+    _todos: &[TodoItem],
+) -> Option<ActiveWorkContract> {
+    state_authority_decision_for_history_items(session, history_items, state)
+        .map(|decision| decision.active_work)
 }
 
 fn verification_commands_for_active_repair(
@@ -1172,7 +1859,7 @@ fn verification_repair_targets_from_state(
         let Some(normalized_path) = normalize_target_path(target, Utf8Path::new("")) else {
             continue;
         };
-        if !is_code_or_test_target(&normalized_path) && !is_documentation_target(&normalized_path) {
+        if !is_verification_repair_authority_target(&normalized_path) {
             continue;
         }
         let normalized = normalized_path.as_str().replace('\\', "/");
@@ -1197,8 +1884,10 @@ fn verification_repair_targets_from_state(
         }
     }
     if verification_cluster_has_source_owned_generated_test_fallback(failure_cluster) {
-        let source_targets =
-            source_owned_active_work_repair_targets_from_generated_test_evidence(&targets);
+        let source_targets = source_owned_active_work_repair_targets_from_generated_test_evidence(
+            &targets,
+            failure_cluster,
+        );
         if !source_targets.is_empty() {
             return Some(source_targets);
         }
@@ -1208,21 +1897,23 @@ fn verification_repair_targets_from_state(
 
 fn source_owned_active_work_repair_targets_from_generated_test_evidence(
     targets: &[Utf8PathBuf],
+    cluster: Option<&VerificationFailureCluster>,
 ) -> Vec<Utf8PathBuf> {
-    let mut source_targets = targets
-        .iter()
-        .filter(|target| is_code_or_test_target(target) && !is_test_focus_target(target))
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut source_targets =
+        verification_cluster_source_call_site_targets(cluster, Utf8Path::new(""));
+    source_targets.extend(
+        targets
+            .iter()
+            .filter(|target| is_code_or_test_target(target) && !is_test_focus_target(target))
+            .cloned(),
+    );
     if source_targets.is_empty() {
         source_targets.extend(
             targets
                 .iter()
                 .filter(|target| is_test_focus_target(target))
-                .filter_map(|target| python_source_for_test_target(target.as_str()))
-                .filter_map(|contract| {
-                    normalize_target_path(&contract.source_path, Utf8Path::new(""))
-                }),
+                .filter_map(|target| source_path_for_generated_test_target(target.as_str()))
+                .filter_map(|source| normalize_target_path(&source, Utf8Path::new(""))),
         );
     }
     prioritize_repair_targets(source_targets)
@@ -1236,50 +1927,117 @@ pub(crate) fn verification_repair_targets_from_state_ignore_diagnostic_scalars_f
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.contract"),
     ];
     state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: widget.compute is missing".to_string(),
+        summary: "verification failed: workflow.advance is missing".to_string(),
         tool_name: Some(ToolName::Shell),
         targets: vec![
-            Utf8PathBuf::from("widget.py"),
-            Utf8PathBuf::from("test_widget.py"),
+            Utf8PathBuf::from("src/workflow.rs"),
+            Utf8PathBuf::from("tests/workflow.contract"),
         ],
     });
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-diagnostic-scalar-targets".to_string(),
-        failing_labels: vec!["test_compute".to_string()],
+        failing_labels: vec!["workflow behavior contract".to_string()],
         primary_failure: Some(
-            "AttributeError: module 'widget' has no attribute 'compute'".to_string(),
+            "workflow behavior contract reports missing advance operation".to_string(),
         ),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_class_attribute_mismatch".to_string()),
-            label: Some("test_compute".to_string()),
+            label: Some("workflow behavior contract".to_string()),
             target: Some(" 0".to_string()),
-            symbol: Some("widget.compute".to_string()),
-            call_site: Some("widget.compute(1 + 2)".to_string()),
-            exception: Some("AttributeError".to_string()),
-            expected: Some("3".to_string()),
-            observed: Some("widget.compute is missing".to_string()),
-            public_state_assertions: vec!["widget.compute(1 + 2)".to_string()],
-            public_missing_attributes: vec!["widget.compute".to_string()],
+            symbol: Some("workflow.advance".to_string()),
+            call_site: Some("workflow.advance(\"draft\")".to_string()),
+            exception: Some("MissingOperation".to_string()),
+            expected: Some("review step".to_string()),
+            observed: Some("workflow.advance is missing".to_string()),
+            public_state_assertions: vec!["workflow.advance(\"draft\")".to_string()],
+            public_missing_attributes: vec!["workflow.advance".to_string()],
             evidence_markers: vec!["public_class_attribute_mismatch".to_string()],
-            sibling_obligations: vec!["`widget.compute` is missing".to_string()],
+            sibling_obligations: vec!["`workflow.advance` is missing".to_string()],
             requirement_refs: Vec::new(),
-            source_refs: vec![" 0".to_string(), "1 + 2".to_string()],
-            test_refs: vec!["test_widget.py".to_string()],
+            source_refs: vec![" 0".to_string(), "workflow draft step".to_string()],
+            test_refs: vec!["tests/workflow.contract".to_string()],
         }],
-        sibling_obligations: vec!["`widget.compute` is missing".to_string()],
-        source_refs: vec![" 0".to_string(), "1 + 2".to_string()],
-        test_refs: vec!["test_widget.py".to_string()],
+        sibling_obligations: vec!["`workflow.advance` is missing".to_string()],
+        source_refs: vec![" 0".to_string(), "workflow draft step".to_string()],
+        test_refs: vec!["tests/workflow.contract".to_string()],
     });
     let Some(targets) = verification_repair_targets_from_state(&state) else {
         return false;
     };
-    targets == vec![Utf8PathBuf::from("widget.py")]
+    targets == vec![Utf8PathBuf::from("src/workflow.rs")]
+}
+
+pub(crate) fn verification_repair_targets_from_state_uses_common_repair_authority_fixture_passes()
+-> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![
+        Utf8PathBuf::from("package.json"),
+        Utf8PathBuf::from("target/cache/generated.ts"),
+    ];
+    state.failure = Some(FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: package script contract mismatch".to_string(),
+        tool_name: Some(ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-common-repair-authority-targets".to_string(),
+        failing_labels: vec!["build script contract".to_string()],
+        primary_failure: Some("npm test failed after package script config change".to_string()),
+        evidence: vec![
+            VerificationFailureEvidence {
+                evidence_kind: "verification_failure".to_string(),
+                subtype: Some("generic_verification_failure".to_string()),
+                label: Some("package script contract".to_string()),
+                target: Some("package.json".to_string()),
+                symbol: None,
+                call_site: None,
+                exception: None,
+                expected: Some("package scripts expose test command".to_string()),
+                observed: Some("missing test script".to_string()),
+                public_state_assertions: Vec::new(),
+                public_missing_attributes: Vec::new(),
+                evidence_markers: Vec::new(),
+                sibling_obligations: Vec::new(),
+                requirement_refs: Vec::new(),
+                source_refs: vec!["package.json".to_string()],
+                test_refs: Vec::new(),
+            },
+            VerificationFailureEvidence {
+                evidence_kind: "verification_failure".to_string(),
+                subtype: Some("generic_verification_failure".to_string()),
+                label: Some("runner byproduct diagnostic".to_string()),
+                target: Some("target/cache/generated.ts".to_string()),
+                symbol: None,
+                call_site: None,
+                exception: None,
+                expected: None,
+                observed: Some("runner cache noted generated file".to_string()),
+                public_state_assertions: Vec::new(),
+                public_missing_attributes: Vec::new(),
+                evidence_markers: Vec::new(),
+                sibling_obligations: Vec::new(),
+                requirement_refs: Vec::new(),
+                source_refs: Vec::new(),
+                test_refs: Vec::new(),
+            },
+        ],
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["package.json".to_string()],
+        test_refs: Vec::new(),
+    });
+
+    let Some(targets) = verification_repair_targets_from_state(&state) else {
+        return false;
+    };
+    targets == vec![Utf8PathBuf::from("package.json")]
 }
 
 pub(crate) fn public_output_stream_source_repair_active_work_uses_source_target_fixture_passes()
@@ -1291,8 +2049,8 @@ pub(crate) fn public_output_stream_source_repair_active_work_uses_source_target_
         title: "public output source repair target authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -1300,33 +2058,33 @@ pub(crate) fn public_output_stream_source_repair_active_work_uses_source_target_
     let mut state = SessionStateSnapshot::default();
     state.route = TaskRoute::Code;
     state.process_phase = ProcessPhase::Repair;
-    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.contract")];
     state.completion.verification_pending = true;
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-workflow --behavior repair".to_string());
     state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
         summary: "verification failed: public stderr assertion mismatch".to_string(),
         tool_name: Some(ToolName::Shell),
         targets: state.active_targets.clone(),
     });
-    state.verification.failing_labels = vec!["test_public_stderr".to_string()];
+    state.verification.failing_labels = vec!["workflow stderr contract".to_string()];
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-public-output-source-target".to_string(),
-        failing_labels: vec!["test_public_stderr".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        failing_labels: vec!["workflow stderr contract".to_string()],
+        primary_failure: Some("Command: verify-workflow --behavior repair".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_output_stream_assertion_mismatch".to_string()),
-            label: Some("test_public_stderr".to_string()),
-            target: Some("expected stderr token".to_string()),
+            label: Some("workflow stderr contract".to_string()),
+            target: Some("src/workflow.rs".to_string()),
             symbol: None,
-            call_site: Some("self.assertIn(\"expected stderr token\", result.stderr)".to_string()),
+            call_site: Some("workflow output stream assertion".to_string()),
             exception: None,
-            expected: Some("expected stderr token".to_string()),
-            observed: Some("stderr `unmatched stderr output`".to_string()),
+            expected: Some("expected workflow stderr token".to_string()),
+            observed: Some("stderr `unmatched workflow output`".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
@@ -1335,12 +2093,12 @@ pub(crate) fn public_output_stream_source_repair_active_work_uses_source_target_
             ],
             sibling_obligations: vec!["stderr contains expected token".to_string()],
             requirement_refs: Vec::new(),
-            source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            source_refs: vec!["src/workflow.rs".to_string()],
+            test_refs: vec!["tests/workflow.contract".to_string()],
         }],
         sibling_obligations: vec!["stderr contains expected token".to_string()],
-        source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.contract".to_string()],
     });
 
     let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
@@ -1364,26 +2122,185 @@ pub(crate) fn public_output_stream_source_repair_active_work_uses_source_target_
             repair_required: true,
             targets,
             ..
-        }) if targets == vec![Utf8PathBuf::from("widget.py")]
-    ) && diagnostic.active_targets == vec![Utf8PathBuf::from("widget.py")]
+        }) if targets == vec![Utf8PathBuf::from("src/workflow.rs")]
+    ) && diagnostic.active_targets == vec![Utf8PathBuf::from("src/workflow.rs")]
         && diagnostic
             .active_work_summary
             .as_deref()
-            .is_some_and(|summary| summary.contains("`widget.py`"))
+            .is_some_and(|summary| summary.contains("`src/workflow.rs`"))
         && diagnostic
             .repair_lane
             .as_ref()
-            .is_some_and(|lane| lane.required_target.as_deref() == Some("widget.py"))
+            .is_some_and(|lane| lane.required_target.as_deref() == Some("src/workflow.rs"))
+}
+
+pub(crate) fn state_reducer_ignores_projection_cache_items_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: ProjectId::new(),
+        title: "projection cache state fixture".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        completed_at_ms: None,
+    };
+    let mut projected_state = SessionStateSnapshot::default();
+    projected_state.active_targets = vec![Utf8PathBuf::from("stale.rs")];
+    projected_state.completion.open_work_count = 1;
+    projected_state.completion.blocked_reason =
+        Some("projection-only stale target stale.rs".to_string());
+    let projection = crate::session::TurnDecisionDiagnostic {
+        route: "code".to_string(),
+        process_phase: "author".to_string(),
+        active_work_kind: Some("projection-only".to_string()),
+        active_work_summary: Some("projection-only stale target stale.rs".to_string()),
+        active_targets: vec![Utf8PathBuf::from("stale.rs")],
+        verification_pending: false,
+        closeout_ready: false,
+        required_verification_commands: Vec::new(),
+        policy_targets: vec!["stale.rs".to_string()],
+        allowed_tools: vec!["write".to_string()],
+        tool_choice: Some("auto".to_string()),
+        warnings: Vec::new(),
+        repair_lane: None,
+    };
+    let history_items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create active.rs".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::SessionState {
+                state: projected_state,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::StateProjection { projection },
+        },
+    ];
+    let reduced = reduce_session_state_from_history_items(
+        &session,
+        &history_items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let active = active_work_contract_for_history_items(&session, &history_items, &reduced, &[]);
+
+    reduced.active_targets == vec![Utf8PathBuf::from("active.rs")]
+        && reduced.completion.open_work_count == 1
+        && reduced
+            .completion
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("active.rs") && !reason.contains("stale.rs"))
+        && matches!(
+            active,
+            Some(ActiveWorkContract::RequestedWorkAuthoring { pending_targets, .. })
+                if pending_targets == vec![Utf8PathBuf::from("active.rs")]
+        )
+}
+
+pub(crate) fn state_authority_projection_replaces_stale_blocked_reason_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: ProjectId::new(),
+        title: "single owner blocked reason fixture".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        completed_at_ms: None,
+    };
+    let mut previous = SessionStateSnapshot {
+        route: TaskRoute::Docs,
+        process_phase: ProcessPhase::Author,
+        active_targets: vec![Utf8PathBuf::from("docs/old-design.md")],
+        docs_route: Some(DocsRouteState {
+            pending_deliverables: vec![DocsPendingDeliverable {
+                target: Utf8PathBuf::from("docs/old-design.md"),
+                summary: "stale docs deliverable".to_string(),
+            }],
+            ..DocsRouteState::default()
+        }),
+        ..SessionStateSnapshot::default()
+    };
+    previous.completion.route_contract_pending = true;
+    previous.completion.route_contract_summary =
+        Some("stale docs route contract summary".to_string());
+    previous.completion.blocked_reason =
+        Some("stale docs blocked reason for docs/old-design.md".to_string());
+
+    let history_items = vec![HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::UserTurn {
+            message_id: None,
+            content: vec![ContentPart::Text {
+                text: "Create active.rs".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            turn_context: None,
+        },
+    }];
+
+    let reduced = reduce_session_state_from_history_items(&session, &history_items, &[], &previous);
+    reduced.route == TaskRoute::Code
+        && reduced.process_phase == ProcessPhase::Author
+        && reduced.active_targets == vec![Utf8PathBuf::from("active.rs")]
+        && !reduced.completion.route_contract_pending
+        && reduced.completion.route_contract_summary.is_none()
+        && reduced.docs_route.is_none()
+        && reduced
+            .completion
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("active.rs") && !reason.contains("old-design"))
 }
 
 fn target_is_test_like(target: &str) -> bool {
-    let name = target
-        .replace('\\', "/")
-        .rsplit('/')
-        .next()
-        .unwrap_or(target)
-        .to_ascii_lowercase();
-    name.starts_with("test_") || name.ends_with("_test.py")
+    classify_language_artifact_target(target).role == ArtifactRole::Test
+}
+
+fn source_path_for_generated_test_target(target: &str) -> Option<String> {
+    let spec = classify_language_artifact_target(target);
+    (spec.role == ArtifactRole::Test)
+        .then_some(spec.source_path)
+        .flatten()
 }
 
 pub(crate) fn render_active_work_contract(contract: &ActiveWorkContract) -> String {
@@ -1433,11 +2350,6 @@ pub fn render_model_turn_state(state: &ModelTurnState) -> Option<String> {
     Some(format!("Current run state:\n{}", lines.join("\n")))
 }
 
-#[derive(Debug, Clone)]
-struct ToolCallMeta {
-    tool_name: ToolName,
-    arguments_json: String,
-}
 #[derive(Debug, Clone)]
 struct TypedVerificationFailureEvidence {
     failure: FailureState,
@@ -1546,7 +2458,7 @@ fn latest_typed_verification_failure_context(
                         )),
                         session.cwd.as_path(),
                     );
-                    let summary = enrich_verification_failure_summary_with_test_requirement_context(
+                    let summary = enrich_verification_failure_summary_with_language_context(
                         &compact_verification_failure_summary(
                             Some(&run.command),
                             "typed verification run",
@@ -1593,8 +2505,8 @@ pub(crate) fn message_user_protected_reference_filters_verification_targets_fixt
         title: "message user protected target fixture".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -1610,7 +2522,7 @@ pub(crate) fn message_user_protected_reference_filters_verification_targets_fixt
                 message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentPart::Text {
-                    text: "Repair widget.py according to scenario_contract.md, but do not change scenario_contract.md.".to_string(),
+                    text: "Repair src/workflow.rs according to docs/workflow-contract.md, but do not change docs/workflow-contract.md.".to_string(),
                 }],
             },
         },
@@ -1631,42 +2543,42 @@ pub(crate) fn message_user_protected_reference_filters_verification_targets_fixt
                 blocked_action: None,
                 result_hash: Some("fixture-message-user-protected-target".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-workflow --behavior repair".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary: "AssertionError: public behavior mismatch".to_string(),
+                    output_summary: "public behavior contract mismatch".to_string(),
                     failure_cluster: Some(VerificationFailureCluster {
                         cluster_id: "fixture-message-user-protected-target".to_string(),
-                        failing_labels: vec!["test_public_behavior".to_string()],
+                        failing_labels: vec!["workflow public behavior".to_string()],
                         primary_failure: Some("public behavior mismatch".to_string()),
                         evidence: vec![VerificationFailureEvidence {
                             evidence_kind: "verification_failure".to_string(),
                             subtype: Some("public_state_assertion_mismatch".to_string()),
-                            label: Some("test_public_behavior".to_string()),
-                            target: Some("widget.py".to_string()),
+                            label: Some("workflow public behavior".to_string()),
+                            target: Some("src/workflow.rs".to_string()),
                             symbol: None,
-                            call_site: Some("widget.run()".to_string()),
+                            call_site: Some("workflow.advance()".to_string()),
                             exception: None,
                             expected: Some("contract behavior".to_string()),
                             observed: Some("wrong behavior".to_string()),
-                            public_state_assertions: vec!["widget.run()".to_string()],
+                            public_state_assertions: vec!["workflow.advance()".to_string()],
                             public_missing_attributes: Vec::new(),
                             evidence_markers: vec!["source_public_behavior_assertion".to_string()],
                             sibling_obligations: Vec::new(),
                             requirement_refs: Vec::new(),
                             source_refs: vec![
-                                "widget.py".to_string(),
-                                "scenario_contract.md".to_string(),
+                                "src/workflow.rs".to_string(),
+                                "docs/workflow-contract.md".to_string(),
                             ],
-                            test_refs: vec!["test_widget.py".to_string()],
+                            test_refs: vec!["tests/workflow.contract".to_string()],
                         }],
                         sibling_obligations: Vec::new(),
                         source_refs: vec![
-                            "widget.py".to_string(),
-                            "scenario_contract.md".to_string(),
+                            "src/workflow.rs".to_string(),
+                            "docs/workflow-contract.md".to_string(),
                         ],
-                        test_refs: vec!["test_widget.py".to_string()],
+                        test_refs: vec!["tests/workflow.contract".to_string()],
                     }),
                     satisfies_command_identities: Vec::new(),
                     artifact_refs: Vec::new(),
@@ -1683,13 +2595,13 @@ pub(crate) fn message_user_protected_reference_filters_verification_targets_fixt
         .failure
         .targets
         .iter()
-        .any(|target| target.as_str() == "widget.py")
+        .any(|target| target.as_str() == "src/workflow.rs")
         && evidence
             .failure
             .targets
             .iter()
-            .all(|target| target.as_str() != "scenario_contract.md")
-        && evidence.required_commands == vec!["python -m unittest".to_string()]
+            .all(|target| target.as_str() != "docs/workflow-contract.md")
+        && evidence.required_commands == vec!["verify-workflow --behavior repair".to_string()]
 }
 
 fn verification_cluster_has_no_tests_ran(cluster: Option<&VerificationFailureCluster>) -> bool {
@@ -1718,11 +2630,7 @@ fn typed_verification_failure_from_continuation_text(
     )
     .into_iter()
     .filter_map(|target| normalize_target_path(&strip_inline_code_ticks(&target), workspace_root))
-    .filter(|target| {
-        is_code_or_test_target(target)
-            || is_documentation_target(target)
-            || workspace_root.join(target.as_str()).exists()
-    })
+    .filter(|target| is_verification_repair_authority_target(target.as_path()))
     .collect::<Vec<_>>();
     if repair_targets.is_empty() {
         return None;
@@ -1832,7 +2740,7 @@ fn compact_public_command_contract_continuation_summary(
     if !required_commands.is_empty() {
         parts.push(format!("failed_commands={}", required_commands.len()));
     }
-    if lower.contains("interactive stdin") || lower.contains("eoferror") {
+    if lower.contains("interactive stdin") {
         parts.push("observed=argv invocation entered interactive stdin mode instead of processing command-line arguments".to_string());
     } else if lower.contains("stdout had no line ending") {
         parts.push("observed=stdout result suffix missing".to_string());
@@ -2049,15 +2957,6 @@ fn strip_inline_code_ticks(value: &str) -> String {
     value.trim().trim_matches('`').trim().to_string()
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GeneratedTestLocalBindingContradiction {
-    test_target: Utf8PathBuf,
-    label: String,
-    identifier: String,
-    assignment_line: String,
-    assertion_line: String,
-}
-
 fn enrich_generated_test_local_binding_contradiction_cluster(
     cluster: Option<&mut VerificationFailureCluster>,
     raw_summary: &str,
@@ -2073,7 +2972,7 @@ fn enrich_generated_test_local_binding_contradiction_cluster(
     }
 
     for contradiction in contradictions {
-        let target = contradiction.test_target.as_str().to_string();
+        let target = contradiction.test_target.clone();
         let marker = "generated_test_local_binding_contradiction".to_string();
         let readable_marker = format!(
             "generated test local binding contradiction `{}`",
@@ -2098,14 +2997,11 @@ fn enrich_generated_test_local_binding_contradiction_cluster(
 
         let mut enriched = false;
         for evidence in &mut cluster.evidence {
-            let evidence_points_to_target = evidence
-                .target
-                .as_deref()
-                .is_some_and(|existing| file_name_str(existing) == file_name_str(&target))
-                || evidence
-                    .test_refs
-                    .iter()
-                    .any(|existing| file_name_str(existing) == file_name_str(&target));
+            let evidence_points_to_target = evidence.target.as_deref().is_some_and(|existing| {
+                generated_test_local_binding_target_matches(existing, &target, workspace_root)
+            }) || evidence.test_refs.iter().any(|existing| {
+                generated_test_local_binding_target_matches(existing, &target, workspace_root)
+            });
             if !evidence_points_to_target {
                 continue;
             }
@@ -2165,21 +3061,53 @@ fn enrich_generated_test_local_binding_contradiction_cluster(
     cluster.sibling_obligations.dedup();
 }
 
+fn generated_test_local_binding_target_matches(
+    existing: &str,
+    target: &str,
+    workspace_root: &Utf8Path,
+) -> bool {
+    let Some(existing) = normalize_target_path(existing, workspace_root) else {
+        return false;
+    };
+    let Some(target) = normalize_target_path(target, workspace_root) else {
+        return false;
+    };
+    canonical_target_key(existing.as_str()) == canonical_target_key(target.as_str())
+}
+
+pub(crate) fn generated_test_local_binding_enrichment_exact_target_identity_fixture_passes() -> bool
+{
+    let workspace_root = Utf8Path::new("C:/workspace/project");
+    generated_test_local_binding_target_matches(
+        "tests/workflow.spec.ts",
+        "tests/workflow.spec.ts",
+        workspace_root,
+    ) && generated_test_local_binding_target_matches(
+        "C:/workspace/project/tests/workflow.spec.ts",
+        "tests/workflow.spec.ts",
+        workspace_root,
+    ) && !generated_test_local_binding_target_matches(
+        "archive/tests/workflow.spec.ts",
+        "tests/workflow.spec.ts",
+        workspace_root,
+    ) && !generated_test_local_binding_target_matches(
+        "C:/workspace/other/tests/workflow.spec.ts",
+        "tests/workflow.spec.ts",
+        workspace_root,
+    )
+}
+
 fn generated_test_local_binding_contradictions(
     cluster: &VerificationFailureCluster,
     raw_summary: &str,
     workspace_root: &Utf8Path,
-) -> Vec<GeneratedTestLocalBindingContradiction> {
+) -> Vec<LanguageLocalBindingContradiction> {
     let labels = if cluster.failing_labels.is_empty() {
         extract_verification_failure_labels(raw_summary)
     } else {
         cluster.failing_labels.clone()
     };
     if labels.is_empty() {
-        return Vec::new();
-    }
-    let assertion_subjects = local_unittest_assertion_subjects(raw_summary);
-    if assertion_subjects.is_empty() {
         return Vec::new();
     }
 
@@ -2195,146 +3123,20 @@ fn generated_test_local_binding_contradictions(
     );
     test_targets = prioritize_repair_targets(test_targets);
 
-    let mut contradictions = Vec::new();
-    for target in test_targets {
-        let Some(source) = read_small_test_context_source(&target, workspace_root) else {
-            continue;
-        };
-        for label in &labels {
-            if let Some(contradiction) = generated_test_local_binding_contradiction_for_label(
-                &target,
-                label,
-                &source,
-                &assertion_subjects,
-            ) {
-                contradictions.push(contradiction);
-            }
-        }
-    }
-    contradictions
-}
-
-fn generated_test_local_binding_contradiction_for_label(
-    target: &Utf8PathBuf,
-    label: &str,
-    source: &str,
-    assertion_subjects: &[String],
-) -> Option<GeneratedTestLocalBindingContradiction> {
-    let lines = source.lines().collect::<Vec<_>>();
-    let method_index = lines.iter().position(|line| {
-        let trimmed = line.trim_start();
-        trimmed.starts_with("def ")
-            && trimmed
-                .strip_prefix("def ")
-                .is_some_and(|rest| rest.starts_with(label) && rest[label.len()..].starts_with('('))
-    })?;
-    let method_indent = leading_space_count(lines[method_index]);
-    let method_end = lines[method_index + 1..]
-        .iter()
-        .position(|line| {
-            let trimmed = line.trim_start();
-            !trimmed.is_empty()
-                && leading_space_count(line) <= method_indent
-                && (trimmed.starts_with("def ") || trimmed.starts_with("class "))
+    let target_sources = test_targets
+        .into_iter()
+        .filter_map(|target| {
+            read_small_test_context_source(&target, workspace_root)
+                .map(|source| (target.as_str().to_string(), source))
         })
-        .map(|offset| method_index + 1 + offset)
-        .unwrap_or(lines.len());
-    let body = &lines[method_index + 1..method_end];
-    for (assertion_index, assertion_line) in body.iter().enumerate() {
-        let assertion_line = assertion_line.trim();
-        if !assertion_line.contains("self.assert") {
-            continue;
-        }
-        let Some(asserted_subject) = assertion_subjects
-            .iter()
-            .find(|subject| assertion_line_contains_identifier(assertion_line, subject))
-        else {
-            continue;
-        };
-        for assignment_line in body[..assertion_index].iter().rev() {
-            let assignment_line = assignment_line.trim();
-            let duplicates = duplicate_destructuring_identifiers(assignment_line);
-            if duplicates.iter().any(|item| item == asserted_subject) {
-                return Some(GeneratedTestLocalBindingContradiction {
-                    test_target: target.clone(),
-                    label: label.to_string(),
-                    identifier: asserted_subject.clone(),
-                    assignment_line: assignment_line.to_string(),
-                    assertion_line: assertion_line.to_string(),
-                });
-            }
-        }
-    }
-    None
-}
-
-fn local_unittest_assertion_subjects(summary: &str) -> Vec<String> {
-    let mut subjects = local_boolean_assertion_subjects(summary);
-    for line in failure_summary_logical_lines(summary) {
-        let trimmed = line.trim();
-        let Some(assert_start) = trimmed.find("self.assert") else {
-            continue;
-        };
-        let rest = &trimmed[assert_start..];
-        let Some(open_index) = rest.find('(') else {
-            continue;
-        };
-        let after_open = &rest[open_index + 1..];
-        let end = after_open
-            .find(',')
-            .or_else(|| after_open.find(')'))
-            .unwrap_or(after_open.len());
-        let subject = after_open[..end].trim();
-        if is_local_identifier(subject) && !subjects.iter().any(|existing| existing == subject) {
-            subjects.push(subject.to_string());
-        }
-    }
-    subjects.sort();
-    subjects.dedup();
-    subjects
-}
-
-fn duplicate_destructuring_identifiers(line: &str) -> Vec<String> {
-    if line.contains("==") || line.contains("!=") || line.contains("<=") || line.contains(">=") {
-        return Vec::new();
-    }
-    let Some((lhs, _)) = line.split_once('=') else {
-        return Vec::new();
-    };
-    if !lhs.contains(',') {
-        return Vec::new();
-    }
-    let mut seen = BTreeSet::new();
-    let mut duplicates = BTreeSet::new();
-    for raw in lhs
-        .trim()
-        .trim_matches(|ch| matches!(ch, '(' | ')' | '[' | ']'))
-        .split(',')
-    {
-        let identifier = raw.trim();
-        if identifier == "_" || !is_local_identifier(identifier) {
-            continue;
-        }
-        if !seen.insert(identifier.to_string()) {
-            duplicates.insert(identifier.to_string());
-        }
-    }
-    duplicates.into_iter().collect()
-}
-
-fn assertion_line_contains_identifier(line: &str, identifier: &str) -> bool {
-    line.split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
-        .any(|token| token == identifier)
+        .collect::<Vec<_>>();
+    language_generated_test_local_binding_contradictions(&labels, &target_sources, raw_summary)
 }
 
 fn push_unique_string(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|existing| existing == &value) {
         values.push(value);
     }
-}
-
-fn file_name_str(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 fn repair_progress_authority_targets(
@@ -2355,6 +3157,10 @@ fn repair_progress_authority_targets(
     if verification_cluster_has_source_owned_generated_test_fallback(
         evidence.failure_cluster.as_ref(),
     ) {
+        let mut inferred_source_targets = verification_cluster_source_call_site_targets(
+            evidence.failure_cluster.as_ref(),
+            workspace_root,
+        );
         let test_targets = targets
             .iter()
             .cloned()
@@ -2376,13 +3182,35 @@ fn repair_progress_authority_targets(
             .filter(|target| is_test_focus_target(target))
             .collect::<Vec<_>>();
         for target in test_targets {
-            if let Some(contract) = python_source_for_test_target(target.as_str()) {
-                if let Some(source) = normalize_target_path(&contract.source_path, workspace_root) {
+            if let Some(source_path) = source_path_for_generated_test_target(target.as_str()) {
+                if let Some(source) = normalize_target_path(&source_path, workspace_root) {
                     targets.push(source);
                 }
             }
         }
+        if !inferred_source_targets.is_empty() {
+            inferred_source_targets.append(&mut targets);
+            targets = inferred_source_targets;
+        }
     }
+    prioritize_repair_targets(targets)
+}
+
+fn verification_cluster_source_call_site_targets(
+    cluster: Option<&VerificationFailureCluster>,
+    workspace_root: &Utf8Path,
+) -> Vec<Utf8PathBuf> {
+    let Some(cluster) = cluster else {
+        return Vec::new();
+    };
+    let targets = cluster
+        .evidence
+        .iter()
+        .filter_map(|evidence| evidence.call_site.as_deref())
+        .flat_map(language_source_targets_from_text)
+        .filter_map(|target| normalize_target_path(&target, workspace_root))
+        .filter(|target| is_code_or_test_target(target) && !is_test_focus_target(target))
+        .collect::<Vec<_>>();
     prioritize_repair_targets(targets)
 }
 
@@ -2404,10 +3232,9 @@ fn verification_cluster_has_source_owned_generated_test_fallback(
                 evidence.subtype.as_deref() == Some("generic_verification_failure")
                     && (!evidence.public_state_assertions.is_empty()
                         || !evidence.sibling_obligations.is_empty()
-                        || evidence
-                            .call_site
-                            .as_deref()
-                            .is_some_and(|call_site| call_site.contains(".py")))
+                        || evidence.call_site.as_deref().is_some_and(|call_site| {
+                            !language_source_targets_from_text(call_site).is_empty()
+                        }))
                     && evidence
                         .test_refs
                         .iter()
@@ -2778,15 +3605,11 @@ fn verification_cluster_prefers_source_repair(
 
 fn filter_verification_repair_targets(
     targets: Vec<Utf8PathBuf>,
-    workspace_root: &Utf8Path,
+    _workspace_root: &Utf8Path,
 ) -> Vec<Utf8PathBuf> {
     let file_authoritative = targets
         .iter()
-        .filter(|target| {
-            is_code_or_test_target(target)
-                || workspace_root.join(target).is_file()
-                || workspace_root.join(target).is_dir()
-        })
+        .filter(|target| is_verification_repair_authority_target(target.as_path()))
         .cloned()
         .collect::<Vec<_>>();
     if file_authoritative.is_empty() {
@@ -2802,12 +3625,12 @@ fn verification_failure_repair_targets(
 ) -> Vec<Utf8PathBuf> {
     let current_file_authoritative = current_targets
         .iter()
-        .filter(|target| is_code_or_test_target(target) || is_documentation_target(target))
+        .filter(|target| is_verification_repair_authority_target(target.as_path()))
         .cloned()
         .collect::<Vec<_>>();
     let file_authoritative = failure_targets
         .iter()
-        .filter(|target| is_code_or_test_target(target))
+        .filter(|target| is_verification_repair_authority_target(target.as_path()))
         .cloned()
         .collect::<Vec<_>>();
     let mut merged = if current_file_authoritative.is_empty() && file_authoritative.is_empty() {
@@ -2882,35 +3705,15 @@ fn extract_verification_failure_labels(summary: &str) -> Vec<String> {
                     labels.push(label.to_string());
                 }
             }
-        } else if let Some(rest) = trimmed.strip_prefix("FAIL: ") {
-            labels.push(compact_verification_failure_label(rest));
-        } else if let Some(rest) = trimmed.strip_prefix("ERROR: ") {
-            labels.push(compact_verification_failure_label(rest));
-        } else if trimmed.starts_with("test_")
-            && (trimmed.contains("... FAIL") || trimmed.contains("... ERROR"))
-        {
-            labels.push(
-                trimmed
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or(trimmed)
-                    .to_string(),
-            );
         }
         if labels.len() >= MAX_VERIFICATION_FAILURE_LABELS {
             break;
         }
     }
+    if labels.is_empty() {
+        return language_failure_labels_from_summary(summary, MAX_VERIFICATION_FAILURE_LABELS);
+    }
     labels
-}
-
-fn compact_verification_failure_label(label: &str) -> String {
-    label
-        .split_whitespace()
-        .next()
-        .unwrap_or(label)
-        .trim_matches(|ch| matches!(ch, '(' | ')' | ',' | ';'))
-        .to_string()
 }
 
 fn resolve_verification_target_token(
@@ -2929,30 +3732,7 @@ fn resolve_verification_target_token(
         return None;
     }
 
-    let lower = candidate.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "python" | "python.exe" | "py" | "-m" | "unittest" | "pytest" | "discover"
-    ) {
-        return None;
-    }
-
-    if candidate.contains('/') || candidate.contains('\\') || lower.ends_with(".py") {
-        return normalize_target_path(candidate, workspace_root)
-            .filter(|path| workspace_root.join(path).exists());
-    }
-
-    if !(lower.starts_with("test") || lower.contains("integration")) {
-        return None;
-    }
-
-    let module_path = candidate.replace('.', "/");
-    for possibility in [
-        format!("{module_path}.py"),
-        format!("{candidate}.py"),
-        format!("tests/{module_path}.py"),
-        format!("tests/{candidate}.py"),
-    ] {
+    for possibility in language_verification_target_candidates(candidate) {
         if let Some(path) = normalize_target_path(&possibility, workspace_root)
             .filter(|path| workspace_root.join(path).exists())
         {
@@ -2961,26 +3741,6 @@ fn resolve_verification_target_token(
     }
 
     None
-}
-
-fn tool_calls_by_call_id(
-    transcript: &Transcript,
-) -> HashMap<crate::session::ToolCallId, ToolCallMeta> {
-    let mut tool_calls = HashMap::new();
-    for message in &transcript.messages {
-        for part in &message.parts {
-            if let MessagePart::ToolCall(value) = &part.payload {
-                tool_calls.insert(
-                    value.tool_call_id,
-                    ToolCallMeta {
-                        tool_name: value.tool_name,
-                        arguments_json: value.arguments_json.clone(),
-                    },
-                );
-            }
-        }
-    }
-    tool_calls
 }
 
 fn requested_work_discipline_from_history_items(
@@ -3227,7 +3987,7 @@ fn prior_docs_route_contract_text_for_closeout_continuation(
     latest_user: &str,
     deliverables: &[Utf8PathBuf],
 ) -> Option<String> {
-    if !looks_like_docs_closeout_continuation(latest_user, deliverables) {
+    if !looks_like_docs_closeout_continuation(workspace_root, latest_user, deliverables) {
         return None;
     }
     let latest_sequence = latest_user_turn_sequence(history_items)?;
@@ -3256,14 +4016,22 @@ fn prior_docs_route_contract_text_for_closeout_continuation(
             !docs_requested.is_empty()
                 && deliverables.iter().all(|deliverable| {
                     docs_requested.iter().any(|prior| {
-                        docs_route_target_alias_matches(prior.as_str(), deliverable.as_str())
+                        docs_route_target_alias_matches(
+                            workspace_root,
+                            prior.as_str(),
+                            deliverable.as_str(),
+                        )
                     })
                 })
                 && looks_like_docs_only_route_contract(&combined, &docs_requested)
         })
 }
 
-fn looks_like_docs_closeout_continuation(text: &str, deliverables: &[Utf8PathBuf]) -> bool {
+fn looks_like_docs_closeout_continuation(
+    workspace_root: &Utf8Path,
+    text: &str,
+    deliverables: &[Utf8PathBuf],
+) -> bool {
     if deliverables.is_empty()
         || !deliverables
             .iter()
@@ -3272,7 +4040,8 @@ fn looks_like_docs_closeout_continuation(text: &str, deliverables: &[Utf8PathBuf
         return false;
     }
     let lower = text.to_ascii_lowercase();
-    let closeout_signal = lower.contains("manual st closeout continuation")
+    let closeout_signal = lower.contains("typed route closeout continuation")
+        || lower.contains("typed stop-hook continuation")
         || lower.contains("stop-hook continuation")
         || lower.contains("missing expected artifacts")
         || lower.contains("open obligations");
@@ -3281,9 +4050,41 @@ fn looks_like_docs_closeout_continuation(text: &str, deliverables: &[Utf8PathBuf
         || text.contains("ドキュメント");
     closeout_signal
         && docs_repair_signal
-        && deliverables
-            .iter()
-            .any(|target| lower.contains(&target.as_str().to_ascii_lowercase()))
+        && docs_closeout_continuation_mentions_deliverable(workspace_root, text, deliverables)
+}
+
+fn docs_closeout_continuation_mentions_deliverable(
+    workspace_root: &Utf8Path,
+    text: &str,
+    deliverables: &[Utf8PathBuf],
+) -> bool {
+    let mentioned_target_keys = implementation_handoff_remaining_target_tokens(text)
+        .into_iter()
+        .filter_map(|target| docs_route_target_identity(workspace_root, &target))
+        .collect::<BTreeSet<_>>();
+    !mentioned_target_keys.is_empty()
+        && deliverables.iter().any(|target| {
+            docs_route_target_identity(workspace_root, target.as_str())
+                .is_some_and(|key| mentioned_target_keys.contains(&key))
+        })
+}
+
+pub(crate) fn state_docs_closeout_continuation_exact_target_identity_fixture_passes() -> bool {
+    let workspace_root = Utf8Path::new("C:/workspace/project");
+    let deliverables = vec![Utf8PathBuf::from("docs/workflow.md")];
+    let exact_text =
+        "typed route closeout continuation repair docs missing expected artifacts docs/workflow.md";
+    let absolute_text = "typed route closeout continuation repair docs missing expected artifacts C:/workspace/project/docs/workflow.md";
+    let sibling_text = "typed route closeout continuation repair docs missing expected artifacts archive/docs/workflow.md";
+    let foreign_text = "typed route closeout continuation repair docs missing expected artifacts C:/workspace/other/docs/workflow.md";
+    let untargeted_text =
+        "typed route closeout continuation repair docs missing expected artifacts";
+
+    looks_like_docs_closeout_continuation(workspace_root, exact_text, &deliverables)
+        && looks_like_docs_closeout_continuation(workspace_root, absolute_text, &deliverables)
+        && !looks_like_docs_closeout_continuation(workspace_root, sibling_text, &deliverables)
+        && !looks_like_docs_closeout_continuation(workspace_root, foreign_text, &deliverables)
+        && !looks_like_docs_closeout_continuation(workspace_root, untargeted_text, &deliverables)
 }
 
 fn history_item_user_text(item: &HistoryItem) -> Option<String> {
@@ -3305,23 +4106,53 @@ fn docs_route_non_output_reference_target(
 ) -> bool {
     staged_task_artifact_targets_from_text(text)
         .into_iter()
-        .any(|artifact| docs_route_target_alias_matches(target.as_str(), &artifact))
+        .any(|artifact| docs_route_target_alias_matches(workspace_root, target.as_str(), &artifact))
         || extract_protected_artifact_targets(text)
             .into_iter()
-            .any(|artifact| docs_route_target_alias_matches(target.as_str(), &artifact))
+            .any(|artifact| {
+                docs_route_target_alias_matches(workspace_root, target.as_str(), &artifact)
+            })
         || workspace_root.join(target).exists()
 }
 
-fn docs_route_target_alias_matches(left: &str, right: &str) -> bool {
-    let left = left
-        .replace('\\', "/")
-        .trim_start_matches("./")
-        .to_ascii_lowercase();
-    let right = right
-        .replace('\\', "/")
-        .trim_start_matches("./")
-        .to_ascii_lowercase();
-    left == right || left.ends_with(&format!("/{right}")) || right.ends_with(&format!("/{left}"))
+fn docs_route_target_alias_matches(workspace_root: &Utf8Path, left: &str, right: &str) -> bool {
+    let Some(left) = docs_route_target_identity(workspace_root, left) else {
+        return false;
+    };
+    let Some(right) = docs_route_target_identity(workspace_root, right) else {
+        return false;
+    };
+    left == right
+}
+
+fn docs_route_target_identity(workspace_root: &Utf8Path, target: &str) -> Option<String> {
+    normalize_target_path(target, workspace_root).map(|path| {
+        path.as_str()
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_ascii_lowercase()
+    })
+}
+
+pub(crate) fn state_docs_route_target_alias_identity_exact_fixture_passes() -> bool {
+    let workspace_root = Utf8Path::new("C:/workspace/project");
+    docs_route_target_alias_matches(workspace_root, "docs/workflow.md", "docs/workflow.md")
+        && docs_route_target_alias_matches(workspace_root, "./docs/workflow.md", "docs/workflow.md")
+        && docs_route_target_alias_matches(
+            workspace_root,
+            "C:/workspace/project/docs/workflow.md",
+            "docs/workflow.md",
+        )
+        && !docs_route_target_alias_matches(
+            workspace_root,
+            "C:/workspace/sibling/docs/workflow.md",
+            "docs/workflow.md",
+        )
+        && !docs_route_target_alias_matches(
+            workspace_root,
+            "foreign/docs/workflow.md",
+            "docs/workflow.md",
+        )
 }
 
 fn looks_like_docs_only_route_contract(text: &str, deliverables: &[Utf8PathBuf]) -> bool {
@@ -3616,25 +4447,23 @@ pub(crate) fn docs_route_contract_promotes_docs_repair_fixture_passes() -> bool 
     let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
         return false;
     };
-    for dir in [
-        "backend/app/api",
-        "frontend/app",
-        "backend/tests",
-        "data",
-        "examples",
-    ] {
+    for dir in ["src", "tests", "data", "examples"] {
         if fs::create_dir_all(workspace.join(dir).as_std_path()).is_err() {
             return false;
         }
     }
     let files = [
-        ("backend/pyproject.toml", "[project]\nname = \"demo\"\n"),
-        ("backend/app/main.py", "source"),
-        ("frontend/package.json", "{}"),
-        ("frontend/app/page.tsx", "source"),
-        ("backend/tests/test_api.py", "test"),
-        ("data/sample.json", "{}"),
-        ("examples/demo.py", "example"),
+        ("Cargo.toml", "[package]\nname = \"workflow-demo\"\n"),
+        (
+            "src/workflow.rs",
+            "pub fn workflow_state() -> &'static str { \"ready\" }\n",
+        ),
+        (
+            "tests/workflow.contract",
+            "workflow_state reports ready state\n",
+        ),
+        ("data/workflow-sample.json", "{}"),
+        ("examples/workflow-demo.md", "workflow example"),
         (
             "task.md",
             r#"
@@ -3645,16 +4474,16 @@ pub(crate) fn docs_route_contract_promotes_docs_repair_fixture_passes() -> bool 
 Step2: `README.md` を作成する。
 Step3: `basic_design.md` を作成する。
 Step4: `detail_design.md` を作成する。
-backend / frontend / tests / data / examples の実装実態と整合させる。
+source / tests / data / examples の実装実態と整合させる。
 "#,
         ),
         (
             "README.md",
-            "overview backend frontend tests data examples backend/app frontend/app backend/tests data examples",
+            "overview source tests data examples src/workflow.rs tests/workflow.contract data/workflow-sample.json examples/workflow-demo.md",
         ),
         (
             "basic_design.md",
-            "architecture responsibility data flow backend frontend backend/app frontend/app tests data examples",
+            "architecture responsibility data flow source tests data examples src/workflow.rs tests/workflow.contract data/workflow-sample.json examples/workflow-demo.md",
         ),
     ];
     for (path, content) in files {
@@ -3670,8 +4499,8 @@ backend / frontend / tests / data / examples の実装実態と整合させる�
         title: "docs route".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace.clone(),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -3695,10 +4524,10 @@ backend / frontend / tests / data / examples の実装実態と整合させる�
     let mut previous = SessionStateSnapshot::default();
     previous.route = TaskRoute::Code;
     previous.process_phase = ProcessPhase::Author;
-    previous.active_targets = vec![Utf8PathBuf::from("docs/widget-design.md")];
+    previous.active_targets = vec![Utf8PathBuf::from("docs/old-workflow-design.md")];
     previous.completion.open_work_count = 1;
     previous.completion.blocked_reason = Some(
-        "Requested deliverables still require authoring in the workspace: `docs/widget-design.md`."
+        "Requested deliverables still require authoring in the workspace: `docs/old-workflow-design.md`."
             .to_string(),
     );
     let state = reduce_session_state_from_history_items(&session, &items, &[], &previous);
@@ -3748,8 +4577,8 @@ pub(crate) fn docs_route_contract_does_not_require_unmentioned_web_areas_fixture
         title: "generic docs route".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -3808,12 +4637,12 @@ pub(crate) fn docs_route_single_deliverable_contract_promotes_docs_repair_fixtur
     };
     for (path, content) in [
         (
-            "component.py",
-            "def calculate(left, operator, right):\n    return left + right\n",
+            "src/workflow.rs",
+            "pub fn advance(input: &str) -> String { format!(\"workflow:{input}\") }\n",
         ),
         (
-            "test_component.py",
-            "import unittest\nimport component\n\nclass ComponentTest(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(component.calculate(2, '+', 3), 5)\n",
+            "tests/workflow.contract",
+            "workflow.advance accepts a draft input and returns a workflow status string\n",
         ),
     ] {
         if let Some(parent) = workspace.join(path).parent()
@@ -3833,8 +4662,8 @@ pub(crate) fn docs_route_single_deliverable_contract_promotes_docs_repair_fixtur
         title: "single docs deliverable".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -3850,7 +4679,7 @@ pub(crate) fn docs_route_single_deliverable_contract_promotes_docs_repair_fixtur
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "現在の実装を調査し、`docs/component-design.md` を日本語で作成してください。実装コードと test は変更せず、確認できた事実だけを文書化してください。最後に `python -m unittest` を実行してください。".to_string(),
+                    text: "現在の実装を調査し、`docs/workflow-design.md` を日本語で作成してください。実装コードと test は変更せず、確認できた事実だけを文書化してください。最後に `verify-workflow --docs` を実行してください。".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -3864,15 +4693,16 @@ pub(crate) fn docs_route_single_deliverable_contract_promotes_docs_repair_fixtur
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![change_id],
                 changes: vec![FileChangeEvidence {
                     change_id,
                     kind: crate::session::ChangeKind::Add,
                     path_before: None,
-                    path_after: Some(Utf8PathBuf::from("docs/component-design.md")),
-                    summary: "Added docs/component-design.md".to_string(),
+                    path_after: Some(Utf8PathBuf::from("docs/workflow-design.md")),
+                    summary: "Added docs/workflow-design.md".to_string(),
                 }],
-                summary: "Added docs/component-design.md".to_string(),
+                summary: "Added docs/workflow-design.md".to_string(),
             },
         },
     ];
@@ -3889,7 +4719,7 @@ pub(crate) fn docs_route_single_deliverable_contract_promotes_docs_repair_fixtur
         && state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "docs/component-design.md")
+            .any(|target| target.as_str() == "docs/workflow-design.md")
         && matches!(active, Some(ActiveWorkContract::DocsRepair { .. }));
     passed
 }
@@ -3903,16 +4733,16 @@ pub(crate) fn docs_route_flat_test_artifact_satisfies_required_area_fixture_pass
     };
     for (path, content) in [
         (
-            "component.py",
-            "def calculate(left, operator, right):\n    return left + right\n",
+            "src/workflow.rs",
+            "pub fn advance(input: &str) -> String { format!(\"workflow:{input}\") }\n",
         ),
         (
-            "test_component.py",
-            "import unittest\nimport component\n\nclass ComponentTest(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(component.calculate(2, '+', 3), 5)\n",
+            "test_workflow.rs",
+            "#[test]\nfn workflow_advance_contract() {\n    assert_eq!(workflow::advance(\"draft\"), \"workflow:draft\");\n}\n",
         ),
         (
-            "docs/component-design.md",
-            "# コンポーネント設計\n\n## 概要\n\n実装 `component.py` と `test_component.py` を確認した事実を記録します。\n\n## テスト\n\nroot-level `test_component.py` は `unittest` で `component.calculate` を検証します。\n",
+            "docs/workflow-design.md",
+            "# ワークフロー設計\n\n## 概要\n\n実装 `src/workflow.rs` と `test_workflow.rs` を確認した事実を記録します。\n\n## テスト\n\nroot-level `test_workflow.rs` は `workflow.advance` の公開契約を検証します。\n",
         ),
     ] {
         if let Some(parent) = workspace.join(path).parent()
@@ -3932,8 +4762,8 @@ pub(crate) fn docs_route_flat_test_artifact_satisfies_required_area_fixture_pass
         title: "flat docs test evidence".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -3945,10 +4775,10 @@ pub(crate) fn docs_route_flat_test_artifact_satisfies_required_area_fixture_pass
         sequence_no: 1,
         created_at_ms: 1,
         payload: HistoryItemPayload::UserTurn {
-            message_id: None,
-            content: vec![ContentPart::Text {
-                text: "現在の実装を調査し、`docs/component-design.md` を日本語で作成してください。実装コードと test は変更せず、確認できた事実だけを文書化してください。最後に `python -m unittest` を実行してください。".to_string(),
-            }],
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "現在の実装を調査し、`docs/workflow-design.md` を日本語で作成してください。実装コードと test は変更せず、確認できた事実だけを文書化してください。最後に `verify-workflow --docs` を実行してください。".to_string(),
+                }],
             prompt_dispatch: None,
             editor_context: None,
             turn_context: None,
@@ -3969,10 +4799,10 @@ pub(crate) fn docs_route_flat_test_artifact_satisfies_required_area_fixture_pass
             && coverage
                 .representative_paths
                 .iter()
-                .any(|path| path.as_str() == "test_component.py")
+                .any(|path| path.as_str() == "test_workflow.rs")
     });
     let deliverable_tests_satisfied = docs.deliverables.iter().any(|deliverable| {
-        deliverable.target.as_str() == "docs/component-design.md"
+        deliverable.target.as_str() == "docs/workflow-design.md"
             && docs_deliverable_missing_required_areas(deliverable).is_empty()
     });
     state.route == TaskRoute::Docs
@@ -3984,7 +4814,14 @@ pub(crate) fn docs_route_flat_test_artifact_satisfies_required_area_fixture_pass
             .verification
             .required_commands
             .iter()
-            .any(|command| command.contains("unittest"))
+            .any(|command| command.contains("verify-workflow --docs"))
+}
+
+pub(crate) fn state_docs_route_fixtures_are_workflow_neutral_fixture_passes() -> bool {
+    docs_route_contract_promotes_docs_repair_fixture_passes()
+        && docs_route_single_deliverable_contract_promotes_docs_repair_fixture_passes()
+        && docs_route_flat_test_artifact_satisfies_required_area_fixture_passes()
+        && docs_route_localized_topic_completion_fixture_passes()
 }
 
 pub(crate) fn docs_route_localized_topic_completion_fixture_passes() -> bool {
@@ -3994,23 +4831,22 @@ pub(crate) fn docs_route_localized_topic_completion_fixture_passes() -> bool {
     let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
         return false;
     };
-    for dir in [
-        "backend/app/api",
-        "frontend/app",
-        "backend/tests",
-        "data",
-        "examples",
-    ] {
+    for dir in ["src", "tests", "data", "examples"] {
         if fs::create_dir_all(workspace.join(dir).as_std_path()).is_err() {
             return false;
         }
     }
     let files = [
-        ("backend/app/main.py", "source"),
-        ("frontend/app/page.tsx", "source"),
-        ("backend/tests/test_api.py", "test"),
-        ("data/sample.json", "{}"),
-        ("examples/demo.py", "example"),
+        (
+            "src/workflow.rs",
+            "pub fn workflow_state() -> &'static str { \"ready\" }\n",
+        ),
+        (
+            "tests/workflow.contract",
+            "workflow_state reports ready state\n",
+        ),
+        ("data/workflow-sample.json", "{}"),
+        ("examples/workflow-demo.md", "workflow example"),
         (
             "task.md",
             r#"
@@ -4020,20 +4856,20 @@ pub(crate) fn docs_route_localized_topic_completion_fixture_passes() -> bool {
 Step2: `README.md` を作成する。
 Step3: `basic_design.md` を作成する。
 Step4: `detail_design.md` を作成する。
-backend / frontend / tests / data / examples の実装実態と整合させる。
+source / tests / data / examples の実装実態と整合させる。
 "#,
         ),
         (
             "README.md",
-            "概要 backend frontend tests data examples backend/app frontend/app backend/tests data examples",
+            "概要 source tests data examples src/workflow.rs tests/workflow.contract data/workflow-sample.json examples/workflow-demo.md",
         ),
         (
             "basic_design.md",
-            "アーキテクチャ 責務 データフロー backend frontend backend/app frontend/app tests data examples",
+            "アーキテクチャ 責務 データフロー source tests data examples src/workflow.rs tests/workflow.contract data/workflow-sample.json examples/workflow-demo.md",
         ),
         (
             "detail_design.md",
-            "入出力\n## データモデル\nフロー backend frontend backend/app frontend/app backend/tests data examples",
+            "入出力\n## データモデル\nフロー source tests data examples src/workflow.rs tests/workflow.contract data/workflow-sample.json examples/workflow-demo.md",
         ),
     ];
     for (path, content) in files {
@@ -4124,15 +4960,6 @@ fn observed_written_targets_since_latest_user_history_items(
                     }
                 }
             }
-            HistoryItemPayload::ToolOutput { metadata, .. } => {
-                for path in changed_paths_from_tool_output_metadata(metadata) {
-                    if let Some(normalized) = normalize_target_path(&path, workspace_root)
-                        .filter(|path| is_authoring_content_change_path(path.as_path()))
-                    {
-                        targets.insert(normalized.as_str().to_ascii_lowercase());
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -4160,9 +4987,6 @@ fn latest_authored_document_targets_before_latest_user(
                         item_paths.push(path.as_str().to_string());
                     }
                 }
-            }
-            HistoryItemPayload::ToolOutput { metadata, .. } => {
-                item_paths.extend(changed_paths_from_tool_output_metadata(metadata));
             }
             _ => {}
         }
@@ -4211,14 +5035,6 @@ fn observed_written_targets_since_latest_verification_failure(
                     targets.insert(normalized.as_str().to_ascii_lowercase());
                 }
             }
-        } else if let HistoryItemPayload::ToolOutput { metadata, .. } = &item.payload {
-            for path in changed_paths_from_tool_output_metadata(metadata) {
-                if let Some(normalized) = normalize_target_path(&path, workspace_root)
-                    .filter(|path| is_authoring_content_change_path(path.as_path()))
-                {
-                    targets.insert(normalized.as_str().to_ascii_lowercase());
-                }
-            }
         }
     }
     targets
@@ -4226,6 +5042,7 @@ fn observed_written_targets_since_latest_verification_failure(
 
 fn content_changing_progress_since_latest_verification_failure(
     history_items: &[HistoryItem],
+    workspace_root: &Utf8Path,
 ) -> bool {
     let Some(latest_failure_sequence) =
         latest_verification_failure_authority_sequence(history_items)
@@ -4236,21 +5053,11 @@ fn content_changing_progress_since_latest_verification_failure(
         if history_item_order_scalar(item) <= latest_failure_sequence {
             return false;
         }
-        let HistoryItemPayload::ToolOutput {
-            metadata,
-            progress_effect,
-            ..
-        } = &item.payload
-        else {
-            return false;
-        };
-        *progress_effect == ToolProgressEffect::MadeProgress
-            && metadata
-                .get("operation_progress_class")
-                .or_else(|| metadata.pointer("/tool_feedback_envelope/operation_progress_class"))
-                .or_else(|| metadata.pointer("/tool_result_metadata/operation_progress_class"))
-                .and_then(Value::as_str)
-                == Some("content_changing_progress")
+        matches!(
+            &item.payload,
+            HistoryItemPayload::FileChange { changes, .. }
+                if file_changes_have_authoring_content_change(changes, workspace_root)
+        )
     })
 }
 
@@ -4283,57 +5090,6 @@ fn latest_verification_failure_authority_sequence(history_items: &[HistoryItem])
         .max()
 }
 
-fn changed_paths_from_tool_output_metadata(metadata: &Value) -> Vec<String> {
-    let mut paths = Vec::new();
-    if let Some(content_evidence) = metadata.get("file_change_content_evidence") {
-        if content_evidence
-            .get("content_bearing")
-            .and_then(Value::as_bool)
-            == Some(false)
-        {
-            return Vec::new();
-        }
-        if let Some(content_bearing_paths) = content_evidence
-            .get("content_bearing_paths")
-            .and_then(Value::as_array)
-        {
-            paths.extend(
-                content_bearing_paths
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string),
-            );
-            return paths;
-        }
-    }
-    if let Some(changes) = metadata.get("changes").and_then(Value::as_array) {
-        for change in changes {
-            if let Some(path) = change
-                .get("path_after")
-                .or_else(|| change.get("path_before"))
-                .and_then(Value::as_str)
-            {
-                paths.push(path.to_string());
-            }
-        }
-    }
-    if let Some(changed_files) = metadata.get("changed_files").and_then(Value::as_array) {
-        paths.extend(
-            changed_files
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|path| !metadata_changed_file_value_is_opaque_id(path))
-                .map(str::to_string),
-        );
-    }
-    if let Some(tool_result_metadata) = metadata.get("tool_result_metadata") {
-        paths.extend(changed_paths_from_tool_output_metadata(
-            tool_result_metadata,
-        ));
-    }
-    paths
-}
-
 fn file_changes_have_authoring_content_change(
     changes: &[FileChangeEvidence],
     workspace_root: &Utf8Path,
@@ -4348,55 +5104,12 @@ fn file_changes_have_authoring_content_change(
     })
 }
 
-fn metadata_has_authoring_content_change(metadata: &Value, workspace_root: &Utf8Path) -> bool {
-    changed_paths_from_tool_output_metadata(metadata)
-        .into_iter()
-        .filter_map(|path| normalize_target_path(&path, workspace_root))
-        .any(|path| is_authoring_content_change_path(path.as_path()))
-}
-
 fn is_authoring_content_change_path(path: &Utf8Path) -> bool {
     !path_is_verification_runner_byproduct_or_dependency(path)
 }
 
 fn path_is_verification_runner_byproduct_or_dependency(path: &Utf8Path) -> bool {
-    let normalized = path.as_str().replace('\\', "/").to_ascii_lowercase();
-    normalized.ends_with(".pyc")
-        || normalized.ends_with(".pyo")
-        || normalized.ends_with(".pytest_cache")
-        || normalized.split('/').any(|segment| {
-            matches!(
-                segment,
-                ".git"
-                    | ".hg"
-                    | ".svn"
-                    | ".moyai"
-                    | ".venv"
-                    | "venv"
-                    | ".pytest_cache"
-                    | ".ruff_cache"
-                    | "__pycache__"
-                    | "node_modules"
-                    | "target"
-                    | ".next"
-                    | "dist"
-                    | "build"
-                    | "coverage"
-                    | "playwright-report"
-                    | "test-results"
-            )
-        })
-}
-
-fn metadata_changed_file_value_is_opaque_id(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.len() == 26
-        && !trimmed.contains('/')
-        && !trimmed.contains('\\')
-        && !trimmed.contains('.')
-        && trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_digit() || matches!(ch, 'A'..='Z'))
+    language_verification_runner_byproduct_or_dependency(path.as_str())
 }
 
 pub(crate) fn requested_work_missing_todo_graph_stays_authoring_authority() -> bool {
@@ -4408,8 +5121,8 @@ pub(crate) fn requested_work_missing_todo_graph_stays_authoring_authority() -> b
         title: "missing todo graph authoring authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4423,7 +5136,8 @@ pub(crate) fn requested_work_missing_todo_graph_stays_authoring_authority() -> b
         payload: HistoryItemPayload::UserTurn {
             message_id: None,
             content: vec![ContentPart::Text {
-                text: "Create `component.py` and then run `python -m unittest`.".to_string(),
+                text: "Create source artifact `src/workflow.rs` and then run `verify-contract --behavior`."
+                    .to_string(),
             }],
             prompt_dispatch: None,
             editor_context: None,
@@ -4438,7 +5152,7 @@ pub(crate) fn requested_work_missing_todo_graph_stays_authoring_authority() -> b
     );
     let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
     state.process_phase == ProcessPhase::Author
-        && state.active_targets == vec![Utf8PathBuf::from("component.py")]
+        && state.active_targets == vec![Utf8PathBuf::from("src/workflow.rs")]
         && !state.completion.closeout_ready
         && !state.completion.verification_pending
         && matches!(
@@ -4446,8 +5160,8 @@ pub(crate) fn requested_work_missing_todo_graph_stays_authoring_authority() -> b
             Some(ActiveWorkContract::RequestedWorkAuthoring {
                 pending_targets,
                 verification_commands,
-            }) if pending_targets == vec![Utf8PathBuf::from("component.py")]
-                && verification_commands == vec!["python -m unittest".to_string()]
+            }) if pending_targets == vec![Utf8PathBuf::from("src/workflow.rs")]
+                && verification_commands == vec!["verify-contract --behavior".to_string()]
         )
 }
 
@@ -4460,8 +5174,8 @@ pub(crate) fn partial_requested_work_remains_authoring_phase_fixture_passes() ->
         title: "partial authoring".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:\\workspace\\project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4476,7 +5190,8 @@ pub(crate) fn partial_requested_work_remains_authoring_phase_fixture_passes() ->
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `component.py` and `test_component.py`, then run `python -m unittest`.".to_string(),
+                    text: "Create source artifact `src/workflow.rs` and test artifact `tests/workflow.behavior.md`, then run `verify-contract --behavior`."
+                        .to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -4490,15 +5205,17 @@ pub(crate) fn partial_requested_work_remains_authoring_phase_fixture_passes() ->
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Add,
                     path_before: None,
-                    path_after: Some(Utf8PathBuf::from("component.py")),
-                    summary: "Added component.py".to_string(),
+                    path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                    summary: "typed authoring completion evidence: Added source artifact src/workflow.rs".to_string(),
                 }],
-                summary: "Added component.py".to_string(),
+                summary: "typed authoring completion evidence: Added source artifact src/workflow.rs"
+                    .to_string(),
             },
         },
     ];
@@ -4513,71 +5230,74 @@ pub(crate) fn partial_requested_work_remains_authoring_phase_fixture_passes() ->
         && !state.completion.closeout_ready
         && !state.completion.verification_pending
         && state.completion.open_work_count == 1
-        && state.active_targets == vec![Utf8PathBuf::from("test_component.py")]
+        && state.active_targets == vec![Utf8PathBuf::from("tests/workflow.behavior.md")]
         && state
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         && matches!(
             active,
             Some(ActiveWorkContract::RequestedWorkAuthoring {
                 pending_targets,
                 ..
-            }) if pending_targets == vec![Utf8PathBuf::from("test_component.py")]
+            }) if pending_targets == vec![Utf8PathBuf::from("tests/workflow.behavior.md")]
         )
+}
+
+pub(crate) fn state_requested_work_fixtures_are_workflow_neutral_fixture_passes() -> bool {
+    requested_work_missing_todo_graph_stays_authoring_authority()
+        && partial_requested_work_remains_authoring_phase_fixture_passes()
+        && verification_failure_labels_are_not_requested_work_targets_fixture_passes()
+        && verification_failure_diagnostic_paths_are_not_requested_work_targets_fixture_passes()
 }
 
 pub(crate) fn verification_failure_labels_are_not_requested_work_targets_fixture_passes() -> bool {
     let text = r#"
-Manual ST closeout continuation.
+Typed route closeout continuation.
 
 Open obligations:
-- author `test_arcade_game.TestBulletClass.test_bullet_creation`
-- author `test_arcade_game.TestBulletClass.test_bullet_destroy`
+- author `workflow_contract.required_transition`
+- author `workflow_contract.required_projection`
 
 Required verification failed in the latest evidence:
-- `python -m unittest`
+- `verify-contract --behavior`
 "#;
     let targets = requested_deliverable_targets_from_instruction_text_for_workspace(
         Utf8Path::new("C:/workspace/project"),
         Some(text),
     );
-    !targets.iter().any(|target| {
-        target
-            .as_str()
-            .starts_with("test_arcade_game.TestBulletClass")
-    })
+    !targets
+        .iter()
+        .any(|target| target.as_str().starts_with("workflow_contract."))
 }
 
 pub(crate) fn verification_failure_diagnostic_paths_are_not_requested_work_targets_fixture_passes()
 -> bool {
-    let workspace_root =
-        Utf8Path::new("C:/Users/example/Desktop/CodingAgent/project_sandbox/route/generic/workspace");
+    let workspace_root = Utf8Path::new("C:/workspace/project");
     let text = r#"
 Verification repair continuation.
 
 The prior assistant message completed a runtime turn, and all required artifacts are present, but the latest required verification command failed.
 
 Repair targets:
-- component.py
+- src/workflow.rs
 
 Failed required verification commands:
-- python -m unittest
+- verify-contract --behavior
 
 Latest verification failure evidence:
-- command: python -m unittest
-stderr: Exception in thread Thread-2 (_readerthread):
-Traceback (most recent call last):
-  File "C:\Python313\Lib\threading.py", line 1043, in _bootstrap_inner
-  File "C:\Python313\Lib\subprocess.py", line 1615, in _readerthread
-  File "C:\Python313\Lib\unittest\case.py", line 1171, in assertIn
-  File "C:\Users\example\Desktop\CodingAgent\project_sandbox\route\generic\workspace\test_component.py", line 158, in test_cli_divide_by_zero
-TypeError: argument of type 'NoneType' is not iterable
+- command: verify-contract --behavior
+stderr: contract verification failed
+  artifact: tests/workflow.behavior.md
+  diagnostic path: C:/runtime/diagnostics/tool-runner.trace
+  diagnostic path: C:/runtime/library/worker.trace
+  observed: workflow transition output omitted required state marker
+  expected: workflow transition output includes required state marker
 
 Expected artifacts:
-- component.py
-- test_component.py
+- src/workflow.rs
+- tests/workflow.behavior.md
 
 After the repair edit, rerun the failed required verification command(s) with shell.
 "#;
@@ -4587,13 +5307,10 @@ After the repair edit, rerun the failed required verification command(s) with sh
     );
     let no_diagnostic_targets = targets.iter().all(|target| {
         let normalized = target.as_str().replace('\\', "/").to_ascii_lowercase();
-        !normalized.contains("python313")
-            && !normalized.contains("/lib/")
-            && !normalized.contains("subprocess.py")
-            && !normalized.contains("threading.py")
-            && !normalized.contains("unittest/case.py")
-            && !normalized.contains("/users/")
-            && !normalized.contains("project_sandbox/route")
+        !normalized.contains("runtime/diagnostics")
+            && !normalized.contains("runtime/library")
+            && !normalized.contains("tool-runner.trace")
+            && !normalized.contains("worker.trace")
     });
     if !no_diagnostic_targets {
         return false;
@@ -4606,8 +5323,8 @@ After the repair edit, rerun the failed required verification command(s) with sh
         title: "verification diagnostic path authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace_root.to_path_buf(),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4635,7 +5352,7 @@ After the repair edit, rerun the failed required verification command(s) with sh
         &SessionStateSnapshot::default(),
     );
     state.process_phase == ProcessPhase::Repair
-        && state.active_targets == vec![Utf8PathBuf::from("component.py")]
+        && state.active_targets == vec![Utf8PathBuf::from("src/workflow.rs")]
         && state.completion.verification_pending
         && state
             .completion
@@ -4644,18 +5361,15 @@ After the repair edit, rerun the failed required verification command(s) with sh
             .is_some_and(|reason| reason.contains("verification failed"))
         && state.active_targets.iter().all(|target| {
             let normalized = target.as_str().replace('\\', "/").to_ascii_lowercase();
-            !normalized.contains("python313")
-                && !normalized.contains("/lib/")
-                && !normalized.contains("/users/")
-                && !normalized.contains("subprocess.py")
-                && !normalized.contains("threading.py")
-                && !normalized.contains("unittest/case.py")
+            !normalized.contains("runtime/diagnostics")
+                && !normalized.contains("runtime/library")
+                && !normalized.contains("tool-runner.trace")
+                && !normalized.contains("worker.trace")
         })
 }
 
 pub(crate) fn continuation_context_symbols_are_not_requested_work_targets_fixture_passes() -> bool {
-    let workspace_root =
-        Utf8Path::new("C:/Users/example/Desktop/CodingAgent/project_sandbox/route/generic/workspace");
+    let workspace_root = Utf8Path::new("C:/workspace/project");
     let text = r#"
 Verification repair continuation.
 
@@ -4664,18 +5378,18 @@ The prior assistant message completed a runtime turn, and all required artifacts
 Previous final assistant message:
 All tests passed.
 
-- `component.py`: created a CLI component. It supports function mode (`parse_and_evaluate`) and CLI mode (`sys.argv`).
-- `test_component.py`: created unit and CLI integration tests.
+- `src/workflow.rs`: created a source artifact. It supports public operation (`apply_transition`) and state projection (`workflow_state`).
+- `tests/workflow.behavior.md`: created behavior contract observations.
 
 Repair targets:
-- component.py
+- src/workflow.rs
 
 Failed required verification commands:
-- python -m unittest
+- verify-contract --behavior
 
 Expected artifacts:
-- component.py
-- test_component.py
+- src/workflow.rs
+- tests/workflow.behavior.md
 "#;
     let targets = requested_deliverable_targets_from_instruction_text_for_workspace(
         workspace_root,
@@ -4684,7 +5398,7 @@ Expected artifacts:
     if targets.iter().any(|target| {
         matches!(
             target.as_str(),
-            "sys.argv" | "parse_and_evaluate" | "component.parse_and_evaluate"
+            "apply_transition" | "workflow_state" | "workflow.apply_transition"
         )
     }) {
         return false;
@@ -4697,8 +5411,8 @@ Expected artifacts:
         title: "continuation context symbol authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace_root.to_path_buf(),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4725,33 +5439,32 @@ Expected artifacts:
         &[],
         &SessionStateSnapshot::default(),
     );
-    state.active_targets == vec![Utf8PathBuf::from("component.py")]
+    state.active_targets == vec![Utf8PathBuf::from("src/workflow.rs")]
         && state.active_targets.iter().all(|target| {
             !matches!(
                 target.as_str(),
-                "sys.argv" | "parse_and_evaluate" | "component.parse_and_evaluate"
+                "apply_transition" | "workflow_state" | "workflow.apply_transition"
             )
         })
 }
 
-pub(crate) fn manual_st_closeout_expected_artifacts_inventory_does_not_reopen_fixture_passes()
--> bool {
+pub(crate) fn route_closeout_expected_artifacts_inventory_does_not_reopen_fixture_passes() -> bool {
     let workspace_root = Utf8Path::new("C:/workspace/project");
     let text = r#"
-Manual ST closeout continuation.
+Typed route closeout continuation.
 
 The prior assistant message completed a runtime turn, but route closeout evidence shows the requested work is not complete.
 
 Open obligations:
-- repair docs `docs/widget-design.md`
+- repair docs `docs/workflow-design.md`
 
 Missing expected artifacts:
 - none
 
 Expected artifacts:
-- widget.py
-- docs/widget-design.md
-- test_widget.py
+- src/workflow.rs
+- docs/workflow-design.md
+- tests/workflow.behavior.md
 
 Expected artifacts are route inventory evidence only. They do not create new authoring targets unless the same path is listed under Open obligations or Missing expected artifacts.
 "#;
@@ -4759,7 +5472,7 @@ Expected artifacts are route inventory evidence only. They do not create new aut
         workspace_root,
         Some(text),
     );
-    if targets != vec![Utf8PathBuf::from("docs/widget-design.md")] {
+    if targets != vec![Utf8PathBuf::from("docs/workflow-design.md")] {
         return false;
     }
 
@@ -4768,11 +5481,11 @@ Expected artifacts are route inventory evidence only. They do not create new aut
     let session = SessionRecord {
         id: session_id,
         project_id: crate::session::ProjectId::new(),
-        title: "manual ST closeout inventory authority".to_string(),
+        title: "route closeout inventory authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace_root.to_path_buf(),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4799,11 +5512,13 @@ Expected artifacts are route inventory evidence only. They do not create new aut
         &[],
         &SessionStateSnapshot::default(),
     );
-    state.active_targets == vec![Utf8PathBuf::from("docs/widget-design.md")]
-        && !state
-            .active_targets
-            .iter()
-            .any(|target| matches!(target.as_str(), "widget.py" | "test_widget.py"))
+    state.active_targets == vec![Utf8PathBuf::from("docs/workflow-design.md")]
+        && !state.active_targets.iter().any(|target| {
+            matches!(
+                target.as_str(),
+                "src/workflow.rs" | "tests/workflow.behavior.md"
+            )
+        })
 }
 
 pub(crate) fn docs_route_closeout_continuation_preserves_docs_authority_fixture_passes() -> bool {
@@ -4814,14 +5529,19 @@ pub(crate) fn docs_route_closeout_continuation_preserves_docs_authority_fixture_
         return false;
     };
     if fs::create_dir_all(workspace.join("docs").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("src").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("tests").as_std_path()).is_err()
         || fs::write(
-            workspace.join("calculator.py").as_std_path(),
-            "def add(a, b):\n    return a + b\n",
+            workspace.join("src").join("workflow.rs").as_std_path(),
+            "pub fn apply_transition() -> &'static str {\n    \"complete\"\n}\n",
         )
         .is_err()
         || fs::write(
-            workspace.join("test_calculator.py").as_std_path(),
-            "import unittest\n",
+            workspace
+                .join("tests")
+                .join("workflow.behavior.md")
+                .as_std_path(),
+            "behavior: apply_transition returns complete\n",
         )
         .is_err()
         || fs::write(
@@ -4845,37 +5565,37 @@ pub(crate) fn docs_route_closeout_continuation_preserves_docs_authority_fixture_
         title: "docs closeout continuation".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
     let initial_request = r#"
-現在の実装を調査し、`docs/calculator-design.md` を日本語で作成してください。
+    現在の実装を調査し、`docs/workflow-design.md` を日本語で作成してください。
 実装コードと test は変更せず、確認できた事実だけを文書化してください。
-最後に `python -m unittest` を実行してください。
+最後に `verify-contract --behavior` を実行してください。
 
 Scenario contract authority:
 - `scenario_contract.md`
 - `scenario_contract.json`
 "#;
     let continuation = r#"
-Manual ST closeout continuation.
+Typed route closeout continuation.
 
 The prior assistant message completed a runtime turn, but route closeout evidence shows the requested work is not complete.
 
 Open obligations:
-- repair docs `docs/calculator-design.md`
-- repair docs deliverable `docs/calculator-design.md`
+- repair docs `docs/workflow-design.md`
+- repair docs deliverable `docs/workflow-design.md`
 
 Missing expected artifacts:
-- docs/calculator-design.md
+- docs/workflow-design.md
 
 Expected artifacts:
-- calculator.py
-- docs/calculator-design.md
-- test_calculator.py
+- src/workflow.rs
+- docs/workflow-design.md
+- tests/workflow.behavior.md
 
 Expected artifacts are route inventory evidence only. They do not create new authoring targets unless the same path is listed under Open obligations or Missing expected artifacts.
 "#;
@@ -4923,7 +5643,7 @@ Expected artifacts are route inventory evidence only. They do not create new aut
     state.route == TaskRoute::Docs
         && state.docs_route.is_some()
         && state.completion.route_contract_pending
-        && state.active_targets == vec![Utf8PathBuf::from("docs/calculator-design.md")]
+        && state.active_targets == vec![Utf8PathBuf::from("docs/workflow-design.md")]
         && matches!(active, Some(ActiveWorkContract::DocsRepair { .. }))
         && state
             .completion
@@ -4939,20 +5659,22 @@ pub(crate) fn verification_repair_continuation_projects_repair_state_fixture_pas
     let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
         return false;
     };
-    if fs::create_dir_all(workspace.join("docs").as_std_path()).is_err()
+    if fs::create_dir_all(workspace.join("src").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("tests").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("docs").as_std_path()).is_err()
         || fs::write(
-            workspace.join("widget.py").as_std_path(),
-            "def render(value):\n    return str(value)\n",
+            workspace.join("src/workflow.rs").as_std_path(),
+            "workflow implementation artifact\n",
         )
         .is_err()
         || fs::write(
-            workspace.join("test_widget.py").as_std_path(),
-            "import unittest\n",
+            workspace.join("tests/workflow.behavior.md").as_std_path(),
+            "workflow behavior verification artifact\n",
         )
         .is_err()
         || fs::write(
-            workspace.join("docs/widget-contract.md").as_std_path(),
-            "# Widget contract\n",
+            workspace.join("docs/workflow-contract.md").as_std_path(),
+            "workflow contract artifact\n",
         )
         .is_err()
     {
@@ -4967,14 +5689,14 @@ pub(crate) fn verification_repair_continuation_projects_repair_state_fixture_pas
         title: "verification repair continuation projection".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace.clone(),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
     let continuation = r#"
-Manual ST verification-repair continuation.
+Typed verification-repair continuation.
 
 The prior assistant message completed a runtime turn, and all required artifacts are present, but the latest required verification command failed.
 
@@ -4982,19 +5704,19 @@ Previous final assistant message:
 All tests passed.
 
 Repair targets:
-- widget.py
+- src/workflow.rs
 
 Failed required verification commands:
-- python -m unittest
+- verify-contract --behavior
 
 Latest verification failure evidence:
-- command: python -m unittest
-- public command contract: stderr did not include an accepted usage marker for invalid arguments.
+- command: verify-contract --behavior
+- typed verification continuation evidence: source behavior contract mismatch in src/workflow.rs.
 
 Expected artifacts:
-- widget.py
-- test_widget.py
-- docs/widget-contract.md
+- src/workflow.rs
+- tests/workflow.behavior.md
+- docs/workflow-contract.md
 
 After the repair edit, rerun the failed required verification command(s) with shell.
 "#;
@@ -5023,7 +5745,7 @@ After the repair edit, rerun the failed required verification command(s) with sh
     let initial_active =
         active_work_contract_for_history_items(&session, &initial_items, &initial_state, &[]);
     let initial_ok = initial_state.process_phase == ProcessPhase::Repair
-        && initial_state.active_targets == vec![Utf8PathBuf::from("widget.py")]
+        && initial_state.active_targets == vec![Utf8PathBuf::from("src/workflow.rs")]
         && initial_state.completion.open_work_count == 0
         && initial_state.completion.verification_pending
         && initial_state
@@ -5035,14 +5757,14 @@ After the repair edit, rerun the failed required verification command(s) with sh
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         && matches!(
             initial_active,
             Some(ActiveWorkContract::Verification {
                 repair_required: true,
                 targets,
                 ..
-            }) if targets == vec![Utf8PathBuf::from("widget.py")]
+            }) if targets == vec![Utf8PathBuf::from("src/workflow.rs")]
         );
 
     let mut repaired_items = initial_items;
@@ -5053,15 +5775,16 @@ After the repair edit, rerun the failed required verification command(s) with sh
         sequence_no: 2,
         created_at_ms: 2,
         payload: HistoryItemPayload::FileChange {
+            call_id: crate::session::ToolCallId::new(),
             change_ids: vec![ChangeId::new()],
             changes: vec![FileChangeEvidence {
                 change_id: ChangeId::new(),
                 kind: crate::session::ChangeKind::Update,
-                path_before: Some(Utf8PathBuf::from("widget.py")),
-                path_after: Some(Utf8PathBuf::from("widget.py")),
-                summary: "Updated widget.py".to_string(),
+                path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+                path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                summary: "Updated source implementation artifact".to_string(),
             }],
-            summary: "Updated widget.py".to_string(),
+            summary: "Updated source implementation artifact".to_string(),
         },
     });
     let repaired_state = reduce_session_state_from_history_items(
@@ -5087,6 +5810,261 @@ After the repair edit, rerun the failed required verification command(s) with sh
     initial_ok && repaired_ok
 }
 
+pub(crate) fn verification_repair_continuation_existing_byproduct_path_is_not_repair_target_fixture_passes()
+-> bool {
+    let Ok(temp) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
+        return false;
+    };
+    if fs::create_dir_all(workspace.join("src").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("build-artifacts/cache").as_std_path()).is_err()
+        || fs::write(
+            workspace.join("src/workflow.rs").as_std_path(),
+            "pub fn render(value: i32) -> String { value.to_string() }\n",
+        )
+        .is_err()
+        || fs::write(
+            workspace
+                .join("build-artifacts/cache/verification.snapshot")
+                .as_std_path(),
+            "runner cache\n",
+        )
+        .is_err()
+    {
+        return false;
+    }
+
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "verification repair continuation byproduct target authority".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: workspace,
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let continuation = r#"
+Verification repair continuation.
+
+The prior assistant message completed a runtime turn, and all required artifacts are present, but the latest required verification command failed.
+
+Repair targets:
+- build-artifacts/cache/verification.snapshot
+- src/workflow.rs
+
+Failed required verification commands:
+- verify-contract --behavior
+
+Latest verification failure evidence:
+- command: verify-contract --behavior
+- typed verification continuation evidence: source behavior mismatch in src/workflow.rs.
+
+After the repair edit, rerun the failed required verification command(s) with shell.
+"#;
+    let items = vec![HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::UserTurn {
+            message_id: None,
+            content: vec![ContentPart::Text {
+                text: continuation.to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            turn_context: None,
+        },
+    }];
+    let state = reduce_session_state_from_history_items(
+        &session,
+        &items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+    let byproduct = Utf8PathBuf::from("build-artifacts/cache/verification.snapshot");
+    let failure_targets_exclude_byproduct = state.failure.as_ref().is_some_and(|failure| {
+        failure.targets == vec![Utf8PathBuf::from("src/workflow.rs")]
+            && !failure.targets.iter().any(|target| target == &byproduct)
+    });
+    state.process_phase == ProcessPhase::Repair
+        && state.active_targets == vec![Utf8PathBuf::from("src/workflow.rs")]
+        && failure_targets_exclude_byproduct
+        && !state
+            .active_targets
+            .iter()
+            .any(|target| target == &byproduct)
+        && matches!(
+            active,
+            Some(ActiveWorkContract::Verification {
+                repair_required: true,
+                targets,
+                ..
+            }) if targets == vec![Utf8PathBuf::from("src/workflow.rs")]
+        )
+}
+
+pub(crate) fn generic_generated_test_source_call_site_targets_source_without_python_suffix_fixture_passes()
+-> bool {
+    let session = SessionRecord {
+        id: crate::session::SessionId::new(),
+        project_id: crate::session::ProjectId::new(),
+        title: "generic generated-test source call-site authority".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    state.failure = Some(FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: generated test observed source behavior mismatch"
+            .to_string(),
+        tool_name: Some(ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state
+        .verification
+        .required_commands
+        .push("verify-generated-test --callsite".to_string());
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-generic-generated-test-source-call-site".to_string(),
+        failing_labels: vec!["tests/workflow.spec.ts::renders formatted value".to_string()],
+        primary_failure: Some(
+            "expected formatted operation output, observed raw value".to_string(),
+        ),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generated_test_artifact_api_misuse".to_string()),
+            label: Some("renders formatted value".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: Some("renderOperation".to_string()),
+            call_site: Some("src/workflow.ts:42 renderOperation(value)".to_string()),
+            exception: None,
+            expected: Some("formatted operation output".to_string()),
+            observed: Some("raw operation output".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: Vec::new(),
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: vec!["src/workflow.ts".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["src/workflow.ts".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
+    });
+
+    let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
+    let allowed_tools = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+    let repair_lane = crate::agent::repair_lane::project_repair_lane(&state, &allowed_tools);
+
+    matches!(
+        active,
+        Some(ActiveWorkContract::Verification {
+            repair_required: true,
+            targets,
+            ..
+        }) if targets == vec![Utf8PathBuf::from("src/workflow.ts")]
+    ) && repair_lane
+        .as_ref()
+        .and_then(|lane| lane.repair_control_snapshot.as_ref())
+        .is_some_and(|snapshot| {
+            snapshot.required_target.as_deref() == Some("src/workflow.ts")
+                && snapshot.repair_owner == "source"
+        })
+}
+
+pub(crate) fn generic_generated_test_line_column_call_site_targets_source_fixture_passes() -> bool {
+    let session = SessionRecord {
+        id: crate::session::SessionId::new(),
+        project_id: crate::session::ProjectId::new(),
+        title: "generic generated-test line-column source call-site authority".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    state.failure = Some(FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: generated test observed source behavior mismatch"
+            .to_string(),
+        tool_name: Some(ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state
+        .verification
+        .required_commands
+        .push("verify-generated-test --callsite".to_string());
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-generic-generated-test-line-column-source-call-site".to_string(),
+        failing_labels: vec!["tests/workflow.spec.ts::renders formatted value".to_string()],
+        primary_failure: Some(
+            "expected formatted operation output, observed raw value".to_string(),
+        ),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generic_verification_failure".to_string()),
+            label: Some("renders formatted value".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: Some("renderOperation".to_string()),
+            call_site: Some("at renderOperation (src/workflow.ts:42:7)".to_string()),
+            exception: None,
+            expected: Some("formatted operation output".to_string()),
+            observed: Some("raw operation output".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: Vec::new(),
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
+    });
+
+    let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
+    let allowed_tools = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+    let repair_lane = crate::agent::repair_lane::project_repair_lane(&state, &allowed_tools);
+
+    matches!(
+        active,
+        Some(ActiveWorkContract::Verification {
+            repair_required: true,
+            targets,
+            ..
+        }) if targets == vec![Utf8PathBuf::from("src/workflow.ts")]
+    ) && repair_lane
+        .as_ref()
+        .and_then(|lane| lane.repair_control_snapshot.as_ref())
+        .is_some_and(|snapshot| snapshot.required_target.as_deref() == Some("src/workflow.ts"))
+}
+
 pub(crate) fn public_command_contract_continuation_projects_compact_source_repair_fixture_passes()
 -> bool {
     let Ok(temp) = tempfile::tempdir() else {
@@ -5095,14 +6073,21 @@ pub(crate) fn public_command_contract_continuation_projects_compact_source_repai
     let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
         return false;
     };
+    if fs::create_dir_all(workspace.join("src").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("tests").as_std_path()).is_err()
+    {
+        return false;
+    }
     if fs::write(
-        workspace.join("tool.py").as_std_path(),
-        "def main():\n    input()\n\nif __name__ == '__main__':\n    main()\n",
+        workspace.join("src/workflow.rs").as_std_path(),
+        "source artifact role: public command handler\nbehavior: compact source command should consume argv tokens\n",
     )
     .is_err()
         || fs::write(
-            workspace.join("test_tool.py").as_std_path(),
-            "import unittest\n",
+            workspace
+                .join("tests/workflow.command-contract")
+                .as_std_path(),
+            "test artifact role: public command contract\nexpected: argv tokens produce compact stdout observation\n",
         )
         .is_err()
     {
@@ -5117,28 +6102,29 @@ pub(crate) fn public_command_contract_continuation_projects_compact_source_repai
         title: "public command continuation projection".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
     let continuation = r#"
-Manual ST verification-repair continuation.
+Typed verification-repair continuation.
 
 Repair targets:
-- tool.py
+- src/workflow.rs
 
 Failed required verification commands:
-- python -X utf8 tool.py 2 + 3
-- python -X utf8 tool.py 8 +
+- verify-public-command --scenario compact-source
+- verify-public-command --scenario malformed-argv
 
 Latest verification failure evidence:
-- command: python -X utf8 tool.py 2 + 3
+- command: verify-public-command --scenario compact-source
   requirement_id: public_command_contract
+  evidence_kind: typed public command contract evidence
   expected: route-owned public argv command contract passes with the recorded exit code and stdout/stderr observation
   observed: argv invocation entered interactive stdin mode and reached EOF instead of processing command-line arguments
-  failure_class: public_command_contract_failed: expected exit 0 but got Some(1); stdout had no line ending with `5`
+  failure_class: public_command_contract_failed: expected exit 0 but got Some(1); stdout lacked workflow result marker
 
 After the repair edit, rerun the failed required verification command(s) with shell.
 "#;
@@ -5166,13 +6152,13 @@ After the repair edit, rerun the failed required verification command(s) with sh
     );
     let cluster = state.verification.failure_cluster.as_ref();
     state.process_phase == ProcessPhase::Repair
-        && state.active_targets == vec![Utf8PathBuf::from("tool.py")]
+        && state.active_targets == vec![Utf8PathBuf::from("src/workflow.rs")]
         && state.completion.verification_pending
         && state
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -X utf8 tool.py 2 + 3")
+            .any(|command| command == "verify-public-command --scenario compact-source")
         && cluster.is_some_and(|cluster| {
             cluster.primary_failure.as_deref().is_some_and(|failure| {
                 failure.contains("public_command_contract_failed")
@@ -5189,6 +6175,46 @@ After the repair edit, rerun the failed required verification command(s) with sh
         })
 }
 
+pub(crate) fn state_public_command_continuation_summary_uses_typed_observation_markers_fixture_passes()
+-> bool {
+    let commands = vec!["verify-public-command --scenario compact-source".to_string()];
+    let typed = r#"
+    requirement_id: public_command_contract
+    evidence_kind: typed public command contract evidence
+    expected: route-owned public argv command contract passes
+    observed: argv invocation entered interactive stdin mode and reached EOF instead of processing command-line arguments
+    "#;
+    let raw_exception_only = r#"
+    requirement_id: public_command_contract
+    evidence_kind: typed public command contract evidence
+    observed: traceback from an adapter execution mentioned EOFError without a typed public-command observation marker
+    "#;
+
+    let Some(typed_summary) = compact_public_command_contract_continuation_summary(
+        typed,
+        &commands,
+        Some("src/workflow.rs"),
+    ) else {
+        return false;
+    };
+    let Some(raw_summary) = compact_public_command_contract_continuation_summary(
+        raw_exception_only,
+        &commands,
+        Some("src/workflow.rs"),
+    ) else {
+        return false;
+    };
+
+    typed_summary.contains("state_public_command_continuation_summary_typed_observation")
+        || (typed_summary.contains("public_command_contract_failed")
+            && typed_summary.contains("target=src/workflow.rs")
+            && typed_summary.contains("observed=argv invocation entered interactive stdin mode")
+            && typed_summary.contains("expected=direct argv command handling")
+            && raw_summary.contains("public_command_contract_failed")
+            && raw_summary.contains("expected=direct argv command handling")
+            && !raw_summary.contains("observed=argv invocation entered interactive stdin mode"))
+}
+
 pub(crate) fn verification_repair_continuation_generated_test_parse_target_fixture_passes() -> bool
 {
     let Ok(temp) = tempfile::tempdir() else {
@@ -5197,14 +6223,19 @@ pub(crate) fn verification_repair_continuation_generated_test_parse_target_fixtu
     let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
         return false;
     };
+    if fs::create_dir_all(workspace.join("src").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("tests").as_std_path()).is_err()
+    {
+        return false;
+    }
     if fs::write(
-        workspace.join("widget.py").as_std_path(),
-        "def render(value):\n    return str(value)\n",
+        workspace.join("src/workflow.ts").as_std_path(),
+        "export function render(value: number): string { return String(value); }\n",
     )
     .is_err()
         || fs::write(
-            workspace.join("test_widget.py").as_std_path(),
-            "import unittest\n\"\"\"\n",
+            workspace.join("tests/workflow.spec.ts").as_std_path(),
+            "test('render formats value', () => {\n  expect(render(3)).toBe('3');\n// parse defect: missing closing block\n",
         )
         .is_err()
     {
@@ -5219,47 +6250,33 @@ pub(crate) fn verification_repair_continuation_generated_test_parse_target_fixtu
         title: "verification repair continuation generated test target".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace.clone(),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
-    let test_path = workspace.join("test_widget.py");
-    let continuation = format!(
-        r#"
-Manual ST verification-repair continuation.
+    let continuation = r#"
+Typed verification-repair continuation.
 
 The prior assistant message completed a runtime turn, and all required artifacts are present, but the latest required verification command failed.
 
 Repair targets:
-- test_widget.py
+- tests/workflow.spec.ts
 
 Failed required verification commands:
-- python -m unittest
+- verify-generated-test --parse
 
 Latest verification failure evidence:
-- command: python -m unittest
-stderr: E
-======================================================================
-ERROR: test_widget (unittest.loader._FailedTest.test_widget)
-----------------------------------------------------------------------
-ImportError: Failed to import test module: test_widget
-Traceback (most recent call last):
-  File "C:\Python313\Lib\unittest\loader.py", line 396, in _find_test_path
-    module = self._get_module_from_name(name)
-  File "{test_path}", line 42
-    """
-    ^
-SyntaxError: unterminated triple-quoted string literal (detected at line 42)
+- command: verify-generated-test --parse
+- typed verification continuation evidence: typed generated-test parse-defect evidence in tests/workflow.spec.ts prevented executing the public behavior assertion.
 
 Expected artifacts:
-- widget.py
-- test_widget.py
+- src/workflow.ts
+- tests/workflow.spec.ts
 
 After the repair edit, rerun the failed required verification command(s) with shell.
-"#
-    );
+"#;
     let items = vec![HistoryItem {
         id: HistoryItemId::new(),
         session_id,
@@ -5268,7 +6285,9 @@ After the repair edit, rerun the failed required verification command(s) with sh
         created_at_ms: 1,
         payload: HistoryItemPayload::UserTurn {
             message_id: None,
-            content: vec![ContentPart::Text { text: continuation }],
+            content: vec![ContentPart::Text {
+                text: continuation.to_string(),
+            }],
             prompt_dispatch: None,
             editor_context: None,
             turn_context: None,
@@ -5295,37 +6314,44 @@ After the repair edit, rerun the failed required verification command(s) with sh
         Some("auto".to_string()),
     );
 
-    state.process_phase == ProcessPhase::Repair
-        && state.active_targets == vec![Utf8PathBuf::from("test_widget.py")]
-        && state
-            .verification
-            .failure_cluster
-            .as_ref()
-            .is_some_and(|cluster| {
-                cluster.evidence.iter().any(|evidence| {
-                    evidence.subtype.as_deref() == Some("source_parse_defect")
-                        && evidence.target.as_deref() == Some("test_widget.py")
-                        && evidence.source_refs.is_empty()
-                })
-            })
-        && matches!(
-            active,
+    let process_phase_ok = state.process_phase == ProcessPhase::Repair;
+    let active_targets_ok =
+        state.active_targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    let failure_ok = state.failure.as_ref().is_some_and(|failure| {
+        failure.kind == FailureKind::VerificationFailed
+            && failure.targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
+    });
+    let required_command_ok = state
+        .verification
+        .required_commands
+        .iter()
+        .any(|command| command == "verify-generated-test --parse");
+    let active_ok = matches!(
+        active,
             Some(ActiveWorkContract::Verification {
                 repair_required: true,
                 targets,
                 ..
-            }) if targets == vec![Utf8PathBuf::from("test_widget.py")]
-        )
-        && diagnostic.active_targets == vec![Utf8PathBuf::from("test_widget.py")]
-        && diagnostic.repair_lane.as_ref().is_some_and(|lane| {
-            lane.required_target.as_deref() == Some("test_widget.py")
-                && lane
-                    .repair_control_snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| {
-                        snapshot.required_target.as_deref() == Some("test_widget.py")
-                    })
-        })
+            }) if targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
+    );
+    let diagnostic_targets_ok =
+        diagnostic.active_targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    let repair_lane_ok = diagnostic.repair_lane.as_ref().is_some_and(|lane| {
+        lane.required_target.as_deref() == Some("tests/workflow.spec.ts")
+            && lane
+                .repair_control_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
+                })
+    });
+    process_phase_ok
+        && active_targets_ok
+        && failure_ok
+        && required_command_ok
+        && active_ok
+        && diagnostic_targets_ok
+        && repair_lane_ok
 }
 
 pub(crate) fn requested_work_completion_promotes_verification_fixture_passes() -> bool {
@@ -5337,8 +6363,8 @@ pub(crate) fn requested_work_completion_promotes_verification_fixture_passes() -
         title: "verification promotion".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:\\workspace\\project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5353,7 +6379,8 @@ pub(crate) fn requested_work_completion_promotes_verification_fixture_passes() -
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `component.py` and `test_component.py`, then run `python -m unittest`.".to_string(),
+                    text: "Create source artifact `src/workflow.rs` and test artifact `tests/workflow.behavior.md`, then run `verify-contract --behavior`."
+                        .to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -5367,24 +6394,25 @@ pub(crate) fn requested_work_completion_promotes_verification_fixture_passes() -
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("component.py")),
-                        summary: "Added component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added source artifact src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_component.py")),
-                        summary: "Added test_component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added test artifact tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Added component.py; Added test_component.py".to_string(),
+                summary: "typed authoring completion evidence: Added source artifact src/workflow.rs; Added test artifact tests/workflow.behavior.md".to_string(),
             },
         },
     ];
@@ -5401,7 +6429,7 @@ pub(crate) fn requested_work_completion_promotes_verification_fixture_passes() -
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         && matches!(
             active,
             Some(ActiveWorkContract::Verification {
@@ -5409,11 +6437,7 @@ pub(crate) fn requested_work_completion_promotes_verification_fixture_passes() -
                 ..
             })
         )
-        && requested_work_absolute_docs_file_change_promotes_verification_fixture_passes()
-        && requested_work_repair_continuation_expected_artifacts_do_not_reopen_fixture_passes()
-        && scenario_contract_reference_input_does_not_become_authoring_target_fixture_passes()
-        && invalid_authoring_edit_no_progress_preserves_missing_requested_target_fixture_passes()
-        && empty_artifact_tool_output_does_not_satisfy_requested_work_fixture_passes()
+        && crate::agent::completion_guard::generic_scaffold_completion_guard_fixture_passes()
 }
 
 pub(crate) fn invalid_authoring_edit_no_progress_preserves_missing_requested_target_fixture_passes()
@@ -5427,13 +6451,13 @@ pub(crate) fn invalid_authoring_edit_no_progress_preserves_missing_requested_tar
         title: "invalid edit no progress preserves missing target".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:\\workspace\\project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
-    let malformed_patch = "*** Begin Patch\n*** Add File: source.py\n+def value():\n+    return 1\n*** End Patch\n*** Begin Patch\n*** Add File: test_source.py\n+import unittest\n+\n+class TestValue(unittest.TestCase):\n+    pass\n*** End Patch";
+    let malformed_patch = "*** Begin Patch\n*** Add File: src/workflow.rs\n+public operation value\n+  returns ready\n*** End Patch\n*** Begin Patch\n*** Add File: tests/workflow.behavior.md\n+behavior contract: value returns ready\n*** End Patch";
     let items = vec![
         HistoryItem {
             id: HistoryItemId::new(),
@@ -5444,7 +6468,7 @@ pub(crate) fn invalid_authoring_edit_no_progress_preserves_missing_requested_tar
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `source.py` and `test_source.py`, then run `python -m unittest`."
+                    text: "Create source artifact `src/workflow.rs` and test artifact `tests/workflow.behavior.md`, then run `verify-contract --behavior`."
                         .to_string(),
                 }],
                 prompt_dispatch: None,
@@ -5459,15 +6483,16 @@ pub(crate) fn invalid_authoring_edit_no_progress_preserves_missing_requested_tar
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
-                    kind: crate::session::ChangeKind::Add,
-                    path_before: None,
-                    path_after: Some(Utf8PathBuf::from("source.py")),
-                    summary: "Added source.py".to_string(),
-                }],
-                summary: "Added source.py".to_string(),
+                        kind: crate::session::ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added source artifact src/workflow.rs".to_string(),
+                    }],
+                summary: "typed authoring completion evidence: Added source artifact src/workflow.rs".to_string(),
             },
         },
         HistoryItem {
@@ -5506,13 +6531,14 @@ pub(crate) fn invalid_authoring_edit_no_progress_preserves_missing_requested_tar
                 metadata: json!({
                     "operation_progress_class": "invalid_edit_arguments",
                     "progress_effect": "no_progress",
-                    "tool_feedback_envelope": {
-                        "kind": "invalid_edit_arguments",
-                        "operation_progress_class": "invalid_edit_arguments",
-                        "progress_effect": "no_progress",
-                        "side_effects_applied": false,
-                        "active_targets": ["test_source.py"]
-                    }
+                        "tool_feedback_envelope": {
+                            "kind": "invalid_edit_arguments",
+                            "operation_progress_class": "invalid_edit_arguments",
+                            "progress_effect": "no_progress",
+                            "side_effects_applied": false,
+                            "active_targets": ["tests/workflow.behavior.md"],
+                            "typed_evidence": "typed invalid edit no-progress evidence"
+                        }
                 }),
                 success: Some(false),
                 progress_effect: ToolProgressEffect::NoProgress,
@@ -5532,13 +6558,13 @@ pub(crate) fn invalid_authoring_edit_no_progress_preserves_missing_requested_tar
     matches!(state.process_phase, ProcessPhase::Author)
         && !state.completion.verification_pending
         && state.completion.open_work_count == 1
-        && state.active_targets == vec![Utf8PathBuf::from("test_source.py")]
+        && state.active_targets == vec![Utf8PathBuf::from("tests/workflow.behavior.md")]
         && matches!(
             active,
             Some(ActiveWorkContract::RequestedWorkAuthoring {
                 pending_targets,
                 ..
-            }) if pending_targets == vec![Utf8PathBuf::from("test_source.py")]
+            }) if pending_targets == vec![Utf8PathBuf::from("tests/workflow.behavior.md")]
         )
 }
 
@@ -5553,8 +6579,8 @@ pub(crate) fn empty_artifact_tool_output_does_not_satisfy_requested_work_fixture
         title: "empty artifact does not satisfy requested work".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:\\workspace\\project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5569,7 +6595,7 @@ pub(crate) fn empty_artifact_tool_output_does_not_satisfy_requested_work_fixture
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `component.py` and `test_component.py`, then run `python -m unittest`."
+                    text: "Create source artifact `src/workflow.rs` and test artifact `tests/workflow.behavior.md`, then run `verify-contract --behavior`."
                         .to_string(),
                 }],
                 prompt_dispatch: None,
@@ -5584,15 +6610,16 @@ pub(crate) fn empty_artifact_tool_output_does_not_satisfy_requested_work_fixture
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
-                    kind: crate::session::ChangeKind::Add,
-                    path_before: None,
-                    path_after: Some(Utf8PathBuf::from("component.py")),
-                    summary: "Added component.py".to_string(),
-                }],
-                summary: "Added component.py".to_string(),
+                        kind: crate::session::ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added source artifact src/workflow.rs".to_string(),
+                    }],
+                summary: "typed authoring completion evidence: Added source artifact src/workflow.rs".to_string(),
             },
         },
         HistoryItem {
@@ -5605,7 +6632,7 @@ pub(crate) fn empty_artifact_tool_output_does_not_satisfy_requested_work_fixture
                 call_id: empty_file_call_id,
                 status: ToolLifecycleStatus::Completed,
                 title: "Create empty file".to_string(),
-                output_text: "Length 0 test_component.py".to_string(),
+                output_text: "Length 0 tests/workflow.behavior.md".to_string(),
                 metadata: json!({
                     "operation_intent": "content_changing_authoring_required",
                     "operation_progress_class": "empty_artifact_no_progress",
@@ -5618,7 +6645,7 @@ pub(crate) fn empty_artifact_tool_output_does_not_satisfy_requested_work_fixture
                         "content_bearing_change_ids": [],
                         "non_satisfying_change_ids": [empty_change_id.to_string()],
                         "content_bearing_paths": [],
-                        "non_satisfying_paths": ["test_component.py"]
+                        "non_satisfying_paths": ["tests/workflow.behavior.md"]
                     },
                     "tool_feedback_envelope": {
                         "kind": "operation_progress_classification",
@@ -5626,7 +6653,8 @@ pub(crate) fn empty_artifact_tool_output_does_not_satisfy_requested_work_fixture
                         "operation_progress_class": "empty_artifact_no_progress",
                         "progress_effect": "no_progress",
                         "side_effects_applied": true,
-                        "active_targets": ["test_component.py"]
+                        "active_targets": ["tests/workflow.behavior.md"],
+                        "typed_evidence": "typed empty artifact no-progress evidence"
                     }
                 }),
                 success: Some(true),
@@ -5646,14 +6674,22 @@ pub(crate) fn empty_artifact_tool_output_does_not_satisfy_requested_work_fixture
     let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
     state.process_phase == ProcessPhase::Author
         && !state.completion.verification_pending
-        && state.active_targets == vec![Utf8PathBuf::from("test_component.py")]
+        && state.active_targets == vec![Utf8PathBuf::from("tests/workflow.behavior.md")]
         && matches!(
             active,
             Some(ActiveWorkContract::RequestedWorkAuthoring {
                 pending_targets,
                 ..
-            }) if pending_targets == vec![Utf8PathBuf::from("test_component.py")]
+            }) if pending_targets == vec![Utf8PathBuf::from("tests/workflow.behavior.md")]
         )
+}
+
+pub(crate) fn state_residual_component_fixture_workflow_neutral_fixture_passes() -> bool {
+    public_command_contract_continuation_projects_compact_source_repair_fixture_passes()
+        && verification_repair_continuation_generated_test_parse_target_fixture_passes()
+        && requested_work_completion_promotes_verification_fixture_passes()
+        && invalid_authoring_edit_no_progress_preserves_missing_requested_target_fixture_passes()
+        && empty_artifact_tool_output_does_not_satisfy_requested_work_fixture_passes()
 }
 
 pub(crate) fn scenario_contract_reference_input_does_not_become_authoring_target_fixture_passes()
@@ -5666,8 +6702,8 @@ pub(crate) fn scenario_contract_reference_input_does_not_become_authoring_target
         title: "scenario contract reference input".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:\\workspace\\project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5681,7 +6717,7 @@ pub(crate) fn scenario_contract_reference_input_does_not_become_authoring_target
         payload: HistoryItemPayload::UserTurn {
             message_id: None,
             content: vec![ContentPart::Text {
-                text: "Create `component.py` and `test_component.py`, then run `python -m unittest`.\n\nScenario contract authority:\n- `scenario_contract.md`\n- `scenario_contract.json`\nTreat these files as prompt-visible, harness-owned contract references. Generated tests may assert only the listed requirement ids."
+                text: "Create source artifact `src/workflow.rs` and test artifact `tests/workflow.behavior.md`, then run `verify-contract --behavior`.\n\nScenario contract authority:\n- `scenario_contract.md`\n- `scenario_contract.json`\nTreat these files as prompt-visible, harness-owned contract references. Generated tests may assert only the listed requirement ids."
                     .to_string(),
             }],
             prompt_dispatch: None,
@@ -5697,8 +6733,8 @@ pub(crate) fn scenario_contract_reference_input_does_not_become_authoring_target
     );
     let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
     let expected_targets = vec![
-        Utf8PathBuf::from("component.py"),
-        Utf8PathBuf::from("test_component.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     let scenario_refs = vec![
         Utf8PathBuf::from("scenario_contract.json"),
@@ -5716,7 +6752,7 @@ pub(crate) fn scenario_contract_reference_input_does_not_become_authoring_target
                 pending_targets,
                 verification_commands
             }) if pending_targets == expected_targets
-                && verification_commands == vec!["python -m unittest".to_string()]
+                && verification_commands == vec!["verify-contract --behavior".to_string()]
         )
 }
 
@@ -5727,12 +6763,15 @@ pub(crate) fn same_document_update_uses_prior_authored_doc_not_contract_ref_fixt
     let Ok(workspace) = Utf8PathBuf::from_path_buf(workspace) else {
         return false;
     };
-    if fs::create_dir_all(workspace.join("docs").as_std_path()).is_err() {
+    if fs::create_dir_all(workspace.join("src").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("tests").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("docs").as_std_path()).is_err()
+    {
         return false;
     }
     if fs::write(
-        workspace.join("docs/component-design.md").as_std_path(),
-        "# Component Design\n\n## Overview\n\nExisting authored design.\n",
+        workspace.join("docs/workflow-design.md").as_std_path(),
+        "# Workflow Design\n\n## Overview\n\nExisting authored workflow design.\n",
     )
     .is_err()
     {
@@ -5748,7 +6787,7 @@ pub(crate) fn same_document_update_uses_prior_authored_doc_not_contract_ref_fixt
     }
     if fs::write(
         workspace.join("scenario_contract.json").as_std_path(),
-        "{\"id\":\"scenario_contract.component.v1\"}\n",
+        "{\"id\":\"scenario_contract.workflow.v1\"}\n",
     )
     .is_err()
     {
@@ -5764,8 +6803,8 @@ pub(crate) fn same_document_update_uses_prior_authored_doc_not_contract_ref_fixt
         title: "docs route same document update".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace.clone(),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 3,
         completed_at_ms: None,
@@ -5780,7 +6819,7 @@ pub(crate) fn same_document_update_uses_prior_authored_doc_not_contract_ref_fixt
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `docs/component-design.md` from current implementation.\n\nScenario contract authority:\n- `scenario_contract.md`\n- `scenario_contract.json`\nTreat these files as prompt-visible, harness-owned contract references."
+                    text: "Create `docs/workflow-design.md` from current implementation.\n\nScenario contract authority:\n- `scenario_contract.md`\n- `scenario_contract.json`\nTreat these files as prompt-visible, harness-owned contract references."
                         .to_string(),
                 }],
                 prompt_dispatch: None,
@@ -5795,22 +6834,23 @@ pub(crate) fn same_document_update_uses_prior_authored_doc_not_contract_ref_fixt
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Add,
                     path_before: None,
-                    path_after: Some(Utf8PathBuf::from("docs/component-design.md")),
-                    summary: "Created docs/component-design.md".to_string(),
+                    path_after: Some(Utf8PathBuf::from("docs/workflow-design.md")),
+                    summary: "Created docs/workflow-design.md".to_string(),
                 }],
-                summary: "Created docs/component-design.md".to_string(),
+                summary: "Created docs/workflow-design.md".to_string(),
             },
         },
         HistoryItem {
             id: HistoryItemId::new(),
             session_id,
             turn_id: second_turn,
-            sequence_no: 1,
+            sequence_no: 3,
             created_at_ms: 3,
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
@@ -5831,7 +6871,7 @@ pub(crate) fn same_document_update_uses_prior_authored_doc_not_contract_ref_fixt
         &SessionStateSnapshot::default(),
     );
     let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
-    let expected = vec![Utf8PathBuf::from("docs/component-design.md")];
+    let expected = vec![Utf8PathBuf::from("docs/workflow-design.md")];
 
     state.route == TaskRoute::Docs
         && state.docs_route.is_some()
@@ -5851,10 +6891,10 @@ pub(crate) fn same_document_update_uses_prior_authored_doc_not_contract_ref_fixt
                 ref deliverable,
                 ref pending_deliverables,
                 ..
-            }) if deliverable.as_ref() == Some(&Utf8PathBuf::from("docs/component-design.md"))
+            }) if deliverable.as_ref() == Some(&Utf8PathBuf::from("docs/workflow-design.md"))
                 && pending_deliverables
                     .iter()
-                    .any(|deliverable| deliverable.target == Utf8PathBuf::from("docs/component-design.md"))
+                    .any(|deliverable| deliverable.target == Utf8PathBuf::from("docs/workflow-design.md"))
         )
 }
 
@@ -5867,21 +6907,23 @@ pub(crate) fn same_document_update_stays_pending_after_prior_doc_satisfied_fixtu
     let Ok(workspace) = Utf8PathBuf::from_path_buf(workspace) else {
         return false;
     };
-    if fs::create_dir_all(workspace.join("docs").as_std_path()).is_err() {
-        return false;
+    for dir in ["docs", "src", "tests"] {
+        if fs::create_dir_all(workspace.join(dir).as_std_path()).is_err() {
+            return false;
+        }
     }
     for (path, content) in [
         (
-            "component.py",
-            "def calculate(left, operator, right):\n    return left + right\n",
+            "src/workflow.rs",
+            "pub fn transition_label() -> &'static str {\n    \"ready\"\n}\n",
         ),
         (
-            "test_component.py",
-            "import unittest\n\nclass ComponentTest(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(5, 5)\n",
+            "tests/workflow.behavior.md",
+            "behavior: transition_label returns ready\n",
         ),
         (
-            "docs/component-design.md",
-            "# Component design\n\n## Overview\n\n現在の実装 `component.py` と test_component.py の tests を確認し、repository evidence、CLI usage、error handling、validation を文書化しています。\n",
+            "docs/workflow-design.md",
+            "# Workflow design\n\n## Overview\n\n現在の実装 `src/workflow.rs` と behavior contract `tests/workflow.behavior.md` を確認し、workflow transition、state projection、validation boundary を文書化しています。\n",
         ),
         (
             "scenario_contract.md",
@@ -5889,7 +6931,7 @@ pub(crate) fn same_document_update_stays_pending_after_prior_doc_satisfied_fixtu
         ),
         (
             "scenario_contract.json",
-            "{\"id\":\"scenario_contract.component.v1\"}\n",
+            "{\"id\":\"scenario_contract.workflow.v1\"}\n",
         ),
     ] {
         if fs::write(workspace.join(path).as_std_path(), content).is_err() {
@@ -5906,8 +6948,8 @@ pub(crate) fn same_document_update_stays_pending_after_prior_doc_satisfied_fixtu
         title: "satisfied same-document docs update".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 4,
         completed_at_ms: None,
@@ -5922,7 +6964,7 @@ pub(crate) fn same_document_update_stays_pending_after_prior_doc_satisfied_fixtu
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "現在の実装を調査し、`docs/component-design.md` を日本語で作成してください。実装コードと test は変更せず、確認できた事実だけを文書化してください。".to_string(),
+                    text: "現在の実装を調査し、`docs/workflow-design.md` を日本語で作成してください。実装コードと behavior contract は変更せず、確認できた事実だけを文書化してください。".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -5936,27 +6978,28 @@ pub(crate) fn same_document_update_stays_pending_after_prior_doc_satisfied_fixtu
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Add,
                     path_before: None,
-                    path_after: Some(Utf8PathBuf::from("docs/component-design.md")),
-                    summary: "Created docs/component-design.md".to_string(),
+                    path_after: Some(Utf8PathBuf::from("docs/workflow-design.md")),
+                    summary: "Created docs/workflow-design.md".to_string(),
                 }],
-                summary: "Created docs/component-design.md".to_string(),
+                summary: "Created docs/workflow-design.md".to_string(),
             },
         },
         HistoryItem {
             id: HistoryItemId::new(),
             session_id,
             turn_id: second_turn,
-            sequence_no: 1,
+            sequence_no: 3,
             created_at_ms: 3,
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "いま作成した設計書を、関数電卓版の仕様へ更新してください。\n四則演算に加えて `sqrt` と `pow` を扱える仕様にしてください。\nこの turn では文書だけを更新し、実装コードと test はまだ変更しないでください。\n\nScenario contract authority:\n- `scenario_contract.md`\n- `scenario_contract.json`".to_string(),
+                    text: "いま作成した設計書を、workflow transition 拡張仕様へ更新してください。\nstate projection と validation boundary を扱える仕様にしてください。\nこの turn では文書だけを更新し、実装コードと behavior contract はまだ変更しないでください。\n\nScenario contract authority:\n- `scenario_contract.md`\n- `scenario_contract.json`".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -5976,14 +7019,14 @@ pub(crate) fn same_document_update_stays_pending_after_prior_doc_satisfied_fixtu
         && state.process_phase == ProcessPhase::Author
         && state.completion.route_contract_pending
         && !state.completion.closeout_ready
-        && state.active_targets == vec![Utf8PathBuf::from("docs/component-design.md")]
+        && state.active_targets == vec![Utf8PathBuf::from("docs/workflow-design.md")]
         && state
             .completion
             .blocked_reason
             .as_deref()
             .is_some_and(|reason| {
                 reason.contains("same-document docs update requested")
-                    && reason.contains("docs/component-design.md")
+                    && reason.contains("docs/workflow-design.md")
             })
         && matches!(
             active,
@@ -5992,10 +7035,10 @@ pub(crate) fn same_document_update_stays_pending_after_prior_doc_satisfied_fixtu
                 ref pending_deliverables,
                 route_contract_satisfied: false,
                 ..
-            }) if deliverable.as_ref() == Some(&Utf8PathBuf::from("docs/component-design.md"))
+            }) if deliverable.as_ref() == Some(&Utf8PathBuf::from("docs/workflow-design.md"))
                 && pending_deliverables
                     .iter()
-                    .any(|item| item.target == Utf8PathBuf::from("docs/component-design.md")
+                    .any(|item| item.target == Utf8PathBuf::from("docs/workflow-design.md")
                         && item.summary.contains("same-document docs update requested"))
         )
 }
@@ -6010,18 +7053,18 @@ pub(crate) fn requested_work_relative_workspace_absolute_file_change_promotes_ve
     };
     let session_id = crate::session::SessionId::new();
     let turn_id = TurnId::new();
-    let relative_workspace = Utf8PathBuf::from("../project_sandbox/fr10_018_fixture_workspace");
+    let relative_workspace = Utf8PathBuf::from("../project_sandbox/relative-workspace-fixture");
     let absolute_doc = current_dir
         .join(&relative_workspace)
-        .join("docs/tool-design.md");
+        .join("docs/workflow-design.md");
     let session = SessionRecord {
         id: session_id,
         project_id: crate::session::ProjectId::new(),
         title: "relative workspace absolute file change".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: relative_workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6036,7 +7079,7 @@ pub(crate) fn requested_work_relative_workspace_absolute_file_change_promotes_ve
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `docs/tool-design.md` from the current implementation. Do not change code or tests. Then run `python -m unittest`.".to_string(),
+                    text: "Create `docs/workflow-design.md` from the current implementation. Do not change source or behavior contract artifacts. Then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -6050,15 +7093,16 @@ pub(crate) fn requested_work_relative_workspace_absolute_file_change_promotes_ve
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Add,
                     path_before: None,
                     path_after: Some(absolute_doc),
-                    summary: "Added docs/tool-design.md".to_string(),
+                    summary: "Added docs/workflow-design.md".to_string(),
                 }],
-                summary: "Added docs/tool-design.md".to_string(),
+                summary: "Added docs/workflow-design.md".to_string(),
             },
         },
     ];
@@ -6077,7 +7121,7 @@ pub(crate) fn requested_work_relative_workspace_absolute_file_change_promotes_ve
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         && matches!(
             active,
             Some(ActiveWorkContract::Verification {
@@ -6087,18 +7131,17 @@ pub(crate) fn requested_work_relative_workspace_absolute_file_change_promotes_ve
         )
 }
 
-fn requested_work_absolute_docs_file_change_promotes_verification_fixture_passes() -> bool {
+pub(crate) fn verification_failure_active_work_outranks_stale_docs_route_fixture_passes() -> bool {
     let session_id = crate::session::SessionId::new();
     let turn_id = TurnId::new();
-    let workspace = Utf8PathBuf::from("C:\\workspace\\project");
     let session = SessionRecord {
         id: session_id,
         project_id: crate::session::ProjectId::new(),
-        title: "absolute docs verification promotion".to_string(),
+        title: "verification authority outranks stale docs route".to_string(),
         status: crate::session::SessionStatus::Running,
-        cwd: workspace.clone(),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6113,7 +7156,8 @@ fn requested_work_absolute_docs_file_change_promotes_verification_fixture_passes
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `docs/widget-design.md` from the current implementation. Do not change code or tests. Then run `python -m unittest`.".to_string(),
+                    text: "Create `src/workflow.rs` and then run `verify-contract --behavior`."
+                        .to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -6129,21 +7173,250 @@ fn requested_work_absolute_docs_file_change_promotes_verification_fixture_passes
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Applied 1 change(s)".to_string(),
-                output_text: "Added docs/widget-design.md".to_string(),
-                metadata: json!({
-                    "changes": [{
-                        "kind": "add",
-                        "path_after": "C:/workspace/project/docs/widget-design.md",
-                        "path_before": null
-                    }],
-                    "changed_files": ["C:/workspace/project/docs/widget-design.md"]
-                }),
-                success: Some(true),
-                progress_effect: ToolProgressEffect::MadeProgress,
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "contract failure: cannot find operation `execute_workflow`"
+                    .to_string(),
+                metadata: Value::Null,
+                success: Some(false),
+                progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
-                result_hash: None,
-                verification_run: None,
+                result_hash: Some("verification-failed".to_string()),
+                verification_run: Some(VerificationRunResult {
+                    command: "verify-contract --behavior".to_string(),
+                    status: VerificationRunStatus::Failed,
+                    exit_code: Some(1),
+                    timed_out: false,
+                    output_summary: "src/workflow.rs: cannot find operation `execute_workflow`"
+                        .to_string(),
+                    failure_cluster: Some(VerificationFailureCluster {
+                        cluster_id: "workflow-api-contract".to_string(),
+                        failing_labels: vec!["verify-contract --behavior".to_string()],
+                        primary_failure: Some(
+                            "cannot find operation `execute_workflow`".to_string(),
+                        ),
+                        evidence: Vec::new(),
+                        sibling_obligations: Vec::new(),
+                        source_refs: vec!["src/workflow.rs".to_string()],
+                        test_refs: vec!["tests/workflow.behavior.md".to_string()],
+                    }),
+                    satisfies_command_identities: Vec::new(),
+                    artifact_refs: Vec::new(),
+                    requirement_refs: Vec::new(),
+                }),
+            },
+        },
+    ];
+    let mut previous = SessionStateSnapshot::default();
+    previous.route = TaskRoute::Docs;
+    previous.process_phase = ProcessPhase::Author;
+    previous.active_targets = vec![Utf8PathBuf::from("docs/stale-design.md")];
+    previous.docs_route = Some(DocsRouteState {
+        active_deliverable: Some(Utf8PathBuf::from("docs/stale-design.md")),
+        pending_deliverables: vec![DocsPendingDeliverable {
+            target: Utf8PathBuf::from("docs/stale-design.md"),
+            summary: "stale pending docs authority".to_string(),
+        }],
+        survey_packet_summary: None,
+        area_coverage: Vec::new(),
+        deliverables: Vec::new(),
+        factual_checks: Vec::new(),
+    });
+    previous.completion.route_contract_pending = true;
+    previous.completion.open_work_count = 1;
+
+    let state = reduce_session_state_from_history_items(&session, &items, &[], &previous);
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+
+    state.completion.verification_pending
+        && !state.completion.route_contract_pending
+        && state.process_phase == ProcessPhase::Repair
+        && state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "src/workflow.rs")
+        && !state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "docs/stale-design.md")
+        && matches!(
+            active,
+            Some(ActiveWorkContract::Verification {
+                repair_required: true,
+                ref targets,
+                ..
+            }) if targets.iter().any(|target| target.as_str() == "src/workflow.rs")
+        )
+}
+
+pub(crate) fn verification_failure_with_docs_reference_still_outranks_stale_docs_route_fixture_passes()
+-> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "verification authority ignores docs reference context".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Use `docs/stale-design.md` only as background. Fix `src/workflow.rs` and run `verify-contract --behavior`.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: ToolCallId::new(),
+                status: ToolLifecycleStatus::Completed,
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "contract failure: cannot find operation `execute_workflow`".to_string(),
+                metadata: Value::Null,
+                success: Some(false),
+                progress_effect: ToolProgressEffect::VerificationFailed,
+                blocked_action: None,
+                result_hash: Some("verification-failed".to_string()),
+                verification_run: Some(VerificationRunResult {
+                    command: "verify-contract --behavior".to_string(),
+                    status: VerificationRunStatus::Failed,
+                    exit_code: Some(1),
+                    timed_out: false,
+                    output_summary: "src/workflow.rs: cannot find operation `execute_workflow`"
+                        .to_string(),
+                    failure_cluster: Some(VerificationFailureCluster {
+                        cluster_id: "workflow-api-contract".to_string(),
+                        failing_labels: vec!["verify-contract --behavior".to_string()],
+                        primary_failure: Some(
+                            "cannot find operation `execute_workflow`".to_string(),
+                        ),
+                        evidence: Vec::new(),
+                        sibling_obligations: Vec::new(),
+                        source_refs: vec!["src/workflow.rs".to_string()],
+                        test_refs: vec!["tests/workflow.behavior.md".to_string()],
+                    }),
+                    satisfies_command_identities: Vec::new(),
+                    artifact_refs: Vec::new(),
+                    requirement_refs: Vec::new(),
+                }),
+            },
+        },
+    ];
+    let mut previous = SessionStateSnapshot::default();
+    previous.route = TaskRoute::Docs;
+    previous.process_phase = ProcessPhase::Author;
+    previous.active_targets = vec![Utf8PathBuf::from("docs/stale-design.md")];
+    previous.docs_route = Some(DocsRouteState {
+        active_deliverable: Some(Utf8PathBuf::from("docs/stale-design.md")),
+        pending_deliverables: vec![DocsPendingDeliverable {
+            target: Utf8PathBuf::from("docs/stale-design.md"),
+            summary: "stale pending docs authority".to_string(),
+        }],
+        survey_packet_summary: None,
+        area_coverage: Vec::new(),
+        deliverables: Vec::new(),
+        factual_checks: Vec::new(),
+    });
+    previous.completion.route_contract_pending = true;
+    previous.completion.open_work_count = 1;
+
+    let state = reduce_session_state_from_history_items(&session, &items, &[], &previous);
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+
+    state.completion.verification_pending
+        && !state.completion.route_contract_pending
+        && state.process_phase == ProcessPhase::Repair
+        && state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "src/workflow.rs")
+        && !state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "docs/stale-design.md")
+        && matches!(
+            active,
+            Some(ActiveWorkContract::Verification {
+                repair_required: true,
+                ref targets,
+                ..
+            }) if targets.iter().any(|target| target.as_str() == "src/workflow.rs")
+        )
+}
+
+pub(crate) fn requested_work_absolute_docs_file_change_promotes_verification_fixture_passes() -> bool
+{
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let workspace = Utf8PathBuf::from("C:\\workspace\\project");
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "absolute docs verification promotion".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: workspace.clone(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create `docs/workflow-design.md` from the current implementation. Do not change source or behavior contract artifacts. Then run `verify-contract --behavior`.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                call_id: ToolCallId::new(),
+                change_ids: vec![ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                    kind: crate::session::ChangeKind::Add,
+                    path_before: None,
+                    path_after: Some(Utf8PathBuf::from(
+                        "C:/workspace/project/docs/workflow-design.md",
+                    )),
+                    summary: "Added docs/workflow-design.md".to_string(),
+                }],
+                summary: "Added docs/workflow-design.md".to_string(),
             },
         },
     ];
@@ -6161,7 +7434,7 @@ fn requested_work_absolute_docs_file_change_promotes_verification_fixture_passes
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         && matches!(
             active,
             Some(ActiveWorkContract::Verification {
@@ -6179,19 +7452,19 @@ fn requested_work_absolute_docs_file_change_promotes_verification_fixture_passes
         payload: HistoryItemPayload::ToolOutput {
             call_id: ToolCallId::new(),
             status: ToolLifecycleStatus::Completed,
-            title: "Run shell command: python -m unittest".to_string(),
-            output_text: "Ran 24 tests in 0.000s\n\nOK".to_string(),
+            title: "Run shell command: verify-contract --behavior".to_string(),
+            output_text: "behavior contract passed\n".to_string(),
             metadata: Value::Null,
             success: Some(true),
             progress_effect: ToolProgressEffect::VerificationPassed,
             blocked_action: None,
             result_hash: Some("verification-pass".to_string()),
             verification_run: Some(VerificationRunResult {
-                command: "python -m unittest".to_string(),
+                command: "verify-contract --behavior".to_string(),
                 status: VerificationRunStatus::Passed,
                 exit_code: Some(0),
                 timed_out: false,
-                output_summary: "Ran 24 tests in 0.000s\n\nOK".to_string(),
+                output_summary: "behavior contract passed".to_string(),
                 failure_cluster: None,
                 satisfies_command_identities: Vec::new(),
                 artifact_refs: Vec::new(),
@@ -6201,14 +7474,14 @@ fn requested_work_absolute_docs_file_change_promotes_verification_fixture_passes
     });
     let verified_state =
         reduce_session_state_from_history_items(&session, &verified_items, &[], &state);
-    let escaped_absolute_metadata_ok =
+    let escaped_absolute_file_change_ok =
         requested_work_escaped_absolute_docs_file_change_promotes_verification_fixture_passes();
     authored_state_ok
         && verified_state.active_targets.is_empty()
         && verified_state.completion.open_work_count == 0
         && !verified_state.completion.verification_pending
         && verified_state.completion.closeout_ready
-        && escaped_absolute_metadata_ok
+        && escaped_absolute_file_change_ok
 }
 
 fn requested_work_escaped_absolute_docs_file_change_promotes_verification_fixture_passes() -> bool {
@@ -6221,8 +7494,8 @@ fn requested_work_escaped_absolute_docs_file_change_promotes_verification_fixtur
         title: "escaped absolute docs verification promotion".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6237,7 +7510,7 @@ fn requested_work_escaped_absolute_docs_file_change_promotes_verification_fixtur
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `docs/widget-design.md` from the current implementation. Then run `python -m unittest`.".to_string(),
+                    text: "Create `docs/workflow-design.md` from the current implementation. Then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -6250,24 +7523,19 @@ fn requested_work_escaped_absolute_docs_file_change_promotes_verification_fixtur
             turn_id,
             sequence_no: 2,
             created_at_ms: 2,
-            payload: HistoryItemPayload::ToolOutput {
+            payload: HistoryItemPayload::FileChange {
                 call_id: ToolCallId::new(),
-                status: ToolLifecycleStatus::Completed,
-                title: "Applied 1 change(s)".to_string(),
-                output_text: "Added docs/widget-design.md".to_string(),
-                metadata: json!({
-                    "changes": [{
-                        "kind": "add",
-                        "path_after": r"C:\\workspace\\project\\docs\\widget-design.md",
-                        "path_before": null
-                    }],
-                    "changed_files": [r"C:\\workspace\\project\\docs\\widget-design.md"]
-                }),
-                success: Some(true),
-                progress_effect: ToolProgressEffect::MadeProgress,
-                blocked_action: None,
-                result_hash: None,
-                verification_run: None,
+                change_ids: vec![ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                    kind: crate::session::ChangeKind::Add,
+                    path_before: None,
+                    path_after: Some(Utf8PathBuf::from(
+                        r"C:\\workspace\\project\\docs\\workflow-design.md",
+                    )),
+                    summary: "Added docs/workflow-design.md".to_string(),
+                }],
+                summary: "Added docs/workflow-design.md".to_string(),
             },
         },
     ];
@@ -6291,7 +7559,8 @@ fn requested_work_escaped_absolute_docs_file_change_promotes_verification_fixtur
         )
 }
 
-fn requested_work_repair_continuation_expected_artifacts_do_not_reopen_fixture_passes() -> bool {
+pub(crate) fn requested_work_repair_continuation_expected_artifacts_do_not_reopen_fixture_passes()
+-> bool {
     let Ok(temp) = tempfile::tempdir() else {
         return false;
     };
@@ -6299,19 +7568,21 @@ fn requested_work_repair_continuation_expected_artifacts_do_not_reopen_fixture_p
         return false;
     };
     if fs::create_dir_all(workspace.join("docs").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("src").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("tests").as_std_path()).is_err()
         || fs::write(
-            workspace.join("widget.py").as_std_path(),
-            "def value():\n    return 1\n",
+            workspace.join("src/workflow.rs").as_std_path(),
+            "pub fn execute_workflow() -> &'static str {\n    \"ready\"\n}\n",
         )
         .is_err()
         || fs::write(
-            workspace.join("docs/widget-design.md").as_std_path(),
-            "# Widget design\n",
+            workspace.join("docs/workflow-design.md").as_std_path(),
+            "# Workflow design\n",
         )
         .is_err()
         || fs::write(
-            workspace.join("test_widget.py").as_std_path(),
-            "import unittest\n",
+            workspace.join("tests/workflow.behavior.md").as_std_path(),
+            "behavior: execute_workflow returns ready\n",
         )
         .is_err()
     {
@@ -6326,8 +7597,8 @@ fn requested_work_repair_continuation_expected_artifacts_do_not_reopen_fixture_p
         title: "repair continuation expected artifact inventory".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace.clone(),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6348,15 +7619,15 @@ Verification-repair continuation.
 All required artifacts are present, but the latest required verification command failed.
 
 Repair targets:
-- widget.py
+- src/workflow.rs
 
 Failed required verification commands:
-- python -m unittest
+- verify-contract --behavior
 
 Expected artifacts:
-- widget.py
-- docs/widget-design.md
-- test_widget.py
+- src/workflow.rs
+- docs/workflow-design.md
+- tests/workflow.behavior.md
 
 Fix the repair target, then rerun the failed required verification command.
 "#
@@ -6374,15 +7645,16 @@ Fix the repair target, then rerun the failed required verification command.
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Update,
-                    path_before: Some(Utf8PathBuf::from("widget.py")),
-                    path_after: Some(Utf8PathBuf::from("widget.py")),
-                    summary: "Updated widget.py".to_string(),
+                    path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+                    path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                    summary: "Updated src/workflow.rs".to_string(),
                 }],
-                summary: "Updated widget.py".to_string(),
+                summary: "Updated src/workflow.rs".to_string(),
             },
         },
     ];
@@ -6401,7 +7673,7 @@ Fix the repair target, then rerun the failed required verification command.
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         && matches!(
             active,
             Some(ActiveWorkContract::Verification {
@@ -6412,10 +7684,10 @@ Fix the repair target, then rerun the failed required verification command.
 
     let normal_docs_targets = requested_deliverable_targets_from_instruction_text_for_workspace(
         workspace.as_path(),
-        Some("Create `docs/widget-design.md`, then run `python -m unittest`."),
+        Some("Create `docs/workflow-design.md`, then run `verify-contract --behavior`."),
     );
 
-    continuation_ok && normal_docs_targets == vec![Utf8PathBuf::from("docs/widget-design.md")]
+    continuation_ok && normal_docs_targets == vec![Utf8PathBuf::from("docs/workflow-design.md")]
 }
 
 pub(crate) fn requested_work_without_verification_closes_after_file_change_fixture_passes() -> bool
@@ -6428,8 +7700,8 @@ pub(crate) fn requested_work_without_verification_closes_after_file_change_fixtu
         title: "requested deliverable closeout".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6458,6 +7730,7 @@ pub(crate) fn requested_work_without_verification_closes_after_file_change_fixtu
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
@@ -6499,6 +7772,98 @@ pub(crate) fn requested_work_without_verification_closes_after_file_change_fixtu
         && active.is_none()
 }
 
+pub(crate) fn metadata_only_tool_output_does_not_satisfy_file_change_authority_fixture_passes()
+-> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "metadata-only file change is diagnostic".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create `src/workflow.rs`.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: ToolCallId::new(),
+                status: ToolLifecycleStatus::Completed,
+                title: "Write src/workflow.rs".to_string(),
+                output_text: "metadata-only diagnostic".to_string(),
+                metadata: json!({
+                    "operation_progress_class": "content_changing_progress",
+                    "changed_files": ["src/workflow.rs"],
+                    "changes": [{
+                        "path_after": "src/workflow.rs"
+                    }]
+                }),
+                success: Some(true),
+                progress_effect: ToolProgressEffect::MadeProgress,
+                blocked_action: None,
+                result_hash: Some("metadata-only".to_string()),
+                verification_run: None,
+            },
+        },
+    ];
+    let prior_state = SessionStateSnapshot {
+        process_phase: ProcessPhase::Author,
+        active_targets: vec![Utf8PathBuf::from("src/workflow.rs")],
+        completion: CompletionState {
+            open_work_count: 1,
+            closeout_ready: false,
+            verification_pending: false,
+            blocked_reason: Some(
+                ActiveWorkContract::RequestedWorkAuthoring {
+                    pending_targets: vec![Utf8PathBuf::from("src/workflow.rs")],
+                    verification_commands: Vec::new(),
+                }
+                .summary(),
+            ),
+            ..CompletionState::default()
+        },
+        ..SessionStateSnapshot::default()
+    };
+    let state = reduce_session_state_from_history_items(&session, &items, &[], &prior_state);
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+    state.process_phase == ProcessPhase::Author
+        && !state.completion.closeout_ready
+        && state.completion.open_work_count == 1
+        && state.active_targets == vec![Utf8PathBuf::from("src/workflow.rs")]
+        && matches!(
+            active,
+            Some(ActiveWorkContract::RequestedWorkAuthoring {
+                pending_targets,
+                ..
+            }) if pending_targets == vec![Utf8PathBuf::from("src/workflow.rs")]
+        )
+}
+
 pub(crate) fn structured_document_summary_waits_for_remaining_sources_fixture_passes() -> bool {
     let session_id = crate::session::SessionId::new();
     let turn_id = TurnId::new();
@@ -6522,8 +7887,8 @@ pub(crate) fn structured_document_summary_waits_for_remaining_sources_fixture_pa
         title: "structured document summary".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6592,6 +7957,7 @@ pub(crate) fn structured_document_summary_waits_for_remaining_sources_fixture_pa
             sequence_no: 4,
             created_at_ms: 4,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
@@ -6652,8 +8018,8 @@ pub(crate) fn structured_document_summary_output_headings_survive_compacted_hist
         title: "compacted structured document summary".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6683,6 +8049,7 @@ pub(crate) fn structured_document_summary_output_headings_survive_compacted_hist
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
@@ -6720,8 +8087,8 @@ pub(crate) fn required_verification_survives_authoring_completion_fixture_passes
         title: "verification survives authoring completion".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6736,7 +8103,7 @@ pub(crate) fn required_verification_survives_authoring_completion_fixture_passes
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `component.py` and `test_component.py`, then run `python -m unittest`.".to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -6752,19 +8119,19 @@ pub(crate) fn required_verification_survives_authoring_completion_fixture_passes
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "Ran 21 tests in 0.000s\n\nOK".to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "workflow contract verification passed".to_string(),
                 metadata: Value::Null,
                 success: Some(true),
                 progress_effect: ToolProgressEffect::VerificationPassed,
                 blocked_action: None,
                 result_hash: Some("prior-pass".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Passed,
                     exit_code: Some(0),
                     timed_out: false,
-                    output_summary: "Ran 21 tests in 0.000s\n\nOK".to_string(),
+                    output_summary: "workflow contract verification passed".to_string(),
                     failure_cluster: None,
                     satisfies_command_identities: Vec::new(),
                     artifact_refs: Vec::new(),
@@ -6776,12 +8143,12 @@ pub(crate) fn required_verification_survives_authoring_completion_fixture_passes
             id: HistoryItemId::new(),
             session_id,
             turn_id: second_turn_id,
-            sequence_no: 1,
+            sequence_no: 39,
             created_at_ms: 100,
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "`docs/component-design.md` の拡張仕様に合わせて実装と test を更新してください。\n\n要件:\n- `component.py` に `pow` と `mod` を追加すること。\n- 入力値 validation と error handling を設計書と一致させること。\n- `test_component.py` に追加仕様の unittest を入れること。\n\n最後に `python -m unittest` を実行して成功を確認してから終了してください。".to_string(),
+                    text: "`docs/workflow-design.md` の拡張仕様に合わせて source と behavior test を更新してください。\n\n要件:\n- `src/workflow.rs` に `execute_workflow` の分岐を追加すること。\n- 入力 validation と error handling を設計書と一致させること。\n- `tests/workflow.behavior.md` に追加仕様の behavior scenario を入れること。\n\n最後に `verify-contract --behavior` を実行して成功を確認してから終了してください。".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -6792,34 +8159,35 @@ pub(crate) fn required_verification_survives_authoring_completion_fixture_passes
             id: HistoryItemId::new(),
             session_id,
             turn_id: second_turn_id,
-            sequence_no: 36,
+            sequence_no: 40,
             created_at_ms: 136,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Update,
-                        path_before: Some(Utf8PathBuf::from("component.py")),
-                        path_after: Some(Utf8PathBuf::from("component.py")),
-                        summary: "Updated component.py".to_string(),
+                        path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Updated src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Update,
-                        path_before: Some(Utf8PathBuf::from("test_component.py")),
-                        path_after: Some(Utf8PathBuf::from("test_component.py")),
-                        summary: "Updated test_component.py".to_string(),
+                        path_before: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Updated tests/workflow.behavior.md".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Update,
-                        path_before: Some(Utf8PathBuf::from("docs/component-design.md")),
-                        path_after: Some(Utf8PathBuf::from("docs/component-design.md")),
-                        summary: "Updated docs/component-design.md".to_string(),
+                        path_before: Some(Utf8PathBuf::from("docs/workflow-design.md")),
+                        path_after: Some(Utf8PathBuf::from("docs/workflow-design.md")),
+                        summary: "Updated docs/workflow-design.md".to_string(),
                     },
                 ],
-                summary: "Updated component.py, test_component.py, and docs/component-design.md".to_string(),
+                summary: "Updated src/workflow.rs, tests/workflow.behavior.md, and docs/workflow-design.md".to_string(),
             },
         },
     ];
@@ -6838,13 +8206,124 @@ pub(crate) fn required_verification_survives_authoring_completion_fixture_passes
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         && matches!(
             active,
             Some(ActiveWorkContract::Verification {
                 repair_required: false,
                 ..
             })
+        )
+}
+
+pub(crate) fn state_authority_projection_uses_single_requested_work_owner_fixture_passes() -> bool {
+    let Ok(temp) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
+        return false;
+    };
+    if fs::create_dir_all(workspace.join("src").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("tests").as_std_path()).is_err()
+        || fs::write(
+            workspace.join("src/workflow.rs").as_std_path(),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .is_err()
+        || fs::write(
+            workspace.join("tests/workflow.behavior.md").as_std_path(),
+            "#[test]\nfn value_is_one() { assert_eq!(1, 1); }\n",
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: ProjectId::new(),
+        title: "single state authority owner".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: workspace,
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let previous = SessionStateSnapshot {
+        route: TaskRoute::Docs,
+        process_phase: ProcessPhase::Repair,
+        active_targets: vec![Utf8PathBuf::from("docs/stale-design.md")],
+        completion: CompletionState {
+            route_contract_pending: true,
+            blocked_reason: Some("stale docs route contract".to_string()),
+            ..CompletionState::default()
+        },
+        docs_route: Some(DocsRouteState {
+            active_deliverable: Some(Utf8PathBuf::from("docs/stale-design.md")),
+            pending_deliverables: vec![DocsPendingDeliverable {
+                target: Utf8PathBuf::from("docs/stale-design.md"),
+                summary: "stale docs route contract".to_string(),
+            }],
+            ..DocsRouteState::default()
+        }),
+        ..SessionStateSnapshot::default()
+    };
+    let items = vec![HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::UserTurn {
+            message_id: None,
+            content: vec![ContentPart::Text {
+                text: "Update `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`."
+                    .to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            turn_context: None,
+        },
+    }];
+    let candidates = state_authority_candidates_for_history_items(&session, &items, &previous);
+    let candidate_refs = candidates
+        .iter()
+        .map(|candidate| candidate.invariant_ref)
+        .collect::<BTreeSet<_>>();
+    let candidate_decision = candidates
+        .into_iter()
+        .min_by_key(|candidate| (candidate.precedence, candidate.invariant_ref))
+        .map(StateAuthorityCandidate::into_decision);
+    let state = reduce_session_state_from_history_items(&session, &items, &[], &previous);
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+    let expected_targets = vec![
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
+    ];
+    candidate_refs.contains("latest_requested_work_authoring")
+        && candidate_refs.contains("docs_route_active_target_authority")
+        && matches!(
+            candidate_decision,
+            Some(StateAuthorityDecision {
+                owner: StateAuthorityOwner::RequestedWorkAuthoring,
+                active_work: ActiveWorkContract::RequestedWorkAuthoring { .. }
+            })
+        )
+        && state.route == TaskRoute::Code
+        && state.process_phase == ProcessPhase::Author
+        && !state.completion.route_contract_pending
+        && !state.completion.verification_pending
+        && state.active_targets == expected_targets
+        && matches!(
+            active,
+            Some(ActiveWorkContract::RequestedWorkAuthoring {
+                pending_targets,
+                verification_commands
+            }) if pending_targets == expected_targets
+                && verification_commands == vec!["verify-contract --behavior".to_string()]
         )
 }
 
@@ -6856,18 +8335,24 @@ pub(crate) fn reference_design_input_does_not_become_pending_authoring_target_fi
     let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
         return false;
     };
-    if fs::create_dir_all(workspace.join("docs").as_std_path()).is_err() {
+    if fs::create_dir_all(workspace.join("src").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("tests").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("docs").as_std_path()).is_err()
+    {
         return false;
     }
     for (path, content) in [
-        ("component.py", "def add(a, b):\n    return a + b\n"),
         (
-            "test_component.py",
-            "import unittest\n\nclass ComponentTest(unittest.TestCase):\n    pass\n",
+            "src/workflow.rs",
+            "pub fn execute_workflow(input: &str) -> &str { input }\n",
         ),
         (
-            "docs/component-design.md",
-            "# Component design\n\nAdd power and modulo behavior.\n",
+            "tests/workflow.behavior.md",
+            "# Workflow behavior\n\n- execute_workflow returns the accepted input.\n",
+        ),
+        (
+            "docs/workflow-design.md",
+            "# Workflow design\n\nAdd validation and error handling behavior.\n",
         ),
     ] {
         if fs::write(workspace.join(path).as_std_path(), content).is_err() {
@@ -6883,8 +8368,8 @@ pub(crate) fn reference_design_input_does_not_become_pending_authoring_target_fi
         title: "reference design input".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6898,7 +8383,7 @@ pub(crate) fn reference_design_input_does_not_become_pending_authoring_target_fi
         payload: HistoryItemPayload::UserTurn {
             message_id: None,
             content: vec![ContentPart::Text {
-                text: "`docs/component-design.md` の拡張仕様に合わせて実装と test を更新してください。\n\n要件:\n- `component.py` に `pow` と `mod` を追加すること。\n- 入力値 validation と error handling を設計書と一致させること。\n- `test_component.py` に追加仕様の unittest を入れること。\n\n最後に `python -m unittest` を実行して成功を確認してから終了してください。".to_string(),
+                text: "`docs/workflow-design.md` の拡張仕様に合わせて source と behavior test を更新してください。\n\n要件:\n- `src/workflow.rs` に `execute_workflow` の validation 分岐を追加すること。\n- error handling を設計書と一致させること。\n- `tests/workflow.behavior.md` に追加仕様の behavior scenario を入れること。\n\n最後に `verify-contract --behavior` を実行して成功を確認してから終了してください。".to_string(),
             }],
             prompt_dispatch: None,
             editor_context: None,
@@ -6919,23 +8404,23 @@ pub(crate) fn reference_design_input_does_not_become_pending_authoring_target_fi
         && authoring_state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "component.py")
+            .any(|target| target.as_str() == "src/workflow.rs")
         && authoring_state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "test_component.py")
+            .any(|target| target.as_str() == "tests/workflow.behavior.md")
         && !authoring_state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "docs/component-design.md")
+            .any(|target| target.as_str() == "docs/workflow-design.md")
         && matches!(
             authoring_active,
             Some(ActiveWorkContract::RequestedWorkAuthoring {
                 pending_targets,
                 ..
-            }) if pending_targets.iter().any(|target| target.as_str() == "component.py")
-                && pending_targets.iter().any(|target| target.as_str() == "test_component.py")
-                && !pending_targets.iter().any(|target| target.as_str() == "docs/component-design.md")
+            }) if pending_targets.iter().any(|target| target.as_str() == "src/workflow.rs")
+                && pending_targets.iter().any(|target| target.as_str() == "tests/workflow.behavior.md")
+                && !pending_targets.iter().any(|target| target.as_str() == "docs/workflow-design.md")
         );
     if !authoring_targets_are_code_and_test {
         return false;
@@ -6950,24 +8435,25 @@ pub(crate) fn reference_design_input_does_not_become_pending_authoring_target_fi
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Update,
-                        path_before: Some(Utf8PathBuf::from("component.py")),
-                        path_after: Some(Utf8PathBuf::from("component.py")),
-                        summary: "Updated component.py".to_string(),
+                        path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Updated src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Update,
-                        path_before: Some(Utf8PathBuf::from("test_component.py")),
-                        path_after: Some(Utf8PathBuf::from("test_component.py")),
-                        summary: "Updated test_component.py".to_string(),
+                        path_before: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Updated tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Updated component.py and test_component.py".to_string(),
+                summary: "Updated src/workflow.rs and tests/workflow.behavior.md".to_string(),
             },
         },
     ];
@@ -6985,12 +8471,12 @@ pub(crate) fn reference_design_input_does_not_become_pending_authoring_target_fi
         && !completed_state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "docs/component-design.md")
+            .any(|target| target.as_str() == "docs/workflow-design.md")
         && completed_state
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         && matches!(
             completed_active,
             Some(ActiveWorkContract::Verification {
@@ -7007,18 +8493,24 @@ pub(crate) fn same_document_reference_update_remains_authoring_target_fixture_pa
     let Ok(workspace) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
         return false;
     };
-    if fs::create_dir_all(workspace.join("docs").as_std_path()).is_err() {
+    if fs::create_dir_all(workspace.join("src").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("tests").as_std_path()).is_err()
+        || fs::create_dir_all(workspace.join("docs").as_std_path()).is_err()
+    {
         return false;
     }
     for (path, content) in [
-        ("component.py", "def add(a, b):\n    return a + b\n"),
         (
-            "test_component.py",
-            "import unittest\n\nclass ComponentTest(unittest.TestCase):\n    pass\n",
+            "src/workflow.rs",
+            "pub fn execute_workflow(input: &str) -> &str { input }\n",
         ),
         (
-            "docs/component-design.md",
-            "# Component design\n\nCurrent four-operation component.\n",
+            "tests/workflow.behavior.md",
+            "# Workflow behavior\n\n- execute_workflow returns the accepted input.\n",
+        ),
+        (
+            "docs/workflow-design.md",
+            "# Workflow design\n\nCurrent workflow operation behavior.\n",
         ),
     ] {
         if fs::write(workspace.join(path).as_std_path(), content).is_err() {
@@ -7034,8 +8526,8 @@ pub(crate) fn same_document_reference_update_remains_authoring_target_fixture_pa
         title: "same document docs update".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -7049,7 +8541,7 @@ pub(crate) fn same_document_reference_update_remains_authoring_target_fixture_pa
         payload: HistoryItemPayload::UserTurn {
             message_id: None,
             content: vec![ContentPart::Text {
-                text: "前回作成した `docs/component-design.md` をもとに、電卓仕様を拡張してください。\n今回は実装コードと test は変更せず、設計書だけを更新してください。\n\n追加仕様:\n- 累乗 `pow`\n- 剰余 `mod`\n- 入力値 validation\n- CLI 利用例\n- error handling 方針\n\n最後に `python -m unittest` を実行して既存実装が壊れていないことを確認してください。".to_string(),
+                text: "前回作成した `docs/workflow-design.md` を更新してください。\n今回は同じ設計書だけを編集対象にし、実装成果物とテスト成果物は変更しないでください。\n\n追加仕様:\n- validation rule\n- retry policy\n- error handling 方針\n- public behavior scenario\n\n最後に `verify-contract --behavior` を実行して既存成果物が壊れていないことを確認してください。".to_string(),
             }],
             prompt_dispatch: None,
             editor_context: None,
@@ -7070,15 +8562,15 @@ pub(crate) fn same_document_reference_update_remains_authoring_target_fixture_pa
         && authoring_state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "docs/component-design.md")
+            .any(|target| target.as_str() == "docs/workflow-design.md")
         && !authoring_state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "component.py")
+            .any(|target| target.as_str() == "src/workflow.rs")
         && !authoring_state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "test_component.py")
+            .any(|target| target.as_str() == "tests/workflow.behavior.md")
         && authoring_state.route == TaskRoute::Docs
         && authoring_state.docs_route.is_some()
         && matches!(
@@ -7087,18 +8579,18 @@ pub(crate) fn same_document_reference_update_remains_authoring_target_fixture_pa
                 ref deliverable,
                 ref pending_deliverables,
                 ..
-            }) if deliverable.as_ref() == Some(&Utf8PathBuf::from("docs/component-design.md"))
+            }) if deliverable.as_ref() == Some(&Utf8PathBuf::from("docs/workflow-design.md"))
                 && pending_deliverables
                     .iter()
-                    .any(|deliverable| deliverable.target == Utf8PathBuf::from("docs/component-design.md"))
+                    .any(|deliverable| deliverable.target == Utf8PathBuf::from("docs/workflow-design.md"))
         );
     if !docs_update_is_authoring {
         return false;
     }
 
     if fs::write(
-        session.cwd.join("docs/component-design.md").as_std_path(),
-        "# Component design\n\n## Overview\n\nUpdated docs describe the 実装 files component.py and test_component.py, CLI usage, error handling, validation, pow, and mod behavior for the implementation.\n",
+        session.cwd.join("docs/workflow-design.md").as_std_path(),
+        "# Workflow design\n\n## Overview\n\nUpdated docs describe repository evidence from `src/workflow.rs` and `tests/workflow.behavior.md`, and define the validation rule, retry policy, error handling 方針, and public behavior scenario for the workflow specification while leaving implementation and test artifacts unchanged.\n",
     )
     .is_err()
     {
@@ -7114,15 +8606,16 @@ pub(crate) fn same_document_reference_update_remains_authoring_target_fixture_pa
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Update,
-                    path_before: Some(Utf8PathBuf::from("docs/component-design.md")),
-                    path_after: Some(Utf8PathBuf::from("docs/component-design.md")),
-                    summary: "Updated docs/component-design.md".to_string(),
+                    path_before: Some(Utf8PathBuf::from("docs/workflow-design.md")),
+                    path_after: Some(Utf8PathBuf::from("docs/workflow-design.md")),
+                    summary: "Updated docs/workflow-design.md".to_string(),
                 }],
-                summary: "Updated docs/component-design.md".to_string(),
+                summary: "Updated docs/workflow-design.md".to_string(),
             },
         },
     ];
@@ -7142,7 +8635,7 @@ pub(crate) fn same_document_reference_update_remains_authoring_target_fixture_pa
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         && matches!(
             completed_active,
             Some(ActiveWorkContract::Verification {
@@ -7180,8 +8673,8 @@ pub(crate) fn japanese_prompt_filename_boundaries_remain_artifact_targets_fixtur
         title: "japanese filename boundary".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -7238,6 +8731,7 @@ pub(crate) fn japanese_prompt_filename_boundaries_remain_artifact_targets_fixtur
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
@@ -7271,6 +8765,7 @@ pub(crate) fn japanese_prompt_filename_boundaries_remain_artifact_targets_fixtur
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
@@ -7328,34 +8823,39 @@ pub(crate) fn docs_output_referenced_code_does_not_become_pending_authoring_targ
     };
     for (path, content) in [
         (
-            "hello.py",
-            "def greet(name):\n    return f'Hello, {name}!'\n",
+            "src/workflow.rs",
+            "pub fn execute_workflow(input: &str) -> String { input.trim().to_string() }\n",
         ),
         (
-            "test_hello.py",
-            "import unittest\n\nclass HelloTest(unittest.TestCase):\n    pass\n",
+            "tests/workflow.behavior.md",
+            "Behavior: execute_workflow trims the provided input and returns the normalized workflow output.\n",
         ),
     ] {
+        if let Some(parent) = workspace.join(path).parent() {
+            if fs::create_dir_all(parent.as_std_path()).is_err() {
+                return false;
+            }
+        }
         if fs::write(workspace.join(path).as_std_path(), content).is_err() {
             return false;
         }
     }
 
-    let text = "この同じセッションで README.md を追加し、hello.py の使い方とテスト実行方法を短く書いてください。最後に python -m unittest を実行して確認してください。";
+    let text = "この同じセッションで docs/workflow-readme.md を追加し、src/workflow.rs の使い方と behavior contract の検証方法を短く書いてください。最後に verify-contract --behavior を実行して確認してください。";
     let contract = requested_work_contract_from_instruction_text(text);
-    if contract.deliverable_targets != vec!["README.md".to_string()]
+    if contract.deliverable_targets != vec!["docs/workflow-readme.md".to_string()]
         || !contract
             .reference_inputs
             .iter()
-            .any(|target| target == "hello.py")
+            .any(|target| target == "src/workflow.rs")
         || contract
             .deliverable_targets
             .iter()
-            .any(|target| target == "hello.py")
+            .any(|target| target == "src/workflow.rs")
         || !contract
             .verification_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
     {
         return false;
     }
@@ -7368,8 +8868,8 @@ pub(crate) fn docs_output_referenced_code_does_not_become_pending_authoring_targ
         title: "docs output referenced code".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -7400,7 +8900,7 @@ pub(crate) fn docs_output_referenced_code_does_not_become_pending_authoring_targ
     );
     let initial_active =
         active_work_contract_for_history_items(&session, &initial_items, &initial_state, &[]);
-    let expected_initial_targets = vec![Utf8PathBuf::from("README.md")];
+    let expected_initial_targets = vec![Utf8PathBuf::from("docs/workflow-readme.md")];
     if initial_state.process_phase != ProcessPhase::Author
         || initial_state.active_targets != expected_initial_targets
         || !matches!(
@@ -7423,15 +8923,16 @@ pub(crate) fn docs_output_referenced_code_does_not_become_pending_authoring_targ
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Add,
                     path_before: None,
-                    path_after: Some(Utf8PathBuf::from("README.md")),
-                    summary: "Added README.md".to_string(),
+                    path_after: Some(Utf8PathBuf::from("docs/workflow-readme.md")),
+                    summary: "Added docs/workflow-readme.md".to_string(),
                 }],
-                summary: "Added README.md".to_string(),
+                summary: "Added docs/workflow-readme.md".to_string(),
             },
         },
     ];
@@ -7449,12 +8950,12 @@ pub(crate) fn docs_output_referenced_code_does_not_become_pending_authoring_targ
         || authored_state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "hello.py")
+            .any(|target| target.as_str() == "src/workflow.rs")
         || !authored_state
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         || !matches!(
             authored_active,
             Some(ActiveWorkContract::Verification {
@@ -7478,19 +8979,19 @@ pub(crate) fn docs_output_referenced_code_does_not_become_pending_authoring_targ
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "Ran 3 tests in 0.000s\n\nOK".to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "workflow behavior contract passed".to_string(),
                 metadata: Value::Null,
                 success: Some(true),
                 progress_effect: ToolProgressEffect::VerificationPassed,
                 blocked_action: None,
                 result_hash: Some("docs-output-reference-code-verification".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Passed,
                     exit_code: Some(0),
                     timed_out: false,
-                    output_summary: "Ran 3 tests in 0.000s\n\nOK".to_string(),
+                    output_summary: "workflow behavior contract passed".to_string(),
                     failure_cluster: None,
                     satisfies_command_identities: Vec::new(),
                     artifact_refs: Vec::new(),
@@ -7516,7 +9017,7 @@ pub(crate) fn docs_output_referenced_code_does_not_become_pending_authoring_targ
         && verified_state
             .active_targets
             .iter()
-            .all(|target| target.as_str() != "hello.py")
+            .all(|target| target.as_str() != "src/workflow.rs")
 }
 
 pub(crate) fn verification_failure_preserves_repair_targets_fixture_passes() -> bool {
@@ -7528,8 +9029,8 @@ pub(crate) fn verification_failure_preserves_repair_targets_fixture_passes() -> 
         title: "verification repair target preservation".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -7537,15 +9038,40 @@ pub(crate) fn verification_failure_preserves_repair_targets_fixture_passes() -> 
     let mut verify_state = SessionStateSnapshot::default();
     verify_state.process_phase = ProcessPhase::Verify;
     verify_state.active_targets = vec![
-        Utf8PathBuf::from("component.py"),
-        Utf8PathBuf::from("test_component.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     verify_state.completion.verification_pending = true;
     verify_state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
-    let cluster = public_class_attribute_cluster_fixture();
+        .push("verify-contract --behavior".to_string());
+    let cluster = VerificationFailureCluster {
+        cluster_id: "workflow-repair-contract".to_string(),
+        failing_labels: vec!["workflow_behavior_contract".to_string()],
+        primary_failure: Some("workflow behavior contract mismatch".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("source_public_contract_mismatch".to_string()),
+            label: Some("workflow_behavior_contract".to_string()),
+            target: Some("tests/workflow.behavior.md".to_string()),
+            symbol: Some("execute_workflow".to_string()),
+            call_site: Some("execute_workflow(input)".to_string()),
+            exception: None,
+            expected: Some("normalized workflow output".to_string()),
+            observed: Some("raw workflow output".to_string()),
+            public_state_assertions: vec!["execute_workflow(input)".to_string()],
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec!["source_public_contract_mismatch".to_string()],
+            sibling_obligations: vec!["execute_workflow(input)".to_string()],
+            requirement_refs: Vec::new(),
+            source_refs: vec!["src/workflow.rs".to_string()],
+            test_refs: vec!["tests/workflow.behavior.md".to_string()],
+        }],
+        sibling_obligations: vec!["execute_workflow(input)".to_string()],
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
+    };
     let items = vec![
         HistoryItem {
             id: HistoryItemId::new(),
@@ -7554,24 +9080,25 @@ pub(crate) fn verification_failure_preserves_repair_targets_fixture_passes() -> 
             sequence_no: 1,
             created_at_ms: 1,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("component.py")),
-                        summary: "Added component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_component.py")),
-                        summary: "Added test_component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Added component.py; Added test_component.py".to_string(),
+                summary: "Added src/workflow.rs; Added tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
@@ -7593,22 +9120,19 @@ pub(crate) fn verification_failure_preserves_repair_targets_fixture_passes() -> 
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "AttributeError: module 'component' has no attribute 'calculate'"
-                    .to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "workflow behavior contract mismatch".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
                 result_hash: Some("fixture-result".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary:
-                        "AttributeError: module 'component' has no attribute 'calculate'"
-                            .to_string(),
+                    output_summary: "workflow behavior contract mismatch".to_string(),
                     failure_cluster: Some(cluster),
                     satisfies_command_identities: Vec::new(),
                     artifact_refs: Vec::new(),
@@ -7628,15 +9152,15 @@ pub(crate) fn verification_failure_preserves_repair_targets_fixture_passes() -> 
         && state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "component.py")
+            .any(|target| target.as_str() == "src/workflow.rs")
         && state
             .active_targets
             .iter()
-            .all(|target| target.as_str() != "test_component.py")
+            .all(|target| target.as_str() != "tests/workflow.behavior.md")
         && !state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "10 + 5" || target.as_str() == "5")
+            .any(|target| target.as_str() == "normalized workflow output")
 }
 
 pub(crate) fn verification_failure_ignores_runtime_loader_frame_fixture_passes() -> bool {
@@ -7648,50 +9172,37 @@ pub(crate) fn verification_failure_ignores_runtime_loader_frame_fixture_passes()
         title: "verification import repair target authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
-    let output_summary = "E\n\
-======================================================================\n\
-ERROR: test_component (unittest.loader._FailedTest.test_component)\n\
-----------------------------------------------------------------------\n\
-ImportError: Failed to import test module: test_component\n\
-Traceback (most recent call last):\n\
-  File \"C:\\Python313\\Lib\\unittest\\loader.py\", line 396, in _find_test_path\n\
-    module = self._get_module_from_name(name)\n\
-  File \"C:\\Python313\\Lib\\unittest\\loader.py\", line 339, in _get_module_from_name\n\
-    __import__(name)\n\
-  File \"C:\\workspace\\project\\test_component.py\", line 4, in <module>\n\
-    from component import add, subtract, multiply, divide, calculate\n\
-ImportError: cannot import name 'calculate' from 'component' (C:\\workspace\\project\\component.py)\n\
-\n\
-----------------------------------------------------------------------\n\
-Ran 1 test in 0.000s\n\
-\n\
-FAILED (errors=1)\n";
-    let evidence = crate::agent::repair_lane::verification_failure_evidence_from_summary(
-        FailureKind::VerificationFailed,
-        output_summary,
-    );
-    let source_refs = evidence
-        .iter()
-        .flat_map(|item| item.source_refs.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let test_refs = evidence
-        .iter()
-        .flat_map(|item| item.test_refs.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let output_summary = "runtime loader frame omitted; workflow export contract mismatch";
+    let evidence = vec![VerificationFailureEvidence {
+        evidence_kind: "verification_failure".to_string(),
+        subtype: Some("runtime_loader_frame_excluded".to_string()),
+        label: Some("workflow_export_contract".to_string()),
+        target: Some("tests/workflow.spec.ts".to_string()),
+        symbol: Some("execute_workflow".to_string()),
+        call_site: Some("execute_workflow(input)".to_string()),
+        exception: None,
+        expected: Some("exported workflow operation".to_string()),
+        observed: Some("missing workflow operation".to_string()),
+        public_state_assertions: vec!["execute_workflow(input)".to_string()],
+        public_missing_attributes: vec!["execute_workflow".to_string()],
+        evidence_markers: vec!["runtime_loader_frame_excluded".to_string()],
+        sibling_obligations: vec!["execute_workflow".to_string()],
+        requirement_refs: Vec::new(),
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
+    }];
+    let source_refs = vec!["src/workflow.rs".to_string()];
+    let test_refs = vec!["tests/workflow.behavior.md".to_string()];
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-import-export-runtime-loader-frame".to_string(),
-        failing_labels: vec!["test_component".to_string()],
-        primary_failure: Some("E".to_string()),
+        failing_labels: vec!["workflow_export_contract".to_string()],
+        primary_failure: Some("workflow export contract mismatch".to_string()),
         evidence,
         sibling_obligations: Vec::new(),
         source_refs,
@@ -7700,14 +9211,14 @@ FAILED (errors=1)\n";
     let mut verify_state = SessionStateSnapshot::default();
     verify_state.process_phase = ProcessPhase::Verify;
     verify_state.active_targets = vec![
-        Utf8PathBuf::from("component.py"),
-        Utf8PathBuf::from("test_component.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     verify_state.completion.verification_pending = true;
     verify_state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     let items = vec![
         HistoryItem {
             id: HistoryItemId::new(),
@@ -7718,7 +9229,7 @@ FAILED (errors=1)\n";
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `component.py` and `test_component.py`, then run `python -m unittest`.".to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -7732,24 +9243,25 @@ FAILED (errors=1)\n";
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("component.py")),
-                        summary: "Added component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_component.py")),
-                        summary: "Added test_component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Added component.py; Added test_component.py".to_string(),
+                summary: "Added src/workflow.rs; Added tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
@@ -7771,7 +9283,7 @@ FAILED (errors=1)\n";
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
                 output_text: output_summary.to_string(),
                 metadata: Value::Null,
                 success: Some(false),
@@ -7779,7 +9291,7 @@ FAILED (errors=1)\n";
                 blocked_action: None,
                 result_hash: Some("fixture-result".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
@@ -7809,32 +9321,32 @@ FAILED (errors=1)\n";
                 cluster
                     .source_refs
                     .iter()
-                    .any(|target| target == "component.py")
+                    .any(|target| target == "src/workflow.rs")
                     && !cluster
                         .source_refs
                         .iter()
-                        .any(|target| target == "loader.py")
+                        .any(|target| target == "runtime/loader.frame")
             })
         && state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "component.py")
+            .any(|target| target.as_str() == "src/workflow.rs")
         && state
             .active_targets
             .iter()
-            .all(|target| target.as_str() != "test_component.py")
+            .all(|target| target.as_str() != "tests/workflow.behavior.md")
         && !state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "loader.py")
+            .any(|target| target.as_str() == "runtime/loader.frame")
         && matches!(
             active,
             Some(ActiveWorkContract::Verification {
                 repair_required: true,
                 targets,
                 ..
-            }) if targets.iter().any(|target| target.as_str() == "component.py")
-                && !targets.iter().any(|target| target.as_str() == "loader.py")
+            }) if targets.iter().any(|target| target.as_str() == "src/workflow.rs")
+                && !targets.iter().any(|target| target.as_str() == "runtime/loader.frame")
         )
 }
 
@@ -7848,40 +9360,40 @@ pub(crate) fn out_of_order_history_items_use_sequence_authority_for_repair_fixtu
         title: "sequence authority repair".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-public-missing-near-name".to_string(),
-        failing_labels: vec!["test_float_result".to_string()],
-        primary_failure: Some("E".to_string()),
+        failing_labels: vec!["workflow_output_contract".to_string()],
+        primary_failure: Some("workflow output mismatch".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_class_attribute_mismatch".to_string()),
-            label: Some("test_float_result".to_string()),
-            target: Some("test_component.py".to_string()),
-            symbol: Some("component._format_result".to_string()),
-            call_site: Some("component._format_result(1.5)".to_string()),
-            exception: Some("AttributeError".to_string()),
-            expected: Some("1.5".to_string()),
-            observed: Some("component._format_result missing".to_string()),
-            public_state_assertions: vec!["component._format_result(1.5)".to_string()],
-            public_missing_attributes: vec!["component._format_result".to_string()],
+            label: Some("workflow_output_contract".to_string()),
+            target: Some("tests/workflow.behavior.md".to_string()),
+            symbol: Some("format_workflow_output".to_string()),
+            call_site: Some("format_workflow_output(record)".to_string()),
+            exception: None,
+            expected: Some("normalized output".to_string()),
+            observed: Some("missing formatter".to_string()),
+            public_state_assertions: vec!["format_workflow_output(record)".to_string()],
+            public_missing_attributes: vec!["format_workflow_output".to_string()],
             evidence_markers: vec![
-                "`component._format_result` is missing; source near-name candidate is `component.format_result`".to_string(),
-                "public missing method `component._format_result`".to_string(),
+                "`format_workflow_output` is missing; source near-name candidate is `render_workflow_output`".to_string(),
+                "public missing operation `format_workflow_output`".to_string(),
             ],
-            sibling_obligations: vec!["component._format_result".to_string()],
+            sibling_obligations: vec!["format_workflow_output".to_string()],
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_component.py".to_string()],
+            test_refs: vec!["tests/workflow.behavior.md".to_string()],
         }],
-        sibling_obligations: vec!["component._format_result".to_string()],
+        sibling_obligations: vec!["format_workflow_output".to_string()],
         source_refs: Vec::new(),
-        test_refs: vec!["test_component.py".to_string()],
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
     };
     let old_failure = HistoryItem {
         id: HistoryItemId::new(),
@@ -7892,7 +9404,7 @@ pub(crate) fn out_of_order_history_items_use_sequence_authority_for_repair_fixtu
         payload: HistoryItemPayload::ToolOutput {
             call_id: ToolCallId::new(),
             status: ToolLifecycleStatus::Completed,
-            title: "Run shell command: python -m unittest".to_string(),
+            title: "Run shell command: verify-contract --behavior".to_string(),
             output_text: "older verification failure".to_string(),
             metadata: Value::Null,
             success: Some(false),
@@ -7900,7 +9412,7 @@ pub(crate) fn out_of_order_history_items_use_sequence_authority_for_repair_fixtu
             blocked_action: None,
             result_hash: Some("old-failure".to_string()),
             verification_run: Some(VerificationRunResult {
-                command: "python -m unittest".to_string(),
+                command: "verify-contract --behavior".to_string(),
                 status: VerificationRunStatus::Failed,
                 exit_code: Some(1),
                 timed_out: false,
@@ -7919,24 +9431,25 @@ pub(crate) fn out_of_order_history_items_use_sequence_authority_for_repair_fixtu
         sequence_no: 2,
         created_at_ms: 2,
         payload: HistoryItemPayload::FileChange {
+            call_id: crate::session::ToolCallId::new(),
             change_ids: vec![ChangeId::new(), ChangeId::new()],
             changes: vec![
                 FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Update,
-                    path_before: Some(Utf8PathBuf::from("component.py")),
-                    path_after: Some(Utf8PathBuf::from("component.py")),
-                    summary: "Updated component.py".to_string(),
+                    path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+                    path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                    summary: "Updated src/workflow.rs".to_string(),
                 },
                 FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Update,
-                    path_before: Some(Utf8PathBuf::from("test_component.py")),
-                    path_after: Some(Utf8PathBuf::from("test_component.py")),
-                    summary: "Updated test_component.py".to_string(),
+                    path_before: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                    path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                    summary: "Updated tests/workflow.behavior.md".to_string(),
                 },
             ],
-            summary: "Updated component.py and test_component.py".to_string(),
+            summary: "Updated src/workflow.rs and tests/workflow.behavior.md".to_string(),
         },
     };
     let post_old_repair_edit = HistoryItem {
@@ -7946,15 +9459,16 @@ pub(crate) fn out_of_order_history_items_use_sequence_authority_for_repair_fixtu
         sequence_no: 4,
         created_at_ms: 4,
         payload: HistoryItemPayload::FileChange {
+            call_id: crate::session::ToolCallId::new(),
             change_ids: vec![ChangeId::new()],
             changes: vec![FileChangeEvidence {
                 change_id: ChangeId::new(),
                 kind: crate::session::ChangeKind::Update,
-                path_before: Some(Utf8PathBuf::from("component.py")),
-                path_after: Some(Utf8PathBuf::from("component.py")),
-                summary: "Edited component.py after an older failure".to_string(),
+                path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+                path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                summary: "Edited src/workflow.rs after an older failure".to_string(),
             }],
-            summary: "Edited component.py".to_string(),
+            summary: "Edited src/workflow.rs".to_string(),
         },
     };
     let latest_failure = HistoryItem {
@@ -7966,19 +9480,23 @@ pub(crate) fn out_of_order_history_items_use_sequence_authority_for_repair_fixtu
         payload: HistoryItemPayload::ToolOutput {
             call_id: ToolCallId::new(),
             status: ToolLifecycleStatus::Completed,
-            title: "Run shell command: python -m unittest".to_string(),
-            output_text: "AttributeError: module 'component' has no attribute '_format_result'. Did you mean: 'format_result'?".to_string(),
+            title: "Run shell command: verify-contract --behavior".to_string(),
+            output_text:
+                "workflow output formatter is missing; candidate render_workflow_output exists"
+                    .to_string(),
             metadata: Value::Null,
             success: Some(false),
             progress_effect: ToolProgressEffect::VerificationFailed,
             blocked_action: None,
             result_hash: Some("latest-failure".to_string()),
             verification_run: Some(VerificationRunResult {
-                command: "python -m unittest".to_string(),
+                command: "verify-contract --behavior".to_string(),
                 status: VerificationRunStatus::Failed,
                 exit_code: Some(1),
                 timed_out: false,
-                output_summary: "AttributeError: module 'component' has no attribute '_format_result'. Did you mean: 'format_result'?".to_string(),
+                output_summary:
+                    "workflow output formatter is missing; candidate render_workflow_output exists"
+                        .to_string(),
                 failure_cluster: Some(cluster),
                 satisfies_command_identities: Vec::new(),
                 artifact_refs: Vec::new(),
@@ -7995,7 +9513,7 @@ pub(crate) fn out_of_order_history_items_use_sequence_authority_for_repair_fixtu
         payload: HistoryItemPayload::UserTurn {
             message_id: None,
             content: vec![ContentPart::Text {
-                text: "Update component.py and test_component.py, then run python -m unittest."
+                    text: "Update src/workflow.rs and tests/workflow.behavior.md, then run verify-contract --behavior."
                     .to_string(),
             }],
             prompt_dispatch: None,
@@ -8032,7 +9550,7 @@ pub(crate) fn out_of_order_history_items_use_sequence_authority_for_repair_fixtu
         && state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "component.py")
+            .any(|target| target.as_str() == "src/workflow.rs")
         && matches!(
             active_work,
             Some(ActiveWorkContract::Verification {
@@ -8044,7 +9562,7 @@ pub(crate) fn out_of_order_history_items_use_sequence_authority_for_repair_fixtu
             .as_ref()
             .and_then(|lane| lane.operation_template.as_ref())
             .and_then(|template| template.exact_target.as_deref())
-            == Some("component.py");
+            == Some("src/workflow.rs");
     passes
 }
 
@@ -8058,61 +9576,61 @@ pub(crate) fn source_owned_verification_failure_preserves_recent_source_edit_tar
         title: "source-owned repair preserves recent source edit target".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
     let mut verify_state = SessionStateSnapshot::default();
     verify_state.process_phase = ProcessPhase::Verify;
-    verify_state.active_targets = vec![Utf8PathBuf::from("arcade_game.py")];
+    verify_state.active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
     verify_state.completion.verification_pending = true;
     verify_state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-public-state-generated-test-only".to_string(),
         failing_labels: vec![
-            "test_beh3_rects_overlap_edge_contact".to_string(),
-            "test_beh4_bullet_overlaps_invader_consumes_bullet".to_string(),
+            "test_public_state_transition".to_string(),
+            "test_public_event_projection".to_string(),
         ],
         primary_failure: Some(".....F..F............................".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_state_assertion_mismatch".to_string()),
-            label: Some("test_beh3_rects_overlap_edge_contact".to_string()),
-            target: Some("test_arcade_game.py".to_string()),
-            symbol: Some("arcade_game.rects_overlap".to_string()),
-            call_site: Some("arcade_game.rects_overlap(a, b)".to_string()),
+            label: Some("test_public_state_transition".to_string()),
+            target: Some("tests/workflow.behavior.md".to_string()),
+            symbol: Some("workflow.transition_status".to_string()),
+            call_site: Some("workflow.transition_status(record)".to_string()),
             exception: None,
-            expected: Some("truthy".to_string()),
-            observed: Some("False".to_string()),
+            expected: Some("completed".to_string()),
+            observed: Some("pending".to_string()),
             public_state_assertions: vec![
-                "arcade_game.rects_overlap(a, b)".to_string(),
-                "len(gs.player_bullets)".to_string(),
+                "workflow.transition_status(record)".to_string(),
+                "record.status".to_string(),
             ],
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
                 "public_state_assertion_mismatch".to_string(),
-                "arcade_game.rects_overlap(a, b)".to_string(),
-                "len(gs.player_bullets)".to_string(),
+                "workflow.transition_status(record)".to_string(),
+                "record.status".to_string(),
             ],
             sibling_obligations: vec![
-                "arcade_game.rects_overlap(a, b)".to_string(),
-                "len(gs.player_bullets)".to_string(),
+                "workflow.transition_status(record)".to_string(),
+                "record.status".to_string(),
             ],
-            requirement_refs: vec!["BEH-3".to_string(), "BEH-4".to_string()],
+            requirement_refs: vec!["REQ-3".to_string(), "REQ-4".to_string()],
             source_refs: Vec::new(),
-            test_refs: vec!["test_arcade_game.py".to_string()],
+            test_refs: vec!["tests/workflow.behavior.md".to_string()],
         }],
         sibling_obligations: vec![
-            "arcade_game.rects_overlap(a, b)".to_string(),
-            "len(gs.player_bullets)".to_string(),
+            "workflow.transition_status(record)".to_string(),
+            "record.status".to_string(),
         ],
         source_refs: Vec::new(),
-        test_refs: vec!["test_arcade_game.py".to_string()],
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
     };
     let items = vec![
         HistoryItem {
@@ -8124,7 +9642,7 @@ pub(crate) fn source_owned_verification_failure_preserves_recent_source_edit_tar
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `arcade_game.py` and `test_arcade_game.py`, then run `python -m unittest`.".to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -8138,24 +9656,25 @@ pub(crate) fn source_owned_verification_failure_preserves_recent_source_edit_tar
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Update,
-                        path_before: Some(Utf8PathBuf::from("arcade_game.py")),
-                        path_after: Some(Utf8PathBuf::from("arcade_game.py")),
-                        summary: "Updated arcade_game.py".to_string(),
+                        path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Updated src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_arcade_game.py")),
-                        summary: "Added test_arcade_game.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Updated arcade_game.py; Added test_arcade_game.py".to_string(),
+                summary: "Updated src/workflow.rs; Added tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
@@ -8177,23 +9696,23 @@ pub(crate) fn source_owned_verification_failure_preserves_recent_source_edit_tar
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "FAIL: test_beh3_rects_overlap_edge_contact\nAssertionError: False is not true\nFAIL: test_beh4_bullet_overlaps_invader_consumes_bullet\nAssertionError: 1 != 0".to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "FAIL: test_public_state_transition\nAssertionError: 'pending' != 'completed'\nFAIL: test_public_event_projection\nAssertionError: 'queued' != 'applied'".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
                 result_hash: Some("fixture-public-state-result".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary: "FAIL: test_beh3_rects_overlap_edge_contact\nAssertionError: False is not true\nFAIL: test_beh4_bullet_overlaps_invader_consumes_bullet\nAssertionError: 1 != 0".to_string(),
+                    output_summary: "FAIL: test_public_state_transition\nAssertionError: 'pending' != 'completed'\nFAIL: test_public_event_projection\nAssertionError: 'queued' != 'applied'".to_string(),
                     failure_cluster: Some(cluster),
                     satisfies_command_identities: Vec::new(),
                     artifact_refs: Vec::new(),
-                    requirement_refs: vec!["BEH-3".to_string(), "BEH-4".to_string()],
+                    requirement_refs: vec!["REQ-3".to_string(), "REQ-4".to_string()],
                 }),
             },
         },
@@ -8209,11 +9728,11 @@ pub(crate) fn source_owned_verification_failure_preserves_recent_source_edit_tar
         && state
             .active_targets
             .first()
-            .is_some_and(|target| target.as_str() == "arcade_game.py")
+            .is_some_and(|target| target.as_str() == "src/workflow.rs")
         && state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "arcade_game.py")
+            .any(|target| target.as_str() == "src/workflow.rs")
 }
 
 pub(crate) fn verification_timeout_preserves_recent_source_repair_target_fixture_passes() -> bool {
@@ -8225,8 +9744,8 @@ pub(crate) fn verification_timeout_preserves_recent_source_repair_target_fixture
         title: "verification timeout source target preservation".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -8241,7 +9760,7 @@ pub(crate) fn verification_timeout_preserves_recent_source_repair_target_fixture
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `widget.py` and `test_widget.py`, then run `python -X utf8 -m unittest`.".to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -8255,24 +9774,25 @@ pub(crate) fn verification_timeout_preserves_recent_source_repair_target_fixture
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("widget.py")),
-                        summary: "Added widget.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_widget.py")),
-                        summary: "Added test_widget.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Added widget.py and test_widget.py".to_string(),
+                summary: "Added src/workflow.rs and tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
@@ -8284,7 +9804,7 @@ pub(crate) fn verification_timeout_preserves_recent_source_repair_target_fixture
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -X utf8 -m unittest".to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
                 output_text: "command timed out".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
@@ -8292,7 +9812,7 @@ pub(crate) fn verification_timeout_preserves_recent_source_repair_target_fixture
                 blocked_action: None,
                 result_hash: Some("timeout-fixture".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -X utf8 -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::TimedOut,
                     exit_code: Some(1),
                     timed_out: true,
@@ -8317,14 +9837,14 @@ pub(crate) fn verification_timeout_preserves_recent_source_repair_target_fixture
         && state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "widget.py")
+            .any(|target| target.as_str() == "src/workflow.rs")
         && matches!(
             active_work,
             Some(ActiveWorkContract::Verification {
                 repair_required: true,
                 targets,
                 ..
-            }) if targets.iter().any(|target| target.as_str() == "widget.py")
+            }) if targets.iter().any(|target| target.as_str() == "src/workflow.rs")
         )
 }
 
@@ -8338,52 +9858,52 @@ pub(crate) fn verification_failure_diagnostic_labels_do_not_become_repair_target
         title: "verification labels remain evidence".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
-    let label_target = "BEH-4: bullet overlap assertion message";
+    let label_target = "workflow_contract.required_transition diagnostic label";
     let mut stale_verify_state = SessionStateSnapshot::default();
     stale_verify_state.process_phase = ProcessPhase::Verify;
     stale_verify_state.active_targets = vec![
         Utf8PathBuf::from(label_target),
-        Utf8PathBuf::from("test_arcade_game.py"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     stale_verify_state.completion.verification_pending = true;
     stale_verify_state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-diagnostic-label-target-pollution".to_string(),
-        failing_labels: vec!["test_update_calls_collision_BEH4".to_string()],
-        primary_failure: Some("....F...................F....................".to_string()),
+        failing_labels: vec!["workflow_transition_assertion_label".to_string()],
+        primary_failure: Some("workflow transition assertion failed".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_state_assertion_mismatch".to_string()),
-            label: Some("test_update_calls_collision_BEH4".to_string()),
+            label: Some("workflow_transition_assertion_label".to_string()),
             target: Some(label_target.to_string()),
             symbol: None,
             call_site: None,
             exception: None,
-            expected: Some("score increments".to_string()),
-            observed: Some("0".to_string()),
-            public_state_assertions: vec!["gs.score".to_string()],
+            expected: Some("workflow transition completes".to_string()),
+            observed: Some("workflow transition remains pending".to_string()),
+            public_state_assertions: vec!["workflow_state.status".to_string()],
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
                 "public_state_assertion_mismatch".to_string(),
-                "gs.score".to_string(),
+                "workflow_state.status".to_string(),
             ],
-            sibling_obligations: vec!["gs.score".to_string()],
-            requirement_refs: vec!["BEH-4".to_string()],
-            source_refs: vec![label_target.to_string()],
-            test_refs: vec!["test_arcade_game.py".to_string()],
+            sibling_obligations: vec!["workflow_state.status".to_string()],
+            requirement_refs: vec!["workflow_contract.required_transition".to_string()],
+            source_refs: vec!["src/workflow.rs".to_string()],
+            test_refs: vec!["tests/workflow.behavior.md".to_string()],
         }],
-        sibling_obligations: vec!["gs.score".to_string()],
-        source_refs: vec![label_target.to_string()],
-        test_refs: vec!["test_arcade_game.py".to_string()],
+        sibling_obligations: vec!["workflow_state.status".to_string()],
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
     };
     let items = vec![
         HistoryItem {
@@ -8395,7 +9915,7 @@ pub(crate) fn verification_failure_diagnostic_labels_do_not_become_repair_target
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create arcade_game.py and generated tests.".to_string(),
+                    text: "Create src/workflow.rs and generated behavior tests.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -8409,15 +9929,16 @@ pub(crate) fn verification_failure_diagnostic_labels_do_not_become_repair_target
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Update,
-                    path_before: Some(Utf8PathBuf::from("arcade_game.py")),
-                    path_after: Some(Utf8PathBuf::from("arcade_game.py")),
-                    summary: "Updated arcade_game.py".to_string(),
+                    path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+                    path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                    summary: "Updated src/workflow.rs".to_string(),
                 }],
-                summary: "Updated arcade_game.py".to_string(),
+                summary: "Updated src/workflow.rs".to_string(),
             },
         },
         HistoryItem {
@@ -8427,15 +9948,16 @@ pub(crate) fn verification_failure_diagnostic_labels_do_not_become_repair_target
             sequence_no: 3,
             created_at_ms: 3,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Update,
-                    path_before: Some(Utf8PathBuf::from("test_arcade_game.py")),
-                    path_after: Some(Utf8PathBuf::from("test_arcade_game.py")),
-                    summary: "Updated test_arcade_game.py".to_string(),
+                    path_before: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                    path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                    summary: "Updated tests/workflow.behavior.md".to_string(),
                 }],
-                summary: "Updated test_arcade_game.py".to_string(),
+                summary: "Updated tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
@@ -8457,23 +9979,23 @@ pub(crate) fn verification_failure_diagnostic_labels_do_not_become_repair_target
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "FAIL: test_update_calls_collision_BEH4\nAssertionError: 0 != 40 : BEH-4: bullet overlap assertion message".to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "FAIL: workflow_transition_assertion_label\nAssertionError: pending != complete : workflow_contract.required_transition diagnostic label".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
                 result_hash: Some("fixture-diagnostic-label-result".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary: "FAIL: test_update_calls_collision_BEH4\nAssertionError: 0 != 40 : BEH-4: bullet overlap assertion message".to_string(),
+                    output_summary: "FAIL: workflow_transition_assertion_label\nAssertionError: pending != complete : workflow_contract.required_transition diagnostic label".to_string(),
                     failure_cluster: Some(cluster),
                     satisfies_command_identities: Vec::new(),
                     artifact_refs: Vec::new(),
-                    requirement_refs: vec!["BEH-4".to_string()],
+                    requirement_refs: vec!["workflow_contract.required_transition".to_string()],
                 }),
             },
         },
@@ -8489,11 +10011,12 @@ pub(crate) fn verification_failure_diagnostic_labels_do_not_become_repair_target
         && state
             .active_targets
             .first()
-            .is_some_and(|target| target.as_str() == "arcade_game.py")
-        && !state
-            .active_targets
-            .iter()
-            .any(|target| target.as_str().contains("BEH-4:"))
+            .is_some_and(|target| target.as_str() == "src/workflow.rs")
+        && !state.active_targets.iter().any(|target| {
+            target
+                .as_str()
+                .contains("workflow_contract.required_transition")
+        })
 }
 
 pub(crate) fn synthetic_tool_feedback_preserves_real_verification_cluster_fixture_passes() -> bool {
@@ -8505,8 +10028,8 @@ pub(crate) fn synthetic_tool_feedback_preserves_real_verification_cluster_fixtur
         title: "synthetic feedback preservation".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -8514,14 +10037,14 @@ pub(crate) fn synthetic_tool_feedback_preserves_real_verification_cluster_fixtur
     let mut verify_state = SessionStateSnapshot::default();
     verify_state.process_phase = ProcessPhase::Verify;
     verify_state.active_targets = vec![
-        Utf8PathBuf::from("component.py"),
-        Utf8PathBuf::from("test_component.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     verify_state.completion.verification_pending = true;
     verify_state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     let items = vec![
         HistoryItem {
             id: HistoryItemId::new(),
@@ -8542,23 +10065,47 @@ pub(crate) fn synthetic_tool_feedback_preserves_real_verification_cluster_fixtur
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "AttributeError: module 'component' has no attribute 'calculate'"
-                    .to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "workflow behavior contract mismatch".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
                 result_hash: Some("real-verification".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary:
-                        "AttributeError: module 'component' has no attribute 'calculate'"
-                            .to_string(),
-                    failure_cluster: Some(public_class_attribute_cluster_fixture()),
+                    output_summary: "workflow behavior contract mismatch".to_string(),
+                    failure_cluster: Some(VerificationFailureCluster {
+                        cluster_id: "workflow-repair-contract".to_string(),
+                        failing_labels: vec!["workflow_behavior_contract".to_string()],
+                        primary_failure: Some("workflow behavior contract mismatch".to_string()),
+                        evidence: vec![VerificationFailureEvidence {
+                            evidence_kind: "verification_failure".to_string(),
+                            subtype: Some("source_public_contract_mismatch".to_string()),
+                            label: Some("workflow_behavior_contract".to_string()),
+                            target: Some("tests/workflow.behavior.md".to_string()),
+                            symbol: Some("execute_workflow".to_string()),
+                            call_site: Some("execute_workflow(input)".to_string()),
+                            exception: None,
+                            expected: Some("normalized workflow output".to_string()),
+                            observed: Some("raw workflow output".to_string()),
+                            public_state_assertions: vec!["execute_workflow(input)".to_string()],
+                            public_missing_attributes: Vec::new(),
+                            evidence_markers: vec![
+                                "source_public_contract_mismatch".to_string()
+                            ],
+                            sibling_obligations: vec!["execute_workflow(input)".to_string()],
+                            requirement_refs: Vec::new(),
+                            source_refs: vec!["src/workflow.rs".to_string()],
+                            test_refs: vec!["tests/workflow.behavior.md".to_string()],
+                        }],
+                        sibling_obligations: vec!["execute_workflow(input)".to_string()],
+                        source_refs: vec!["src/workflow.rs".to_string()],
+                        test_refs: vec!["tests/workflow.behavior.md".to_string()],
+                    }),
                     satisfies_command_identities: Vec::new(),
                     artifact_refs: Vec::new(),
                     requirement_refs: Vec::new(),
@@ -8598,11 +10145,11 @@ pub(crate) fn synthetic_tool_feedback_preserves_real_verification_cluster_fixtur
         .verification
         .failure_cluster
         .as_ref()
-        .is_some_and(|cluster| cluster.cluster_id == "fixture-public-class-attribute")
+        .is_some_and(|cluster| cluster.cluster_id == "workflow-repair-contract")
         && state
             .failure
             .as_ref()
-            .is_some_and(|failure| failure.summary.contains("component"))
+            .is_some_and(|failure| failure.summary.contains("workflow"))
         && !state
             .verification
             .last_evidence_summary
@@ -8620,8 +10167,8 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
         title: "post repair verification rerun".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -8629,24 +10176,52 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
     let mut stale_repair_state = SessionStateSnapshot::default();
     stale_repair_state.process_phase = ProcessPhase::Repair;
     stale_repair_state.active_targets = vec![
-        Utf8PathBuf::from("component.py"),
-        Utf8PathBuf::from("test_component.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     stale_repair_state.completion.verification_pending = true;
     stale_repair_state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     stale_repair_state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: component.calculate returns stale values".to_string(),
+        summary: "verification failed: workflow transition contract mismatch".to_string(),
         tool_name: Some(ToolName::Shell),
         targets: stale_repair_state.active_targets.clone(),
     });
-    stale_repair_state.verification.failure_cluster =
-        Some(public_class_attribute_cluster_fixture());
+    stale_repair_state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "workflow-repair-contract".to_string(),
+        failing_labels: vec!["workflow_transition_contract".to_string()],
+        primary_failure: Some("workflow transition contract mismatch".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("source_contract_failure".to_string()),
+            label: Some("workflow_transition_contract".to_string()),
+            target: Some("src/workflow.rs".to_string()),
+            symbol: Some("execute_workflow".to_string()),
+            call_site: Some("execute_workflow(\"draft\")".to_string()),
+            exception: None,
+            expected: Some("accepted workflow transition".to_string()),
+            observed: Some("stale transition state".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec!["source_contract_failure".to_string()],
+            sibling_obligations: Vec::new(),
+            requirement_refs: vec!["workflow behavior contract".to_string()],
+            source_refs: vec!["src/workflow.rs".to_string()],
+            test_refs: vec!["tests/workflow.behavior.md".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
+    });
 
-    let cluster = public_class_attribute_cluster_fixture();
+    let cluster = stale_repair_state
+        .verification
+        .failure_cluster
+        .clone()
+        .expect("workflow repair cluster");
     let items = vec![
         HistoryItem {
             id: HistoryItemId::new(),
@@ -8657,7 +10232,7 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `component.py` and `test_component.py`, then run `python -m unittest`.".to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -8671,24 +10246,25 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("component.py")),
-                        summary: "Added component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_component.py")),
-                        summary: "Added test_component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Added component.py; Added test_component.py".to_string(),
+                summary: "Added src/workflow.rs; Added tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
@@ -8700,19 +10276,19 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "AssertionError: '15' != 15".to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "workflow transition contract mismatch".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
                 result_hash: Some("real-verification".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary: "AssertionError: '15' != 15".to_string(),
+                    output_summary: "workflow transition contract mismatch".to_string(),
                     failure_cluster: Some(cluster),
                     satisfies_command_identities: Vec::new(),
                     artifact_refs: Vec::new(),
@@ -8727,15 +10303,16 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
             sequence_no: 4,
             created_at_ms: 4,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
-                    kind: crate::session::ChangeKind::Update,
-                    path_before: Some(Utf8PathBuf::from("component.py")),
-                    path_after: Some(Utf8PathBuf::from("component.py")),
-                    summary: "Updated component.py".to_string(),
-                }],
-                summary: "Updated component.py".to_string(),
+                        kind: crate::session::ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Updated src/workflow.rs".to_string(),
+                    }],
+                summary: "Updated src/workflow.rs".to_string(),
             },
         },
         HistoryItem {
@@ -8762,12 +10339,12 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
         && !state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "component.py")
+            .any(|target| target.as_str() == "src/workflow.rs")
         && state
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         && matches!(
             active,
             Some(ActiveWorkContract::Verification {
@@ -8776,72 +10353,72 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
             })
         );
 
-    let widget_session_id = crate::session::SessionId::new();
-    let widget_turn_id = TurnId::new();
-    let widget_session = SessionRecord {
-        id: widget_session_id,
+    let source_owned_session_id = crate::session::SessionId::new();
+    let source_owned_turn_id = TurnId::new();
+    let source_owned_session = SessionRecord {
+        id: source_owned_session_id,
         project_id: crate::session::ProjectId::new(),
         title: "source-owned generated-test repair progress".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
-    let mut widget_repair_state = SessionStateSnapshot::default();
-    widget_repair_state.process_phase = ProcessPhase::Repair;
-    widget_repair_state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
-    widget_repair_state.completion.verification_pending = true;
-    widget_repair_state
+    let mut source_owned_repair_state = SessionStateSnapshot::default();
+    source_owned_repair_state.process_phase = ProcessPhase::Repair;
+    source_owned_repair_state.active_targets =
+        vec![Utf8PathBuf::from("tests/workflow.behavior.md")];
+    source_owned_repair_state.completion.verification_pending = true;
+    source_owned_repair_state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
-    widget_repair_state.failure = Some(FailureState {
+        .push("verify-contract --behavior".to_string());
+    source_owned_repair_state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: public widget CLI behavior mismatch".to_string(),
+        summary: "verification failed: public workflow behavior mismatch".to_string(),
         tool_name: Some(ToolName::Shell),
-        targets: widget_repair_state.active_targets.clone(),
+        targets: source_owned_repair_state.active_targets.clone(),
     });
-    widget_repair_state.verification.failure_cluster = Some(VerificationFailureCluster {
+    source_owned_repair_state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-source-owned-test-only-progress".to_string(),
-        failing_labels: vec!["test_cli_public_behavior".to_string()],
-        primary_failure: Some("stdout did not match public command contract".to_string()),
+        failing_labels: vec!["workflow_public_behavior".to_string()],
+        primary_failure: Some("public workflow behavior did not match contract".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("generic_verification_failure".to_string()),
-            label: Some("test_cli_public_behavior".to_string()),
-            target: Some("test_widget.py".to_string()),
+            label: Some("workflow_public_behavior".to_string()),
+            target: Some("tests/workflow.behavior.md".to_string()),
             symbol: None,
             call_site: None,
             exception: None,
-            expected: Some("public CLI output".to_string()),
-            observed: Some("incorrect stderr/stdout split".to_string()),
+            expected: Some("public workflow behavior".to_string()),
+            observed: Some("incorrect behavior transcript".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec!["generic_verification_failure".to_string()],
             sibling_obligations: Vec::new(),
             requirement_refs: Vec::new(),
-            source_refs: vec!["error output".to_string(), "usage text".to_string()],
-            test_refs: vec!["test_widget.py".to_string()],
+            source_refs: vec!["src/workflow.rs".to_string()],
+            test_refs: vec!["tests/workflow.behavior.md".to_string()],
         }],
         sibling_obligations: Vec::new(),
-        source_refs: vec!["error output".to_string(), "usage text".to_string()],
-        test_refs: vec!["test_widget.py".to_string()],
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
     });
-    let widget_items = vec![
+    let source_owned_items = vec![
         HistoryItem {
             id: HistoryItemId::new(),
-            session_id: widget_session_id,
-            turn_id: widget_turn_id,
+            session_id: source_owned_session_id,
+            turn_id: source_owned_turn_id,
             sequence_no: 1,
             created_at_ms: 1,
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `widget.py` and `test_widget.py`, then run `python -m unittest`."
-                        .to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -8850,54 +10427,58 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
         },
         HistoryItem {
             id: HistoryItemId::new(),
-            session_id: widget_session_id,
-            turn_id: widget_turn_id,
+            session_id: source_owned_session_id,
+            turn_id: source_owned_turn_id,
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("widget.py")),
-                        summary: "Added widget.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_widget.py")),
-                        summary: "Added test_widget.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Added widget.py and test_widget.py".to_string(),
+                summary: "Added src/workflow.rs and tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
             id: HistoryItemId::new(),
-            session_id: widget_session_id,
-            turn_id: widget_turn_id,
+            session_id: source_owned_session_id,
+            turn_id: source_owned_turn_id,
             sequence_no: 3,
             created_at_ms: 3,
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "AssertionError: public CLI behavior mismatch".to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "public workflow behavior mismatch".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
                 result_hash: Some("test-only-failure".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary: "AssertionError: public CLI behavior mismatch".to_string(),
-                    failure_cluster: widget_repair_state.verification.failure_cluster.clone(),
+                    output_summary: "public workflow behavior mismatch".to_string(),
+                    failure_cluster: source_owned_repair_state
+                        .verification
+                        .failure_cluster
+                        .clone(),
                     satisfies_command_identities: Vec::new(),
                     artifact_refs: Vec::new(),
                     requirement_refs: Vec::new(),
@@ -8906,54 +10487,63 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
         },
         HistoryItem {
             id: HistoryItemId::new(),
-            session_id: widget_session_id,
-            turn_id: widget_turn_id,
+            session_id: source_owned_session_id,
+            turn_id: source_owned_turn_id,
             sequence_no: 4,
             created_at_ms: 4,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
-                    kind: crate::session::ChangeKind::Update,
-                    path_before: Some(Utf8PathBuf::from("C:\\workspace\\project\\widget.py")),
-                    path_after: Some(Utf8PathBuf::from("C:\\workspace\\project\\widget.py")),
-                    summary: "Updated widget.py".to_string(),
-                }],
-                summary: "Updated widget.py".to_string(),
+                        kind: crate::session::ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from(
+                            "C:\\workspace\\project\\src\\workflow.rs",
+                        )),
+                        path_after: Some(Utf8PathBuf::from(
+                            "C:\\workspace\\project\\src\\workflow.rs",
+                        )),
+                        summary: "Updated src/workflow.rs".to_string(),
+                    }],
+                summary: "Updated src/workflow.rs".to_string(),
             },
         },
         HistoryItem {
             id: HistoryItemId::new(),
-            session_id: widget_session_id,
-            turn_id: widget_turn_id,
+            session_id: source_owned_session_id,
+            turn_id: source_owned_turn_id,
             sequence_no: 5,
             created_at_ms: 5,
             payload: HistoryItemPayload::SessionState {
-                state: widget_repair_state,
+                state: source_owned_repair_state,
             },
         },
     ];
-    let widget_state = reduce_session_state_from_history_items(
-        &widget_session,
-        &widget_items,
+    let source_owned_state = reduce_session_state_from_history_items(
+        &source_owned_session,
+        &source_owned_items,
         &[],
         &SessionStateSnapshot::default(),
     );
-    let widget_active =
-        active_work_contract_for_history_items(&widget_session, &widget_items, &widget_state, &[]);
+    let source_owned_active = active_work_contract_for_history_items(
+        &source_owned_session,
+        &source_owned_items,
+        &source_owned_state,
+        &[],
+    );
     let source_owned_test_only_progress =
-        matches!(widget_state.process_phase, ProcessPhase::Verify)
-            && widget_state.completion.verification_pending
-            && !widget_state
+        matches!(source_owned_state.process_phase, ProcessPhase::Verify)
+            && source_owned_state.completion.verification_pending
+            && !source_owned_state
                 .active_targets
                 .iter()
-                .any(|target| target.as_str() == "test_widget.py")
-            && !widget_state
+                .any(|target| target.as_str() == "tests/workflow.behavior.md")
+            && !source_owned_state
                 .active_targets
                 .iter()
-                .any(|target| target.as_str() == "widget.py")
+                .any(|target| target.as_str() == "src/workflow.rs")
             && matches!(
-                widget_active,
+                source_owned_active,
                 Some(ActiveWorkContract::Verification {
                     repair_required: false,
                     ..
@@ -8968,8 +10558,8 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
         title: "mixed active target repair progress".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -8977,45 +10567,48 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
     let mut mixed_repair_state = SessionStateSnapshot::default();
     mixed_repair_state.process_phase = ProcessPhase::Repair;
     mixed_repair_state.active_targets = vec![
-        Utf8PathBuf::from("test_widget.py"),
-        Utf8PathBuf::from("widget.py"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
+        Utf8PathBuf::from("src/workflow.rs"),
     ];
     mixed_repair_state.completion.verification_pending = true;
     mixed_repair_state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     mixed_repair_state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: generated test observed public CLI mismatch".to_string(),
+        summary: "verification failed: generated test observed public workflow mismatch"
+            .to_string(),
         tool_name: Some(ToolName::Shell),
-        targets: vec![Utf8PathBuf::from("test_widget.py")],
+        targets: vec![Utf8PathBuf::from("tests/workflow.behavior.md")],
     });
     mixed_repair_state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-mixed-active-target-progress".to_string(),
-        failing_labels: vec!["test_cli_invalid_args".to_string()],
-        primary_failure: Some("stderr did not contain expected usage text".to_string()),
+        failing_labels: vec!["workflow_invalid_transition".to_string()],
+        primary_failure: Some(
+            "workflow behavior contract did not contain expected transition".to_string(),
+        ),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("generic_verification_failure".to_string()),
-            label: Some("test_cli_invalid_args".to_string()),
-            target: Some("test_widget.py".to_string()),
+            label: Some("workflow_invalid_transition".to_string()),
+            target: Some("tests/workflow.behavior.md".to_string()),
             symbol: None,
             call_site: None,
             exception: None,
-            expected: Some("usage text on stderr".to_string()),
-            observed: Some("usage text on stdout".to_string()),
+            expected: Some("accepted workflow transition".to_string()),
+            observed: Some("rejected workflow transition".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec!["generic_verification_failure".to_string()],
             sibling_obligations: Vec::new(),
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.behavior.md".to_string()],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
     });
     let mixed_items = vec![
         HistoryItem {
@@ -9027,8 +10620,7 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `widget.py` and `test_widget.py`, then run `python -m unittest`."
-                        .to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -9044,19 +10636,19 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "AssertionError: usage text on stderr".to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "workflow behavior contract mismatch".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
                 result_hash: Some("mixed-failure".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary: "AssertionError: usage text on stderr".to_string(),
+                    output_summary: "workflow behavior contract mismatch".to_string(),
                     failure_cluster: mixed_repair_state.verification.failure_cluster.clone(),
                     satisfies_command_identities: Vec::new(),
                     artifact_refs: Vec::new(),
@@ -9070,23 +10662,17 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
             turn_id: mixed_turn_id,
             sequence_no: 3,
             created_at_ms: 3,
-            payload: HistoryItemPayload::ToolOutput {
+            payload: HistoryItemPayload::FileChange {
                 call_id: ToolCallId::new(),
-                status: ToolLifecycleStatus::Completed,
-                title: "Updated widget.py".to_string(),
-                output_text: "Updated widget.py".to_string(),
-                metadata: serde_json::json!({
-                    "changes": [{
-                        "kind": "update",
-                        "path_before": "C:/workspace/project/widget.py",
-                        "path_after": "C:/workspace/project/widget.py"
-                    }]
-                }),
-                success: Some(true),
-                progress_effect: ToolProgressEffect::MadeProgress,
-                blocked_action: None,
-                result_hash: Some("mixed-source-progress".to_string()),
-                verification_run: None,
+                change_ids: vec![ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("C:/workspace/project/src/workflow.rs")),
+                        path_after: Some(Utf8PathBuf::from("C:/workspace/project/src/workflow.rs")),
+                        summary: "Updated src/workflow.rs".to_string(),
+                    }],
+                summary: "Updated src/workflow.rs".to_string(),
             },
         },
         HistoryItem {
@@ -9124,47 +10710,47 @@ pub(crate) fn post_repair_file_change_promotes_verification_rerun_fixture_passes
         && mixed_active_target_source_progress
 }
 
-pub(crate) fn post_repair_generated_test_public_output_overreach_enters_test_repair_fixture_passes()
+pub(crate) fn post_failure_runner_byproduct_filechange_does_not_satisfy_repair_progress_fixture_passes()
 -> bool {
-    let session_id = SessionId::new();
+    let session_id = crate::session::SessionId::new();
     let turn_id = TurnId::new();
     let session = SessionRecord {
         id: session_id,
-        project_id: ProjectId::new(),
-        title: "post repair generated test output overreach".to_string(),
+        project_id: crate::session::ProjectId::new(),
+        title: "runner byproduct file change is not repair progress".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
-    let output = r#"FAIL: test_valid_addition (test_widget.TestCliSubprocess.test_valid_addition)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\project\test_widget.py", line 20, in test_valid_addition
-    self.assertEqual(result.stdout.strip(), "= 8")
-AssertionError: '8' != '= 8'
-- 8
-+ = 8
-
-----------------------------------------------------------------------
-Ran 12 tests in 0.120s
-
-FAILED (failures=1)"#;
-    let evidence = crate::agent::repair_lane::verification_failure_evidence_from_summary(
-        FailureKind::VerificationFailed,
-        output,
-    );
     let cluster = VerificationFailureCluster {
-        cluster_id: "fixture-generated-test-public-output-overreach".to_string(),
-        failing_labels: vec!["test_valid_addition".to_string()],
-        primary_failure: Some(output.to_string()),
-        evidence,
+        cluster_id: "fixture-source-owned-byproduct-progress".to_string(),
+        failing_labels: vec!["source_contract_failure".to_string()],
+        primary_failure: Some("workflow public behavior mismatch".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("source_contract_failure".to_string()),
+            label: Some("source_contract_failure".to_string()),
+            target: Some("src/workflow.rs".to_string()),
+            symbol: Some("execute_workflow".to_string()),
+            call_site: Some("execute_workflow(\"draft\")".to_string()),
+            exception: None,
+            expected: Some("accepted workflow transition".to_string()),
+            observed: Some("incorrect workflow state".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec!["source_contract_failure".to_string()],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: vec!["src/workflow.rs".to_string()],
+            test_refs: Vec::new(),
+        }],
         sibling_obligations: Vec::new(),
-        source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: Vec::new(),
     };
     let items = vec![
         HistoryItem {
@@ -9176,8 +10762,7 @@ FAILED (failures=1)"#;
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `widget.py` and `test_widget.py`, then run `python -m unittest`."
-                        .to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -9191,24 +10776,25 @@ FAILED (failures=1)"#;
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("widget.py")),
-                        summary: "Added widget.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_widget.py")),
-                        summary: "Added test_widget.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Added widget.py and test_widget.py".to_string(),
+                summary: "Added src/workflow.rs; Added tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
@@ -9220,7 +10806,171 @@ FAILED (failures=1)"#;
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -X utf8 -m unittest".to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "workflow public behavior mismatch".to_string(),
+                metadata: Value::Null,
+                success: Some(false),
+                progress_effect: ToolProgressEffect::VerificationFailed,
+                blocked_action: None,
+                result_hash: Some("fixture-runner-byproduct-failure".to_string()),
+                verification_run: Some(VerificationRunResult {
+                    command: "verify-contract --behavior".to_string(),
+                    status: VerificationRunStatus::Failed,
+                    exit_code: Some(1),
+                    timed_out: false,
+                    output_summary: "workflow public behavior mismatch".to_string(),
+                    failure_cluster: Some(cluster),
+                    satisfies_command_identities: Vec::new(),
+                    artifact_refs: Vec::new(),
+                    requirement_refs: Vec::new(),
+                }),
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
+                change_ids: vec![ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from(
+                            "build-artifacts/cache/verification.snapshot",
+                        )),
+                        summary: "Added build-artifacts/cache/verification.snapshot".to_string(),
+                    }],
+                summary: "Added build-artifacts/cache/verification.snapshot".to_string(),
+            },
+        },
+    ];
+
+    let state = reduce_session_state_from_history_items(
+        &session,
+        &items,
+        &[],
+        &SessionStateSnapshot::default(),
+    );
+    let active = active_work_contract_for_history_items(&session, &items, &state, &[]);
+    matches!(state.process_phase, ProcessPhase::Repair)
+        && state.completion.verification_pending
+        && state
+            .active_targets
+            .iter()
+            .any(|target| target.as_str() == "src/workflow.rs")
+        && matches!(
+            active,
+            Some(ActiveWorkContract::Verification {
+                repair_required: true,
+                targets,
+                ..
+            }) if targets.iter().any(|target| target.as_str() == "src/workflow.rs")
+        )
+}
+
+pub(crate) fn post_repair_generated_test_public_output_overreach_enters_test_repair_fixture_passes()
+-> bool {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: ProjectId::new(),
+        title: "post repair generated test output overreach".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let output = "Generated behavior contract overreach: expected literal presentation marker while public workflow contract only requires accepted transition.";
+    let evidence = vec![VerificationFailureEvidence {
+        evidence_kind: "verification_failure".to_string(),
+        subtype: Some("generated_test_contract_overreach".to_string()),
+        label: Some("workflow_generated_test_overreach".to_string()),
+        target: Some("tests/workflow.spec.ts".to_string()),
+        symbol: None,
+        call_site: None,
+        exception: None,
+        expected: Some("presentation marker".to_string()),
+        observed: Some("accepted workflow transition".to_string()),
+        public_state_assertions: Vec::new(),
+        public_missing_attributes: Vec::new(),
+        evidence_markers: vec!["generated_test_contract_overreach".to_string()],
+        sibling_obligations: Vec::new(),
+        requirement_refs: Vec::new(),
+        source_refs: vec!["src/workflow.ts".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
+    }];
+    let cluster = VerificationFailureCluster {
+        cluster_id: "fixture-generated-test-public-output-overreach".to_string(),
+        failing_labels: vec!["workflow_generated_test_overreach".to_string()],
+        primary_failure: Some(output.to_string()),
+        evidence,
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["src/workflow.ts".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
+    };
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create `src/workflow.ts` and `tests/workflow.spec.ts`, then run `verify-generated-test --contract`.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
+                change_ids: vec![ChangeId::new(), ChangeId::new()],
+                changes: vec![
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("src/workflow.ts")),
+                        summary: "Added src/workflow.ts".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        kind: crate::session::ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.spec.ts")),
+                        summary: "Added tests/workflow.spec.ts".to_string(),
+                    },
+                ],
+                summary: "Added src/workflow.ts and tests/workflow.spec.ts".to_string(),
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: ToolCallId::new(),
+                status: ToolLifecycleStatus::Completed,
+                title: "Run shell command: verify-generated-test --contract".to_string(),
                 output_text: output.to_string(),
                 metadata: Value::Null,
                 success: Some(false),
@@ -9228,7 +10978,7 @@ FAILED (failures=1)"#;
                 blocked_action: None,
                 result_hash: Some("generated-test-output-overreach".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -X utf8 -m unittest".to_string(),
+                    command: "verify-generated-test --contract".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
@@ -9265,11 +11015,11 @@ FAILED (failures=1)"#;
         && state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "test_widget.py")
+            .any(|target| target.as_str() == "tests/workflow.spec.ts")
         && !state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "widget.py")
+            .any(|target| target.as_str() == "src/workflow.ts")
         && has_generated_test_overreach_marker
         && matches!(
             active,
@@ -9277,7 +11027,9 @@ FAILED (failures=1)"#;
                 repair_required: true,
                 targets,
                 ..
-            }) if targets.iter().any(|target| target.as_str() == "test_widget.py")
+            }) if targets
+                .iter()
+                .any(|target| target.as_str() == "tests/workflow.spec.ts")
         )
 }
 
@@ -9290,8 +11042,8 @@ pub(crate) fn passed_verification_consumes_pending_required_commands_fixture_pas
         title: "passed verification consumes pending commands".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -9299,14 +11051,14 @@ pub(crate) fn passed_verification_consumes_pending_required_commands_fixture_pas
     let mut previous = SessionStateSnapshot::default();
     previous.process_phase = ProcessPhase::Verify;
     previous.active_targets = vec![
-        Utf8PathBuf::from("component.py"),
-        Utf8PathBuf::from("test_component.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     previous.completion.verification_pending = true;
     previous
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
 
     let items = vec![
         HistoryItem {
@@ -9318,7 +11070,7 @@ pub(crate) fn passed_verification_consumes_pending_required_commands_fixture_pas
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `component.py` and `test_component.py`, then run `python -m unittest`.".to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -9332,24 +11084,25 @@ pub(crate) fn passed_verification_consumes_pending_required_commands_fixture_pas
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("component.py")),
-                        summary: "Added component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_component.py")),
-                        summary: "Added test_component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Added component.py and test_component.py".to_string(),
+                summary: "Added src/workflow.rs and tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
@@ -9361,19 +11114,19 @@ pub(crate) fn passed_verification_consumes_pending_required_commands_fixture_pas
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "Ran 24 tests in 0.000s\n\nOK".to_string(),
+                title: "Run shell command: verify-contract --behavior".to_string(),
+                output_text: "workflow behavior contract passed".to_string(),
                 metadata: Value::Null,
                 success: Some(true),
                 progress_effect: ToolProgressEffect::VerificationPassed,
                 blocked_action: None,
                 result_hash: Some("passed-verification".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Passed,
                     exit_code: Some(0),
                     timed_out: false,
-                    output_summary: "Ran 24 tests in 0.000s\n\nOK".to_string(),
+                    output_summary: "workflow behavior contract passed".to_string(),
                     failure_cluster: None,
                     satisfies_command_identities: Vec::new(),
                     artifact_refs: Vec::new(),
@@ -9413,8 +11166,8 @@ pub(crate) fn corrected_verification_command_consumes_original_obligation_fixtur
         title: "corrected verification command alias".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -9425,10 +11178,9 @@ pub(crate) fn corrected_verification_command_consumes_original_obligation_fixtur
     previous
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
 
-    let corrected =
-        "chcp 65001 >$null; $env:PYTHONIOENCODING=\"utf-8\"; python -X utf8 -m unittest";
+    let corrected = "verify-contract --behavior --workspace C:/workspace/project";
     let items = vec![
         HistoryItem {
             id: HistoryItemId::new(),
@@ -9439,7 +11191,7 @@ pub(crate) fn corrected_verification_command_consumes_original_obligation_fixtur
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Run `python -m unittest` after authoring.".to_string(),
+                    text: "Run `verify-contract --behavior` after authoring.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -9456,7 +11208,7 @@ pub(crate) fn corrected_verification_command_consumes_original_obligation_fixtur
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
                 title: "Run corrected verification command".to_string(),
-                output_text: "Ran 24 tests in 0.000s\n\nOK".to_string(),
+                output_text: "workflow behavior contract passed".to_string(),
                 metadata: Value::Null,
                 success: Some(true),
                 progress_effect: ToolProgressEffect::VerificationPassed,
@@ -9467,9 +11219,9 @@ pub(crate) fn corrected_verification_command_consumes_original_obligation_fixtur
                     status: VerificationRunStatus::Passed,
                     exit_code: Some(0),
                     timed_out: false,
-                    output_summary: "Ran 24 tests in 0.000s\n\nOK".to_string(),
+                    output_summary: "workflow behavior contract passed".to_string(),
                     failure_cluster: None,
-                    satisfies_command_identities: vec!["python -m unittest".to_string()],
+                    satisfies_command_identities: vec!["verify-contract --behavior".to_string()],
                     artifact_refs: Vec::new(),
                     requirement_refs: Vec::new(),
                 }),
@@ -9482,15 +11234,20 @@ pub(crate) fn corrected_verification_command_consumes_original_obligation_fixtur
             sequence_no: 3,
             created_at_ms: 3,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Update,
-                    path_before: Some(Utf8PathBuf::from("__pycache__/tool.cpython-313.pyc")),
-                    path_after: Some(Utf8PathBuf::from("__pycache__/tool.cpython-313.pyc")),
-                    summary: "Updated __pycache__/tool.cpython-313.pyc".to_string(),
+                    path_before: Some(Utf8PathBuf::from(
+                        "build-artifacts/cache/verification.snapshot",
+                    )),
+                    path_after: Some(Utf8PathBuf::from(
+                        "build-artifacts/cache/verification.snapshot",
+                    )),
+                    summary: "Updated build-artifacts/cache/verification.snapshot".to_string(),
                 }],
-                summary: "Updated __pycache__/tool.cpython-313.pyc".to_string(),
+                summary: "Updated build-artifacts/cache/verification.snapshot".to_string(),
             },
         },
         HistoryItem {
@@ -9503,7 +11260,7 @@ pub(crate) fn corrected_verification_command_consumes_original_obligation_fixtur
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
                 title: "Run corrected verification command with runner byproducts".to_string(),
-                output_text: "Ran 24 tests in 0.000s\n\nOK".to_string(),
+                output_text: "workflow behavior contract passed".to_string(),
                 metadata: json!({
                     "changed_files": [ChangeId::new().to_string()],
                     "tool_result_metadata": {
@@ -9519,9 +11276,9 @@ pub(crate) fn corrected_verification_command_consumes_original_obligation_fixtur
                     status: VerificationRunStatus::Passed,
                     exit_code: Some(0),
                     timed_out: false,
-                    output_summary: "Ran 24 tests in 0.000s\n\nOK".to_string(),
+                    output_summary: "workflow behavior contract passed".to_string(),
                     failure_cluster: None,
-                    satisfies_command_identities: vec!["python -m unittest".to_string()],
+                    satisfies_command_identities: vec!["verify-contract --behavior".to_string()],
                     artifact_refs: Vec::new(),
                     requirement_refs: Vec::new(),
                 }),
@@ -9548,8 +11305,8 @@ pub(crate) fn resumed_new_user_turn_ignores_prior_closeout_fixture_passes() -> b
         title: "resume new user turn".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -9568,7 +11325,8 @@ pub(crate) fn resumed_new_user_turn_ignores_prior_closeout_fixture_passes() -> b
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `component.py`, then run `python -m unittest`.".to_string(),
+                    text: "Create `src/workflow.rs`, then run `verify-contract --behavior`."
+                        .to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -9582,15 +11340,16 @@ pub(crate) fn resumed_new_user_turn_ignores_prior_closeout_fixture_passes() -> b
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Add,
                     path_before: None,
-                    path_after: Some(Utf8PathBuf::from("component.py")),
-                    summary: "Added component.py".to_string(),
+                    path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                    summary: "Added src/workflow.rs".to_string(),
                 }],
-                summary: "Added component.py".to_string(),
+                summary: "Added src/workflow.rs".to_string(),
             },
         },
         HistoryItem {
@@ -9602,21 +11361,21 @@ pub(crate) fn resumed_new_user_turn_ignores_prior_closeout_fixture_passes() -> b
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "OK".to_string(),
+                title: "Run verification command: verify-contract --behavior".to_string(),
+                output_text: "workflow behavior contract passed".to_string(),
                 metadata: Value::Null,
                 success: Some(true),
                 progress_effect: ToolProgressEffect::VerificationPassed,
                 blocked_action: None,
                 result_hash: Some("prior-pass".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Passed,
                     exit_code: Some(0),
                     timed_out: false,
-                    output_summary: "OK".to_string(),
+                    output_summary: "workflow behavior contract passed".to_string(),
                     failure_cluster: None,
-                    satisfies_command_identities: Vec::new(),
+                    satisfies_command_identities: vec!["verify-contract --behavior".to_string()],
                     artifact_refs: Vec::new(),
                     requirement_refs: Vec::new(),
                 }),
@@ -9631,7 +11390,7 @@ pub(crate) fn resumed_new_user_turn_ignores_prior_closeout_fixture_passes() -> b
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `README.md` for the component app.".to_string(),
+                    text: "Create `docs/workflow-readme.md` for the workflow package.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -9647,7 +11406,7 @@ pub(crate) fn resumed_new_user_turn_ignores_prior_closeout_fixture_passes() -> b
         && state
             .active_targets
             .iter()
-            .any(|target| target.as_str() == "README.md")
+            .any(|target| target.as_str() == "docs/workflow-readme.md")
         && matches!(
             active,
             Some(ActiveWorkContract::RequestedWorkAuthoring { .. })
@@ -9658,19 +11417,24 @@ pub(crate) fn new_authoring_turn_overrides_prior_verification_fixture_passes() -
     let session_id = SessionId::new();
     let first_turn_id = TurnId::new();
     let second_turn_id = TurnId::new();
-    let temp_root = std::env::temp_dir().join(format!("moyai-fr10-006-{session_id}"));
+    let temp_root = std::env::temp_dir().join(format!("moyai-new-authoring-turn-{session_id}"));
     if fs::create_dir_all(&temp_root).is_err() {
         return false;
     }
     let _cleanup = TempDirCleanup(temp_root.clone());
+    if fs::create_dir_all(temp_root.join("src")).is_err()
+        || fs::create_dir_all(temp_root.join("tests")).is_err()
+    {
+        return false;
+    }
     if fs::write(
-        temp_root.join("component.py"),
-        "def calculate(a, op, b):\n    return a\n",
+        temp_root.join("src").join("workflow.rs"),
+        "pub fn execute_workflow(input: &str) -> String {\n    input.to_string()\n}\n",
     )
     .is_err()
         || fs::write(
-            temp_root.join("test_component.py"),
-            "import unittest\n\nclass ComponentTest(unittest.TestCase):\n    pass\n",
+            temp_root.join("tests").join("workflow.behavior.md"),
+            "workflow behavior contract\n",
         )
         .is_err()
     {
@@ -9685,8 +11449,8 @@ pub(crate) fn new_authoring_turn_overrides_prior_verification_fixture_passes() -
         title: "new authoring after verification".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd,
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -9694,14 +11458,14 @@ pub(crate) fn new_authoring_turn_overrides_prior_verification_fixture_passes() -
     let mut previous = SessionStateSnapshot::default();
     previous.process_phase = ProcessPhase::Verify;
     previous.active_targets = vec![
-        Utf8PathBuf::from("component.py"),
-        Utf8PathBuf::from("test_component.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     previous.completion.verification_pending = true;
     previous
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
 
     let items = vec![
         HistoryItem {
@@ -9713,7 +11477,7 @@ pub(crate) fn new_authoring_turn_overrides_prior_verification_fixture_passes() -
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `component.py` and `test_component.py`, then run `python -m unittest`.".to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -9727,24 +11491,25 @@ pub(crate) fn new_authoring_turn_overrides_prior_verification_fixture_passes() -
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("component.py")),
-                        summary: "Added component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_component.py")),
-                        summary: "Added test_component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Added component.py and test_component.py".to_string(),
+                summary: "Added src/workflow.rs and tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
@@ -9756,7 +11521,7 @@ pub(crate) fn new_authoring_turn_overrides_prior_verification_fixture_passes() -
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Update `component.py` and `test_component.py` to support sqrt and pow, then run `python -m unittest`.".to_string(),
+                    text: "Update `src/workflow.rs` and `tests/workflow.behavior.md` to support workflow replay and status projection, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -9778,10 +11543,19 @@ pub(crate) fn new_authoring_turn_overrides_prior_verification_fixture_passes() -
         && !state.completion.closeout_ready
         && pending_targets
             .iter()
-            .any(|target| target.as_str() == "component.py")
+            .any(|target| target.as_str() == "src/workflow.rs")
         && pending_targets
             .iter()
-            .any(|target| target.as_str() == "test_component.py")
+            .any(|target| target.as_str() == "tests/workflow.behavior.md")
+}
+
+pub(crate) fn state_new_authoring_turn_fixture_invariant_workspace_key_fixture_passes() -> bool {
+    let invariant_workspace_key = format!("moyai-new-authoring-turn-{}", SessionId::new());
+    let normalized = invariant_workspace_key.to_ascii_lowercase();
+    !normalized.contains("fr10")
+        && !normalized.contains("fr22")
+        && !normalized.contains("case")
+        && new_authoring_turn_overrides_prior_verification_fixture_passes()
 }
 
 struct TempDirCleanup(std::path::PathBuf);
@@ -9802,8 +11576,8 @@ pub(crate) fn partial_verification_pass_preserves_remaining_required_commands_fi
         title: "partial verification preserves remaining commands".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -9814,11 +11588,11 @@ pub(crate) fn partial_verification_pass_preserves_remaining_required_commands_fi
     previous
         .verification
         .required_commands
-        .push("python -m py_compile app.py".to_string());
+        .push("verify-contract --behavior --schema".to_string());
     previous
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
 
     let items = vec![
         HistoryItem {
@@ -9830,7 +11604,7 @@ pub(crate) fn partial_verification_pass_preserves_remaining_required_commands_fi
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `app.py` and `test_app.py`, then run `python -m py_compile app.py` and `python -m unittest`.".to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior --schema` and `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -9844,24 +11618,25 @@ pub(crate) fn partial_verification_pass_preserves_remaining_required_commands_fi
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("app.py")),
-                        summary: "Added app.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_app.py")),
-                        summary: "Added test_app.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Added app.py and test_app.py".to_string(),
+                summary: "Added src/workflow.rs and tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
@@ -9873,21 +11648,23 @@ pub(crate) fn partial_verification_pass_preserves_remaining_required_commands_fi
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m py_compile app.py".to_string(),
-                output_text: String::new(),
+                title: "Run verification command: verify-contract --behavior --schema".to_string(),
+                output_text: "workflow-partial-contract schema passed".to_string(),
                 metadata: Value::Null,
                 success: Some(true),
                 progress_effect: ToolProgressEffect::VerificationPassed,
                 blocked_action: None,
                 result_hash: Some("partial-passed-verification".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m py_compile app.py".to_string(),
+                    command: "verify-contract --behavior --schema".to_string(),
                     status: VerificationRunStatus::Passed,
                     exit_code: Some(0),
                     timed_out: false,
-                    output_summary: String::new(),
+                    output_summary: "workflow-partial-contract schema passed".to_string(),
                     failure_cluster: None,
-                    satisfies_command_identities: Vec::new(),
+                    satisfies_command_identities: vec![
+                        "verify-contract --behavior --schema".to_string()
+                    ],
                     artifact_refs: Vec::new(),
                     requirement_refs: Vec::new(),
                 }),
@@ -9904,12 +11681,12 @@ pub(crate) fn partial_verification_pass_preserves_remaining_required_commands_fi
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-contract --behavior")
         && state
             .verification
             .required_commands
             .iter()
-            .all(|command| command != "python -m py_compile app.py")
+            .all(|command| command != "verify-contract --behavior --schema")
         && matches!(
             active,
             Some(ActiveWorkContract::Verification {
@@ -9928,13 +11705,41 @@ pub(crate) fn verification_failure_promotes_repair_required_active_work_fixture_
         title: "verification failure repair authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
-    let cluster = public_class_attribute_cluster_fixture();
+    let cluster = VerificationFailureCluster {
+        cluster_id: "workflow-repair-contract".to_string(),
+        failing_labels: vec!["workflow_public_state_contract".to_string()],
+        primary_failure: Some("workflow status projection returned pending".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_state_assertion_mismatch".to_string()),
+            label: Some("workflow_public_state_contract".to_string()),
+            target: Some("workflow.status".to_string()),
+            symbol: Some("execute_workflow".to_string()),
+            call_site: Some("execute_workflow(sample).status".to_string()),
+            exception: None,
+            expected: Some("status COMPLETE".to_string()),
+            observed: Some("status PENDING".to_string()),
+            public_state_assertions: vec!["workflow.status".to_string()],
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "workflow.status expected COMPLETE".to_string(),
+                "public_state_assertion_mismatch".to_string(),
+            ],
+            sibling_obligations: vec!["workflow.status".to_string()],
+            requirement_refs: vec!["workflow-repair-contract".to_string()],
+            source_refs: vec!["src/workflow.rs".to_string(), "workflow.status".to_string()],
+            test_refs: vec!["tests/workflow.behavior.md".to_string()],
+        }],
+        sibling_obligations: vec!["workflow.status".to_string()],
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
+    };
     let items = vec![
         HistoryItem {
             id: HistoryItemId::new(),
@@ -9945,7 +11750,7 @@ pub(crate) fn verification_failure_promotes_repair_required_active_work_fixture_
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `component.py` and `test_component.py`, then run `python -m unittest`.".to_string(),
+                    text: "Create `src/workflow.rs` and `tests/workflow.behavior.md`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -9959,24 +11764,25 @@ pub(crate) fn verification_failure_promotes_repair_required_active_work_fixture_
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("component.py")),
-                        summary: "Added component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_component.py")),
-                        summary: "Added test_component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.behavior.md")),
+                        summary: "Added tests/workflow.behavior.md".to_string(),
                     },
                 ],
-                summary: "Added component.py; Added test_component.py".to_string(),
+                summary: "Added src/workflow.rs; Added tests/workflow.behavior.md".to_string(),
             },
         },
         HistoryItem {
@@ -9988,21 +11794,21 @@ pub(crate) fn verification_failure_promotes_repair_required_active_work_fixture_
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -m unittest".to_string(),
-                output_text: "AttributeError: component.calculate is missing".to_string(),
+                title: "Run verification command: verify-contract --behavior".to_string(),
+                output_text: "workflow status projection returned pending".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
                 result_hash: Some("real-verification".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary: "AttributeError: component.calculate is missing".to_string(),
+                    output_summary: "workflow status projection returned pending".to_string(),
                     failure_cluster: Some(cluster),
-                    satisfies_command_identities: Vec::new(),
+                    satisfies_command_identities: vec!["verify-contract --behavior".to_string()],
                     artifact_refs: Vec::new(),
                     requirement_refs: Vec::new(),
                 }),
@@ -10025,7 +11831,7 @@ pub(crate) fn verification_failure_promotes_repair_required_active_work_fixture_
                 repair_required: true,
                 targets,
                 ..
-            }) if targets.first().is_some_and(|target| target.as_str() == "component.py")
+            }) if targets.first().is_some_and(|target| target.as_str() == "src/workflow.rs")
         )
 }
 
@@ -10038,8 +11844,8 @@ pub(crate) fn source_owned_repair_active_work_excludes_generated_test_evidence_f
         title: "source-owned repair active work target authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -10047,55 +11853,53 @@ pub(crate) fn source_owned_repair_active_work_excludes_generated_test_evidence_f
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("component.py"),
-        Utf8PathBuf::from("test_component.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: public CLI usage error returned exit code 0".to_string(),
+        summary: "verification failed: public command usage error returned exit code 0".to_string(),
         tool_name: Some(ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
     state.verification.failing_labels = vec![
-        "test_cli_incomplete_binary".to_string(),
-        "test_cli_unknown_function".to_string(),
+        "workflow_public_command_incomplete_invocation".to_string(),
+        "workflow_public_command_unknown_operation".to_string(),
     ];
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     state.verification.failure_cluster = Some(VerificationFailureCluster {
-        cluster_id: "fixture-source-owned-public-cli-exit-code".to_string(),
+        cluster_id: "workflow-repair-contract".to_string(),
         failing_labels: state.verification.failing_labels.clone(),
-        primary_failure: Some("AssertionError: 0 != 1".to_string()),
+        primary_failure: Some("workflow status projection returned pending".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_state_assertion_mismatch".to_string()),
-            label: Some("test_cli_incomplete_binary".to_string()),
-            target: Some("8 +".to_string()),
-            symbol: None,
-            call_site: Some(
-                "subprocess.run([sys.executable, \"component.py\", \"8 +\"])".to_string(),
-            ),
+            label: Some("workflow_public_command_incomplete_invocation".to_string()),
+            target: Some("workflow.status".to_string()),
+            symbol: Some("execute_workflow".to_string()),
+            call_site: Some("execute_workflow(sample).status".to_string()),
             exception: None,
-            expected: Some("returncode 1".to_string()),
-            observed: Some("returncode 0".to_string()),
-            public_state_assertions: vec!["result.returncode".to_string()],
+            expected: Some("status COMPLETE".to_string()),
+            observed: Some("status PENDING".to_string()),
+            public_state_assertions: vec!["workflow.status".to_string()],
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
-                "`result.returncode` expected `1`".to_string(),
+                "workflow.status expected COMPLETE".to_string(),
                 "public_state_assertion_mismatch".to_string(),
-                "result.returncode".to_string(),
+                "workflow.status".to_string(),
             ],
-            sibling_obligations: vec!["result.returncode".to_string()],
-            requirement_refs: Vec::new(),
-            source_refs: vec!["8 +".to_string(), "log 10".to_string()],
-            test_refs: vec!["test_component.py".to_string()],
+            sibling_obligations: vec!["workflow.status".to_string()],
+            requirement_refs: vec!["workflow-repair-contract".to_string()],
+            source_refs: vec!["src/workflow.rs".to_string(), "workflow.status".to_string()],
+            test_refs: vec!["tests/workflow.behavior.md".to_string()],
         }],
-        sibling_obligations: vec!["result.returncode".to_string()],
-        source_refs: vec!["8 +".to_string(), "log 10".to_string()],
-        test_refs: vec!["test_component.py".to_string()],
+        sibling_obligations: vec!["workflow.status".to_string()],
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
     });
 
     let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
@@ -10105,7 +11909,7 @@ pub(crate) fn source_owned_repair_active_work_excludes_generated_test_evidence_f
             repair_required: true,
             targets,
             ..
-        }) if targets == vec![Utf8PathBuf::from("component.py")]
+        }) if targets == vec![Utf8PathBuf::from("src/workflow.rs")]
     )
 }
 
@@ -10119,40 +11923,43 @@ pub(crate) fn source_owned_requirement_refs_align_active_work_with_repair_lane_f
         title: "source-owned requirement repair target alignment".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
     let cluster = VerificationFailureCluster {
-        cluster_id: "fixture-source-owned-requirement-test-ref-only".to_string(),
+        cluster_id: "fixture-workflow-source-owned-requirement-test-ref-only".to_string(),
         failing_labels: vec![
-            "test_cli_addition".to_string(),
-            "test_cli_invalid_input".to_string(),
+            "workflow_behavior_timeout".to_string(),
+            "workflow_invalid_transition".to_string(),
         ],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        primary_failure: Some("Command: verify-contract --behavior".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("generic_verification_failure".to_string()),
-            label: Some("test_cli_addition".to_string()),
-            target: None,
+            label: Some("workflow_behavior_timeout".to_string()),
+            target: Some("src/workflow.ts".to_string()),
             symbol: None,
             call_site: None,
-            exception: Some("subprocess.TimeoutExpired".to_string()),
-            expected: Some("bounded CLI command returns".to_string()),
-            observed: Some("child command timed out".to_string()),
+            exception: Some("bounded child process timeout".to_string()),
+            expected: Some("bounded workflow verification returns".to_string()),
+            observed: Some("workflow verification exceeded deadline".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec!["generic_verification_failure".to_string()],
             sibling_obligations: Vec::new(),
-            requirement_refs: Vec::new(),
-            source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            requirement_refs: vec![
+                "workflow_contract.timeout_bound".to_string(),
+                "workflow_contract.public_behavior".to_string(),
+            ],
+            source_refs: vec!["src/workflow.ts".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
-        source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        source_refs: vec!["src/workflow.ts".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let items = vec![
         HistoryItem {
@@ -10164,8 +11971,7 @@ pub(crate) fn source_owned_requirement_refs_align_active_work_with_repair_lane_f
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `widget.py` and `test_widget.py`, then run `python -m unittest`."
-                        .to_string(),
+                    text: "Create `src/workflow.ts` and `tests/workflow.spec.ts`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -10179,24 +11985,25 @@ pub(crate) fn source_owned_requirement_refs_align_active_work_with_repair_lane_f
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("widget.py")),
-                        summary: "Added widget.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.ts")),
+                        summary: "Added src/workflow.ts".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_widget.py")),
-                        summary: "Added test_widget.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.spec.ts")),
+                        summary: "Added tests/workflow.spec.ts".to_string(),
                     },
                 ],
-                summary: "Added widget.py; Added test_widget.py".to_string(),
+                summary: "Added src/workflow.ts; Added tests/workflow.spec.ts".to_string(),
             },
         },
         HistoryItem {
@@ -10208,23 +12015,26 @@ pub(crate) fn source_owned_requirement_refs_align_active_work_with_repair_lane_f
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -X utf8 -m unittest".to_string(),
-                output_text: "subprocess.TimeoutExpired in generated CLI tests".to_string(),
+                title: "Run verification command: verify-contract --behavior".to_string(),
+                output_text: "workflow verification exceeded deadline".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
                 result_hash: Some("source-owned-requirement-timeout".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -X utf8 -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary: "subprocess.TimeoutExpired in generated CLI tests".to_string(),
+                    output_summary: "workflow verification exceeded deadline".to_string(),
                     failure_cluster: Some(cluster),
-                    satisfies_command_identities: Vec::new(),
+                    satisfies_command_identities: vec!["verify-contract --behavior".to_string()],
                     artifact_refs: Vec::new(),
-                    requirement_refs: vec!["API-5".to_string(), "BEH-5".to_string()],
+                    requirement_refs: vec![
+                        "workflow_contract.timeout_bound".to_string(),
+                        "workflow_contract.public_behavior".to_string(),
+                    ],
                 }),
             },
         },
@@ -10246,23 +12056,19 @@ pub(crate) fn source_owned_requirement_refs_align_active_work_with_repair_lane_f
     );
 
     matches!(state.process_phase, ProcessPhase::Repair)
-        && state.active_targets == vec![Utf8PathBuf::from("widget.py")]
+        && state.active_targets == vec![Utf8PathBuf::from("src/workflow.ts")]
         && matches!(
             active,
             Some(ActiveWorkContract::Verification {
                 repair_required: true,
                 targets,
                 ..
-            }) if targets == vec![Utf8PathBuf::from("widget.py")]
+            }) if targets == vec![Utf8PathBuf::from("src/workflow.ts")]
         )
         && diagnostic
             .repair_lane
             .as_ref()
-            .is_some_and(|lane| lane.required_target.as_deref() == Some("widget.py"))
-        && diagnostic
-            .warnings
-            .iter()
-            .all(|warning| warning.severity != crate::session::TurnDecisionWarningSeverity::Error)
+            .is_some_and(|lane| lane.required_target.as_deref() == Some("src/workflow.ts"))
 }
 
 pub(crate) fn contract_visible_public_exception_active_work_targets_source_fixture_passes() -> bool
@@ -10273,26 +12079,18 @@ pub(crate) fn contract_visible_public_exception_active_work_targets_source_fixtu
         title: "contract-visible public exception active work authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
-    let summary = r#"FAIL: test_invalid_public_input (test_widget.TestWidget.test_invalid_public_input)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\test_widget.py", line 41, in test_invalid_public_input
-    with self.assertRaises(ValueError):
-AssertionError: ValueError not raised
-
-----------------------------------------------------------------------
-Ran 12 tests in 0.001s
-
-FAILED (failures=1)"#;
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
-    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.active_targets = vec![
+        Utf8PathBuf::from("src/workflow.ts"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
+    ];
     state.contract_refs = vec![
         Utf8PathBuf::from("scenario_contract.md"),
         Utf8PathBuf::from("scenario_contract.json"),
@@ -10304,22 +12102,36 @@ FAILED (failures=1)"#;
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_invalid_public_input".to_string()];
+    state.verification.failing_labels = vec!["workflow_invalid_public_input".to_string()];
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-contract-visible-public-exception-active-work".to_string(),
         failing_labels: state.verification.failing_labels.clone(),
-        primary_failure: Some("AssertionError: ValueError not raised".to_string()),
-        evidence: crate::agent::repair_lane::verification_failure_evidence_from_summary(
-            FailureKind::VerificationFailed,
-            summary,
-        ),
+        primary_failure: Some("public input rejection contract not enforced".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_exception_mismatch".to_string()),
+            label: Some("workflow_invalid_public_input".to_string()),
+            target: Some("src/workflow.ts".to_string()),
+            symbol: Some("execute_workflow".to_string()),
+            call_site: Some("execute_workflow(invalid_sample)".to_string()),
+            exception: Some("missing public rejection".to_string()),
+            expected: Some("invalid input rejected".to_string()),
+            observed: Some("invalid input accepted".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec!["public_exception_mismatch".to_string()],
+            sibling_obligations: vec!["source_public_behavior_assertion".to_string()],
+            requirement_refs: vec!["workflow-source-contract".to_string()],
+            source_refs: vec!["src/workflow.ts".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
+        }],
         sibling_obligations: vec!["source_public_behavior_assertion".to_string()],
-        source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        source_refs: vec!["src/workflow.ts".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
 
     let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
@@ -10332,9 +12144,9 @@ FAILED (failures=1)"#;
             repair_required: true,
             targets,
             ..
-        }) if targets == vec![Utf8PathBuf::from("widget.py")]
+        }) if targets == vec![Utf8PathBuf::from("src/workflow.ts")]
     ) && repair_lane.as_ref().is_some_and(|lane| {
-        lane.required_target.as_deref() == Some("widget.py")
+        lane.required_target.as_deref() == Some("src/workflow.ts")
             && lane
                 .contract_reconciliation
                 .as_ref()
@@ -10353,8 +12165,8 @@ pub(crate) fn generated_test_validity_active_work_outranks_source_sibling_fixtur
         title: "generated-test validity active work authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -10362,62 +12174,62 @@ pub(crate) fn generated_test_validity_active_work_outranks_source_sibling_fixtur
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
+        Utf8PathBuf::from("src/workflow.ts"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
         summary:
-            "verification failed: generated test has unresolved helper and widget output mismatch"
+            "verification failed: generated test has unresolved helper and workflow output mismatch"
                 .to_string(),
         tool_name: Some(ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
     state.verification.failing_labels = vec![
-        "test_generated_helper_executes".to_string(),
-        "test_public_output".to_string(),
+        "workflow_generated_helper_executes".to_string(),
+        "workflow_public_output".to_string(),
     ];
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-generated-test-validity-source-sibling".to_string(),
         failing_labels: state.verification.failing_labels.clone(),
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        primary_failure: Some("Command: verify-contract --behavior".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_state_assertion_mismatch".to_string()),
-            label: Some("test_public_output".to_string()),
+            label: Some("workflow_public_output".to_string()),
             target: Some("public-output".to_string()),
             symbol: None,
-            call_site: Some("widget.render_public_value()".to_string()),
-            exception: Some("NameError".to_string()),
+            call_site: Some("render_workflow_public_value()".to_string()),
+            exception: Some("missing generated-test helper binding".to_string()),
             expected: Some("visible output contract".to_string()),
-            observed: Some("NameError: name 'helper_value' is not defined".to_string()),
-            public_state_assertions: vec!["widget.render_public_value()".to_string()],
+            observed: Some("generated helper binding unresolved".to_string()),
+            public_state_assertions: vec!["render_workflow_public_value()".to_string()],
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
-                "generated test missing name `helper_value`".to_string(),
-                "generated test name-resolution frame `test_widget.py`".to_string(),
+                "generated test missing helper binding".to_string(),
+                "generated test name-resolution frame `tests/workflow.spec.ts`".to_string(),
                 "generated_test_artifact_name_resolution_defect".to_string(),
                 "public_state_assertion_mismatch".to_string(),
             ],
             sibling_obligations: vec![
-                "widget.render_public_value()".to_string(),
+                "render_workflow_public_value()".to_string(),
                 "generated test executable validity".to_string(),
             ],
             requirement_refs: Vec::new(),
             source_refs: vec!["public-output".to_string()],
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: vec![
-            "widget.render_public_value()".to_string(),
+            "render_workflow_public_value()".to_string(),
             "generated test executable validity".to_string(),
         ],
         source_refs: vec!["public-output".to_string()],
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
 
     let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
@@ -10430,13 +12242,13 @@ pub(crate) fn generated_test_validity_active_work_outranks_source_sibling_fixtur
             repair_required: true,
             targets,
             ..
-        }) if targets == vec![Utf8PathBuf::from("test_widget.py")]
+        }) if targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
     ) && repair_lane
         .as_ref()
         .and_then(|lane| lane.repair_control_snapshot.as_ref())
         .is_some_and(|snapshot| {
             snapshot.repair_owner == "generated_test"
-                && snapshot.required_target.as_deref() == Some("test_widget.py")
+                && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
         })
 }
 
@@ -10447,8 +12259,8 @@ pub(crate) fn generated_test_api_misuse_active_work_targets_test_fixture_passes(
         title: "generated-test api misuse active work authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -10456,53 +12268,51 @@ pub(crate) fn generated_test_api_misuse_active_work_targets_test_fixture_passes(
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
+        Utf8PathBuf::from("src/workflow.ts"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: generated test passed str to inspect.getsource".to_string(),
+        summary: "verification failed: generated test used invalid reflection subject".to_string(),
         tool_name: Some(ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_main_guard".to_string()];
+    state.verification.failing_labels = vec!["workflow_generated_reflection_subject".to_string()];
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-generated-test-api-misuse".to_string(),
         failing_labels: state.verification.failing_labels.clone(),
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        primary_failure: Some("Command: verify-contract --behavior".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
-            subtype: Some("generic_verification_failure".to_string()),
-            label: Some("test_main_guard".to_string()),
-            target: Some("test_calculator.py".to_string()),
-            symbol: Some("inspect.getsource".to_string()),
-            call_site: Some("source = inspect.getsource(main.__module__)".to_string()),
-            exception: Some("TypeError: code object was expected, got str".to_string()),
+            subtype: Some("generated_test_artifact_api_misuse".to_string()),
+            label: Some("workflow_generated_reflection_subject".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: Some("source_reflection_subject".to_string()),
+            call_site: Some("source = inspect_source(module_name_string)".to_string()),
+            exception: Some("reflection subject was a string".to_string()),
             expected: None,
             observed: Some(
-                "generated test invalid reflection subject `inspect.getsource(__module__ string)`"
-                    .to_string(),
+                "generated test invalid reflection subject `module_name_string`".to_string(),
             ),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
                 "generated_test_artifact_api_misuse".to_string(),
-                "generated test invalid reflection subject `inspect.getsource(__module__ string)`"
-                    .to_string(),
+                "generated test invalid reflection subject `module_name_string`".to_string(),
             ],
             sibling_obligations: Vec::new(),
-            requirement_refs: vec!["API-5".to_string()],
+            requirement_refs: vec!["workflow_contract.generated_test_api_surface".to_string()],
             source_refs: Vec::new(),
-            test_refs: vec!["test_calculator.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_calculator.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
 
     let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
@@ -10515,13 +12325,13 @@ pub(crate) fn generated_test_api_misuse_active_work_targets_test_fixture_passes(
             repair_required: true,
             targets,
             ..
-        }) if targets == vec![Utf8PathBuf::from("test_calculator.py")]
+        }) if targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
     ) && repair_lane
         .as_ref()
         .and_then(|lane| lane.repair_control_snapshot.as_ref())
         .is_some_and(|snapshot| {
             snapshot.repair_owner == "generated_test"
-                && snapshot.required_target.as_deref() == Some("test_calculator.py")
+                && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
         })
 }
 
@@ -10533,54 +12343,60 @@ pub(crate) fn generated_test_module_attribute_api_misuse_active_work_targets_tes
         title: "generated-test module attribute api misuse active work authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
-    let summary = r#"ERROR: test_cli_addition (test_calculator.TestCalculatorCli.test_cli_addition)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\test_calculator.py", line 151, in test_cli_addition
-    proc = self._run_calculator("3 + 4\n")
-  File "C:\workspace\test_calculator.py", line 134, in _run_calculator
-    env = dict(sys.environ)
-AttributeError: module 'sys' has no attribute 'environ'
-
-----------------------------------------------------------------------
-Ran 21 tests in 0.003s
-
-FAILED (errors=1)"#;
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
+        Utf8PathBuf::from("src/workflow.ts"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: generated test used invalid module attribute".to_string(),
+        summary: "verification failed: generated test used invalid environment provider"
+            .to_string(),
         tool_name: Some(ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_cli_addition".to_string()];
+    state.verification.failing_labels = vec!["workflow_env_contract".to_string()];
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-generated-test-module-attribute-api-misuse-active-work".to_string(),
         failing_labels: state.verification.failing_labels.clone(),
-        primary_failure: Some("Command: python -m unittest".to_string()),
-        evidence: crate::agent::repair_lane::verification_failure_evidence_from_summary(
-            FailureKind::VerificationFailed,
-            summary,
-        ),
+        primary_failure: Some("Command: verify-contract --behavior".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generated_test_artifact_api_misuse".to_string()),
+            label: Some("workflow_env_contract".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: Some("environment_provider".to_string()),
+            call_site: Some("env = environment_provider.snapshot()".to_string()),
+            exception: Some("invalid generated-test environment provider".to_string()),
+            expected: None,
+            observed: Some("generated test used invalid environment provider".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "generated_test_artifact_api_misuse".to_string(),
+                "generated test invalid environment provider".to_string(),
+                "generated test invalid module attribute `workflow_env`".to_string(),
+            ],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: Vec::new(),
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
+        }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_calculator.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
 
     let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
@@ -10593,7 +12409,7 @@ FAILED (errors=1)"#;
             repair_required: true,
             targets,
             ..
-        }) if targets == vec![Utf8PathBuf::from("test_calculator.py")]
+        }) if targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
     ) && state
         .verification
         .failure_cluster
@@ -10613,7 +12429,7 @@ FAILED (errors=1)"#;
             .and_then(|lane| lane.repair_control_snapshot.as_ref())
             .is_some_and(|snapshot| {
                 snapshot.repair_owner == "generated_test"
-                    && snapshot.required_target.as_deref() == Some("test_calculator.py")
+                    && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
             })
 }
 
@@ -10625,8 +12441,8 @@ pub(crate) fn generated_test_exception_type_overreach_active_work_targets_test_f
         title: "generated-test exception type overreach active work authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -10634,37 +12450,36 @@ pub(crate) fn generated_test_exception_type_overreach_active_work_targets_test_f
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
+        Utf8PathBuf::from("src/workflow.ts"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
-        summary:
-            "verification failed: generated test over-specified division-by-zero exception type"
-                .to_string(),
+        summary: "verification failed: generated test over-specified workflow error kind"
+            .to_string(),
         tool_name: Some(ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_divide_by_zero".to_string()];
+    state.verification.failing_labels = vec!["workflow_generated_exception_overreach".to_string()];
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-generated-test-exception-type-overreach".to_string(),
         failing_labels: state.verification.failing_labels.clone(),
-        primary_failure: Some("ValueError: division by zero".to_string()),
+        primary_failure: Some("generated test over-specified workflow error kind".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_exception_mismatch".to_string()),
-            label: Some("test_divide_by_zero".to_string()),
-            target: Some("calculator.py".to_string()),
+            label: Some("workflow_error_kind".to_string()),
+            target: Some("src/workflow.ts".to_string()),
             symbol: None,
-            call_site: Some("divide(10, 0)".to_string()),
-            exception: Some("ValueError".to_string()),
-            expected: Some("ZeroDivisionError".to_string()),
-            observed: Some("ValueError".to_string()),
+            call_site: Some("execute_workflow(invalid_sample)".to_string()),
+            exception: Some("generated test over-specified error kind".to_string()),
+            expected: Some("workflow contract error".to_string()),
+            observed: Some("specific generated-test error kind".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
@@ -10674,12 +12489,12 @@ pub(crate) fn generated_test_exception_type_overreach_active_work_targets_test_f
             ],
             sibling_obligations: Vec::new(),
             requirement_refs: Vec::new(),
-            source_refs: vec!["calculator.py".to_string()],
-            test_refs: vec!["test_calculator.py".to_string()],
+            source_refs: vec!["src/workflow.ts".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
-        source_refs: vec!["calculator.py".to_string()],
-        test_refs: vec!["test_calculator.py".to_string()],
+        source_refs: vec!["src/workflow.ts".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
 
     let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
@@ -10692,14 +12507,24 @@ pub(crate) fn generated_test_exception_type_overreach_active_work_targets_test_f
             repair_required: true,
             targets,
             ..
-        }) if targets == vec![Utf8PathBuf::from("test_calculator.py")]
+        }) if targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
     ) && repair_lane
         .as_ref()
         .and_then(|lane| lane.repair_control_snapshot.as_ref())
         .is_some_and(|snapshot| {
             snapshot.repair_owner == "generated_test"
-                && snapshot.required_target.as_deref() == Some("test_calculator.py")
+                && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
         })
+}
+
+pub(crate) fn state_generated_test_exception_overreach_fixture_domain_neutral_fixture_passes()
+-> bool {
+    let neutral_label = "workflow_generated_exception_overreach";
+    !neutral_label.contains("divide_by_zero")
+        && !neutral_label.contains("calculator")
+        && !neutral_label.contains("calculate")
+        && !neutral_label.contains("arithmetic")
+        && generated_test_exception_type_overreach_active_work_targets_test_fixture_passes()
 }
 
 pub(crate) fn mixed_source_public_api_and_generated_test_name_resolution_active_work_fixture_passes()
@@ -10710,67 +12535,70 @@ pub(crate) fn mixed_source_public_api_and_generated_test_name_resolution_active_
         title: "mixed source/test repair authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
-    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.active_targets = vec![
+        Utf8PathBuf::from("src/workflow.ts"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
+    ];
     state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
         summary:
-            "verification failed: widget public API missing and generated test helper unresolved"
+            "verification failed: workflow public operation missing and generated test helper unresolved"
                 .to_string(),
         tool_name: Some(ToolName::Shell),
-        targets: vec![Utf8PathBuf::from("test_widget.py")],
+        targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-mixed-source-public-api-generated-test-name-resolution".to_string(),
-        failing_labels: vec!["test_widget_api".to_string(), "test_cli_widget".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        failing_labels: vec![
+            "workflow_public_api".to_string(),
+            "workflow_generated_helper".to_string(),
+        ],
+        primary_failure: Some("Command: verify-contract --behavior".to_string()),
         evidence: vec![
             VerificationFailureEvidence {
                 evidence_kind: "verification_failure".to_string(),
                 subtype: Some("public_class_attribute_mismatch".to_string()),
-                label: Some("test_widget_api".to_string()),
+                label: Some("workflow_public_api".to_string()),
                 target: None,
-                symbol: Some("widget.calculate_binary".to_string()),
-                call_site: Some("widget.calculate_binary(2, '+', 3)".to_string()),
-                exception: Some(
-                    "AttributeError: module 'widget' has no attribute 'calculate_binary'"
-                        .to_string(),
-                ),
-                expected: Some("5".to_string()),
-                observed: Some("widget.calculate_binary is missing".to_string()),
-                public_state_assertions: vec!["widget.calculate_binary(2, '+', 3)".to_string()],
-                public_missing_attributes: vec!["widget.calculate_binary".to_string()],
+                symbol: Some("run_workflow".to_string()),
+                call_site: Some("run_workflow(sample)".to_string()),
+                exception: Some("public operation missing".to_string()),
+                expected: Some("workflow result".to_string()),
+                observed: Some("run_workflow is missing".to_string()),
+                public_state_assertions: vec!["run_workflow(sample)".to_string()],
+                public_missing_attributes: vec!["run_workflow".to_string()],
                 evidence_markers: vec![
                     "public_class_attribute_mismatch".to_string(),
-                    "public missing method `widget.calculate_binary`".to_string(),
+                    "public missing operation `run_workflow`".to_string(),
                 ],
-                sibling_obligations: vec!["`widget.calculate_binary` is missing".to_string()],
+                sibling_obligations: vec!["`run_workflow` is missing".to_string()],
                 requirement_refs: Vec::new(),
-                source_refs: Vec::new(),
-                test_refs: vec!["test_widget.py".to_string()],
+                source_refs: vec!["src/workflow.ts".to_string()],
+                test_refs: vec!["tests/workflow.spec.ts".to_string()],
             },
             VerificationFailureEvidence {
                 evidence_kind: "verification_failure".to_string(),
                 subtype: Some("generic_verification_failure".to_string()),
-                label: Some("test_cli_widget".to_string()),
-                target: Some("test_widget.py".to_string()),
-                symbol: Some("envlib".to_string()),
-                call_site: Some("env = dict(envlib.environ)".to_string()),
-                exception: Some("NameError: name 'envlib' is not defined".to_string()),
+                label: Some("workflow_generated_helper".to_string()),
+                target: Some("tests/workflow.spec.ts".to_string()),
+                symbol: Some("workflow_env".to_string()),
+                call_site: Some("env = make_workflow_env(workflow_env)".to_string()),
+                exception: Some("generated-test helper unresolved".to_string()),
                 expected: None,
-                observed: Some("missing generated-test helper name `envlib`".to_string()),
+                observed: Some("missing generated-test helper name `workflow_env`".to_string()),
                 public_state_assertions: Vec::new(),
                 public_missing_attributes: Vec::new(),
                 evidence_markers: vec![
@@ -10780,12 +12608,12 @@ pub(crate) fn mixed_source_public_api_and_generated_test_name_resolution_active_
                 sibling_obligations: Vec::new(),
                 requirement_refs: Vec::new(),
                 source_refs: Vec::new(),
-                test_refs: vec!["test_widget.py".to_string()],
+                test_refs: vec!["tests/workflow.spec.ts".to_string()],
             },
         ],
-        sibling_obligations: vec!["`widget.calculate_binary` is missing".to_string()],
-        source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        sibling_obligations: vec!["`run_workflow` is missing".to_string()],
+        source_refs: vec!["src/workflow.ts".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
 
     let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
@@ -10798,9 +12626,9 @@ pub(crate) fn mixed_source_public_api_and_generated_test_name_resolution_active_
             repair_required: true,
             targets,
             ..
-        }) if targets == vec![Utf8PathBuf::from("widget.py")]
+        }) if targets == vec![Utf8PathBuf::from("src/workflow.ts")]
     ) && repair_lane.as_ref().is_some_and(|lane| {
-        lane.required_target.as_deref() == Some("widget.py")
+        lane.required_target.as_deref() == Some("src/workflow.ts")
             && lane
                 .contract_reconciliation
                 .as_ref()
@@ -10814,7 +12642,7 @@ pub(crate) fn mixed_source_public_api_and_generated_test_name_resolution_active_
                 .as_ref()
                 .is_some_and(|snapshot| {
                     snapshot.repair_owner == "source_or_generated_test_by_contract_evidence"
-                        && snapshot.required_target.as_deref() == Some("widget.py")
+                        && snapshot.required_target.as_deref() == Some("src/workflow.ts")
                 })
     })
 }
@@ -10826,8 +12654,8 @@ pub(crate) fn generated_test_parse_defect_active_work_matches_repair_lane_fixtur
         title: "generated-test parse defect active work authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -10835,51 +12663,50 @@ pub(crate) fn generated_test_parse_defect_active_work_matches_repair_lane_fixtur
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
+        Utf8PathBuf::from("src/workflow.ts"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: generated test import has SyntaxError".to_string(),
+        summary: "verification failed: generated test parse defect".to_string(),
         tool_name: Some(ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_widget".to_string()];
+    state.verification.failing_labels = vec!["workflow_generated_parse".to_string()];
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-generated-test-parse-defect-active-work".to_string(),
         failing_labels: state.verification.failing_labels.clone(),
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        primary_failure: Some("Command: verify-contract --behavior".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("source_parse_defect".to_string()),
-            label: Some("test_widget".to_string()),
-            target: Some("test_widget.py".to_string()),
+            label: Some("workflow_generated_parse".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
             symbol: None,
             call_site: None,
             exception: None,
             expected: None,
-            observed: Some("SyntaxError: unterminated triple-quoted string literal".to_string()),
+            observed: Some("generated test parse defect in contract fixture".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
-                "source parse defect `SyntaxError: unterminated triple-quoted string literal`"
-                    .to_string(),
-                "source parse frame `test_widget.py`".to_string(),
+                "source parse defect in generated-test artifact".to_string(),
+                "source parse frame `tests/workflow.spec.ts`".to_string(),
                 "source_parse_defect".to_string(),
             ],
             sibling_obligations: Vec::new(),
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
 
     let active = active_work_contract_for_history_items(&session, &[], &state, &[]);
@@ -10904,18 +12731,18 @@ pub(crate) fn generated_test_parse_defect_active_work_matches_repair_lane_fixtur
             repair_required: true,
             targets,
             ..
-        }) if targets == vec![Utf8PathBuf::from("test_widget.py")]
-    ) && diagnostic.active_targets == vec![Utf8PathBuf::from("test_widget.py")]
+        }) if targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
+    ) && diagnostic.active_targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
         && diagnostic
             .active_work_summary
             .as_deref()
-            .is_some_and(|summary| summary.contains("`test_widget.py`"))
+            .is_some_and(|summary| summary.contains("`tests/workflow.spec.ts`"))
         && repair_lane
             .as_ref()
             .and_then(|lane| lane.repair_control_snapshot.as_ref())
             .is_some_and(|snapshot| {
                 snapshot.repair_owner == "generated_test"
-                    && snapshot.required_target.as_deref() == Some("test_widget.py")
+                    && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
                     && snapshot
                         .forbidden_actions
                         .iter()
@@ -10933,8 +12760,8 @@ pub(crate) fn no_tests_ran_recent_generated_test_filechange_preserves_target_fix
         title: "no tests ran generated-test target authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -10949,7 +12776,7 @@ pub(crate) fn no_tests_ran_recent_generated_test_filechange_preserves_target_fix
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Create `component.py` and `test_component.py`, then run `python -m unittest`.".to_string(),
+                    text: "Create `src/workflow.ts` and `tests/workflow.spec.ts`, then run `verify-contract --behavior`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -10963,15 +12790,16 @@ pub(crate) fn no_tests_ran_recent_generated_test_filechange_preserves_target_fix
             sequence_no: 2,
             created_at_ms: 2,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: ChangeId::new(),
                     kind: crate::session::ChangeKind::Add,
                     path_before: None,
-                    path_after: Some(Utf8PathBuf::from("test_component.py")),
-                    summary: "Added test_component.py".to_string(),
+                    path_after: Some(Utf8PathBuf::from("tests/workflow.spec.ts")),
+                    summary: "Added tests/workflow.spec.ts".to_string(),
                 }],
-                summary: "Added test_component.py".to_string(),
+                summary: "Added tests/workflow.spec.ts".to_string(),
             },
         },
         HistoryItem {
@@ -10983,23 +12811,23 @@ pub(crate) fn no_tests_ran_recent_generated_test_filechange_preserves_target_fix
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -X utf8 -m unittest".to_string(),
-                output_text: "Ran 0 tests in 0.000s\n\nNO TESTS RAN".to_string(),
+                title: "Run verification command: verify-contract --behavior".to_string(),
+                output_text: "No generated workflow verification cases were discovered".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
                 result_hash: Some("no-tests-ran".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -X utf8 -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary: "Command: python -X utf8 -m unittest\n\nStderr:\n----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nNO TESTS RAN".to_string(),
+                    output_summary: "Command: verify-contract --behavior\n\nNo generated workflow verification cases were discovered".to_string(),
                     failure_cluster: Some(VerificationFailureCluster {
                         cluster_id: "fixture-no-tests-ran-recent-generated-test".to_string(),
                         failing_labels: Vec::new(),
-                        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+                        primary_failure: Some("Command: verify-contract --behavior".to_string()),
                         evidence: vec![VerificationFailureEvidence {
                             evidence_kind: "verification_failure".to_string(),
                             subtype: Some("no_tests_ran".to_string()),
@@ -11022,7 +12850,7 @@ pub(crate) fn no_tests_ran_recent_generated_test_filechange_preserves_target_fix
                         source_refs: Vec::new(),
                         test_refs: Vec::new(),
                     }),
-                    satisfies_command_identities: vec!["python -m unittest".to_string()],
+                    satisfies_command_identities: vec!["verify-contract --behavior".to_string()],
                     artifact_refs: Vec::new(),
                     requirement_refs: Vec::new(),
                 }),
@@ -11044,25 +12872,24 @@ pub(crate) fn no_tests_ran_recent_generated_test_filechange_preserves_target_fix
     ]);
     let repair_lane = crate::agent::repair_lane::project_repair_lane(&state, &allowed);
     state.process_phase == ProcessPhase::Repair
-        && state.active_targets == vec![Utf8PathBuf::from("test_component.py")]
-        && state
-            .failure
-            .as_ref()
-            .is_some_and(|failure| failure.targets == vec![Utf8PathBuf::from("test_component.py")])
+        && state.active_targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
+        && state.failure.as_ref().is_some_and(|failure| {
+            failure.targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
+        })
         && matches!(
             active,
             Some(ActiveWorkContract::Verification {
                 repair_required: true,
                 targets,
                 ..
-            }) if targets == vec![Utf8PathBuf::from("test_component.py")]
+            }) if targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
         )
         && repair_lane
             .as_ref()
             .and_then(|lane| lane.repair_control_snapshot.as_ref())
             .is_some_and(|snapshot| {
                 snapshot.repair_owner.contains("generated_test")
-                    && snapshot.required_target.as_deref() == Some("test_component.py")
+                    && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
                     && !snapshot.selected_recovery_action.starts_with("fail_closed")
             })
 }
@@ -11077,19 +12904,26 @@ pub(crate) fn generated_test_local_binding_contradiction_active_work_fixture_pas
     if fs::create_dir_all(&workspace_root).is_err() {
         return false;
     }
-    let source_path = workspace_root.join("widget.py");
-    let test_path = workspace_root.join("test_widget.py");
+    let source_dir = workspace_root.join("src");
+    let test_dir = workspace_root.join("tests");
+    if fs::create_dir_all(source_dir.as_std_path()).is_err()
+        || fs::create_dir_all(test_dir.as_std_path()).is_err()
+    {
+        return false;
+    }
+    let source_path = source_dir.join("workflow.rs");
+    let test_path = test_dir.join("workflow.spec.ts");
     if fs::write(
-        &source_path,
-        "def public_tuple():\n    return \"alpha\", \"+\", \"omega\"\n",
+        source_path.as_std_path(),
+        "pub fn workflow_tuple() -> (&'static str, &'static str, &'static str) {\n    (\"alpha\", \"marker\", \"omega\")\n}\n",
     )
     .is_err()
     {
         return false;
     }
     if fs::write(
-        &test_path,
-        "import unittest\nimport widget\n\nclass TestGenerated(unittest.TestCase):\n    def test_public_tuple_contract(self):\n        first, marker, first = widget.public_tuple()\n        self.assertEqual(first, \"alpha\")\n",
+        test_path.as_std_path(),
+        "workflow generated contract: first binding must remain distinct from terminal binding\n",
     )
     .is_err()
     {
@@ -11102,51 +12936,43 @@ pub(crate) fn generated_test_local_binding_contradiction_active_work_fixture_pas
         title: "generated-test local binding contradiction".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: workspace_root.clone(),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
     };
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-local-binding-before-enrichment".to_string(),
-        failing_labels: vec!["test_public_tuple_contract".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        failing_labels: vec!["workflow_tuple_contract".to_string()],
+        primary_failure: Some("Command: verify-contract --behavior".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_state_assertion_mismatch".to_string()),
-            label: Some("test_public_tuple_contract".to_string()),
+            label: Some("workflow_tuple_contract".to_string()),
             target: None,
             symbol: None,
             call_site: None,
             exception: None,
             expected: Some("alpha".to_string()),
             observed: Some("omega".to_string()),
-            public_state_assertions: vec!["first".to_string()],
+            public_state_assertions: vec!["workflow_first_binding".to_string()],
             public_missing_attributes: Vec::new(),
-            evidence_markers: vec!["public_state_assertion_mismatch".to_string()],
-            sibling_obligations: vec!["first".to_string()],
+            evidence_markers: vec![
+                "public_state_assertion_mismatch".to_string(),
+                "generated_test_local_binding_contradiction".to_string(),
+            ],
+            sibling_obligations: vec!["workflow_first_binding".to_string()],
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
-        sibling_obligations: vec!["first".to_string()],
+        sibling_obligations: vec!["workflow_first_binding".to_string()],
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
-    let output_summary = "F\n\
-======================================================================\n\
-FAIL: test_public_tuple_contract (test_widget.TestGenerated.test_public_tuple_contract)\n\
-----------------------------------------------------------------------\n\
-Traceback (most recent call last):\n\
-  File \"test_widget.py\", line 7, in test_public_tuple_contract\n\
-    self.assertEqual(first, \"alpha\")\n\
-AssertionError: 'omega' != 'alpha'\n\
-\n\
-----------------------------------------------------------------------\n\
-Ran 1 test in 0.001s\n\
-\n\
-FAILED (failures=1)\n";
+    let output_summary =
+        "workflow tuple contract failed: terminal binding shadowed first binding\n";
     let items = vec![
         HistoryItem {
             id: HistoryItemId::new(),
@@ -11155,24 +12981,25 @@ FAILED (failures=1)\n";
             sequence_no: 1,
             created_at_ms: 1,
             payload: HistoryItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![ChangeId::new(), ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("widget.py")),
-                        summary: "Added widget.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.ts")),
+                        summary: "Added src/workflow.ts".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: ChangeId::new(),
                         kind: crate::session::ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_widget.py")),
-                        summary: "Added test_widget.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.spec.ts")),
+                        summary: "Added tests/workflow.spec.ts".to_string(),
                     },
                 ],
-                summary: "Added widget.py; Added test_widget.py".to_string(),
+                summary: "Added src/workflow.ts; Added tests/workflow.spec.ts".to_string(),
             },
         },
         HistoryItem {
@@ -11184,7 +13011,7 @@ FAILED (failures=1)\n";
             payload: HistoryItemPayload::ToolOutput {
                 call_id: ToolCallId::new(),
                 status: ToolLifecycleStatus::Completed,
-                title: "Run shell command: python -X utf8 -m unittest".to_string(),
+                title: "Run verification command: verify-contract --behavior".to_string(),
                 output_text: output_summary.to_string(),
                 metadata: Value::Null,
                 success: Some(false),
@@ -11192,13 +13019,13 @@ FAILED (failures=1)\n";
                 blocked_action: None,
                 result_hash: Some("fixture-result".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -X utf8 -m unittest".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
                     output_summary: output_summary.to_string(),
                     failure_cluster: Some(cluster),
-                    satisfies_command_identities: vec!["python -m unittest".to_string()],
+                    satisfies_command_identities: vec!["verify-contract --behavior".to_string()],
                     artifact_refs: Vec::new(),
                     requirement_refs: Vec::new(),
                 }),
@@ -11216,7 +13043,7 @@ FAILED (failures=1)\n";
     let _ = fs::remove_dir_all(&workspace_root);
 
     matches!(state.process_phase, ProcessPhase::Repair)
-        && state.active_targets == vec![Utf8PathBuf::from("test_widget.py")]
+        && state.active_targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
         && state
             .verification
             .failure_cluster
@@ -11234,46 +13061,46 @@ FAILED (failures=1)\n";
             .and_then(|lane| lane.repair_control_snapshot.as_ref())
             .is_some_and(|snapshot| {
                 snapshot.repair_owner == "generated_test"
-                    && snapshot.required_target.as_deref() == Some("test_widget.py")
+                    && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
             })
 }
 
 pub(crate) fn public_class_attribute_cluster_fixture() -> VerificationFailureCluster {
     VerificationFailureCluster {
-        cluster_id: "fixture-public-class-attribute".to_string(),
-        failing_labels: vec!["test_calculate_add".to_string()],
-        primary_failure: Some(".E".to_string()),
+        cluster_id: "fixture-public-workflow-operation".to_string(),
+        failing_labels: vec!["workflow_public_operation".to_string()],
+        primary_failure: Some("workflow public operation missing".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_class_attribute_mismatch".to_string()),
-            label: Some("test_calculate_add".to_string()),
-            target: Some("component.py".to_string()),
-            symbol: Some("component.calculate".to_string()),
-            call_site: Some("component.calculate(\"10 + 5\")".to_string()),
-            exception: Some("AttributeError".to_string()),
-            expected: Some("15".to_string()),
-            observed: Some("component.calculate is missing".to_string()),
-            public_state_assertions: vec!["component.calculate(\"10 + 5\")".to_string()],
-            public_missing_attributes: vec!["component.calculate".to_string()],
+            label: Some("workflow_public_operation".to_string()),
+            target: Some("src/workflow.ts".to_string()),
+            symbol: Some("run_workflow".to_string()),
+            call_site: Some("run_workflow(sample)".to_string()),
+            exception: Some("public operation missing".to_string()),
+            expected: Some("workflow result".to_string()),
+            observed: Some("run_workflow is missing".to_string()),
+            public_state_assertions: vec!["run_workflow(sample)".to_string()],
+            public_missing_attributes: vec!["run_workflow".to_string()],
             evidence_markers: vec![
                 "public_class_attribute_mismatch".to_string(),
-                "public missing method `component.calculate`".to_string(),
+                "public missing operation `run_workflow`".to_string(),
                 "generated-test conflict evidence".to_string(),
             ],
             sibling_obligations: vec![
-                "`component.calculate` is missing".to_string(),
-                "component.calculate(\"10 + 5\")".to_string(),
+                "`run_workflow` is missing".to_string(),
+                "run_workflow(sample)".to_string(),
             ],
             requirement_refs: Vec::new(),
-            source_refs: vec!["component.py".to_string(), "10 + 5".to_string()],
-            test_refs: vec!["test_component.py".to_string()],
+            source_refs: vec!["src/workflow.ts".to_string(), "workflow result".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: vec![
-            "`component.calculate` is missing".to_string(),
-            "component.calculate(\"10 + 5\")".to_string(),
+            "`run_workflow` is missing".to_string(),
+            "run_workflow(sample)".to_string(),
         ],
-        source_refs: vec!["component.py".to_string(), "10 + 5".to_string()],
-        test_refs: vec!["test_component.py".to_string()],
+        source_refs: vec!["src/workflow.ts".to_string(), "workflow result".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     }
 }
 fn is_scenario_contract_ref(target: &str) -> bool {
@@ -11588,6 +13415,15 @@ fn path_matches_docs_area(path: &Utf8Path, area: DocsArea) -> bool {
 
 pub(crate) fn docs_route_path_is_generated_or_dependency(path: &Utf8Path) -> bool {
     let normalized = path.as_str().replace('\\', "/").to_ascii_lowercase();
+    path_is_generated_dependency_or_cache(&normalized) || normalized.ends_with(".pdf")
+}
+
+fn structured_document_path_is_generated_or_dependency(path: &Utf8Path) -> bool {
+    let normalized = path.as_str().replace('\\', "/").to_ascii_lowercase();
+    path_is_generated_dependency_or_cache(&normalized)
+}
+
+fn path_is_generated_dependency_or_cache(normalized: &str) -> bool {
     normalized.split('/').any(|part| {
         matches!(
             part,
@@ -11599,6 +13435,9 @@ pub(crate) fn docs_route_path_is_generated_or_dependency(path: &Utf8Path) -> boo
                 | "__pycache__"
                 | ".pytest_cache"
                 | "target"
+                | "build-artifacts"
+                | "generated"
+                | "cache"
                 | "dist"
                 | "build"
                 | "coverage"
@@ -11611,35 +13450,13 @@ pub(crate) fn docs_route_path_is_generated_or_dependency(path: &Utf8Path) -> boo
         || normalized.ends_with(".db")
         || normalized.ends_with(".sqlite")
         || normalized.ends_with(".sqlite3")
-        || normalized.ends_with(".pdf")
 }
 
 fn docs_route_path_is_flat_test_artifact(path: &Utf8Path) -> bool {
     if path.components().count() != 1 {
         return false;
     }
-    let Some(file_name) = path.file_name() else {
-        return false;
-    };
-    let lower = file_name.to_ascii_lowercase();
-    let Some(stem) = path.file_stem() else {
-        return false;
-    };
-    let stem = stem.to_ascii_lowercase();
-    let extension = path
-        .extension()
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    let conventional_extension = matches!(
-        extension.as_str(),
-        "py" | "rs" | "go" | "js" | "jsx" | "ts" | "tsx" | "java" | "kt" | "cs" | "rb"
-    );
-    conventional_extension
-        && (stem.starts_with("test_")
-            || stem.ends_with("_test")
-            || lower.contains(".test.")
-            || lower.contains(".spec.")
-            || lower == "tests.rs")
+    classify_language_artifact_target(path.as_str()).role == ArtifactRole::Test
 }
 
 fn docs_route_path_has_generated_data_prefix(normalized: &str) -> bool {
@@ -11871,52 +13688,7 @@ pub(crate) struct StructuredDocumentSummarySnapshot {
     pub current_batch_processed: usize,
 }
 
-pub(crate) fn structured_document_summary_snapshot(
-    transcript: &Transcript,
-    latest_user_text: Option<&str>,
-) -> Option<StructuredDocumentSummarySnapshot> {
-    let latest_user_text = latest_user_text?;
-    let contract =
-        structured_document_summary_contract(latest_user_text, transcript.session.cwd.as_path())?;
-    let progress = structured_document_summary_progress(transcript, &contract);
-    let processed_set = progress
-        .processed_files
-        .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<BTreeSet<_>>();
-    let missing_files = contract
-        .expected_files
-        .iter()
-        .filter(|value| !processed_set.contains(&value.to_ascii_lowercase()))
-        .cloned()
-        .collect::<Vec<_>>();
-    let expected_batch_sizes = contract
-        .batch_size
-        .map(|batch_size| expected_batch_sizes(contract.expected_files.len(), batch_size))
-        .unwrap_or_default();
-    let completed_batch_total = progress.batch_sizes.iter().sum::<usize>();
-    let current_batch_processed = progress
-        .processed_files
-        .len()
-        .saturating_sub(completed_batch_total);
-    let current_batch_expected = expected_batch_sizes
-        .get(progress.batch_sizes.len())
-        .copied();
-
-    Some(StructuredDocumentSummarySnapshot {
-        output_target: contract.output_target,
-        expected_files: contract.expected_files,
-        processed_files: progress.processed_files,
-        missing_files,
-        batch_size: contract.batch_size,
-        expected_batch_sizes,
-        observed_batch_sizes: progress.batch_sizes,
-        current_batch_expected,
-        current_batch_processed,
-    })
-}
-
-fn structured_document_summary_snapshot_from_history_items(
+pub(crate) fn structured_document_summary_snapshot_from_history_items(
     workspace_root: &Utf8Path,
     history_items: &[HistoryItem],
     latest_user_text: Option<&str>,
@@ -12062,6 +13834,13 @@ fn collect_structured_document_targets_recursive(
         let Ok(path) = Utf8PathBuf::from_path_buf(entry.path()) else {
             continue;
         };
+        let relative = path
+            .strip_prefix(root)
+            .map(|value| value.to_path_buf())
+            .unwrap_or_else(|_| path.clone());
+        if structured_document_path_is_generated_or_dependency(relative.as_path()) {
+            continue;
+        }
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -12083,12 +13862,7 @@ fn collect_structured_document_targets_recursive(
         if !extensions.contains(&extension.to_ascii_lowercase()) {
             continue;
         }
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(path.as_path())
-            .as_str()
-            .replace('\\', "/");
-        targets.insert(relative);
+        targets.insert(relative.as_str().replace('\\', "/"));
     }
 }
 
@@ -12110,82 +13884,6 @@ fn explicit_batch_size(text: &str) -> Option<usize> {
     None
 }
 
-fn structured_document_summary_progress(
-    transcript: &Transcript,
-    contract: &StructuredDocumentSummaryContract,
-) -> StructuredDocumentSummaryProgress {
-    let Some(latest_user_index) =
-        transcript
-            .messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, message)| {
-                matches!(message.record.role, MessageRole::User).then_some(index)
-            })
-    else {
-        return StructuredDocumentSummaryProgress::default();
-    };
-
-    let expected = contract
-        .expected_files
-        .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<BTreeSet<_>>();
-    let tool_calls = tool_calls_by_call_id(transcript);
-    let mut processed = BTreeSet::new();
-    let mut pending_batch = BTreeSet::new();
-    let mut batch_sizes = Vec::new();
-    let output_target = contract.output_target.to_ascii_lowercase();
-
-    for message in &transcript.messages[latest_user_index + 1..] {
-        for part in &message.parts {
-            match &part.payload {
-                MessagePart::ToolResult(value)
-                    if is_successful_docling_conversion_result(value) =>
-                {
-                    let Some(call) = tool_calls.get(&value.tool_call_id) else {
-                        continue;
-                    };
-                    if call.tool_name != ToolName::DoclingConvert {
-                        continue;
-                    }
-                    let Some(target) = extract_docling_target(&call.arguments_json) else {
-                        continue;
-                    };
-                    let normalized = target.to_ascii_lowercase();
-                    if !expected.contains(&normalized) {
-                        continue;
-                    }
-                    if processed.insert(normalized.clone()) {
-                        pending_batch.insert(normalized);
-                    }
-                }
-                MessagePart::DiffSummary(value)
-                    if value.summary.to_ascii_lowercase().contains(&output_target) =>
-                {
-                    if !pending_batch.is_empty() {
-                        batch_sizes.push(pending_batch.len());
-                        pending_batch.clear();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let processed_files = contract
-        .expected_files
-        .iter()
-        .filter(|value| processed.contains(&value.to_ascii_lowercase()))
-        .cloned()
-        .collect();
-    StructuredDocumentSummaryProgress {
-        processed_files,
-        batch_sizes,
-    }
-}
-
 fn structured_document_summary_progress_from_history_items(
     history_items: &[HistoryItem],
     contract: &StructuredDocumentSummaryContract,
@@ -12203,7 +13901,7 @@ fn structured_document_summary_progress_from_history_items(
     let mut processed = BTreeSet::new();
     let mut pending_batch = BTreeSet::new();
     let mut batch_sizes = Vec::new();
-    let output_target = contract.output_target.to_ascii_lowercase();
+    let output_target = canonical_target_key(&contract.output_target);
 
     for item in history_items_in_sequence(history_items)
         .into_iter()
@@ -12250,16 +13948,19 @@ fn structured_document_summary_progress_from_history_items(
                 }
             }
             HistoryItemPayload::FileChange {
-                changes, summary, ..
+                call_id: _,
+                changes,
+                summary: _,
+                ..
             } => {
                 let output_changed = changes.iter().any(|change| {
                     change
                         .path_after
                         .as_ref()
                         .or(change.path_before.as_ref())
-                        .map(|path| path.as_str().replace('\\', "/").to_ascii_lowercase())
-                        .is_some_and(|path| path.ends_with(&output_target))
-                }) || summary.to_ascii_lowercase().contains(&output_target);
+                        .map(|path| canonical_target_key(path.as_str()))
+                        .is_some_and(|path| path == output_target)
+                });
                 if output_changed && !pending_batch.is_empty() {
                     batch_sizes.push(pending_batch.len());
                     pending_batch.clear();
@@ -12279,6 +13980,121 @@ fn structured_document_summary_progress_from_history_items(
         processed_files,
         batch_sizes,
     }
+}
+
+pub(crate) fn structured_document_output_progress_exact_target_identity_fixture_passes() -> bool {
+    let unique = format!(
+        "moyai-state-structured-doc-output-target-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    );
+    let root_path = std::env::temp_dir().join(unique);
+    let Ok(workspace_root) = Utf8PathBuf::from_path_buf(root_path) else {
+        return false;
+    };
+    let result = (|| -> bool {
+        if fs::create_dir_all(workspace_root.as_std_path()).is_err()
+            || fs::write(workspace_root.join("a.pdf").as_std_path(), b"a").is_err()
+            || fs::write(workspace_root.join("b.pdf").as_std_path(), b"b").is_err()
+        {
+            return false;
+        }
+        let user_text =
+            "Summarize all pdf files into summary.md in batches of 1 file at a time.".to_string();
+        let observed_batches = |file_change_path: &str, summary: &str| -> Option<Vec<usize>> {
+            let session_id = SessionId::new();
+            let turn_id = TurnId::new();
+            let call_id = ToolCallId::new();
+            let history_items = vec![
+                HistoryItem {
+                    id: HistoryItemId::new(),
+                    session_id,
+                    turn_id,
+                    sequence_no: 1,
+                    created_at_ms: 1,
+                    payload: HistoryItemPayload::Message {
+                        message_id: None,
+                        role: MessageRole::User,
+                        content: vec![ContentPart::Text {
+                            text: user_text.clone(),
+                        }],
+                    },
+                },
+                HistoryItem {
+                    id: HistoryItemId::new(),
+                    session_id,
+                    turn_id,
+                    sequence_no: 2,
+                    created_at_ms: 2,
+                    payload: HistoryItemPayload::ToolCall {
+                        call_id,
+                        tool: ToolName::DoclingConvert,
+                        arguments: json!({"path": "a.pdf"}),
+                        model_arguments: json!({"path": "a.pdf"}),
+                        effective_arguments: json!({"path": "a.pdf"}),
+                        adjusted_arguments: None,
+                        permission_decision: None,
+                        sandbox_decision: None,
+                        allowed_surface: Vec::new(),
+                        retry_policy: None,
+                        terminal_guard_policy: None,
+                    },
+                },
+                HistoryItem {
+                    id: HistoryItemId::new(),
+                    session_id,
+                    turn_id,
+                    sequence_no: 3,
+                    created_at_ms: 3,
+                    payload: HistoryItemPayload::ToolOutput {
+                        call_id,
+                        status: ToolLifecycleStatus::Completed,
+                        title: "Docling converted a.pdf".to_string(),
+                        output_text: "converted".to_string(),
+                        metadata: Value::Null,
+                        success: Some(true),
+                        progress_effect: ToolProgressEffect::MadeProgress,
+                        blocked_action: None,
+                        result_hash: Some("structured-doc-output-target".to_string()),
+                        verification_run: None,
+                    },
+                },
+                HistoryItem {
+                    id: HistoryItemId::new(),
+                    session_id,
+                    turn_id,
+                    sequence_no: 4,
+                    created_at_ms: 4,
+                    payload: HistoryItemPayload::FileChange {
+                        call_id: crate::session::ToolCallId::new(),
+                        change_ids: Vec::new(),
+                        changes: vec![FileChangeEvidence {
+                            change_id: ChangeId::new(),
+                            path_before: None,
+                            path_after: Some(Utf8PathBuf::from(file_change_path)),
+                            kind: crate::session::ChangeKind::Add,
+                            summary: summary.to_string(),
+                        }],
+                        summary: summary.to_string(),
+                    },
+                },
+            ];
+            structured_document_summary_snapshot_from_history_items(
+                workspace_root.as_path(),
+                &history_items,
+                Some(&user_text),
+            )
+            .map(|snapshot| snapshot.observed_batch_sizes)
+        };
+
+        observed_batches("archive/summary.md", "summary.md updated") == Some(Vec::new())
+            && observed_batches("summary.md", "archive/summary.md mentioned") == Some(vec![1])
+    })();
+    let _ = fs::remove_dir_all(workspace_root.as_std_path());
+    result
 }
 
 pub(crate) fn message_user_structured_document_progress_fixture_passes() -> bool {
@@ -12331,8 +14147,8 @@ pub(crate) fn message_user_structured_document_progress_fixture_passes() -> bool
                     call_id,
                     tool: ToolName::DoclingConvert,
                     arguments: json!({"path": "a.pdf"}),
-                    model_arguments: Value::Null,
-                    effective_arguments: Value::Null,
+                    model_arguments: json!({"path": "a.pdf"}),
+                    effective_arguments: json!({"path": "a.pdf"}),
                     adjusted_arguments: None,
                     permission_decision: None,
                     sandbox_decision: None,
@@ -12367,6 +14183,7 @@ pub(crate) fn message_user_structured_document_progress_fixture_passes() -> bool
                 sequence_no: 4,
                 created_at_ms: 4,
                 payload: HistoryItemPayload::FileChange {
+                    call_id: crate::session::ToolCallId::new(),
                     change_ids: Vec::new(),
                     changes: vec![FileChangeEvidence {
                         change_id: ChangeId::new(),
@@ -12408,83 +14225,225 @@ fn expected_batch_sizes(total: usize, batch_size: usize) -> Vec<usize> {
     batches
 }
 
-fn is_successful_docling_conversion_result(value: &crate::session::ToolResultPart) -> bool {
-    value.status == crate::session::ToolCallStatus::Completed
-        && (value.title.starts_with("Docling converted ") || value.title.starts_with("Converted "))
-}
-
 fn extract_docling_target(arguments_json: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(arguments_json).ok()?;
     let path = value.get("path")?.as_str()?;
     let normalized = path.replace('\\', "/");
-    let parsed = Utf8Path::new(&normalized);
-    let relative = parsed
-        .file_name()
-        .map(str::to_string)
-        .unwrap_or_else(|| parsed.as_str().to_string());
-    Some(relative)
+    let trimmed = normalized.trim().trim_start_matches("./");
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+pub(crate) fn structured_document_docling_progress_exact_target_identity_fixture_passes() -> bool {
+    if extract_docling_target(r#"{"path":"archive/a.pdf"}"#).as_deref() != Some("archive/a.pdf")
+        || extract_docling_target(r#"{"path":"a.pdf"}"#).as_deref() != Some("a.pdf")
+    {
+        return false;
+    }
+
+    let unique = format!(
+        "moyai-state-structured-doc-docling-target-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    );
+    let root_path = std::env::temp_dir().join(unique);
+    let Ok(workspace_root) = Utf8PathBuf::from_path_buf(root_path) else {
+        return false;
+    };
+    let result = (|| -> bool {
+        if fs::create_dir_all(workspace_root.join("archive").as_std_path()).is_err()
+            || fs::write(workspace_root.join("a.pdf").as_std_path(), b"root").is_err()
+            || fs::write(
+                workspace_root.join("archive").join("a.pdf").as_std_path(),
+                b"archive",
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let call_id = ToolCallId::new();
+        let user_text =
+            "Summarize all pdf files into summary.md in batches of 1 file at a time.".to_string();
+        let history_items = vec![
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: HistoryItemPayload::Message {
+                    message_id: None,
+                    role: MessageRole::User,
+                    content: vec![ContentPart::Text {
+                        text: user_text.clone(),
+                    }],
+                },
+            },
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 2,
+                created_at_ms: 2,
+                payload: HistoryItemPayload::ToolCall {
+                    call_id,
+                    tool: ToolName::DoclingConvert,
+                    arguments: json!({"path": "archive/a.pdf"}),
+                    model_arguments: json!({"path": "archive/a.pdf"}),
+                    effective_arguments: json!({"path": "archive/a.pdf"}),
+                    adjusted_arguments: None,
+                    permission_decision: None,
+                    sandbox_decision: None,
+                    allowed_surface: Vec::new(),
+                    retry_policy: None,
+                    terminal_guard_policy: None,
+                },
+            },
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 3,
+                created_at_ms: 3,
+                payload: HistoryItemPayload::ToolOutput {
+                    call_id,
+                    status: ToolLifecycleStatus::Completed,
+                    title: "Docling converted archive/a.pdf".to_string(),
+                    output_text: "converted".to_string(),
+                    metadata: Value::Null,
+                    success: Some(true),
+                    progress_effect: ToolProgressEffect::MadeProgress,
+                    blocked_action: None,
+                    result_hash: Some("structured-doc-docling-target".to_string()),
+                    verification_run: None,
+                },
+            },
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 4,
+                created_at_ms: 4,
+                payload: HistoryItemPayload::FileChange {
+                    call_id: crate::session::ToolCallId::new(),
+                    change_ids: Vec::new(),
+                    changes: vec![FileChangeEvidence {
+                        change_id: ChangeId::new(),
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("summary.md")),
+                        kind: crate::session::ChangeKind::Add,
+                        summary: "summary.md updated".to_string(),
+                    }],
+                    summary: "summary.md updated".to_string(),
+                },
+            },
+        ];
+        let Some(snapshot) = structured_document_summary_snapshot_from_history_items(
+            workspace_root.as_path(),
+            &history_items,
+            Some(&user_text),
+        ) else {
+            return false;
+        };
+        snapshot.processed_files == vec!["archive/a.pdf".to_string()]
+            && snapshot.missing_files == vec!["a.pdf".to_string()]
+            && snapshot.observed_batch_sizes == vec![1]
+    })();
+    let _ = fs::remove_dir_all(workspace_root.as_std_path());
+    result
+}
+
+pub(crate) fn structured_document_summary_skips_generated_dependency_targets_fixture_passes() -> bool
+{
+    let unique = format!(
+        "moyai-state-structured-doc-generated-dependency-targets-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    );
+    let root_path = std::env::temp_dir().join(unique);
+    let Ok(workspace_root) = Utf8PathBuf::from_path_buf(root_path) else {
+        return false;
+    };
+    let result = (|| -> bool {
+        for directory in [
+            "archive",
+            "node_modules/pkg",
+            "build-artifacts/cache",
+            "data/runs",
+            "generated",
+            "src/generated",
+        ] {
+            if fs::create_dir_all(workspace_root.join(directory).as_std_path()).is_err() {
+                return false;
+            }
+        }
+        for (path, body) in [
+            ("a.pdf", b"root".as_slice()),
+            ("archive/b.pdf", b"archive".as_slice()),
+            ("node_modules/pkg/c.pdf", b"dependency".as_slice()),
+            ("build-artifacts/cache/d.pdf", b"cache".as_slice()),
+            ("data/runs/e.pdf", b"run".as_slice()),
+            ("generated/f.pdf", b"generated".as_slice()),
+            ("src/generated/g.pdf", b"src-generated".as_slice()),
+        ] {
+            if fs::write(workspace_root.join(path).as_std_path(), body).is_err() {
+                return false;
+            }
+        }
+        let user_text =
+            "Summarize all pdf files into summary.md in batches of 1 file at a time.".to_string();
+        let Some(snapshot) = structured_document_summary_snapshot_from_history_items(
+            workspace_root.as_path(),
+            &[],
+            Some(&user_text),
+        ) else {
+            return false;
+        };
+        let expected_files = snapshot
+            .expected_files
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let allowed_files = BTreeSet::from(["a.pdf".to_string(), "archive/b.pdf".to_string()]);
+        let excluded_markers = [
+            "node_modules",
+            "build-artifacts/cache",
+            "data/runs",
+            "generated",
+            "src/generated",
+        ];
+        expected_files == allowed_files
+            && snapshot
+                .missing_files
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                == allowed_files
+            && snapshot.expected_batch_sizes == vec![1, 1]
+            && snapshot.processed_files.is_empty()
+            && snapshot
+                .expected_files
+                .iter()
+                .chain(snapshot.missing_files.iter())
+                .all(|file| !excluded_markers.iter().any(|marker| file.contains(marker)))
+    })();
+    let _ = fs::remove_dir_all(workspace_root.as_std_path());
+    result
 }
 
 fn extract_failure_paths_from_text(summary: &str, workspace_root: &Utf8Path) -> Vec<Utf8PathBuf> {
-    let mut targets = Vec::new();
-    for line in summary.lines() {
-        let trimmed = line.trim();
-        if let Some(path) = extract_python_traceback_path(trimmed)
-            .and_then(|value| normalize_target_path(&value, workspace_root))
-        {
-            targets.push(path);
-        }
-    }
-    targets.extend(extract_import_error_module_paths_from_text(
-        summary,
-        workspace_root,
-    ));
+    let targets = language_failure_paths_from_summary(summary)
+        .into_iter()
+        .filter_map(|value| normalize_target_path(&value, workspace_root))
+        .collect::<Vec<_>>();
     prioritize_repair_targets(targets)
-}
-
-fn extract_import_error_module_paths_from_text(
-    summary: &str,
-    workspace_root: &Utf8Path,
-) -> Vec<Utf8PathBuf> {
-    let mut targets = Vec::new();
-    for line in summary.lines() {
-        let trimmed = line.trim();
-        if let Some(path) = extract_import_error_module_path(trimmed)
-            .and_then(|value| normalize_target_path(&value, workspace_root))
-        {
-            targets.push(path);
-        }
-    }
-    prioritize_repair_targets(targets)
-}
-
-fn extract_import_error_module_path(line: &str) -> Option<String> {
-    let lower = line.to_ascii_lowercase();
-    if !lower.contains("importerror:")
-        || !lower.contains("cannot import name")
-        || !lower.contains(" from ")
-    {
-        return None;
-    }
-
-    let start = line.rfind('(')?;
-    let end = line[start + 1..].find(')')? + start + 1;
-    let candidate = line[start + 1..end].trim();
-    if candidate.is_empty() {
-        return None;
-    }
-    let normalized = candidate.replace('\\', "/").to_ascii_lowercase();
-    normalized.ends_with(".py").then(|| candidate.to_string())
-}
-
-fn extract_python_traceback_path(line: &str) -> Option<String> {
-    if let Some(rest) = line.split_once("File \"").map(|(_, rest)| rest) {
-        return rest.split('"').next().map(str::to_string);
-    }
-    if let Some(rest) = line.split_once("File '").map(|(_, rest)| rest) {
-        return rest.split('\'').next().map(str::to_string);
-    }
-    None
 }
 
 fn normalize_target_path(target: &str, workspace_root: &Utf8Path) -> Option<Utf8PathBuf> {
@@ -12619,35 +14578,19 @@ fn is_documentation_target(path: &Utf8Path) -> bool {
         || lower.ends_with(".adoc")
 }
 
+fn is_verification_repair_authority_target(path: &Utf8Path) -> bool {
+    language_verification_repair_authority_target(path.as_str())
+}
+
 fn is_code_or_test_target(path: &Utf8Path) -> bool {
-    let lower = path.as_str().replace('\\', "/").to_ascii_lowercase();
-    lower.contains("/src/")
-        || lower.contains("/tests/")
-        || lower.ends_with(".py")
-        || lower.ends_with(".rs")
-        || lower.ends_with(".js")
-        || lower.ends_with(".ts")
-        || lower.ends_with(".tsx")
-        || lower.ends_with(".jsx")
-        || lower
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .starts_with("test_")
+    matches!(
+        classify_language_artifact_target(path.as_str()).role,
+        ArtifactRole::Source | ArtifactRole::Test
+    )
 }
 
 fn is_test_focus_target(path: &Utf8Path) -> bool {
-    let lower = path.as_str().replace('\\', "/").to_ascii_lowercase();
-    lower.contains("/tests/")
-        || lower.starts_with("tests/")
-        || lower.ends_with("_test.py")
-        || lower.ends_with("test_integration.py")
-        || lower.ends_with("integration_test.py")
-        || lower
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .starts_with("test_")
+    classify_language_artifact_target(path.as_str()).role == ArtifactRole::Test
 }
 
 pub(crate) fn docs_route_verification_failure_preserves_docs_active_target_fixture_passes() -> bool
@@ -12661,8 +14604,8 @@ pub(crate) fn docs_route_verification_failure_preserves_docs_active_target_fixtu
         title: "docs route verification target authority".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: Utf8PathBuf::from("C:/workspace/project"),
-        model: "local".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: STATE_FIXTURE_MODEL.to_string(),
+        base_url: STATE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12670,12 +14613,12 @@ pub(crate) fn docs_route_verification_failure_preserves_docs_active_target_fixtu
     let mut previous = SessionStateSnapshot::default();
     previous.route = TaskRoute::Docs;
     previous.process_phase = ProcessPhase::Repair;
-    previous.active_targets = vec![Utf8PathBuf::from("docs/calculator-design.md")];
+    previous.active_targets = vec![Utf8PathBuf::from("docs/workflow-design.md")];
     previous.completion.route_contract_pending = true;
     previous.docs_route = Some(DocsRouteState {
-        active_deliverable: Some(Utf8PathBuf::from("docs/calculator-design.md")),
+        active_deliverable: Some(Utf8PathBuf::from("docs/workflow-design.md")),
         pending_deliverables: vec![DocsPendingDeliverable {
-            target: Utf8PathBuf::from("docs/calculator-design.md"),
+            target: Utf8PathBuf::from("docs/workflow-design.md"),
             summary: "same-document docs update remains pending".to_string(),
         }],
         ..DocsRouteState::default()
@@ -12690,7 +14633,7 @@ pub(crate) fn docs_route_verification_failure_preserves_docs_active_target_fixtu
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![ContentPart::Text {
-                    text: "Update `docs/calculator-design.md` only; do not edit calculator.py or test_calculator.py.".to_string(),
+                    text: "Update `docs/workflow-design.md` only; do not edit `src/workflow.rs` or `tests/workflow.behavior.md`.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -12707,18 +14650,18 @@ pub(crate) fn docs_route_verification_failure_preserves_docs_active_target_fixtu
                 call_id,
                 status: ToolLifecycleStatus::Completed,
                 title: "Docs write command failed".to_string(),
-                output_text: "verification failed: calculator.py appeared in docs command output".to_string(),
+                output_text: "verification failed: workflow source artifact appeared in docs command output".to_string(),
                 metadata: Value::Null,
                 success: Some(false),
                 progress_effect: ToolProgressEffect::VerificationFailed,
                 blocked_action: None,
                 result_hash: Some("fixture-docs-route-verification-target-authority".to_string()),
                 verification_run: Some(VerificationRunResult {
-                    command: "python -X utf8 -c \"write docs\"".to_string(),
+                    command: "verify-contract --behavior".to_string(),
                     status: VerificationRunStatus::Failed,
                     exit_code: Some(1),
                     timed_out: false,
-                    output_summary: "AssertionError: calculator.py should not become the repair target for docs/calculator-design.md".to_string(),
+                    output_summary: "workflow source diagnostic should not become the repair target for docs/workflow-design.md".to_string(),
                     failure_cluster: Some(VerificationFailureCluster {
                         cluster_id: "fixture-docs-route-verification-target-authority".to_string(),
                         failing_labels: vec!["docs semantic check".to_string()],
@@ -12727,7 +14670,7 @@ pub(crate) fn docs_route_verification_failure_preserves_docs_active_target_fixtu
                             evidence_kind: "verification_failure".to_string(),
                             subtype: Some("generic_verification_failure".to_string()),
                             label: Some("docs semantic check".to_string()),
-                            target: Some("calculator.py".to_string()),
+                            target: Some("src/workflow.rs".to_string()),
                             symbol: None,
                             call_site: None,
                             exception: None,
@@ -12735,17 +14678,21 @@ pub(crate) fn docs_route_verification_failure_preserves_docs_active_target_fixtu
                             observed: None,
                             public_state_assertions: Vec::new(),
                             public_missing_attributes: Vec::new(),
-                            evidence_markers: vec!["generic_verification_failure".to_string()],
+                            evidence_markers: vec![
+                                "generic_verification_failure".to_string(),
+                                "docs_route_verification_target_fixture_language_neutral"
+                                    .to_string(),
+                            ],
                             sibling_obligations: Vec::new(),
                             requirement_refs: Vec::new(),
-                            source_refs: vec!["calculator.py".to_string()],
-                            test_refs: Vec::new(),
+                            source_refs: vec!["src/workflow.rs".to_string()],
+                            test_refs: vec!["tests/workflow.behavior.md".to_string()],
                         }],
                         sibling_obligations: Vec::new(),
-                        source_refs: vec!["calculator.py".to_string()],
-                        test_refs: Vec::new(),
+                        source_refs: vec!["src/workflow.rs".to_string()],
+                        test_refs: vec!["tests/workflow.behavior.md".to_string()],
                     }),
-                    satisfies_command_identities: Vec::new(),
+                    satisfies_command_identities: vec!["verify-contract --behavior".to_string()],
                     artifact_refs: Vec::new(),
                     requirement_refs: Vec::new(),
                 }),
@@ -12757,7 +14704,7 @@ pub(crate) fn docs_route_verification_failure_preserves_docs_active_target_fixtu
         && state.process_phase == ProcessPhase::Repair
         && state.completion.route_contract_pending
         && state.completion.verification_pending
-        && state.active_targets == vec![Utf8PathBuf::from("docs/calculator-design.md")]
+        && state.active_targets == vec![Utf8PathBuf::from("docs/workflow-design.md")]
 }
 
 #[cfg(test)]
@@ -12807,18 +14754,24 @@ fn compact_verification_failure_summary(
     }
 }
 
-fn enrich_verification_failure_summary_with_test_requirement_context(
+fn enrich_verification_failure_summary_with_language_context(
     compact_summary: &str,
     raw_summary: &str,
     workspace_root: &Utf8Path,
 ) -> String {
-    let requirement_contexts = test_requirement_contexts_for_unittest_failure(
-        compact_summary,
-        raw_summary,
-        workspace_root,
+    let labels = extract_verification_failure_labels(compact_summary);
+    let test_sources = verification_failure_test_context_sources(raw_summary, workspace_root);
+    let requirement_contexts = language_failure_requirement_contexts_from_sources(
+        &labels,
+        &test_sources,
+        MAX_VERIFICATION_FAILURE_LABELS,
     );
-    let assertion_contexts =
-        test_assertion_contexts_for_unittest_failure(compact_summary, raw_summary, workspace_root);
+    let assertion_contexts = language_failure_assertion_contexts_from_sources(
+        compact_summary,
+        &labels,
+        &test_sources,
+        MAX_VERIFICATION_FAILURE_LABELS,
+    );
     let mut summary = compact_summary.to_string();
     if !requirement_contexts.is_empty() {
         summary.push_str("; requirement context: ");
@@ -12831,44 +14784,15 @@ fn enrich_verification_failure_summary_with_test_requirement_context(
     summary
 }
 
-fn test_requirement_contexts_for_unittest_failure(
-    compact_summary: &str,
+fn verification_failure_test_context_sources(
     raw_summary: &str,
     workspace_root: &Utf8Path,
 ) -> Vec<String> {
-    let labels = extract_verification_failure_labels(compact_summary);
-    if labels.is_empty() {
-        return Vec::new();
-    }
-    let test_sources = extract_failure_paths_from_text(raw_summary, workspace_root)
+    extract_failure_paths_from_text(raw_summary, workspace_root)
         .into_iter()
         .filter(|path| is_test_focus_target(path))
         .filter_map(|path| read_small_test_context_source(&path, workspace_root))
-        .collect::<Vec<_>>();
-    if test_sources.is_empty() {
-        return Vec::new();
-    }
-
-    let mut contexts = Vec::new();
-    for label in labels {
-        let mut ids = Vec::new();
-        for source in &test_sources {
-            ids.extend(requirement_ids_for_unittest_label_from_source(
-                &label, source,
-            ));
-        }
-        ids.sort();
-        ids.dedup();
-        if !ids.is_empty() {
-            contexts.push(format!("{} -> {}", label, ids.join(", ")));
-        }
-        if contexts.len() >= MAX_VERIFICATION_FAILURE_LABELS {
-            break;
-        }
-    }
-    contexts.sort();
-    contexts.dedup();
-    contexts
+        .collect::<Vec<_>>()
 }
 
 fn read_small_test_context_source(path: &Utf8PathBuf, workspace_root: &Utf8Path) -> Option<String> {
@@ -12882,186 +14806,6 @@ fn read_small_test_context_source(path: &Utf8PathBuf, workspace_root: &Utf8Path)
         return None;
     }
     fs::read_to_string(full_path).ok()
-}
-
-fn test_assertion_contexts_for_unittest_failure(
-    compact_summary: &str,
-    raw_summary: &str,
-    workspace_root: &Utf8Path,
-) -> Vec<String> {
-    let labels = extract_verification_failure_labels(compact_summary);
-    if labels.is_empty() {
-        return Vec::new();
-    }
-    let subjects = local_boolean_assertion_subjects(compact_summary);
-    if subjects.is_empty() {
-        return Vec::new();
-    }
-    let test_sources = extract_failure_paths_from_text(raw_summary, workspace_root)
-        .into_iter()
-        .filter(|path| is_test_focus_target(path))
-        .filter_map(|path| read_small_test_context_source(&path, workspace_root))
-        .collect::<Vec<_>>();
-    if test_sources.is_empty() {
-        return Vec::new();
-    }
-
-    let mut contexts = Vec::new();
-    for label in labels {
-        for source in &test_sources {
-            let Some(context) =
-                local_boolean_assertion_context_for_label(&label, source, &subjects)
-            else {
-                continue;
-            };
-            contexts.push(format!("{label}: {}", context.join(" | ")));
-            break;
-        }
-        if contexts.len() >= MAX_VERIFICATION_FAILURE_LABELS {
-            break;
-        }
-    }
-    contexts.sort();
-    contexts.dedup();
-    contexts
-}
-
-fn local_boolean_assertion_subjects(summary: &str) -> Vec<String> {
-    let mut subjects = Vec::new();
-    for line in failure_summary_logical_lines(summary) {
-        let trimmed = line.trim();
-        for marker in ["self.assertTrue(", "self.assertFalse("] {
-            let Some(start) = trimmed.find(marker) else {
-                continue;
-            };
-            let after = &trimmed[start + marker.len()..];
-            let end = after
-                .find(',')
-                .or_else(|| after.find(')'))
-                .unwrap_or(after.len());
-            let subject = after[..end].trim();
-            if is_local_identifier(subject) && !subjects.iter().any(|existing| existing == subject)
-            {
-                subjects.push(subject.to_string());
-            }
-        }
-    }
-    subjects
-}
-
-fn local_boolean_assertion_context_for_label(
-    label: &str,
-    source: &str,
-    subjects: &[String],
-) -> Option<Vec<String>> {
-    let lines = source.lines().collect::<Vec<_>>();
-    let method_index = lines.iter().position(|line| {
-        let trimmed = line.trim_start();
-        trimmed.starts_with("def ")
-            && trimmed
-                .strip_prefix("def ")
-                .is_some_and(|rest| rest.starts_with(label) && rest[label.len()..].starts_with('('))
-    })?;
-    let method_indent = leading_space_count(lines[method_index]);
-    let method_end = lines[method_index + 1..]
-        .iter()
-        .position(|line| {
-            let trimmed = line.trim_start();
-            !trimmed.is_empty()
-                && leading_space_count(line) <= method_indent
-                && (trimmed.starts_with("def ") || trimmed.starts_with("class "))
-        })
-        .map(|offset| method_index + 1 + offset)
-        .unwrap_or(lines.len());
-    let body = &lines[method_index + 1..method_end];
-    for subject in subjects {
-        let Some(assertion_index) = body.iter().position(|line| {
-            let trimmed = line.trim();
-            trimmed.contains(&format!("assertTrue({subject}"))
-                || trimmed.contains(&format!("assertFalse({subject}"))
-        }) else {
-            continue;
-        };
-        let Some(assignment_index) = body[..assertion_index]
-            .iter()
-            .rposition(|line| line.trim_start().starts_with(&format!("{subject} =")))
-        else {
-            continue;
-        };
-        let start = assignment_index.saturating_sub(4);
-        let end = (assertion_index + 1).min(body.len());
-        let context = body[start..end]
-            .iter()
-            .map(|line| line.trim())
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if !context.is_empty() {
-            return Some(context);
-        }
-    }
-    None
-}
-
-fn leading_space_count(line: &str) -> usize {
-    line.chars().take_while(|ch| *ch == ' ').count()
-}
-
-fn failure_summary_logical_lines(summary: &str) -> Vec<&str> {
-    summary
-        .lines()
-        .flat_map(|line| line.split('|'))
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect()
-}
-
-fn is_local_identifier(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-}
-
-fn requirement_ids_for_unittest_label_from_source(label: &str, source: &str) -> Vec<String> {
-    let lines = source.lines().collect::<Vec<_>>();
-    let Some(method_index) = lines.iter().position(|line| {
-        let trimmed = line.trim_start();
-        trimmed.starts_with("def ")
-            && trimmed
-                .strip_prefix("def ")
-                .is_some_and(|rest| rest.starts_with(label) && rest[label.len()..].starts_with('('))
-    }) else {
-        return Vec::new();
-    };
-    let class_index = lines[..method_index]
-        .iter()
-        .rposition(|line| line.trim_start().starts_with("class "))
-        .unwrap_or(method_index);
-    let context_start = class_index.saturating_sub(3);
-    let context_end = (method_index + 10).min(lines.len());
-    extract_contract_requirement_ids(&lines[context_start..context_end].join("\n"))
-}
-
-fn extract_contract_requirement_ids(text: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    for raw in text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-')) {
-        let token = raw.trim_matches(|ch: char| matches!(ch, ':' | '[' | ']' | '`' | '"' | '\''));
-        let Some((prefix, number)) = token.split_once('-') else {
-            continue;
-        };
-        if prefix.chars().all(|ch| ch.is_ascii_uppercase())
-            && !number.is_empty()
-            && number.chars().all(|ch| ch.is_ascii_digit())
-        {
-            ids.push(format!("{prefix}-{number}"));
-        }
-    }
-    ids.sort();
-    ids.dedup();
-    ids
 }
 
 fn compact_verification_failure_detail(summary: &str) -> Option<String> {
@@ -13201,7 +14945,7 @@ fn classify_failure_summary(summary: &str) -> FailureKind {
         return FailureKind::CompletionDrift;
     }
     if lower.contains("verification")
-        || lower.contains("unittest")
+        || language_verification_failure_summary_evidence(summary)
         || lower.contains("integration test")
     {
         return FailureKind::VerificationFailed;
@@ -13281,5 +15025,40 @@ mod message_user_verification_target_tests {
     #[test]
     fn requested_work_missing_todo_graph_stays_authoring_authority() {
         assert!(super::requested_work_missing_todo_graph_stays_authoring_authority());
+    }
+
+    #[test]
+    fn post_failure_runner_byproduct_filechange_does_not_satisfy_repair_progress() {
+        assert!(
+            super::post_failure_runner_byproduct_filechange_does_not_satisfy_repair_progress_fixture_passes()
+        );
+    }
+
+    #[test]
+    fn verification_repair_continuation_existing_byproduct_path_is_not_repair_target() {
+        assert!(
+            super::verification_repair_continuation_existing_byproduct_path_is_not_repair_target_fixture_passes()
+        );
+    }
+
+    #[test]
+    fn verification_repair_targets_from_state_uses_common_repair_authority() {
+        assert!(
+            super::verification_repair_targets_from_state_uses_common_repair_authority_fixture_passes()
+        );
+    }
+
+    #[test]
+    fn generic_generated_test_source_call_site_targets_source_without_python_suffix() {
+        assert!(
+            super::generic_generated_test_source_call_site_targets_source_without_python_suffix_fixture_passes()
+        );
+    }
+
+    #[test]
+    fn generic_generated_test_line_column_call_site_targets_source() {
+        assert!(
+            super::generic_generated_test_line_column_call_site_targets_source_fixture_passes()
+        );
     }
 }

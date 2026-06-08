@@ -136,11 +136,13 @@ fn command_directory(command: &CliCommand) -> Result<camino::Utf8PathBuf, AppBoo
         CliCommand::Run(args) => args.directory.clone().unwrap_or(current),
         CliCommand::SessionList(args) => args.directory.clone().unwrap_or(current),
         CliCommand::Tui(args) => args.directory.clone().unwrap_or(current),
-        CliCommand::Desktop(args) => args
-            .directory
-            .clone()
-            .or_else(default_desktop_workspace_directory)
-            .unwrap_or(current),
+        CliCommand::Desktop(args) => {
+            if let Some(directory) = args.directory.clone() {
+                directory
+            } else {
+                default_desktop_workspace_directory()?.unwrap_or(current)
+            }
+        }
         CliCommand::SessionShow(_) => current,
         CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
@@ -153,10 +155,23 @@ fn command_directory(command: &CliCommand) -> Result<camino::Utf8PathBuf, AppBoo
     })
 }
 
-fn default_desktop_workspace_directory() -> Option<Utf8PathBuf> {
-    let path = StoragePaths::discover()
+fn default_desktop_workspace_directory() -> Result<Option<Utf8PathBuf>, AppBootstrapError> {
+    let Some(path) = StoragePaths::discover()
         .ok()
-        .map(|paths| paths.data_dir.join("quick-chat-workspace"))?;
-    let _ = std::fs::create_dir_all(path.as_std_path());
-    Some(path)
+        .map(|paths| paths.data_dir.join("quick-chat-workspace"))
+    else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(path.as_std_path())?;
+    Ok(Some(path))
+}
+
+pub(crate) fn app_default_desktop_workspace_creation_fixture_passes() -> bool {
+    let Ok(temp_dir) = tempfile::TempDir::new() else {
+        return false;
+    };
+    let Ok(root) = Utf8PathBuf::from_path_buf(temp_dir.path().join("quick-chat-workspace")) else {
+        return false;
+    };
+    std::fs::create_dir_all(root.as_std_path()).is_ok() && root.exists()
 }

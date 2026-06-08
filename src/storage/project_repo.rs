@@ -207,7 +207,10 @@ impl ProjectRepository for SqliteProjectRepository {
 mod tests {
     use super::*;
     use crate::session::{NewSession, SessionRepository};
-    use crate::storage::{SqliteStore, StoragePaths};
+    use crate::storage::{
+        STORAGE_REPOSITORY_FIXTURE_BASE_URL, STORAGE_REPOSITORY_FIXTURE_MODEL, SqliteStore,
+        StoragePaths,
+    };
 
     #[test]
     fn delete_project_removes_child_sessions_without_touching_other_projects() {
@@ -245,8 +248,8 @@ mod tests {
                     project_id: deleted_project,
                     title: "delete me".to_string(),
                     cwd: deleted_root.to_path_buf(),
-                    model: "model".to_string(),
-                    base_url: "http://localhost:1234".to_string(),
+                    model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
+                    base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
                 })
                 .await
                 .expect("insert deleted session");
@@ -255,8 +258,8 @@ mod tests {
                     project_id: kept_project,
                     title: "keep me".to_string(),
                     cwd: kept_root.to_path_buf(),
-                    model: "model".to_string(),
-                    base_url: "http://localhost:1234".to_string(),
+                    model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
+                    base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
                 })
                 .await
                 .expect("insert kept session");

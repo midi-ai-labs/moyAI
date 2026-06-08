@@ -6,6 +6,9 @@ use crate::session::{
     UserMessageMeta,
 };
 
+const SESSION_TRANSCRIPT_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
+const SESSION_TRANSCRIPT_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
+
 pub fn flatten_text_parts(transcript: &Transcript) -> Vec<String> {
     transcript
         .messages
@@ -20,7 +23,7 @@ pub fn flatten_text_parts(transcript: &Transcript) -> Vec<String> {
 
 pub fn transcript_from_history_items(session: &SessionRecord, items: &[HistoryItem]) -> Transcript {
     let mut ordered = items.iter().enumerate().collect::<Vec<_>>();
-    ordered.sort_by_key(|(index, item)| (item.created_at_ms, item.sequence_no, *index));
+    ordered.sort_by_key(|(index, item)| (item.sequence_no, item.created_at_ms, *index));
     let messages = ordered
         .iter()
         .filter_map(|(_, item)| {
@@ -170,6 +173,7 @@ fn history_item_parts(message_id: MessageId, payload: &HistoryItemPayload) -> Ve
             MessagePart::PromptDispatch(dispatch.clone()),
         )),
         HistoryItemPayload::FileChange {
+            call_id,
             change_ids,
             changes,
             summary,
@@ -178,6 +182,7 @@ fn history_item_parts(message_id: MessageId, payload: &HistoryItemPayload) -> Ve
             1,
             PartKind::DiffSummary,
             MessagePart::DiffSummary(DiffSummaryPart {
+                tool_call_id: Some(*call_id),
                 change_ids: change_ids.clone(),
                 changes: changes.clone(),
                 summary: summary.clone(),
@@ -188,6 +193,7 @@ fn history_item_parts(message_id: MessageId, payload: &HistoryItemPayload) -> Ve
         | HistoryItemPayload::Continuation { .. }
         | HistoryItemPayload::StateProjection { .. }
         | HistoryItemPayload::SessionState { .. }
+        | HistoryItemPayload::LifecycleGuard { .. }
         | HistoryItemPayload::ApprovalDecision { .. }
         | HistoryItemPayload::RetryDecision { .. }
         | HistoryItemPayload::ControlEnvelope { .. } => {}
@@ -265,8 +271,8 @@ pub(crate) fn transcript_from_history_items_uses_item_sequence_fixture_passes() 
         title: "sequence fixture".to_string(),
         status: crate::session::SessionStatus::Completed,
         cwd: camino::Utf8PathBuf::from("C:/workspace"),
-        model: "model".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: SESSION_TRANSCRIPT_FIXTURE_MODEL.to_string(),
+        base_url: SESSION_TRANSCRIPT_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 3,
         completed_at_ms: Some(3),
@@ -276,7 +282,7 @@ pub(crate) fn transcript_from_history_items_uses_item_sequence_fixture_passes() 
         session_id: session.id,
         turn_id: crate::protocol::TurnId::new(),
         sequence_no: 2,
-        created_at_ms: 2,
+        created_at_ms: 1,
         payload: HistoryItemPayload::Message {
             message_id: None,
             role: MessageRole::Assistant,
@@ -290,7 +296,7 @@ pub(crate) fn transcript_from_history_items_uses_item_sequence_fixture_passes() 
         session_id: session.id,
         turn_id: crate::protocol::TurnId::new(),
         sequence_no: 1,
-        created_at_ms: 1,
+        created_at_ms: 2,
         payload: HistoryItemPayload::Message {
             message_id: None,
             role: MessageRole::User,
@@ -310,6 +316,21 @@ pub(crate) fn transcript_from_history_items_uses_item_sequence_fixture_passes() 
         && second.record.role == MessageRole::Assistant
         && first.record.sequence_no == 1
         && second.record.sequence_no == 2
+        && matches!(
+            &first.record.metadata,
+            MessageMetadata::User(meta)
+                if meta.requested_model.as_deref() == Some(SESSION_TRANSCRIPT_FIXTURE_MODEL)
+        )
+        && matches!(
+            &second.record.metadata,
+            MessageMetadata::Assistant(meta)
+                if meta.model == SESSION_TRANSCRIPT_FIXTURE_MODEL
+                    && meta.base_url == SESSION_TRANSCRIPT_FIXTURE_BASE_URL
+        )
+}
+
+pub(crate) fn transcript_from_history_items_current_provider_profile_fixture_passes() -> bool {
+    transcript_from_history_items_uses_item_sequence_fixture_passes()
 }
 
 #[cfg(test)]
@@ -317,5 +338,10 @@ mod tests {
     #[test]
     fn transcript_from_history_items_uses_item_sequence() {
         assert!(super::transcript_from_history_items_uses_item_sequence_fixture_passes());
+    }
+
+    #[test]
+    fn transcript_from_history_items_uses_current_provider_profile() {
+        assert!(super::transcript_from_history_items_current_provider_profile_fixture_passes());
     }
 }

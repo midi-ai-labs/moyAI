@@ -1,5 +1,8 @@
 use camino::Utf8PathBuf;
 
+use crate::agent::language_evidence::{
+    ArtifactRole, LanguageFamily, classify_artifact_target, language_source_targets_from_text,
+};
 use crate::session::{
     ContractReconciliationDiagnostic, SessionStateSnapshot, VerificationFailureCluster,
     VerificationFailureEvidence,
@@ -102,7 +105,7 @@ impl ContractReconciliationDecision {
 pub(crate) struct ScenarioContractProfile {
     pub scenario_id: String,
     pub source_target: String,
-    pub generated_test_target: String,
+    pub generated_test_target: Option<String>,
     pub contract_targets: Vec<String>,
     pub requirement_prefixes: Vec<String>,
     pub source_requirement_prefixes: Vec<String>,
@@ -122,7 +125,7 @@ pub(crate) fn scenario_contract_profile(
     ScenarioContractProfile {
         scenario_id: scenario_id.into(),
         source_target: source_target.into(),
-        generated_test_target: generated_test_target.into(),
+        generated_test_target: Some(generated_test_target.into()),
         contract_targets,
         requirement_prefixes: strings(&[
             "FILE", "API", "STATE", "BEH", "TEST", "VERIFY", "HARNESS",
@@ -141,25 +144,30 @@ pub(crate) fn generic_scenario_contract_profile(
     if contract_refs.is_empty() && !has_visible_contract_ref(active_targets) {
         return None;
     }
-    let generated_test_target = first_test_target(active_targets).or_else(|| {
-        first_mutable_source_target(active_targets)
-            .map(|source| format!("test_{}", file_name(&source)))
+    let generated_test_target = first_test_target(active_targets);
+    let source_target = first_mutable_source_target(active_targets).or_else(|| {
+        generated_test_target
+            .as_deref()
+            .and_then(source_target_for_generated_test_target)
     })?;
-    let source_target = first_mutable_source_target(active_targets)
-        .or_else(|| source_target_for_generated_test_target(&generated_test_target))?;
     let contract_targets = contract_refs
         .iter()
         .map(|path| file_name(path.as_str()).to_string())
         .filter(|name| !name.is_empty())
         .collect::<Vec<_>>();
-    Some(scenario_contract_profile(
-        "scenario_contract.visible_contract.v1",
+    Some(ScenarioContractProfile {
+        scenario_id: "scenario_contract.visible_contract.v1".to_string(),
         source_target,
         generated_test_target,
         contract_targets,
-        Vec::new(),
-        Vec::new(),
-    ))
+        requirement_prefixes: strings(&[
+            "FILE", "API", "STATE", "BEH", "TEST", "VERIFY", "HARNESS",
+        ]),
+        source_requirement_prefixes: strings(&["FILE", "API", "STATE", "BEH", "VERIFY"]),
+        test_requirement_prefixes: strings(&["TEST"]),
+        allowed_public_symbols: Vec::new(),
+        allowed_constructor_keywords: Vec::new(),
+    })
 }
 
 pub(crate) fn reconcile_session_state_failure_with_cluster(
@@ -176,11 +184,11 @@ pub(crate) fn reconcile_session_state_failure_with_cluster(
 }
 
 pub(crate) fn contract_reconciliation_ignores_diagnostic_label_targets_fixture_passes() -> bool {
-    let label_target = "BEH-4: bullet overlap assertion message";
+    let label_target = "BEH-4: workflow overlap assertion message";
     let active_targets = vec![
         Utf8PathBuf::from(label_target),
-        Utf8PathBuf::from("arcade_game.py"),
-        Utf8PathBuf::from("test_arcade_game.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -189,56 +197,65 @@ pub(crate) fn contract_reconciliation_ignores_diagnostic_label_targets_fixture_p
         &["BEH-4".to_string()],
     );
     decision.owner == ContractFailureOwner::SourceViolatesContract
-        && decision.required_target.as_deref() == Some("arcade_game.py")
+        && decision.required_target.as_deref() == Some("src/workflow.rs")
         && decision.required_target.as_deref() != Some(label_target)
 }
 
-pub(crate) fn generated_test_constructor_misuse_is_test_owned_fixture_passes() -> bool {
-    let active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
+pub(crate) fn contract_reconciliation_source_only_profile_does_not_synthesize_generated_test_target_fixture_passes()
+-> bool {
+    let active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
+    let contract_refs = vec![
+        Utf8PathBuf::from("scenario_contract.md"),
+        Utf8PathBuf::from("scenario_contract.json"),
     ];
+    let Some(profile) = generic_scenario_contract_profile(&active_targets, &contract_refs) else {
+        return false;
+    };
+    profile.source_target == "src/workflow.rs" && profile.generated_test_target.is_none()
+}
+
+pub(crate) fn generated_test_constructor_misuse_is_test_owned_fixture_passes() -> bool {
+    let active_targets = workflow_active_targets();
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-generated-test-constructor-misuse".to_string(),
-        failing_labels: vec!["test_widget_cli_error".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        failing_labels: vec!["workflow_generated_test_process_contract".to_string()],
+        primary_failure: Some("Command: verify-generated-test --contract".to_string()),
         evidence: vec![crate::session::VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_constructor_signature_mismatch".to_string()),
-            label: Some("test_widget_cli_error".to_string()),
-            target: Some("test_widget.py".to_string()),
-            symbol: None,
-            call_site: Some(
-                "subprocess.Popen([sys.executable, '-c', 'import widget'], capture_output=True)"
+            label: Some("workflow_generated_test_process_contract".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: Some("ExternalProcess".to_string()),
+            call_site: Some("ExternalProcess(args).with_option(unknown=true)".to_string()),
+            exception: Some(
+                "ExternalProcess.__init__() got an unexpected keyword argument 'unknown'"
                     .to_string(),
             ),
-            exception: Some(
-                "Popen.__init__() got an unexpected keyword argument 'capture_output'".to_string(),
-            ),
             expected: None,
-            observed: Some("unexpected keyword `capture_output`".to_string()),
+            observed: Some("unexpected keyword `unknown`".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
-                "Popen.__init__()".to_string(),
-                "constructor keyword compatibility for `Popen`".to_string(),
-                "unexpected keyword `capture_output`".to_string(),
+                "ExternalProcess.__init__()".to_string(),
+                "constructor keyword compatibility for `ExternalProcess`".to_string(),
+                "unexpected keyword `unknown`".to_string(),
                 "public_constructor_signature_mismatch".to_string(),
+                "workflow-generated-test-contract".to_string(),
             ],
             sibling_obligations: vec![
-                "constructor keyword compatibility for `Popen`".to_string(),
-                "unexpected keyword `capture_output`".to_string(),
+                "constructor keyword compatibility for `ExternalProcess`".to_string(),
+                "unexpected keyword `unknown`".to_string(),
             ],
             requirement_refs: Vec::new(),
-            source_refs: vec!["-c".to_string(), "utf-8".to_string()],
-            test_refs: vec!["test_widget.py".to_string()],
+            source_refs: Vec::new(),
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: vec![
-            "constructor keyword compatibility for `Popen`".to_string(),
-            "unexpected keyword `capture_output`".to_string(),
+            "constructor keyword compatibility for `ExternalProcess`".to_string(),
+            "unexpected keyword `unknown`".to_string(),
         ],
-        source_refs: vec!["-c".to_string(), "utf-8".to_string()],
-        test_refs: vec!["test_widget.py".to_string()],
+        source_refs: Vec::new(),
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -247,47 +264,64 @@ pub(crate) fn generated_test_constructor_misuse_is_test_owned_fixture_passes() -
         &[],
     );
     decision.owner == ContractFailureOwner::GeneratedTestOutOfScope
-        && decision.required_target.as_deref() == Some("test_widget.py")
+        && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && decision.permits_generated_test_repair()
         && !decision.source_repair_allowed
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contract_reconciliation_source_only_profile_does_not_synthesize_generated_test_target() {
+        assert!(
+            contract_reconciliation_source_only_profile_does_not_synthesize_generated_test_target_fixture_passes()
+        );
+    }
+
+    #[test]
+    fn contract_reconciliation_preserves_workspace_relative_target_identity() {
+        assert!(
+            contract_reconciliation_preserves_workspace_relative_target_identity_fixture_passes()
+        );
+    }
+}
+
 pub(crate) fn source_constructor_misuse_remains_source_owned_fixture_passes() -> bool {
-    let active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
-    ];
+    let active_targets = workflow_active_targets();
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-source-constructor-misuse".to_string(),
-        failing_labels: vec!["test_widget_constructor".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        failing_labels: vec!["workflow_source_constructor_contract".to_string()],
+        primary_failure: Some("Command: verify-contract --behavior".to_string()),
         evidence: vec![crate::session::VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_constructor_signature_mismatch".to_string()),
-            label: Some("test_widget_constructor".to_string()),
-            target: Some("test_widget.py".to_string()),
-            symbol: Some("Widget".to_string()),
-            call_site: Some("Widget(bad=True)".to_string()),
+            label: Some("workflow_source_constructor_contract".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: Some("workflow".to_string()),
+            call_site: Some("workflow(invalid=true)".to_string()),
             exception: Some(
-                "Widget.__init__() got an unexpected keyword argument 'bad'".to_string(),
+                "workflow.__init__() got an unexpected keyword argument 'invalid'".to_string(),
             ),
             expected: None,
-            observed: Some("unexpected keyword `bad`".to_string()),
+            observed: Some("unexpected keyword `invalid`".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
-                "Widget.__init__()".to_string(),
-                "unexpected keyword `bad`".to_string(),
+                "workflow.__init__()".to_string(),
+                "unexpected keyword `invalid`".to_string(),
                 "public_constructor_signature_mismatch".to_string(),
+                "workflow-source-contract".to_string(),
             ],
-            sibling_obligations: vec!["unexpected keyword `bad`".to_string()],
+            sibling_obligations: vec!["unexpected keyword `invalid`".to_string()],
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
-        sibling_obligations: vec!["unexpected keyword `bad`".to_string()],
+        sibling_obligations: vec!["unexpected keyword `invalid`".to_string()],
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -296,44 +330,44 @@ pub(crate) fn source_constructor_misuse_remains_source_owned_fixture_passes() ->
         &[],
     );
     decision.owner == ContractFailureOwner::SourceViolatesContract
-        && decision.required_target.as_deref() == Some("widget.py")
+        && decision.required_target.as_deref() == Some("src/workflow.rs")
         && decision.source_repair_allowed
 }
 
 pub(crate) fn generated_test_parse_defect_is_test_owned_fixture_passes() -> bool {
-    let active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
-    ];
+    let active_targets = workflow_active_targets();
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-generated-test-parse-defect".to_string(),
-        failing_labels: vec!["test_widget".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        failing_labels: vec!["workflow_generated_test_parse_contract".to_string()],
+        primary_failure: Some("Command: verify-generated-test --parse".to_string()),
         evidence: vec![crate::session::VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("source_parse_defect".to_string()),
-            label: Some("test_widget".to_string()),
-            target: Some("test_widget.py".to_string()),
+            label: Some("workflow_generated_test_parse_contract".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
             symbol: None,
             call_site: None,
             exception: None,
             expected: None,
-            observed: Some("SyntaxError: expected ':'".to_string()),
+            observed: Some("generated test parse defect: missing block terminator".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
-                "source parse defect `SyntaxError: expected ':'`".to_string(),
-                "source parse frame `test_widget.py`".to_string(),
+                "source parse defect `generated test parse defect: missing block terminator`"
+                    .to_string(),
+                "source parse frame `tests/workflow.spec.ts`".to_string(),
                 "source_parse_defect".to_string(),
+                "generated_test_artifact_parse_defect".to_string(),
+                "workflow-generated-test-contract".to_string(),
             ],
             sibling_obligations: Vec::new(),
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -342,54 +376,44 @@ pub(crate) fn generated_test_parse_defect_is_test_owned_fixture_passes() -> bool
         &[],
     );
     decision.owner == ContractFailureOwner::TestViolatesContract
-        && decision.required_target.as_deref() == Some("test_widget.py")
+        && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && decision.permits_generated_test_repair()
         && !decision.source_repair_allowed
 }
 
 pub(crate) fn source_parse_defect_is_source_owned_without_requirement_id_fixture_passes() -> bool {
-    let active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
-    ];
-    let profile = scenario_contract_profile(
-        "scenario_contract.visible_contract.v1",
-        "widget.py",
-        "test_widget.py",
-        vec!["scenario_contract.md".to_string()],
-        Vec::new(),
-        Vec::new(),
-    );
+    let active_targets = workflow_active_targets();
+    let profile = workflow_contract_profile();
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-source-parse-defect".to_string(),
-        failing_labels: vec!["test_widget".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        failing_labels: vec!["workflow_source_parse_contract".to_string()],
+        primary_failure: Some("Command: verify-contract --behavior".to_string()),
         evidence: vec![crate::session::VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("source_parse_defect".to_string()),
-            label: Some("test_widget".to_string()),
-            target: Some("C:/workspace/widget.py".to_string()),
+            label: Some("workflow_source_parse_contract".to_string()),
+            target: Some("src/workflow.rs".to_string()),
             symbol: None,
             call_site: None,
             exception: None,
             expected: None,
-            observed: Some("SyntaxError: expected 'except' or 'finally' block".to_string()),
+            observed: Some("source parse defect: missing branch terminator".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
-                "source parse defect `SyntaxError: expected 'except' or 'finally' block`"
-                    .to_string(),
-                "source parse frame `C:/workspace/widget.py`".to_string(),
+                "source parse defect `source parse defect: missing branch terminator`".to_string(),
+                "source parse frame `src/workflow.rs`".to_string(),
                 "source_parse_defect".to_string(),
+                "workflow-source-contract".to_string(),
             ],
             sibling_obligations: Vec::new(),
             requirement_refs: Vec::new(),
-            source_refs: vec!["widget.py".to_string()],
-            test_refs: vec!["test_widget.py".to_string()],
+            source_refs: vec!["src/workflow.rs".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
-        source_refs: vec!["widget.py".to_string()],
-        test_refs: vec!["test_widget.py".to_string()],
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -399,47 +423,48 @@ pub(crate) fn source_parse_defect_is_source_owned_without_requirement_id_fixture
     );
     decision.owner == ContractFailureOwner::SourceViolatesContract
         && decision.strict_contract_active
-        && decision.required_target.as_deref() == Some("widget.py")
+        && decision.required_target.as_deref() == Some("src/workflow.rs")
         && decision.source_repair_allowed
         && !decision.fail_closed()
 }
 
 pub(crate) fn generated_test_name_resolution_self_defect_without_source_public_api_is_test_owned_fixture_passes()
 -> bool {
-    let active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
-    ];
+    let active_targets = workflow_active_targets();
     let cluster = VerificationFailureCluster {
         cluster_id: "mixed-generated-test-name-resolution".to_string(),
-        failing_labels: vec!["test_cli_widget".to_string(), "test_widget_api".to_string()],
+        failing_labels: vec![
+            "workflow_generated_test_helper".to_string(),
+            "workflow_source_contract".to_string(),
+        ],
         primary_failure: Some(
-            "NameError: name 'envlib' is not defined in generated test helper".to_string(),
+            "NameError: name 'runtimeEnv' is not defined in generated test helper".to_string(),
         ),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("generic_verification_failure".to_string()),
-            label: Some("test_cli_widget".to_string()),
-            target: Some("test_widget.py".to_string()),
-            symbol: Some("envlib".to_string()),
-            call_site: Some("env = dict(envlib.environ)".to_string()),
-            exception: Some("NameError: name 'envlib' is not defined".to_string()),
+            label: Some("workflow_generated_test_helper".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: Some("runtimeEnv".to_string()),
+            call_site: Some("settings = runtimeEnv.current()".to_string()),
+            exception: Some("NameError: name 'runtimeEnv' is not defined".to_string()),
             expected: None,
-            observed: Some("missing generated-test helper name `envlib`".to_string()),
+            observed: Some("missing generated-test helper name `runtimeEnv`".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
                 "generated test helper unresolved name".to_string(),
                 "generated test artifact name resolution defect".to_string(),
+                "workflow-generated-test-contract".to_string(),
             ],
             sibling_obligations: Vec::new(),
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -448,47 +473,47 @@ pub(crate) fn generated_test_name_resolution_self_defect_without_source_public_a
         &[],
     );
     decision.owner == ContractFailureOwner::TestViolatesContract
-        && decision.required_target.as_deref() == Some("test_widget.py")
+        && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && decision.permits_generated_test_repair()
         && !decision.source_repair_allowed
 }
 
 pub(crate) fn generated_test_api_misuse_without_source_public_api_is_test_owned_fixture_passes()
 -> bool {
-    let active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
-    ];
+    let active_targets = workflow_active_targets();
     let cluster = VerificationFailureCluster {
         cluster_id: "generated-test-api-misuse".to_string(),
-        failing_labels: vec!["test_main_guard".to_string()],
-        primary_failure: Some(
-            "TypeError: module, class, method, function, traceback, frame, or code object was expected, got str".to_string(),
-        ),
+        failing_labels: vec!["workflow_generated_test_api_contract".to_string()],
+        primary_failure: Some("Command: verify-generated-test --api".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("generic_verification_failure".to_string()),
-            label: Some("test_main_guard".to_string()),
-            target: Some("test_calculator.py".to_string()),
-            symbol: Some("inspect.getsource".to_string()),
-            call_site: Some("source = inspect.getsource(main.__module__)".to_string()),
-            exception: Some("TypeError: code object was expected, got str".to_string()),
+            label: Some("workflow_generated_test_api_contract".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: Some("reflectContract".to_string()),
+            call_site: Some("source = reflectContract(publicWorkflowName)".to_string()),
+            exception: Some("TypeError: code object was expected, got contract label".to_string()),
             expected: None,
-            observed: Some("generated test invalid reflection subject `inspect.getsource(__module__ string)`".to_string()),
+            observed: Some(
+                "generated test invalid reflection subject `reflectContract(contract label)`"
+                    .to_string(),
+            ),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
                 "generated_test_artifact_api_misuse".to_string(),
-                "generated test invalid reflection subject `inspect.getsource(__module__ string)`".to_string(),
+                "generated test invalid reflection subject `reflectContract(contract label)`"
+                    .to_string(),
+                "workflow-generated-test-contract".to_string(),
             ],
             sibling_obligations: Vec::new(),
-            requirement_refs: vec!["API-5".to_string()],
+            requirement_refs: vec!["workflow-generated-test-contract".to_string()],
             source_refs: Vec::new(),
-            test_refs: vec!["test_calculator.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_calculator.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -497,73 +522,77 @@ pub(crate) fn generated_test_api_misuse_without_source_public_api_is_test_owned_
         &[],
     );
     decision.owner == ContractFailureOwner::TestViolatesContract
-        && decision.required_target.as_deref() == Some("test_calculator.py")
+        && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && decision.permits_generated_test_repair()
         && !decision.source_repair_allowed
 }
 
 pub(crate) fn mixed_generated_test_name_resolution_source_public_api_is_source_test_mismatch_fixture_passes()
 -> bool {
-    let active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
-    ];
+    let active_targets = workflow_active_targets();
     let cluster = VerificationFailureCluster {
         cluster_id: "mixed-generated-test-name-resolution-source-public-api".to_string(),
-        failing_labels: vec!["test_cli_widget".to_string(), "test_widget_api".to_string()],
+        failing_labels: vec![
+            "workflow_generated_test_helper".to_string(),
+            "workflow_public_api".to_string(),
+        ],
         primary_failure: Some(
-            "NameError: name 'envlib' is not defined in generated test helper".to_string(),
+            "NameError: name 'runtimeEnv' is not defined in generated test helper".to_string(),
         ),
         evidence: vec![
             VerificationFailureEvidence {
                 evidence_kind: "verification_failure".to_string(),
                 subtype: Some("generic_verification_failure".to_string()),
-                label: Some("test_cli_widget".to_string()),
-                target: Some("test_widget.py".to_string()),
-                symbol: Some("envlib".to_string()),
-                call_site: Some("env = dict(envlib.environ)".to_string()),
-                exception: Some("NameError: name 'envlib' is not defined".to_string()),
+                label: Some("workflow_generated_test_helper".to_string()),
+                target: Some("tests/workflow.spec.ts".to_string()),
+                symbol: Some("runtimeEnv".to_string()),
+                call_site: Some("settings = runtimeEnv.current()".to_string()),
+                exception: Some("NameError: name 'runtimeEnv' is not defined".to_string()),
                 expected: None,
-                observed: Some("missing generated-test helper name `envlib`".to_string()),
+                observed: Some("missing generated-test helper name `runtimeEnv`".to_string()),
                 public_state_assertions: Vec::new(),
                 public_missing_attributes: Vec::new(),
                 evidence_markers: vec![
                     "generated test helper unresolved name".to_string(),
                     "generated test artifact name resolution defect".to_string(),
+                    "workflow-generated-test-contract".to_string(),
                 ],
                 sibling_obligations: Vec::new(),
                 requirement_refs: Vec::new(),
                 source_refs: Vec::new(),
-                test_refs: vec!["test_widget.py".to_string()],
+                test_refs: vec!["tests/workflow.spec.ts".to_string()],
             },
             VerificationFailureEvidence {
                 evidence_kind: "verification_failure".to_string(),
                 subtype: Some("public_class_attribute_mismatch".to_string()),
-                label: Some("test_widget_api".to_string()),
+                label: Some("workflow_public_api".to_string()),
                 target: None,
-                symbol: Some("widget.calculate_binary".to_string()),
-                call_site: Some("widget.calculate_binary(2, '+', 3)".to_string()),
+                symbol: Some("workflow.execute_operation".to_string()),
+                call_site: Some("workflow.execute_operation(2, 'add', 3)".to_string()),
                 exception: Some(
-                    "AttributeError: module 'widget' has no attribute 'calculate_binary'"
+                    "AttributeError: workflow contract has no public operation `execute_operation`"
                         .to_string(),
                 ),
                 expected: Some("5".to_string()),
                 observed: Some("missing public API".to_string()),
-                public_state_assertions: vec!["widget.calculate_binary(2, '+', 3)".to_string()],
-                public_missing_attributes: vec!["widget.calculate_binary".to_string()],
+                public_state_assertions: vec![
+                    "workflow.execute_operation(2, 'add', 3)".to_string(),
+                ],
+                public_missing_attributes: vec!["workflow.execute_operation".to_string()],
                 evidence_markers: vec![
                     "public_class_attribute_mismatch".to_string(),
-                    "public missing method `widget.calculate_binary`".to_string(),
+                    "public missing method `workflow.execute_operation`".to_string(),
+                    "workflow-source-contract".to_string(),
                 ],
-                sibling_obligations: vec!["`widget.calculate_binary` is missing".to_string()],
+                sibling_obligations: vec!["`workflow.execute_operation` is missing".to_string()],
                 requirement_refs: Vec::new(),
                 source_refs: Vec::new(),
-                test_refs: vec!["test_widget.py".to_string()],
+                test_refs: vec!["tests/workflow.spec.ts".to_string()],
             },
         ],
-        sibling_obligations: vec!["`widget.calculate_binary` is missing".to_string()],
+        sibling_obligations: vec!["`workflow.execute_operation` is missing".to_string()],
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -572,27 +601,24 @@ pub(crate) fn mixed_generated_test_name_resolution_source_public_api_is_source_t
         &[],
     );
     decision.owner == ContractFailureOwner::SourceTestContractMismatch
-        && decision.required_target.as_deref() == Some("widget.py")
+        && decision.required_target.as_deref() == Some("src/workflow.rs")
         && decision.permits_generated_test_repair()
         && decision.source_repair_allowed
 }
 
 pub(crate) fn generated_test_local_binding_contradiction_is_test_owned_fixture_passes() -> bool {
-    let active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
-    ];
+    let active_targets = workflow_active_targets();
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-generated-test-local-binding-contradiction".to_string(),
-        failing_labels: vec!["test_public_tuple_contract".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        failing_labels: vec!["workflow_generated_test_binding_contract".to_string()],
+        primary_failure: Some("Command: verify-generated-test --contract".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_state_assertion_mismatch".to_string()),
-            label: Some("test_public_tuple_contract".to_string()),
-            target: Some("test_widget.py".to_string()),
+            label: Some("workflow_generated_test_binding_contract".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
             symbol: None,
-            call_site: Some("first, operator, first = widget.public_tuple()".to_string()),
+            call_site: Some("first, operation, first = workflow_public_tuple()".to_string()),
             exception: None,
             expected: Some("first public tuple value".to_string()),
             observed: Some("local `first` overwritten by duplicate destructuring".to_string()),
@@ -602,15 +628,16 @@ pub(crate) fn generated_test_local_binding_contradiction_is_test_owned_fixture_p
                 "generated_test_local_binding_contradiction".to_string(),
                 "generated test local binding contradiction".to_string(),
                 "public_state_assertion_mismatch".to_string(),
+                "workflow-generated-test-contract".to_string(),
             ],
             sibling_obligations: vec!["generated test local binding contradiction".to_string()],
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: vec!["generated test local binding contradiction".to_string()],
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -619,22 +646,22 @@ pub(crate) fn generated_test_local_binding_contradiction_is_test_owned_fixture_p
         &[],
     );
     decision.owner == ContractFailureOwner::TestViolatesContract
-        && decision.required_target.as_deref() == Some("test_widget.py")
+        && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && decision.permits_generated_test_repair()
         && !decision.source_repair_allowed
 }
 
 pub(crate) fn generic_generated_test_only_failure_preserves_active_test_target_fixture_passes()
 -> bool {
-    let active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    let active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-generic-generated-test-only".to_string(),
-        failing_labels: vec!["test_invalid_visible_contract".to_string()],
+        failing_labels: vec!["workflow_generated_test_visible_contract".to_string()],
         primary_failure: Some("AssertionError: stale literal expectation".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("generic_verification_failure".to_string()),
-            label: Some("test_invalid_visible_contract".to_string()),
+            label: Some("workflow_generated_test_visible_contract".to_string()),
             target: None,
             symbol: None,
             call_site: None,
@@ -643,15 +670,18 @@ pub(crate) fn generic_generated_test_only_failure_preserves_active_test_target_f
             observed: Some("current visible literal".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
-            evidence_markers: vec!["generic_verification_failure".to_string()],
+            evidence_markers: vec![
+                "generic_verification_failure".to_string(),
+                "workflow-generated-test-contract".to_string(),
+            ],
             sibling_obligations: Vec::new(),
-            requirement_refs: Vec::new(),
+            requirement_refs: vec!["workflow-generated-test-contract".to_string()],
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -660,57 +690,49 @@ pub(crate) fn generic_generated_test_only_failure_preserves_active_test_target_f
         &[],
     );
     decision.owner == ContractFailureOwner::SourceTestContractMismatch
-        && decision.required_target.as_deref() == Some("test_widget.py")
+        && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && decision.source_repair_allowed
         && decision.test_repair_allowed
 }
 
 pub(crate) fn contract_visible_public_exception_failure_is_source_owned_fixture_passes() -> bool {
-    let active_targets = vec![Utf8PathBuf::from("test_widget.py")];
-    let profile = generic_scenario_contract_profile(
-        &active_targets,
-        &[
-            Utf8PathBuf::from("scenario_contract.md"),
-            Utf8PathBuf::from("scenario_contract.json"),
-        ],
-    );
-    let Some(profile) = profile else {
-        return false;
-    };
+    let active_targets = workflow_active_targets();
+    let profile = workflow_contract_profile();
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-contract-visible-public-exception".to_string(),
-        failing_labels: vec!["test_invalid_public_input".to_string()],
-        primary_failure: Some("AssertionError: ValueError not raised".to_string()),
+        failing_labels: vec!["workflow_invalid_public_input".to_string()],
+        primary_failure: Some("workflow public exception behavior was not raised".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_exception_mismatch".to_string()),
-            label: Some("test_invalid_public_input".to_string()),
-            target: Some("test_widget.py".to_string()),
+            label: Some("workflow_invalid_public_input".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
             symbol: None,
-            call_site: Some("with self.assertRaises(ValueError):".to_string()),
-            exception: Some("ValueError not raised".to_string()),
-            expected: Some("ValueError".to_string()),
-            observed: Some("no exception was raised".to_string()),
+            call_site: Some("expect workflow invalid input to raise public error".to_string()),
+            exception: Some("WorkflowError not raised".to_string()),
+            expected: Some("WorkflowError".to_string()),
+            observed: Some("no public error was raised".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
                 "public_exception_mismatch".to_string(),
                 "source_public_behavior_assertion".to_string(),
+                "workflow-source-contract".to_string(),
             ],
             sibling_obligations: vec![
                 "source_public_behavior_assertion".to_string(),
-                "expected public exception `ValueError`".to_string(),
+                "expected public exception `WorkflowError`".to_string(),
             ],
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: vec![
             "source_public_behavior_assertion".to_string(),
-            "expected public exception `ValueError`".to_string(),
+            "expected public exception `WorkflowError`".to_string(),
         ],
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -720,56 +742,45 @@ pub(crate) fn contract_visible_public_exception_failure_is_source_owned_fixture_
     );
     decision.owner == ContractFailureOwner::SourceViolatesContract
         && decision.strict_contract_active
-        && decision.required_target.as_deref() == Some("widget.py")
+        && decision.required_target.as_deref() == Some("src/workflow.rs")
         && decision.source_repair_allowed
         && !decision.test_repair_allowed
         && !decision.fail_closed()
 }
 
 pub(crate) fn generated_test_exception_type_overreach_is_test_owned_fixture_passes() -> bool {
-    let active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
-    ];
-    let profile = generic_scenario_contract_profile(
-        &active_targets,
-        &[
-            Utf8PathBuf::from("scenario_contract.md"),
-            Utf8PathBuf::from("scenario_contract.json"),
-        ],
-    );
-    let Some(profile) = profile else {
-        return false;
-    };
+    let active_targets = workflow_active_targets();
+    let profile = workflow_contract_profile();
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-generated-test-exception-type-overreach".to_string(),
-        failing_labels: vec!["test_divide_by_zero".to_string()],
-        primary_failure: Some("ValueError: division by zero".to_string()),
+        failing_labels: vec!["workflow_generated_test_exception_overreach".to_string()],
+        primary_failure: Some("Command: verify-generated-test --contract".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_exception_mismatch".to_string()),
-            label: Some("test_divide_by_zero".to_string()),
-            target: Some("widget.py".to_string()),
+            label: Some("workflow_generated_test_exception_overreach".to_string()),
+            target: Some("src/workflow.rs".to_string()),
             symbol: None,
-            call_site: Some("widget.divide(10, 0)".to_string()),
-            exception: Some("ValueError".to_string()),
-            expected: Some("ZeroDivisionError".to_string()),
-            observed: Some("ValueError".to_string()),
+            call_site: Some("execute_workflow('invalid')".to_string()),
+            exception: Some("WorkflowRecoverableError".to_string()),
+            expected: Some("WorkflowError".to_string()),
+            observed: Some("WorkflowRecoverableError".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
                 "public_exception_mismatch".to_string(),
                 "generated_test_contract_overreach".to_string(),
                 "generated-test exception type assertion overreach".to_string(),
+                "workflow-generated-test-contract".to_string(),
             ],
             sibling_obligations: Vec::new(),
             requirement_refs: Vec::new(),
-            source_refs: vec!["widget.py".to_string()],
-            test_refs: vec!["test_widget.py".to_string()],
+            source_refs: vec!["src/workflow.rs".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
-        source_refs: vec!["widget.py".to_string()],
-        test_refs: vec!["test_widget.py".to_string()],
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -779,7 +790,7 @@ pub(crate) fn generated_test_exception_type_overreach_is_test_owned_fixture_pass
     );
     decision.owner == ContractFailureOwner::TestViolatesContract
         && decision.strict_contract_active
-        && decision.required_target.as_deref() == Some("test_widget.py")
+        && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && !decision.source_repair_allowed
         && decision.test_repair_allowed
         && !decision.fail_closed()
@@ -787,83 +798,73 @@ pub(crate) fn generated_test_exception_type_overreach_is_test_owned_fixture_pass
 
 pub(crate) fn mixed_generated_test_validity_and_public_behavior_preserves_source_test_mismatch_fixture_passes()
 -> bool {
-    let active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
-    ];
-    let profile = generic_scenario_contract_profile(
-        &active_targets,
-        &[
-            Utf8PathBuf::from("scenario_contract.md"),
-            Utf8PathBuf::from("scenario_contract.json"),
-        ],
-    );
-    let Some(profile) = profile else {
-        return false;
-    };
+    let active_targets = workflow_active_targets();
+    let profile = workflow_contract_profile();
     let cluster = VerificationFailureCluster {
         cluster_id: "fixture-mixed-generated-test-validity-public-behavior".to_string(),
         failing_labels: vec![
-            "test_generated_helper_import".to_string(),
-            "test_invalid_public_input".to_string(),
+            "workflow_generated_test_helper".to_string(),
+            "workflow_invalid_public_input".to_string(),
         ],
         primary_failure: Some(
-            "NameError: name 'envlib' is not defined; AssertionError: ValueError not raised"
+            "NameError: name 'runtimeEnv' is not defined; workflow public exception behavior was not raised"
                 .to_string(),
         ),
         evidence: vec![
             VerificationFailureEvidence {
                 evidence_kind: "verification_failure".to_string(),
                 subtype: Some("generic_verification_failure".to_string()),
-                label: Some("test_generated_helper_import".to_string()),
-                target: Some("test_widget.py".to_string()),
-                symbol: Some("envlib".to_string()),
-                call_site: Some("env = dict(envlib.environ)".to_string()),
-                exception: Some("NameError: name 'envlib' is not defined".to_string()),
+                label: Some("workflow_generated_test_helper".to_string()),
+                target: Some("tests/workflow.spec.ts".to_string()),
+                symbol: Some("runtimeEnv".to_string()),
+                call_site: Some("settings = runtimeEnv.current()".to_string()),
+                exception: Some("NameError: name 'runtimeEnv' is not defined".to_string()),
                 expected: None,
-                observed: Some("missing generated-test helper name `envlib`".to_string()),
+                observed: Some("missing generated-test helper name `runtimeEnv`".to_string()),
                 public_state_assertions: Vec::new(),
                 public_missing_attributes: Vec::new(),
                 evidence_markers: vec![
                     "generated test helper unresolved name".to_string(),
                     "generated test artifact name resolution defect".to_string(),
+                    "workflow-generated-test-contract".to_string(),
                 ],
                 sibling_obligations: Vec::new(),
                 requirement_refs: Vec::new(),
                 source_refs: Vec::new(),
-                test_refs: vec!["test_widget.py".to_string()],
+                test_refs: vec!["tests/workflow.spec.ts".to_string()],
             },
             VerificationFailureEvidence {
                 evidence_kind: "verification_failure".to_string(),
                 subtype: Some("public_exception_mismatch".to_string()),
-                label: Some("test_invalid_public_input".to_string()),
-                target: Some("test_widget.py".to_string()),
+                label: Some("workflow_invalid_public_input".to_string()),
+                target: Some("tests/workflow.spec.ts".to_string()),
                 symbol: None,
-                call_site: Some("with self.assertRaises(ValueError): widget.parse('')".to_string()),
-                exception: Some("ValueError not raised".to_string()),
-                expected: Some("ValueError".to_string()),
-                observed: Some("no exception was raised".to_string()),
+                call_site: Some("expect workflow invalid input to raise public error".to_string()),
+                exception: Some("WorkflowError not raised".to_string()),
+                expected: Some("WorkflowError".to_string()),
+                observed: Some("no public error was raised".to_string()),
                 public_state_assertions: Vec::new(),
                 public_missing_attributes: Vec::new(),
                 evidence_markers: vec![
                     "public_exception_mismatch".to_string(),
                     "source_public_behavior_assertion".to_string(),
+                    "workflow-source-contract".to_string(),
                 ],
                 sibling_obligations: vec![
                     "source_public_behavior_assertion".to_string(),
-                    "expected public exception `ValueError`".to_string(),
+                    "expected public exception `WorkflowError`".to_string(),
                 ],
                 requirement_refs: Vec::new(),
                 source_refs: Vec::new(),
-                test_refs: vec!["test_widget.py".to_string()],
+                test_refs: vec!["tests/workflow.spec.ts".to_string()],
             },
         ],
         sibling_obligations: vec![
             "source_public_behavior_assertion".to_string(),
-            "expected public exception `ValueError`".to_string(),
+            "expected public exception `WorkflowError`".to_string(),
         ],
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     };
     let decision = reconcile_failure_with_profile_and_typed_evidence(
         &active_targets,
@@ -873,10 +874,38 @@ pub(crate) fn mixed_generated_test_validity_and_public_behavior_preserves_source
     );
     decision.owner == ContractFailureOwner::SourceTestContractMismatch
         && decision.strict_contract_active
-        && decision.required_target.as_deref() == Some("widget.py")
+        && decision.required_target.as_deref() == Some("src/workflow.rs")
         && decision.source_repair_allowed
         && decision.test_repair_allowed
         && !decision.fail_closed()
+}
+
+fn workflow_active_targets() -> Vec<Utf8PathBuf> {
+    vec![
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
+    ]
+}
+
+fn workflow_contract_profile() -> ScenarioContractProfile {
+    scenario_contract_profile(
+        "scenario_contract.workflow.v1",
+        "src/workflow.rs",
+        "tests/workflow.spec.ts",
+        vec![
+            "scenario_contract.md".to_string(),
+            "scenario_contract.json".to_string(),
+        ],
+        vec![
+            "execute_workflow".to_string(),
+            "workflow.execute_operation".to_string(),
+            "render_operation".to_string(),
+        ],
+        vec![(
+            "workflow".to_string(),
+            vec!["runtime_config".to_string(), "runtime_settings".to_string()],
+        )],
+    )
 }
 
 pub(crate) fn reconcile_failure_with_profile_and_typed_evidence(
@@ -894,11 +923,12 @@ pub(crate) fn reconcile_failure_with_profile_and_typed_evidence(
         profile,
     );
     let generated_test_target = profile
-        .map(|profile| profile.generated_test_target.clone())
+        .and_then(|profile| profile.generated_test_target.clone())
         .or_else(|| first_test_target(active_targets));
     let source_target = profile
         .map(|profile| profile.source_target.clone())
         .or_else(|| first_mutable_source_target(active_targets))
+        .or_else(|| first_source_call_site_target(failure_cluster))
         .or_else(|| {
             generated_test_target
                 .as_deref()
@@ -1261,6 +1291,7 @@ fn generic_generated_test_only_failure_without_source_evidence(
         )
         .any(|target| target_is_mutable_source_like(target));
     if has_source_ref
+        || first_source_call_site_target(Some(cluster)).is_some()
         || has_source_public_callable_obligation_from_cluster(Some(cluster))
         || has_contract_valid_public_behavior_assertion_from_cluster(Some(cluster))
     {
@@ -1272,6 +1303,17 @@ fn generic_generated_test_only_failure_without_source_evidence(
                 && evidence.public_state_assertions.is_empty()
                 && evidence.public_missing_attributes.is_empty()
         })
+}
+
+fn first_source_call_site_target(cluster: Option<&VerificationFailureCluster>) -> Option<String> {
+    cluster.and_then(|cluster| {
+        cluster
+            .evidence
+            .iter()
+            .filter_map(|evidence| evidence.call_site.as_deref())
+            .flat_map(language_source_targets_from_text)
+            .find(|target| target_is_mutable_source_like(target))
+    })
 }
 
 fn evidence_scoped_uncontracted_repair_target(
@@ -1509,10 +1551,16 @@ impl ContractEvidenceItemStream {
     ) -> bool {
         let has_source_target = active_targets
             .iter()
-            .any(|target| file_name(target.as_str()).eq_ignore_ascii_case(&profile.source_target));
-        let has_generated_test_target = active_targets.iter().any(|target| {
-            file_name(target.as_str()).eq_ignore_ascii_case(&profile.generated_test_target)
-        });
+            .any(|target| target_identity_matches(target.as_str(), &profile.source_target));
+        let has_generated_test_target =
+            profile
+                .generated_test_target
+                .as_ref()
+                .is_some_and(|generated_test_target| {
+                    active_targets.iter().any(|target| {
+                        target_identity_matches(target.as_str(), generated_test_target)
+                    })
+                });
         if !has_source_target || !has_generated_test_target {
             return false;
         }
@@ -1554,7 +1602,7 @@ fn typed_requirement_ids(
 
 fn cluster_refs_contain(refs: &[String], target: &str) -> bool {
     refs.iter()
-        .any(|value| file_name(value).eq_ignore_ascii_case(target))
+        .any(|value| target_identity_matches(value, target))
 }
 
 fn has_contract_owned_public_behavior_assertion_from_cluster(
@@ -1585,7 +1633,12 @@ fn typed_unknown_public_symbol_references(
     let mut symbols = cluster
         .sibling_obligations
         .iter()
-        .chain(cluster.primary_failure.iter())
+        .chain(
+            cluster
+                .evidence
+                .iter()
+                .flat_map(|evidence| evidence.evidence_markers.iter()),
+        )
         .filter_map(|marker| marker.strip_prefix("unknown_public_symbol:"))
         .map(str::trim)
         .filter(|symbol| {
@@ -1616,7 +1669,12 @@ fn typed_unlisted_constructor_keyword_evidence(
     let mut evidence = cluster
         .sibling_obligations
         .iter()
-        .chain(cluster.primary_failure.iter())
+        .chain(
+            cluster
+                .evidence
+                .iter()
+                .flat_map(|evidence| evidence.evidence_markers.iter()),
+        )
         .filter_map(|marker| marker.strip_prefix("constructor_keyword:"))
         .filter_map(|payload| payload.split_once(':'))
         .filter_map(|(symbol, keyword)| {
@@ -1657,6 +1715,7 @@ fn typed_contract_classification_markers(
                     | "oracle_conflict"
                     | "generated_test_insufficient"
                     | "generated_test_out_of_scope"
+                    | "generated_test_artifact_parse_defect"
                     | "generated_test_artifact_name_resolution_defect"
                     | "generated_test_artifact_api_misuse"
                     | "generated_test_subprocess_encoding_missing"
@@ -1750,26 +1809,11 @@ fn evidence_is_generated_test_artifact_validity_defect(
     evidence: &crate::session::VerificationFailureEvidence,
 ) -> bool {
     evidence_is_parse_defect(evidence)
-        || evidence
-            .evidence_markers
-            .iter()
-            .chain(evidence.observed.iter())
-            .chain(evidence.exception.iter())
-            .any(|marker| {
-                let marker = marker.to_ascii_lowercase();
-                marker.contains("generated test artifact name resolution defect")
-                    || marker.contains("generated_test_artifact_name_resolution_defect")
-                    || marker.contains("generated_test_artifact_api_misuse")
-                    || marker.contains("generated test invalid reflection subject")
-                    || marker.contains("generated_test_subprocess_encoding_missing")
-                    || marker.contains("generated test subprocess child encoding missing")
-                    || marker.contains("generated test helper unresolved name")
-                    || (marker.contains("nameerror:") && marker.contains(" is not defined"))
-                    || marker.contains("generated_test_subprocess_output_capture_missing")
-                    || marker.contains("generated_test_subprocess_encoding_missing")
-                    || marker.contains("generated test subprocess child encoding missing")
-                    || marker.contains("subprocess output capture missing")
-            })
+        || evidence.evidence_markers.iter().any(|marker| {
+            generated_test_name_resolution_marker(marker)
+                || generated_test_api_misuse_marker(marker)
+                || generated_test_subprocess_marker(marker)
+        })
 }
 
 fn generated_test_local_binding_contradiction_in_cluster(
@@ -1811,17 +1855,7 @@ fn generated_test_name_resolution_defect_in_cluster(cluster: &VerificationFailur
             && evidence
                 .evidence_markers
                 .iter()
-                .chain(evidence.observed.iter())
-                .chain(evidence.exception.iter())
-                .any(|marker| {
-                    let marker = marker.to_ascii_lowercase();
-                    marker.contains("generated test artifact name resolution defect")
-                        || marker.contains("generated_test_artifact_name_resolution_defect")
-                        || marker.contains("generated_test_artifact_api_misuse")
-                        || marker.contains("generated test invalid reflection subject")
-                        || marker.contains("generated test helper unresolved name")
-                        || (marker.contains("nameerror:") && marker.contains(" is not defined"))
-                })
+                .any(|marker| generated_test_name_resolution_marker(marker))
     })
 }
 
@@ -1831,14 +1865,29 @@ fn generated_test_api_misuse_in_cluster(cluster: &VerificationFailureCluster) ->
             && evidence
                 .evidence_markers
                 .iter()
-                .chain(evidence.observed.iter())
-                .chain(evidence.exception.iter())
-                .any(|marker| {
-                    let marker = marker.to_ascii_lowercase();
-                    marker.contains("generated_test_artifact_api_misuse")
-                        || marker.contains("generated test invalid reflection subject")
-                })
+                .any(|marker| generated_test_api_misuse_marker(marker))
     })
+}
+
+fn generated_test_name_resolution_marker(marker: &str) -> bool {
+    let marker = marker.to_ascii_lowercase();
+    marker.contains("generated test artifact name resolution defect")
+        || marker.contains("generated_test_artifact_name_resolution_defect")
+        || marker.contains("generated test helper unresolved name")
+}
+
+fn generated_test_api_misuse_marker(marker: &str) -> bool {
+    let marker = marker.to_ascii_lowercase();
+    marker.contains("generated_test_artifact_api_misuse")
+        || marker.contains("generated test invalid reflection subject")
+}
+
+fn generated_test_subprocess_marker(marker: &str) -> bool {
+    let marker = marker.to_ascii_lowercase();
+    marker.contains("generated_test_subprocess_encoding_missing")
+        || marker.contains("generated test subprocess child encoding missing")
+        || marker.contains("generated_test_subprocess_output_capture_missing")
+        || marker.contains("subprocess output capture missing")
 }
 
 fn generated_test_parse_defect_without_source_target(cluster: &VerificationFailureCluster) -> bool {
@@ -1852,10 +1901,12 @@ fn generated_test_parse_defect_without_source_target(cluster: &VerificationFailu
 
 fn evidence_is_parse_defect(evidence: &crate::session::VerificationFailureEvidence) -> bool {
     evidence.subtype.as_deref() == Some("source_parse_defect")
-        || evidence
-            .evidence_markers
-            .iter()
-            .any(|marker| marker == "source_parse_defect")
+        || evidence.subtype.as_deref() == Some("generated_test_parse_defect")
+        || evidence.evidence_markers.iter().any(|marker| {
+            marker == "source_parse_defect"
+                || marker == "generated_test_parse_defect"
+                || marker == "generated_test_artifact_parse_defect"
+        })
 }
 
 fn source_parse_defect_source_target(
@@ -1887,9 +1938,9 @@ fn source_parse_defect_source_target(
         )
         .next()?;
     source_target
-        .filter(|source_target| file_name(&target).eq_ignore_ascii_case(source_target))
+        .filter(|source_target| target_identity_matches(&target, source_target))
         .map(str::to_string)
-        .or_else(|| Some(file_name(&target).to_string()))
+        .or_else(|| Some(normalized_target_identity(&target)))
 }
 
 fn generated_test_constructor_signature_misuse_without_source_target(
@@ -1966,8 +2017,6 @@ fn evidence_has_constructor_keyword_misuse(
         .iter()
         .chain(evidence.sibling_obligations.iter())
         .chain(cluster.sibling_obligations.iter())
-        .chain(evidence.exception.iter())
-        .chain(evidence.observed.iter())
         .any(|value| {
             let value = value.to_ascii_lowercase();
             value.contains("unexpected keyword")
@@ -2061,41 +2110,34 @@ fn first_mutable_source_target(targets: &[Utf8PathBuf]) -> Option<String> {
 }
 
 fn source_target_for_generated_test_target(target: &str) -> Option<String> {
-    let normalized = target.replace('\\', "/");
-    let (dir, name) = normalized
-        .rsplit_once('/')
-        .map(|(dir, name)| (Some(dir), name))
-        .unwrap_or((None, normalized.as_str()));
-    let source_name = if let Some(rest) = name.strip_prefix("test_") {
-        rest.to_string()
-    } else if let Some(stem) = name.strip_suffix("_test.py") {
-        format!("{stem}.py")
-    } else {
-        return None;
-    };
-    match dir {
-        Some(dir) if !dir.is_empty() => Some(format!("{dir}/{source_name}")),
-        _ => Some(source_name),
-    }
+    classify_artifact_target(target).source_path
+}
+
+fn target_identity_matches(candidate: &str, expected: &str) -> bool {
+    normalized_target_identity(candidate)
+        .eq_ignore_ascii_case(&normalized_target_identity(expected))
+}
+
+fn normalized_target_identity(target: &str) -> String {
+    classify_artifact_target(target).normalized_target
 }
 
 fn target_is_test_like(target: &str) -> bool {
-    let name = file_name(target).to_ascii_lowercase();
-    name.starts_with("test_") || name.ends_with("_test.py")
+    classify_artifact_target(target).role == ArtifactRole::Test
 }
 
 fn target_is_mutable_source_like(target: &str) -> bool {
-    let normalized = target.replace('\\', "/").to_ascii_lowercase();
-    let name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    !target_is_test_like(target)
-        && !matches!(name, "scenario_contract.md" | "scenario_contract.json")
-        && (normalized.contains("/src/")
-            || name.ends_with(".py")
-            || name.ends_with(".rs")
-            || name.ends_with(".js")
-            || name.ends_with(".ts")
-            || name.ends_with(".tsx")
-            || name.ends_with(".jsx"))
+    let spec = classify_artifact_target(target);
+    let name = file_name(&spec.normalized_target).to_ascii_lowercase();
+    spec.role == ArtifactRole::Source
+        && !matches!(
+            name.as_str(),
+            "scenario_contract.md" | "scenario_contract.json"
+        )
+        && matches!(
+            spec.language,
+            LanguageFamily::Python | LanguageFamily::Code | LanguageFamily::Unknown
+        )
 }
 
 fn file_name(target: &str) -> &str {
@@ -2112,4 +2154,75 @@ fn file_stem(target: &str) -> Option<&str> {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
+}
+
+pub(crate) fn contract_reconciliation_preserves_workspace_relative_target_identity_fixture_passes()
+-> bool {
+    let active_targets = workflow_active_targets();
+    let profile = workflow_contract_profile();
+    let mixed_cluster = VerificationFailureCluster {
+        cluster_id: "fixture-contract-reconciliation-target-identity".to_string(),
+        failing_labels: vec![
+            "workflow_source_requirement".to_string(),
+            "workflow_test_requirement".to_string(),
+        ],
+        primary_failure: Some(
+            "workflow contract and generated test requirements both failed".to_string(),
+        ),
+        evidence: Vec::new(),
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
+    };
+    let mixed_decision = reconcile_failure_with_profile_and_typed_evidence(
+        &active_targets,
+        Some(&profile),
+        Some(&mixed_cluster),
+        &["BEH-7".to_string(), "TEST-2".to_string()],
+    );
+
+    let parse_cluster = VerificationFailureCluster {
+        cluster_id: "fixture-source-parse-target-identity".to_string(),
+        failing_labels: vec!["workflow_source_parse_contract".to_string()],
+        primary_failure: Some("source parse defect in src/workflow.rs".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("source_parse_defect".to_string()),
+            label: Some("workflow_source_parse_contract".to_string()),
+            target: Some("src/workflow.rs".to_string()),
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: None,
+            observed: Some("source parse defect: missing branch terminator".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec!["source_parse_defect".to_string()],
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: vec!["src/workflow.rs".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
+    };
+    let parse_target =
+        source_parse_defect_source_target(Some(&parse_cluster), Some("src/workflow.rs"));
+
+    mixed_decision.owner == ContractFailureOwner::SourceTestContractMismatch
+        && mixed_decision.required_target.as_deref() == Some("src/workflow.rs")
+        && mixed_decision.source_repair_allowed
+        && mixed_decision.test_repair_allowed
+        && parse_target.as_deref() == Some("src/workflow.rs")
+}
+
+pub(crate) fn contract_reconciliation_cluster_refs_exact_target_identity_fixture_passes() -> bool {
+    let exact_refs = vec!["src/workflow.rs".to_string()];
+    let sibling_refs = vec!["tests/workflow.rs".to_string()];
+    let basename_refs = vec!["workflow.rs".to_string()];
+
+    cluster_refs_contain(&exact_refs, "src/workflow.rs")
+        && !cluster_refs_contain(&sibling_refs, "src/workflow.rs")
+        && !cluster_refs_contain(&basename_refs, "src/workflow.rs")
 }

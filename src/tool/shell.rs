@@ -16,6 +16,11 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::language_evidence::{
+    language_command_inherits_utf8_bootstrap, language_command_test_or_verification_io_evidence,
+    language_command_text_io_surface_evidence, language_python_utf8_correction_applies,
+    language_runtime_execution_io_evidence,
+};
 use crate::config::ShellFamily;
 use crate::edit::path_for_change_storage;
 use crate::error::ToolError;
@@ -93,22 +98,7 @@ impl Tool for ShellTool {
         let guarded =
             PathGuard::require_path(ctx.workspace, &requested_workdir, AccessKind::Shell)?;
         if let Some(violation) = shell_contract_violation(&input.command, family) {
-            return Ok(ToolResult {
-                title: violation.title,
-                output_text: violation.output_text,
-                metadata: json!({
-                    "exit_code": null,
-                    "timeout": false,
-                    "truncated": false,
-                    "changed_files": [],
-                    "corrective_result": true,
-                    "contract_violation": violation.kind,
-                    "command_text_encoding_review": violation.encoding_review,
-                }),
-                truncated_output_path: None,
-                recorded_changes: Vec::new(),
-                change_summaries: Vec::new(),
-            });
+            return Ok(shell_contract_violation_result(&input.command, violation));
         }
         let outside_workspace = (!guarded.inside_workspace && !guarded.trusted_external)
             || references_outside_workspace(ctx.workspace, &input.command);
@@ -143,20 +133,29 @@ impl Tool for ShellTool {
         .await?;
         let after = snapshot_workspace(ctx.workspace)?;
         let shell_changes = build_shell_changes(&ctx, before, after)?;
-        sync_shell_change_set(
+        let baseline_snapshot = snapshot_and_sync_shell_change_set(
             &ctx.services.edit_safety,
             ctx.session.session.id,
             &shell_changes,
         )?;
         let changes = shell_changes.changes;
-        let file_change_content_evidence =
-            file_change_content_evidence(&changes, &ctx.workspace.root);
-        let change_ids = ctx
+        let change_ids = match ctx
             .services
             .store
             .change_repo()
             .insert_changes(ctx.session.session.id, &changes)
-            .await?;
+            .await
+        {
+            Ok(change_ids) => change_ids,
+            Err(error) => {
+                restore_shell_change_set_baseline(
+                    &ctx.services.edit_safety,
+                    ctx.session.session.id,
+                    &baseline_snapshot,
+                )?;
+                return Err(error.into());
+            }
+        };
         let change_summaries = changes
             .iter()
             .map(|change| crate::edit::ChangeSummary {
@@ -187,7 +186,6 @@ impl Tool for ShellTool {
                 "timeout": output.timed_out,
                 "truncated": preview.truncated,
                 "changed_files": change_ids,
-                "file_change_content_evidence": file_change_content_evidence,
                 "success": output.exit_code == Some(0) && !output.timed_out,
                 "progress_effect": if output.exit_code == Some(0) && !output.timed_out { "made_progress" } else { "blocked" },
                 "shell_output_projection": {
@@ -234,6 +232,49 @@ impl Tool for ShellTool {
     }
 }
 
+fn shell_contract_violation_result(command: &str, violation: ShellContractViolation) -> ToolResult {
+    let result_hash = crate::harness::artifact::hash_bytes(
+        format!(
+            "shell_contract_violation|{}|{}|{}",
+            violation.kind, command, violation.output_text
+        )
+        .as_bytes(),
+    );
+    let encoding_review = violation.encoding_review.clone();
+    ToolResult {
+        title: violation.title,
+        output_text: violation.output_text,
+        metadata: json!({
+            "exit_code": null,
+            "timeout": false,
+            "truncated": false,
+            "changed_files": [],
+            "corrective_result": true,
+            "contract_violation": violation.kind,
+            "command_text_encoding_review": encoding_review,
+            "success": false,
+            "progress_effect": "no_progress",
+            "result_hash": result_hash,
+            "tool_feedback_envelope": {
+                "kind": "shell_contract_violation",
+                "success": false,
+                "progress_effect": "no_progress",
+                "tool": "shell",
+                "submitted_command": command,
+                "contract_violation": violation.kind,
+                "command_text_encoding_review": violation.encoding_review,
+                "side_effects_applied": false,
+                "blocked_action": violation.kind,
+                "required_next_action": "submit_corrected_native_shell_command",
+                "result_hash": result_hash,
+            },
+        }),
+        truncated_output_path: None,
+        recorded_changes: Vec::new(),
+        change_summaries: Vec::new(),
+    }
+}
+
 struct ShellContractViolation {
     title: String,
     output_text: String,
@@ -251,7 +292,7 @@ fn shell_contract_violation(command: &str, family: ShellFamily) -> Option<ShellC
         }
         if trimmed.contains("2>&1") {
             return Some(shell_syntax_violation(
-                "Do not append `2>&1` when using this `shell` tool on Windows PowerShell. moyai already captures both stdout and stderr for you, and PowerShell 5.1 can turn native stderr redirection into `NativeCommandError` noise. Send the raw command directly, for example `python -m unittest`.",
+                "Do not append `2>&1` when using this `shell` tool on Windows PowerShell. moyai already captures both stdout and stderr for you, and PowerShell 5.1 can turn native stderr redirection into `NativeCommandError` noise. Send the raw command directly without stderr redirection, using native shell syntax.",
             ));
         }
         if trimmed
@@ -416,7 +457,7 @@ fn command_text_encoding_review(command: &str, family: ShellFamily) -> CommandTe
         evidence.push("explicit_encoding_control");
         return CommandTextEncodingReview {
             status: "encoding_explicit",
-            io_profile: command_text_io_profile(&tokens),
+            io_profile: command_text_io_profile(&tokens, &lower),
             evidence,
             required_action: None,
             suggested_command: None,
@@ -439,7 +480,7 @@ fn command_text_encoding_review(command: &str, family: ShellFamily) -> CommandTe
         } else {
             "encoding_unspecified"
         },
-        io_profile: command_text_io_profile(&tokens),
+        io_profile: command_text_io_profile(&tokens, &lower),
         evidence,
         required_action: Some(
             "make the command or generated artifact text encoding explicit before execution",
@@ -470,34 +511,13 @@ fn command_has_text_io_surface(tokens: &[String], lower: &str) -> bool {
     {
         return true;
     }
-    tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "python"
-                | "python3"
-                | "py"
-                | "pytest"
-                | "unittest"
-                | "node"
-                | "npm"
-                | "pnpm"
-                | "yarn"
-                | "ruby"
-                | "perl"
-                | "php"
-                | "java"
-                | "javac"
-                | "dotnet"
-                | "go"
-                | "cargo"
-                | "rustc"
-                | "powershell"
-                | "pwsh"
-        )
-    })
+    language_command_text_io_surface_evidence(tokens, lower)
+        || tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "powershell" | "pwsh"))
 }
 
-fn command_text_io_profile(tokens: &[String]) -> &'static str {
+fn command_text_io_profile(tokens: &[String], lower: &str) -> &'static str {
     if tokens.iter().any(|token| {
         matches!(
             token.as_str(),
@@ -506,17 +526,9 @@ fn command_text_io_profile(tokens: &[String]) -> &'static str {
     }) {
         return "text_producing_or_text_consuming_command";
     }
-    if tokens
-        .iter()
-        .any(|token| matches!(token.as_str(), "test" | "tests" | "pytest" | "unittest"))
-    {
+    if language_command_test_or_verification_io_evidence(tokens, lower) {
         "test_or_verification_runner"
-    } else if tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "python" | "python3" | "py" | "node" | "ruby" | "perl" | "php"
-        )
-    }) {
+    } else if language_runtime_execution_io_evidence(tokens) {
         "language_runtime_execution"
     } else {
         "text_producing_or_text_consuming_command"
@@ -546,12 +558,7 @@ fn command_has_explicit_encoding_control(lower: &str) -> bool {
 }
 
 fn command_inherits_tool_encoding_bootstrap(tokens: &[String]) -> bool {
-    tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "python" | "python3" | "py" | "pytest" | "unittest"
-        )
-    })
+    language_command_inherits_utf8_bootstrap(tokens)
 }
 
 fn command_encoding_correction(
@@ -560,10 +567,7 @@ fn command_encoding_correction(
     lower: &str,
     family: ShellFamily,
 ) -> Option<String> {
-    if tokens
-        .iter()
-        .any(|token| matches!(token.as_str(), "python" | "python3" | "py" | "pytest"))
-    {
+    if language_python_utf8_correction_applies(tokens) {
         return Some(correct_python_command_for_utf8(command, lower, family));
     }
     if tokens
@@ -948,6 +952,104 @@ pub(crate) fn shell_timeout_process_tree_termination_order_fixture_passes() -> b
     ) && plan.last() == Some(&ShellTerminationStep::WaitForParent)
 }
 
+pub(crate) fn shell_contract_violation_typed_no_progress_feedback_fixture_passes() -> bool {
+    let Some(syntax_violation) = shell_contract_violation("dir /s /b", ShellFamily::PowerShell)
+    else {
+        return false;
+    };
+    let syntax_result = shell_contract_violation_result("dir /s /b", syntax_violation);
+    if !shell_contract_violation_result_has_typed_no_progress_feedback(
+        &syntax_result,
+        "shell_syntax_contract",
+        "dir /s /b",
+    ) {
+        return false;
+    }
+
+    let command = "python -m workflow_check";
+    let Some(encoding_violation) = shell_contract_violation(command, ShellFamily::PowerShell)
+    else {
+        return false;
+    };
+    let encoding_result = shell_contract_violation_result(command, encoding_violation);
+    shell_contract_violation_result_has_typed_no_progress_feedback(
+        &encoding_result,
+        "command_text_encoding_contract",
+        command,
+    ) && encoding_result
+        .metadata
+        .pointer("/tool_feedback_envelope/command_text_encoding_review/contract")
+        .and_then(serde_json::Value::as_str)
+        == Some("command_text_encoding_contract")
+}
+
+fn shell_contract_violation_result_has_typed_no_progress_feedback(
+    result: &ToolResult,
+    violation_kind: &str,
+    command: &str,
+) -> bool {
+    result.recorded_changes.is_empty()
+        && result.change_summaries.is_empty()
+        && result
+            .metadata
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && result
+            .metadata
+            .get("progress_effect")
+            .and_then(serde_json::Value::as_str)
+            == Some("no_progress")
+        && result
+            .metadata
+            .get("contract_violation")
+            .and_then(serde_json::Value::as_str)
+            == Some(violation_kind)
+        && result
+            .metadata
+            .get("result_hash")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && result
+            .metadata
+            .pointer("/tool_feedback_envelope/success")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && result
+            .metadata
+            .pointer("/tool_feedback_envelope/progress_effect")
+            .and_then(serde_json::Value::as_str)
+            == Some("no_progress")
+        && result
+            .metadata
+            .pointer("/tool_feedback_envelope/side_effects_applied")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && result
+            .metadata
+            .pointer("/tool_feedback_envelope/submitted_command")
+            .and_then(serde_json::Value::as_str)
+            == Some(command)
+        && result
+            .metadata
+            .pointer("/tool_feedback_envelope/contract_violation")
+            .and_then(serde_json::Value::as_str)
+            == Some(violation_kind)
+        && result
+            .metadata
+            .pointer("/tool_feedback_envelope/required_next_action")
+            .and_then(serde_json::Value::as_str)
+            == Some("submit_corrected_native_shell_command")
+        && result
+            .metadata
+            .pointer("/tool_feedback_envelope/result_hash")
+            .and_then(serde_json::Value::as_str)
+            == result
+                .metadata
+                .get("result_hash")
+                .and_then(serde_json::Value::as_str)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShellCompletionCleanupStep {
     DescendantProcessTreeCleanup,
@@ -1254,6 +1356,20 @@ struct ShellChangeSet {
     current_paths: Vec<Utf8PathBuf>,
 }
 
+impl ShellChangeSet {
+    fn baseline_paths(&self) -> Vec<Utf8PathBuf> {
+        let mut paths = self
+            .removed_paths
+            .iter()
+            .chain(self.current_paths.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+}
+
 fn decode_shell_bytes_for_display(bytes: &[u8]) -> String {
     match String::from_utf8(bytes.to_vec()) {
         Ok(value) => value,
@@ -1279,6 +1395,27 @@ fn sync_shell_change_set(
             &shell_changes.removed_paths,
             &shell_changes.current_paths,
         )
+        .map_err(ToolError::from)
+}
+
+fn snapshot_and_sync_shell_change_set(
+    edit_safety: &crate::edit::EditSafety,
+    session_id: crate::session::SessionId,
+    shell_changes: &ShellChangeSet,
+) -> Result<Vec<(Utf8PathBuf, Option<crate::edit::FileReadStamp>)>, ToolError> {
+    let baseline_snapshot =
+        edit_safety.snapshot_path_stamps(session_id, &shell_changes.baseline_paths());
+    sync_shell_change_set(edit_safety, session_id, shell_changes)?;
+    Ok(baseline_snapshot)
+}
+
+fn restore_shell_change_set_baseline(
+    edit_safety: &crate::edit::EditSafety,
+    session_id: crate::session::SessionId,
+    baseline_snapshot: &[(Utf8PathBuf, Option<crate::edit::FileReadStamp>)],
+) -> Result<(), ToolError> {
+    edit_safety
+        .restore_path_stamps(session_id, baseline_snapshot)
         .map_err(ToolError::from)
 }
 
@@ -1343,66 +1480,6 @@ fn build_shell_changes(
     })
 }
 
-fn file_change_content_evidence(
-    changes: &[crate::edit::FileChange],
-    workspace_root: &Utf8Path,
-) -> serde_json::Value {
-    let mut content_bearing_change_ids = Vec::new();
-    let mut non_satisfying_change_ids = Vec::new();
-    let mut content_bearing_paths = Vec::new();
-    let mut non_satisfying_paths = Vec::new();
-
-    for change in changes {
-        let path = change
-            .path_after
-            .as_ref()
-            .or(change.path_before.as_ref())
-            .map(|path| render_change_path(path, workspace_root))
-            .unwrap_or_default();
-        if file_change_has_content_bearing_after_state(change) {
-            content_bearing_change_ids.push(change.id.to_string());
-            if !path.is_empty() {
-                content_bearing_paths.push(path);
-            }
-        } else {
-            non_satisfying_change_ids.push(change.id.to_string());
-            if !path.is_empty() {
-                non_satisfying_paths.push(path);
-            }
-        }
-    }
-
-    serde_json::json!({
-        "kind": "file_change_content_evidence",
-        "content_bearing": !content_bearing_change_ids.is_empty(),
-        "all_changes_content_bearing": !changes.is_empty() && non_satisfying_change_ids.is_empty(),
-        "content_bearing_change_ids": content_bearing_change_ids,
-        "non_satisfying_change_ids": non_satisfying_change_ids,
-        "content_bearing_paths": content_bearing_paths,
-        "non_satisfying_paths": non_satisfying_paths,
-    })
-}
-
-fn file_change_has_content_bearing_after_state(change: &crate::edit::FileChange) -> bool {
-    if matches!(change.kind, crate::session::ChangeKind::Delete) {
-        return false;
-    }
-    change.diff_text.lines().any(|line| {
-        line.starts_with('+')
-            && !line.starts_with("+++")
-            && line.trim_start_matches('+').trim().len() > 0
-    })
-}
-
-fn render_change_path(path: &Utf8Path, workspace_root: &Utf8Path) -> String {
-    crate::workspace::project::workspace_relative_key_for_match(
-        path.as_str(),
-        workspace_root.as_str(),
-    )
-    .filter(|relative| !relative.is_empty())
-    .unwrap_or_else(|| path.as_str().replace('\\', "/"))
-}
-
 pub(crate) fn shell_change_set_syncs_confirmed_edit_baseline_fixture_passes() -> bool {
     let temp = match tempfile::tempdir() {
         Ok(value) => value,
@@ -1448,6 +1525,47 @@ pub(crate) fn shell_change_set_syncs_confirmed_edit_baseline_fixture_passes() ->
         .is_ok()
 }
 
+pub(crate) fn shell_change_set_restores_baseline_on_persistence_failure_fixture_passes() -> bool {
+    let temp = match tempfile::tempdir() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let path = match Utf8PathBuf::from_path_buf(temp.path().join("shell-edited.txt")) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if fs::write(&path, "before").is_err() {
+        return false;
+    }
+    let edit_safety = crate::edit::EditSafety::default();
+    let session_id = crate::session::SessionId::new();
+    if edit_safety
+        .record_current_file_state(session_id, &path)
+        .is_err()
+    {
+        return false;
+    }
+    let before_stamp = edit_safety.get_stamp(session_id, &path);
+    if before_stamp.is_none() || fs::write(&path, "after").is_err() {
+        return false;
+    }
+    let shell_changes = ShellChangeSet {
+        changes: Vec::new(),
+        removed_paths: vec![path.clone()],
+        current_paths: vec![path.clone()],
+    };
+    let baseline_snapshot =
+        match snapshot_and_sync_shell_change_set(&edit_safety, session_id, &shell_changes) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+    if edit_safety.get_stamp(session_id, &path) == before_stamp {
+        return false;
+    }
+    restore_shell_change_set_baseline(&edit_safety, session_id, &baseline_snapshot).is_ok()
+        && edit_safety.get_stamp(session_id, &path) == before_stamp
+}
+
 pub(crate) fn shell_output_encoding_fixture_passes() -> bool {
     let cp932_japanese = [
         0x8e, 0xa9, 0x91, 0x52, 0x91, 0xce, 0x90, 0x94, 0x82, 0xcc, 0x8a, 0xee, 0x96, 0x7b, 0x93,
@@ -1474,16 +1592,17 @@ pub(crate) fn shell_output_encoding_fixture_passes() -> bool {
 }
 
 pub fn command_text_encoding_contract_fixture_passes() -> bool {
-    let python_plain = command_text_encoding_review("python -m unittest", ShellFamily::PowerShell);
+    let python_plain =
+        command_text_encoding_review("python -m workflow_check", ShellFamily::PowerShell);
     if python_plain.status != "encoding_inherited_from_tool_environment"
         || !python_plain.requires_correction
-        || python_plain.suggested_command.as_deref() != Some("python -X utf8 -m unittest")
+        || python_plain.suggested_command.as_deref() != Some("python -X utf8 -m workflow_check")
     {
         return false;
     }
 
     let python_explicit =
-        command_text_encoding_review("python -X utf8 -m unittest", ShellFamily::PowerShell);
+        command_text_encoding_review("python -X utf8 -m workflow_check", ShellFamily::PowerShell);
     if python_explicit.status != "encoding_explicit" || python_explicit.requires_correction {
         return false;
     }
@@ -1502,6 +1621,30 @@ pub fn command_text_encoding_contract_fixture_passes() -> bool {
         return false;
     }
 
+    let node_builtin_test = command_text_encoding_review("node --test", ShellFamily::PowerShell);
+    if node_builtin_test.io_profile != "test_or_verification_runner"
+        || node_builtin_test.status != "encoding_unspecified"
+        || !node_builtin_test.requires_correction
+    {
+        return false;
+    }
+
+    let bun_test = command_text_encoding_review("bun test", ShellFamily::PowerShell);
+    if bun_test.io_profile != "test_or_verification_runner"
+        || bun_test.status != "encoding_unspecified"
+        || !bun_test.requires_correction
+    {
+        return false;
+    }
+
+    let deno_test = command_text_encoding_review("deno test", ShellFamily::PowerShell);
+    if deno_test.io_profile != "test_or_verification_runner"
+        || deno_test.status != "encoding_unspecified"
+        || !deno_test.requires_correction
+    {
+        return false;
+    }
+
     let diagnostic = command_text_encoding_review(
         "Get-Process | Select-Object -First 5",
         ShellFamily::PowerShell,
@@ -1511,7 +1654,7 @@ pub fn command_text_encoding_contract_fixture_passes() -> bool {
     }
 
     let get_content_utf8 = command_text_encoding_review(
-        "Get-Content calculator.py -Encoding UTF8",
+        "Get-Content src/workflow.rs -Encoding UTF8",
         ShellFamily::PowerShell,
     );
     if get_content_utf8.status != "encoding_explicit"
@@ -1570,6 +1713,11 @@ mod tests {
     #[test]
     fn shell_change_set_syncs_confirmed_edit_baseline() {
         assert!(super::shell_change_set_syncs_confirmed_edit_baseline_fixture_passes());
+    }
+
+    #[test]
+    fn shell_change_set_restores_baseline_on_persistence_failure() {
+        assert!(super::shell_change_set_restores_baseline_on_persistence_failure_fixture_passes());
     }
 
     #[test]

@@ -36,7 +36,6 @@ pub use state::{
     VerificationState,
 };
 pub use todo::{
-    TodoItem, TodoKind, TodoPriority, TodoStatus, is_completion_todo, todo_counts_as_open_work,
-    todo_is_completion_item,
+    TodoItem, TodoKind, TodoPriority, TodoStatus, todo_counts_as_open_work, todo_is_completion_item,
 };
 pub use transcript::transcript_from_history_items;

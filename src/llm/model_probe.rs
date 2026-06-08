@@ -7,6 +7,14 @@ use serde_json::{Value, json};
 
 use crate::config::{ProviderMetadataMode, ResolvedConfig};
 use crate::error::LlmError;
+use crate::llm::dto::{
+    OpenAiChatRequest, OpenAiContent, OpenAiContentPart, OpenAiImageUrl, OpenAiMessage,
+};
+use crate::llm::openai_compat::{openai_tool_schema_json, provider_tool_choice_json};
+use crate::llm::{
+    ProviderToolChoice, ToolSchema, effective_parallel_tool_calls,
+    tool_surface_scoped_parallel_tool_calls_projection,
+};
 
 #[derive(Debug, Deserialize)]
 struct OpenAiModelsResponse {
@@ -51,6 +59,33 @@ pub struct ToolCallProbeReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisionProbeReport {
+    pub probe: String,
+    pub status: ModelAvailabilityStatus,
+    pub required_for_gate: bool,
+    pub image_content_sent: bool,
+    pub response_received: bool,
+    pub finish_reason: Option<String>,
+    pub content: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapabilityKind {
+    ToolUse,
+    VisionInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCapabilityOverride {
+    pub capability: ModelCapabilityKind,
+    pub metadata_value: Option<bool>,
+    pub effective_value: bool,
+    pub evidence_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelAvailabilityReport {
     pub gate: String,
     pub status: ModelAvailabilityStatus,
@@ -62,7 +97,13 @@ pub struct ModelAvailabilityReport {
     pub native_present: bool,
     pub require_vision: bool,
     pub vision_capable: bool,
+    #[serde(default)]
+    pub vision_probe_passed: bool,
+    #[serde(default)]
+    pub vision_probes: Vec<VisionProbeReport>,
     pub tool_use_capable: Option<bool>,
+    #[serde(default)]
+    pub capability_overrides: Vec<ModelCapabilityOverride>,
     pub tool_call_probe_passed: bool,
     pub tool_call_probes: Vec<ToolCallProbeReport>,
     pub reasoning_capable: Option<bool>,
@@ -166,7 +207,10 @@ pub async fn check_model_availability(
         native_present: false,
         require_vision,
         vision_capable: false,
+        vision_probe_passed: false,
+        vision_probes: Vec::new(),
         tool_use_capable: None,
+        capability_overrides: Vec::new(),
         tool_call_probe_passed: false,
         tool_call_probes: Vec::new(),
         reasoning_capable: None,
@@ -282,6 +326,22 @@ pub async fn check_model_availability(
     }
     report.matched_model = matched_model;
 
+    if report.v1_present && report.require_vision {
+        let vision_probe =
+            run_vision_probe(&client, &report.base_url, headers.clone(), &report.model).await;
+        report.vision_probes = vec![vision_probe];
+        report.vision_probe_passed = report
+            .vision_probes
+            .iter()
+            .filter(|probe| probe.required_for_gate)
+            .all(|probe| matches!(probe.status, ModelAvailabilityStatus::Pass));
+        if report.vision_probe_passed {
+            apply_vision_probe_capability_evidence(&mut report);
+        } else {
+            report.vision_capable = false;
+        }
+    }
+
     if report.v1_present {
         report.tool_call_probes = run_tool_call_probe_suite(
             &client,
@@ -289,6 +349,10 @@ pub async fn check_model_availability(
             headers,
             &report.model,
             report.provider_metadata_mode,
+            config.model.parallel_tool_calls,
+            report
+                .max_parallel_predictions
+                .unwrap_or(config.model.max_parallel_predictions),
         )
         .await;
         report.tool_call_probe_passed = !report.tool_call_probes.is_empty()
@@ -297,9 +361,7 @@ pub async fn check_model_availability(
                 .iter()
                 .filter(|probe| probe.required_for_gate)
                 .all(|probe| matches!(probe.status, ModelAvailabilityStatus::Pass));
-        if report.tool_call_probe_passed && report.tool_use_capable.is_none() {
-            report.tool_use_capable = Some(true);
-        }
+        apply_tool_call_probe_capability_evidence(&mut report);
     }
 
     if model_availability_passes(
@@ -308,11 +370,63 @@ pub async fn check_model_availability(
         report.native_present,
         report.require_vision,
         report.vision_capable,
+        report.vision_probe_passed,
         report.tool_call_probe_passed,
     ) {
         report.status = ModelAvailabilityStatus::Pass;
     }
     report
+}
+
+fn apply_vision_probe_capability_evidence(report: &mut ModelAvailabilityReport) {
+    if !report.vision_probe_passed {
+        return;
+    }
+    let metadata_value = report
+        .matched_model
+        .as_ref()
+        .and_then(|model| model.supports_images);
+    if metadata_value != Some(true)
+        && !report.capability_overrides.iter().any(|override_record| {
+            override_record.capability == ModelCapabilityKind::VisionInput
+                && override_record.evidence_ref == "vision_probe_passed"
+        })
+    {
+        report.capability_overrides.push(ModelCapabilityOverride {
+            capability: ModelCapabilityKind::VisionInput,
+            metadata_value,
+            effective_value: true,
+            evidence_ref: "vision_probe_passed".to_string(),
+        });
+    }
+    report.vision_capable = true;
+    if let Some(model) = report.matched_model.as_mut() {
+        model.supports_images = Some(true);
+    }
+}
+
+fn apply_tool_call_probe_capability_evidence(report: &mut ModelAvailabilityReport) {
+    if !report.tool_call_probe_passed {
+        return;
+    }
+    let metadata_value = report.tool_use_capable;
+    if metadata_value != Some(true)
+        && !report.capability_overrides.iter().any(|override_record| {
+            override_record.capability == ModelCapabilityKind::ToolUse
+                && override_record.evidence_ref == "tool_call_probe_passed"
+        })
+    {
+        report.capability_overrides.push(ModelCapabilityOverride {
+            capability: ModelCapabilityKind::ToolUse,
+            metadata_value,
+            effective_value: true,
+            evidence_ref: "tool_call_probe_passed".to_string(),
+        });
+    }
+    report.tool_use_capable = Some(true);
+    if let Some(model) = report.matched_model.as_mut() {
+        model.supports_tools = Some(true);
+    }
 }
 
 fn model_availability_passes(
@@ -321,14 +435,151 @@ fn model_availability_passes(
     native_present: bool,
     require_vision: bool,
     vision_capable: bool,
+    vision_probe_passed: bool,
     tool_call_probe_passed: bool,
 ) -> bool {
     let provider_ok = match provider_metadata_mode {
         ProviderMetadataMode::LmStudioNativeRequired => v1_present && native_present,
         ProviderMetadataMode::OpenAiCompatibleOnly => v1_present,
     };
-    let vision_ok = !require_vision || vision_capable;
+    let vision_ok = !require_vision || (vision_capable && vision_probe_passed);
     provider_ok && vision_ok && tool_call_probe_passed
+}
+
+async fn run_vision_probe(
+    client: &reqwest::Client,
+    base_url: &str,
+    headers: HeaderMap,
+    model: &str,
+) -> VisionProbeReport {
+    let endpoint = format!("{}/v1/chat/completions", base_url);
+    let body = match vision_probe_request_body(model) {
+        Ok(body) => body,
+        Err(error) => {
+            return failed_vision_probe_report(format!(
+                "vision probe request could not be materialized: {error}"
+            ));
+        }
+    };
+
+    let response = match client
+        .post(&endpoint)
+        .headers(headers)
+        .json(&body)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return failed_vision_probe_report(format!("vision probe request failed: {error}"));
+        }
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<response body unavailable>".to_string());
+        return failed_vision_probe_report(format!(
+            "vision probe request failed with status {}: {}",
+            status,
+            summarize_body(&body)
+        ));
+    }
+    let payload = match response.json::<Value>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            return failed_vision_probe_report(format!(
+                "vision probe response was not valid JSON: {error}"
+            ));
+        }
+    };
+    vision_probe_report_from_response(&payload)
+}
+
+fn vision_probe_request_body(model: &str) -> Result<Value, LlmError> {
+    const ONE_PIXEL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    let request = OpenAiChatRequest {
+        model: model.to_string(),
+        stream: false,
+        messages: vec![OpenAiMessage {
+            role: "user".to_string(),
+            content: Some(OpenAiContent::Parts(vec![
+                OpenAiContentPart::Text {
+                    text: "Reply with a short confirmation that you received this image."
+                        .to_string(),
+                },
+                OpenAiContentPart::ImageUrl {
+                    image_url: OpenAiImageUrl {
+                        url: format!("data:image/png;base64,{ONE_PIXEL_PNG_BASE64}"),
+                    },
+                },
+            ])),
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        max_tokens: Some(32),
+        temperature: Some(0.0),
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        stop_sequences: Vec::new(),
+        tools: Vec::new(),
+        parallel_tool_calls: None,
+    };
+    serde_json::to_value(request)
+        .map_err(|error| LlmError::Message(format!("failed to serialize vision probe: {error}")))
+}
+
+fn vision_probe_report_from_response(payload: &Value) -> VisionProbeReport {
+    let choice = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first());
+    let finish_reason = choice.and_then(|choice| string_field(choice, &["finish_reason"]));
+    let message = choice.and_then(|choice| choice.get("message"));
+    let content = message
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let response_received = content
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    VisionProbeReport {
+        probe: "vision_input_image_url".to_string(),
+        status: if response_received {
+            ModelAvailabilityStatus::Pass
+        } else {
+            ModelAvailabilityStatus::Fail
+        },
+        required_for_gate: true,
+        image_content_sent: true,
+        response_received,
+        finish_reason,
+        content,
+        error: if response_received {
+            None
+        } else {
+            Some("expected non-empty assistant content after image input probe".to_string())
+        },
+    }
+}
+
+fn failed_vision_probe_report(error: String) -> VisionProbeReport {
+    VisionProbeReport {
+        probe: "vision_input_image_url".to_string(),
+        status: ModelAvailabilityStatus::Fail,
+        required_for_gate: true,
+        image_content_sent: false,
+        response_received: false,
+        finish_reason: None,
+        content: None,
+        error: Some(error),
+    }
 }
 
 async fn run_tool_call_probe_suite(
@@ -337,42 +588,46 @@ async fn run_tool_call_probe_suite(
     headers: HeaderMap,
     model: &str,
     provider_metadata_mode: ProviderMetadataMode,
+    parallel_tool_calls_enabled: bool,
+    max_parallel_predictions: u32,
 ) -> Vec<ToolCallProbeReport> {
     let probes = [
-        (
-            "tool_choice_required",
-            "required",
-            json!("required"),
-            false,
-            true,
-        ),
-        (
-            "tool_choice_named",
-            "named_function",
-            json!({
-                "type": "function",
-                "function": {
-                    "name": "echo_word"
-                }
+        ToolCallProbeSpec {
+            probe: "tool_choice_required",
+            tool_choice_label: "required",
+            tool_choice: ProbeToolChoice::Runtime(ProviderToolChoice::Required),
+            strong_instruction: false,
+            required_for_gate: true,
+        },
+        ToolCallProbeSpec {
+            probe: "tool_choice_named",
+            tool_choice_label: "named_function",
+            tool_choice: ProbeToolChoice::Runtime(ProviderToolChoice::Named {
+                name: "echo_word".to_string(),
             }),
-            false,
-            provider_metadata_mode == ProviderMetadataMode::OpenAiCompatibleOnly,
-        ),
-        ("tool_choice_auto_strong", "auto", json!("auto"), true, true),
+            strong_instruction: false,
+            required_for_gate: provider_metadata_mode == ProviderMetadataMode::OpenAiCompatibleOnly,
+        },
+        ToolCallProbeSpec {
+            probe: "tool_choice_auto_strong",
+            tool_choice_label: "auto",
+            tool_choice: ProbeToolChoice::Auto,
+            strong_instruction: true,
+            required_for_gate: true,
+        },
     ];
     let mut reports = Vec::with_capacity(probes.len());
-    for (probe, tool_choice_label, tool_choice, strong_instruction, required_for_gate) in probes {
+    for spec in probes {
         reports.push(
             run_tool_call_probe(
                 client,
                 base_url,
                 headers.clone(),
                 model,
-                probe,
-                tool_choice_label,
-                tool_choice,
-                strong_instruction,
-                required_for_gate,
+                provider_metadata_mode,
+                &spec,
+                parallel_tool_calls_enabled,
+                max_parallel_predictions,
             )
             .await,
         );
@@ -380,18 +635,113 @@ async fn run_tool_call_probe_suite(
     reports
 }
 
+#[derive(Debug, Clone)]
+struct ToolCallProbeSpec {
+    probe: &'static str,
+    tool_choice_label: &'static str,
+    tool_choice: ProbeToolChoice,
+    strong_instruction: bool,
+    required_for_gate: bool,
+}
+
+#[derive(Debug, Clone)]
+enum ProbeToolChoice {
+    Runtime(ProviderToolChoice),
+    Auto,
+}
+
 async fn run_tool_call_probe(
     client: &reqwest::Client,
     base_url: &str,
     headers: HeaderMap,
     model: &str,
-    probe: &str,
-    tool_choice_label: &str,
-    tool_choice: Value,
-    strong_instruction: bool,
-    required_for_gate: bool,
+    provider_metadata_mode: ProviderMetadataMode,
+    spec: &ToolCallProbeSpec,
+    parallel_tool_calls_enabled: bool,
+    max_parallel_predictions: u32,
 ) -> ToolCallProbeReport {
     let endpoint = format!("{}/v1/chat/completions", base_url);
+    let body = match tool_call_probe_request_body(
+        model,
+        provider_metadata_mode,
+        &spec.tool_choice,
+        spec.strong_instruction,
+        parallel_tool_calls_enabled,
+        max_parallel_predictions,
+    ) {
+        Ok(body) => body,
+        Err(error) => {
+            return failed_tool_call_probe_report(
+                spec.probe,
+                spec.tool_choice_label,
+                spec.required_for_gate,
+                format!("tool-call probe request could not be materialized: {error}"),
+            );
+        }
+    };
+
+    let response = match client
+        .post(&endpoint)
+        .headers(headers)
+        .json(&body)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return failed_tool_call_probe_report(
+                spec.probe,
+                spec.tool_choice_label,
+                spec.required_for_gate,
+                format!("tool-call probe request failed: {error}"),
+            );
+        }
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<response body unavailable>".to_string());
+        return failed_tool_call_probe_report(
+            spec.probe,
+            spec.tool_choice_label,
+            spec.required_for_gate,
+            format!(
+                "tool-call probe request failed with status {}: {}",
+                status,
+                summarize_body(&body)
+            ),
+        );
+    }
+    let payload = match response.json::<Value>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            return failed_tool_call_probe_report(
+                spec.probe,
+                spec.tool_choice_label,
+                spec.required_for_gate,
+                format!("tool-call probe response was not valid JSON: {error}"),
+            );
+        }
+    };
+    tool_call_probe_report_from_response(
+        spec.probe,
+        spec.tool_choice_label,
+        spec.required_for_gate,
+        &payload,
+    )
+}
+
+fn tool_call_probe_request_body(
+    model: &str,
+    provider_metadata_mode: ProviderMetadataMode,
+    tool_choice: &ProbeToolChoice,
+    strong_instruction: bool,
+    parallel_tool_calls_enabled: bool,
+    max_parallel_predictions: u32,
+) -> Result<Value, LlmError> {
     let messages = if strong_instruction {
         json!([
             {
@@ -411,80 +761,57 @@ async fn run_tool_call_probe(
             }
         ])
     };
-    let body = json!({
+    let echo_tool = echo_word_tool_schema();
+    let mut body = json!({
         "model": model,
+        "stream": false,
         "messages": messages,
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "echo_word",
-                    "description": "Echoes a single word for provider tool-call capability probing.",
-                    "parameters": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "word": {
-                                "type": "string"
-                            }
-                        },
-                        "required": ["word"]
-                    }
-                }
-            }
-        ],
-        "tool_choice": tool_choice,
+        "tools": [openai_tool_schema_json(&echo_tool)?],
+        "tool_choice": probe_tool_choice_json(tool_choice, provider_metadata_mode),
         "temperature": 0,
         "max_tokens": 128
     });
-
-    let response = match client
-        .post(&endpoint)
-        .headers(headers)
-        .json(&body)
-        .timeout(Duration::from_secs(120))
-        .send()
-        .await
+    if let Some(parallel_tool_calls) = tool_surface_scoped_parallel_tool_calls_projection(
+        1,
+        effective_parallel_tool_calls(1, parallel_tool_calls_enabled, max_parallel_predictions),
+    ) && let Value::Object(map) = &mut body
     {
-        Ok(response) => response,
-        Err(error) => {
-            return failed_tool_call_probe_report(
-                probe,
-                tool_choice_label,
-                required_for_gate,
-                format!("tool-call probe request failed: {error}"),
-            );
-        }
-    };
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<response body unavailable>".to_string());
-        return failed_tool_call_probe_report(
-            probe,
-            tool_choice_label,
-            required_for_gate,
-            format!(
-                "tool-call probe request failed with status {}: {}",
-                status,
-                summarize_body(&body)
-            ),
+        map.insert(
+            "parallel_tool_calls".to_string(),
+            Value::Bool(parallel_tool_calls),
         );
     }
-    let payload = match response.json::<Value>().await {
-        Ok(payload) => payload,
-        Err(error) => {
-            return failed_tool_call_probe_report(
-                probe,
-                tool_choice_label,
-                required_for_gate,
-                format!("tool-call probe response was not valid JSON: {error}"),
-            );
+    Ok(body)
+}
+
+fn probe_tool_choice_json(
+    tool_choice: &ProbeToolChoice,
+    provider_metadata_mode: ProviderMetadataMode,
+) -> Value {
+    match tool_choice {
+        ProbeToolChoice::Runtime(choice) => {
+            provider_tool_choice_json(choice, provider_metadata_mode)
         }
-    };
-    tool_call_probe_report_from_response(probe, tool_choice_label, required_for_gate, &payload)
+        ProbeToolChoice::Auto => json!("auto"),
+    }
+}
+
+fn echo_word_tool_schema() -> ToolSchema {
+    ToolSchema {
+        name: "echo_word".to_string(),
+        description: "Echoes a single word for provider tool-call capability probing.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "word": {
+                    "type": "string"
+                }
+            },
+            "required": ["word"]
+        }),
+        strict: false,
+    }
 }
 
 fn tool_call_probe_report_from_response(
@@ -515,13 +842,7 @@ fn tool_call_probe_report_from_response(
         .map(ToString::to_string);
     let arguments_valid = tool_arguments
         .as_deref()
-        .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
-        .and_then(|arguments| {
-            arguments
-                .get("word")
-                .and_then(Value::as_str)
-                .map(|word| word == "ping")
-        })
+        .map(echo_word_probe_arguments_valid)
         .unwrap_or(false);
     let tool_call_received = first_tool_call.is_some();
     let passed = tool_call_received && tool_name.as_deref() == Some("echo_word") && arguments_valid;
@@ -548,6 +869,51 @@ fn tool_call_probe_report_from_response(
     }
 }
 
+fn echo_word_probe_arguments_valid(arguments: &str) -> bool {
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(arguments) else {
+        return false;
+    };
+    object.len() == 1 && object.get("word").and_then(Value::as_str) == Some("ping")
+}
+
+pub fn model_probe_rejects_extra_tool_arguments_fixture_passes() -> bool {
+    let valid_payload = json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "function": {
+                        "name": "echo_word",
+                        "arguments": "{\"word\":\"ping\"}"
+                    }
+                }]
+            }
+        }]
+    });
+    let extra_payload = json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "function": {
+                        "name": "echo_word",
+                        "arguments": "{\"word\":\"ping\",\"extra\":\"accepted\"}"
+                    }
+                }]
+            }
+        }]
+    });
+    let valid = tool_call_probe_report_from_response("fixture", "required", true, &valid_payload);
+    let extra = tool_call_probe_report_from_response("fixture", "required", true, &extra_payload);
+
+    matches!(valid.status, ModelAvailabilityStatus::Pass)
+        && valid.arguments_valid
+        && matches!(extra.status, ModelAvailabilityStatus::Fail)
+        && !extra.arguments_valid
+        && extra.tool_call_received
+        && extra.tool_name.as_deref() == Some("echo_word")
+}
+
 fn failed_tool_call_probe_report(
     probe: &str,
     tool_choice_label: &str,
@@ -569,26 +935,261 @@ fn failed_tool_call_probe_report(
     }
 }
 
-pub async fn ensure_openai_model_available(config: &ResolvedConfig) -> Result<(), LlmError> {
-    let configured_model = config.model.model.trim();
-    if configured_model.is_empty() {
-        return Err(LlmError::Message("configured model is empty".to_string()));
+pub(crate) fn model_availability_probe_uses_shared_transport_projection_fixture_passes() -> bool {
+    let provider_profile_marker = "model_probe_fixture_provider_profile_openai_compatible";
+    let Ok(required_body) = tool_call_probe_request_body(
+        "openai-compatible-fixture-model",
+        ProviderMetadataMode::OpenAiCompatibleOnly,
+        &ProbeToolChoice::Runtime(ProviderToolChoice::Required),
+        false,
+        true,
+        1,
+    ) else {
+        return false;
+    };
+    let Ok(named_openai_body) = tool_call_probe_request_body(
+        "openai-compatible-fixture-model",
+        ProviderMetadataMode::OpenAiCompatibleOnly,
+        &ProbeToolChoice::Runtime(ProviderToolChoice::Named {
+            name: "echo_word".to_string(),
+        }),
+        false,
+        true,
+        2,
+    ) else {
+        return false;
+    };
+    let Ok(named_lm_studio_body) = tool_call_probe_request_body(
+        "openai-compatible-fixture-model",
+        ProviderMetadataMode::LmStudioNativeRequired,
+        &ProbeToolChoice::Runtime(ProviderToolChoice::Named {
+            name: "echo_word".to_string(),
+        }),
+        false,
+        true,
+        2,
+    ) else {
+        return false;
+    };
+    let Ok(auto_body) = tool_call_probe_request_body(
+        "openai-compatible-fixture-model",
+        ProviderMetadataMode::OpenAiCompatibleOnly,
+        &ProbeToolChoice::Auto,
+        true,
+        true,
+        1,
+    ) else {
+        return false;
+    };
+
+    required_body
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        == Some(false)
+        && required_body.get("tool_choice").and_then(Value::as_str) == Some("required")
+        && required_body.get("stream").and_then(Value::as_bool) == Some(false)
+        && required_body
+            .get("tools")
+            .and_then(Value::as_array)
+            .and_then(|tools| tools.first())
+            .and_then(|tool| tool.get("function"))
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            == Some("echo_word")
+        && named_openai_body
+            .get("tool_choice")
+            .and_then(|tool_choice| tool_choice.get("function"))
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            == Some("echo_word")
+        && named_openai_body
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && named_lm_studio_body
+            .get("tool_choice")
+            .and_then(Value::as_str)
+            == Some("required")
+        && auto_body.get("tool_choice").and_then(Value::as_str) == Some("auto")
+        && auto_body
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && provider_profile_marker == "model_probe_fixture_provider_profile_openai_compatible"
+}
+
+pub(crate) fn model_availability_probe_pass_hydrates_runtime_tool_capability_fixture_passes() -> bool
+{
+    let metadata_false_model = ProviderModelInfo {
+        id: "openai-compatible-fixture-model".to_string(),
+        display_name: None,
+        context_window: Some(131_072),
+        max_output_tokens: Some(8_192),
+        supports_images: None,
+        supports_tools: Some(false),
+        supports_reasoning: None,
+        max_parallel_predictions: Some(1),
+        loaded: true,
+        source: "openai_compat".to_string(),
+    };
+    let mut report = ModelAvailabilityReport {
+        gate: "model_availability".to_string(),
+        status: ModelAvailabilityStatus::Pass,
+        generated_by: "moyai_model_availability_v2".to_string(),
+        model: metadata_false_model.id.clone(),
+        base_url: "http://openai-compatible.fixture.invalid".to_string(),
+        provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+        v1_present: true,
+        native_present: false,
+        require_vision: false,
+        vision_capable: false,
+        vision_probe_passed: false,
+        vision_probes: Vec::new(),
+        tool_use_capable: metadata_false_model.supports_tools,
+        capability_overrides: Vec::new(),
+        tool_call_probe_passed: true,
+        tool_call_probes: vec![ToolCallProbeReport {
+            probe: "tool_choice_required".to_string(),
+            status: ModelAvailabilityStatus::Pass,
+            tool_choice: "required".to_string(),
+            required_for_gate: true,
+            finish_reason: Some("tool_calls".to_string()),
+            tool_call_received: true,
+            tool_name: Some("echo_word".to_string()),
+            tool_arguments: Some("{\"word\":\"ping\"}".to_string()),
+            arguments_valid: true,
+            content: None,
+            error: None,
+        }],
+        reasoning_capable: None,
+        context: metadata_false_model.context_window,
+        max_output_tokens: metadata_false_model.max_output_tokens,
+        max_parallel_predictions: metadata_false_model.max_parallel_predictions,
+        matched_model: Some(metadata_false_model),
+        v1_models: vec!["openai-compatible-fixture-model".to_string()],
+        native_models: Vec::new(),
+        openai_error: None,
+        native_error: None,
+        checked_at_ms: 0,
+    };
+
+    apply_tool_call_probe_capability_evidence(&mut report);
+
+    let Some(hydrated_model) = report.matched_model.as_ref() else {
+        return false;
+    };
+    let mut config = crate::config::ResolvedConfig::default().model;
+    config.supports_tools = false;
+    apply_provider_model_info_to_config(&mut config, hydrated_model);
+
+    report.tool_use_capable == Some(true)
+        && hydrated_model.supports_tools == Some(true)
+        && report.capability_overrides.iter().any(|override_record| {
+            override_record.capability == ModelCapabilityKind::ToolUse
+                && override_record.metadata_value == Some(false)
+                && override_record.effective_value
+                && override_record.evidence_ref == "tool_call_probe_passed"
+        })
+        && config.supports_tools
+}
+
+pub(crate) fn model_availability_vision_probe_hydrates_runtime_image_capability_fixture_passes()
+-> bool {
+    let metadata_false_model = ProviderModelInfo {
+        id: "openai-compatible-fixture-model".to_string(),
+        display_name: None,
+        context_window: Some(131_072),
+        max_output_tokens: Some(8_192),
+        supports_images: Some(false),
+        supports_tools: Some(true),
+        supports_reasoning: None,
+        max_parallel_predictions: Some(1),
+        loaded: true,
+        source: "openai_compat".to_string(),
+    };
+    let mut report = ModelAvailabilityReport {
+        gate: "model_availability".to_string(),
+        status: ModelAvailabilityStatus::Fail,
+        generated_by: "moyai_model_availability_v2".to_string(),
+        model: metadata_false_model.id.clone(),
+        base_url: "http://openai-compatible.fixture.invalid".to_string(),
+        provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+        v1_present: true,
+        native_present: false,
+        require_vision: true,
+        vision_capable: metadata_false_model.supports_images.unwrap_or(false),
+        vision_probe_passed: true,
+        vision_probes: vec![VisionProbeReport {
+            probe: "vision_input_image_url".to_string(),
+            status: ModelAvailabilityStatus::Pass,
+            required_for_gate: true,
+            image_content_sent: true,
+            response_received: true,
+            finish_reason: Some("stop".to_string()),
+            content: Some("received".to_string()),
+            error: None,
+        }],
+        tool_use_capable: metadata_false_model.supports_tools,
+        capability_overrides: Vec::new(),
+        tool_call_probe_passed: true,
+        tool_call_probes: vec![ToolCallProbeReport {
+            probe: "tool_choice_required".to_string(),
+            status: ModelAvailabilityStatus::Pass,
+            tool_choice: "required".to_string(),
+            required_for_gate: true,
+            finish_reason: Some("tool_calls".to_string()),
+            tool_call_received: true,
+            tool_name: Some("echo_word".to_string()),
+            tool_arguments: Some("{\"word\":\"ping\"}".to_string()),
+            arguments_valid: true,
+            content: None,
+            error: None,
+        }],
+        reasoning_capable: None,
+        context: metadata_false_model.context_window,
+        max_output_tokens: metadata_false_model.max_output_tokens,
+        max_parallel_predictions: metadata_false_model.max_parallel_predictions,
+        matched_model: Some(metadata_false_model),
+        v1_models: vec!["openai-compatible-fixture-model".to_string()],
+        native_models: Vec::new(),
+        openai_error: None,
+        native_error: None,
+        checked_at_ms: 0,
+    };
+
+    apply_vision_probe_capability_evidence(&mut report);
+    if model_availability_passes(
+        report.provider_metadata_mode,
+        report.v1_present,
+        report.native_present,
+        report.require_vision,
+        report.vision_capable,
+        report.vision_probe_passed,
+        report.tool_call_probe_passed,
+    ) {
+        report.status = ModelAvailabilityStatus::Pass;
     }
 
-    let models = fetch_provider_model_infos(config, &config.model.base_url).await?;
-    if models.iter().any(|model| model.id == configured_model) {
-        return Ok(());
+    let Some(hydrated_model) = report.matched_model.as_ref() else {
+        return false;
+    };
+    let mut config = crate::config::ResolvedConfig::default().model;
+    config.model = hydrated_model.id.clone();
+    config.supports_images = false;
+    if apply_model_availability_report_to_config(&mut config, &report).is_err() {
+        return false;
     }
-    let ids = models
-        .iter()
-        .map(|model| model.id.clone())
-        .collect::<Vec<_>>();
 
-    Err(LlmError::Message(format!(
-        "configured model `{configured_model}` is not available at `{}`; available models: {}",
-        normalize_provider_base_url(&config.model.base_url),
-        summarize_models(&ids)
-    )))
+    report.vision_capable
+        && report.vision_probe_passed
+        && hydrated_model.supports_images == Some(true)
+        && report.capability_overrides.iter().any(|override_record| {
+            override_record.capability == ModelCapabilityKind::VisionInput
+                && override_record.metadata_value == Some(false)
+                && override_record.effective_value
+                && override_record.evidence_ref == "vision_probe_passed"
+        })
+        && config.supports_images
 }
 
 fn build_probe_client(config: &ResolvedConfig) -> Result<reqwest::Client, LlmError> {
@@ -638,8 +1239,8 @@ pub fn apply_provider_model_info_to_config(
     if let Some(value) = model.supports_images {
         config.supports_images = value;
     }
-    if let Some(value) = model.supports_tools {
-        config.supports_tools = value;
+    if model.supports_tools == Some(true) {
+        config.supports_tools = true;
     }
     if let Some(value) = model.supports_reasoning {
         config.supports_reasoning = value;
@@ -647,11 +1248,54 @@ pub fn apply_provider_model_info_to_config(
     if let Some(value) = model.max_parallel_predictions {
         config.max_parallel_predictions = value.max(1);
     }
-    if config.parallel_tool_calls && config.max_parallel_predictions > 1 {
-        config.extra_body_json = Some(extra_body_with_parallel_tool_calls(
+}
+
+pub fn apply_model_availability_report_to_config(
+    config: &mut crate::config::model::ModelConfig,
+    report: &ModelAvailabilityReport,
+) -> Result<(), LlmError> {
+    if !matches!(report.status, ModelAvailabilityStatus::Pass) {
+        return Err(LlmError::Message(format!(
+            "model availability gate did not pass for `{}` at `{}`",
+            report.model, report.base_url
+        )));
+    }
+    if config.model.trim() != report.model {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` cannot hydrate configured model `{}`",
+            report.model, config.model
+        )));
+    }
+    let Some(model) = report.matched_model.as_ref() else {
+        return Err(LlmError::Message(format!(
+            "model availability report passed without matched model metadata for `{}`",
+            report.model
+        )));
+    };
+    apply_provider_model_info_to_config(config, model);
+    if report.tool_use_capable == Some(true) {
+        config.supports_tools = true;
+    }
+    if report.vision_capable {
+        config.supports_images = true;
+    }
+    if let Some(reasoning_capable) = report.reasoning_capable {
+        config.supports_reasoning = reasoning_capable;
+    }
+    if let Some(context_window) = report.context {
+        config.context_window = context_window;
+        config.extra_body_json = Some(extra_body_with_num_ctx(
             config.extra_body_json.clone(),
+            context_window,
         ));
     }
+    if let Some(max_output_tokens) = report.max_output_tokens {
+        config.max_output_tokens = max_output_tokens;
+    }
+    if let Some(max_parallel_predictions) = report.max_parallel_predictions {
+        config.max_parallel_predictions = max_parallel_predictions.max(1);
+    }
+    Ok(())
 }
 
 async fn fetch_openai_model_infos(
@@ -1083,17 +1727,6 @@ pub fn extra_body_with_num_ctx(extra_body: Option<Value>, num_ctx: u32) -> Value
     }
 }
 
-fn extra_body_with_parallel_tool_calls(extra_body: Option<Value>) -> Value {
-    let mut value = extra_body.unwrap_or_else(|| serde_json::json!({}));
-    match &mut value {
-        Value::Object(map) => {
-            map.insert("parallel_tool_calls".to_string(), Value::Bool(true));
-            value
-        }
-        _ => serde_json::json!({ "parallel_tool_calls": true }),
-    }
-}
-
 impl ProviderModelInfo {
     fn enrich_from(&mut self, other: &ProviderModelInfo) {
         self.display_name = other
@@ -1118,18 +1751,6 @@ impl ProviderModelInfo {
     }
 }
 
-fn summarize_models(models: &[String]) -> String {
-    if models.is_empty() {
-        return "<none>".to_string();
-    }
-    let limit = 12;
-    let mut summary = models.iter().take(limit).cloned().collect::<Vec<_>>();
-    if models.len() > limit {
-        summary.push(format!("... and {} more", models.len() - limit));
-    }
-    summary.join(", ")
-}
-
 fn summarize_body(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.chars().count() <= 200 {
@@ -1149,7 +1770,7 @@ mod tests {
         let payload = serde_json::json!({
             "models": [
                 {
-                    "key": "qwen/qwen3.6-35b-a3b",
+                    "key": "openai-compatible-fixture-model",
                     "type": "llm",
                     "loaded_instances": [],
                     "context_length": null,
@@ -1161,7 +1782,7 @@ mod tests {
         let models = parse_lmstudio_model_infos(&payload);
 
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "qwen/qwen3.6-35b-a3b");
+        assert_eq!(models[0].id, "openai-compatible-fixture-model");
         assert_eq!(models[0].context_window, None);
         assert_eq!(models[0].max_output_tokens, None);
         assert!(!models[0].loaded);
@@ -1172,7 +1793,7 @@ mod tests {
         let payload = serde_json::json!({
             "models": [
                 {
-                    "key": "qwen/qwen3.6-35b-a3b",
+                    "key": "openai-compatible-fixture-model",
                     "type": "llm",
                     "loaded_instances": [
                         {
@@ -1197,7 +1818,7 @@ mod tests {
     fn openai_compatible_parser_uses_extended_metadata_when_provider_exposes_it() {
         let payload = OpenAiModelsResponse {
             data: vec![serde_json::json!({
-                "id": "qwen3.6-35b-a3b-4bit",
+                "id": "openai-compatible-fixture-model",
                 "max_model_len": 131072,
                 "max_output_tokens": 8192,
                 "capabilities": {
@@ -1221,15 +1842,15 @@ mod tests {
         let payload = serde_json::json!({
             "status": "healthy",
             "model_loaded": true,
-            "model_name": "qwen3.6-35b-a3b-4bit",
-            "available_models": ["qwen3.6-35b-a3b-4bit"],
+            "model_name": "openai-compatible-fixture-model",
+            "available_models": ["openai-compatible-fixture-model"],
             "engine_type": "batched"
         });
 
         let models = parse_vllm_mlx_health_model_infos(&payload);
 
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "qwen3.6-35b-a3b-4bit");
+        assert_eq!(models[0].id, "openai-compatible-fixture-model");
         assert!(models[0].loaded);
         assert_eq!(models[0].context_window, None);
         assert_eq!(models[0].max_output_tokens, None);
@@ -1243,6 +1864,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             true
         ));
         assert!(!model_availability_passes(
@@ -1251,6 +1873,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             true
         ));
         assert!(!model_availability_passes(
@@ -1259,11 +1882,22 @@ mod tests {
             false,
             true,
             false,
+            false,
+            true
+        ));
+        assert!(model_availability_passes(
+            ProviderMetadataMode::OpenAiCompatibleOnly,
+            true,
+            false,
+            true,
+            true,
+            true,
             true
         ));
         assert!(!model_availability_passes(
             ProviderMetadataMode::OpenAiCompatibleOnly,
             true,
+            false,
             false,
             false,
             false,
@@ -1333,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn lm_studio_availability_can_ignore_named_tool_choice_object_probe() {
+    fn lm_studio_availability_gates_on_required_and_auto_named_probe_is_optional() {
         let required = ToolCallProbeReport {
             probe: "tool_choice_required".to_string(),
             status: ModelAvailabilityStatus::Pass,
@@ -1349,16 +1983,16 @@ mod tests {
         };
         let named = ToolCallProbeReport {
             probe: "tool_choice_named".to_string(),
-            status: ModelAvailabilityStatus::Fail,
+            status: ModelAvailabilityStatus::Pass,
             tool_choice: "named_function".to_string(),
             required_for_gate: false,
-            finish_reason: None,
-            tool_call_received: false,
-            tool_name: None,
-            tool_arguments: None,
-            arguments_valid: false,
+            finish_reason: Some("tool_calls".to_string()),
+            tool_call_received: true,
+            tool_name: Some("echo_word".to_string()),
+            tool_arguments: Some("{\"word\":\"ping\"}".to_string()),
+            arguments_valid: true,
             content: None,
-            error: Some("LM Studio does not accept object tool_choice".to_string()),
+            error: None,
         };
         let auto = ToolCallProbeReport {
             probe: "tool_choice_auto_strong".to_string(),

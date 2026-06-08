@@ -1,9 +1,20 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
+use crate::agent::language_evidence::{
+    LANGUAGE_VERIFICATION_COMMAND_PREFIXES, language_build_check_verification_evidence,
+    language_test_runner_evidence, language_verification_command_evidence,
+    looks_like_language_direct_shell_verification_command,
+    looks_like_language_explicit_verification_command, normalize_language_verification_command,
+};
 use crate::agent::prompt::{ArtifactTargetKind, classify_artifact_target};
-use crate::session::{MessagePart, TodoItem, ToolCallStatus, Transcript};
+use crate::protocol::{
+    ContentPart, HistoryItem, HistoryItemPayload, ToolLifecycleStatus, TurnId,
+    VerificationRunStatus, canonical_tool_call_arguments,
+};
+use crate::session::{MessageRole, SessionId, TodoItem};
 use crate::tool::ToolName;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -11,7 +22,7 @@ pub(crate) struct VerificationRequirements {
     pub any: bool,
     pub unit: bool,
     pub integration: bool,
-    pub rust_build: bool,
+    pub build_check: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +30,7 @@ pub(crate) struct VerificationEvidence {
     pub any: bool,
     pub unit: bool,
     pub integration: bool,
-    pub rust_build: bool,
+    pub build_check: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -41,7 +52,7 @@ pub(crate) struct VerificationRepairReadSpan {
 
 impl VerificationRequirements {
     pub(crate) fn is_required(self) -> bool {
-        self.any || self.unit || self.integration || self.rust_build
+        self.any || self.unit || self.integration || self.build_check
     }
 
     pub(crate) fn is_satisfied_by(self, evidence: VerificationEvidence) -> bool {
@@ -56,8 +67,8 @@ impl VerificationRequirements {
         if self.integration && !evidence.integration {
             missing.push("integration test");
         }
-        if self.rust_build && !evidence.rust_build {
-            missing.push("Rust compile verification");
+        if self.build_check && !evidence.build_check {
+            missing.push("build/check verification");
         }
         if missing.is_empty() && self.any && !evidence.any {
             missing.push("verification");
@@ -69,15 +80,20 @@ impl VerificationRequirements {
 impl VerificationEvidence {
     fn record_from_text(&mut self, text: &str) {
         let lower = text.to_lowercase();
-        let unit = contains_any(&lower, UNIT_TOKENS) || looks_like_python_test_runner(&lower);
+        let unit = contains_any(&lower, UNIT_TOKENS) || language_test_runner_evidence(&lower);
         let integration =
             contains_any(&lower, INTEGRATION_TOKENS) || looks_like_integration_runner(&lower);
-        let rust_build = contains_any(&lower, RUST_BUILD_TOKENS);
-        let generic = unit || integration || rust_build || contains_any(&lower, GENERIC_TOKENS);
+        let build_check = language_build_check_verification_evidence(&lower)
+            || contains_any(&lower, BUILD_CHECK_TOKENS);
+        let generic = unit
+            || integration
+            || build_check
+            || language_verification_command_evidence(&lower)
+            || contains_any(&lower, GENERIC_TOKENS);
         self.any |= generic;
         self.unit |= unit;
         self.integration |= integration;
-        self.rust_build |= rust_build;
+        self.build_check |= build_check;
     }
 }
 
@@ -89,25 +105,12 @@ const GENERIC_TOKENS: &[&str] = &[
     "tests pass",
     "all tests pass",
     "ensure tests pass",
-    "pytest",
-    "cargo test",
-    "cargo check",
-    "go test",
-    "python -m py_compile",
-    "python -m unittest",
-    "unittest",
     "テストを実行",
     "テスト実行",
     "テストが通る",
     "テストを通す",
 ];
-const UNIT_TOKENS: &[&str] = &[
-    "unit test",
-    "unit tests",
-    "unittest",
-    "python -m unittest",
-    "単体テスト",
-];
+const UNIT_TOKENS: &[&str] = &["unit test", "unit tests", "単体テスト"];
 const INTEGRATION_TOKENS: &[&str] = &[
     "integration test",
     "integration tests",
@@ -117,7 +120,15 @@ const INTEGRATION_TOKENS: &[&str] = &[
     "統合テスト",
     "結合テスト",
 ];
-const RUST_BUILD_TOKENS: &[&str] = &["cargo test", "cargo check", "cargo build"];
+const BUILD_CHECK_TOKENS: &[&str] = &[
+    "build check",
+    "build verification",
+    "compile check",
+    "compile verification",
+    "rust build",
+    "rust compile",
+    "rust check",
+];
 const VERIFICATION_FAILURE_TOKENS: &[&str] = &[
     "assertion failed",
     "can't open file",
@@ -155,15 +166,22 @@ pub(crate) fn verification_requirements(
 }
 
 pub(crate) fn verification_evidence_after_latest_user_with_freshness(
-    transcript: &Transcript,
+    history_items: &[HistoryItem],
     start_index: usize,
     freshness_targets: &[Utf8PathBuf],
 ) -> VerificationEvidence {
-    let Some(latest_user) = latest_user_index(transcript, start_index) else {
+    let canonical_history_items = canonical_history_items_for_verification(history_items);
+    let history_items = canonical_history_items.as_ref();
+    let start_index = start_index.min(history_items.len());
+    let Some(latest_user) = latest_user_history_index(history_items, start_index) else {
         return VerificationEvidence::default();
     };
-    verification_progress_from_range_with_freshness(transcript, latest_user + 1, freshness_targets)
-        .evidence
+    verification_progress_from_history_items_with_freshness(
+        history_items,
+        latest_user + 1,
+        freshness_targets,
+    )
+    .evidence
 }
 
 pub(crate) fn explicit_verification_commands_from_text(text: &str) -> Vec<String> {
@@ -188,30 +206,31 @@ fn verification_freshness_targets_from_todos(todos: &[TodoItem]) -> Vec<Utf8Path
 }
 
 pub(crate) fn verification_freshness_targets_after_latest_user(
-    transcript: &Transcript,
+    history_items: &[HistoryItem],
     start_index: usize,
     todos: &[TodoItem],
 ) -> Vec<Utf8PathBuf> {
     let mut targets = verification_freshness_targets_from_todos(todos)
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let Some(latest_user) = latest_user_index(transcript, start_index) else {
+    let canonical_history_items = canonical_history_items_for_verification(history_items);
+    let history_items = canonical_history_items.as_ref();
+    let start_index = start_index.min(history_items.len());
+    let Some(latest_user) = latest_user_history_index(history_items, start_index) else {
         return targets.into_iter().collect();
     };
-    for message in &transcript.messages[latest_user + 1..] {
-        for part in &message.parts {
-            if let MessagePart::DiffSummary(value) = &part.payload {
-                for target in extract_diff_summary_targets_with_workspace(
-                    &value.summary,
-                    &transcript.session.cwd,
-                ) {
-                    let target = Utf8PathBuf::from(target);
-                    if classify_artifact_target(target.as_str())
-                        != ArtifactTargetKind::Documentation
-                        && !is_noise_only_verification_target(target.as_str())
-                    {
-                        targets.insert(target);
-                    }
+    for item in history_items.iter().skip(latest_user + 1) {
+        if let HistoryItemPayload::FileChange { changes, .. } = &item.payload {
+            for target in changes
+                .iter()
+                .filter_map(|change| change.path_after.as_ref().or(change.path_before.as_ref()))
+            {
+                if classify_artifact_target(target.as_str()) != ArtifactTargetKind::Documentation
+                    && !is_noise_only_verification_target(target.as_str())
+                {
+                    targets.insert(Utf8PathBuf::from(normalize_verification_target_key(
+                        target.as_str(),
+                    )));
                 }
             }
         }
@@ -243,152 +262,303 @@ pub(crate) fn verification_command_satisfaction_keys(text: &str) -> BTreeSet<Str
     keys
 }
 
-pub(crate) fn latest_verification_repair_cycle(
-    transcript: &Transcript,
+pub(crate) fn latest_verification_repair_cycle_from_history_items(
+    history_items: &[HistoryItem],
+    start_index: usize,
+    workspace_root: &Utf8Path,
 ) -> Option<VerificationRepairCycle> {
+    let canonical_history_items = canonical_history_items_for_verification(history_items);
+    let history_items = canonical_history_items.as_ref();
+    let start_index = start_index.min(history_items.len());
     let mut tool_calls = HashMap::new();
-    for message in &transcript.messages {
-        for part in &message.parts {
-            if let MessagePart::ToolCall(value) = &part.payload {
-                let command = if value.tool_name == ToolName::Shell {
-                    extract_shell_command(&value.arguments_json)
+    let mut failure_ordinal = 0usize;
+    let mut cycle = None;
+
+    for item in history_items.iter().skip(start_index) {
+        match &item.payload {
+            HistoryItemPayload::ToolCall {
+                call_id,
+                tool,
+                arguments,
+                model_arguments,
+                effective_arguments,
+                ..
+            } => {
+                let arguments =
+                    canonical_tool_call_arguments(arguments, model_arguments, effective_arguments);
+                let arguments_json =
+                    serde_json::to_string(arguments).unwrap_or_else(|_| arguments.to_string());
+                let command = if *tool == ToolName::Shell {
+                    extract_shell_command(&arguments_json)
                 } else {
                     None
                 };
                 let read_span = verification_repair_read_span_from_tool_call(
-                    value.tool_name,
-                    &value.arguments_json,
-                    &transcript.session.cwd,
+                    *tool,
+                    &arguments_json,
+                    workspace_root,
                 );
-                tool_calls.insert(value.tool_call_id, (value.tool_name, command, read_span));
+                tool_calls.insert(call_id.to_string(), (*tool, command, read_span));
             }
-        }
-    }
-
-    let mut failure_ordinal = 0usize;
-    let mut cycle = None;
-    for message in &transcript.messages {
-        for part in &message.parts {
-            let MessagePart::ToolResult(value) = &part.payload else {
-                continue;
-            };
-            if value.status != ToolCallStatus::Completed {
-                continue;
-            }
-            let Some((tool_name, command, read_span)) = tool_calls.get(&value.tool_call_id) else {
-                continue;
-            };
-
-            if *tool_name == ToolName::Shell
-                && looks_like_verification_command(command.as_deref(), &value.title)
-            {
-                if looks_like_verification_failure(command.as_deref(), &value.title, &value.summary)
-                {
-                    failure_ordinal += 1;
-                    cycle = Some(VerificationRepairCycle {
-                        failure_ordinal,
-                        failed_command: command.clone().unwrap_or_default(),
-                        repair_recorded: false,
-                        post_failure_read_attempt_count: 0,
-                        post_failure_read_targets: Vec::new(),
-                        post_failure_read_spans: Vec::new(),
-                    });
-                } else if verification_output_looks_successful(&value.title, &value.summary) {
-                    cycle = None;
+            HistoryItemPayload::ToolOutput {
+                call_id,
+                status,
+                title,
+                output_text,
+                success,
+                progress_effect,
+                verification_run,
+                ..
+            } if *status == ToolLifecycleStatus::Completed => {
+                let Some((tool_name, command, read_span)) = tool_calls.get(&call_id.to_string())
+                else {
+                    continue;
+                };
+                let verification_command = verification_run
+                    .as_ref()
+                    .map(|run| run.command.as_str())
+                    .or(command.as_deref());
+                let typed_verification_run = verification_run
+                    .as_ref()
+                    .is_some_and(|run| run.status != VerificationRunStatus::NotVerification);
+                let shell_verification_output = *tool_name == ToolName::Shell
+                    && (typed_verification_run
+                        || looks_like_verification_command(verification_command, title));
+                if shell_verification_output {
+                    if verification_run.as_ref().is_some_and(|run| {
+                        matches!(
+                            run.status,
+                            VerificationRunStatus::Failed | VerificationRunStatus::TimedOut
+                        )
+                    }) || looks_like_verification_failure(
+                        verification_command,
+                        title,
+                        output_text,
+                    ) {
+                        failure_ordinal += 1;
+                        cycle = Some(VerificationRepairCycle {
+                            failure_ordinal,
+                            failed_command: verification_command.unwrap_or_default().to_string(),
+                            repair_recorded: false,
+                            post_failure_read_attempt_count: 0,
+                            post_failure_read_targets: Vec::new(),
+                            post_failure_read_spans: Vec::new(),
+                        });
+                    } else if verification_run
+                        .as_ref()
+                        .is_some_and(|run| run.status == VerificationRunStatus::Passed)
+                        || verification_output_looks_successful(title, output_text)
+                    {
+                        cycle = None;
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            let Some(current_cycle) = cycle.as_mut() else {
-                continue;
-            };
-            if matches!(tool_name, ToolName::Write | ToolName::ApplyPatch)
-                && verification_repair_result_counts_as_progress(value)
-            {
-                current_cycle.repair_recorded = true;
-                continue;
+                let Some(current_cycle) = cycle.as_mut() else {
+                    continue;
+                };
+                if matches!(tool_name, ToolName::Write | ToolName::ApplyPatch)
+                    && history_tool_output_counts_as_repair_progress(
+                        *success,
+                        progress_effect.clone(),
+                        title,
+                        output_text,
+                    )
+                {
+                    current_cycle.repair_recorded = true;
+                    continue;
+                }
+                if current_cycle.repair_recorded {
+                    continue;
+                }
+                if let Some(span) = read_span.as_ref().filter(|_| {
+                    history_tool_output_counts_as_repair_context(
+                        *success,
+                        progress_effect.clone(),
+                        title,
+                        output_text,
+                    )
+                }) {
+                    current_cycle.post_failure_read_attempt_count += 1;
+                    insert_unique_target(
+                        &mut current_cycle.post_failure_read_targets,
+                        span.target.clone(),
+                    );
+                    current_cycle.post_failure_read_spans.push(span.clone());
+                }
             }
-            if current_cycle.repair_recorded {
-                continue;
-            }
-            if let Some(span) = read_span
-                .as_ref()
-                .filter(|_| verification_repair_read_result_counts_as_context(value))
-            {
-                current_cycle.post_failure_read_attempt_count += 1;
-                insert_unique_target(
-                    &mut current_cycle.post_failure_read_targets,
-                    span.target.clone(),
-                );
-                current_cycle.post_failure_read_spans.push(span.clone());
-            }
+            _ => {}
         }
     }
 
     cycle
 }
 
-pub(crate) fn latest_failed_verification_preceding_repair_targets(
-    transcript: &Transcript,
-) -> Vec<Utf8PathBuf> {
-    let mut tool_calls = HashMap::new();
-    for message in &transcript.messages {
-        for part in &message.parts {
-            if let MessagePart::ToolCall(value) = &part.payload {
-                let command = if value.tool_name == ToolName::Shell {
-                    extract_shell_command(&value.arguments_json)
-                } else {
-                    None
-                };
-                tool_calls.insert(value.tool_call_id, (value.tool_name, command));
-            }
-        }
+fn canonical_history_items_for_verification(
+    history_items: &[HistoryItem],
+) -> Cow<'_, [HistoryItem]> {
+    if history_items_in_canonical_order(history_items) {
+        return Cow::Borrowed(history_items);
     }
+    let mut sorted = history_items.to_vec();
+    sorted.sort_by_key(history_item_order_key);
+    Cow::Owned(sorted)
+}
 
+fn history_items_in_canonical_order(history_items: &[HistoryItem]) -> bool {
+    history_items
+        .windows(2)
+        .all(|items| history_item_order_key(&items[0]) <= history_item_order_key(&items[1]))
+}
+
+fn history_item_order_key(item: &HistoryItem) -> (i64, i64) {
+    (item.sequence_no, item.created_at_ms)
+}
+
+pub(crate) fn verification_history_sequence_primary_order_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let items = vec![
+        verification_order_fixture_item(session_id, turn_id, 3, 1000, "third"),
+        verification_order_fixture_item(session_id, turn_id, 1, 3000, "first"),
+        verification_order_fixture_item(session_id, turn_id, 2, 2000, "second"),
+    ];
+    let ordered = canonical_history_items_for_verification(&items);
+    let sequence_order = ordered
+        .iter()
+        .map(|item| item.sequence_no)
+        .collect::<Vec<_>>();
+
+    sequence_order == vec![1, 2, 3] && history_items_in_canonical_order(ordered.as_ref())
+}
+
+fn verification_order_fixture_item(
+    session_id: SessionId,
+    turn_id: TurnId,
+    sequence_no: i64,
+    created_at_ms: i64,
+    label: &str,
+) -> HistoryItem {
+    HistoryItem {
+        id: crate::protocol::HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no,
+        created_at_ms,
+        payload: HistoryItemPayload::Message {
+            message_id: None,
+            role: MessageRole::Assistant,
+            content: vec![ContentPart::Text {
+                text: label.to_string(),
+            }],
+        },
+    }
+}
+
+fn history_tool_output_counts_as_repair_progress(
+    success: Option<bool>,
+    progress_effect: crate::protocol::ToolProgressEffect,
+    title: &str,
+    output_text: &str,
+) -> bool {
+    !history_tool_output_is_repair_nonprogress(success, progress_effect, title, output_text)
+}
+
+fn history_tool_output_counts_as_repair_context(
+    success: Option<bool>,
+    progress_effect: crate::protocol::ToolProgressEffect,
+    title: &str,
+    output_text: &str,
+) -> bool {
+    !history_tool_output_is_repair_nonprogress(success, progress_effect, title, output_text)
+}
+
+fn history_tool_output_is_repair_nonprogress(
+    success: Option<bool>,
+    progress_effect: crate::protocol::ToolProgressEffect,
+    title: &str,
+    output_text: &str,
+) -> bool {
+    success == Some(false)
+        || matches!(
+            progress_effect,
+            crate::protocol::ToolProgressEffect::NoProgress
+                | crate::protocol::ToolProgressEffect::Blocked
+                | crate::protocol::ToolProgressEffect::VerificationFailed
+        )
+        || verification_output_is_nonexecution(title, output_text)
+}
+
+pub(crate) fn latest_failed_verification_preceding_repair_targets_from_history_items(
+    history_items: &[HistoryItem],
+    start_index: usize,
+) -> Vec<Utf8PathBuf> {
+    let canonical_history_items = canonical_history_items_for_verification(history_items);
+    let history_items = canonical_history_items.as_ref();
+    let start_index = start_index.min(history_items.len());
+    let mut tool_calls = HashMap::new();
     let mut last_repair_targets: Vec<Utf8PathBuf> = Vec::new();
     let mut latest_failed_after_targets: Vec<Utf8PathBuf> = Vec::new();
 
-    for message in &transcript.messages {
-        for part in &message.parts {
-            match &part.payload {
-                MessagePart::DiffSummary(value) => {
-                    let changed_targets = extract_diff_summary_targets_with_workspace(
-                        &value.summary,
-                        &transcript.session.cwd,
-                    )
-                    .into_iter()
-                    .map(Utf8PathBuf::from)
+    for item in history_items.iter().skip(start_index) {
+        match &item.payload {
+            HistoryItemPayload::ToolCall {
+                call_id,
+                tool,
+                arguments,
+                model_arguments,
+                effective_arguments,
+                ..
+            } => {
+                let arguments =
+                    canonical_tool_call_arguments(arguments, model_arguments, effective_arguments);
+                let arguments_json =
+                    serde_json::to_string(arguments).unwrap_or_else(|_| arguments.to_string());
+                let command = if *tool == ToolName::Shell {
+                    extract_shell_command(&arguments_json)
+                } else {
+                    None
+                };
+                tool_calls.insert(call_id.to_string(), (*tool, command));
+            }
+            HistoryItemPayload::FileChange { changes, .. } => {
+                let changed_targets = changes
+                    .iter()
+                    .filter_map(|change| change.path_after.as_ref().or(change.path_before.as_ref()))
                     .filter(|target| !is_noise_only_verification_target(target.as_str()))
+                    .cloned()
                     .collect::<Vec<_>>();
-                    if !changed_targets.is_empty() {
-                        last_repair_targets = changed_targets;
-                    }
+                if !changed_targets.is_empty() {
+                    last_repair_targets = changed_targets;
                 }
-                MessagePart::ToolResult(value) => {
-                    if value.status != ToolCallStatus::Completed {
-                        continue;
-                    }
-                    let Some((tool_name, command)) = tool_calls.get(&value.tool_call_id) else {
-                        continue;
-                    };
-                    if *tool_name != ToolName::Shell
-                        || !looks_like_verification_command(command.as_deref(), &value.title)
-                    {
-                        continue;
-                    }
-                    if looks_like_verification_failure(
-                        command.as_deref(),
-                        &value.title,
-                        &value.summary,
-                    ) {
+            }
+            HistoryItemPayload::ToolOutput {
+                call_id,
+                status,
+                verification_run,
+                ..
+            } if *status == ToolLifecycleStatus::Completed => {
+                let Some((tool_name, _command)) = tool_calls.get(&call_id.to_string()) else {
+                    continue;
+                };
+                if *tool_name != ToolName::Shell {
+                    continue;
+                }
+                let Some(verification_run) = verification_run else {
+                    continue;
+                };
+                match verification_run.status {
+                    VerificationRunStatus::Failed | VerificationRunStatus::TimedOut => {
                         latest_failed_after_targets = last_repair_targets.clone();
-                    } else if verification_output_looks_successful(&value.title, &value.summary) {
+                    }
+                    VerificationRunStatus::Passed => {
                         latest_failed_after_targets.clear();
                         last_repair_targets.clear();
                     }
+                    VerificationRunStatus::NotVerification => {}
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
 
@@ -400,19 +570,9 @@ pub(crate) fn looks_like_verification_command(command: Option<&str>, title: &str
         .and_then(normalize_verification_command)
         .unwrap_or_else(|| command.unwrap_or_default().to_ascii_lowercase());
     let title = title.to_ascii_lowercase();
-    command.contains("python -m unittest")
-        || command.contains("python -m py_compile")
-        || looks_like_python_test_runner(&command)
-        || command.contains("pytest")
-        || command.contains("cargo test")
-        || command.contains("cargo check")
-        || title.contains("python -m unittest")
-        || title.contains("python -m py_compile")
+    language_verification_command_evidence(&command)
+        || language_verification_command_evidence(&title)
         || title.contains("run tests")
-        || looks_like_python_test_runner(&title)
-        || title.contains("pytest")
-        || title.contains("cargo test")
-        || title.contains("cargo check")
         || title.contains("integration test")
 }
 
@@ -438,34 +598,31 @@ fn apply_requirement_text(requirements: &mut VerificationRequirements, text: &st
     requirements.any |= flags.any;
     requirements.unit |= flags.unit;
     requirements.integration |= flags.integration;
-    requirements.rust_build |= flags.rust_build;
+    requirements.build_check |= flags.build_check;
 }
 
 fn requirement_flags_from_text(text: &str) -> VerificationRequirements {
     let lower = text.to_lowercase();
-    let unit = contains_any(&lower, UNIT_TOKENS) || looks_like_python_test_runner(&lower);
+    let unit = contains_any(&lower, UNIT_TOKENS) || language_test_runner_evidence(&lower);
     let integration = integration_verification_requirement_from_text(text, &lower);
-    let rust_build =
-        contains_any(&lower, RUST_BUILD_TOKENS) || implies_rust_project_verification(text, &lower);
-    let generic = unit || integration || rust_build || contains_any(&lower, GENERIC_TOKENS);
+    let build_check = language_build_check_verification_evidence(&lower)
+        || contains_any(&lower, BUILD_CHECK_TOKENS)
+        || implies_project_build_check_verification(text, &lower);
+    let generic = unit
+        || integration
+        || build_check
+        || language_verification_command_evidence(&lower)
+        || contains_any(&lower, GENERIC_TOKENS);
     VerificationRequirements {
         any: generic,
         unit,
         integration,
-        rust_build,
+        build_check,
     }
 }
 
 fn contains_any(lower: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| lower.contains(needle))
-}
-
-fn looks_like_python_test_runner(lower: &str) -> bool {
-    (lower.contains("python") || lower.starts_with("py "))
-        && (lower.contains("test_")
-            || lower.contains("_test.py")
-            || lower.contains("/tests/")
-            || lower.contains("\\tests\\"))
 }
 
 fn looks_like_integration_runner(lower: &str) -> bool {
@@ -562,144 +719,120 @@ fn integration_verification_requirement_from_text(text: &str, lower: &str) -> bo
     saw_execution_integration || !saw_authoring_only_integration
 }
 
-fn implies_rust_project_verification(text: &str, lower: &str) -> bool {
+fn implies_project_build_check_verification(text: &str, lower: &str) -> bool {
     if contains_explicit_file_target(text) {
         return false;
     }
-    lower.starts_with("rust ")
-        || (lower.contains("rust")
-            && contains_any(
-                lower,
-                &[
-                    "app",
-                    "application",
-                    "build",
-                    "cli",
-                    "crate",
-                    "create",
-                    "game",
-                    "implement",
-                    "library",
-                    "make",
-                    "project",
-                    "tool",
-                    "write",
-                ],
-            ))
-}
-
-fn contains_explicit_file_target(text: &str) -> bool {
-    text.split_whitespace().any(|token| {
-        let candidate = token
-            .trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ','
-                )
-            })
-            .trim_end_matches(|ch: char| matches!(ch, '.' | ':' | ';' | '!' | '?'))
-            .trim_start_matches(|ch: char| matches!(ch, '*' | '-' | '+'));
-        !candidate.is_empty()
-            && (candidate.contains('/') || candidate.contains('\\') || candidate.contains('.'))
+    let project_markers = [
+        "app",
+        "application",
+        "build",
+        "cli",
+        "crate",
+        "create",
+        "game",
+        "implement",
+        "library",
+        "make",
+        "project",
+        "tool",
+        "write",
+    ];
+    let build_check_languages = [
+        "rust",
+        "crate",
+        "cargo",
+        "javascript",
+        "react.js",
+        "next.js",
+        "vue.js",
+        "node.js",
+        "go",
+        "golang",
+        "java",
+        "kotlin",
+        "dotnet",
+        "c#",
+        "typescript",
+        "ts",
+    ];
+    build_check_languages.iter().any(|language| {
+        lower.starts_with(&format!("{language} "))
+            || (lower.contains(language) && contains_any(lower, &project_markers))
     })
 }
 
-fn verification_evidence_from_range(
-    transcript: &Transcript,
-    message_start_index: usize,
-) -> VerificationEvidence {
-    let mut tool_calls = HashMap::new();
-    for message in &transcript.messages[message_start_index..] {
-        for part in &message.parts {
-            if let MessagePart::ToolCall(value) = &part.payload {
-                let command = if value.tool_name == ToolName::Shell {
-                    extract_shell_command(&value.arguments_json)
-                } else {
-                    None
-                };
-                tool_calls.insert(value.tool_call_id, (value.tool_name, command));
-            }
-        }
-    }
-
-    let mut evidence = VerificationEvidence::default();
-    for message in &transcript.messages[message_start_index..] {
-        for part in &message.parts {
-            if let MessagePart::ToolResult(value) = &part.payload {
-                if value.status != ToolCallStatus::Completed {
-                    continue;
-                }
-                let Some((tool_name, command)) = tool_calls.get(&value.tool_call_id) else {
-                    continue;
-                };
-                if *tool_name != ToolName::Shell {
-                    continue;
-                }
-                if !looks_like_verification_command(command.as_deref(), &value.title) {
-                    continue;
-                }
-                if !verification_output_looks_successful(&value.title, &value.summary) {
-                    continue;
-                }
-                if let Some(command) = command {
-                    evidence.record_from_text(command);
-                }
-                evidence.record_from_text(&value.title);
-                evidence.record_from_text(&value.summary);
-            }
-        }
-    }
-
-    evidence
+fn contains_explicit_file_target(text: &str) -> bool {
+    let tokens = text
+        .split_whitespace()
+        .map(normalize_target_classifier_token)
+        .collect::<Vec<_>>();
+    tokens.iter().enumerate().any(|(index, candidate)| {
+        let following = tokens.get(index + 1).map(String::as_str);
+        explicit_file_target_token(candidate.as_str(), following)
+    })
 }
 
-fn successful_verification_commands_from_range(
-    transcript: &Transcript,
-    message_start_index: usize,
-) -> Vec<String> {
-    let mut tool_calls = HashMap::new();
-    for message in &transcript.messages[message_start_index..] {
-        for part in &message.parts {
-            if let MessagePart::ToolCall(value) = &part.payload {
-                let command = if value.tool_name == ToolName::Shell {
-                    extract_shell_command(&value.arguments_json)
-                } else {
-                    None
-                };
-                tool_calls.insert(value.tool_call_id, (value.tool_name, command));
-            }
-        }
-    }
+fn normalize_target_classifier_token(token: &str) -> String {
+    token
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ','
+            )
+        })
+        .trim_end_matches(|ch: char| matches!(ch, '.' | ':' | ';' | '!' | '?'))
+        .trim_start_matches(|ch: char| matches!(ch, '*' | '-' | '+'))
+        .to_string()
+}
 
-    let mut commands = Vec::new();
-    for message in &transcript.messages[message_start_index..] {
-        for part in &message.parts {
-            if let MessagePart::ToolResult(value) = &part.payload {
-                if value.status != ToolCallStatus::Completed {
-                    continue;
-                }
-                let Some((tool_name, command)) = tool_calls.get(&value.tool_call_id) else {
-                    continue;
-                };
-                if *tool_name != ToolName::Shell {
-                    continue;
-                }
-                if !looks_like_verification_command(command.as_deref(), &value.title) {
-                    continue;
-                }
-                if !verification_output_looks_successful(&value.title, &value.summary) {
-                    continue;
-                }
-                let Some(command) = command.as_deref() else {
-                    continue;
-                };
-                if let Some(normalized) = normalize_verification_command(command) {
-                    commands.push(normalized);
-                }
-            }
-        }
+fn explicit_file_target_token(candidate: &str, following: Option<&str>) -> bool {
+    if candidate.is_empty() {
+        return false;
     }
-    dedupe_commands(commands)
+    if candidate.contains('/') || candidate.contains('\\') {
+        return true;
+    }
+    if !target_token_contains_dot(candidate) {
+        return false;
+    }
+    if candidate.starts_with('.') {
+        return true;
+    }
+    !dotted_technology_token_in_project_context(candidate, following)
+}
+
+fn target_token_contains_dot(candidate: &str) -> bool {
+    candidate.chars().any(|ch| ch == '.')
+}
+
+fn dotted_technology_token_in_project_context(candidate: &str, following: Option<&str>) -> bool {
+    let lower = candidate.to_ascii_lowercase();
+    let known_dotted_technology = matches!(
+        lower.as_str(),
+        "react.js" | "next.js" | "vue.js" | "node.js" | "three.js" | "p5.js" | "d3.js"
+    );
+    if !known_dotted_technology {
+        return false;
+    }
+    following
+        .map(|token| {
+            matches!(
+                token.to_ascii_lowercase().as_str(),
+                "app"
+                    | "application"
+                    | "project"
+                    | "tool"
+                    | "site"
+                    | "website"
+                    | "frontend"
+                    | "backend"
+                    | "library"
+                    | "cli"
+                    | "game"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Default)]
@@ -708,76 +841,77 @@ struct VerificationProgress {
     commands: Vec<String>,
 }
 
-fn verification_progress_from_range_with_freshness(
-    transcript: &Transcript,
-    message_start_index: usize,
+fn verification_progress_from_history_items_with_freshness(
+    history_items: &[HistoryItem],
+    item_start_index: usize,
     freshness_targets: &[Utf8PathBuf],
 ) -> VerificationProgress {
     let freshness_keys = verification_freshness_target_keys(freshness_targets);
-    if freshness_keys.is_empty() {
-        return VerificationProgress {
-            evidence: verification_evidence_from_range(transcript, message_start_index),
-            commands: successful_verification_commands_from_range(transcript, message_start_index),
-        };
-    }
-
     let mut tool_calls = HashMap::new();
-    for message in &transcript.messages[message_start_index..] {
-        for part in &message.parts {
-            if let MessagePart::ToolCall(value) = &part.payload {
-                let command = if value.tool_name == ToolName::Shell {
-                    extract_shell_command(&value.arguments_json)
+    let mut progress = VerificationProgress::default();
+    let item_start_index = item_start_index.min(history_items.len());
+
+    for item in history_items.iter().skip(item_start_index) {
+        match &item.payload {
+            HistoryItemPayload::ToolCall {
+                call_id,
+                tool,
+                arguments,
+                model_arguments,
+                effective_arguments,
+                ..
+            } => {
+                let arguments =
+                    canonical_tool_call_arguments(arguments, model_arguments, effective_arguments);
+                let arguments_json =
+                    serde_json::to_string(arguments).unwrap_or_else(|_| arguments.to_string());
+                let command = if *tool == ToolName::Shell {
+                    extract_shell_command(&arguments_json)
                 } else {
                     None
                 };
-                tool_calls.insert(value.tool_call_id, (value.tool_name, command));
+                tool_calls.insert(call_id.to_string(), (*tool, command));
             }
-        }
-    }
-
-    let mut progress = VerificationProgress::default();
-    for message in &transcript.messages[message_start_index..] {
-        for part in &message.parts {
-            match &part.payload {
-                MessagePart::ToolResult(value) => {
-                    if value.status != ToolCallStatus::Completed {
-                        continue;
-                    }
-                    let Some((tool_name, command)) = tool_calls.get(&value.tool_call_id) else {
-                        continue;
-                    };
-                    if *tool_name != ToolName::Shell {
-                        continue;
-                    }
-                    if !looks_like_verification_command(command.as_deref(), &value.title) {
-                        continue;
-                    }
-                    if !verification_output_looks_successful(&value.title, &value.summary) {
-                        continue;
-                    }
-                    if let Some(command) = command {
-                        progress.evidence.record_from_text(command);
-                        if let Some(normalized) = normalize_verification_command(command) {
-                            progress.commands.push(normalized);
-                        }
-                    }
-                    progress.evidence.record_from_text(&value.title);
-                    progress.evidence.record_from_text(&value.summary);
+            HistoryItemPayload::ToolOutput {
+                call_id,
+                status,
+                verification_run,
+                ..
+            } if *status == ToolLifecycleStatus::Completed => {
+                let Some((tool_name, _command)) = tool_calls.get(&call_id.to_string()) else {
+                    continue;
+                };
+                if *tool_name != ToolName::Shell {
+                    continue;
                 }
-                MessagePart::DiffSummary(value) => {
-                    let changed_targets = extract_diff_summary_targets_with_workspace(
-                        &value.summary,
-                        &transcript.session.cwd,
-                    );
-                    if changed_targets
-                        .iter()
-                        .any(|target| freshness_keys.contains(target))
-                    {
-                        progress = VerificationProgress::default();
-                    }
+                let Some(verification_run) = verification_run else {
+                    continue;
+                };
+                if verification_run.status != VerificationRunStatus::Passed {
+                    continue;
                 }
-                _ => {}
+                progress
+                    .evidence
+                    .record_from_text(&verification_run.command);
+                progress
+                    .evidence
+                    .record_from_text(&verification_run.output_summary);
+                if let Some(normalized) = normalize_verification_command(&verification_run.command)
+                {
+                    progress.commands.push(normalized);
+                }
             }
+            HistoryItemPayload::FileChange { changes, .. } if !freshness_keys.is_empty() => {
+                let freshness_changed = changes
+                    .iter()
+                    .filter_map(|change| change.path_after.as_ref().or(change.path_before.as_ref()))
+                    .map(|target| normalize_verification_target_key(target.as_str()))
+                    .any(|target| freshness_keys.contains(&target));
+                if freshness_changed {
+                    progress = VerificationProgress::default();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -810,27 +944,6 @@ fn verification_repair_read_span_from_tool_call(
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok()),
     })
-}
-
-fn verification_repair_result_counts_as_progress(value: &crate::session::ToolResultPart) -> bool {
-    !verification_repair_result_is_nonprogress(value)
-}
-
-fn verification_repair_read_result_counts_as_context(
-    value: &crate::session::ToolResultPart,
-) -> bool {
-    !verification_repair_result_is_nonprogress(value)
-}
-
-fn verification_repair_result_is_nonprogress(value: &crate::session::ToolResultPart) -> bool {
-    value.success == Some(false)
-        || matches!(
-            value.progress_effect,
-            crate::protocol::ToolProgressEffect::NoProgress
-                | crate::protocol::ToolProgressEffect::Blocked
-                | crate::protocol::ToolProgressEffect::VerificationFailed
-        )
-        || verification_output_is_nonexecution(&value.title, &value.summary)
 }
 
 fn insert_unique_target(targets: &mut Vec<Utf8PathBuf>, candidate: Utf8PathBuf) {
@@ -869,40 +982,12 @@ fn is_noise_only_verification_target(target: &str) -> bool {
                     | "__pycache__"
                     | "node_modules"
                     | "target"
+                    | "build-artifacts"
                     | ".next"
                     | "playwright-report"
                     | "test-results"
             )
         })
-}
-
-fn extract_diff_summary_targets_with_workspace(
-    text: &str,
-    workspace_root: &Utf8Path,
-) -> Vec<String> {
-    let mut targets = BTreeSet::new();
-    for raw in text.split(|ch: char| {
-        ch.is_whitespace()
-            || matches!(
-                ch,
-                ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''
-            )
-    }) {
-        let candidate = raw.trim_matches(|ch: char| matches!(ch, '`' | '.' | '!' | '?'));
-        if candidate.is_empty() {
-            continue;
-        }
-        if !(candidate.contains('/')
-            || candidate.contains('\\')
-            || Utf8Path::new(candidate).extension().is_some())
-        {
-            continue;
-        }
-        if let Some(target) = normalize_verification_target_path(candidate, workspace_root) {
-            targets.insert(normalize_verification_target_key(target.as_str()));
-        }
-    }
-    targets.into_iter().collect()
 }
 
 fn normalize_verification_target_path(
@@ -1010,20 +1095,9 @@ fn extract_inline_verification_commands(line: &str) -> Vec<String> {
 }
 
 fn extract_inline_verification_command_candidates(line: &str) -> Vec<String> {
-    const PREFIXES: &[&str] = &[
-        "python -x utf8 -m unittest",
-        "python -m py_compile",
-        "python -m unittest",
-        "cargo test",
-        "cargo check",
-        "cargo build",
-        "go test",
-        "pytest",
-    ];
-
     let lower = line.to_ascii_lowercase();
     let mut candidates = Vec::new();
-    for prefix in PREFIXES {
+    for prefix in LANGUAGE_VERIFICATION_COMMAND_PREFIXES {
         let mut search_from = 0usize;
         while let Some(found) = lower[search_from..].find(prefix) {
             let start = search_from + found;
@@ -1047,14 +1121,14 @@ fn normalize_command_candidate(text: &str) -> String {
         .trim_start_matches(|ch: char| matches!(ch, '-' | '*' | '+' | '•'))
         .trim();
     let collapsed = collapse_whitespace(trimmed);
-    let collapsed = normalize_closed_network_verification_command(&collapsed);
+    let collapsed = normalize_language_verification_command(&collapsed);
     let collapsed = verification_command_suffix_boundary(&collapsed)
         .map(|index| collapsed[..index].trim().to_string())
         .unwrap_or(collapsed);
     let collapsed = collapsed
         .trim_end_matches(|ch: char| matches!(ch, '.' | '．' | ':'))
         .trim();
-    normalize_python_unittest_command(collapsed)
+    collapsed.to_string()
 }
 
 fn verification_command_suffix_boundary(text: &str) -> Option<usize> {
@@ -1108,45 +1182,10 @@ fn verification_command_suffix_boundary(text: &str) -> Option<usize> {
         .min()
 }
 
-fn normalize_python_unittest_command(text: &str) -> String {
-    let tokens = text.split_whitespace().collect::<Vec<_>>();
-    if tokens.is_empty() || !tokens[0].eq_ignore_ascii_case("python") {
-        return text.to_string();
-    }
-
-    let mut index = 1usize;
-    while index + 1 < tokens.len()
-        && (tokens[index].eq_ignore_ascii_case("-x") || tokens[index].eq_ignore_ascii_case("-X"))
-        && tokens[index + 1].eq_ignore_ascii_case("utf8")
-    {
-        index += 2;
-    }
-    if index + 1 < tokens.len()
-        && tokens[index].eq_ignore_ascii_case("-m")
-        && tokens[index + 1].eq_ignore_ascii_case("unittest")
-    {
-        let mut canonical = vec![
-            "python".to_string(),
-            "-m".to_string(),
-            "unittest".to_string(),
-        ];
-        canonical.extend(tokens[index + 2..].iter().map(|token| token.to_string()));
-        return canonical.join(" ");
-    }
-
-    text.to_string()
-}
-
 fn looks_like_explicit_verification_command(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
-    lower.starts_with("python -m unittest")
-        || lower.starts_with("python -x utf8 -m unittest")
-        || lower.starts_with("python -m py_compile")
-        || lower.starts_with("pytest")
-        || lower.starts_with("cargo test")
-        || lower.starts_with("cargo check")
-        || lower.starts_with("cargo build")
-        || lower.starts_with("go test")
+    looks_like_language_explicit_verification_command(&lower)
+        || looks_like_direct_shell_verification_command(&lower)
 }
 
 fn direct_shell_command_identity_key(text: &str) -> Option<String> {
@@ -1167,37 +1206,29 @@ fn looks_like_direct_shell_verification_command(text: &str) -> bool {
         return false;
     };
     match program.as_str() {
-        "python" | "python3" | "py" => {
-            let mut index = 1usize;
-            while index < tokens.len() {
-                let token = tokens[index].to_ascii_lowercase();
-                if token == "-x" && index + 1 < tokens.len() {
-                    index += 2;
-                    continue;
-                }
-                if token == "-m" {
-                    return false;
-                }
-                break;
-            }
-            tokens[index..]
-                .iter()
-                .any(|token| token.to_ascii_lowercase().ends_with(".py"))
+        "python" | "python3" | "py" | "node" => {
+            looks_like_language_direct_shell_verification_command(text)
         }
-        "node" => tokens
-            .iter()
-            .skip(1)
-            .any(|token| token.to_ascii_lowercase().ends_with(".js")),
-        _ => false,
+        _ => looks_like_custom_verification_program(&program),
     }
 }
 
-fn normalize_closed_network_verification_command(text: &str) -> String {
-    let collapsed = collapse_whitespace(text.trim());
-    if collapsed.to_ascii_lowercase().starts_with("uv run pytest") {
-        return collapsed["uv run ".len()..].to_string();
-    }
-    collapsed
+fn looks_like_custom_verification_program(program: &str) -> bool {
+    let leaf = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .trim_start_matches("./")
+        .trim_end_matches(".exe");
+    leaf == "verify"
+        || leaf == "check"
+        || leaf == "test"
+        || leaf.starts_with("verify-")
+        || leaf.ends_with("-verify")
+        || leaf.starts_with("check-")
+        || leaf.ends_with("-check")
+        || leaf.starts_with("test-")
+        || leaf.ends_with("-test")
 }
 
 fn collapse_whitespace(text: &str) -> String {
@@ -1225,13 +1256,231 @@ fn extract_shell_command(arguments_json: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn latest_user_index(transcript: &Transcript, start_index: usize) -> Option<usize> {
-    transcript.messages[start_index..]
+fn latest_user_history_index(history_items: &[HistoryItem], start_index: usize) -> Option<usize> {
+    history_items[start_index..]
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(offset, message)| {
-            matches!(message.record.role, crate::session::MessageRole::User)
-                .then_some(start_index + offset)
+        .find_map(|(offset, item)| {
+            matches!(
+                item.payload,
+                HistoryItemPayload::UserTurn { .. }
+                    | HistoryItemPayload::Message {
+                        role: crate::session::MessageRole::User,
+                        ..
+                    }
+            )
+            .then_some(start_index + offset)
         })
+}
+
+pub(crate) fn verification_requirements_use_generic_build_check_fixture_passes() -> bool {
+    let rust_project = requirement_flags_from_text("Create a Rust CLI project.");
+    let go_project = requirement_flags_from_text("Create a Go CLI project.");
+    let explicit_cargo = requirement_flags_from_text("Run `cargo check` before completion.");
+    let explicit_py_compile =
+        requirement_flags_from_text("Run `python -m py_compile src/tool.py` before completion.");
+    let explicit_tests = requirement_flags_from_text("Run `cargo test` before completion.");
+    let mut cargo_check_evidence = VerificationEvidence::default();
+    cargo_check_evidence.record_from_text("cargo check");
+    let mut py_compile_evidence = VerificationEvidence::default();
+    py_compile_evidence.record_from_text("python -m py_compile src/tool.py");
+    rust_project.build_check
+        && go_project.build_check
+        && explicit_cargo.build_check
+        && explicit_py_compile.build_check
+        && explicit_tests.unit
+        && !explicit_tests.build_check
+        && cargo_check_evidence.build_check
+        && !cargo_check_evidence.unit
+        && py_compile_evidence.build_check
+        && !py_compile_evidence.unit
+        && VerificationRequirements {
+            any: true,
+            unit: false,
+            integration: false,
+            build_check: true,
+        }
+        .is_satisfied_by(cargo_check_evidence)
+}
+
+pub(crate) fn verification_dotted_technology_tokens_are_not_file_targets_fixture_passes() -> bool {
+    let react_project = requirement_flags_from_text("Create a React.js app.");
+    let next_project = requirement_flags_from_text("Create a Next.js project.");
+    let explicit_source_file = requirement_flags_from_text("Create src/workflow.rs.");
+    let explicit_markdown_file = requirement_flags_from_text("Update README.md.");
+
+    react_project.build_check
+        && next_project.build_check
+        && !explicit_source_file.build_check
+        && !explicit_markdown_file.build_check
+        && !contains_explicit_file_target("Create a React.js app.")
+        && !contains_explicit_file_target("Create a Next.js project.")
+        && contains_explicit_file_target("Create src/workflow.rs.")
+        && contains_explicit_file_target("Update README.md.")
+}
+
+pub(crate) fn verification_repair_cycle_uses_canonical_history_order_fixture_passes() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let failed_check_call_id = crate::session::ToolCallId::new();
+    let read_call_id = crate::session::ToolCallId::new();
+    let repair_call_id = crate::session::ToolCallId::new();
+
+    let failed_check_call = verification_fixture_tool_call_item(
+        session_id,
+        turn_id,
+        2,
+        failed_check_call_id,
+        ToolName::Shell,
+        serde_json::json!({"command":"cargo test"}),
+    );
+    let failed_check_output = verification_fixture_tool_output_item(
+        session_id,
+        turn_id,
+        3,
+        failed_check_call_id,
+        "cargo test failed",
+        "test result: FAILED. assertion failed",
+        Some(false),
+        crate::protocol::ToolProgressEffect::VerificationFailed,
+        Some(crate::protocol::VerificationRunResult {
+            command: "cargo test".to_string(),
+            status: VerificationRunStatus::Failed,
+            exit_code: Some(101),
+            timed_out: false,
+            output_summary: "assertion failed".to_string(),
+            failure_cluster: None,
+            satisfies_command_identities: Vec::new(),
+            artifact_refs: Vec::new(),
+            requirement_refs: Vec::new(),
+        }),
+    );
+    let read_call = verification_fixture_tool_call_item(
+        session_id,
+        turn_id,
+        4,
+        read_call_id,
+        ToolName::Read,
+        serde_json::json!({"path":"src/lib.rs"}),
+    );
+    let read_output = verification_fixture_tool_output_item(
+        session_id,
+        turn_id,
+        5,
+        read_call_id,
+        "Read src/lib.rs",
+        "fn broken() {}",
+        Some(true),
+        crate::protocol::ToolProgressEffect::Unknown,
+        None,
+    );
+    let repair_call = verification_fixture_tool_call_item(
+        session_id,
+        turn_id,
+        6,
+        repair_call_id,
+        ToolName::ApplyPatch,
+        serde_json::json!({"path":"src/lib.rs","patch_text":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-fn broken() {}\n+fn fixed() {}\n*** End Patch\n"}),
+    );
+    let repair_output = verification_fixture_tool_output_item(
+        session_id,
+        turn_id,
+        7,
+        repair_call_id,
+        "Patch applied",
+        "Updated src/lib.rs",
+        Some(true),
+        crate::protocol::ToolProgressEffect::MadeProgress,
+        None,
+    );
+
+    let out_of_order_history = vec![
+        repair_call,
+        repair_output,
+        failed_check_call,
+        failed_check_output,
+        read_call,
+        read_output,
+    ];
+    latest_verification_repair_cycle_from_history_items(
+        &out_of_order_history,
+        0,
+        Utf8Path::new("."),
+    )
+    .is_some_and(|cycle| {
+        cycle.failed_command == "cargo test"
+            && cycle.repair_recorded
+            && cycle.post_failure_read_attempt_count == 1
+            && cycle
+                .post_failure_read_targets
+                .iter()
+                .any(|target| target.as_str() == "src/lib.rs")
+    })
+}
+
+pub(crate) fn verification_repair_cycle_history_item_authority_fixture_passes() -> bool {
+    verification_repair_cycle_uses_canonical_history_order_fixture_passes()
+}
+
+fn verification_fixture_tool_call_item(
+    session_id: crate::session::SessionId,
+    turn_id: crate::protocol::TurnId,
+    sequence_no: i64,
+    call_id: crate::session::ToolCallId,
+    tool: ToolName,
+    arguments: Value,
+) -> HistoryItem {
+    HistoryItem {
+        id: crate::protocol::HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no,
+        created_at_ms: sequence_no,
+        payload: HistoryItemPayload::ToolCall {
+            call_id,
+            tool,
+            arguments: arguments.clone(),
+            model_arguments: Value::Null,
+            effective_arguments: arguments,
+            adjusted_arguments: None,
+            permission_decision: None,
+            sandbox_decision: None,
+            allowed_surface: vec![tool],
+            retry_policy: None,
+            terminal_guard_policy: None,
+        },
+    }
+}
+
+fn verification_fixture_tool_output_item(
+    session_id: crate::session::SessionId,
+    turn_id: crate::protocol::TurnId,
+    sequence_no: i64,
+    call_id: crate::session::ToolCallId,
+    title: &str,
+    output_text: &str,
+    success: Option<bool>,
+    progress_effect: crate::protocol::ToolProgressEffect,
+    verification_run: Option<crate::protocol::VerificationRunResult>,
+) -> HistoryItem {
+    HistoryItem {
+        id: crate::protocol::HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no,
+        created_at_ms: sequence_no,
+        payload: HistoryItemPayload::ToolOutput {
+            call_id,
+            status: ToolLifecycleStatus::Completed,
+            title: title.to_string(),
+            output_text: output_text.to_string(),
+            metadata: Value::Null,
+            success,
+            progress_effect,
+            blocked_action: None,
+            result_hash: Some(format!("fixture-{sequence_no}")),
+            verification_run,
+        },
+    }
 }

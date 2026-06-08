@@ -24,9 +24,10 @@ impl ChangeRepository for SqliteChangeRepository {
         session_id: SessionId,
         changes: &[crate::edit::FileChange],
     ) -> Result<Vec<ChangeId>, StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
         for change in changes {
-            connection.execute(
+            transaction.execute(
                 "INSERT INTO file_changes (id, session_id, tool_call_id, change_kind, path_before, path_after, before_sha256, after_sha256, diff_text, summary_text, created_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
@@ -44,6 +45,7 @@ impl ChangeRepository for SqliteChangeRepository {
                 ],
             )?;
         }
+        transaction.commit()?;
         Ok(changes.iter().map(|change| change.id).collect())
     }
 }

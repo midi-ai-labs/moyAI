@@ -11,8 +11,8 @@ use crate::config::merge::apply_patch as apply_config_patch;
 use crate::error::{AppRunError, RuntimeError};
 use crate::harness::{HarnessRecordingSink, NativeHarnessRecorder};
 use crate::llm::{
-    ConfigModelCatalog, ModelCatalog, apply_provider_model_info_to_config,
-    fetch_provider_model_infos,
+    ConfigModelCatalog, ModelCatalog, apply_model_availability_report_to_config,
+    check_model_availability,
 };
 use crate::protocol::{
     ActiveWorkContractProjection, ModelCapabilities as ProtocolModelCapabilities, OutputContract,
@@ -23,7 +23,6 @@ use crate::runtime::RunEventSink;
 use crate::session::{
     DispatchTransformKind, ImagePart, PromptDispatchPart, RunSummary, SessionRepository,
     SessionSelector, SessionStartRequest, SessionStateSnapshot, SessionStatus, TaskRoute,
-    Transcript,
 };
 use crate::storage::StoreBundle;
 use crate::workspace::{branch_review_scope, uncommitted_review_scope};
@@ -78,8 +77,7 @@ impl RunService {
             .store
             .protocol_event_store()
             .list_history_items_for_session(session_id)?;
-        let session = self.store.session_repo().get_session(session_id).await?;
-        let runtime_input = RuntimeInputView::from_history_items(&session, history_items);
+        let runtime_input = RuntimeInputView::from_history_items(history_items);
         if !runtime_input.has_user_turn() {
             return Err(AppRunError::Message(
                 "cannot build runtime input without a canonical protocol user turn".to_string(),
@@ -121,10 +119,10 @@ impl RunService {
                 .map(is_placeholder_session_title)
                 .unwrap_or(false)
             && !request.prompt.trim().is_empty();
-        let resuming_interrupted_session = self.session_was_running(&selector).await?;
-        hydrate_configured_model_from_provider(&mut effective_config).await?;
-        let model = ConfigModelCatalog::new(effective_config.clone()).resolve(None)?;
         let image_parts = load_image_attachments(&request.cwd, &request.image_paths)?;
+        hydrate_configured_model_from_provider(&mut effective_config, !image_parts.is_empty())
+            .await?;
+        let model = ConfigModelCatalog::new(effective_config.clone()).resolve(None)?;
         if !image_parts.is_empty() && !effective_config.model.supports_images {
             return Err(AppRunError::Message(format!(
                 "configured model `{}` does not advertise image support; choose a vision-capable model before sending images",
@@ -167,12 +165,6 @@ impl RunService {
             session_id: session_context.session.id,
             title: session_context.session.title.clone(),
         })?;
-        if resuming_interrupted_session {
-            sink.emit(crate::session::RunEvent::SessionFailed {
-                session_id: session_context.session.id,
-                message: "Previous run was interrupted.".to_string(),
-            })?;
-        }
 
         let user_message_id = if prepared.prompt.trim().is_empty() {
             let runtime_input = self.runtime_input_view(session_context.session.id).await?;
@@ -327,21 +319,6 @@ impl RunService {
         Ok(summary)
     }
 
-    async fn session_was_running(&self, selector: &SessionSelector) -> Result<bool, AppRunError> {
-        let repository = self.store.session_repo();
-        let session = match selector {
-            SessionSelector::New => return Ok(false),
-            SessionSelector::ById(id) => repository.get_session(*id).await?,
-            SessionSelector::Latest => {
-                match repository.latest_session(self.workspace.project_id).await? {
-                    Some(session) => session,
-                    None => return Ok(false),
-                }
-            }
-        };
-        Ok(session.status == SessionStatus::Running)
-    }
-
     async fn execute_session_list(
         &self,
         request: SessionListRequest,
@@ -383,16 +360,7 @@ impl RunService {
                 "cannot show session because canonical protocol history is empty".to_string(),
             ));
         }
-        let transcript = self
-            .runtime_input_view(request.session_id)
-            .await?
-            .into_compatibility_transcript();
-        let transcript = if request.show_reasoning {
-            transcript
-        } else {
-            strip_reasoning(transcript)
-        };
-        renderer.render_session_history_items(&session, &history_items, &transcript)?;
+        renderer.render_session_history_items(&session, &history_items, request.show_reasoning)?;
         Ok(RunSummary {
             session_id: request.session_id,
             assistant_message_id: None,
@@ -409,7 +377,7 @@ fn latest_user_message_id_from_history_items(
     history_items: &[crate::protocol::HistoryItem],
 ) -> Option<crate::session::MessageId> {
     let mut ordered = history_items.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|item| (item.created_at_ms, item.sequence_no));
+    ordered.sort_by_key(|item| (item.sequence_no, item.created_at_ms));
     ordered.iter().rev().find_map(|item| match &item.payload {
         crate::protocol::HistoryItemPayload::UserTurn {
             message_id: Some(message_id),
@@ -424,8 +392,8 @@ pub(crate) fn resume_latest_user_message_uses_item_order_fixture_passes() -> boo
     use crate::session::{MessageId, SessionId};
 
     let session_id = SessionId::new();
-    let old_message = MessageId::new();
-    let new_message = MessageId::new();
+    let sequence_latest_message = MessageId::new();
+    let timestamp_latest_message = MessageId::new();
     let items = vec![
         HistoryItem {
             id: HistoryItemId::new(),
@@ -434,9 +402,9 @@ pub(crate) fn resume_latest_user_message_uses_item_order_fixture_passes() -> boo
             sequence_no: 2,
             created_at_ms: 10,
             payload: HistoryItemPayload::UserTurn {
-                message_id: Some(old_message),
+                message_id: Some(sequence_latest_message),
                 content: vec![ContentPart::Text {
-                    text: "older request".to_string(),
+                    text: "sequence latest request".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -450,9 +418,9 @@ pub(crate) fn resume_latest_user_message_uses_item_order_fixture_passes() -> boo
             sequence_no: 1,
             created_at_ms: 20,
             payload: HistoryItemPayload::UserTurn {
-                message_id: Some(new_message),
+                message_id: Some(timestamp_latest_message),
                 content: vec![ContentPart::Text {
-                    text: "newer request".to_string(),
+                    text: "timestamp latest request".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -460,7 +428,11 @@ pub(crate) fn resume_latest_user_message_uses_item_order_fixture_passes() -> boo
             },
         },
     ];
-    latest_user_message_id_from_history_items(&items) == Some(new_message)
+    latest_user_message_id_from_history_items(&items) == Some(sequence_latest_message)
+}
+
+pub(crate) fn app_resume_latest_user_sequence_primary_order_fixture_passes() -> bool {
+    resume_latest_user_message_uses_item_order_fixture_passes()
 }
 
 fn build_user_thread_op(
@@ -499,6 +471,7 @@ fn build_user_thread_op(
 
 async fn hydrate_configured_model_from_provider(
     config: &mut crate::config::ResolvedConfig,
+    require_vision: bool,
 ) -> Result<(), AppRunError> {
     let configured_model = config.model.model.trim().to_string();
     if configured_model.is_empty() {
@@ -507,21 +480,69 @@ async fn hydrate_configured_model_from_provider(
         ));
     }
 
-    let models = fetch_provider_model_infos(config, &config.model.base_url).await?;
-    let Some(model) = models.iter().find(|model| model.id == configured_model) else {
-        let available = models
-            .iter()
-            .take(12)
-            .map(|model| model.id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(AppRunError::Message(format!(
-            "configured model `{configured_model}` is not available at `{}`; available models: {available}",
-            crate::llm::normalize_provider_base_url(&config.model.base_url),
-        )));
-    };
-    apply_provider_model_info_to_config(&mut config.model, model);
+    let report = check_model_availability(config, None, None, require_vision).await;
+    apply_model_availability_report_to_config(&mut config.model, &report)
+        .map_err(|error| AppRunError::Message(error.to_string()))?;
     Ok(())
+}
+
+pub(crate) fn runtime_model_hydration_uses_availability_probe_evidence_fixture_passes() -> bool {
+    let mut config = crate::config::ResolvedConfig::default();
+    config.model.supports_tools = false;
+    let metadata_only_model = crate::llm::ProviderModelInfo {
+        id: config.model.model.clone(),
+        display_name: None,
+        context_window: Some(config.model.context_window),
+        max_output_tokens: Some(config.model.max_output_tokens),
+        supports_images: None,
+        supports_tools: Some(false),
+        supports_reasoning: None,
+        max_parallel_predictions: Some(config.model.max_parallel_predictions),
+        loaded: true,
+        source: "openai_compat".to_string(),
+    };
+
+    let mut report = crate::llm::ModelAvailabilityReport {
+        gate: "model_availability".to_string(),
+        status: crate::llm::ModelAvailabilityStatus::Pass,
+        generated_by: "moyai_model_availability_v2".to_string(),
+        model: metadata_only_model.id.clone(),
+        base_url: config.model.base_url.clone(),
+        provider_metadata_mode: config.model.provider_metadata_mode,
+        v1_present: true,
+        native_present: false,
+        require_vision: false,
+        vision_capable: false,
+        vision_probe_passed: false,
+        vision_probes: Vec::new(),
+        tool_use_capable: Some(true),
+        capability_overrides: vec![crate::llm::model_probe::ModelCapabilityOverride {
+            capability: crate::llm::model_probe::ModelCapabilityKind::ToolUse,
+            metadata_value: Some(false),
+            effective_value: true,
+            evidence_ref: "tool_call_probe_passed".to_string(),
+        }],
+        tool_call_probe_passed: true,
+        tool_call_probes: Vec::new(),
+        reasoning_capable: None,
+        context: metadata_only_model.context_window,
+        max_output_tokens: metadata_only_model.max_output_tokens,
+        max_parallel_predictions: metadata_only_model.max_parallel_predictions,
+        matched_model: Some(crate::llm::ProviderModelInfo {
+            supports_tools: Some(true),
+            ..metadata_only_model
+        }),
+        v1_models: vec![config.model.model.clone()],
+        native_models: Vec::new(),
+        openai_error: None,
+        native_error: None,
+        checked_at_ms: 0,
+    };
+    report.status = crate::llm::ModelAvailabilityStatus::Pass;
+    if apply_model_availability_report_to_config(&mut config.model, &report).is_err() {
+        return false;
+    }
+    config.model.supports_tools
 }
 
 fn load_image_attachments(
@@ -655,7 +676,11 @@ fn build_initial_turn_context(
             supports_tools: config.model.supports_tools,
             supports_reasoning: config.model.supports_reasoning,
             supports_images: config.model.supports_images,
-            parallel_tool_calls: config.model.parallel_tool_calls,
+            parallel_tool_calls: crate::llm::control_plane_parallel_tool_calls_projection(
+                allowed_tools.len(),
+                config.model.parallel_tool_calls,
+                config.model.max_parallel_predictions,
+            ),
             context_window: config.model.context_window,
             max_output_tokens: config.model.max_output_tokens,
         },
@@ -664,7 +689,7 @@ fn build_initial_turn_context(
         active_contract: ActiveWorkContractProjection {
             route: state.route,
             process_phase: state.process_phase,
-            active_work_kind: Some(format!("{:?}", state.route)),
+            active_work_kind: Some(state.route.key().to_string()),
             summary: "Initial user turn context before reducer projection.".to_string(),
             active_targets: state.active_targets.clone(),
             operation_intents: Vec::new(),
@@ -687,6 +712,21 @@ fn build_initial_turn_context(
             .and_then(|handoff| handoff.continuation_contract.clone()),
         turn_decision_projection: None,
     }
+}
+
+pub(crate) fn app_initial_turn_route_key_projection_fixture_passes() -> bool {
+    use crate::session::TaskRoute;
+
+    [
+        (TaskRoute::Code, "code"),
+        (TaskRoute::Docs, "docs"),
+        (TaskRoute::Review, "review"),
+        (TaskRoute::Debug, "debug"),
+        (TaskRoute::Ask, "ask"),
+        (TaskRoute::Summary, "summary"),
+    ]
+    .into_iter()
+    .all(|(route, key)| route.key() == key && route.key() != format!("{route:?}"))
 }
 
 fn sandbox_profile_for_access_mode(access_mode: crate::config::AccessMode) -> SandboxProfile {
@@ -814,15 +854,6 @@ impl<'a> RunEventSink for RendererSink<'a> {
             .render(&event)
             .map_err(|error| RuntimeError::Message(error.to_string()))
     }
-}
-
-fn strip_reasoning(mut transcript: Transcript) -> Transcript {
-    for message in &mut transcript.messages {
-        message
-            .parts
-            .retain(|part| !matches!(part.kind, crate::session::PartKind::Reasoning));
-    }
-    transcript
 }
 
 #[cfg(test)]

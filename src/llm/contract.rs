@@ -12,6 +12,8 @@ use crate::session::{FinishReason, TokenUsage};
 pub struct ModelCapabilities {
     pub supports_tools: bool,
     pub supports_reasoning: bool,
+    #[serde(default)]
+    pub supports_images: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +68,8 @@ pub enum ModelMessage {
         call_id: String,
         tool_name: String,
         result: String,
+        #[serde(default, skip_serializing, skip_deserializing)]
+        metadata: serde_json::Value,
     },
 }
 
@@ -78,6 +82,22 @@ pub struct ToolSchema {
     pub strict: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderToolChoice {
+    Required,
+    Named { name: String },
+}
+
+impl ProviderToolChoice {
+    pub fn diagnostic_label(&self) -> String {
+        match self {
+            Self::Required => "required".to_string(),
+            Self::Named { name } => format!("named:{name}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub model: ModelProfile,
@@ -85,6 +105,10 @@ pub struct ChatRequest {
     pub system_prompt: String,
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ToolSchema>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ProviderToolChoice>,
+    #[serde(default)]
+    pub parallel_tool_calls: bool,
     pub timeout_ms: u64,
     pub stream_idle_timeout_ms: u64,
     pub stream_max_retries: u8,
@@ -132,6 +156,11 @@ pub const OPENAI_COMPATIBLE_ONLY_TOOL_LIFECYCLE_POLICY: &str = r#"Agent Tool Pol
 - A final assistant message is allowed only after the current lifecycle state says no open obligations remain.
 - If this Agent Tool Policy and the final-answer-form rule appear to conflict, this Agent Tool Policy controls tool-enabled requests with open obligations."#;
 
+const CURRENT_PROVIDER_MODEL: &str = "qwen/qwen3.6-35b-a3b";
+const CURRENT_PROVIDER_BASE_URL: &str = "http://127.0.0.1:1234";
+const CURRENT_PROVIDER_CONTEXT_WINDOW: u32 = 131_072;
+const CURRENT_PROVIDER_MAX_OUTPUT_TOKENS: u32 = 8_192;
+
 impl ChatRequest {
     pub fn provider_system_prompt(&self) -> String {
         system_prompt_with_provider_policy(
@@ -148,10 +177,95 @@ impl ChatRequest {
     pub fn output_budget_reason(&self) -> &'static str {
         effective_max_output_tokens_for_request(self).1
     }
+
+    pub fn validate_provider_lifecycle(&self) -> Result<(), LlmError> {
+        if !self.model.capabilities.supports_tools && !self.tools.is_empty() {
+            return Err(LlmError::Message(
+                "ChatRequest provider tools require a tool-capable model profile".to_string(),
+            ));
+        }
+        if self.tool_choice.is_some() && self.tools.is_empty() {
+            return Err(LlmError::Message(
+                "ChatRequest tool_choice requires a non-empty provider tool surface".to_string(),
+            ));
+        }
+        if let Some(ProviderToolChoice::Named { name }) = &self.tool_choice
+            && !self.tools.iter().any(|tool| tool.name == *name)
+        {
+            return Err(LlmError::Message(format!(
+                "ChatRequest named tool_choice `{name}` is not present in provider tool surface"
+            )));
+        }
+        if self.parallel_tool_calls && self.tools.is_empty() {
+            return Err(LlmError::Message(
+                "ChatRequest parallel_tool_calls requires a non-empty provider tool surface"
+                    .to_string(),
+            ));
+        }
+        if !self.model.capabilities.supports_images && self.messages.iter().any(message_has_image) {
+            return Err(LlmError::Message(
+                "ChatRequest image content requires a vision-capable model profile".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn message_has_image(message: &ModelMessage) -> bool {
+    matches!(
+        message,
+        ModelMessage::UserParts { parts }
+            if parts
+                .iter()
+                .any(|part| matches!(part, ModelContentPart::Image { .. }))
+    )
 }
 
 pub fn effective_max_output_tokens_for_request(request: &ChatRequest) -> (u32, &'static str) {
     (request.model.max_output_tokens, "configured_model_limit")
+}
+
+pub fn effective_parallel_tool_calls(
+    tool_surface_len: usize,
+    parallel_tool_calls_enabled: bool,
+    max_parallel_predictions: u32,
+) -> bool {
+    tool_surface_len > 0 && parallel_tool_calls_enabled && max_parallel_predictions > 1
+}
+
+pub fn control_plane_parallel_tool_calls_projection(
+    tool_surface_len: usize,
+    parallel_tool_calls_enabled: bool,
+    max_parallel_predictions: u32,
+) -> bool {
+    effective_parallel_tool_calls(
+        tool_surface_len,
+        parallel_tool_calls_enabled,
+        max_parallel_predictions,
+    )
+}
+
+pub fn tool_surface_scoped_parallel_tool_calls_projection(
+    tool_surface_len: usize,
+    effective_parallel_tool_calls: bool,
+) -> Option<bool> {
+    (tool_surface_len > 0).then_some(effective_parallel_tool_calls)
+}
+
+pub(crate) fn effective_parallel_tool_calls_requires_tool_surface_and_prediction_capacity_fixture_passes()
+-> bool {
+    !effective_parallel_tool_calls(0, true, 4)
+        && !effective_parallel_tool_calls(1, true, 1)
+        && !effective_parallel_tool_calls(1, false, 4)
+        && effective_parallel_tool_calls(1, true, 2)
+}
+
+pub(crate) fn control_plane_parallel_tool_calls_matches_effective_projection_fixture_passes() -> bool
+{
+    !control_plane_parallel_tool_calls_projection(0, true, 4)
+        && !control_plane_parallel_tool_calls_projection(1, true, 1)
+        && !control_plane_parallel_tool_calls_projection(1, false, 4)
+        && control_plane_parallel_tool_calls_projection(1, true, 2)
 }
 
 pub fn system_prompt_with_provider_policy(
@@ -159,17 +273,16 @@ pub fn system_prompt_with_provider_policy(
     provider_metadata_mode: ProviderMetadataMode,
     tool_calls_available: bool,
 ) -> String {
-    if provider_metadata_mode != ProviderMetadataMode::OpenAiCompatibleOnly
-        || system_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
-    {
+    if provider_metadata_mode != ProviderMetadataMode::OpenAiCompatibleOnly {
         return system_prompt.to_string();
     }
 
     let provider_policy = openai_compatible_only_provider_policy(tool_calls_available);
-    if system_prompt.trim().is_empty() {
+    let body = strip_openai_compatible_provider_policy(system_prompt);
+    if body.trim().is_empty() {
         provider_policy
     } else {
-        format!("{provider_policy}\n\n{system_prompt}")
+        format!("{provider_policy}\n\n{body}")
     }
 }
 
@@ -181,6 +294,17 @@ fn openai_compatible_only_provider_policy(tool_calls_available: bool) -> String 
     } else {
         OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY.to_string()
     }
+}
+
+fn strip_openai_compatible_provider_policy(system_prompt: &str) -> &str {
+    let tool_policy = openai_compatible_only_provider_policy(true);
+    if let Some(rest) = system_prompt.strip_prefix(&tool_policy) {
+        return rest.strip_prefix("\n\n").unwrap_or(rest);
+    }
+    if let Some(rest) = system_prompt.strip_prefix(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY) {
+        return rest.strip_prefix("\n\n").unwrap_or(rest);
+    }
+    system_prompt
 }
 
 pub fn openai_compatible_only_tool_policy_fixture_passes() -> bool {
@@ -206,23 +330,76 @@ pub fn openai_compatible_only_tool_policy_fixture_passes() -> bool {
         && tool_prompt.ends_with("\n\nBase coding prompt")
 }
 
+pub fn provider_policy_tool_lifecycle_upgrade_fixture_passes() -> bool {
+    let no_tool_prompt = system_prompt_with_provider_policy(
+        "Base coding prompt",
+        ProviderMetadataMode::OpenAiCompatibleOnly,
+        false,
+    );
+    let upgraded_tool_prompt = system_prompt_with_provider_policy(
+        &no_tool_prompt,
+        ProviderMetadataMode::OpenAiCompatibleOnly,
+        true,
+    );
+
+    no_tool_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
+        && !no_tool_prompt.contains(OPENAI_COMPATIBLE_ONLY_TOOL_LIFECYCLE_POLICY)
+        && upgraded_tool_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
+        && upgraded_tool_prompt.contains(OPENAI_COMPATIBLE_ONLY_TOOL_LIFECYCLE_POLICY)
+        && upgraded_tool_prompt.contains("use the provided tools")
+        && upgraded_tool_prompt.contains("final assistant message is allowed only after")
+        && upgraded_tool_prompt.ends_with("\n\nBase coding prompt")
+}
+
 pub fn tool_call_turn_uses_configured_output_budget_fixture_passes() -> bool {
+    let tool_request = output_budget_fixture_chat_request();
+    let no_tool_request = ChatRequest {
+        tools: Vec::new(),
+        tool_choice: None,
+        extra_body: None,
+        ..tool_request.clone()
+    };
+
+    tool_request.model.max_output_tokens == CURRENT_PROVIDER_MAX_OUTPUT_TOKENS
+        && tool_request.effective_max_output_tokens() == CURRENT_PROVIDER_MAX_OUTPUT_TOKENS
+        && tool_request.output_budget_reason() == "configured_model_limit"
+        && no_tool_request.effective_max_output_tokens() == CURRENT_PROVIDER_MAX_OUTPUT_TOKENS
+        && no_tool_request.output_budget_reason() == "configured_model_limit"
+}
+
+pub fn llm_contract_current_provider_profile_fixture_passes() -> bool {
+    let request = output_budget_fixture_chat_request();
+
+    request.model.name == CURRENT_PROVIDER_MODEL
+        && request.base_url == CURRENT_PROVIDER_BASE_URL
+        && request.model.context_window == CURRENT_PROVIDER_CONTEXT_WINDOW
+        && request.model.max_output_tokens == CURRENT_PROVIDER_MAX_OUTPUT_TOKENS
+        && request.model.provider_metadata_mode == ProviderMetadataMode::LmStudioNativeRequired
+        && request.model.capabilities.supports_tools
+        && !request.model.capabilities.supports_reasoning
+        && !request.model.capabilities.supports_images
+}
+
+fn output_budget_fixture_chat_request() -> ChatRequest {
     let model = ModelProfile {
-        name: "local-tool-model".to_string(),
-        context_window: 131_072,
-        max_output_tokens: 131_072,
-        provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+        name: CURRENT_PROVIDER_MODEL.to_string(),
+        context_window: CURRENT_PROVIDER_CONTEXT_WINDOW,
+        max_output_tokens: CURRENT_PROVIDER_MAX_OUTPUT_TOKENS,
+        provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
         capabilities: ModelCapabilities {
             supports_tools: true,
             supports_reasoning: false,
+            supports_images: false,
         },
     };
-    let tool_request = ChatRequest {
+    ChatRequest {
         model: model.clone(),
-        base_url: "http://localhost:8110".to_string(),
+        base_url: CURRENT_PROVIDER_BASE_URL.to_string(),
         system_prompt: "Use tools for open work.".to_string(),
         messages: vec![ModelMessage::User {
-            content: "Create test_component.py".to_string(),
+            content:
+                "Create src/workflow.rs for workflow-output-budget-contract (llm_contract_fixture_language_neutral)"
+                    .to_string(),
         }],
         tools: vec![ToolSchema {
             name: "write".to_string(),
@@ -237,6 +414,8 @@ pub fn tool_call_turn_uses_configured_output_budget_fixture_passes() -> bool {
             }),
             strict: false,
         }],
+        tool_choice: Some(ProviderToolChoice::Required),
+        parallel_tool_calls: true,
         timeout_ms: 600_000,
         stream_idle_timeout_ms: 300_000,
         stream_max_retries: 0,
@@ -248,19 +427,71 @@ pub fn tool_call_turn_uses_configured_output_budget_fixture_passes() -> bool {
         frequency_penalty: None,
         seed: None,
         stop_sequences: Vec::new(),
-        extra_body: Some(serde_json::json!({"tool_choice": "required"})),
-    };
-    let no_tool_request = ChatRequest {
-        tools: Vec::new(),
         extra_body: None,
-        ..tool_request.clone()
+    }
+}
+
+pub fn chat_request_tool_choice_is_provider_neutral_typed_fixture_passes() -> bool {
+    let named = ProviderToolChoice::Named {
+        name: "apply_patch".to_string(),
+    };
+    let required = ProviderToolChoice::Required;
+    let Ok(serialized_named) = serde_json::to_value(&named) else {
+        return false;
+    };
+    named.diagnostic_label() == "named:apply_patch"
+        && required.diagnostic_label() == "required"
+        && serialized_named
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("named")
+        && serialized_named
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            == Some("apply_patch")
+        && serialized_named.get("function").is_none()
+}
+
+pub fn model_tool_replay_metadata_is_not_serialized_fixture_passes() -> bool {
+    let message = ModelMessage::Tool {
+        call_id: "call_1".to_string(),
+        tool_name: "read".to_string(),
+        result: "repository excerpt".to_string(),
+        metadata: serde_json::json!({
+            "tool_feedback_envelope": {
+                "kind": "supporting_context",
+                "operation_progress_class": "supporting_context"
+            },
+            "operation_progress_class": "supporting_context"
+        }),
     };
 
-    tool_request.model.max_output_tokens == 131_072
-        && tool_request.effective_max_output_tokens() == 131_072
-        && tool_request.output_budget_reason() == "configured_model_limit"
-        && no_tool_request.effective_max_output_tokens() == 131_072
-        && no_tool_request.output_budget_reason() == "configured_model_limit"
+    let serialized = serde_json::to_value(&message).unwrap_or(serde_json::Value::Null);
+    serialized.get("metadata").is_none()
+        && !serialized.to_string().contains("tool_feedback_envelope")
+        && !serialized.to_string().contains("supporting_context")
+}
+
+pub fn model_tool_replay_metadata_is_not_deserialized_fixture_passes() -> bool {
+    let incoming = serde_json::json!({
+        "role": "tool",
+        "call_id": "call_1",
+        "tool_name": "read",
+        "result": "repository excerpt",
+        "metadata": {
+            "tool_feedback_envelope": {
+                "kind": "supporting_context",
+                "operation_progress_class": "supporting_context"
+            },
+            "operation_progress_class": "supporting_context"
+        }
+    });
+
+    let Ok(ModelMessage::Tool { metadata, .. }) = serde_json::from_value::<ModelMessage>(incoming)
+    else {
+        return false;
+    };
+    metadata.is_null()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +585,11 @@ mod tests {
         assert!(prompt.contains("use the provided tools"));
         assert!(prompt.contains("open obligations remain"));
         assert!(openai_compatible_only_tool_policy_fixture_passes());
+    }
+
+    #[test]
+    fn openai_compatible_only_policy_upgrade_preserves_tool_lifecycle_authority() {
+        assert!(super::provider_policy_tool_lifecycle_upgrade_fixture_passes());
     }
 
     #[test]

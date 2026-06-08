@@ -1,6 +1,23 @@
 export type RowId = string;
 
 export interface TranscriptRow {
+  row_kind:
+    | "empty_placeholder"
+    | "user"
+    | "assistant"
+    | "reasoning"
+    | "editing"
+    | "tool"
+    | "summary"
+    | "diff"
+    | "system"
+    | "error"
+    | "work_summary_running"
+    | "work_summary_completed"
+    | "work_summary_failed"
+    | "work_summary_cancelled"
+    | "work_summary_awaiting_user"
+    | "file_changes";
   kind: string;
   step: string;
   title: string;
@@ -98,9 +115,11 @@ export interface DesktopWebState {
   session_rows: SessionRow[];
   chat_session_rows: SessionRow[];
   selected_session_index: number;
+  thread_empty: boolean;
   transcript_rows: TranscriptRow[];
   artifact_rows: ArtifactRow[];
   selected_artifact_index: number;
+  artifact_preview_available: boolean;
   artifact_preview_text: string;
   file_change_rows: FileChangeRow[];
   file_change_summary_text: string;

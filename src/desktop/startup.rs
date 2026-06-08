@@ -2,9 +2,17 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::config::ResolvedConfig;
 use crate::docling::normalize_docling_base_url;
-use crate::llm::{ProviderModelInfo, normalize_provider_base_url};
+use crate::llm::{
+    ModelAvailabilityReport, ModelAvailabilityStatus, ProviderModelInfo, ToolCallProbeReport,
+    normalize_provider_base_url,
+};
 
 use super::state::DesktopOverlay;
+
+const DESKTOP_STARTUP_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
+const DESKTOP_STARTUP_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
+const DESKTOP_STARTUP_FIXTURE_CONTEXT_WINDOW: u32 = 131_072;
+const DESKTOP_STARTUP_FIXTURE_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopStartupStatus {
@@ -160,13 +168,8 @@ impl DesktopStartupState {
         state
     }
 
-    pub fn complete_provider_catalog(
-        &mut self,
-        config: &ResolvedConfig,
-        models: &[ProviderModelInfo],
-    ) {
-        let configured_model = config.model.model.trim();
-        if configured_model.is_empty() {
+    pub fn complete_model_availability(&mut self, report: &ModelAvailabilityReport) {
+        if report.model.trim().is_empty() {
             self.set_provider_check(DesktopStartupCheck::fail(
                 "provider",
                 "LLM 接続",
@@ -175,45 +178,110 @@ impl DesktopStartupState {
             self.recompute();
             return;
         }
-        if let Some(model) = models.iter().find(|model| model.id == configured_model) {
-            let source = if model.loaded {
-                format!("{} / loaded", model.source)
-            } else {
-                model.source.clone()
-            };
+        if matches!(report.status, ModelAvailabilityStatus::Pass) {
+            let source = report
+                .matched_model
+                .as_ref()
+                .map(|model| {
+                    if model.loaded {
+                        format!("{} / loaded", model.source)
+                    } else {
+                        model.source.clone()
+                    }
+                })
+                .unwrap_or_else(|| "model availability report".to_string());
             self.set_provider_check(DesktopStartupCheck::pass(
                 "provider",
                 "LLM 接続",
-                format!("接続できました: {configured_model} ({source})"),
+                format!("接続できました: {} ({source})", report.model),
             ));
         } else {
-            let available = models
+            let failure = report
+                .tool_call_probes
                 .iter()
-                .take(8)
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let suffix = if available.is_empty() {
-                "利用可能な model が見つかりません。".to_string()
-            } else {
-                format!("利用可能: {available}")
-            };
+                .find_map(|probe| probe.error.as_deref())
+                .or_else(|| {
+                    report
+                        .vision_probes
+                        .iter()
+                        .find_map(|probe| probe.error.as_deref())
+                })
+                .or(report.openai_error.as_deref())
+                .or(report.native_error.as_deref())
+                .unwrap_or("model availability gate failed");
             self.set_provider_check(DesktopStartupCheck::fail(
                 "provider",
                 "LLM 接続",
-                format!("設定中の model `{configured_model}` が provider にありません。{suffix}"),
+                format!(
+                    "設定中の model `{}` を利用できません: {failure}",
+                    report.model
+                ),
             ));
         }
         self.recompute();
     }
 
-    pub fn fail_provider_catalog(&mut self, message: impl Into<String>) {
+    pub fn fail_provider_availability(&mut self, message: impl Into<String>) {
         self.set_provider_check(DesktopStartupCheck::fail(
             "provider",
             "LLM 接続",
             message.into(),
         ));
         self.recompute();
+    }
+
+    pub(crate) fn desktop_startup_uses_model_availability_report_fixture_passes() -> bool {
+        let config = test_config_with_provider(
+            DESKTOP_STARTUP_FIXTURE_MODEL,
+            DESKTOP_STARTUP_FIXTURE_BASE_URL,
+        );
+        let mut state = DesktopStartupState::begin(true, None, camino::Utf8Path::new("."), &config);
+        let report = test_model_availability_report(ModelAvailabilityStatus::Fail);
+
+        state.complete_model_availability(&report);
+
+        state.status == DesktopStartupStatus::RequiresProvider
+            && state.checks.iter().any(|check| {
+                check.key == "provider"
+                    && check.status == DesktopStartupCheckStatus::Fail
+                    && check.message.contains("tool probe failed")
+            })
+    }
+
+    pub(crate) fn desktop_startup_fixture_current_provider_profile_fixture_passes() -> bool {
+        let config = test_config_with_provider(
+            DESKTOP_STARTUP_FIXTURE_MODEL,
+            DESKTOP_STARTUP_FIXTURE_BASE_URL,
+        );
+        let pass_report = test_model_availability_report(ModelAvailabilityStatus::Pass);
+        let fail_report = test_model_availability_report(ModelAvailabilityStatus::Fail);
+        let matched_model_ok = pass_report
+            .matched_model
+            .as_ref()
+            .map(|model| {
+                model.id == DESKTOP_STARTUP_FIXTURE_MODEL
+                    && model.context_window == Some(DESKTOP_STARTUP_FIXTURE_CONTEXT_WINDOW)
+                    && model.max_output_tokens == Some(DESKTOP_STARTUP_FIXTURE_MAX_OUTPUT_TOKENS)
+            })
+            .unwrap_or(false);
+
+        config.model.model == DESKTOP_STARTUP_FIXTURE_MODEL
+            && config.model.base_url == DESKTOP_STARTUP_FIXTURE_BASE_URL
+            && pass_report.model == DESKTOP_STARTUP_FIXTURE_MODEL
+            && pass_report.base_url == DESKTOP_STARTUP_FIXTURE_BASE_URL
+            && pass_report.context == Some(DESKTOP_STARTUP_FIXTURE_CONTEXT_WINDOW)
+            && pass_report.max_output_tokens == Some(DESKTOP_STARTUP_FIXTURE_MAX_OUTPUT_TOKENS)
+            && pass_report
+                .v1_models
+                .iter()
+                .any(|model| model == DESKTOP_STARTUP_FIXTURE_MODEL)
+            && pass_report
+                .native_models
+                .iter()
+                .any(|model| model == DESKTOP_STARTUP_FIXTURE_MODEL)
+            && fail_report.model == DESKTOP_STARTUP_FIXTURE_MODEL
+            && fail_report.base_url == DESKTOP_STARTUP_FIXTURE_BASE_URL
+            && matched_model_ok
     }
 
     pub fn begin_docling_check(&mut self, config: &ResolvedConfig) -> bool {
@@ -343,6 +411,76 @@ impl DesktopStartupState {
     }
 }
 
+fn test_config_with_provider(model: &str, base_url: &str) -> ResolvedConfig {
+    let mut config = ResolvedConfig::default();
+    config.model.model = model.to_string();
+    config.model.base_url = base_url.to_string();
+    config
+}
+
+fn test_model_info(id: &str) -> ProviderModelInfo {
+    ProviderModelInfo {
+        id: id.to_string(),
+        display_name: None,
+        context_window: Some(DESKTOP_STARTUP_FIXTURE_CONTEXT_WINDOW),
+        max_output_tokens: Some(DESKTOP_STARTUP_FIXTURE_MAX_OUTPUT_TOKENS),
+        supports_images: Some(false),
+        supports_tools: Some(true),
+        supports_reasoning: Some(false),
+        max_parallel_predictions: Some(1),
+        loaded: true,
+        source: "lmstudio_native".to_string(),
+    }
+}
+
+fn test_model_availability_report(status: ModelAvailabilityStatus) -> ModelAvailabilityReport {
+    let matched_model = matches!(status, ModelAvailabilityStatus::Pass)
+        .then(|| test_model_info(DESKTOP_STARTUP_FIXTURE_MODEL));
+    ModelAvailabilityReport {
+        gate: "model_availability".to_string(),
+        status,
+        generated_by: "desktop_startup_fixture".to_string(),
+        model: DESKTOP_STARTUP_FIXTURE_MODEL.to_string(),
+        base_url: DESKTOP_STARTUP_FIXTURE_BASE_URL.to_string(),
+        provider_metadata_mode: crate::config::ProviderMetadataMode::LmStudioNativeRequired,
+        v1_present: matches!(status, ModelAvailabilityStatus::Pass),
+        native_present: matches!(status, ModelAvailabilityStatus::Pass),
+        require_vision: false,
+        vision_capable: false,
+        vision_probe_passed: false,
+        vision_probes: Vec::new(),
+        tool_use_capable: matches!(status, ModelAvailabilityStatus::Pass).then_some(true),
+        capability_overrides: Vec::new(),
+        tool_call_probe_passed: matches!(status, ModelAvailabilityStatus::Pass),
+        tool_call_probes: vec![ToolCallProbeReport {
+            probe: "tool_call_smoke".to_string(),
+            status,
+            tool_choice: "required".to_string(),
+            required_for_gate: true,
+            finish_reason: None,
+            tool_call_received: matches!(status, ModelAvailabilityStatus::Pass),
+            tool_name: matches!(status, ModelAvailabilityStatus::Pass)
+                .then(|| "moyai_probe".to_string()),
+            tool_arguments: matches!(status, ModelAvailabilityStatus::Pass)
+                .then(|| "{}".to_string()),
+            arguments_valid: matches!(status, ModelAvailabilityStatus::Pass),
+            content: None,
+            error: (!matches!(status, ModelAvailabilityStatus::Pass))
+                .then(|| "tool probe failed".to_string()),
+        }],
+        reasoning_capable: Some(false),
+        context: Some(DESKTOP_STARTUP_FIXTURE_CONTEXT_WINDOW),
+        max_output_tokens: Some(DESKTOP_STARTUP_FIXTURE_MAX_OUTPUT_TOKENS),
+        max_parallel_predictions: Some(1),
+        matched_model,
+        v1_models: vec![DESKTOP_STARTUP_FIXTURE_MODEL.to_string()],
+        native_models: vec![DESKTOP_STARTUP_FIXTURE_MODEL.to_string()],
+        openai_error: None,
+        native_error: None,
+        checked_at_ms: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
@@ -350,37 +488,37 @@ mod tests {
     use super::*;
 
     fn config_with_provider(model: &str, base_url: &str) -> ResolvedConfig {
-        let mut config = ResolvedConfig::default();
-        config.model.model = model.to_string();
-        config.model.base_url = base_url.to_string();
-        config
+        test_config_with_provider(model, base_url)
     }
 
     fn config_with_docling(enabled: bool, base_url: &str) -> ResolvedConfig {
-        let mut config = config_with_provider("qwen/example", "http://127.0.0.1:1234");
+        let mut config = config_with_provider(
+            DESKTOP_STARTUP_FIXTURE_MODEL,
+            DESKTOP_STARTUP_FIXTURE_BASE_URL,
+        );
         config.docling.enabled = enabled;
         config.docling.base_url = base_url.to_string();
         config
     }
 
     fn model_info(id: &str) -> ProviderModelInfo {
-        ProviderModelInfo {
-            id: id.to_string(),
-            display_name: None,
-            context_window: Some(4096),
-            max_output_tokens: Some(1024),
-            supports_images: Some(false),
-            supports_tools: Some(true),
-            supports_reasoning: Some(false),
-            max_parallel_predictions: Some(1),
-            loaded: true,
-            source: "lmstudio_native".to_string(),
-        }
+        test_model_info(id)
+    }
+
+    fn passing_availability_report() -> ModelAvailabilityReport {
+        test_model_availability_report(ModelAvailabilityStatus::Pass)
+    }
+
+    fn failing_availability_report() -> ModelAvailabilityReport {
+        test_model_availability_report(ModelAvailabilityStatus::Fail)
     }
 
     #[test]
     fn missing_launch_config_requires_config_after_provider_check() {
-        let config = config_with_provider("qwen/example", "http://127.0.0.1:1234");
+        let config = config_with_provider(
+            DESKTOP_STARTUP_FIXTURE_MODEL,
+            DESKTOP_STARTUP_FIXTURE_BASE_URL,
+        );
         let mut state = DesktopStartupState::begin(
             false,
             Some(Utf8PathBuf::from(
@@ -390,7 +528,7 @@ mod tests {
             &config,
         );
 
-        state.complete_provider_catalog(&config, &[model_info("qwen/example")]);
+        state.complete_model_availability(&passing_availability_report());
 
         assert_eq!(state.status, DesktopStartupStatus::RequiresConfig);
         assert_eq!(state.action_overlay, Some(DesktopOverlay::ConfigEditor));
@@ -401,10 +539,13 @@ mod tests {
 
     #[test]
     fn provider_failure_requires_provider_editor() {
-        let config = config_with_provider("qwen/example", "http://127.0.0.1:1234");
+        let config = config_with_provider(
+            DESKTOP_STARTUP_FIXTURE_MODEL,
+            DESKTOP_STARTUP_FIXTURE_BASE_URL,
+        );
         let mut state = DesktopStartupState::begin(true, None, camino::Utf8Path::new("."), &config);
 
-        state.fail_provider_catalog("connection refused");
+        state.fail_provider_availability("connection refused");
 
         assert_eq!(state.status, DesktopStartupStatus::RequiresProvider);
         assert_eq!(state.action_overlay, Some(DesktopOverlay::ProviderEditor));
@@ -412,10 +553,13 @@ mod tests {
 
     #[test]
     fn matching_provider_model_marks_startup_ready() {
-        let config = config_with_provider("qwen/example", "http://127.0.0.1:1234");
+        let config = config_with_provider(
+            DESKTOP_STARTUP_FIXTURE_MODEL,
+            DESKTOP_STARTUP_FIXTURE_BASE_URL,
+        );
         let mut state = DesktopStartupState::begin(true, None, camino::Utf8Path::new("."), &config);
 
-        state.complete_provider_catalog(&config, &[model_info("qwen/example")]);
+        state.complete_model_availability(&passing_availability_report());
 
         assert_eq!(state.status, DesktopStartupStatus::Ready);
         assert_eq!(state.action_overlay, None);
@@ -426,7 +570,7 @@ mod tests {
         let config = config_with_docling(true, "http://127.0.0.1:8123/");
         let mut state = DesktopStartupState::begin(true, None, camino::Utf8Path::new("."), &config);
 
-        state.complete_provider_catalog(&config, &[model_info("qwen/example")]);
+        state.complete_model_availability(&passing_availability_report());
 
         assert_eq!(state.status, DesktopStartupStatus::Loading);
         assert!(state.checks.iter().any(|check| {
@@ -448,7 +592,7 @@ mod tests {
         let config = config_with_docling(true, "http://127.0.0.1:8123");
         let mut state = DesktopStartupState::begin(true, None, camino::Utf8Path::new("."), &config);
 
-        state.complete_provider_catalog(&config, &[model_info("qwen/example")]);
+        state.complete_model_availability(&passing_availability_report());
         state.fail_docling_check("connection refused");
 
         assert_eq!(state.status, DesktopStartupStatus::RequiresConfig);
@@ -460,11 +604,30 @@ mod tests {
         let config = config_with_docling(false, "http://127.0.0.1:8123");
         let mut state = DesktopStartupState::begin(true, None, camino::Utf8Path::new("."), &config);
 
-        state.complete_provider_catalog(&config, &[model_info("qwen/example")]);
+        state.complete_model_availability(&passing_availability_report());
 
         assert_eq!(state.status, DesktopStartupStatus::Ready);
         assert!(state.checks.iter().any(|check| {
             check.key == "docling" && check.status == DesktopStartupCheckStatus::Pass
+        }));
+    }
+
+    #[test]
+    fn catalog_presence_is_not_startup_readiness_authority() {
+        let config = config_with_provider(
+            DESKTOP_STARTUP_FIXTURE_MODEL,
+            DESKTOP_STARTUP_FIXTURE_BASE_URL,
+        );
+        let _catalog_model_present = model_info(DESKTOP_STARTUP_FIXTURE_MODEL);
+        let mut state = DesktopStartupState::begin(true, None, camino::Utf8Path::new("."), &config);
+
+        state.complete_model_availability(&failing_availability_report());
+
+        assert_eq!(state.status, DesktopStartupStatus::RequiresProvider);
+        assert!(state.checks.iter().any(|check| {
+            check.key == "provider"
+                && check.status == DesktopStartupCheckStatus::Fail
+                && check.message.contains("tool probe failed")
         }));
     }
 }

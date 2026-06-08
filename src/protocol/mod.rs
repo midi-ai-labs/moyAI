@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
@@ -21,19 +22,47 @@ mod recording;
 mod runtime;
 mod store;
 
+const CURRENT_PROTOCOL_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
+const CURRENT_PROTOCOL_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
+const CURRENT_PROTOCOL_FIXTURE_CONTEXT_WINDOW: u32 = 131_072;
+const CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS: u32 = 8_192;
+const PROTOCOL_MOD_PROJECTION_PROVIDER_PROFILE_MARKER: &str =
+    "protocol_mod_projection_fixture_current_provider_profile";
+const PROTOCOL_TOOL_CALL_TYPED_ARGUMENT_AUTHORITY_MARKER: &str =
+    "protocol_tool_call_typed_arguments_authority";
+
 pub(crate) use control::canonicalize_workspace_targets;
 pub use control::{
     ActionAuthority, ControlEnvelopeIssue, ControlEnvelopeIssueCode, ControlEnvelopeIssueSeverity,
     ControlEnvelopeValidation, DispatchPolicy, EvidenceRef, ObligationKind, ObligationSet,
     ObligationStatus, ProjectionBundle, ProjectionSurface, ProjectionSurfaceKind,
-    RenderedProjectionSurface, RequiredAction, RequiredActionKind, TurnControlEnvelope,
-    TurnObligation,
+    RenderedProjectionSurface, RequiredAction, RequiredActionConflict, RequiredActionKind,
+    TurnControlEnvelope, TurnObligation, action_authority_matches_open_obligations_fixture_passes,
+    active_apply_patch_target_projection_renders_operation_template_fixture_passes,
+    active_work_contract_matches_open_obligation_targets_fixture_passes,
+    active_work_contract_route_phase_matches_turn_context_fixture_passes,
+    allowed_forbidden_tool_surfaces_are_disjoint_fixture_passes,
+    conflicting_required_actions_fail_closed_fixture_passes,
     content_changing_projection_text_separates_availability_from_satisfying_progress_fixture_passes,
+    continuation_contract_matches_control_envelope_fixture_passes,
+    edit_only_authoring_grounding_recovery_narrows_action_surface_fixture_passes,
+    named_tool_choice_matches_required_action_fixture_passes,
+    non_python_edit_projection_uses_language_adapter_fixture_passes,
+    output_contract_final_answer_matches_open_obligations_fixture_passes,
+    projection_bundle_lifecycle_fields_match_authority_fixture_passes,
+    required_action_projection_label_is_typed_rendering_fixture_passes,
     singleton_missing_target_stable_surface_projects_apply_patch_action_fixture_passes,
+    turn_decision_projection_matches_control_envelope_fixture_passes,
+    turn_obligation_required_actions_are_typed_fixture_passes,
+    unavailable_explicit_required_action_fails_closed_fixture_passes,
+    verification_active_work_matches_open_obligation_targets_fixture_passes,
     verification_only_authority_narrows_to_exact_shell_fixture_passes,
 };
 pub use projection::{
-    ProtocolRunEventProjection, project_protocol_run_event, project_turn_item_for_run_event,
+    ProtocolRunEventProjection, filechange_item_projection_preserves_call_id_fixture_passes,
+    pending_tool_lifecycle_does_not_fabricate_blocked_action_fixture_passes,
+    project_protocol_run_event, project_turn_item_for_run_event,
+    tool_output_projection_preserves_blocked_action_fixture_passes,
 };
 pub use recording::ProtocolRecordingSink;
 pub(crate) use recording::pre_recorded_protocol_sequence_reservation_fixture_passes;
@@ -41,8 +70,14 @@ pub use runtime::{
     CompiledTurn, ObligationCompiler, TurnEngine, TurnEngineInput, WorkOrder, WorkOrderState,
     repair_target_identity_aliases_compile_exact_write_action_fixture_passes,
 };
-pub(crate) use store::insert_event_bundle_in_transaction;
 pub use store::{ProtocolEventStore, SqliteProtocolEventStore};
+pub(crate) use store::{
+    insert_event_bundle_in_transaction,
+    protocol_store_latest_turn_position_resists_timestamp_drift_fixture_passes,
+    protocol_store_latest_turn_position_uses_unified_item_stream_fixture_passes,
+    protocol_store_rejects_incoherent_event_bundles_fixture_passes,
+    protocol_store_single_item_append_order_atomic_commit_fixture_passes,
+};
 
 macro_rules! protocol_id {
     ($name:ident) => {
@@ -295,6 +330,18 @@ pub struct ActiveWorkContractProjection {
     pub projection_id: ProjectionId,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleGuardSnapshot {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub counters: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_flags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped_targets: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub payloads: BTreeMap<String, Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolApprovalDecision {
@@ -395,6 +442,9 @@ pub enum RuntimeEventMsg {
     ControlEnvelopePrepared {
         envelope: TurnControlEnvelope,
     },
+    LifecycleGuardUpdated {
+        snapshot: LifecycleGuardSnapshot,
+    },
     FileChangesRecorded {
         call_id: ToolCallId,
         change_ids: Vec<ChangeId>,
@@ -491,8 +541,8 @@ pub enum HistoryItemPayload {
     ToolCall {
         call_id: ToolCallId,
         tool: ToolName,
-        /// Compatibility projection used by old transcript/materialized views.
-        /// New runtime code must prefer `effective_arguments`.
+        /// Display/materialized snapshot only; canonical argument authority is
+        /// resolved from `effective_arguments` or `model_arguments`.
         arguments: Value,
         #[serde(default, skip_serializing_if = "Value::is_null")]
         model_arguments: Value,
@@ -558,6 +608,9 @@ pub enum HistoryItemPayload {
     ControlEnvelope {
         envelope: TurnControlEnvelope,
     },
+    LifecycleGuard {
+        snapshot: LifecycleGuardSnapshot,
+    },
     Compaction {
         mode: CompactionMode,
         summary: String,
@@ -565,6 +618,7 @@ pub enum HistoryItemPayload {
         continuation: Option<ContinuationContract>,
     },
     FileChange {
+        call_id: ToolCallId,
         change_ids: Vec<ChangeId>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         changes: Vec<FileChangeEvidence>,
@@ -572,8 +626,260 @@ pub enum HistoryItemPayload {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryItemAuthorityRole {
+    UserInput,
+    AssistantOutput,
+    ToolCall,
+    ToolOutput,
+    RejectedModelAction,
+    CandidateRepairEvidence,
+    RuntimeDiagnostic,
+    RuntimeProjection,
+    RuntimeControl,
+    StateCache,
+    ApprovalEvidence,
+    RetryEvidence,
+    LifecycleGuard,
+    MemoryContinuity,
+    FileEvidence,
+    RuntimeError,
+    ReasoningTrace,
+}
+
+impl HistoryItemPayload {
+    pub fn authority_role(&self) -> HistoryItemAuthorityRole {
+        match self {
+            Self::UserTurn { .. }
+            | Self::Message {
+                role: MessageRole::User,
+                ..
+            }
+            | Self::PromptDispatch { .. } => HistoryItemAuthorityRole::UserInput,
+            Self::Message {
+                role: MessageRole::Assistant,
+                ..
+            } => HistoryItemAuthorityRole::AssistantOutput,
+            Self::Reasoning { .. } => HistoryItemAuthorityRole::ReasoningTrace,
+            Self::Error { .. } => HistoryItemAuthorityRole::RuntimeError,
+            Self::ToolCall { .. } => HistoryItemAuthorityRole::ToolCall,
+            Self::ToolOutput { .. } => HistoryItemAuthorityRole::ToolOutput,
+            Self::RejectedToolProposal { .. } => HistoryItemAuthorityRole::RejectedModelAction,
+            Self::CandidateRepairEdit { .. } => HistoryItemAuthorityRole::CandidateRepairEvidence,
+            Self::RequestDiagnostics { .. } => HistoryItemAuthorityRole::RuntimeDiagnostic,
+            Self::Continuation { .. } => HistoryItemAuthorityRole::RuntimeControl,
+            Self::StateProjection { .. } => HistoryItemAuthorityRole::RuntimeProjection,
+            Self::SessionState { .. } => HistoryItemAuthorityRole::StateCache,
+            Self::ApprovalDecision { .. } => HistoryItemAuthorityRole::ApprovalEvidence,
+            Self::RetryDecision { .. } => HistoryItemAuthorityRole::RetryEvidence,
+            Self::ControlEnvelope { .. } => HistoryItemAuthorityRole::RuntimeControl,
+            Self::LifecycleGuard { .. } => HistoryItemAuthorityRole::LifecycleGuard,
+            Self::Compaction { .. } => HistoryItemAuthorityRole::MemoryContinuity,
+            Self::FileChange { .. } => HistoryItemAuthorityRole::FileEvidence,
+        }
+    }
+
+    pub fn is_provider_replay_candidate(&self) -> bool {
+        match self {
+            Self::UserTurn { .. }
+            | Self::Message { .. }
+            | Self::ToolCall { .. }
+            | Self::ToolOutput { .. } => true,
+            Self::RejectedToolProposal { proposal } => {
+                proposal.semantic_class == "text_final_while_obligations_open"
+            }
+            _ => false,
+        }
+    }
+
+    pub fn is_materialized_projection_only(&self) -> bool {
+        matches!(
+            self.authority_role(),
+            HistoryItemAuthorityRole::RuntimeDiagnostic
+                | HistoryItemAuthorityRole::RuntimeProjection
+                | HistoryItemAuthorityRole::RuntimeControl
+                | HistoryItemAuthorityRole::StateCache
+                | HistoryItemAuthorityRole::LifecycleGuard
+                | HistoryItemAuthorityRole::RetryEvidence
+        )
+    }
+
+    pub fn is_state_reducer_authority(&self) -> bool {
+        matches!(
+            self.authority_role(),
+            HistoryItemAuthorityRole::UserInput
+                | HistoryItemAuthorityRole::ToolOutput
+                | HistoryItemAuthorityRole::RejectedModelAction
+                | HistoryItemAuthorityRole::CandidateRepairEvidence
+                | HistoryItemAuthorityRole::FileEvidence
+                | HistoryItemAuthorityRole::MemoryContinuity
+                | HistoryItemAuthorityRole::RuntimeError
+        )
+    }
+}
+
+pub fn history_item_projection_roles_are_not_authority_fixture_passes() -> bool {
+    let projection_id = ProjectionId::new();
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let context = TurnContext {
+        session_id,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        workspace_root: Utf8PathBuf::from("C:/workspace/project"),
+        provider: "lm_studio".to_string(),
+        model: CURRENT_PROTOCOL_FIXTURE_MODEL.to_string(),
+        base_url: CURRENT_PROTOCOL_FIXTURE_BASE_URL.to_string(),
+        access_mode: AccessMode::AutoReview,
+        sandbox: SandboxProfile::WorkspaceWrite,
+        shell_family: ShellFamily::PowerShell,
+        model_capabilities: ModelCapabilities {
+            supports_tools: true,
+            supports_reasoning: false,
+            supports_images: false,
+            parallel_tool_calls: false,
+            context_window: CURRENT_PROTOCOL_FIXTURE_CONTEXT_WINDOW,
+            max_output_tokens: CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS,
+        },
+        route: TaskRoute::Code,
+        process_phase: ProcessPhase::Author,
+        active_contract: ActiveWorkContractProjection {
+            route: TaskRoute::Code,
+            process_phase: ProcessPhase::Author,
+            active_work_kind: Some("fixture".to_string()),
+            summary: "create active artifact".to_string(),
+            active_targets: vec![Utf8PathBuf::from("active.rs")],
+            operation_intents: vec![OperationIntent::ContentChangingAuthoringRequired],
+            required_verification_commands: Vec::new(),
+            allowed_tools: vec![ToolName::ApplyPatch],
+            forbidden_tools: Vec::new(),
+            projection_id,
+        },
+        allowed_tools: vec![ToolName::ApplyPatch],
+        tool_choice: ToolChoice::Auto,
+        images: Vec::new(),
+        output_contract: OutputContract {
+            final_answer_required: true,
+            structured_schema_name: None,
+            history_markdown_projection: true,
+        },
+        continuation: None,
+        turn_decision_projection: None,
+    };
+    let provider_profile_is_current = context.model == CURRENT_PROTOCOL_FIXTURE_MODEL
+        && context.base_url == CURRENT_PROTOCOL_FIXTURE_BASE_URL
+        && context.model_capabilities.context_window == CURRENT_PROTOCOL_FIXTURE_CONTEXT_WINDOW
+        && context.model_capabilities.max_output_tokens
+            == CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS;
+    let envelope = TurnControlEnvelope::new(
+        turn_id,
+        context,
+        ObligationSet::empty(),
+        ActionAuthority {
+            projection_id,
+            required_action: None,
+            required_action_conflicts: Vec::new(),
+            required_verification_commands: Vec::new(),
+            operation_intents: Vec::new(),
+            allowed_tools: vec![ToolName::ApplyPatch],
+            forbidden_tools: Vec::new(),
+            tool_choice: ToolChoice::Auto,
+        },
+        ProjectionBundle::from_authority_and_obligations(
+            &ActionAuthority {
+                projection_id,
+                required_action: None,
+                required_action_conflicts: Vec::new(),
+                required_verification_commands: Vec::new(),
+                operation_intents: Vec::new(),
+                allowed_tools: vec![ToolName::ApplyPatch],
+                forbidden_tools: Vec::new(),
+                tool_choice: ToolChoice::Auto,
+            },
+            &ObligationSet::empty(),
+        ),
+        DispatchPolicy::Dispatch,
+        Vec::new(),
+    );
+    let projection_items = vec![
+        HistoryItemPayload::RequestDiagnostics {
+            diagnostics: RequestDiagnosticsPart {
+                provider: "lm_studio".to_string(),
+                model_name: CURRENT_PROTOCOL_FIXTURE_MODEL.to_string(),
+                base_url: CURRENT_PROTOCOL_FIXTURE_BASE_URL.to_string(),
+                request_timeout_ms: 30_000,
+                stream_idle_timeout_ms: 30_000,
+                stream_max_retries: 0,
+                configured_max_output_tokens: Some(CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS),
+                effective_max_output_tokens: Some(CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS),
+                output_budget_reason: None,
+                supports_tools: Some(true),
+                supports_reasoning: Some(false),
+                supports_images: Some(false),
+                system_prompt_chars: 0,
+                tool_count: 1,
+                tool_choice: Some("auto".to_string()),
+                parallel_tool_calls: Some(false),
+                provider_message_count: 0,
+                image_count: 0,
+                image_bytes: 0,
+                tool_names: vec!["apply_patch".to_string()],
+                tool_schemas: Vec::new(),
+                turn_decision: None,
+                control_envelope: None,
+                replay_policies: Vec::new(),
+                messages: Vec::new(),
+            },
+        },
+        HistoryItemPayload::StateProjection {
+            projection: TurnDecisionDiagnostic {
+                route: "code".to_string(),
+                process_phase: "author".to_string(),
+                active_work_kind: None,
+                active_work_summary: None,
+                active_targets: Vec::new(),
+                verification_pending: false,
+                closeout_ready: false,
+                required_verification_commands: Vec::new(),
+                policy_targets: Vec::new(),
+                allowed_tools: Vec::new(),
+                tool_choice: None,
+                warnings: Vec::new(),
+                repair_lane: None,
+            },
+        },
+        HistoryItemPayload::SessionState {
+            state: SessionStateSnapshot::default(),
+        },
+        HistoryItemPayload::ControlEnvelope { envelope },
+        HistoryItemPayload::LifecycleGuard {
+            snapshot: LifecycleGuardSnapshot::default(),
+        },
+    ];
+
+    projection_items.iter().all(|payload| {
+        payload.is_materialized_projection_only()
+            && !payload.is_provider_replay_candidate()
+            && !payload.is_state_reducer_authority()
+    }) && provider_profile_is_current
+        && projection_items.iter().any(|payload| {
+            matches!(
+                payload,
+                HistoryItemPayload::RequestDiagnostics { diagnostics }
+                    if diagnostics.model_name == CURRENT_PROTOCOL_FIXTURE_MODEL
+                        && diagnostics.base_url == CURRENT_PROTOCOL_FIXTURE_BASE_URL
+                        && diagnostics.configured_max_output_tokens
+                            == Some(CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS)
+                        && diagnostics.effective_max_output_tokens
+                            == Some(CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS)
+            )
+        })
+        && PROTOCOL_MOD_PROJECTION_PROVIDER_PROFILE_MARKER
+            == "protocol_mod_projection_fixture_current_provider_profile"
+}
+
 pub fn canonical_tool_call_arguments<'a>(
-    arguments: &'a Value,
+    _arguments: &'a Value,
     model_arguments: &'a Value,
     effective_arguments: &'a Value,
 ) -> &'a Value {
@@ -582,8 +888,48 @@ pub fn canonical_tool_call_arguments<'a>(
     } else if !model_arguments.is_null() {
         model_arguments
     } else {
-        arguments
+        model_arguments
     }
+}
+
+pub fn protocol_tool_call_arguments_do_not_fallback_to_legacy_display_projection_fixture_passes()
+-> bool {
+    let legacy_display_arguments = serde_json::json!({
+        "target": "legacy-display-only.rs",
+        "operation": "write"
+    });
+    let model_arguments = serde_json::Value::Null;
+    let effective_arguments = serde_json::Value::Null;
+    let selected = canonical_tool_call_arguments(
+        &legacy_display_arguments,
+        &model_arguments,
+        &effective_arguments,
+    );
+    let typed_model_arguments = serde_json::json!({
+        "target": "typed-model.rs",
+        "operation": "write"
+    });
+    let selected_model = canonical_tool_call_arguments(
+        &legacy_display_arguments,
+        &typed_model_arguments,
+        &effective_arguments,
+    );
+    let typed_effective_arguments = serde_json::json!({
+        "target": "typed-effective.rs",
+        "operation": "write"
+    });
+    let selected_effective = canonical_tool_call_arguments(
+        &legacy_display_arguments,
+        &typed_model_arguments,
+        &typed_effective_arguments,
+    );
+
+    selected.is_null()
+        && selected_model == &typed_model_arguments
+        && selected_effective == &typed_effective_arguments
+        && selected != &legacy_display_arguments
+        && PROTOCOL_TOOL_CALL_TYPED_ARGUMENT_AUTHORITY_MARKER
+            == "protocol_tool_call_typed_arguments_authority"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -697,6 +1043,9 @@ pub enum TurnItemPayload {
     State {
         summary: String,
     },
+    LifecycleGuard {
+        summary: String,
+    },
     ToolStatus {
         call_id: ToolCallId,
         tool: ToolName,
@@ -706,6 +1055,7 @@ pub enum TurnItemPayload {
         summary: String,
     },
     FileChange {
+        call_id: ToolCallId,
         change_ids: Vec<ChangeId>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         changes: Vec<FileChangeEvidence>,
@@ -728,6 +1078,90 @@ pub enum TurnItemPayload {
         status: TurnTerminalStatus,
         summary: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnItemProjectionRole {
+    UserVisibleMessage,
+    AssistantVisibleMessage,
+    ReasoningTrace,
+    RuntimeProjection,
+    RuntimeControl,
+    ToolLifecycleEvidence,
+    FileEvidence,
+    MemoryContinuity,
+    ApprovalEvidence,
+    RuntimeDiagnostic,
+    RuntimeError,
+    TerminalOutcome,
+}
+
+impl TurnItemPayload {
+    pub fn projection_role(&self) -> TurnItemProjectionRole {
+        match self {
+            Self::UserMessage { .. } => TurnItemProjectionRole::UserVisibleMessage,
+            Self::AgentMessage { .. } => TurnItemProjectionRole::AssistantVisibleMessage,
+            Self::Reasoning { .. } => TurnItemProjectionRole::ReasoningTrace,
+            Self::Plan { .. } | Self::PromptDispatch { .. } | Self::State { .. } => {
+                TurnItemProjectionRole::RuntimeProjection
+            }
+            Self::LifecycleGuard { .. } => TurnItemProjectionRole::RuntimeControl,
+            Self::ToolStatus { .. } => TurnItemProjectionRole::ToolLifecycleEvidence,
+            Self::FileChange { .. } => TurnItemProjectionRole::FileEvidence,
+            Self::ContextCompaction { .. } => TurnItemProjectionRole::MemoryContinuity,
+            Self::ApprovalRequest { .. } => TurnItemProjectionRole::ApprovalEvidence,
+            Self::Warning { .. } => TurnItemProjectionRole::RuntimeDiagnostic,
+            Self::Error { .. } => TurnItemProjectionRole::RuntimeError,
+            Self::Terminal { .. } => TurnItemProjectionRole::TerminalOutcome,
+        }
+    }
+
+    pub fn is_internal_projection_only(&self) -> bool {
+        matches!(
+            self.projection_role(),
+            TurnItemProjectionRole::RuntimeProjection | TurnItemProjectionRole::RuntimeControl
+        )
+    }
+}
+
+pub fn turn_item_internal_projection_roles_are_not_primary_display_fixture_passes() -> bool {
+    let internal = [
+        TurnItemPayload::Plan {
+            summary: "plan cache".to_string(),
+        },
+        TurnItemPayload::PromptDispatch {
+            summary: "prompt dispatch cache".to_string(),
+        },
+        TurnItemPayload::State {
+            summary: "state cache".to_string(),
+        },
+        TurnItemPayload::LifecycleGuard {
+            summary: "guard cache".to_string(),
+        },
+    ];
+    let visible = [
+        TurnItemPayload::UserMessage {
+            text: "user".to_string(),
+        },
+        TurnItemPayload::AgentMessage {
+            text: "assistant".to_string(),
+        },
+        TurnItemPayload::ContextCompaction {
+            summary: "compaction".to_string(),
+        },
+        TurnItemPayload::Terminal {
+            status: TurnTerminalStatus::Completed,
+            summary: "done".to_string(),
+        },
+    ];
+
+    internal
+        .iter()
+        .all(TurnItemPayload::is_internal_projection_only)
+        && visible
+            .iter()
+            .all(|payload| !payload.is_internal_projection_only())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

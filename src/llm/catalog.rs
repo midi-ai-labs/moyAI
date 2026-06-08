@@ -26,6 +26,7 @@ impl ConfigModelCatalog {
             capabilities: ModelCapabilities {
                 supports_tools: self.config.model.supports_tools,
                 supports_reasoning: self.config.model.supports_reasoning,
+                supports_images: self.config.model.supports_images,
             },
         }
     }

@@ -27,6 +27,12 @@ struct PendingToolCall {
     arguments_json: String,
 }
 
+impl PendingToolCall {
+    fn is_complete(&self) -> bool {
+        !self.tool_name.trim().is_empty() && !self.arguments_json.trim().is_empty()
+    }
+}
+
 impl StreamAccumulator {
     pub fn finish_reason(&self) -> Option<crate::session::FinishReason> {
         self.finish_reason
@@ -73,6 +79,7 @@ impl LlmEventSink for StreamAccumulator {
                     .filter_map(|call_id| {
                         self.pending_tool_calls
                             .get(call_id)
+                            .filter(|pending| pending.is_complete())
                             .map(|pending| CompletedToolCall {
                                 call_id: call_id.clone(),
                                 tool_name: pending.tool_name.clone(),
@@ -83,5 +90,147 @@ impl LlmEventSink for StreamAccumulator {
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) fn stream_accumulator_complete_tool_call_lifecycle_fixture_passes() -> bool {
+    let mut args_only = StreamAccumulator::default();
+    let args_only_ok = args_only
+        .push(LlmEvent::ToolCallArgsDelta {
+            call_id: "call_args_only".to_string(),
+            delta: "{\"path\":\"src/workflow.rs\"}".to_string(),
+        })
+        .and_then(|_| {
+            args_only.push(LlmEvent::Finished {
+                finish_reason: crate::session::FinishReason::ToolCall,
+                usage: None,
+            })
+        })
+        .is_ok()
+        && args_only.tool_calls.is_empty();
+
+    let mut name_only = StreamAccumulator::default();
+    let name_only_ok = name_only
+        .push(LlmEvent::ToolCallStart {
+            call_id: "call_name_only".to_string(),
+            tool_name: "write".to_string(),
+        })
+        .and_then(|_| {
+            name_only.push(LlmEvent::Finished {
+                finish_reason: crate::session::FinishReason::ToolCall,
+                usage: None,
+            })
+        })
+        .is_ok()
+        && name_only.tool_calls.is_empty();
+
+    let mut reordered = StreamAccumulator::default();
+    let reordered_ok = reordered
+        .push(LlmEvent::ToolCallArgsDelta {
+            call_id: "call_reordered".to_string(),
+            delta: "{\"path\":\"src/workflow.rs\"}".to_string(),
+        })
+        .and_then(|_| {
+            reordered.push(LlmEvent::ToolCallStart {
+                call_id: "call_reordered".to_string(),
+                tool_name: "write".to_string(),
+            })
+        })
+        .and_then(|_| {
+            reordered.push(LlmEvent::Finished {
+                finish_reason: crate::session::FinishReason::ToolCall,
+                usage: None,
+            })
+        })
+        .is_ok()
+        && reordered.tool_calls.len() == 1
+        && reordered.tool_calls[0].tool_name == "write"
+        && reordered.tool_calls[0].arguments_json == "{\"path\":\"src/workflow.rs\"}";
+
+    args_only_ok && name_only_ok && reordered_ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::FinishReason;
+
+    #[test]
+    fn stream_accumulator_drops_args_only_incomplete_tool_call() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator
+            .push(LlmEvent::ToolCallArgsDelta {
+                call_id: "call_args_only".to_string(),
+                delta: "{\"path\":\"src/workflow.rs\"}".to_string(),
+            })
+            .expect("args delta accepted as incomplete provider evidence");
+        accumulator
+            .push(LlmEvent::Finished {
+                finish_reason: FinishReason::ToolCall,
+                usage: None,
+            })
+            .expect("finish accepted");
+
+        assert!(
+            accumulator.tool_calls.is_empty(),
+            "args-only provider stream evidence must not become a completed tool call"
+        );
+    }
+
+    #[test]
+    fn stream_accumulator_drops_name_only_incomplete_tool_call() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator
+            .push(LlmEvent::ToolCallStart {
+                call_id: "call_name_only".to_string(),
+                tool_name: "write".to_string(),
+            })
+            .expect("tool call start accepted as incomplete provider evidence");
+        accumulator
+            .push(LlmEvent::Finished {
+                finish_reason: FinishReason::ToolCall,
+                usage: None,
+            })
+            .expect("finish accepted");
+
+        assert!(
+            accumulator.tool_calls.is_empty(),
+            "name-only provider stream evidence must not become a completed tool call"
+        );
+    }
+
+    #[test]
+    fn stream_accumulator_completes_args_before_start_after_name_arrives() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator
+            .push(LlmEvent::ToolCallArgsDelta {
+                call_id: "call_reordered".to_string(),
+                delta: "{\"path\":\"src/workflow.rs\"}".to_string(),
+            })
+            .expect("args delta accepted");
+        accumulator
+            .push(LlmEvent::ToolCallStart {
+                call_id: "call_reordered".to_string(),
+                tool_name: "write".to_string(),
+            })
+            .expect("tool call start accepted");
+        accumulator
+            .push(LlmEvent::Finished {
+                finish_reason: FinishReason::ToolCall,
+                usage: None,
+            })
+            .expect("finish accepted");
+
+        assert_eq!(accumulator.tool_calls.len(), 1);
+        assert_eq!(accumulator.tool_calls[0].tool_name, "write");
+        assert_eq!(
+            accumulator.tool_calls[0].arguments_json,
+            "{\"path\":\"src/workflow.rs\"}"
+        );
+    }
+
+    #[test]
+    fn stream_accumulator_complete_tool_call_lifecycle_fixture() {
+        assert!(stream_accumulator_complete_tool_call_lifecycle_fixture_passes());
     }
 }

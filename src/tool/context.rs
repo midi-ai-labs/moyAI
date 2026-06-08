@@ -96,10 +96,24 @@ fn permission_preset_allows(
         return false;
     }
     match access_mode {
-        AccessMode::FullAccess => true,
+        AccessMode::FullAccess => full_access_allows(request),
         AccessMode::AutoReview => auto_review_allows(request),
         AccessMode::Default => default_allows(request),
     }
+}
+
+fn full_access_allows(request: &crate::tool::PermissionRequest) -> bool {
+    if request.outside_workspace {
+        return false;
+    }
+    !request.risks.iter().any(|risk| {
+        matches!(
+            risk,
+            crate::tool::PermissionRisk::Network
+                | crate::tool::PermissionRisk::ExternalConnection
+                | crate::tool::PermissionRisk::ProtectedWorkspaceAuthority
+        )
+    })
 }
 
 fn default_allows(request: &crate::tool::PermissionRequest) -> bool {
@@ -127,5 +141,59 @@ trait PermissionRiskClass {
 impl PermissionRiskClass for crate::tool::PermissionRisk {
     fn requires_review(&self) -> bool {
         true
+    }
+}
+
+pub(crate) fn full_access_configured_boundary_fixture_passes() -> bool {
+    use crate::tool::{PermissionRequest, PermissionRisk};
+
+    fn request(
+        access: AccessKind,
+        outside_workspace: bool,
+        risks: Vec<PermissionRisk>,
+    ) -> PermissionRequest {
+        PermissionRequest {
+            access,
+            summary: "tool permission fixture".to_string(),
+            details: Vec::new(),
+            targets: vec![Utf8PathBuf::from("src/workflow.rs")],
+            outside_workspace,
+            risks,
+        }
+    }
+
+    permission_preset_allows(
+        AccessMode::FullAccess,
+        &request(AccessKind::Edit, false, Vec::new()),
+    ) && !permission_preset_allows(
+        AccessMode::FullAccess,
+        &request(AccessKind::Edit, true, Vec::new()),
+    ) && !permission_preset_allows(
+        AccessMode::FullAccess,
+        &request(
+            AccessKind::Edit,
+            false,
+            vec![PermissionRisk::ProtectedWorkspaceAuthority],
+        ),
+    ) && !permission_preset_allows(
+        AccessMode::FullAccess,
+        &request(AccessKind::Edit, false, vec![PermissionRisk::Network]),
+    ) && permission_preset_allows(
+        AccessMode::FullAccess,
+        &request(
+            AccessKind::Edit,
+            false,
+            vec![PermissionRisk::DestructiveDelete],
+        ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::full_access_configured_boundary_fixture_passes;
+
+    #[test]
+    fn full_access_respects_configured_workspace_boundary() {
+        assert!(full_access_configured_boundary_fixture_passes());
     }
 }

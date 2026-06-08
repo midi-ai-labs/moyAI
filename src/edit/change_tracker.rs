@@ -65,7 +65,7 @@ impl ChangeSummary {
             ChangeKind::Add => {
                 let path = render_display_path(self.path_after.as_ref(), workspace_root);
                 format!(
-                    "Added {path}\nThe file now exists, and this successful tool result established its current contents for this session. Use `write` again for another clean full rewrite, or use `*** Update File: {path}` for a targeted patch only when the current active work still requires another edit. Otherwise follow the current active-work next action from the runtime state."
+                    "Added {path}\nThis successful ToolResult is completed FileChange evidence. The file now exists, and its current contents are established for this session. It is not a next-edit instruction. Follow the current TurnControlEnvelope for the next active-work action."
                 )
             }
             ChangeKind::Update => {
@@ -74,18 +74,22 @@ impl ChangeSummary {
                     workspace_root,
                 );
                 format!(
-                    "Updated {path}\nThis successful tool result established the file's current contents for this session. Continue with `write` for another clean full rewrite, or use `*** Update File: {path}` for a targeted patch only when the current active work still requires another edit. Otherwise follow the current active-work next action from the runtime state."
+                    "Updated {path}\nThis successful ToolResult is completed FileChange evidence. The file's current contents are established for this session. It is not a next-edit instruction. Follow the current TurnControlEnvelope for the next active-work action."
                 )
             }
-            ChangeKind::Delete => format!(
-                "Deleted {}",
-                render_display_path(self.path_before.as_ref(), workspace_root)
-            ),
-            ChangeKind::Move => format!(
-                "Moved {} -> {}",
-                render_display_path(self.path_before.as_ref(), workspace_root),
-                render_display_path(self.path_after.as_ref(), workspace_root)
-            ),
+            ChangeKind::Delete => {
+                let path = render_display_path(self.path_before.as_ref(), workspace_root);
+                format!(
+                    "Deleted {path}\nThis successful ToolResult is completed FileChange evidence. The file removal is established for this session. It is not a next-edit instruction. Follow the current TurnControlEnvelope for the next active-work action."
+                )
+            }
+            ChangeKind::Move => {
+                let before = render_display_path(self.path_before.as_ref(), workspace_root);
+                let after = render_display_path(self.path_after.as_ref(), workspace_root);
+                format!(
+                    "Moved {before} -> {after}\nThis successful ToolResult is completed FileChange evidence. The file move is established for this session. It is not a next-edit instruction. Follow the current TurnControlEnvelope for the next active-work action."
+                )
+            }
         }
     }
 }
@@ -161,23 +165,69 @@ pub(crate) fn path_for_change_storage(path: &Utf8Path, workspace_root: &Utf8Path
 }
 
 pub(crate) fn change_path_storage_uses_workspace_relative_authority() -> bool {
+    let marker = "edit_change_tracker_fixture_language_neutral";
     let root = Utf8Path::new("C:/runs/route/generic/workspace");
     path_for_change_storage(
-        Utf8Path::new("C:/runs/route/generic/workspace/component.py"),
+        Utf8Path::new("C:/runs/route/generic/workspace/src/workflow.rs"),
         root,
-    ) == Utf8PathBuf::from("component.py")
+    ) == Utf8PathBuf::from("src/workflow.rs")
         && path_for_change_storage(
-            Utf8Path::new("C:/runs/route/generic/workspace/test_component.py"),
+            Utf8Path::new("C:/runs/route/generic/workspace/tests/workflow.contract"),
             root,
-        ) == Utf8PathBuf::from("test_component.py")
+        ) == Utf8PathBuf::from("tests/workflow.contract")
         && path_for_change_storage(
-            Utf8Path::new(r"C:\\runs\\route\\generic\\workspace\\docs\\design.md"),
+            Utf8Path::new(r"C:\\runs\\route\\generic\\workspace\\docs\\workflow-design.md"),
             root,
-        ) == Utf8PathBuf::from("docs/design.md")
+        ) == Utf8PathBuf::from("docs/workflow-design.md")
         && path_for_change_storage(
-            Utf8Path::new(r"C:\\runs\\route\\generic\\workspace2\\docs\\design.md"),
+            Utf8Path::new(r"C:\\runs\\route\\generic\\workspace2\\docs\\workflow-design.md"),
             root,
-        ) == Utf8PathBuf::from(r"C:\\runs\\route\\generic\\workspace2\\docs\\design.md")
+        ) == Utf8PathBuf::from(r"C:\\runs\\route\\generic\\workspace2\\docs\\workflow-design.md")
+        && marker == "edit_change_tracker_fixture_language_neutral"
+}
+
+pub(crate) fn successful_file_change_tool_feedback_is_evidence_only() -> bool {
+    let marker = "edit_file_change_feedback_all_kinds_evidence_only";
+    let add = ChangeSummary {
+        change_id: ChangeId::new(),
+        kind: ChangeKind::Add,
+        path_before: None,
+        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+    }
+    .tool_feedback_text(None);
+    let update = ChangeSummary {
+        change_id: ChangeId::new(),
+        kind: ChangeKind::Update,
+        path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+    }
+    .tool_feedback_text(None);
+    let delete = ChangeSummary {
+        change_id: ChangeId::new(),
+        kind: ChangeKind::Delete,
+        path_before: Some(Utf8PathBuf::from("src/obsolete-workflow.rs")),
+        path_after: None,
+    }
+    .tool_feedback_text(None);
+    let moved = ChangeSummary {
+        change_id: ChangeId::new(),
+        kind: ChangeKind::Move,
+        path_before: Some(Utf8PathBuf::from("src/workflow-old.rs")),
+        path_after: Some(Utf8PathBuf::from("src/workflow-new.rs")),
+    }
+    .tool_feedback_text(None);
+    let combined = format!("{add}\n{update}\n{delete}\n{moved}");
+    let expected_guidance_count = combined.matches("current TurnControlEnvelope").count();
+
+    expected_guidance_count == 4
+        && add.contains("completed FileChange evidence")
+        && update.contains("completed FileChange evidence")
+        && delete.contains("The file removal is established for this session")
+        && moved.contains("The file move is established for this session")
+        && marker == "edit_file_change_feedback_all_kinds_evidence_only"
+        && !combined.contains("Use `write`")
+        && !combined.contains("Continue with `write`")
+        && !combined.contains("*** Update File: src/workflow.rs")
 }
 
 fn sha256_hex(text: &str) -> String {

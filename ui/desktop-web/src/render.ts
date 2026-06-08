@@ -274,11 +274,7 @@ export function renderRunStatusStrip(state: DesktopWebState): string {
 }
 
 export function renderThreadContent(state: DesktopWebState): string {
-  const onlyEmptyPlaceholder =
-    state.transcript_rows.length === 1 &&
-    state.transcript_rows[0]?.title.includes("チャット") &&
-    state.transcript_rows[0]?.body.includes("下の入力欄");
-  if ((state.transcript_rows.length === 0 || onlyEmptyPlaceholder || state.selected_session_index < 0) && state.file_change_rows.length === 0) {
+  if ((state.thread_empty || state.selected_session_index < 0) && state.file_change_rows.length === 0) {
     return renderEmptyThread(state);
   }
   return state.transcript_rows.map(renderTranscriptCard).join("");
@@ -497,8 +493,7 @@ export function renderArtifactPane(state: DesktopWebState): string {
       </aside>
     `;
   }
-  const previewText = state.artifact_preview_text.trim();
-  const hasPreview = previewText.length > 0 && !previewText.includes("選択されていません");
+  const hasPreview = state.artifact_preview_available;
   const hasActivity = state.busy && (state.progress_text.trim().length > 0 || state.tool_status_text.trim().length > 0);
   return `
     <aside class="artifact-pane">

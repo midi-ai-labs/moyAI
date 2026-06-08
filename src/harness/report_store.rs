@@ -78,7 +78,10 @@ impl ReplayReportStore for SqliteReplayReportStore {
                  FROM harness_replay_reports reports
                  JOIN harness_runs runs ON runs.id = reports.run_id
                  WHERE runs.session_id = ?1
-                 ORDER BY reports.created_at_ms DESC
+                 ORDER BY COALESCE(runs.completed_at_ms, runs.started_at_ms) DESC,
+                          runs.started_at_ms DESC,
+                          reports.created_at_ms DESC,
+                          reports.run_id DESC
                  LIMIT 1",
                 params![session_id.to_string()],
                 |row| row.get(0),

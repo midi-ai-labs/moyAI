@@ -43,6 +43,8 @@ pub async fn generate_session_title(
                     content: first_prompt.to_string(),
                 }],
                 tools: Vec::new(),
+                tool_choice: None,
+                parallel_tool_calls: false,
                 timeout_ms: config.model.request_timeout_ms,
                 stream_idle_timeout_ms: config.model.stream_idle_timeout_ms,
                 stream_max_retries: config.model.stream_max_retries,
@@ -131,6 +133,14 @@ pub fn is_placeholder_session_title(title: &str) -> bool {
     title.trim() == NEW_SESSION_PLACEHOLDER_TITLE
 }
 
+pub(crate) fn app_session_title_fixture_domain_neutral_fixture_passes() -> bool {
+    sanitize_generated_session_title("タイトル：「ワークフロー整理」。").as_deref()
+        == Some("ワークフロー整理")
+        && sanitize_generated_session_title("Title: quicksort notes").as_deref()
+            == Some("quicksort notes")
+        && !is_placeholder_session_title("ワークフロー整理")
+}
+
 #[derive(Default)]
 struct SessionTitleSink {
     output: String,
@@ -161,8 +171,8 @@ mod tests {
     #[test]
     fn sanitize_generated_session_title_strips_wrappers_and_prefixes() {
         assert_eq!(
-            sanitize_generated_session_title("タイトル：「電卓テスト作成」。").as_deref(),
-            Some("電卓テスト作成")
+            sanitize_generated_session_title("タイトル：「ワークフロー整理」。").as_deref(),
+            Some("ワークフロー整理")
         );
         assert_eq!(
             sanitize_generated_session_title("Title: quicksort notes").as_deref(),
@@ -184,6 +194,7 @@ mod tests {
     #[test]
     fn placeholder_session_title_is_explicit() {
         assert!(is_placeholder_session_title(NEW_SESSION_PLACEHOLDER_TITLE));
-        assert!(!is_placeholder_session_title("電卓テスト作成"));
+        assert!(!is_placeholder_session_title("ワークフロー整理"));
+        assert!(super::app_session_title_fixture_domain_neutral_fixture_passes());
     }
 }

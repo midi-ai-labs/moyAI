@@ -64,7 +64,7 @@ impl PatchParser {
                     let raw_line = lines[index];
                     let body = raw_line.strip_prefix('+').ok_or_else(|| {
                         PatchError::Message(format!(
-                            "add file body line `{raw_line}` must start with `+`; every added content line, including blank lines and top-level `def`/`class`/`import` lines, must be prefixed with `+`"
+                            "add file body line `{raw_line}` must start with `+`; all content lines, including blank lines, indented lines, and source-code lines, must be prefixed with `+` (edit_patch_parser_feedback_language_neutral)"
                         ))
                     })?;
                     contents.push(body.to_string());
@@ -471,6 +471,26 @@ pub(crate) fn patch_context_matching_is_exact_fixture_passes() -> bool {
     PatchParser::apply_to_text("alpha\ngamma\n", hunks).is_err()
 }
 
+pub(crate) fn edit_patch_parser_feedback_language_neutral_fixture_passes() -> bool {
+    let patch = r#"*** Begin Patch
+*** Add File: src/workflow.rs
+pub fn run() {}
+*** End Patch"#;
+    let error = match PatchParser::parse(patch) {
+        Ok(_) => return false,
+        Err(error) => error.to_string(),
+    };
+    error.contains("all content lines")
+        && error.contains("blank lines")
+        && error.contains("indented lines")
+        && error.contains("source-code lines")
+        && error.contains("edit_patch_parser_feedback_language_neutral")
+        && !error.contains("def")
+        && !error.contains("class")
+        && !error.contains("import")
+        && !error.contains("top-level")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PatchOperation, PatchParser};
@@ -493,5 +513,10 @@ mod tests {
         let updated =
             PatchParser::apply_to_text("alpha\ngamma\n", hunks).expect("exact context applies");
         assert_eq!(updated, "beta\ngamma");
+    }
+
+    #[test]
+    fn edit_patch_parser_feedback_language_neutral() {
+        assert!(super::edit_patch_parser_feedback_language_neutral_fixture_passes());
     }
 }

@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use crate::error::StorageError;
 use crate::protocol::{
     HistoryItem, HistoryItemId, HistoryItemPayload, RuntimeEvent, RuntimeEventId, RuntimeEventMsg,
-    TurnId, TurnItem, TurnItemId, TurnItemPayload,
+    TurnId, TurnItem, TurnItemId, TurnItemPayload, TurnTerminalStatus,
 };
 use crate::session::SessionId;
 
@@ -48,6 +48,10 @@ pub trait ProtocolEventStore {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<TurnItem>, StorageError>;
+    fn latest_turn_position_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<(TurnId, i64)>, StorageError>;
 }
 
 #[derive(Clone)]
@@ -63,8 +67,10 @@ impl SqliteProtocolEventStore {
 
 impl ProtocolEventStore for SqliteProtocolEventStore {
     fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<(), StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        insert_runtime_event(&*connection, event)?;
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        insert_runtime_event(&transaction, event)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -74,6 +80,7 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         history_item: Option<&HistoryItem>,
         turn_item: Option<&TurnItem>,
     ) -> Result<(), StorageError> {
+        validate_event_bundle_coherence(event, history_item, turn_item)?;
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction()?;
         insert_runtime_event(&transaction, event)?;
@@ -126,8 +133,10 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
     }
 
     fn append_history_item(&self, item: &HistoryItem) -> Result<(), StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        insert_history_item(&*connection, item)?;
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        insert_history_item(&transaction, item)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -136,6 +145,7 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         history_item: &HistoryItem,
         turn_item: &TurnItem,
     ) -> Result<(), StorageError> {
+        validate_history_turn_bundle_coherence(history_item, turn_item)?;
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction()?;
         insert_history_item(&transaction, history_item)?;
@@ -218,8 +228,10 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
     }
 
     fn append_turn_item(&self, item: &TurnItem) -> Result<(), StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        insert_turn_item(&*connection, item)?;
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        insert_turn_item(&transaction, item)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -299,6 +311,60 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         }
         Ok(items)
     }
+
+    fn latest_turn_position_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<(TurnId, i64)>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        latest_turn_position_for_session(&*connection, session_id)
+    }
+}
+
+fn latest_turn_position_for_session(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Option<(TurnId, i64)>, StorageError> {
+    let latest_turn_id = query_latest_protocol_turn_id(connection, session_id)?;
+    let Some(latest_turn_id) = latest_turn_id else {
+        return Ok(None);
+    };
+    let max_sequence_no = connection.query_row(
+        "SELECT MAX(sequence_no)
+         FROM (
+           SELECT sequence_no FROM protocol_runtime_events WHERE session_id = ?1 AND turn_id = ?2
+           UNION ALL
+           SELECT sequence_no FROM protocol_history_items WHERE session_id = ?1 AND turn_id = ?2
+           UNION ALL
+           SELECT sequence_no FROM protocol_turn_items WHERE session_id = ?1 AND turn_id = ?2
+         )",
+        params![session_id.to_string(), latest_turn_id.to_string()],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    Ok(Some((latest_turn_id, max_sequence_no.unwrap_or(-1) + 1)))
+}
+
+fn query_latest_protocol_turn_id(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Option<TurnId>, StorageError> {
+    let value = connection.query_row(
+        "SELECT turn_id
+         FROM protocol_item_append_order
+         WHERE session_id = ?1
+         ORDER BY append_position DESC
+         LIMIT 1",
+        params![session_id.to_string()],
+        |row| row.get::<_, String>(0),
+    );
+    match value {
+        Ok(value) => Ok(Some(parse_protocol_id::<TurnId>(
+            &value,
+            "latest protocol turn",
+        )?)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(StorageError::from(error)),
+    }
 }
 
 trait ProtocolSqlExecutor {
@@ -347,6 +413,15 @@ fn insert_runtime_event(
             &event.created_at_ms,
         ],
     )?;
+    insert_protocol_append_order(
+        connection,
+        event.session_id,
+        event.turn_id,
+        event.sequence_no,
+        "runtime_event",
+        &event.id.to_string(),
+        event.created_at_ms,
+    )?;
     Ok(())
 }
 
@@ -356,6 +431,7 @@ pub(crate) fn insert_event_bundle_in_transaction(
     history_item: Option<&HistoryItem>,
     turn_item: Option<&TurnItem>,
 ) -> Result<(), StorageError> {
+    validate_event_bundle_coherence(event, history_item, turn_item)?;
     insert_runtime_event(transaction, event)?;
     if let Some(history_item) = history_item {
         insert_history_item(transaction, history_item)?;
@@ -364,6 +440,339 @@ pub(crate) fn insert_event_bundle_in_transaction(
         insert_turn_item(transaction, turn_item)?;
     }
     Ok(())
+}
+
+fn validate_event_bundle_coherence(
+    event: &RuntimeEvent,
+    history_item: Option<&HistoryItem>,
+    turn_item: Option<&TurnItem>,
+) -> Result<(), StorageError> {
+    if let Some(history_item) = history_item {
+        validate_event_history_identity(event, history_item)?;
+    }
+    if let Some(turn_item) = turn_item {
+        validate_event_turn_identity(event, turn_item)?;
+    }
+    if let (Some(history_item), Some(turn_item)) = (history_item, turn_item) {
+        validate_history_turn_bundle_coherence(history_item, turn_item)?;
+    }
+    Ok(())
+}
+
+fn validate_event_history_identity(
+    event: &RuntimeEvent,
+    history_item: &HistoryItem,
+) -> Result<(), StorageError> {
+    if event.session_id != history_item.session_id {
+        return Err(StorageError::Message(format!(
+            "protocol event bundle session mismatch: event session `{}` history item session `{}`",
+            event.session_id, history_item.session_id
+        )));
+    }
+    if event.turn_id != history_item.turn_id {
+        return Err(StorageError::Message(format!(
+            "protocol event bundle turn mismatch: event turn `{}` history item turn `{}`",
+            event.turn_id, history_item.turn_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_event_turn_identity(
+    event: &RuntimeEvent,
+    turn_item: &TurnItem,
+) -> Result<(), StorageError> {
+    if event.session_id != turn_item.session_id {
+        return Err(StorageError::Message(format!(
+            "protocol event bundle session mismatch: event session `{}` turn item session `{}`",
+            event.session_id, turn_item.session_id
+        )));
+    }
+    if event.turn_id != turn_item.turn_id {
+        return Err(StorageError::Message(format!(
+            "protocol event bundle turn mismatch: event turn `{}` turn item turn `{}`",
+            event.turn_id, turn_item.turn_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_history_turn_bundle_coherence(
+    history_item: &HistoryItem,
+    turn_item: &TurnItem,
+) -> Result<(), StorageError> {
+    if history_item.session_id != turn_item.session_id {
+        return Err(StorageError::Message(format!(
+            "protocol history-turn bundle session mismatch: history item session `{}` turn item session `{}`",
+            history_item.session_id, turn_item.session_id
+        )));
+    }
+    if history_item.turn_id != turn_item.turn_id {
+        return Err(StorageError::Message(format!(
+            "protocol history-turn bundle turn mismatch: history item turn `{}` turn item turn `{}`",
+            history_item.turn_id, turn_item.turn_id
+        )));
+    }
+    if turn_item.source_item_id != Some(history_item.id) {
+        return Err(StorageError::Message(format!(
+            "protocol history-turn bundle source mismatch: turn item source `{:?}` history item id `{}`",
+            turn_item.source_item_id, history_item.id
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn protocol_store_rejects_incoherent_event_bundles_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let event = RuntimeEvent {
+        id: RuntimeEventId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 0,
+        created_at_ms: 1,
+        msg: RuntimeEventMsg::TurnCompleted {
+            finish_reason: None,
+        },
+    };
+    let history = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 2,
+        payload: HistoryItemPayload::Message {
+            message_id: None,
+            role: crate::session::MessageRole::Assistant,
+            content: Vec::new(),
+        },
+    };
+    let linked_turn = TurnItem {
+        id: TurnItemId::new(),
+        session_id,
+        turn_id,
+        source_item_id: Some(history.id),
+        sequence_no: 2,
+        payload: TurnItemPayload::Terminal {
+            status: TurnTerminalStatus::Completed,
+            summary: "done".to_string(),
+        },
+    };
+    let wrong_session_history = HistoryItem {
+        session_id: SessionId::new(),
+        ..history.clone()
+    };
+    let wrong_turn_item = TurnItem {
+        turn_id: TurnId::new(),
+        ..linked_turn.clone()
+    };
+    let unlinked_turn = TurnItem {
+        source_item_id: Some(HistoryItemId::new()),
+        ..linked_turn.clone()
+    };
+
+    validate_event_bundle_coherence(&event, Some(&history), Some(&linked_turn)).is_ok()
+        && validate_event_bundle_coherence(&event, Some(&wrong_session_history), Some(&linked_turn))
+            .is_err()
+        && validate_event_bundle_coherence(&event, Some(&history), Some(&wrong_turn_item)).is_err()
+        && validate_event_bundle_coherence(&event, Some(&history), Some(&unlinked_turn)).is_err()
+        && validate_history_turn_bundle_coherence(&history, &unlinked_turn).is_err()
+}
+
+pub(crate) fn protocol_store_latest_turn_position_uses_unified_item_stream_fixture_passes() -> bool
+{
+    let connection = match Connection::open_in_memory() {
+        Ok(connection) => connection,
+        Err(_) => return false,
+    };
+    if connection
+        .execute_batch(include_str!(
+            "../../migrations/V16__protocol_event_store.sql"
+        ))
+        .is_err()
+        || connection
+            .execute_batch(include_str!(
+                "../../migrations/V20__protocol_item_append_order.sql"
+            ))
+            .is_err()
+    {
+        return false;
+    }
+    let session_id = SessionId::new();
+    let older_turn = TurnId::new();
+    let newer_turn = TurnId::new();
+    let older_event = RuntimeEvent {
+        id: RuntimeEventId::new(),
+        session_id,
+        turn_id: older_turn,
+        sequence_no: 0,
+        created_at_ms: 1,
+        msg: RuntimeEventMsg::UserInputAccepted { item_count: 0 },
+    };
+    let newer_history = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id: newer_turn,
+        sequence_no: 0,
+        created_at_ms: 10,
+        payload: HistoryItemPayload::Message {
+            message_id: None,
+            role: crate::session::MessageRole::User,
+            content: Vec::new(),
+        },
+    };
+    let newer_turn_item = TurnItem {
+        id: TurnItemId::new(),
+        session_id,
+        turn_id: newer_turn,
+        source_item_id: Some(newer_history.id),
+        sequence_no: 1,
+        payload: TurnItemPayload::UserMessage {
+            text: "newer history-linked turn item".to_string(),
+        },
+    };
+
+    if insert_runtime_event(&connection, &older_event).is_err()
+        || insert_history_item(&connection, &newer_history).is_err()
+        || insert_turn_item(&connection, &newer_turn_item).is_err()
+    {
+        return false;
+    }
+
+    matches!(
+        latest_turn_position_for_session(&connection, session_id),
+        Ok(Some((turn_id, next_sequence_no)))
+            if turn_id == newer_turn && next_sequence_no == 2
+    )
+}
+
+pub(crate) fn protocol_store_latest_turn_position_resists_timestamp_drift_fixture_passes() -> bool {
+    let connection = match Connection::open_in_memory() {
+        Ok(connection) => connection,
+        Err(_) => return false,
+    };
+    if connection
+        .execute_batch(include_str!(
+            "../../migrations/V16__protocol_event_store.sql"
+        ))
+        .is_err()
+        || connection
+            .execute_batch(include_str!(
+                "../../migrations/V20__protocol_item_append_order.sql"
+            ))
+            .is_err()
+    {
+        return false;
+    }
+    let session_id = SessionId::new();
+    let first_appended_turn = TurnId::new();
+    let second_appended_turn = TurnId::new();
+    let first_appended_high_timestamp = RuntimeEvent {
+        id: RuntimeEventId::new(),
+        session_id,
+        turn_id: first_appended_turn,
+        sequence_no: 0,
+        created_at_ms: 9_000,
+        msg: RuntimeEventMsg::UserInputAccepted { item_count: 0 },
+    };
+    let second_appended_low_timestamp = RuntimeEvent {
+        id: RuntimeEventId::new(),
+        session_id,
+        turn_id: second_appended_turn,
+        sequence_no: 0,
+        created_at_ms: 1,
+        msg: RuntimeEventMsg::UserInputAccepted { item_count: 0 },
+    };
+
+    if insert_runtime_event(&connection, &first_appended_high_timestamp).is_err()
+        || insert_runtime_event(&connection, &second_appended_low_timestamp).is_err()
+    {
+        return false;
+    }
+
+    matches!(
+        latest_turn_position_for_session(&connection, session_id),
+        Ok(Some((turn_id, next_sequence_no)))
+            if turn_id == second_appended_turn && next_sequence_no == 1
+    )
+}
+
+pub(crate) fn protocol_store_single_item_append_order_atomic_commit_fixture_passes() -> bool {
+    let connection = match Connection::open_in_memory() {
+        Ok(connection) => connection,
+        Err(_) => return false,
+    };
+    if connection
+        .execute_batch(include_str!(
+            "../../migrations/V16__protocol_event_store.sql"
+        ))
+        .is_err()
+        || connection
+            .execute_batch(include_str!(
+                "../../migrations/V20__protocol_item_append_order.sql"
+            ))
+            .is_err()
+    {
+        return false;
+    }
+    let connection = Arc::new(Mutex::new(connection));
+    let store = SqliteProtocolEventStore::new(connection.clone());
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let runtime_event = RuntimeEvent {
+        id: RuntimeEventId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 0,
+        created_at_ms: 1,
+        msg: RuntimeEventMsg::UserInputAccepted { item_count: 1 },
+    };
+    let history_item = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 2,
+        payload: HistoryItemPayload::Message {
+            message_id: None,
+            role: crate::session::MessageRole::User,
+            content: Vec::new(),
+        },
+    };
+    let turn_item = TurnItem {
+        id: TurnItemId::new(),
+        session_id,
+        turn_id,
+        source_item_id: Some(history_item.id),
+        sequence_no: 2,
+        payload: TurnItemPayload::UserMessage {
+            text: "single append-order atomic fixture".to_string(),
+        },
+    };
+
+    if store.append_runtime_event(&runtime_event).is_err()
+        || store.append_history_item(&history_item).is_err()
+        || store.append_turn_item(&turn_item).is_err()
+    {
+        return false;
+    }
+
+    let Ok(connection) = connection.lock() else {
+        return false;
+    };
+    let count = connection.query_row(
+        "SELECT COUNT(*)
+         FROM protocol_item_append_order
+         WHERE session_id = ?1 AND turn_id = ?2",
+        params![session_id.to_string(), turn_id.to_string()],
+        |row| row.get::<_, i64>(0),
+    );
+    matches!(count, Ok(3))
+        && matches!(
+            latest_turn_position_for_session(&connection, session_id),
+            Ok(Some((latest_turn, next_sequence_no)))
+                if latest_turn == turn_id && next_sequence_no == 3
+        )
 }
 
 fn insert_history_item(
@@ -383,6 +792,15 @@ fn insert_history_item(
             &hash_text(&payload_json),
             &item.created_at_ms,
         ],
+    )?;
+    insert_protocol_append_order(
+        connection,
+        item.session_id,
+        item.turn_id,
+        item.sequence_no,
+        "history_item",
+        &item.id.to_string(),
+        item.created_at_ms,
     )?;
     Ok(())
 }
@@ -406,6 +824,40 @@ fn insert_turn_item(
             &hash_text(&payload_json),
         ],
     )?;
+    insert_protocol_append_order(
+        connection,
+        item.session_id,
+        item.turn_id,
+        item.sequence_no,
+        "turn_item",
+        &item.id.to_string(),
+        0,
+    )?;
+    Ok(())
+}
+
+fn insert_protocol_append_order(
+    connection: &impl ProtocolSqlExecutor,
+    session_id: SessionId,
+    turn_id: TurnId,
+    sequence_no: i64,
+    source_kind: &str,
+    source_id: &str,
+    created_at_ms: i64,
+) -> Result<(), StorageError> {
+    connection.execute_protocol(
+        "INSERT OR IGNORE INTO protocol_item_append_order
+            (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        &[
+            &session_id.to_string(),
+            &turn_id.to_string(),
+            &sequence_no,
+            &source_kind,
+            &source_id,
+            &created_at_ms,
+        ],
+    )?;
     Ok(())
 }
 
@@ -423,4 +875,29 @@ where
     value.parse::<T>().map_err(|error| {
         StorageError::Message(format!("invalid protocol {label} id `{value}`: {error}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_store_rejects_incoherent_event_bundles() {
+        assert!(protocol_store_rejects_incoherent_event_bundles_fixture_passes());
+    }
+
+    #[test]
+    fn protocol_store_latest_turn_position_uses_unified_item_stream() {
+        assert!(protocol_store_latest_turn_position_uses_unified_item_stream_fixture_passes());
+    }
+
+    #[test]
+    fn protocol_store_latest_turn_position_resists_timestamp_drift() {
+        assert!(protocol_store_latest_turn_position_resists_timestamp_drift_fixture_passes());
+    }
+
+    #[test]
+    fn protocol_store_single_item_append_order_atomic_commit() {
+        assert!(protocol_store_single_item_append_order_atomic_commit_fixture_passes());
+    }
 }

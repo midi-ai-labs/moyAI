@@ -17,11 +17,13 @@ use super::startup::DesktopStartupState;
 use super::view_state::DesktopViewState;
 use crate::config::ProviderMetadataMode;
 use crate::config::ResolvedConfig;
-use crate::llm::{ProviderModelInfo, normalize_provider_base_url};
+use crate::llm::{ModelAvailabilityReport, ProviderModelInfo, normalize_provider_base_url};
 
 pub const MIN_WINDOW_OPACITY_PERCENT: i32 = 50;
 pub const MAX_WINDOW_OPACITY_PERCENT: i32 = 100;
 pub const DEFAULT_WINDOW_OPACITY_PERCENT: i32 = 96;
+const CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
+const CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopOverlay {
@@ -92,15 +94,14 @@ impl DesktopState {
         self.apply_startup_overlay();
     }
 
-    pub fn finish_startup_provider_model_load(&mut self, infos: &[ProviderModelInfo]) {
-        self.startup
-            .complete_provider_catalog(&self.provider_config.effective_config, infos);
+    pub fn finish_startup_provider_model_load(&mut self, report: &ModelAvailabilityReport) {
+        self.startup.complete_model_availability(report);
         self.sync_startup_readiness_operation();
         self.apply_startup_overlay();
     }
 
     pub fn fail_startup_provider_model_load(&mut self, message: impl Into<String>) {
-        self.startup.fail_provider_catalog(message);
+        self.startup.fail_provider_availability(message);
         self.sync_startup_readiness_operation();
         self.apply_startup_overlay();
     }
@@ -470,9 +471,11 @@ impl DesktopState {
         } else {
             DesktopSessionDetail {
                 session_id: SessionId::new(),
+                thread_empty: true,
                 transcript_text: "チャットはまだありません。".to_string(),
                 transcript_rows: vec![crate::desktop::models::DesktopTranscriptRow {
-                    kind: "system".to_string(),
+                    row_kind: crate::desktop::models::DesktopTranscriptRowKind::EmptyPlaceholder,
+                    kind: "empty_placeholder".to_string(),
                     step: "00".to_string(),
                     title: "チャットはありません".to_string(),
                     body: if self.selected_project_id().is_some() {
@@ -491,6 +494,7 @@ impl DesktopState {
                 artifacts: Vec::new(),
                 file_changes: Vec::new(),
                 file_change_summary_text: "ファイル変更はまだありません。".to_string(),
+                artifact_preview_available: false,
                 artifact_preview_text: "アーティファクトは選択されていません。".to_string(),
             }
         }
@@ -665,12 +669,8 @@ impl DesktopState {
             state.clone(),
             todos.clone(),
         );
-        if turn_items.is_empty() {
-            self.app_state.load_transcript(transcript, state, todos);
-        } else {
-            self.app_state
-                .load_turn_items(session, turn_items, state, todos);
-        }
+        self.app_state
+            .load_turn_items(session, turn_items, state, todos);
         self.open_session = Some(open_session);
         if let Some(index) = self
             .snapshot
@@ -1217,6 +1217,35 @@ fn truncate_for_search(value: &str, max_chars: usize) -> String {
     format!("{shortened}…")
 }
 
+fn desktop_state_provider_profile_session_record(
+    project_id: ProjectId,
+    session_id: SessionId,
+    title: &str,
+) -> SessionRecord {
+    SessionRecord {
+        id: session_id,
+        project_id,
+        title: title.to_string(),
+        status: crate::session::SessionStatus::Completed,
+        cwd: camino::Utf8PathBuf::from("C:/workspace"),
+        model: CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL.to_string(),
+        base_url: CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1_000,
+        updated_at_ms: 34_000,
+        completed_at_ms: Some(34_000),
+    }
+}
+
+pub(crate) fn desktop_state_current_provider_profile_fixture_passes() -> bool {
+    let session = desktop_state_provider_profile_session_record(
+        ProjectId::new(),
+        SessionId::new(),
+        "desktop-state-provider-fixture",
+    );
+    session.base_url == CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL
+        && session.model == CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL
+}
+
 pub(crate) fn initial_provider_models(config: &ResolvedConfig) -> Vec<String> {
     ensure_current_model(Vec::new(), &config.model.model)
 }
@@ -1428,18 +1457,11 @@ mod tests {
     fn loaded_open_session_detail_keeps_elapsed_work_summary_title() {
         let project_id = ProjectId::new();
         let session_id = SessionId::new();
-        let mut session = SessionRecord {
-            id: session_id,
+        let mut session = desktop_state_provider_profile_session_record(
             project_id,
-            title: "elapsed session".to_string(),
-            status: crate::session::SessionStatus::Completed,
-            cwd: camino::Utf8PathBuf::from("C:/workspace"),
-            model: "model".to_string(),
-            base_url: "http://localhost:1234".to_string(),
-            created_at_ms: 1_000,
-            updated_at_ms: 34_000,
-            completed_at_ms: Some(34_000),
-        };
+            session_id,
+            "elapsed session",
+        );
         let turn_id = crate::protocol::TurnId::new();
         let turn_items = vec![
             TurnItem {

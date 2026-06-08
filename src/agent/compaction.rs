@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::agent::event::StreamAccumulator;
 use crate::agent::prompt::{AgentRunRequest, build_provider_replay_messages_from_history_items};
 use crate::agent::prompt_assets::render_compaction_prompt;
@@ -15,6 +17,8 @@ use crate::tool::truncate::clip_text_with_ellipsis;
 
 const AUTO_COMPACT_CONTEXT_WINDOW_PERCENT: usize = 90;
 const MAX_COMPACTION_TARGETS: usize = 3;
+const COMPACTION_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
+const COMPACTION_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
 
 pub async fn maybe_compact(
     llm: &dyn LlmClient,
@@ -23,18 +27,21 @@ pub async fn maybe_compact(
     todos: &[TodoItem],
     sink: &mut dyn RunEventSink,
 ) -> Result<bool, AgentError> {
-    if !needs_compaction(request) {
+    let canonical_history_items =
+        canonical_history_items_for_compaction(&request.runtime_input.history_items);
+    let history_items = canonical_history_items.as_ref();
+    if !needs_compaction_for_history_items(request, history_items) {
         return Ok(false);
     }
 
-    let split_index = match compaction_split_index(request) {
+    let split_index = match compaction_split_index_for_history_items(request, history_items) {
         Some(value) => value,
         None => return Ok(false),
     };
 
     let summary_messages = build_compaction_messages_from_history_items(
         &request.session.session,
-        &request.runtime_input.history_items[..split_index],
+        &history_items[..split_index],
     );
     if summary_messages.is_empty() {
         return Ok(false);
@@ -76,6 +83,8 @@ pub async fn maybe_compact(
                 ),
                 messages: summary_messages.clone(),
                 tools: Vec::new(),
+                tool_choice: None,
+                parallel_tool_calls: false,
                 timeout_ms: request.config.model.request_timeout_ms,
                 stream_idle_timeout_ms: request.config.model.stream_idle_timeout_ms,
                 stream_max_retries: request.config.model.stream_max_retries,
@@ -176,23 +185,35 @@ async fn persist_compaction_token_accounting(
 }
 
 pub fn needs_compaction(request: &AgentRunRequest) -> bool {
-    let history_items = &request.runtime_input.history_items;
+    let canonical_history_items =
+        canonical_history_items_for_compaction(&request.runtime_input.history_items);
+    needs_compaction_for_history_items(request, canonical_history_items.as_ref())
+}
+
+fn needs_compaction_for_history_items(
+    request: &AgentRunRequest,
+    history_items: &[HistoryItem],
+) -> bool {
     if history_items.is_empty() {
         return false;
     }
     let Some(limit) = auto_compact_token_limit(request.model.context_window) else {
         return false;
     };
-    compaction_trigger_pressure_tokens(request) >= limit
+    compaction_trigger_pressure_tokens_for_history_items(request, history_items) >= limit
 }
 
-fn compaction_pressure_history_items(history_items: &[HistoryItem]) -> &[HistoryItem] {
-    let start = latest_summary_history_index(history_items).unwrap_or(0);
-    &history_items[start..]
+fn compaction_pressure_history_items(history_items: &[HistoryItem]) -> Vec<HistoryItem> {
+    let canonical_history_items = canonical_history_items_for_compaction(history_items);
+    let ordered = canonical_history_items.as_ref();
+    let start = latest_summary_history_index(ordered).unwrap_or(0);
+    ordered[start..].to_vec()
 }
 
-fn compaction_split_index(request: &AgentRunRequest) -> Option<usize> {
-    let history_items = &request.runtime_input.history_items;
+fn compaction_split_index_for_history_items(
+    request: &AgentRunRequest,
+    history_items: &[HistoryItem],
+) -> Option<usize> {
     if history_items.is_empty() {
         return None;
     }
@@ -234,6 +255,25 @@ fn compaction_split_index(request: &AgentRunRequest) -> Option<usize> {
     if split <= start { None } else { Some(split) }
 }
 
+fn canonical_history_items_for_compaction(history_items: &[HistoryItem]) -> Cow<'_, [HistoryItem]> {
+    if history_items_in_canonical_order(history_items) {
+        return Cow::Borrowed(history_items);
+    }
+    let mut ordered = history_items.to_vec();
+    ordered.sort_by_key(history_item_order_key);
+    Cow::Owned(ordered)
+}
+
+fn history_items_in_canonical_order(history_items: &[HistoryItem]) -> bool {
+    history_items
+        .windows(2)
+        .all(|pair| history_item_order_key(&pair[0]) <= history_item_order_key(&pair[1]))
+}
+
+fn history_item_order_key(item: &HistoryItem) -> (i64, i64) {
+    (item.sequence_no, item.created_at_ms)
+}
+
 fn latest_summary_history_index(history_items: &[HistoryItem]) -> Option<usize> {
     history_items
         .iter()
@@ -258,11 +298,13 @@ fn auto_compact_token_limit(context_window: u32) -> Option<usize> {
     Some((context_window as usize).saturating_mul(AUTO_COMPACT_CONTEXT_WINDOW_PERCENT) / 100)
 }
 
-fn compaction_trigger_pressure_tokens(request: &AgentRunRequest) -> usize {
-    let provider_visible_tokens = estimate_provider_replay_tokens(
-        &request.session.session,
-        compaction_pressure_history_items(&request.runtime_input.history_items),
-    );
+fn compaction_trigger_pressure_tokens_for_history_items(
+    request: &AgentRunRequest,
+    history_items: &[HistoryItem],
+) -> usize {
+    let pressure_items = compaction_pressure_history_items(history_items);
+    let provider_visible_tokens =
+        estimate_provider_replay_tokens(&request.session.session, &pressure_items);
     compaction_pressure_with_accounting(provider_visible_tokens, &request.state.token_accounting)
 }
 
@@ -278,7 +320,8 @@ fn compaction_trigger_provider_visible_tokens(
     session: &SessionRecord,
     history_items: &[HistoryItem],
 ) -> usize {
-    estimate_provider_replay_tokens(session, compaction_pressure_history_items(history_items))
+    let pressure_items = compaction_pressure_history_items(history_items);
+    estimate_provider_replay_tokens(session, &pressure_items)
 }
 
 fn estimate_provider_replay_tokens(
@@ -329,7 +372,7 @@ pub(crate) fn compaction_trigger_ignores_pre_summary_history_fixture_passes() ->
         session_id,
         turn_id,
         sequence_no: 1,
-        created_at_ms: 1,
+        created_at_ms: 30,
         payload: HistoryItemPayload::Message {
             message_id: None,
             role: MessageRole::Assistant,
@@ -344,7 +387,7 @@ pub(crate) fn compaction_trigger_ignores_pre_summary_history_fixture_passes() ->
         session_id,
         turn_id,
         sequence_no: 2,
-        created_at_ms: 2,
+        created_at_ms: 10,
         payload: HistoryItemPayload::Compaction {
             mode: crate::protocol::CompactionMode::PreTurn,
             summary: "CompactionContinuity: compacted older large history.".to_string(),
@@ -357,7 +400,7 @@ pub(crate) fn compaction_trigger_ignores_pre_summary_history_fixture_passes() ->
         session_id,
         turn_id,
         sequence_no: 3,
-        created_at_ms: 3,
+        created_at_ms: 20,
         payload: HistoryItemPayload::UserTurn {
             message_id: None,
             content: vec![ContentPart::Text {
@@ -390,8 +433,8 @@ pub(crate) fn compaction_trigger_ignores_pre_summary_history_fixture_passes() ->
         title: "compaction trigger fixture".to_string(),
         status: crate::session::SessionStatus::Running,
         cwd: camino::Utf8PathBuf::from("C:/workspace"),
-        model: "test-model".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        model: COMPACTION_FIXTURE_MODEL.to_string(),
+        base_url: COMPACTION_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -404,11 +447,77 @@ pub(crate) fn compaction_trigger_ignores_pre_summary_history_fixture_passes() ->
         && auto_compact_token_limit(131_072) == Some(117_964)
 }
 
+pub(crate) fn compaction_trigger_uses_canonical_history_order_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let old_huge = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::Message {
+            message_id: None,
+            role: MessageRole::Assistant,
+            content: vec![ContentPart::Text {
+                text: "x".repeat(600_000),
+            }],
+        },
+    };
+    let compacted_old_id = old_huge.id;
+    let summary = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 2,
+        created_at_ms: 2,
+        payload: HistoryItemPayload::Compaction {
+            mode: crate::protocol::CompactionMode::PreTurn,
+            summary: "CompactionContinuity: compacted older large history.".to_string(),
+            replacement_item_ids: vec![compacted_old_id],
+            continuation: None,
+        },
+    };
+    let current_user = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 3,
+        created_at_ms: 3,
+        payload: HistoryItemPayload::UserTurn {
+            message_id: None,
+            content: vec![ContentPart::Text {
+                text: "continue after compaction".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            turn_context: None,
+        },
+    };
+    let history = vec![summary, current_user, old_huge];
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "compaction trigger canonical order fixture".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: camino::Utf8PathBuf::from("C:/workspace"),
+        model: COMPACTION_FIXTURE_MODEL.to_string(),
+        base_url: COMPACTION_FIXTURE_BASE_URL.to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let pressure_items = compaction_pressure_history_items(&history);
+    let pressure_tokens = compaction_trigger_provider_visible_tokens(&session, &history);
+
+    pressure_items.len() == 2 && pressure_tokens < 1_024
+}
+
 pub(crate) fn llm_summary_text_is_wrapped_with_typed_continuity_fixture_passes() -> bool {
     let summary = compaction_summary_with_continuity(
         "Older work was summarized.".to_string(),
         12,
-        "Route: code\nPhase: repair\nTargets: component.py",
+        "Route: code\nPhase: repair\nTargets: src/workflow.rs",
     );
     summary.contains("Summarized history items: 12")
         && summary.contains("CompactionContinuity")
@@ -535,24 +644,24 @@ pub(crate) fn compaction_summary_with_continuity(
     continuation_block: &str,
 ) -> String {
     let trimmed = summary_text.trim();
-    let has_continuity = trimmed.contains("CompactionContinuity");
-    let has_focus = trimmed.contains("Continuation focus:");
-    if has_continuity && has_focus {
+    let canonical_prefix = format!(
+        "Summarized history items: {summarized_messages}.\nContinuation invariant: CompactionContinuity.\nContinuation focus:\n{}\nCompacted summary:",
+        continuation_block.trim()
+    );
+    if trimmed.starts_with(&canonical_prefix) {
         return trimmed.to_string();
     }
-    let mut lines = vec![
-        format!("Summarized history items: {summarized_messages}."),
-        "Continuation invariant: CompactionContinuity.".to_string(),
-        "Continuation focus:".to_string(),
-        continuation_block.trim().to_string(),
-        "Compacted summary:".to_string(),
-    ];
+    let mut lines = vec![canonical_prefix];
     if trimmed.is_empty() {
         lines.push("No model summary text was returned.".to_string());
     } else {
         lines.push(trimmed.to_string());
     }
     lines.join("\n")
+}
+
+pub(crate) fn compaction_sequence_order_resists_timestamp_drift_fixture_passes() -> bool {
+    compaction_trigger_uses_canonical_history_order_fixture_passes()
 }
 
 fn compaction_message_excerpt(message: &ModelMessage) -> String {
@@ -606,7 +715,10 @@ fn compaction_continuation_contract(
         .as_ref()
         .and_then(|handoff| handoff.continuation_contract.clone())
     {
-        return Some(contract);
+        return Some(continuation_contract_with_lifecycle_guard_snapshot(
+            contract,
+            &request.runtime_input.history_items,
+        ));
     }
 
     let active_work_summary = request
@@ -634,28 +746,234 @@ fn compaction_continuation_contract(
         return None;
     }
 
-    Some(crate::session::ContinuationContract {
-        route: task_route_label(request.state.route).to_string(),
-        process_phase: process_phase_label(request.state.process_phase).to_string(),
-        active_work_kind: active_work_summary
-            .as_ref()
-            .map(|_| "typed_continuation".to_string()),
-        active_work_summary,
-        target_files,
-        verification_commands,
-        failure_kind: request
-            .state
-            .failure
-            .as_ref()
-            .map(|failure| format!("{:?}", failure.kind)),
-        failure_summary: request
-            .state
-            .failure
-            .as_ref()
-            .map(|failure| clip_compaction_text(&failure.summary, 240)),
-        completion_blocker: request.state.completion.blocked_reason.clone(),
-        invariant_refs: vec!["CompactionContinuity".to_string()],
-    })
+    Some(continuation_contract_with_lifecycle_guard_snapshot(
+        crate::session::ContinuationContract {
+            route: task_route_label(request.state.route).to_string(),
+            process_phase: process_phase_label(request.state.process_phase).to_string(),
+            active_work_kind: active_work_summary
+                .as_ref()
+                .map(|_| "typed_continuation".to_string()),
+            active_work_summary,
+            target_files,
+            verification_commands,
+            failure_kind: request
+                .state
+                .failure
+                .as_ref()
+                .map(|failure| format!("{:?}", failure.kind)),
+            failure_summary: request
+                .state
+                .failure
+                .as_ref()
+                .map(|failure| clip_compaction_text(&failure.summary, 240)),
+            completion_blocker: request.state.completion.blocked_reason.clone(),
+            invariant_refs: vec!["CompactionContinuity".to_string()],
+            ..crate::session::ContinuationContract::default()
+        },
+        &request.runtime_input.history_items,
+    ))
+}
+
+fn continuation_contract_with_lifecycle_guard_snapshot(
+    mut contract: crate::session::ContinuationContract,
+    history_items: &[HistoryItem],
+) -> crate::session::ContinuationContract {
+    if let Some((refs, payload, metadata)) =
+        latest_lifecycle_guard_snapshot_continuity(history_items)
+    {
+        if !contract
+            .invariant_refs
+            .iter()
+            .any(|value| value == "LifecycleGuardSnapshot")
+        {
+            contract
+                .invariant_refs
+                .push("LifecycleGuardSnapshot".to_string());
+        }
+        contract.lifecycle_guard_snapshot_refs = refs;
+        contract.lifecycle_guard_snapshot_payload = Some(payload);
+        contract.lifecycle_guard_snapshot_metadata = metadata;
+    }
+    contract
+}
+
+fn latest_lifecycle_guard_snapshot_continuity(
+    history_items: &[HistoryItem],
+) -> Option<(
+    Vec<String>,
+    serde_json::Value,
+    std::collections::BTreeMap<String, serde_json::Value>,
+)> {
+    let canonical_history_items = canonical_history_items_for_compaction(history_items);
+    let (item, snapshot) = canonical_history_items
+        .as_ref()
+        .iter()
+        .rev()
+        .find_map(|item| match &item.payload {
+            HistoryItemPayload::LifecycleGuard { snapshot } => Some((item, snapshot)),
+            _ => None,
+        })?;
+    let payload = serde_json::to_value(snapshot).ok()?;
+    let refs = vec![
+        "LifecycleGuardSnapshot".to_string(),
+        format!("history_item:{}", item.id),
+        format!("turn:{}", item.turn_id),
+    ];
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert(
+        "counter_count".to_string(),
+        serde_json::json!(snapshot.counters.len()),
+    );
+    metadata.insert(
+        "active_flag_count".to_string(),
+        serde_json::json!(snapshot.active_flags.len()),
+    );
+    metadata.insert(
+        "scoped_target_count".to_string(),
+        serde_json::json!(snapshot.scoped_targets.len()),
+    );
+    metadata.insert(
+        "payload_count".to_string(),
+        serde_json::json!(snapshot.payloads.len()),
+    );
+    Some((refs, payload, metadata))
+}
+
+pub(crate) fn compaction_continuity_carries_lifecycle_guard_snapshot_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let mut counters = std::collections::BTreeMap::new();
+    counters.insert("rejected_tool:semantic".to_string(), 2);
+    let mut payloads = std::collections::BTreeMap::new();
+    payloads.insert(
+        "invalid_edit_arguments_recovery".to_string(),
+        serde_json::json!({"recovery_target":"src/lib.rs"}),
+    );
+    let guard_item = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 7,
+        created_at_ms: 7,
+        payload: HistoryItemPayload::LifecycleGuard {
+            snapshot: crate::protocol::LifecycleGuardSnapshot {
+                counters,
+                active_flags: vec!["invalid_edit_arguments_recovery".to_string()],
+                scoped_targets: vec!["patch_context_mismatch_grounding:src/lib.rs".to_string()],
+                payloads,
+            },
+        },
+    };
+    let contract = continuation_contract_with_lifecycle_guard_snapshot(
+        crate::session::ContinuationContract {
+            route: "code".to_string(),
+            process_phase: "repair".to_string(),
+            invariant_refs: vec!["CompactionContinuity".to_string()],
+            ..crate::session::ContinuationContract::default()
+        },
+        &[guard_item],
+    );
+    contract
+        .invariant_refs
+        .contains(&"LifecycleGuardSnapshot".to_string())
+        && contract
+            .lifecycle_guard_snapshot_refs
+            .iter()
+            .any(|value| value == "LifecycleGuardSnapshot")
+        && contract.lifecycle_guard_snapshot_payload.is_some()
+        && contract
+            .lifecycle_guard_snapshot_metadata
+            .get("payload_count")
+            == Some(&serde_json::json!(1))
+}
+
+pub(crate) fn compaction_continuity_uses_canonical_history_order_for_lifecycle_guard_snapshot_fixture_passes()
+-> bool {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+
+    let mut old_payloads = std::collections::BTreeMap::new();
+    old_payloads.insert(
+        "invalid_edit_arguments_recovery".to_string(),
+        serde_json::json!({"recovery_target":"src/old.rs"}),
+    );
+    let old_guard_item = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 3,
+        created_at_ms: 90,
+        payload: HistoryItemPayload::LifecycleGuard {
+            snapshot: crate::protocol::LifecycleGuardSnapshot {
+                counters: std::collections::BTreeMap::new(),
+                active_flags: vec!["old_recovery".to_string()],
+                scoped_targets: vec!["old:src/old.rs".to_string()],
+                payloads: old_payloads,
+            },
+        },
+    };
+
+    let mut latest_payloads = std::collections::BTreeMap::new();
+    latest_payloads.insert(
+        "invalid_edit_arguments_recovery".to_string(),
+        serde_json::json!({"recovery_target":"src/latest.rs"}),
+    );
+    let latest_guard_item = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 9,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::LifecycleGuard {
+            snapshot: crate::protocol::LifecycleGuardSnapshot {
+                counters: std::collections::BTreeMap::new(),
+                active_flags: vec!["latest_recovery".to_string()],
+                scoped_targets: vec!["latest:src/latest.rs".to_string()],
+                payloads: latest_payloads,
+            },
+        },
+    };
+
+    let contract = continuation_contract_with_lifecycle_guard_snapshot(
+        crate::session::ContinuationContract {
+            route: "code".to_string(),
+            process_phase: "repair".to_string(),
+            invariant_refs: vec!["CompactionContinuity".to_string()],
+            ..crate::session::ContinuationContract::default()
+        },
+        &[latest_guard_item, old_guard_item],
+    );
+
+    contract
+        .lifecycle_guard_snapshot_payload
+        .as_ref()
+        .and_then(|payload| payload.get("payloads"))
+        .and_then(|payloads| payloads.get("invalid_edit_arguments_recovery"))
+        .and_then(|value| value.get("recovery_target"))
+        .and_then(serde_json::Value::as_str)
+        == Some("src/latest.rs")
+        && contract
+            .lifecycle_guard_snapshot_refs
+            .iter()
+            .any(|value| value == "LifecycleGuardSnapshot")
+}
+
+pub(crate) fn compaction_summary_ignores_model_claimed_continuity_fixture_passes() -> bool {
+    let deceptive_model_summary =
+        "CompactionContinuity was preserved. Continuation focus: all set.";
+    let summary = compaction_summary_with_continuity(
+        deceptive_model_summary.to_string(),
+        9,
+        "Route: code\nPhase: repair\nTargets: src/lib.rs",
+    );
+    summary.starts_with(
+        "Summarized history items: 9.\nContinuation invariant: CompactionContinuity.\nContinuation focus:\nRoute: code\nPhase: repair\nTargets: src/lib.rs\nCompacted summary:",
+    ) && summary.contains(deceptive_model_summary)
+}
+
+pub(crate) fn compaction_lifecycle_guard_sequence_order_resists_timestamp_drift_fixture_passes()
+-> bool {
+    compaction_continuity_uses_canonical_history_order_for_lifecycle_guard_snapshot_fixture_passes()
 }
 
 fn task_route_label(route: crate::session::TaskRoute) -> &'static str {
@@ -740,8 +1058,8 @@ mod tests {
             title: "compaction test".to_string(),
             status: SessionStatus::Running,
             cwd: Utf8PathBuf::from("C:/workspace"),
-            model: "test-model".to_string(),
-            base_url: "http://localhost:1234".to_string(),
+            model: COMPACTION_FIXTURE_MODEL.to_string(),
+            base_url: COMPACTION_FIXTURE_BASE_URL.to_string(),
             created_at_ms: 1,
             updated_at_ms: 1,
             completed_at_ms: None,
@@ -830,5 +1148,27 @@ mod tests {
     #[test]
     fn llm_summary_text_is_wrapped_with_typed_continuity() {
         assert!(llm_summary_text_is_wrapped_with_typed_continuity_fixture_passes());
+    }
+
+    #[test]
+    fn compaction_summary_ignores_model_claimed_continuity() {
+        assert!(compaction_summary_ignores_model_claimed_continuity_fixture_passes());
+    }
+
+    #[test]
+    fn compaction_continuity_uses_canonical_history_order_for_lifecycle_guard_snapshot() {
+        assert!(
+            compaction_continuity_uses_canonical_history_order_for_lifecycle_guard_snapshot_fixture_passes()
+        );
+    }
+
+    #[test]
+    fn compaction_sequence_order_resists_timestamp_drift() {
+        assert!(compaction_sequence_order_resists_timestamp_drift_fixture_passes());
+    }
+
+    #[test]
+    fn compaction_lifecycle_guard_sequence_order_resists_timestamp_drift() {
+        assert!(compaction_lifecycle_guard_sequence_order_resists_timestamp_drift_fixture_passes());
     }
 }

@@ -1,6 +1,8 @@
 use std::fs;
+use std::io::Write;
 
 use camino::Utf8Path;
+use tempfile::NamedTempFile;
 
 use crate::config::loader::global_config_path;
 use crate::config::model::{
@@ -318,12 +320,23 @@ fn write_partial(path: &Utf8Path, patch: &PartialResolvedConfig) -> Result<(), S
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let text = toml::to_string_pretty(patch).map_err(|error| error.to_string())?;
-    let temp_path = path.with_extension("tmp");
-    fs::write(&temp_path, text).map_err(|error| error.to_string())?;
-    if path.exists() {
-        let _ = fs::remove_file(path);
-    }
-    fs::rename(&temp_path, path).map_err(|error| error.to_string())
+    persist_config_tempfile(path, &text)
+}
+
+fn persist_config_tempfile(path: &Utf8Path, text: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("config path `{path}` has no parent directory"))?;
+    let mut temp =
+        NamedTempFile::new_in(parent.as_std_path()).map_err(|error| error.to_string())?;
+    temp.write_all(text.as_bytes())
+        .map_err(|error| error.to_string())?;
+    temp.as_file_mut()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temp.persist(path.as_std_path())
+        .map(|_| ())
+        .map_err(|error| error.error.to_string())
 }
 
 fn parse_editor_patch(editor: &ConfigEditorState) -> Result<PartialResolvedConfig, String> {
@@ -725,7 +738,12 @@ impl ValueExt for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigEditorState, ConfigField, parse_editor_patch};
+    use camino::Utf8PathBuf;
+
+    use super::{
+        ConfigEditorState, ConfigField, PartialModelConfig, PartialResolvedConfig,
+        parse_editor_patch, write_partial,
+    };
     use crate::config::{ProviderMetadataMode, ResolvedConfig};
 
     #[test]
@@ -745,5 +763,25 @@ mod tests {
             patch.model.and_then(|model| model.provider_metadata_mode),
             Some(ProviderMetadataMode::OpenAiCompatibleOnly)
         );
+    }
+
+    #[test]
+    fn config_editor_global_write_persists_existing_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        std::fs::write(&path, "[model]\nmodel = \"old\"\n").expect("seed existing config");
+        let patch = PartialResolvedConfig {
+            model: Some(PartialModelConfig {
+                model: Some("new-model".to_string()),
+                ..PartialModelConfig::default()
+            }),
+            ..PartialResolvedConfig::default()
+        };
+
+        write_partial(&path, &patch).expect("persist config");
+
+        let saved = std::fs::read_to_string(&path).expect("read saved config");
+        assert!(saved.contains("new-model"));
     }
 }

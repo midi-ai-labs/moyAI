@@ -47,6 +47,137 @@ pub fn project_protocol_run_event(
     })
 }
 
+pub fn filechange_item_projection_preserves_call_id_fixture_passes() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let tool_call_id = crate::session::ToolCallId::new();
+    let change_id = crate::session::ChangeId::new();
+    let event = RunEvent::FileChangesRecorded {
+        tool_call_id,
+        changes: vec![crate::edit::ChangeSummary {
+            change_id,
+            kind: crate::session::ChangeKind::Update,
+            path_before: Some(camino::Utf8PathBuf::from("src/lib.rs")),
+            path_after: Some(camino::Utf8PathBuf::from("src/lib.rs")),
+        }],
+    };
+    let Some(projection) = project_protocol_run_event(&event, Some(session_id), turn_id, 7) else {
+        return false;
+    };
+    let runtime_has_owner = matches!(
+        projection.runtime_event.msg,
+        RuntimeEventMsg::FileChangesRecorded {
+            call_id,
+            ref change_ids,
+            ..
+        } if call_id == tool_call_id && change_ids.as_slice() == [change_id]
+    );
+    let history_has_owner = matches!(
+        projection.history_item.as_ref().map(|item| &item.payload),
+        Some(HistoryItemPayload::FileChange {
+            call_id,
+            change_ids,
+            ..
+        }) if *call_id == tool_call_id && change_ids.as_slice() == [change_id]
+    );
+    let turn_item_has_owner = matches!(
+        projection.turn_item.as_ref().map(|item| &item.payload),
+        Some(TurnItemPayload::FileChange {
+            call_id,
+            change_ids,
+            ..
+        }) if *call_id == tool_call_id && change_ids.as_slice() == [change_id]
+    );
+    runtime_has_owner && history_has_owner && turn_item_has_owner
+}
+
+pub fn tool_output_projection_preserves_blocked_action_fixture_passes() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let tool_call_id = crate::session::ToolCallId::new();
+    let metadata = serde_json::json!({
+        "success": false,
+        "progress_effect": "no_progress",
+        "tool_feedback_envelope": {
+            "blocked_action": "apply_patch:src/workflow.rs",
+            "required_next_action": "apply_patch:src/workflow.rs",
+            "result_hash": "blocked-action-hash",
+            "operation_progress_class": "wrong_target_authoring_edit"
+        }
+    });
+    let event = RunEvent::ToolCallCompleted {
+        tool_call_id,
+        tool: ToolName::ApplyPatch,
+        title: "Wrong target rejected".to_string(),
+        summary: "The submitted edit targeted an inactive artifact.".to_string(),
+        metadata,
+    };
+    let Some(projection) = project_protocol_run_event(&event, Some(session_id), turn_id, 8) else {
+        return false;
+    };
+    let history_preserves_blocked_action = matches!(
+        projection.history_item.as_ref().map(|item| &item.payload),
+        Some(HistoryItemPayload::ToolOutput {
+            blocked_action,
+            result_hash,
+            ..
+        }) if blocked_action.as_deref() == Some("apply_patch:src/workflow.rs")
+            && result_hash.as_deref() == Some("blocked-action-hash")
+    );
+    let runtime_preserves_blocked_action = matches!(
+        projection.runtime_event.msg,
+        RuntimeEventMsg::ToolLifecycle { ref envelope }
+            if envelope.blocked_action.as_deref() == Some("apply_patch:src/workflow.rs")
+                && envelope.result_hash.as_deref() == Some("blocked-action-hash")
+                && envelope.semantic_class.as_deref() == Some("wrong_target_authoring_edit")
+    );
+    history_preserves_blocked_action && runtime_preserves_blocked_action
+}
+
+pub fn pending_tool_lifecycle_does_not_fabricate_blocked_action_fixture_passes() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = TurnId::new();
+    let tool_call_id = crate::session::ToolCallId::new();
+    let event = RunEvent::ToolCallPending {
+        tool_call_id,
+        tool: ToolName::ApplyPatch,
+        title: "apply patch src/workflow.rs".to_string(),
+        metadata: serde_json::json!({
+            "tool_route": {
+                "original_arguments": {"path": "src/workflow.rs"},
+                "effective_arguments": {"path": "src/workflow.rs"},
+                "allowed_tools": ["apply_patch"]
+            }
+        }),
+    };
+    let Some(projection) = project_protocol_run_event(&event, Some(session_id), turn_id, 6) else {
+        return false;
+    };
+    let runtime_pending_has_no_blocked_action = matches!(
+        projection.runtime_event.msg,
+        RuntimeEventMsg::ToolLifecycle { ref envelope }
+            if envelope.status == ToolLifecycleStatus::Pending
+                && envelope.blocked_action.is_none()
+                && envelope.result_hash.is_none()
+                && envelope.allowed_surface == vec![ToolName::ApplyPatch]
+    );
+    let history_pending_is_tool_call_not_output = matches!(
+        projection.history_item.as_ref().map(|item| &item.payload),
+        Some(HistoryItemPayload::ToolCall {
+            call_id,
+            tool,
+            effective_arguments,
+            ..
+        }) if *call_id == tool_call_id
+            && *tool == ToolName::ApplyPatch
+            && effective_arguments
+                .get("path")
+                .and_then(Value::as_str)
+                == Some("src/workflow.rs")
+    );
+    runtime_pending_has_no_blocked_action && history_pending_is_tool_call_not_output
+}
+
 pub fn project_history_item_for_run_event(
     event: &RunEvent,
     session_id: SessionId,
@@ -153,7 +284,11 @@ pub fn project_history_item_for_run_event(
                 candidate: candidate.clone(),
             }
         }
-        RunEvent::FileChangesRecorded { changes, .. } => HistoryItemPayload::FileChange {
+        RunEvent::FileChangesRecorded {
+            tool_call_id,
+            changes,
+        } => HistoryItemPayload::FileChange {
+            call_id: *tool_call_id,
             change_ids: changes.iter().map(|change| change.change_id).collect(),
             changes: changes.iter().map(file_change_evidence).collect(),
             summary: changes
@@ -179,6 +314,9 @@ pub fn project_history_item_for_run_event(
         },
         RunEvent::StateUpdated { state, .. } => HistoryItemPayload::SessionState {
             state: state.clone(),
+        },
+        RunEvent::LifecycleGuardUpdated { snapshot, .. } => HistoryItemPayload::LifecycleGuard {
+            snapshot: snapshot.clone(),
         },
         RunEvent::PermissionResolved {
             tool_call_id,
@@ -293,7 +431,11 @@ pub fn project_turn_item_for_run_event(
         RunEvent::ToolProposalRejected { .. } | RunEvent::CandidateRepairEditRecorded { .. } => {
             return None;
         }
-        RunEvent::FileChangesRecorded { changes, .. } => TurnItemPayload::FileChange {
+        RunEvent::FileChangesRecorded {
+            tool_call_id,
+            changes,
+        } => TurnItemPayload::FileChange {
+            call_id: *tool_call_id,
             change_ids: changes.iter().map(|change| change.change_id).collect(),
             changes: changes.iter().map(file_change_evidence).collect(),
             summary: changes
@@ -370,6 +512,9 @@ pub fn project_turn_item_for_run_event(
                 state.active_targets.len()
             ),
         },
+        RunEvent::LifecycleGuardUpdated { snapshot, .. } => TurnItemPayload::LifecycleGuard {
+            summary: lifecycle_guard_summary(snapshot),
+        },
         RunEvent::UserTurnStored { turn, .. } => TurnItemPayload::UserMessage {
             text: turn
                 .content_parts()
@@ -442,7 +587,7 @@ fn runtime_msg_for_run_event(
         RunEvent::ToolCallPending {
             tool_call_id,
             tool,
-            title,
+            title: _,
             metadata,
         } => {
             let mut envelope = tool_envelope(
@@ -450,7 +595,7 @@ fn runtime_msg_for_run_event(
                 tool.clone(),
                 ToolLifecycleStatus::Pending,
                 None,
-                Some(title.clone()),
+                None,
             );
             apply_tool_route_metadata(&mut envelope, metadata);
             RuntimeEventMsg::ToolLifecycle { envelope }
@@ -556,6 +701,11 @@ fn runtime_msg_for_run_event(
                 state.route, state.process_phase
             ),
         },
+        RunEvent::LifecycleGuardUpdated { snapshot, .. } => {
+            RuntimeEventMsg::LifecycleGuardUpdated {
+                snapshot: snapshot.clone(),
+            }
+        }
         RunEvent::SessionCompleted { finish_reason, .. } => RuntimeEventMsg::TurnCompleted {
             finish_reason: *finish_reason,
         },
@@ -573,6 +723,15 @@ fn runtime_msg_for_run_event(
     }
 }
 
+fn lifecycle_guard_summary(snapshot: &crate::protocol::LifecycleGuardSnapshot) -> String {
+    let counter_count = snapshot.counters.len();
+    let flag_count = snapshot.active_flags.len();
+    let target_count = snapshot.scoped_targets.len();
+    format!(
+        "lifecycle guard projected: counters={counter_count}, active_flags={flag_count}, scoped_targets={target_count}"
+    )
+}
+
 fn session_id_for_run_event(event: &RunEvent) -> Option<SessionId> {
     match event {
         RunEvent::SessionStarted { session_id, .. }
@@ -583,6 +742,7 @@ fn session_id_for_run_event(event: &RunEvent) -> Option<SessionId> {
         | RunEvent::RetryScheduled { session_id, .. }
         | RunEvent::RecoverableRuntimeFeedback { session_id, .. }
         | RunEvent::StateUpdated { session_id, .. }
+        | RunEvent::LifecycleGuardUpdated { session_id, .. }
         | RunEvent::SessionCompleted { session_id, .. }
         | RunEvent::SessionAwaitingUser { session_id, .. }
         | RunEvent::SessionInterrupted { session_id, .. }
@@ -789,8 +949,13 @@ fn tool_progress_effect_from_metadata(
 }
 
 fn blocked_action_from_metadata(metadata: &Value) -> Option<String> {
-    let _ = metadata;
-    None
+    let feedback = metadata.get("tool_feedback_envelope");
+    feedback
+        .and_then(|value| value.get("blocked_action"))
+        .or_else(|| feedback.and_then(|value| value.get("required_next_action")))
+        .or_else(|| metadata.get("blocked_action"))
+        .or_else(|| metadata.get("required_next_action"))
+        .and_then(string_from_value)
 }
 
 fn result_hash_from_metadata(metadata: &Value) -> Option<String> {
@@ -843,6 +1008,10 @@ fn apply_completed_tool_metadata(envelope: &mut ToolLifecycleEnvelope, metadata:
         .and_then(string_from_value)
     {
         envelope.result_hash = Some(result_hash);
+    }
+
+    if let Some(blocked_action) = blocked_action_from_metadata(metadata) {
+        envelope.blocked_action = Some(blocked_action);
     }
 
     if let Some(progress_class) = feedback_envelope
@@ -1148,5 +1317,20 @@ mod tests {
             }
             other => panic!("unexpected history item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn filechange_item_projection_preserves_call_id() {
+        assert!(filechange_item_projection_preserves_call_id_fixture_passes());
+    }
+
+    #[test]
+    fn tool_output_projection_preserves_blocked_action_fixture() {
+        assert!(tool_output_projection_preserves_blocked_action_fixture_passes());
+    }
+
+    #[test]
+    fn pending_tool_lifecycle_does_not_fabricate_blocked_action_fixture() {
+        assert!(pending_tool_lifecycle_does_not_fabricate_blocked_action_fixture_passes());
     }
 }

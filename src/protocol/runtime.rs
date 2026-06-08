@@ -7,6 +7,13 @@ use super::{
 };
 use crate::tool::ToolName;
 
+const CURRENT_PROVIDER_MODEL: &str = "qwen/qwen3.6-35b-a3b";
+const CURRENT_PROVIDER_BASE_URL: &str = "http://127.0.0.1:1234";
+const CURRENT_PROVIDER_CONTEXT_WINDOW: u32 = 131_072;
+const CURRENT_PROVIDER_MAX_OUTPUT_TOKENS: u32 = 8_192;
+const PROTOCOL_RUNTIME_PROVIDER_PROFILE_MARKER: &str =
+    "protocol_runtime_fixture_current_provider_profile";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnEngineInput {
     pub turn_id: TurnId,
@@ -176,16 +183,19 @@ pub struct WorkOrder {
 pub fn repair_target_identity_aliases_compile_exact_write_action_fixture_passes() -> bool {
     let projection_id = super::ProjectionId::new();
     let workspace_root = camino::Utf8PathBuf::from("C:/workspace/project");
-    let relative_target = camino::Utf8PathBuf::from("test_widget.py");
-    let absolute_target = camino::Utf8PathBuf::from("C:/workspace/project/test_widget.py");
+    let relative_target = camino::Utf8PathBuf::from("tests/workflow.behavior.md");
+    let absolute_target =
+        camino::Utf8PathBuf::from("C:/workspace/project/tests/workflow.behavior.md");
     let active_contract = super::ActiveWorkContractProjection {
         route: crate::session::TaskRoute::Code,
         process_phase: crate::session::ProcessPhase::Repair,
         active_work_kind: Some("verification".to_string()),
-        summary: "Repair generated test parse defect before rerunning verification.".to_string(),
+        summary: "Repair workflow behavior artifact before rerunning verification.".to_string(),
         active_targets: vec![relative_target.clone(), absolute_target.clone()],
         operation_intents: vec![super::OperationIntent::ContentChangingAuthoringRequired],
-        required_verification_commands: vec!["python -m unittest".to_string()],
+        required_verification_commands: vec![
+            "verify-contract --behavior --encoding utf-8".to_string(),
+        ],
         allowed_tools: vec![
             crate::tool::ToolName::ApplyPatch,
             crate::tool::ToolName::Write,
@@ -198,12 +208,14 @@ pub fn repair_target_identity_aliases_compile_exact_write_action_fixture_passes(
         process_phase: "repair".to_string(),
         active_work_kind: Some("verification".to_string()),
         active_work_summary: Some(
-            "Repair generated test parse defect before rerunning verification.".to_string(),
+            "Repair workflow behavior artifact before rerunning verification.".to_string(),
         ),
         active_targets: vec![relative_target.clone(), absolute_target],
         verification_pending: true,
         closeout_ready: false,
-        required_verification_commands: vec!["python -m unittest".to_string()],
+        required_verification_commands: vec![
+            "verify-contract --behavior --encoding utf-8".to_string(),
+        ],
         policy_targets: Vec::new(),
         allowed_tools: vec!["apply_patch".to_string(), "write".to_string()],
         tool_choice: Some("named".to_string()),
@@ -214,9 +226,9 @@ pub fn repair_target_identity_aliases_compile_exact_write_action_fixture_passes(
         session_id: crate::session::SessionId::new(),
         cwd: workspace_root.clone(),
         workspace_root: workspace_root.clone(),
-        provider: "openai_compat".to_string(),
-        model: "model".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        provider: "lm_studio".to_string(),
+        model: CURRENT_PROVIDER_MODEL.to_string(),
+        base_url: CURRENT_PROVIDER_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::AutoReview,
         sandbox: super::SandboxProfile::WorkspaceWrite,
         shell_family: crate::config::ShellFamily::PowerShell,
@@ -225,8 +237,8 @@ pub fn repair_target_identity_aliases_compile_exact_write_action_fixture_passes(
             supports_reasoning: false,
             supports_images: false,
             parallel_tool_calls: false,
-            context_window: 8192,
-            max_output_tokens: 1024,
+            context_window: CURRENT_PROVIDER_CONTEXT_WINDOW,
+            max_output_tokens: CURRENT_PROVIDER_MAX_OUTPUT_TOKENS,
         },
         route: crate::session::TaskRoute::Code,
         process_phase: crate::session::ProcessPhase::Repair,
@@ -245,6 +257,12 @@ pub fn repair_target_identity_aliases_compile_exact_write_action_fixture_passes(
         continuation: None,
         turn_decision_projection: Some(turn_decision_projection),
     };
+    let provider_profile_is_current = context.model == CURRENT_PROVIDER_MODEL
+        && context.base_url == CURRENT_PROVIDER_BASE_URL
+        && context.model_capabilities.context_window == CURRENT_PROVIDER_CONTEXT_WINDOW
+        && context.model_capabilities.max_output_tokens == CURRENT_PROVIDER_MAX_OUTPUT_TOKENS
+        && PROTOCOL_RUNTIME_PROVIDER_PROFILE_MARKER
+            == "protocol_runtime_fixture_current_provider_profile";
     let obligations = ObligationCompiler::compile(&context);
     let compiled = TurnEngine::compile(TurnEngineInput {
         turn_id: super::TurnId::new(),
@@ -261,6 +279,7 @@ pub fn repair_target_identity_aliases_compile_exact_write_action_fixture_passes(
         .all(|item| item.targets.is_empty() || item.targets == vec![relative_target.clone()]);
 
     compiled.validation.passes()
+        && provider_profile_is_current
         && all_targets_are_canonical
         && compiled
             .envelope
@@ -270,9 +289,10 @@ pub fn repair_target_identity_aliases_compile_exact_write_action_fixture_passes(
             .is_some_and(|action| {
                 action.kind == super::RequiredActionKind::EditTarget
                     && action.tool == crate::tool::ToolName::Write
-                    && action.target.as_deref() == Some(camino::Utf8Path::new("test_widget.py"))
+                    && action.target.as_deref()
+                        == Some(camino::Utf8Path::new("tests/workflow.behavior.md"))
                     && action.command.is_none()
-                    && action.projection_text == "write:test_widget.py"
+                    && action.projection_label() == "write:tests/workflow.behavior.md"
             })
         && compiled
             .envelope
@@ -287,7 +307,7 @@ pub fn repair_target_identity_aliases_compile_exact_write_action_fixture_passes(
             .request_diagnostics
             .render_control_projection()
             .text
-            .contains("Required action: write:test_widget.py")
+            .contains("Required action: write:tests/workflow.behavior.md")
 }
 
 impl WorkOrder {
@@ -312,4 +332,12 @@ pub enum WorkOrderState {
     AwaitingUser,
     Failed,
     Completed,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn repair_target_identity_aliases_compile_exact_write_action() {
+        assert!(super::repair_target_identity_aliases_compile_exact_write_action_fixture_passes());
+    }
 }

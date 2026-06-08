@@ -1,5 +1,10 @@
 use serde_json::json;
 
+use crate::agent::language_evidence::{
+    ArtifactRole, LanguageFamily, VerificationContractPromptProjection,
+    classify_artifact_target as classify_language_artifact_target,
+    verification_contract_prompt_projection_from_summary,
+};
 use crate::config::{PromptProfile, ShellFamily};
 
 const BASE_IDENTITY_PROMPT: &str = "You are moyAI, a local coding agent for software engineering tasks in an offline-friendly environment.";
@@ -86,14 +91,13 @@ If Chinese or Korean characters appear by mistake, immediately correct them and 
 Role:\n\
 You are an assistant specialized in software engineering and technical documentation.\n\
 Focus on clear code, precise explanations, and well-structured documentation.";
-const PYTHON_UTF8_PROMPT: &str = "Python UTF-8 Rules\n\
-- When generating Python that reads or writes text files, always specify `encoding=\"utf-8\"` explicitly.\n\
-- When generating Python subprocess calls that capture text, specify UTF-8 explicitly (for example `text=True, encoding=\"utf-8\"`).\n\
-- When generated tests start child commands with `subprocess.run(...)`, always pass a finite `timeout=` so verification cannot wait forever on interactive stdin or a stalled child process.\n\
-- Do not rely on platform-default encodings for Python text I/O, logs, fixtures, subprocess output, or CLI-visible text.\n\
-- When Python CLI code emits non-ASCII stdout/stderr, make the artifact itself UTF-8-safe (for example by configuring `sys.stdout` / `sys.stderr` when appropriate); do not rely only on the surrounding shell environment.\n\
-- If Python code emits or checks Japanese text, keep the entire path UTF-8-safe from file read/write through test assertions.\n\
-- For user-facing console output on Windows, avoid characters that commonly fail under cp932 consoles when plain ASCII or normal Japanese wording is enough. Use `approx`, `->`, `>=`, or Japanese text instead of symbols such as `≈`.";
+const TEXT_IO_PROMPT: &str = "Text I/O and Verification Process Rules\n\
+- When generating code that reads or writes text files, make text encoding explicit through the target language or toolchain facility when one is available.\n\
+- When generated tests start child commands or external processes, use a finite timeout so verification cannot wait forever on interactive input or a stalled child process.\n\
+- Do not rely on platform-default encodings for text I/O, logs, fixtures, verification output, or CLI-visible text when the artifact or assertion involves non-ASCII content.\n\
+- When artifacts emit or check localized stdout/stderr, keep the path from file content through command execution and test assertion text-encoding-aware.\n\
+- For user-facing console output, avoid console-fragile symbols when plain ASCII or normal localized wording is enough. Prefer `approx`, `->`, `>=`, or ordinary prose over decorative symbols.";
+const PROMPT_TEXT_IO_GUIDANCE_LANGUAGE_NEUTRAL: &str = "prompt_text_io_guidance_language_neutral";
 const QWEN_CODER_PROMPT: &str = "Model-Specific Rules\n\
 - Use one precise tool call at a time when recovering from an error.\n\
 - Tool arguments must be raw JSON values only. Do not wrap them in markdown fences or prose.\n\
@@ -186,7 +190,7 @@ const FOLLOW_UP_SPEC_ALIGNMENT_REMINDER_PREFIX: &str =
     "This implementation turn is grounded in specification or documentation files.";
 const FOLLOW_UP_DOCUMENTATION_SCOPE_REMINDER_PREFIX: &str =
     "This turn is currently scoped to documentation artifacts.";
-const PUBLIC_CONTRACT_PRESERVATION_REMINDER: &str = "When a documentation or spec update starts from an existing workspace, preserve observed public function signatures, test call sites, CLI argv order, error classes/messages, and stdout/stderr behavior including numeric formatting unless the latest user explicitly requests a breaking migration. Treat future behavior as additive around that baseline contract, not as permission to replace it with a more convenient API. Before finalizing a documentation/spec write, reconcile the draft against the latest user request and remove internal contradictions: required claims from the latest request must be present, and prohibited claims remain prohibited even when an older helper API has adjacent wording. If you add unary CLI operations to an existing binary `<left> <operator> <right>` CLI, keep binary operations in that order and document/test unary calls as `<function> <value>` without dummy operands, unless executable evidence explicitly shows another established unary form. Treat two-argument unary CLI forms as unary only for the documented function tokens; binary-looking incomplete invocations such as `<left> <operator>` remain usage errors if the baseline binary CLI would have shown usage. Unknown two-token CLI commands such as `log 10` are not an unsupported-function route unless the spec explicitly adds unknown function tokens to the CLI grammar; omit that generated CLI test or expect usage error while keeping direct helper APIs free to raise unsupported-function errors. If the existing CLI prints integer-valued numeric results without trailing `.0`, keep examples and tests on that compact output or compare numerically. Preserve the positional meaning of an existing `calculate(left, operator, right)` API: `left` and `right` stay operands and `operator` stays the operation token. Do not document or test invented call sites such as `calculate(\"sin\", \"sin\", 0)`; use a consistent helper such as `calculate_unary(function, value)` or a clearly documented operand/operator form instead.";
+const PUBLIC_CONTRACT_PRESERVATION_REMINDER: &str = "When a documentation or spec update starts from an existing workspace, preserve observed public function signatures, test call sites, command argv order, error classes/messages, and stdout/stderr behavior including numeric formatting unless the latest user explicitly requests a breaking migration. Treat future behavior as additive around that baseline contract, not as permission to replace it with a more convenient API. Before finalizing a documentation/spec write, reconcile the draft against the latest user request and remove internal contradictions: required claims from the latest request must be present, and prohibited claims remain prohibited even when an older helper API has adjacent wording. If you add a new command form, preserve the positional meaning of every existing argument form and document/test the new form as an explicit additional contract. Do not infer unsupported-operation behavior for undocumented argument shapes just because a helper API has an adjacent concept; omit generated tests for undocumented command shapes or make the specification explicitly define them first. If existing executable evidence establishes output formatting, keep examples and tests on that formatting or compare semantically instead of inventing display changes.";
 const STAGED_TASK_EXECUTION_REMINDER_PREFIX: &str =
     "The staged task instructions were already captured in the runtime contract.";
 const STAGED_TASK_DOCUMENTATION_GROUNDING_REMINDER_PREFIX: &str =
@@ -228,6 +232,7 @@ const CONTINUATION_FAILURE_SUMMARY_MAX_CHARS: usize = 180;
 
 pub(crate) fn render_system_prompt(input: SystemPromptInput<'_>) -> String {
     let mut sections = Vec::new();
+    let _text_io_guidance_marker = PROMPT_TEXT_IO_GUIDANCE_LANGUAGE_NEUTRAL;
     sections.push(format!(
         "{BASE_IDENTITY_PROMPT}\nWorkspace root: {}\nCurrent directory: {}\nModel: {}",
         input.workspace_root, input.cwd, input.model_name
@@ -248,7 +253,7 @@ pub(crate) fn render_system_prompt(input: SystemPromptInput<'_>) -> String {
     sections.push(BASE_TODO_PROMPT.to_string());
     sections.push(LOCALIZATION_PROMPT.to_string());
     sections.push(STRICT_LANGUAGE_POLICY_PROMPT.to_string());
-    sections.push(PYTHON_UTF8_PROMPT.to_string());
+    sections.push(TEXT_IO_PROMPT.to_string());
     sections.push(COMPLETION_PROMPT.to_string());
     if let Some(model_specific) = render_model_specific_section(input.prompt_profile) {
         sections.push(model_specific.to_string());
@@ -661,7 +666,7 @@ fn staged_task_documentation_write_contract_example(active_targets: &[String]) -
         .iter()
         .find(|target| !target.trim().is_empty())
         .cloned()
-        .unwrap_or_else(|| "detail_design.md".to_string());
+        .unwrap_or_else(|| "docs/workflow-documentation.md".to_string());
     json!({
         "path": path,
         "content": "..."
@@ -765,21 +770,10 @@ pub(crate) fn pseudo_tool_call_stall_reminder() -> &'static str {
 }
 
 fn staged_task_documentation_deliverable_expectation(active_targets: &[String]) -> &'static str {
-    let focus = active_targets
-        .iter()
-        .map(|target| target.to_ascii_lowercase())
-        .next()
-        .unwrap_or_default();
-    if focus.ends_with("readme.md") {
-        return "Summarize the repository purpose and the concrete areas required by the task using file-grounded facts instead of generic setup boilerplate. Keep nested inspected paths literal instead of collapsing them into root-level aliases.";
+    if active_targets.is_empty() {
+        return "Use the workflow documentation contract to choose the current documentation deliverable role, then ground it in concrete repository files, paths, and inspected facts.";
     }
-    if focus.ends_with("basic_design.md") {
-        return "Explain the architecture boundary and responsibility split between the major areas, and anchor each section to concrete repository paths instead of only listing the tech stack.";
-    }
-    if focus.ends_with("detail_design.md") {
-        return "Explain module-level inputs, outputs, major data, and the main processing flow, grounded in concrete modules, entrypoints, config, tests, examples, or data paths only when those areas were requested or observed.";
-    }
-    "Keep the deliverable tightly grounded in concrete repository files, paths, and inspected facts."
+    "Use the staged task contract to preserve the current documentation deliverable role, keep the exact output path named by the route contract, and ground the deliverable in concrete repository files, paths, and inspected facts."
 }
 
 pub(crate) fn completion_ready_reminder() -> &'static str {
@@ -817,13 +811,15 @@ pub(crate) fn docs_route_reminder(
 pub(crate) fn docs_route_reminder_projects_write_ready_boundary_fixture_passes() -> bool {
     let rendered = docs_route_reminder(
         &[
-            "README.md".to_string(),
-            "basic_design.md".to_string(),
-            "detail_design.md".to_string(),
+            "docs/workflow-overview.md".to_string(),
+            "docs/workflow-architecture.md".to_string(),
+            "docs/workflow-behavior.md".to_string(),
         ],
         Some("docs-only route: representative anchors are available"),
         Some("docs route contract pending"),
-        Some("Pending docs deliverables are README.md / basic_design.md / detail_design.md."),
+        Some(
+            "Pending workflow documentation deliverables are overview / architecture / behavior roles.",
+        ),
     );
     rendered.contains("Representative survey is bounded")
         && rendered.contains("route contract")
@@ -835,6 +831,29 @@ pub(crate) fn docs_route_reminder_projects_write_ready_boundary_fixture_passes()
         && rendered.contains("prohibited claims remain prohibited")
         && rendered.contains("不明")
         && !rendered.contains("backend, frontend, tests, data, and examples anchors")
+}
+
+pub(crate) fn staged_docs_deliverable_projection_workflow_neutral_fixture_passes() -> bool {
+    let write_contract = staged_task_documentation_write_contract_example(&[]);
+    let expectation_empty = staged_task_documentation_deliverable_expectation(&[]);
+    let expectation_active = staged_task_documentation_deliverable_expectation(&[
+        "docs/workflow-behavior.md".to_string(),
+    ]);
+    let route_fixture_passes = docs_route_reminder_projects_write_ready_boundary_fixture_passes();
+    let combined = format!("{write_contract}\n{expectation_empty}\n{expectation_active}");
+    let workflow_neutral_marker =
+        "prompt_assets_staged_docs_deliverable_projection_workflow_neutral";
+
+    route_fixture_passes
+        && write_contract.contains("docs/workflow-documentation.md")
+        && combined.contains("workflow documentation contract")
+        && combined.contains("documentation deliverable role")
+        && combined.contains("staged task contract")
+        && workflow_neutral_marker
+            == "prompt_assets_staged_docs_deliverable_projection_workflow_neutral"
+        && !combined.contains("detail_design.md")
+        && !combined.contains("basic_design.md")
+        && !combined.contains("README.md")
 }
 
 pub(crate) fn structured_document_summary_reminder(targets: &[String]) -> String {
@@ -917,6 +936,7 @@ pub(crate) fn inactive_target_edit_recovery_reminder(
     active_targets: &[String],
     rejection_summary: &str,
     required_read_target: Option<&str>,
+    authoring_tool: Option<&str>,
 ) -> String {
     let todo_line = active_todo
         .map(|todo| format!("Current active todo: `{todo}`.\n"))
@@ -934,32 +954,102 @@ pub(crate) fn inactive_target_edit_recovery_reminder(
     if rejection_summary.trim().chars().count() > 800 {
         summary.push_str("...");
     }
+    let active_target_text = if active_targets.is_empty() {
+        "the active target".to_string()
+    } else {
+        active_targets
+            .iter()
+            .map(|target| format!("`{target}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let has_documentation_target = active_targets
+        .iter()
+        .any(|target| target_is_documentation_like(target));
     let next_action = if let Some(target) = required_read_target {
         format!(
-            "The next tool surface is constrained to `read` for `{target}` because the active target already exists and must be grounded before any rewrite. Read that active target first; the following recovery turn will write only the active target."
+            "The next tool surface is constrained to `read` for `{target}` because the active target already exists and must be grounded before any edit. Read that active target first; the following recovery turn will edit only the active target through the TurnControlEnvelope required action."
         )
-    } else if active_targets
-        .iter()
-        .any(|target| target_is_documentation_like(target))
-    {
-        "The next tool surface is constrained to `write` for the active documentation target. Write a Markdown documentation/design document for the active target itself; do not write Python, Rust, JavaScript, CLI code, or implementation content from a completed file.".to_string()
     } else {
-        "The next tool surface is constrained to `write` for the active target. Write content for the active target itself; do not paste implementation content from any completed file.".to_string()
+        match authoring_tool {
+            Some("apply_patch") => {
+                let content_kind = if has_documentation_target {
+                    "Markdown/documentation content"
+                } else {
+                    "content"
+                };
+                format!(
+                    "The next tool surface is constrained to `apply_patch` for {active_target_text}. Submit `patch_text` that adds or updates only the active target path(s) with {content_kind} for those target(s). Do not include completed or inactive target paths in the patch."
+                )
+            }
+            Some("write") => {
+                let content_kind = if has_documentation_target {
+                    "a Markdown documentation/design document"
+                } else {
+                    "complete content"
+                };
+                format!(
+                    "The next tool surface is constrained to `write` for {active_target_text}. Submit {content_kind} for the active target itself; do not paste implementation content from any completed or inactive file."
+                )
+            }
+            Some(tool) => format!(
+                "The next tool surface is constrained to `{tool}` by the current TurnControlEnvelope for {active_target_text}. Complete that exact active target action; do not retry the completed or inactive target."
+            ),
+            None => format!(
+                "The next tool surface is defined by the current TurnControlEnvelope for {active_target_text}. Complete that exact active target action; do not retry the completed or inactive target."
+            ),
+        }
     };
     format!(
         "Inactive target edit recovery.\nThe previous edit was rejected by the runtime contract because it tried to modify a completed or inactive target.\n{todo_line}{target_line}\n{next_action} Do not retry the rejected completed/inactive target, and do not replan around the active todo in this recovery turn.\nRejected edit summary: {summary}"
     )
 }
 
+pub(crate) fn inactive_target_edit_recovery_reminder_uses_current_edit_surface_fixture_passes()
+-> bool {
+    let active_targets = vec!["tests/workflow.behavior.md".to_string()];
+    let reminder = inactive_target_edit_recovery_reminder(
+        None,
+        &active_targets,
+        "The submitted content-changing `apply_patch` call targets `src/workflow.rs`, but the current active requested deliverables are `tests/workflow.behavior.md`.",
+        None,
+        Some("apply_patch"),
+    );
+    let workflow_neutral_marker = "prompt_assets_fixture_workflow_neutral";
+    reminder.contains("`apply_patch`")
+        && reminder.contains("patch_text")
+        && reminder.contains("tests/workflow.behavior.md")
+        && !reminder.contains("constrained to `write`")
+        && !reminder.contains("write only the active target")
+        && workflow_neutral_marker == "prompt_assets_fixture_workflow_neutral"
+}
+
+pub(crate) fn prompt_assets_fixtures_are_workflow_neutral_fixture_passes() -> bool {
+    inactive_target_edit_recovery_reminder_uses_current_edit_surface_fixture_passes()
+        && verification_repair_prompt_uses_language_projection_fixture_passes()
+        && python_context_uses_language_evidence_adapter_fixture_passes()
+        && staged_docs_deliverable_projection_workflow_neutral_fixture_passes()
+        && documentation_target_classifier_shape_based_fixture_passes()
+        && contract_guidance_uses_typed_verification_evidence_fixture_passes()
+}
+
 fn target_is_documentation_like(target: &str) -> bool {
     let normalized = target.replace('\\', "/").to_ascii_lowercase();
-    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    matches!(
-        file_name,
-        "readme.md" | "design.md" | "basic_design.md" | "detail_design.md" | "detailed_design.md"
-    ) || file_name.ends_with(".md")
-        || file_name.ends_with(".markdown")
+    normalized.ends_with(".md")
+        || normalized.ends_with(".markdown")
+        || normalized.starts_with("docs/")
         || normalized.contains("/docs/")
+}
+
+pub(crate) fn documentation_target_classifier_shape_based_fixture_passes() -> bool {
+    let workflow_neutral_marker = "prompt_assets_documentation_target_classifier_shape_based";
+    target_is_documentation_like("docs/workflow-contract")
+        && target_is_documentation_like("docs/workflow-design.md")
+        && target_is_documentation_like("notes/workflow.markdown")
+        && target_is_documentation_like("README.md")
+        && !target_is_documentation_like("src/workflow.rs")
+        && !target_is_documentation_like("tests/workflow.spec.ts")
+        && workflow_neutral_marker == "prompt_assets_documentation_target_classifier_shape_based"
 }
 
 pub(crate) fn superseded_tool_denial_reminder(
@@ -1060,20 +1150,15 @@ pub(crate) fn verification_failure_repair_reminder(
     failure_summary: Option<&str>,
     targets: &[String],
 ) -> String {
-    let has_test_target = targets
-        .iter()
-        .any(|target| target_looks_like_test_file(target));
-    let all_targets_are_tests = !targets.is_empty()
-        && targets
-            .iter()
-            .all(|target| target_looks_like_test_file(target));
+    let projection = verification_repair_prompt_projection(targets);
+    let contract_projection = verification_contract_prompt_projection_from_summary(failure_summary);
     let failure_line = if failures.is_empty() {
         "Latest verification run failed.\n".to_string()
     } else {
         format!("Latest failing checks: {}\n", failures.join(", "))
     };
     let failure_detail_line = verification_failure_detail_line(failure_summary);
-    let contract_line = verification_failure_contract_line(failure_summary);
+    let contract_line = verification_failure_contract_line(&contract_projection);
     let target_line = if targets.is_empty() {
         String::new()
     } else {
@@ -1082,18 +1167,22 @@ pub(crate) fn verification_failure_repair_reminder(
             targets.join(", ")
         )
     };
-    let test_contract_line = if all_targets_are_tests {
+    let test_contract_line = if projection.all_targets_are_tests {
         "The latest verification evidence points at test files first. Repair the failing test contract or expectation before reopening production files, unless a traceback line explicitly names a production file.\n".to_string()
     } else {
         String::new()
     };
-    let generated_scope_line = if has_test_target {
-        "Generated tests authored or expanded in this run are not automatically the authority. If the failing expectation came from a generated test and it broadens behavior beyond the latest user request or spec, narrow that generated test back to the requested scope instead of expanding production code to satisfy the invented behavior. For mixed production/test targets, compare subprocess argv, expected exception class/message, stdout/stderr, and numeric formatting against the latest user request, design document, or spec already read in this session. If the generated test conflicts with that authority, repair the test file; if production violates both that authority and the test, repair production. If the spec limits two-argument unary CLI calls to a fixed function-token set, a same-run generated test that expects an unknown two-token command such as `log 10` to be an unsupported-function exit is expectation drift unless the spec explicitly added that CLI grammar. When the latest failure detail names concrete defects in more than one active target, fix every named target in the same repair pass instead of repeatedly rewriting only one file.\n".to_string()
+    let generated_scope_line = if projection.has_test_target {
+        generated_test_scope_guidance_line()
     } else {
         String::new()
     };
+    let missing_surface_line = missing_surface_guidance_line(&contract_projection);
+    let stream_line = output_stream_guidance_line(&contract_projection);
+    let exception_line = exception_assertion_guidance_line(&contract_projection, &projection);
+    let python_line = python_repair_guidance_line(&projection);
     format!(
-        "{VERIFICATION_FAILURE_REPAIR_REMINDER_PREFIX}\nCurrent verification task: {todo_content}\n{failure_line}{failure_detail_line}{contract_line}{target_line}{test_contract_line}{generated_scope_line}Treat the latest failing verification output as authoritative for the observed failure, but do not promote generated tests over the latest user request, design document, or spec. Use the failing traceback, assertion text, and concrete call sites as the source of truth for what is broken.\nDo not reinterpret public method names, argument order, argument counts, CLI argv order, exit codes, or stdout formatting from prose alone; if the failing tests call an existing signature or subprocess invocation, preserve that exact contract unless you are intentionally updating the spec and the tests together.\nIf the failure is `ImportError: cannot import name ... from <module>`, treat it as an import/export surface mismatch unless it conflicts with the latest user/spec/design authority; either align the generated test import or add the missing production export.\nWhen the failing tests use subprocess or CLI assertions and do not conflict with a newer user/spec/design authority, treat the exact argv list, expected return code, and expected stdout/stderr text in those tests as the behavior contract.\nIf a test asserts `output.stdout` or `output.stdout.strip()`, print that user-facing success/error text to stdout, not stderr. If a test asserts stderr, print it to stderr exactly.\nFor `assertRaisesRegex` failures, the expected regex text is case-sensitive behavior contract; change the raised exception message to match that expected lowercase/uppercase wording exactly unless the test itself is out of scope.\nFor string or stdout assertions, the observed value on the left side of the assertion diff is actual output and the right side is expected output. Produce the expected string exactly only when that expected string is backed by the latest user request, design document, spec, or non-generated test authority. If a same-run generated test expects trailing zeros such as `.0` but the already-read design or baseline output contract uses compact integer formatting, repair the generated test expectation instead of changing production formatting.\nFor CLI argv failures, validate operator or subcommand tokens in the position asserted by the test before converting operands, so an unsupported operator does not turn into a numeric conversion error when the spec/test expects an unsupported-operator error.\nWhen repairing a generated source file, preserve existing imports, public functions, CLI entrypoints, and `if __name__ == \"__main__\"` launch blocks unless the failing verification output explicitly proves that exact contract is wrong.\nDo not restart broad task-file or specification rediscovery unless the verification output itself shows the mismatch is there.\nFirst make the targeted repair with `read`, `write`, or `apply_patch`. As soon as that repair is in place, rerun the failing verification command with `shell` and keep the verification todo open with `todowrite` until the rerun succeeds."
+        "{VERIFICATION_FAILURE_REPAIR_REMINDER_PREFIX}\nCurrent verification task: {todo_content}\n{failure_line}{failure_detail_line}{contract_line}{target_line}{test_contract_line}{generated_scope_line}Treat the latest failing verification output as authoritative for the observed failure, but do not promote generated tests over the latest user request, design document, or spec. Use the failing diagnostics, assertion text, and concrete call sites as the source of truth for what is broken.\nDo not reinterpret public method names, argument order, argument counts, command argv order, exit codes, or stdout/stderr formatting from prose alone; if the failing tests call an existing signature or command invocation, preserve that exact contract unless you are intentionally updating the spec and the tests together.\n{missing_surface_line}When failing tests use process or command assertions and do not conflict with a newer user/spec/design authority, treat the exact argv list, expected return code, and expected stdout/stderr text in those tests as the behavior contract.\n{stream_line}{exception_line}For string or stdout assertions, the observed value on the left side of the assertion diff is actual output and the right side is expected output. Produce the expected string exactly only when that expected string is backed by the latest user request, design document, spec, or non-generated test authority. If a same-run generated test expects a formatting change that conflicts with the already-read design or baseline output contract, repair the generated test expectation instead of changing production formatting.\nFor command argv failures, validate operator or subcommand tokens in the position asserted by the test before converting operands, so an unsupported operation does not turn into an unrelated conversion error when the spec/test expects an unsupported-operation error.\nWhen repairing a generated source file, preserve existing imports, public functions, command entrypoints, and launch blocks unless the failing verification output explicitly proves that exact contract is wrong.\n{python_line}Do not restart broad task-file or specification rediscovery unless the verification output itself shows the mismatch is there.\nFirst make the targeted repair with `read`, `write`, or `apply_patch`. As soon as that repair is in place, rerun the failing verification command with `shell` and keep the verification todo open with `todowrite` until the rerun succeeds."
     )
 }
 
@@ -1104,16 +1193,15 @@ pub(crate) fn verification_failure_repair_edit_focused_reminder(
     targets: &[String],
     focused_target: Option<&str>,
 ) -> String {
-    let has_test_target = targets
-        .iter()
-        .any(|target| target_looks_like_test_file(target));
+    let projection = verification_repair_prompt_projection(targets);
+    let contract_projection = verification_contract_prompt_projection_from_summary(failure_summary);
     let failure_line = if failures.is_empty() {
         "Latest verification run failed.\n".to_string()
     } else {
         format!("Latest failing checks: {}\n", failures.join(", "))
     };
     let failure_detail_line = verification_failure_detail_line(failure_summary);
-    let contract_line = verification_failure_contract_line(failure_summary);
+    let contract_line = verification_failure_contract_line(&contract_projection);
     let target_line = if targets.is_empty() {
         String::new()
     } else {
@@ -1129,27 +1217,171 @@ pub(crate) fn verification_failure_repair_edit_focused_reminder(
             )
         })
         .unwrap_or_default();
-    let generated_scope_line = if has_test_target {
-        "Generated tests authored or expanded in this run are not automatically the authority. Compare subprocess argv, expected exception class/message, stdout/stderr, and numeric formatting against the latest user request, design document, or spec already read in this session. If the generated test conflicts with that authority, repair the test file now; if production violates both that authority and the test, repair production. If the spec limits two-argument unary CLI calls to a fixed function-token set, a same-run generated test that expects an unknown two-token command such as `log 10` to be an unsupported-function exit is expectation drift unless the spec explicitly added that CLI grammar. When the latest failure detail names concrete defects in more than one active target, fix every named target in the same repair pass instead of repeatedly rewriting only one file.\n".to_string()
+    let generated_scope_line = if projection.has_test_target {
+        generated_test_scope_guidance_line()
     } else {
         String::new()
     };
+    let missing_surface_line = missing_surface_guidance_line(&contract_projection);
+    let stream_line = output_stream_guidance_line(&contract_projection);
+    let exception_line = exception_assertion_guidance_line(&contract_projection, &projection);
+    let python_line = python_repair_guidance_line(&projection);
     format!(
-        "{VERIFICATION_FAILURE_REPAIR_EDIT_FOCUSED_REMINDER_PREFIX}\nCurrent verification task: {todo_content}\n{failure_line}{failure_detail_line}{contract_line}{target_line}{focused_target_line}{generated_scope_line}This repair lane already has enough concrete failure context. The next productive step is one concrete `write` or `apply_patch` repair, followed by the verification rerun. A same-target `read` is allowed only when edit safety requires a fresh grounding read before a whole-file rewrite. `todowrite` may be used only to keep progress visible; it does not replace the concrete repair or verification rerun.\nPreserve the exact contract from the failing tests, including subprocess argv order, exit code, and stdout/stderr formatting when those assertions exist and do not conflict with a newer user/spec/design authority.\nIf the failure is `ImportError: cannot import name ... from <module>`, treat it as an import/export surface mismatch unless it conflicts with the latest user/spec/design authority; either align the generated test import or add the missing production export.\nIf a test asserts `output.stdout` or `output.stdout.strip()`, print that user-facing success/error text to stdout, not stderr. If a test asserts stderr, print it to stderr exactly.\nFor `assertRaisesRegex` failures, the expected regex text is case-sensitive behavior contract; change the raised exception message to match that expected lowercase/uppercase wording exactly unless the test itself is out of scope.\nFor exact string/stdout assertions, follow the expected string only when it is backed by the latest user request, design document, spec, or non-generated test authority. If a same-run generated test expects trailing zeros such as `.0` but the already-read design or baseline output contract uses compact integer formatting, repair the generated test expectation instead of changing production formatting. For CLI argv errors, validate operator/subcommand tokens before operand conversion when the failing test expects an unsupported-operator style error.\nIf you choose a whole-file rewrite, keep existing imports, public functions, CLI entrypoints, and `if __name__ == \"__main__\"` launch blocks unless the latest failure directly identifies them as wrong.\nDo not spend this turn on broad rediscovery, more analysis, or verification reruns. Do not call `list`, `glob`, `grep`, `inspect_directory`, `docling_convert`, `mcp_call`, or `shell` yet. Use `read` only for the active repair target when the write safety contract requires it. Repair the concrete bug now, then rerun the exact failing verification command on the next step."
+        "{VERIFICATION_FAILURE_REPAIR_EDIT_FOCUSED_REMINDER_PREFIX}\nCurrent verification task: {todo_content}\n{failure_line}{failure_detail_line}{contract_line}{target_line}{focused_target_line}{generated_scope_line}This repair lane already has enough concrete failure context. The next productive step is one concrete `write` or `apply_patch` repair, followed by the verification rerun. A same-target `read` is allowed only when edit safety requires a fresh grounding read before a whole-file rewrite. `todowrite` may be used only to keep progress visible; it does not replace the concrete repair or verification rerun.\nPreserve the exact contract from the failing tests, including process/command argv order, exit code, and stdout/stderr formatting when those assertions exist and do not conflict with a newer user/spec/design authority.\n{missing_surface_line}{stream_line}{exception_line}For exact string/stdout assertions, follow the expected string only when it is backed by the latest user request, design document, spec, or non-generated test authority. If a same-run generated test expects a formatting change that conflicts with the already-read design or baseline output contract, repair the generated test expectation instead of changing production formatting. For command argv errors, validate operator/subcommand tokens before operand conversion when the failing test expects an unsupported-operation style error.\nIf you choose a whole-file rewrite, keep existing imports, public functions, command entrypoints, and launch blocks unless the latest failure directly identifies them as wrong.\n{python_line}Do not spend this turn on broad rediscovery, more analysis, or verification reruns. Do not call `list`, `glob`, `grep`, `inspect_directory`, `docling_convert`, `mcp_call`, or `shell` yet. Use `read` only for the active repair target when the write safety contract requires it. Repair the concrete bug now, then rerun the exact failing verification command on the next step."
     )
 }
 
-fn target_looks_like_test_file(target: &str) -> bool {
-    let lower = target.replace('\\', "/").to_ascii_lowercase();
-    lower.contains("/tests/")
-        || lower.starts_with("tests/")
-        || lower.ends_with("_test.py")
-        || lower.ends_with("test_integration.py")
-        || lower
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .starts_with("test_")
+#[derive(Debug, Clone, Copy)]
+struct VerificationRepairPromptProjection {
+    has_test_target: bool,
+    all_targets_are_tests: bool,
+    has_python_context: bool,
+}
+
+fn verification_repair_prompt_projection(targets: &[String]) -> VerificationRepairPromptProjection {
+    let specs = targets
+        .iter()
+        .map(|target| classify_language_artifact_target(target))
+        .collect::<Vec<_>>();
+    let has_test_target = specs.iter().any(|spec| spec.role == ArtifactRole::Test);
+    let all_targets_are_tests =
+        !specs.is_empty() && specs.iter().all(|spec| spec.role == ArtifactRole::Test);
+    let has_python_target = specs
+        .iter()
+        .any(|spec| spec.language == LanguageFamily::Python);
+    VerificationRepairPromptProjection {
+        has_test_target,
+        all_targets_are_tests,
+        has_python_context: has_python_target,
+    }
+}
+
+fn generated_test_scope_guidance_line() -> String {
+    "Generated tests authored or expanded in this run are not automatically the authority. If the failing expectation came from a generated test and it broadens behavior beyond the latest user request or spec, narrow that generated test back to the requested scope instead of expanding production code to satisfy the invented behavior. For mixed production/test targets, compare public calls, command invocations, expected exception or error behavior, stdout/stderr, and output formatting against the latest user request, design document, or spec already read in this session. If the generated test conflicts with that authority, repair the test file; if production violates both that authority and the test, repair production. When the latest failure detail names concrete defects in more than one active target, fix every named target in the same repair pass instead of repeatedly rewriting only one file.\n".to_string()
+}
+
+fn missing_surface_guidance_line(projection: &VerificationContractPromptProjection) -> String {
+    if projection.has_missing_surface_evidence {
+        "If the failure identifies a missing import, export, function, method, attribute, or member, treat it as a public surface mismatch unless it conflicts with the latest user/spec/design authority; either align the generated test import/call or add the missing production surface.\n".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn output_stream_guidance_line(projection: &VerificationContractPromptProjection) -> String {
+    if projection.has_output_stream_evidence {
+        "If a test asserts stdout, print that user-facing success/error text to stdout, not stderr. If a test asserts stderr, print it to stderr exactly.\n".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn exception_assertion_guidance_line(
+    contract_projection: &VerificationContractPromptProjection,
+    projection: &VerificationRepairPromptProjection,
+) -> String {
+    if projection.has_python_context && contract_projection.has_python_exception_assertion {
+        "For Python `assertRaisesRegex` failures, the expected regex text is case-sensitive behavior contract; change the raised exception message to match that expected lowercase/uppercase wording exactly unless the test itself is out of scope.\n".to_string()
+    } else if contract_projection.has_python_exception_assertion
+        || contract_projection.has_exception_or_error_evidence
+    {
+        "For exception/error assertion failures, preserve the expected type, message, and case-sensitive text when that expectation is backed by the latest user request, spec, design, or non-generated test authority.\n".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn python_repair_guidance_line(projection: &VerificationRepairPromptProjection) -> String {
+    if projection.has_python_context {
+        "Python-specific repair note: preserve existing imports and `if __name__ == \"__main__\"` launch blocks unless the latest failure directly identifies them as wrong; do not rewrite a Python test module into production source or production source into a test module.\n".to_string()
+    } else {
+        String::new()
+    }
+}
+
+pub(crate) fn verification_repair_prompt_uses_language_projection_fixture_passes() -> bool {
+    let js_targets = vec!["tests/workflow.spec.ts".to_string()];
+    let js_prompt = verification_failure_repair_reminder(
+        "Repair workflow verification and rerun verify-contract --behavior.",
+        &["verify-contract --behavior".to_string()],
+        Some(
+            "Command: verify-contract --behavior\nTypeError: workflow.advance is not a function\nexpect(workflow_result.stdout).toBe('ok')",
+        ),
+        &js_targets,
+    );
+    let js_focused_prompt = verification_failure_repair_edit_focused_reminder(
+        "Repair workflow verification and rerun verify-contract --behavior.",
+        &["verify-contract --behavior".to_string()],
+        Some("Command: verify-contract --behavior\nExpected stdout: ok\nReceived stderr: ok"),
+        &js_targets,
+        Some("tests/workflow.spec.ts"),
+    );
+    let python_prompt = verification_failure_repair_reminder(
+        "Repair workflow verification and rerun python -m workflow_check.",
+        &["python -m workflow_check".to_string()],
+        Some(
+            "Traceback (most recent call last):\n  File \"tests/test_workflow.py\", line 3\nself.assertRaisesRegex(ValueError, \"workflow_result\")",
+        ),
+        &["tests/test_workflow.py".to_string()],
+    );
+    let workflow_source_target = "src/workflow.rs";
+    let workflow_neutral_marker = "prompt_assets_fixture_workflow_neutral";
+
+    let forbidden_generic_python_markers = [
+        "unittest/pytest",
+        "subprocess.run",
+        "assertRaisesRegex",
+        "__main__",
+        "Python-specific repair note",
+    ];
+    let subprocess_argv_marker = ["subprocess", " argv"].concat();
+    let case_specific_generated_test_marker = ["log", " 10"].concat();
+
+    forbidden_generic_python_markers
+        .iter()
+        .all(|marker| !js_prompt.contains(marker) && !js_focused_prompt.contains(marker))
+        && !js_prompt.contains(&subprocess_argv_marker)
+        && !js_focused_prompt.contains(&subprocess_argv_marker)
+        && !js_prompt.contains(&case_specific_generated_test_marker)
+        && !js_focused_prompt.contains(&case_specific_generated_test_marker)
+        && js_prompt.contains("process or command assertions")
+        && js_prompt.contains("public surface mismatch")
+        && js_focused_prompt.contains("stdout")
+        && python_prompt.contains("Python-specific repair note")
+        && python_prompt.contains("assertRaisesRegex")
+        && workflow_source_target == "src/workflow.rs"
+        && workflow_neutral_marker == "prompt_assets_fixture_workflow_neutral"
+}
+
+pub(crate) fn python_context_uses_language_evidence_adapter_fixture_passes() -> bool {
+    let python_like_summary =
+        "Traceback: pytest collected tests/test_workflow.py with assertRaisesRegex under python";
+    let js_targets = vec!["tests/workflow.spec.ts".to_string()];
+    let python_targets = vec!["tests/test_workflow.py".to_string()];
+    let js_prompt = verification_failure_repair_reminder(
+        "Repair workflow verification and rerun verify-contract --behavior.",
+        &["verify-contract --behavior".to_string()],
+        Some(python_like_summary),
+        &js_targets,
+    );
+    let python_prompt = verification_failure_repair_reminder(
+        "Repair workflow verification and rerun python -m workflow_check.",
+        &["python -m workflow_check".to_string()],
+        Some("Expected workflow_result exception text"),
+        &python_targets,
+    );
+    let adapter_marker = "prompt_assets_python_context_uses_language_evidence_adapter";
+
+    !js_prompt.contains("Python-specific repair note")
+        && !js_prompt.contains("assertRaisesRegex")
+        && python_prompt.contains("Python-specific repair note")
+        && classify_language_artifact_target("tests/test_workflow.py").language
+            == LanguageFamily::Python
+        && classify_language_artifact_target("tests/workflow.spec.ts").language
+            == LanguageFamily::Code
+        && verification_contract_prompt_projection_from_summary(Some(python_like_summary))
+            .has_python_exception_assertion
+        && adapter_marker == "prompt_assets_python_context_uses_language_evidence_adapter"
 }
 
 fn verification_failure_detail_line(failure_summary: Option<&str>) -> String {
@@ -1168,25 +1400,16 @@ fn verification_failure_detail_line(failure_summary: Option<&str>) -> String {
     }
 }
 
-fn verification_failure_contract_line(failure_summary: Option<&str>) -> String {
-    let Some(summary) = failure_summary else {
-        return String::new();
-    };
-    let call_sites = extract_verification_contract_call_sites(summary);
-    let call_site_line = if call_sites.is_empty() {
+fn verification_failure_contract_line(projection: &VerificationContractPromptProjection) -> String {
+    let call_site_line = if projection.call_sites.is_empty() {
         String::new()
     } else {
         format!(
-            "Call-site contract extracted from latest verification output: {}. Preserve these public calls/subprocess invocations unless a newer user/spec/design authority explicitly changes them.\n",
-            call_sites.join("; ")
+            "Call-site contract extracted from latest verification output: {}. Preserve these public calls or process/command invocations unless a newer user/spec/design authority explicitly changes them.\n",
+            projection.call_sites.join("; ")
         )
     };
-    let lower = summary.to_ascii_lowercase();
-    let argument_order_line = if lower.contains("unsupported operation:")
-        || lower.contains("unsupported operator:")
-        || lower.contains("unsupported unary operator:")
-        || summary.contains("未対応の演算子")
-    {
+    let argument_order_line = if projection.has_argument_order_evidence {
         "If an operand value appears in an unsupported-operation/operator error, including unsupported-unary-operator text or localized unsupported-operator text such as `未対応の演算子`, while the failing call site passes an operator/function token in another positional argument, treat it as argument-order drift in production. Repair the production argument binding to match the call site; do not rewrite tests to the drifted production order. If tests expect English exception/stdout text, replace localized production error messages with the expected English contract.\n"
     } else {
         ""
@@ -1198,50 +1421,19 @@ fn verification_failure_contract_line(failure_summary: Option<&str>) -> String {
     }
 }
 
-fn extract_verification_contract_call_sites(summary: &str) -> Vec<String> {
-    let mut call_sites = Vec::new();
-    for raw in summary.split(['\n', '|']) {
-        let trimmed = raw.trim();
-        if !looks_like_contract_call_site(trimmed) {
-            continue;
-        }
-        let normalized = crate::tool::truncate::clip_text_with_ellipsis(
-            &trimmed.split_whitespace().collect::<Vec<_>>().join(" "),
-            180,
-        );
-        if !call_sites.iter().any(|existing| existing == &normalized) {
-            call_sites.push(normalized);
-        }
-        if call_sites.len() >= 4 {
-            break;
-        }
-    }
-    call_sites
-}
-
-fn looks_like_contract_call_site(line: &str) -> bool {
-    if line.is_empty()
-        || line.starts_with("File \"")
-        || line.starts_with("Traceback ")
-        || line.starts_with("FAIL: ")
-        || line.starts_with("ERROR: ")
-        || line.starts_with("FAILED ")
-        || line.starts_with("Ran ")
-        || line == "----------------------------------------------------------------------"
-    {
-        return false;
-    }
-    if !(line.contains('(') && line.contains(')')) {
-        return false;
-    }
-
-    let lower = line.to_ascii_lowercase();
-    lower.contains("assert")
-        || lower.contains("subprocess.run")
-        || lower.contains("self._run")
-        || lower.contains("calculate(")
-        || lower.contains("output =")
-        || lower.contains("result =")
+pub(crate) fn contract_guidance_uses_typed_verification_evidence_fixture_passes() -> bool {
+    let summary = "workflow.assert_behavior(2, \"+\", 3)\nunsupported operation: 2";
+    let projection = verification_contract_prompt_projection_from_summary(Some(summary));
+    let line = verification_failure_contract_line(&projection);
+    let marker = "prompt_assets_contract_guidance_typed_verification_evidence";
+    projection.has_argument_order_evidence
+        && projection
+            .call_sites
+            .iter()
+            .any(|call_site| call_site.contains("workflow.assert_behavior"))
+        && line.contains("Call-site contract extracted from latest verification output")
+        && line.contains("argument-order drift")
+        && marker == "prompt_assets_contract_guidance_typed_verification_evidence"
 }
 
 pub(crate) fn max_steps_reminder() -> &'static str {

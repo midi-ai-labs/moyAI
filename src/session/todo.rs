@@ -71,51 +71,47 @@ impl TodoItem {
 }
 
 pub fn todo_is_completion_item(todo: &TodoItem) -> bool {
-    matches!(todo.kind, TodoKind::Completion) || is_completion_todo(&todo.content)
+    matches!(todo.kind, TodoKind::Completion)
 }
 
 pub fn todo_counts_as_open_work(todo: &TodoItem) -> bool {
     todo.status.is_open() && !todo_is_completion_item(todo)
 }
 
-pub fn is_completion_todo(content: &str) -> bool {
-    let lower = content.trim().to_ascii_lowercase();
-    let has_english_completion = lower.contains("close out")
-        || lower.contains("close-out")
-        || lower.contains("final check")
-        || lower.contains("final review")
-        || lower.contains("final verification")
-        || lower.contains("wrap up")
-        || lower.contains("finish the run")
-        || lower.contains("finalize");
-    let has_japanese_completion = (content.contains("完了")
-        || content.contains("終了")
-        || content.contains("最終")
-        || content.contains("クローズ"))
-        && (content.contains("確認")
-            || content.contains("整合")
-            || content.contains("照合")
-            || content.contains("再読")
-            || content.contains("チェック")
-            || content.contains("完了条件"))
-        || content.contains("整合確認")
-        || content.contains("整合性確認")
-        || content.contains("完了条件チェック");
-    let has_japanese_reread_closeout = (content.contains("再読")
-        || content.contains("読み直し")
-        || content.contains("読み直す"))
-        && (content.contains("確認") || content.contains("照合") || content.contains("チェック"));
-    let has_unsupported_claim_closeout = lower.contains("unsupported claim")
-        && (lower.contains("reread")
-            || lower.contains("read again")
-            || lower.contains("final review")
-            || lower.contains("final check")
-            || content.contains("再読")
-            || content.contains("読み直し")
-            || content.contains("読み直す"));
+pub(crate) fn todo_completion_kind_only_open_work_authority_fixture_passes() -> bool {
+    let work_with_closeout_words = TodoItem {
+        id: TodoId::new(),
+        content: "final verification and close out remaining workflow evidence".to_string(),
+        kind: TodoKind::Work,
+        status: TodoStatus::Pending,
+        priority: TodoPriority::High,
+        targets: Vec::new(),
+        depends_on: Vec::new(),
+        success_criteria: Vec::new(),
+        blocked_by: Vec::new(),
+    };
+    let typed_completion = TodoItem {
+        id: TodoId::new(),
+        content: "continue implementation".to_string(),
+        kind: TodoKind::Completion,
+        status: TodoStatus::Pending,
+        priority: TodoPriority::Low,
+        targets: Vec::new(),
+        depends_on: Vec::new(),
+        success_criteria: Vec::new(),
+        blocked_by: Vec::new(),
+    };
 
-    has_english_completion
-        || has_japanese_completion
-        || has_japanese_reread_closeout
-        || has_unsupported_claim_closeout
+    !todo_is_completion_item(&work_with_closeout_words)
+        && todo_counts_as_open_work(&work_with_closeout_words)
+        && todo_is_completion_item(&typed_completion)
+        && !todo_counts_as_open_work(&typed_completion)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn todo_completion_kind_only_open_work_authority() {
+        assert!(super::todo_completion_kind_only_open_work_authority_fixture_passes());
+    }
 }

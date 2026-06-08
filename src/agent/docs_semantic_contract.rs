@@ -14,6 +14,8 @@ use crate::session::{MessageRole, SessionId, SessionStateSnapshot, TaskRoute, To
 use crate::tool::ToolResult;
 
 pub(crate) const DOCS_SPEC_SEMANTIC_RECONCILIATION_TERMINAL_THRESHOLD: usize = 2;
+pub(crate) const DOCS_SEMANTIC_EXIT_CODE_EVIDENCE_LANGUAGE_NEUTRAL: &str =
+    "docs_semantic_exit_code_evidence_language_neutral";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DocumentationSemanticClaim {
@@ -420,40 +422,41 @@ fn target_display(targets: &[Utf8PathBuf]) -> String {
 }
 
 pub fn docs_spec_semantic_reconciliation_fixture_passes() -> bool {
-    let authority = "Update only docs/spec. The CLI grammar treats unknown two-token invocations such as `tool beta` as usage error exit code 1. Do not document or test those as unsupported function exit code 2.";
-    let exact_authority = "Docs only. Incomplete binary-looking `python tool.py 8 +` must be usage error exit code 1. Unknown two-token `python tool.py log 10` must be usage error exit code 1; do not create unsupported-function exit code 2 tests.";
+    let authority = "Update only docs/spec. The CLI grammar treats unknown two-token invocations such as `workflow-tool archive draft` as usage error exit code 1. Do not document or test those as unsupported command exit code 2.";
+    let exact_authority = "Docs only. Incomplete binary-looking `workflow-tool 8 +` must be usage error exit code 1. Unknown two-token `workflow-tool archive draft` must be usage error exit code 1; do not create unsupported-command exit code 2 tests.";
+    let additive_two_token_authority = "Docs only. Keep existing binary command `workflow-tool 2 + 3`. Add routed commands `workflow-tool inspect draft` and `workflow-tool publish draft` using the `<action> <subject>` form. Unknown two-token `workflow-tool archive draft` must be usage error exit code 1; do not create unsupported-command exit code 2 tests. The direct helper API may be documented as `workflow_transition(action, subject)`.";
     let bad_doc = r#"
 # Tool CLI
 
-Unknown two-token invocations such as `tool beta` are usage error cases and exit code 1.
+Unknown two-token invocations such as `workflow-tool archive draft` are usage error cases and exit code 1.
 
 | Case | Exit |
 | --- | --- |
-| unknown two-token unsupported function | exit code 2 |
+| unknown two-token unsupported command | exit code 2 |
 "#;
     let localized_bad_doc = r#"
 # ツール CLI
 
-未知の 2 token 入力 such as `tool beta` は usage error として exit code 1 を返す。
+未知の 2 token 入力 such as `workflow-tool archive draft` は usage error として exit code 1 を返す。
 
 | 状況 | 処理内容 |
 | --- | --- |
-| 未知の 2 token 未定義の関数 | `sys.exit(2)` |
+| 未知の 2 token 未定義の操作 | `終了コード 2` |
 "#;
     let fixed_doc = r#"
 # Tool CLI
 
-Unknown two-token invocations such as `tool beta` are usage error cases and exit code 1.
-Unsupported helper functions are internal API errors and are not a CLI fallback for unknown two-token input.
+Unknown two-token invocations such as `workflow-tool archive draft` are usage error cases and exit code 1.
+Unsupported internal commands are internal API errors and are not a CLI fallback for unknown two-token input.
 "#;
     let allowed_separate_unsupported_function_doc = r#"
 # Tool CLI
 
-Unknown two-token invocations such as `tool beta` are usage error cases and exit code 1.
+Unknown two-token invocations such as `workflow-tool archive draft` are usage error cases and exit code 1.
 
 | Case | Exit |
 | --- | --- |
-| unsupported helper function | exit code 2 |
+| unsupported internal command | exit code 2 |
 "#;
     let too_generic_doc = r#"
 # Tool CLI
@@ -463,27 +466,37 @@ Inputs with fewer than 3 tokens are usage error cases and exit code 1.
     let exact_fixed_doc = r#"
 # Tool CLI
 
-Incomplete binary CLI input such as `python tool.py 8 +` is a usage error and exits with exit code 1.
-Unknown 2 トークン CLI input such as `python tool.py log 10` is a usage error and exits with exit code 1.
+Incomplete binary CLI input such as `workflow-tool 8 +` is a usage error and exits with exit code 1.
+Unknown 2 トークン CLI input such as `workflow-tool archive draft` is a usage error and exits with exit code 1.
 "#;
     let exact_table_fixed_doc = r#"
 # Tool CLI
 
 | command | behavior | exit |
 | --- | --- | --- |
-| `python tool.py 8 +` | usage error: show valid input format | exit code 1 |
-| `python tool.py log 10` | usage error: show valid input format | exit code 1 |
+| `workflow-tool 8 +` | usage error: show valid input format | exit code 1 |
+| `workflow-tool archive draft` | usage error: show valid input format | exit code 1 |
+"#;
+    let section_heading_context_fixed_doc = r#"
+# Tool CLI
+
+### Usage error (exit code 1)
+
+| case | example |
+| --- | --- |
+| unknown two-token CLI input | `workflow-tool archive draft` |
+| incomplete binary-looking input | `workflow-tool 8 +` |
 "#;
     let negative_guidance_fixed_doc = r#"
 # Tool CLI
 
 | command | behavior | exit |
 | --- | --- | --- |
-| `python tool.py 8 +` | invalid incomplete input: show valid input format | exit code 1 |
-| `python tool.py log 10` | unknown two-token input usage error: show valid input format | exit code 1 |
+| `workflow-tool 8 +` | invalid incomplete input: show valid input format | exit code 1 |
+| `workflow-tool archive draft` | unknown two-token input usage error: show valid input format | exit code 1 |
 
-- Do not create generated tests that expect unknown two-token input to be an undefined function with exit code 2.
-- 未知の2トークン入力 (`log 10` など) について、exit code 2 を期待する生成 test は作成しない。
+- Do not create generated tests that expect unknown two-token input to be an undefined command with exit code 2.
+- 未知の2トークン入力 (`archive draft` など) について、exit code 2 を期待する生成 test は作成しない。
 "#;
     let Some(contract) = documentation_semantic_contract_from_authority(authority) else {
         return false;
@@ -492,6 +505,38 @@ Unknown 2 トークン CLI input such as `python tool.py log 10` is a usage erro
     else {
         return false;
     };
+    let Some(additive_two_token_contract) =
+        documentation_semantic_contract_from_authority(additive_two_token_authority)
+    else {
+        return false;
+    };
+    let Some(additive_unknown_claim) = additive_two_token_contract
+        .required_claims
+        .iter()
+        .find(|claim| claim.id == "unknown_two_token_cli_usage_error_exit_1")
+    else {
+        return false;
+    };
+    let additive_unknown_evidence_is_bounded = additive_unknown_claim
+        .evidence_refs
+        .iter()
+        .any(|evidence| evidence.contains("workflow-tool archive draft"))
+        && !additive_unknown_claim
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.contains("workflow-tool inspect draft"))
+        && !additive_unknown_claim
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.contains("workflow-tool publish draft"))
+        && !additive_unknown_claim
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.contains("<action> <subject>"))
+        && !additive_unknown_claim
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.contains("workflow_transition"));
     let bad = reconcile_documentation_semantics(&contract, bad_doc);
     let localized_bad = reconcile_documentation_semantics(&contract, localized_bad_doc);
     let fixed = reconcile_documentation_semantics(&contract, fixed_doc);
@@ -501,6 +546,8 @@ Unknown 2 トークン CLI input such as `python tool.py log 10` is a usage erro
     let exact_fixed = reconcile_documentation_semantics(&exact_contract, exact_fixed_doc);
     let exact_table_fixed =
         reconcile_documentation_semantics(&exact_contract, exact_table_fixed_doc);
+    let section_heading_context_fixed =
+        reconcile_documentation_semantics(&exact_contract, section_heading_context_fixed_doc);
     let negative_guidance_fixed =
         reconcile_documentation_semantics(&exact_contract, negative_guidance_fixed_doc);
 
@@ -508,24 +555,26 @@ Unknown 2 トークン CLI input such as `python tool.py log 10` is a usage erro
         && bad
             .prohibited_claims_present
             .iter()
-            .any(|claim| claim.id == "unknown_two_token_cli_as_unsupported_function_exit_2")
+            .any(|claim| claim.id == "unknown_two_token_cli_as_unsupported_command_exit_2")
         && !localized_bad.is_clean()
         && localized_bad
             .prohibited_claims_present
             .iter()
-            .any(|claim| claim.id == "unknown_two_token_cli_as_undefined_function_exit_2")
+            .any(|claim| claim.id == "unknown_two_token_cli_as_undefined_operation_exit_2")
         && fixed.is_clean()
         && allowed_separate_unsupported_function.is_clean()
+        && additive_unknown_evidence_is_bounded
         && !too_generic.is_clean()
         && too_generic.missing_required_claims.iter().any(|claim| {
             claim.id == "unknown_two_token_cli_usage_error_exit_1"
                 && claim
                     .evidence_refs
                     .iter()
-                    .any(|evidence| evidence.contains("python tool.py log 10"))
+                    .any(|evidence| evidence.contains("workflow-tool archive draft"))
         })
         && exact_fixed.is_clean()
         && exact_table_fixed.is_clean()
+        && section_heading_context_fixed.is_clean()
         && negative_guidance_fixed.is_clean()
         && exact_table_fixed
             .satisfied_required_claims
@@ -535,7 +584,7 @@ Unknown 2 トークン CLI input such as `python tool.py log 10` is a usage erro
                     && claim
                         .observed_refs
                         .iter()
-                        .any(|observed| observed.contains("python tool.py log 10"))
+                        .any(|observed| observed.contains("workflow-tool archive draft"))
             })
         && exact_table_fixed
             .satisfied_required_claims
@@ -545,7 +594,7 @@ Unknown 2 トークン CLI input such as `python tool.py log 10` is a usage erro
                     && claim
                         .observed_refs
                         .iter()
-                        .any(|observed| observed.contains("python tool.py 8 +"))
+                        .any(|observed| observed.contains("workflow-tool 8 +"))
             })
         && negative_guidance_fixed
             .satisfied_required_claims
@@ -562,7 +611,7 @@ Unknown 2 トークン CLI input such as `python tool.py log 10` is a usage erro
 pub fn docs_spec_semantic_reconciliation_feedback_projection_fixture_passes() -> bool {
     let session_id = SessionId::new();
     let turn_id = TurnId::new();
-    let target = Utf8PathBuf::from("docs/component-design.md");
+    let target = Utf8PathBuf::from("docs/workflow-design.md");
     let history_items = vec![HistoryItem {
         id: HistoryItemId::new(),
         session_id,
@@ -578,13 +627,13 @@ pub fn docs_spec_semantic_reconciliation_feedback_projection_fixture_passes() ->
                 "docs_spec_semantic_reconciliation": true,
                 "operation_progress_class": "docs_spec_semantic_reconciliation_failed",
                 "progress_effect": "no_progress",
-                "targets": ["docs/component-design.md"],
+                "targets": ["docs/workflow-design.md"],
                 "missing_required_claim_details": [{
                     "id": "unknown_two_token_cli_usage_error_exit_1",
                     "description": "Document that unknown two-token CLI input is a usage error with exit code 1.",
-                    "evidence_refs": ["python tool.py log 10"],
+                    "evidence_refs": ["workflow-tool archive draft"],
                     "observed_refs": [],
-                    "repair_snippets": ["Add a Markdown row or sentence containing `python tool.py log 10` with usage error semantics and exit code 1."]
+                    "repair_snippets": ["Add a Markdown row or sentence containing `workflow-tool archive draft` with usage error semantics and exit code 1."]
                 }],
                 "prohibited_claim_details": []
             }),
@@ -598,7 +647,7 @@ pub fn docs_spec_semantic_reconciliation_feedback_projection_fixture_passes() ->
     let active_work = ActiveWorkContract::DocsRepair {
         deliverable: Some(target.clone()),
         pending_deliverables: Vec::new(),
-        pending_summary: "rewrite docs/component-design.md".to_string(),
+        pending_summary: "rewrite docs/workflow-design.md".to_string(),
         route_contract_satisfied: false,
     };
     let Some(obligation) = docs_spec_semantic_reconciliation_recovery_obligation(
@@ -610,13 +659,11 @@ pub fn docs_spec_semantic_reconciliation_feedback_projection_fixture_passes() ->
     };
     let authority = crate::protocol::ActionAuthority {
         projection_id: ProjectionId::new(),
-        required_action: Some(crate::protocol::RequiredAction {
-            kind: crate::protocol::RequiredActionKind::EditTarget,
-            tool: crate::tool::ToolName::Write,
-            target: Some(target),
-            command: None,
-            projection_text: "write:docs/component-design.md".to_string(),
-        }),
+        required_action: Some(crate::protocol::RequiredAction::edit(
+            crate::tool::ToolName::Write,
+            target,
+        )),
+        required_action_conflicts: Vec::new(),
         required_verification_commands: Vec::new(),
         operation_intents: vec![OperationIntent::ContentChangingAuthoringRequired],
         allowed_tools: vec![crate::tool::ToolName::Write],
@@ -638,19 +685,84 @@ pub fn docs_spec_semantic_reconciliation_feedback_projection_fixture_passes() ->
         reference
             .reference
             .contains("unknown_two_token_cli_usage_error_exit_1")
-            && reference.reference.contains("python tool.py log 10")
+            && reference.reference.contains("workflow-tool archive draft")
             && reference.reference.contains("exit code 1")
             && reference
                 .reference
-                .contains("repair=Add a Markdown row or sentence containing `python tool.py log 10` with usage error semantics and exit code 1.")
+                .contains("repair=Add a Markdown row or sentence containing `workflow-tool archive draft` with usage error semantics and exit code 1.")
     }) && prompt.contains("docs_semantic_reconciliation")
         && prompt.contains("unknown_two_token_cli_usage_error_exit_1")
-        && prompt.contains("python tool.py log 10")
-        && prompt.contains("repair=Add a Markdown row or sentence containing `python tool.py log 10` with usage error semantics and exit code 1.")
+        && prompt.contains("workflow-tool archive draft")
+        && prompt.contains("repair=Add a Markdown row or sentence containing `workflow-tool archive draft` with usage error semantics and exit code 1.")
         && diagnostics.contains("unknown_two_token_cli_usage_error_exit_1")
-        && diagnostics.contains("repair=Add a Markdown row or sentence containing `python tool.py log 10` with usage error semantics and exit code 1.")
-        && feedback.contains("python tool.py log 10")
-        && feedback.contains("repair=Add a Markdown row or sentence containing `python tool.py log 10` with usage error semantics and exit code 1.")
+        && diagnostics.contains("repair=Add a Markdown row or sentence containing `workflow-tool archive draft` with usage error semantics and exit code 1.")
+        && feedback.contains("workflow-tool archive draft")
+        && feedback.contains("repair=Add a Markdown row or sentence containing `workflow-tool archive draft` with usage error semantics and exit code 1.")
+}
+
+pub(crate) fn docs_semantic_contract_fixtures_are_workflow_neutral_fixture_passes() -> bool {
+    docs_semantic_contract_cli_fixture_workflow_neutral_fixture_passes()
+}
+
+pub(crate) fn docs_semantic_contract_cli_fixture_workflow_neutral_fixture_passes() -> bool {
+    !DOCS_SEMANTIC_EXIT_CODE_EVIDENCE_LANGUAGE_NEUTRAL.is_empty()
+        && docs_spec_semantic_reconciliation_fixture_passes()
+        && docs_spec_semantic_reconciliation_feedback_projection_fixture_passes()
+        && latest_user_authority_text_uses_sequence_order_fixture_passes()
+        && docs_spec_semantic_reconciliation_tool_fixture_passes()
+        && docs_semantic_claim_projection_operation_authority_fixture_passes()
+        && docs_semantic_documentation_target_classifier_shape_based_fixture_passes()
+}
+
+pub(crate) fn docs_semantic_claim_projection_operation_authority_fixture_passes() -> bool {
+    let authority = "Docs only: unknown two-token CLI input is a usage error with exit code 1; do not add unsupported-command exit-code-2 generated tests for that input.";
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.active_targets = vec![Utf8PathBuf::from("docs/spec.md")];
+    let active_work = ActiveWorkContract::RequestedWorkAuthoring {
+        pending_targets: vec![Utf8PathBuf::from("docs/spec.md")],
+        verification_commands: vec![],
+    };
+    let Some(result) = docs_spec_semantic_reconciliation_result(
+        "write",
+        &json!({
+            "path": "docs/spec.md",
+            "content": "Unknown two-token CLI input is usage error exit code 1.\nUnknown two-token CLI input is treated as unsupported command exit code 2.\n未知の 2 token CLI input は 未定義の操作 exit code 2 として扱う。"
+        }),
+        &state,
+        Some(&active_work),
+        Utf8Path::new("C:/workspace"),
+        Some(authority),
+    ) else {
+        return false;
+    };
+    let metadata = result.metadata.to_string();
+    let projected = format!("{metadata}\n{}", result.output_text);
+    let contains_old_projection = [
+        "unknown_two_token_cli_as_unsupported_function_exit_2",
+        "unknown_two_token_cli_as_undefined_function_exit_2",
+        "unsupported function exit code 2.",
+        "undefined function exit code 2.",
+    ]
+    .iter()
+    .any(|stale| projected.contains(stale));
+    !contains_old_projection
+        && projected.contains("unknown_two_token_cli_as_unsupported_command_exit_2")
+        && projected.contains("unknown_two_token_cli_as_undefined_operation_exit_2")
+        && projected.contains("unsupported command exit code 2")
+        && projected.contains("undefined operation exit code 2")
+}
+
+pub(crate) fn docs_semantic_documentation_target_classifier_shape_based_fixture_passes() -> bool {
+    documentation_target(Utf8Path::new("docs/workflow-contract"))
+        && documentation_target(Utf8Path::new("team/docs/workflow-contract"))
+        && documentation_target(Utf8Path::new("workflow-notes.md"))
+        && documentation_target(Utf8Path::new("workflow-notes.markdown"))
+        && documentation_target(Utf8Path::new("readme.md"))
+        && !documentation_target(Utf8Path::new("README"))
+        && !documentation_target(Utf8Path::new("basic_design"))
+        && !documentation_target(Utf8Path::new("detail_design"))
+        && !documentation_target(Utf8Path::new("src/workflow.rs"))
 }
 
 pub(crate) fn latest_user_authority_text_uses_sequence_order_fixture_passes() -> bool {
@@ -667,7 +779,7 @@ pub(crate) fn latest_user_authority_text_uses_sequence_order_fixture_passes() ->
                 message_id: None,
                 role: MessageRole::User,
                 content: vec![crate::protocol::ContentPart::Text {
-                    text: "Latest docs authority: unknown two-token `python tool.py log 10` must be usage error exit code 1.".to_string(),
+                    text: "Latest docs authority: unknown two-token `workflow-tool archive draft` must be usage error exit code 1.".to_string(),
                 }],
             },
         },
@@ -680,7 +792,7 @@ pub(crate) fn latest_user_authority_text_uses_sequence_order_fixture_passes() ->
             payload: HistoryItemPayload::UserTurn {
                 message_id: None,
                 content: vec![crate::protocol::ContentPart::Text {
-                    text: "Older docs authority: unsupported function exit code 2.".to_string(),
+                    text: "Older docs authority: unsupported command exit code 2.".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
@@ -689,12 +801,13 @@ pub(crate) fn latest_user_authority_text_uses_sequence_order_fixture_passes() ->
         },
     ];
     latest_user_authority_text(&items).is_some_and(|text| {
-        text.contains("python tool.py log 10") && !text.contains("unsupported function exit code 2")
+        text.contains("workflow-tool archive draft")
+            && !text.contains("unsupported command exit code 2")
     })
 }
 
 pub fn docs_spec_semantic_reconciliation_tool_fixture_passes() -> bool {
-    let authority = "Docs only: unknown two-token CLI input is a usage error with exit code 1; do not add unsupported-function exit-code-2 generated tests for that input.";
+    let authority = "Docs only: unknown two-token CLI input is a usage error with exit code 1; do not add unsupported-command exit-code-2 generated tests for that input.";
     let mut state = SessionStateSnapshot::default();
     state.route = TaskRoute::Code;
     state.active_targets = vec![Utf8PathBuf::from("docs/spec.md")];
@@ -706,7 +819,7 @@ pub fn docs_spec_semantic_reconciliation_tool_fixture_passes() -> bool {
         "write",
         &json!({
             "path": "docs/spec.md",
-            "content": "Unknown two-token CLI input is usage error exit code 1.\nUnknown two-token CLI input is treated as unsupported function exit code 2."
+            "content": "Unknown two-token CLI input is usage error exit code 1.\nUnknown two-token CLI input is treated as unsupported command exit code 2."
         }),
         &state,
         Some(&active_work),
@@ -728,7 +841,7 @@ pub fn docs_spec_semantic_reconciliation_tool_fixture_passes() -> bool {
                 .is_some_and(|claims| {
                     claims.iter().any(|claim| {
                         claim.as_str()
-                            == Some("unknown_two_token_cli_as_unsupported_function_exit_2")
+                            == Some("unknown_two_token_cli_as_unsupported_command_exit_2")
                     })
                 })
             && tool_result
@@ -743,7 +856,7 @@ pub fn docs_spec_semantic_reconciliation_tool_fixture_passes() -> bool {
                             .is_some_and(|refs| {
                                 refs.iter().any(|value| {
                                     value.as_str().is_some_and(|text| {
-                                        text.contains("unsupported function exit code 2")
+                                        text.contains("unsupported command exit code 2")
                                     })
                                 })
                             })
@@ -754,7 +867,7 @@ pub fn docs_spec_semantic_reconciliation_tool_fixture_passes() -> bool {
         "write",
         &json!({
             "path": "docs/spec.md",
-            "content": "未知の 2 token CLI input は usage error として sys.exit(1) を返す。\n| 未知の 2 token 未定義の関数 | sys.exit(2) |"
+            "content": "未知の 2 token CLI input は usage error として終了コード 1 を返す。\n| 未知の 2 token 未定義の操作 | 終了コード 2 |"
         }),
         &state,
         Some(&active_work),
@@ -765,39 +878,39 @@ pub fn docs_spec_semantic_reconciliation_tool_fixture_passes() -> bool {
         "write",
         &json!({
             "path": "docs/spec.md",
-            "content": "Incomplete binary input `python tool.py 8 +` is invalid input and exits with exit code 1.\nUnknown two-token `python tool.py log 10` is a usage error and exits with exit code 1.\nDo not create generated tests that expect unknown two-token input as undefined function exit code 2.\n未知の2トークン入力 (`log 10` など) について、exit code 2 を期待する生成 test は作成しない。"
+            "content": "Incomplete binary input `workflow-tool 8 +` is invalid input and exits with exit code 1.\nUnknown two-token `workflow-tool archive draft` is a usage error and exits with exit code 1.\nDo not create generated tests that expect unknown two-token input as undefined command exit code 2.\n未知の2トークン入力 (`archive draft` など) について、exit code 2 を期待する生成 test は作成しない。"
         }),
         &state,
         Some(&active_work),
         Utf8Path::new("C:/workspace"),
         Some(
-            "Docs only. Incomplete binary-looking `python tool.py 8 +` must be usage error exit code 1. Unknown two-token `python tool.py log 10` must be usage error exit code 1; do not create unsupported-function exit code 2 tests.",
+            "Docs only. Incomplete binary-looking `workflow-tool 8 +` must be usage error exit code 1. Unknown two-token `workflow-tool archive draft` must be usage error exit code 1; do not create unsupported-command exit code 2 tests.",
         ),
     );
     let command_subject_result = docs_spec_semantic_reconciliation_result(
         "write",
         &json!({
             "path": "docs/spec.md",
-            "content": "| Command | Classification | Exit code |\n| --- | --- | --- |\n| `python tool.py log 10` | usage error | exit code 1 |\n| `python tool.py 8 +` | usage error | exit code 1 |"
+            "content": "| Command | Classification | Exit code |\n| --- | --- | --- |\n| `workflow-tool archive draft` | usage error | exit code 1 |\n| `workflow-tool 8 +` | usage error | exit code 1 |"
         }),
         &state,
         Some(&active_work),
         Utf8Path::new("C:/workspace"),
         Some(
-            "Docs only. Incomplete binary-looking `python tool.py 8 +` must be usage error exit code 1. Unknown two-token `python tool.py log 10` must be usage error exit code 1.",
+            "Docs only. Incomplete binary-looking `workflow-tool 8 +` must be usage error exit code 1. Unknown two-token `workflow-tool archive draft` must be usage error exit code 1.",
         ),
     );
     let localized_numeric_exit_table_result = docs_spec_semantic_reconciliation_result(
         "write",
         &json!({
             "path": "docs/spec.md",
-            "content": "| CLI 入力 | 分類 | 終了コード |\n| --- | --- | --- |\n| `python tool.py log 10` | 不明な2トークン入力 | 1 |\n| `python tool.py 8 +` | 二項演算の不完全な入力 | 1 |"
+            "content": "| CLI 入力 | 分類 | 終了コード |\n| --- | --- | --- |\n| `workflow-tool archive draft` | 不明な2トークン入力 | 1 |\n| `workflow-tool 8 +` | 二項演算の不完全な入力 | 1 |"
         }),
         &state,
         Some(&active_work),
         Utf8Path::new("C:/workspace"),
         Some(
-            "Docs only. Incomplete binary-looking `python tool.py 8 +` must be usage error exit code 1. Unknown two-token `python tool.py log 10` must be usage error exit code 1.",
+            "Docs only. Incomplete binary-looking `workflow-tool 8 +` must be usage error exit code 1. Unknown two-token `workflow-tool archive draft` must be usage error exit code 1.",
         ),
     );
     result_ok
@@ -816,7 +929,7 @@ pub fn docs_spec_semantic_reconciliation_tool_fixture_passes() -> bool {
                     .is_some_and(|claims| {
                         claims.iter().any(|claim| {
                             claim.as_str()
-                                == Some("unknown_two_token_cli_as_undefined_function_exit_2")
+                                == Some("unknown_two_token_cli_as_undefined_operation_exit_2")
                         })
             })
         })
@@ -827,7 +940,7 @@ pub fn docs_spec_semantic_reconciliation_tool_fixture_passes() -> bool {
             "write",
             &json!({
                 "path": "docs/spec.md",
-                "content": "Unknown two-token CLI input is usage error exit code 1.\nUnsupported helper function is exit code 2."
+                "content": "Unknown two-token CLI input is usage error exit code 1.\nUnsupported helper command is exit code 2."
             }),
             &state,
             Some(&active_work),
@@ -844,15 +957,15 @@ pub fn docs_spec_semantic_reconciliation_tool_fixture_passes() -> bool {
             &state,
             Some(&active_work),
             Utf8Path::new("C:/workspace"),
-            Some("Docs only. Incomplete binary-looking `python tool.py 8 +` must be usage error exit code 1. Unknown two-token `python tool.py log 10` must be usage error exit code 1."),
+            Some("Docs only. Incomplete binary-looking `workflow-tool 8 +` must be usage error exit code 1. Unknown two-token `workflow-tool archive draft` must be usage error exit code 1."),
         )
         .as_ref()
         .is_some_and(|tool_result| {
             tool_result.output_text.contains("Required claim detail")
-                && tool_result.output_text.contains("python tool.py log 10")
+                && tool_result.output_text.contains("workflow-tool archive draft")
                 && tool_result
                     .output_text
-                    .contains("Add a Markdown row or sentence containing `python tool.py log 10` with usage error semantics and exit code 1.")
+                    .contains("Add a Markdown row or sentence containing `workflow-tool archive draft` with usage error semantics and exit code 1.")
                 && tool_result
                     .metadata
                     .get("missing_required_claim_details")
@@ -866,7 +979,7 @@ pub fn docs_spec_semantic_reconciliation_tool_fixture_passes() -> bool {
                                     refs.iter().any(|value| {
                                         value
                                             .as_str()
-                                            .is_some_and(|text| text.contains("python tool.py log 10"))
+                                            .is_some_and(|text| text.contains("workflow-tool archive draft"))
                                     })
                                 })
                         })
@@ -883,7 +996,7 @@ pub fn docs_spec_semantic_reconciliation_tool_fixture_passes() -> bool {
                                 .is_some_and(|snippets| {
                                     snippets.iter().any(|value| {
                                         value.as_str().is_some_and(|text| {
-                                            text.contains("python tool.py 8 +")
+                                            text.contains("workflow-tool 8 +")
                                                 && text.contains("usage error")
                                                 && text.contains("exit code 1")
                                         })
@@ -930,24 +1043,13 @@ fn documentation_semantic_contract_from_authority(
     let mut contract = DocumentationSemanticClaimContract::default();
 
     if mentions_unknown_two_token_cli_usage_error(&normalized) {
-        let examples = extract_cli_code_examples(authority_text);
+        let examples = extract_unknown_two_token_cli_examples(authority_text);
         contract.required_claims.push(DocumentationSemanticClaim {
             id: "unknown_two_token_cli_usage_error_exit_1",
             description:
                 "Document that unknown two-token CLI input is a usage error with exit code 1."
                     .to_string(),
-            evidence_refs: examples
-                .iter()
-                .filter(|example| {
-                    let normalized = normalize_semantic_text(example);
-                    normalized.contains("log 10")
-                        || normalized.contains("unknown")
-                        || normalized.contains("未知")
-                        || normalized.contains("不明")
-                        || normalized.contains("未定義")
-                })
-                .cloned()
-                .collect(),
+            evidence_refs: examples,
             subject_term_groups: vec![
                 terms(&["unknown", "不明", "未定義", "未知"]),
                 terms(&[
@@ -984,7 +1086,7 @@ fn documentation_semantic_contract_from_authority(
                 .iter()
                 .filter(|example| {
                     let normalized = normalize_semantic_text(example);
-                    normalized.contains("8 +")
+                    cli_example_looks_like_incomplete_binary_subject(example)
                         || normalized.contains("incomplete")
                         || normalized.contains("不完全")
                 })
@@ -1011,13 +1113,14 @@ fn documentation_semantic_contract_from_authority(
             ],
         });
     }
-    if prohibits_unknown_two_token_cli_unsupported_function_exit_2(&normalized) {
+    if prohibits_unknown_two_token_cli_command_or_operation_exit_2(&normalized) {
+        let unknown_examples = extract_unknown_two_token_cli_examples(authority_text);
         contract.prohibited_claims.push(DocumentationSemanticClaim {
-            id: "unknown_two_token_cli_as_unsupported_function_exit_2",
+            id: "unknown_two_token_cli_as_unsupported_command_exit_2",
             description:
-                "Do not document unknown two-token CLI input as unsupported function exit code 2."
+                "Do not document unknown two-token CLI input as unsupported command exit code 2."
                     .to_string(),
-            evidence_refs: extract_cli_code_examples(authority_text),
+            evidence_refs: unknown_examples.clone(),
             subject_term_groups: vec![
                 terms(&["unknown", "不明", "未定義", "未知"]),
                 terms(&[
@@ -1033,18 +1136,19 @@ fn documentation_semantic_contract_from_authority(
             predicate_term_groups: vec![
                 terms(&[
                     "unsupported function",
-                    "unsupported function",
+                    "unsupported command",
+                    "unsupported action",
                     "unknown unary function",
                 ]),
                 terms(&["exit code 2", "終了コード 2"]),
             ],
         });
         contract.prohibited_claims.push(DocumentationSemanticClaim {
-            id: "unknown_two_token_cli_as_undefined_function_exit_2",
+            id: "unknown_two_token_cli_as_undefined_operation_exit_2",
             description:
-                "Do not document unknown two-token CLI input as undefined function exit code 2."
+                "Do not document unknown two-token CLI input as undefined operation exit code 2."
                     .to_string(),
-            evidence_refs: extract_cli_code_examples(authority_text),
+            evidence_refs: unknown_examples,
             subject_term_groups: vec![
                 terms(&["unknown", "不明", "未定義", "未知"]),
                 terms(&[
@@ -1058,7 +1162,7 @@ fn documentation_semantic_contract_from_authority(
                 ]),
             ],
             predicate_term_groups: vec![
-                terms(&["未定義関数", "未知の単項関数", "未知単項関数"]),
+                terms(&["未定義関数", "未定義操作", "未知の単項関数", "未知単項関数"]),
                 terms(&["exit code 2", "終了コード 2"]),
             ],
         });
@@ -1269,28 +1373,57 @@ fn semantic_claim_term_groups_match(normalized_text: &str, groups: &[Vec<String>
 fn document_claim_segments(document_text: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut paragraph = Vec::new();
+    let mut heading_context: Option<String> = None;
     for line in document_text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            push_claim_segment(&mut segments, &mut paragraph);
+            push_claim_segment(&mut segments, &mut paragraph, heading_context.as_deref());
+            continue;
+        }
+        if let Some(heading) = markdown_heading_context(trimmed) {
+            push_claim_segment(&mut segments, &mut paragraph, heading_context.as_deref());
+            segments.push(trimmed.to_string());
+            heading_context = Some(heading);
             continue;
         }
         segments.push(trimmed.to_string());
+        if let Some(context) = heading_context.as_deref() {
+            segments.push(format!("{context} {trimmed}"));
+        }
         paragraph.push(trimmed.to_string());
         if paragraph.len() >= 4 {
-            push_claim_segment(&mut segments, &mut paragraph);
+            push_claim_segment(&mut segments, &mut paragraph, heading_context.as_deref());
         }
     }
-    push_claim_segment(&mut segments, &mut paragraph);
+    push_claim_segment(&mut segments, &mut paragraph, heading_context.as_deref());
     segments
 }
 
-fn push_claim_segment(segments: &mut Vec<String>, paragraph: &mut Vec<String>) {
+fn push_claim_segment(
+    segments: &mut Vec<String>,
+    paragraph: &mut Vec<String>,
+    heading_context: Option<&str>,
+) {
     if paragraph.is_empty() {
         return;
     }
-    segments.push(paragraph.join(" "));
+    let segment = paragraph.join(" ");
+    segments.push(segment.clone());
+    if let Some(context) = heading_context {
+        segments.push(format!("{context} {segment}"));
+    }
     paragraph.clear();
+}
+
+fn markdown_heading_context(trimmed_line: &str) -> Option<String> {
+    let without_hash = trimmed_line.strip_prefix('#')?;
+    if without_hash.starts_with('#') || without_hash.starts_with(' ') {
+        let heading = trimmed_line.trim_start_matches('#').trim();
+        if !heading.is_empty() {
+            return Some(heading.to_string());
+        }
+    }
+    None
 }
 
 fn semantic_claim_evidence_ref_matches(normalized_segment: &str, evidence_refs: &[String]) -> bool {
@@ -1379,16 +1512,8 @@ fn normalize_doc_target(path: &str, workspace_root: &Utf8Path) -> Option<String>
 fn documentation_target(path: &Utf8Path) -> bool {
     let normalized = path.as_str().replace('\\', "/").to_ascii_lowercase();
     let name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    normalized.contains("/docs/")
-        || matches!(
-            name,
-            "readme.md"
-                | "design.md"
-                | "spec.md"
-                | "basic_design.md"
-                | "detail_design.md"
-                | "detailed_design.md"
-        )
+    normalized.starts_with("docs/")
+        || normalized.contains("/docs/")
         || name.ends_with(".md")
         || name.ends_with(".markdown")
 }
@@ -1403,9 +1528,7 @@ fn mentions_unknown_two_token_cli_usage_error(normalized: &str) -> bool {
 }
 
 fn mentions_incomplete_binary_cli_usage_error(normalized: &str) -> bool {
-    (normalized.contains("8 +")
-        || normalized.contains("incomplete binary")
-        || normalized.contains("不完全"))
+    (normalized.contains("incomplete binary") || normalized.contains("不完全"))
         && (normalized.contains("binary") || normalized.contains("二項"))
         && (normalized.contains("usage error")
             || normalized.contains("usage")
@@ -1414,11 +1537,16 @@ fn mentions_incomplete_binary_cli_usage_error(normalized: &str) -> bool {
         && normalized.contains("exit code 1")
 }
 
-fn prohibits_unknown_two_token_cli_unsupported_function_exit_2(normalized: &str) -> bool {
+fn prohibits_unknown_two_token_cli_command_or_operation_exit_2(normalized: &str) -> bool {
     mentions_unknown_two_token_cli(normalized)
         && (normalized.contains("unsupported function")
             || normalized.contains("unsupported-function")
-            || normalized.contains("未定義関数"))
+            || normalized.contains("unsupported command")
+            || normalized.contains("unsupported-command")
+            || normalized.contains("unsupported action")
+            || normalized.contains("unsupported-action")
+            || normalized.contains("未定義関数")
+            || normalized.contains("未定義操作"))
         && (normalized.contains("exit code 2") || normalized.contains("exit-code-2"))
         && (normalized.contains("do not")
             || normalized.contains("not ")
@@ -1431,35 +1559,23 @@ fn prohibits_unknown_two_token_cli_unsupported_function_exit_2(normalized: &str)
 }
 
 fn mentions_unknown_two_token_cli(normalized: &str) -> bool {
-    let names_prompt_command_subject = normalized.contains("python ")
-        && normalized.contains("log 10")
-        && (normalized.contains("tool.py") || normalized.contains("calculator.py"));
-    names_prompt_command_subject
-        || ((normalized.contains("unknown")
-            || normalized.contains("不明")
-            || normalized.contains("未定義")
-            || normalized.contains("未知"))
-            && (normalized.contains("two token")
-                || normalized.contains("two-token")
-                || normalized.contains("2 token")
-                || normalized.contains("2-token")
-                || normalized.contains("2トークン")
-                || normalized.contains("2 トークン")
-                || normalized.contains("二つの引数")))
+    (normalized.contains("unknown")
+        || normalized.contains("不明")
+        || normalized.contains("未定義")
+        || normalized.contains("未知"))
+        && (normalized.contains("two token")
+            || normalized.contains("two-token")
+            || normalized.contains("2 token")
+            || normalized.contains("2-token")
+            || normalized.contains("2トークン")
+            || normalized.contains("2 トークン")
+            || normalized.contains("二つの引数"))
 }
 
 fn normalize_semantic_text(text: &str) -> String {
     let mut normalized = text.to_lowercase();
     for code in 0..=255 {
         let exit_code = format!("exit code {code}");
-        for pattern in [
-            format!("sys.exit({code})"),
-            format!("sys.exit ({code})"),
-            format!("exit({code})"),
-            format!("exit ({code})"),
-        ] {
-            normalized = normalized.replace(&pattern, &exit_code);
-        }
         normalized =
             normalized.replace(&format!("終了コード{code}"), &format!("終了コード {code}"));
         if semantic_text_has_exit_code_header(&normalized)
@@ -1472,6 +1588,8 @@ fn normalize_semantic_text(text: &str) -> String {
         .replace("exit code:", "exit code ")
         .replace("未定義の関数", "未定義関数")
         .replace("未定義 の 関数", "未定義関数")
+        .replace("未定義の操作", "未定義操作")
+        .replace("未定義 の 操作", "未定義操作")
         .replace("未知の単項関数", "未知の単項関数")
         .replace("未知 の 単項 関数", "未知の単項関数")
         .replace('`', " ")
@@ -1512,9 +1630,7 @@ fn extract_cli_code_examples(text: &str) -> Vec<String> {
         if ch == '`' {
             if in_code {
                 let candidate = current.trim();
-                if !candidate.is_empty()
-                    && (candidate.contains(".py") || candidate.split_whitespace().count() <= 4)
-                {
+                if !candidate.is_empty() && candidate.split_whitespace().count() <= 5 {
                     examples.push(candidate.to_string());
                 }
                 current.clear();
@@ -1529,6 +1645,150 @@ fn extract_cli_code_examples(text: &str) -> Vec<String> {
     examples.sort();
     examples.dedup();
     examples
+}
+
+fn extract_unknown_two_token_cli_examples(text: &str) -> Vec<String> {
+    let mut examples = semantic_authority_chunks(text)
+        .into_iter()
+        .flat_map(|chunk| {
+            let normalized_chunk = normalize_semantic_text(&chunk);
+            let context_marks_unknown = semantic_context_marks_unknown_two_token(&normalized_chunk);
+            extract_cli_code_examples(&chunk)
+                .into_iter()
+                .filter(move |example| {
+                    context_marks_unknown
+                        && cli_example_looks_like_unknown_two_token_subject(example)
+                })
+        })
+        .collect::<Vec<_>>();
+    examples.sort();
+    examples.dedup();
+    examples
+}
+
+fn semantic_authority_chunks(text: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        current.push(ch);
+        let sentence_boundary = matches!(ch, '。' | '!' | '?' | '！' | '？' | ';' | '；')
+            || (ch == '.' && chars.peek().is_some_and(|next| next.is_whitespace()));
+        if sentence_boundary || ch == '\n' {
+            let chunk = current.trim();
+            if !chunk.is_empty() {
+                chunks.push(chunk.to_string());
+            }
+            current.clear();
+        }
+    }
+    let chunk = current.trim();
+    if !chunk.is_empty() {
+        chunks.push(chunk.to_string());
+    }
+    chunks
+}
+
+fn semantic_context_marks_unknown_two_token(normalized_context: &str) -> bool {
+    mentions_unknown_two_token_cli(normalized_context)
+        || ((normalized_context.contains("unknown")
+            || normalized_context.contains("不明")
+            || normalized_context.contains("未定義")
+            || normalized_context.contains("未知"))
+            && (normalized_context.contains("two token")
+                || normalized_context.contains("two-token")
+                || normalized_context.contains("2 token")
+                || normalized_context.contains("2-token")
+                || normalized_context.contains("2トークン")
+                || normalized_context.contains("2 トークン")))
+}
+
+fn cli_example_looks_like_unknown_two_token_subject(example: &str) -> bool {
+    let args = cli_example_subject_args(example);
+    args.len() == 2
+        && !cli_args_look_like_incomplete_binary(&args)
+        && args.iter().any(|arg| {
+            let normalized = arg
+                .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+                .to_ascii_lowercase();
+            !normalized.is_empty()
+                && normalized.chars().any(|ch| ch.is_ascii_alphabetic())
+                && !matches!(
+                    normalized.as_str(),
+                    "run" | "test" | "build" | "check" | "help" | "version"
+                )
+        })
+}
+
+fn cli_example_looks_like_incomplete_binary_subject(example: &str) -> bool {
+    let args = cli_example_subject_args(example);
+    args.len() == 2 && cli_args_look_like_incomplete_binary(&args)
+}
+
+fn cli_args_look_like_incomplete_binary(args: &[String]) -> bool {
+    args.len() == 2
+        && semantic_token_looks_numeric(&args[0])
+        && semantic_token_looks_operator(&args[1])
+}
+
+fn cli_example_subject_args(example: &str) -> Vec<String> {
+    let tokens = example
+        .split_whitespace()
+        .map(|token| token.trim_matches('`').trim().to_string())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.len() <= 2 {
+        return tokens;
+    }
+    let subject_start = command_subject_start_index(&tokens).unwrap_or(0);
+    tokens.into_iter().skip(subject_start).collect()
+}
+
+fn command_subject_start_index(tokens: &[String]) -> Option<usize> {
+    if tokens.len() <= 2 {
+        return None;
+    }
+    let last_possible_command = tokens.len().saturating_sub(2);
+    for (index, token) in tokens.iter().take(last_possible_command).enumerate().rev() {
+        if token_looks_like_cli_invocation(token) {
+            return Some(index + 1);
+        }
+    }
+    token_looks_like_cli_invocation(&tokens[0]).then_some(1)
+}
+
+fn token_looks_like_cli_invocation(token: &str) -> bool {
+    let normalized = token
+        .trim_matches(|ch: char| {
+            ch == '`' || ch == '"' || ch == '\'' || ch == ',' || ch == ':' || ch == ';'
+        })
+        .to_ascii_lowercase();
+    normalized.contains('/')
+        || normalized.contains('\\')
+        || normalized.contains('.')
+        || normalized.ends_with("-tool")
+        || normalized.ends_with("_tool")
+        || normalized.ends_with("tool")
+        || normalized.ends_with("-cli")
+        || normalized.ends_with("_cli")
+        || normalized.ends_with("cli")
+        || normalized.ends_with("-cmd")
+        || normalized.ends_with("_cmd")
+        || normalized.ends_with("cmd")
+}
+
+fn semantic_token_looks_numeric(token: &str) -> bool {
+    token
+        .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == ',')
+        .parse::<f64>()
+        .is_ok()
+}
+
+fn semantic_token_looks_operator(token: &str) -> bool {
+    matches!(
+        token.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == ','),
+        "+" | "-" | "*" | "/" | "%" | "^" | "**"
+    )
 }
 
 fn docs_spec_semantic_reconciliation_tool_result(

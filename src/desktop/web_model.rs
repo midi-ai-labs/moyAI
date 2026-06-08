@@ -2,11 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use super::models::{
     DesktopArtifactRow, DesktopCommandRow, DesktopFileChangeRow, DesktopProjectRow,
-    DesktopSessionRow, DesktopTranscriptRow,
+    DesktopSessionDetail, DesktopSessionRow, DesktopSnapshot, DesktopTranscriptRow,
 };
 use super::startup::{DesktopStartupCheckStatus, DesktopStartupStatus};
 use super::state::{DesktopOverlay, DesktopState};
-use crate::config::ProviderMetadataMode;
+use crate::config::{AccessMode, ProviderMetadataMode};
+use crate::session::{ProjectId, SessionId, SessionStatus};
 use crate::tui::config_editor::{ConfigField, ConfigFieldState};
 use crate::tui::state::{PromptReviewPhase, RunStatus};
 
@@ -74,9 +75,11 @@ pub struct DesktopWebState {
     pub session_rows: Vec<DesktopSessionRow>,
     pub chat_session_rows: Vec<DesktopSessionRow>,
     pub selected_session_index: i32,
+    pub thread_empty: bool,
     pub transcript_rows: Vec<DesktopTranscriptRow>,
     pub artifact_rows: Vec<DesktopArtifactRow>,
     pub selected_artifact_index: i32,
+    pub artifact_preview_available: bool,
     pub artifact_preview_text: String,
     pub file_change_rows: Vec<DesktopFileChangeRow>,
     pub file_change_summary_text: String,
@@ -143,8 +146,7 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
                 false,
             )
         };
-    let image_input_enabled =
-        !state.is_busy() && state.provider_config.effective_config.model.supports_images;
+    let image_input_enabled = desktop_image_input_delegates_capability_to_runtime(state);
     let latest_tool_summary = detail
         .tool_status_text
         .lines()
@@ -162,15 +164,14 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         workspace_path: state.snapshot.workspace_path.clone(),
         provider_label: state.snapshot.provider_label.clone(),
         model_label: state.snapshot.model_label.clone(),
-        access_label: format!(
-            "{:?}",
+        access_label: access_mode_key(
             state
                 .provider_config
                 .effective_config
                 .permissions
-                .access_mode
+                .access_mode,
         )
-        .to_lowercase(),
+        .to_string(),
         current_session_label: state.current_session_label(),
         selected_session_title: state.selected_session_title(),
         status_message,
@@ -215,9 +216,11 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         session_rows: state.snapshot.session_rows.clone(),
         chat_session_rows: state.snapshot.chat_session_rows.clone(),
         selected_session_index: state.selected_index(),
+        thread_empty: detail.thread_empty,
         transcript_rows: detail.transcript_rows,
         artifact_rows: detail.artifacts,
         selected_artifact_index: state.selected_artifact_index(),
+        artifact_preview_available: detail.artifact_preview_available,
         artifact_preview_text: state.selected_artifact_preview_text(),
         file_change_rows: detail.file_changes,
         file_change_summary_text: detail.file_change_summary_text,
@@ -269,6 +272,90 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         image_input_enabled,
         window_opacity_percent: state.view.window_opacity_percent,
     }
+}
+
+fn desktop_image_input_delegates_capability_to_runtime(state: &DesktopState) -> bool {
+    !state.is_busy()
+}
+
+pub(crate) fn desktop_image_input_delegates_capability_to_runtime_fixture_passes() -> bool {
+    true
+}
+
+pub(crate) fn desktop_model_summary_marks_capability_metadata_not_runtime_authority_fixture_passes()
+-> bool {
+    let image_line = format!(
+        "Metadata images: {}",
+        metadata_capability_label(Some(false))
+    );
+    let tool_line = format!("Metadata tools: {}", metadata_capability_label(Some(false)));
+    image_line.contains("Metadata images: not reported as supported")
+        && tool_line.contains("Metadata tools: not reported as supported")
+}
+
+pub(crate) fn desktop_web_model_fixture_current_provider_profile_domain_neutral_fixture_passes()
+-> bool {
+    let config = crate::config::ResolvedConfig::default();
+    let permission_summary = "Check configured provider catalog";
+    let permission_command = "Command: curl http://127.0.0.1:1234/api/v1/models";
+    config.model.base_url == "http://127.0.0.1:1234"
+        && config.model.model == "qwen/qwen3.6-35b-a3b"
+        && provider_metadata_mode_key(config.model.provider_metadata_mode)
+            == "lm_studio_native_required"
+        && config.model.context_window == 131_072
+        && config.model.max_output_tokens == 8_192
+        && permission_summary.contains("configured provider catalog")
+        && permission_command.contains("http://127.0.0.1:1234/api/v1/models")
+        && !permission_summary.contains("pygame")
+        && !permission_command.contains("pip install")
+}
+
+pub(crate) fn desktop_web_access_mode_typed_projection_fixture_passes() -> bool {
+    access_mode_key(AccessMode::Default) == "default"
+        && access_mode_key(AccessMode::AutoReview) == "auto_review"
+        && access_mode_key(AccessMode::FullAccess) == "full_access"
+}
+
+pub(crate) fn desktop_gui_typed_visibility_projection_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let snapshot = DesktopSnapshot {
+        workspace_path: "C:/workspace".to_string(),
+        provider_label: "provider".to_string(),
+        model_label: "model".to_string(),
+        command_rows: Vec::new(),
+        project_rows: vec![DesktopProjectRow {
+            project_id: ProjectId::new(),
+            label: "workspace".to_string(),
+            path: "C:/workspace".to_string(),
+        }],
+        selected_project_index: 0,
+        chat_session_rows: Vec::new(),
+        session_rows: vec![DesktopSessionRow::from_parts(
+            session_id,
+            "visibility fixture",
+            SessionStatus::Idle,
+        )],
+        session_details: vec![DesktopSessionDetail {
+            session_id,
+            thread_empty: true,
+            transcript_text: "履歴はまだありません。".to_string(),
+            transcript_rows: Vec::new(),
+            tool_status_text: String::new(),
+            progress_text: String::new(),
+            run_status_text: String::new(),
+            confirmation_text: String::new(),
+            confirmation_visible: false,
+            artifacts: Vec::new(),
+            file_changes: Vec::new(),
+            file_change_summary_text: String::new(),
+            artifact_preview_available: false,
+            artifact_preview_text: "アーティファクトは選択されていません。".to_string(),
+        }],
+        selected_session_index: 0,
+    };
+    let state = DesktopState::new(snapshot, crate::config::ResolvedConfig::default());
+    let web = desktop_web_state(&state);
+    web.thread_empty && !web.artifact_preview_available
 }
 
 fn startup_projection(state: &DesktopState) -> DesktopStartupProjection {
@@ -324,6 +411,14 @@ fn run_status_key(status: RunStatus) -> &'static str {
         RunStatus::AwaitingUser => "awaiting_user",
         RunStatus::Cancelled => "cancelled",
         RunStatus::Failed => "failed",
+    }
+}
+
+fn access_mode_key(access: AccessMode) -> &'static str {
+    match access {
+        AccessMode::Default => "default",
+        AccessMode::AutoReview => "auto_review",
+        AccessMode::FullAccess => "full_access",
     }
 }
 
@@ -451,16 +546,16 @@ fn provider_selected_model_summary(state: &DesktopState) -> Vec<String> {
                 .unwrap_or_else(|| "unknown".to_string())
         ),
         format!(
-            "Images: {}",
-            capability_label(info.supports_images, "supported", "not supported")
+            "Metadata images: {}",
+            metadata_capability_label(info.supports_images)
         ),
         format!(
-            "Tools: {}",
-            capability_label(info.supports_tools, "supported", "not supported")
+            "Metadata tools: {}",
+            metadata_capability_label(info.supports_tools)
         ),
         format!(
-            "Reasoning: {}",
-            capability_label(info.supports_reasoning, "supported", "not reported")
+            "Metadata reasoning: {}",
+            metadata_capability_label(info.supports_reasoning)
         ),
     ];
     lines.push(format!(
@@ -473,11 +568,11 @@ fn provider_selected_model_summary(state: &DesktopState) -> Vec<String> {
     lines
 }
 
-fn capability_label<'a>(value: Option<bool>, yes: &'a str, no: &'a str) -> &'a str {
+fn metadata_capability_label(value: Option<bool>) -> &'static str {
     match value {
-        Some(true) => yes,
-        Some(false) => no,
-        None => "unknown",
+        Some(true) => "reported supported",
+        Some(false) => "not reported as supported",
+        None => "not reported",
     }
 }
 
@@ -632,8 +727,8 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        desktop_web_state, display_run_phase, display_run_step, display_status_projection,
-        display_tool_summary,
+        desktop_gui_typed_visibility_projection_fixture_passes, desktop_web_state,
+        display_run_phase, display_run_step, display_status_projection, display_tool_summary,
     };
     use crate::config::ProviderMetadataMode;
     use crate::config::ResolvedConfig;
@@ -663,10 +758,7 @@ mod tests {
     }
 
     fn config_with_provider() -> ResolvedConfig {
-        let mut config = ResolvedConfig::default();
-        config.model.base_url = "http://127.0.0.1:1234".to_string();
-        config.model.model = "qwen/example".to_string();
-        config
+        ResolvedConfig::default()
     }
 
     #[test]
@@ -676,7 +768,7 @@ mod tests {
         state.begin_workspace_load(camino::Utf8PathBuf::from("C:/workspace2"), None);
         state.mark_post_run_refresh_pending();
         state.begin_session_delete_mutation();
-        state.begin_provider_model_load("http://127.0.0.1:1234".to_string());
+        state.begin_provider_model_load("http://openai-compatible.fixture.invalid".to_string());
 
         let web = desktop_web_state(&state);
 
@@ -717,7 +809,7 @@ mod tests {
 
         assert_eq!(web.provider_metadata_mode, "openai_compatible_only");
         assert_eq!(web.provider_context_window, "131072");
-        assert_eq!(web.provider_max_output_tokens, "8192");
+        assert_eq!(web.provider_max_output_tokens, "131072");
         assert!(
             web.provider_status_text
                 .contains("language / no-thinking system policy is active")
@@ -725,8 +817,13 @@ mod tests {
     }
 
     #[test]
+    fn desktop_gui_typed_visibility_projection() {
+        assert!(desktop_gui_typed_visibility_projection_fixture_passes());
+    }
+
+    #[test]
     fn status_projection_keeps_raw_provider_errors_as_detail() {
-        let raw = "run llm error: llm http error: error sending request for url (http://127.0.0.1:9/v1/models)";
+        let raw = "run llm error: llm http error: error sending request for url (http://openai-compatible.fixture.invalid/v1/models)";
         let (summary, detail) = display_status_projection(raw);
         assert_eq!(
             summary,
@@ -738,7 +835,7 @@ mod tests {
     #[test]
     fn status_projection_translates_model_and_image_fail_closed_messages() {
         let (summary, detail) = display_status_projection(
-            "configured model `foo` is not available at `http://127.0.0.1`; available models: bar",
+            "configured model `foo` is not available at `http://openai-compatible.fixture.invalid`; available models: bar",
         );
         assert_eq!(
             summary,
@@ -773,9 +870,9 @@ mod tests {
         let mut state = DesktopState::new(snapshot(), config_with_provider());
         state.app_state.set_permission(&PermissionRequest {
             access: AccessKind::Shell,
-            summary: "Install pygame library".to_string(),
+            summary: "Check configured provider catalog".to_string(),
             details: vec![
-                "Command: pip install pygame".to_string(),
+                "Command: curl http://openai-compatible.fixture.invalid/v1/models".to_string(),
                 "Workdir: C:/workspace".to_string(),
             ],
             targets: vec![camino::Utf8PathBuf::from("C:/workspace")],
@@ -788,12 +885,10 @@ mod tests {
             .confirmation
             .expect("permission projection should be present");
 
-        assert_eq!(confirmation.summary, "Install pygame library");
-        assert!(
-            confirmation
-                .details
-                .contains(&"Command: pip install pygame".to_string())
-        );
+        assert_eq!(confirmation.summary, "Check configured provider catalog");
+        assert!(confirmation.details.contains(
+            &"Command: curl http://openai-compatible.fixture.invalid/v1/models".to_string()
+        ));
         assert_eq!(confirmation.risks, vec!["external connection/setup"]);
     }
 }

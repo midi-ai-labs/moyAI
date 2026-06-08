@@ -3,7 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::Value;
 
-use crate::agent::lifecycle_kernel::provider_replay_result_is_supporting_context;
+use crate::agent::language_evidence::{
+    ArtifactRole, LanguageFamily, classify_artifact_target as classify_language_artifact_target,
+};
+use crate::agent::lifecycle_kernel::provider_replay_metadata_is_supporting_context;
 use crate::agent::tool_orchestrator::{AuthoringGroundingRecoveryEnvelope, ToolLifecycleRuntime};
 use crate::protocol::{
     HistoryItem, HistoryItemPayload, OperationIntent, ToolLifecycleStatus,
@@ -167,18 +170,46 @@ fn docs_route_grep_line_path(line: &str) -> Option<&str> {
     if trimmed.is_empty() {
         return None;
     }
-    let lower = trimmed.to_ascii_lowercase();
-    if let Some(index) = lower.find(".py:") {
-        return Some(trimmed[..index + 3].trim());
+    if let Some(index) = grep_line_number_delimiter_index(trimmed) {
+        return Some(trimmed[..index].trim());
+    }
+    if has_windows_drive_prefix(trimmed) {
+        return None;
     }
     let (path, _) = trimmed.split_once(':')?;
     Some(path.trim())
 }
 
-fn docs_route_tool_output_is_supporting_context(metadata: &Value, output_text: &str) -> bool {
+fn has_windows_drive_prefix(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn grep_line_number_delimiter_index(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b':' {
+            continue;
+        }
+        let mut cursor = index + 1;
+        let digit_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > digit_start && (cursor == bytes.len() || bytes[cursor] == b':') {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn docs_route_tool_output_is_supporting_context(metadata: &Value, _output_text: &str) -> bool {
     ToolLifecycleRuntime::operation_progress_class_from_metadata(metadata)
         == Some("supporting_context")
-        || provider_replay_result_is_supporting_context(output_text)
+        || provider_replay_metadata_is_supporting_context(metadata)
 }
 
 fn docs_route_tool_output_has_content_bearing_repository_evidence(
@@ -311,6 +342,10 @@ pub(crate) fn authoring_grounding_recovery_envelope(
 pub(crate) fn authoring_grounding_recovery_obligation(
     envelope: &AuthoringGroundingRecoveryEnvelope,
 ) -> crate::protocol::TurnObligation {
+    let mut contract_refs = vec!["authoring_target_grounding_recovery".to_string()];
+    if envelope.missing_grounding_targets.is_empty() {
+        contract_refs.push("authoring_target_grounding_recovery_edit_only".to_string());
+    }
     crate::protocol::TurnObligation {
         obligation_id: "authoring_target_grounding_recovery".to_string(),
         kind: crate::protocol::ObligationKind::Repair,
@@ -327,7 +362,7 @@ pub(crate) fn authoring_grounding_recovery_obligation(
         operation_intents: vec![OperationIntent::ContentChangingAuthoringRequired],
         required_actions: Vec::new(),
         verification_commands: Vec::new(),
-        contract_refs: vec!["authoring_target_grounding_recovery".to_string()],
+        contract_refs,
         evidence_refs: vec![crate::protocol::EvidenceRef {
             source: "authoring_target_grounding".to_string(),
             reference: envelope.evidence_ref(),
@@ -463,8 +498,9 @@ pub(crate) fn matching_active_target_key(
     path: &str,
     active_targets: &BTreeSet<String>,
 ) -> Option<String> {
+    let normalized_path = normalize_path_for_target_match(path);
     active_targets.iter().find_map(|target| {
-        if path == target || path.ends_with(&format!("/{target}")) {
+        if normalized_path == normalize_path_for_target_match(target) {
             Some(target.clone())
         } else {
             None
@@ -608,7 +644,9 @@ pub(crate) fn history_has_current_source_reference_read_for_generated_test(
 
 fn source_reference_target_for_generated_test(path: &str) -> bool {
     let lower = path.replace('\\', "/").to_ascii_lowercase();
-    lower.ends_with(".py")
+    let spec = classify_language_artifact_target(&lower);
+    spec.role == ArtifactRole::Source
+        && matches!(spec.language, LanguageFamily::Python | LanguageFamily::Code)
         && !lower.contains("/__pycache__/")
         && !path_looks_like_test_content(&lower)
 }
@@ -646,11 +684,8 @@ pub(crate) fn metadata_path_matches_active_target(
         return false;
     };
     let normalized_path = normalize_path_for_target_match(path);
-    state.active_targets.iter().any(|target| {
-        let normalized_target = normalize_path_for_target_match(target.as_str());
-        normalized_path == normalized_target
-            || normalized_path.ends_with(&format!("/{normalized_target}"))
-    })
+    let active_targets = active_authoring_target_keys(state);
+    matching_active_target_key(&normalized_path, &active_targets).is_some()
 }
 
 pub(crate) fn normalize_path_for_target_match(path: &str) -> String {
@@ -658,10 +693,67 @@ pub(crate) fn normalize_path_for_target_match(path: &str) -> String {
 }
 
 fn path_looks_like_test_content(value: &str) -> bool {
-    let normalized = value.replace('\\', "/").to_ascii_lowercase();
-    normalized.rsplit('/').next().is_some_and(|file_name| {
-        file_name.starts_with("test_")
-            || file_name.ends_with("_test.py")
-            || file_name.ends_with(".test.py")
-    }) || normalized.contains("/tests/")
+    classify_language_artifact_target(value).role == ArtifactRole::Test
+}
+
+pub(crate) fn grounding_target_matching_rejects_foreign_suffix_collision_fixture_passes() -> bool {
+    let active_targets = BTreeSet::from(["src/workflow.rs".to_string()]);
+    matching_active_target_key("src/workflow.rs", &active_targets).as_deref()
+        == Some("src/workflow.rs")
+        && matching_active_target_key("./src/workflow.rs", &active_targets).as_deref()
+            == Some("src/workflow.rs")
+        && matching_active_target_key("C:/outside/sibling/src/workflow.rs", &active_targets)
+            .is_none()
+        && matching_active_target_key("../sibling/src/workflow.rs", &active_targets).is_none()
+}
+
+pub(crate) fn grounding_metadata_path_matching_rejects_foreign_suffix_collision_fixture_passes()
+-> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
+
+    metadata_path_matches_active_target(&serde_json::json!({ "path": "src/workflow.rs" }), &state)
+        && metadata_path_matches_active_target(
+            &serde_json::json!({ "path": "./src/workflow.rs" }),
+            &state,
+        )
+        && !metadata_path_matches_active_target(
+            &serde_json::json!({ "path": "C:/outside/sibling/src/workflow.rs" }),
+            &state,
+        )
+        && !metadata_path_matches_active_target(
+            &serde_json::json!({ "path": "../sibling/src/workflow.rs" }),
+            &state,
+        )
+}
+
+pub(crate) fn docs_route_grep_line_path_generic_path_line_fixture_passes() -> bool {
+    docs_route_grep_line_path("C:/workspace/tests/workflow.rs:12:assertion failed")
+        == Some("C:/workspace/tests/workflow.rs")
+        && docs_route_grep_line_path("src/workflow.spec.ts:7:expected behavior")
+            == Some("src/workflow.spec.ts")
+        && docs_route_grep_line_path("C:/workspace/tests/workflow.py:9:legacy coverage")
+            == Some("C:/workspace/tests/workflow.py")
+        && docs_route_grep_line_path("C:/workspace/tests/workflow.rs: no line number").is_none()
+        && docs_route_grep_line_path("src/workflow.rs: no line number").is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grounding_target_matching_rejects_foreign_suffix_collision() {
+        assert!(grounding_target_matching_rejects_foreign_suffix_collision_fixture_passes());
+    }
+
+    #[test]
+    fn grounding_metadata_path_matching_rejects_foreign_suffix_collision() {
+        assert!(grounding_metadata_path_matching_rejects_foreign_suffix_collision_fixture_passes());
+    }
+
+    #[test]
+    fn docs_route_grep_line_path_parses_non_python_windows_absolute_test_path() {
+        assert!(docs_route_grep_line_path_generic_path_line_fixture_passes());
+    }
 }

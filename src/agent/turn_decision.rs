@@ -2,12 +2,16 @@ use std::collections::BTreeSet;
 
 use camino::Utf8PathBuf;
 
+use crate::agent::language_evidence::{
+    ArtifactRole, classify_artifact_target as classify_language_artifact_target,
+};
 use crate::agent::prompt::PromptPolicy;
 use crate::agent::repair_lane::project_repair_lane;
 use crate::agent::state::ActiveWorkContract;
 use crate::session::{
-    ProcessPhase, SessionStateSnapshot, TaskRoute, TurnDecisionDiagnostic, TurnDecisionWarning,
-    TurnDecisionWarningSeverity,
+    ProcessPhase, RepairControlSnapshotDiagnostic, RepairLaneDiagnostic,
+    RepairRecoveryChoiceDiagnostic, SessionStateSnapshot, TaskRoute, TurnDecisionDiagnostic,
+    TurnDecisionWarning, TurnDecisionWarningSeverity,
 };
 pub(crate) fn build_turn_decision_diagnostic(
     state: &SessionStateSnapshot,
@@ -109,6 +113,20 @@ fn projection_warnings(diagnostic: &TurnDecisionDiagnostic) -> Vec<TurnDecisionW
         ));
     }
 
+    if diagnostic.process_phase == "repair"
+        && diagnostic.active_work_kind.as_deref() == Some("verification")
+        && diagnostic.verification_pending
+        && !diagnostic.active_targets.is_empty()
+        && !allowed.contains("write")
+        && !allowed.contains("apply_patch")
+    {
+        warnings.push(warning(
+            "repair_required_active_work_without_edit_surface",
+            TurnDecisionWarningSeverity::Error,
+            "Repair-required active work has open repair targets but the provider-visible tool surface has no content-changing edit tool before verification rerun.",
+        ));
+    }
+
     if let Some(repair_lane) = diagnostic.repair_lane.as_ref() {
         let Some(snapshot) = repair_lane.repair_control_snapshot.as_ref() else {
             warnings.push(warning(
@@ -168,6 +186,31 @@ fn projection_warnings(diagnostic: &TurnDecisionDiagnostic) -> Vec<TurnDecisionW
                     "A public exception source repair must keep the source file as the exact repair target.",
                 ));
             }
+            if !template.required_edit_surface.is_empty()
+                && snapshot
+                    .hard_invariants
+                    .iter()
+                    .any(|invariant| invariant == "progress_requires_content_changing_edit")
+            {
+                let supporting_tools = snapshot
+                    .allowed_surface_snapshot
+                    .iter()
+                    .filter(|tool| {
+                        !template
+                            .required_edit_surface
+                            .iter()
+                            .any(|edit_tool| edit_tool == *tool)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !supporting_tools.is_empty() {
+                    warnings.push(warning(
+                        "repair_control_executable_surface_contains_support_tools",
+                        TurnDecisionWarningSeverity::Error,
+                        "RepairControlSnapshot requires content-changing edit progress but its executable surface still includes supporting tools.",
+                    ));
+                }
+            }
         }
         if diagnostic.process_phase == "repair"
             && snapshot.selected_recovery_action.starts_with("fail_closed")
@@ -205,22 +248,13 @@ fn projection_warnings(diagnostic: &TurnDecisionDiagnostic) -> Vec<TurnDecisionW
 }
 
 fn diagnostic_target_is_test_like(target: &str) -> bool {
-    let normalized = target.replace('\\', "/").to_ascii_lowercase();
-    normalized
-        .rsplit('/')
-        .next()
-        .is_some_and(|name| name.starts_with("test_") || name.ends_with("_test.py"))
+    classify_language_artifact_target(target).role == ArtifactRole::Test
 }
 
 fn diagnostic_targets_equivalent(left: &str, right: &str) -> bool {
     let left = left.replace('\\', "/").to_ascii_lowercase();
     let right = right.replace('\\', "/").to_ascii_lowercase();
     left == right
-        || left
-            .rsplit('/')
-            .next()
-            .zip(right.rsplit('/').next())
-            .is_some_and(|(left_name, right_name)| left_name == right_name)
 }
 
 fn warning(
@@ -257,23 +291,23 @@ pub(crate) fn active_work_edit_authority_precedes_verification_rerun_fixture_pas
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("component.py"),
-        Utf8PathBuf::from("test_component.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: crate::session::FailureKind::VerificationFailed,
-        summary: "verification failed: component.calculate is missing".to_string(),
+        summary: "verification failed: workflow.active_work_contract is incomplete".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_calculate_add".to_string()];
+    state.verification.failing_labels = vec!["workflow.active_work_contract".to_string()];
     state.verification.failure_cluster =
         Some(crate::agent::state::public_class_attribute_cluster_fixture());
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     let active_work = ActiveWorkContract::Verification {
         commands: state.verification.required_commands.clone(),
         failing_labels: state.verification.failing_labels.clone(),
@@ -291,8 +325,8 @@ pub(crate) fn active_work_edit_authority_precedes_verification_rerun_fixture_pas
 
     diagnostic.active_targets
         == vec![
-            Utf8PathBuf::from("component.py"),
-            Utf8PathBuf::from("test_component.py"),
+            Utf8PathBuf::from("src/workflow.rs"),
+            Utf8PathBuf::from("tests/workflow.spec.ts"),
         ]
         && diagnostic
             .repair_lane
@@ -313,23 +347,23 @@ pub(crate) fn active_work_edit_authority_precedes_verification_rerun_fixture_pas
 pub(crate) fn repair_lane_target_matches_active_work_authority_fixture_passes() -> bool {
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
-    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
     state.failure = Some(crate::session::FailureState {
         kind: crate::session::FailureKind::VerificationFailed,
-        summary: "verification failed: generated test stale literal".to_string(),
+        summary: "verification failed: generated workflow contract stale literal".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_invalid_visible_contract".to_string()];
+    state.verification.failing_labels = vec!["workflow-repair-target-contract".to_string()];
     state.verification.failure_cluster = Some(crate::session::VerificationFailureCluster {
         cluster_id: "fixture-turn-decision-repair-target-active-work".to_string(),
-        failing_labels: vec!["test_invalid_visible_contract".to_string()],
+        failing_labels: vec!["workflow-repair-target-contract".to_string()],
         primary_failure: Some("AssertionError: stale literal expectation".to_string()),
         evidence: vec![crate::session::VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("generic_verification_failure".to_string()),
-            label: Some("test_invalid_visible_contract".to_string()),
+            label: Some("workflow-repair-target-contract".to_string()),
             target: None,
             symbol: None,
             call_site: None,
@@ -338,20 +372,20 @@ pub(crate) fn repair_lane_target_matches_active_work_authority_fixture_passes() 
             observed: Some("current visible literal".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
-            evidence_markers: vec!["generic_verification_failure".to_string()],
+            evidence_markers: vec!["workflow-repair-target-contract".to_string()],
             sibling_obligations: Vec::new(),
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-generated-test --contract".to_string());
     let active_work = ActiveWorkContract::Verification {
         commands: state.verification.required_commands.clone(),
         failing_labels: state.verification.failing_labels.clone(),
@@ -366,36 +400,103 @@ pub(crate) fn repair_lane_target_matches_active_work_authority_fixture_passes() 
         Some("required".to_string()),
     );
 
-    diagnostic.active_targets == vec![Utf8PathBuf::from("test_widget.py")]
+    diagnostic.active_targets == vec![Utf8PathBuf::from("tests/workflow.spec.ts")]
         && diagnostic
             .repair_lane
             .as_ref()
-            .is_some_and(|lane| lane.required_target.as_deref() == Some("test_widget.py"))
+            .is_some_and(|lane| lane.required_target.as_deref() == Some("tests/workflow.spec.ts"))
         && diagnostic
             .warnings
             .iter()
             .all(|warning| warning.severity != TurnDecisionWarningSeverity::Error)
 }
 
+pub(crate) fn turn_decision_repair_target_exact_path_authority_fixture_passes() -> bool {
+    let required_target = "src/workflow.rs".to_string();
+    let active_target = "tests/workflow.rs".to_string();
+    if diagnostic_targets_equivalent(active_target.as_str(), required_target.as_str()) {
+        return false;
+    }
+
+    let mut diagnostic = TurnDecisionDiagnostic {
+        route: "code".to_string(),
+        process_phase: "repair".to_string(),
+        active_work_kind: Some("verification".to_string()),
+        active_work_summary: Some("Repair source before rerun.".to_string()),
+        active_targets: vec![Utf8PathBuf::from(active_target.as_str())],
+        verification_pending: true,
+        closeout_ready: false,
+        required_verification_commands: vec!["verify-contract --behavior".to_string()],
+        policy_targets: Vec::new(),
+        allowed_tools: vec!["write".to_string()],
+        tool_choice: Some("required".to_string()),
+        warnings: Vec::new(),
+        repair_lane: Some(RepairLaneDiagnostic {
+            subtype: "source_public_contract".to_string(),
+            required_target: Some(required_target.clone()),
+            allowed_tools: vec!["write".to_string()],
+            forbidden_tools: Vec::new(),
+            missing_symbol: None,
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            contract_reconciliation: None,
+            operation_template: None,
+            verification_cluster: None,
+            repair_intent: None,
+            repair_control_snapshot: Some(RepairControlSnapshotDiagnostic {
+                admitted: true,
+                admission_reason: "typed source repair".to_string(),
+                repair_subtype: "source_public_contract".to_string(),
+                repair_owner: "source".to_string(),
+                selected_recovery_action: "edit_source".to_string(),
+                rollback_depth: "bounded".to_string(),
+                operation_id: None,
+                required_target: Some(required_target),
+                allowed_surface_snapshot: vec!["write".to_string()],
+                hard_invariants: vec!["progress_requires_content_changing_edit".to_string()],
+                recovery_choices: vec![RepairRecoveryChoiceDiagnostic {
+                    recovery_action: "edit_source".to_string(),
+                    rollback_depth: "bounded".to_string(),
+                    allowed_tools: vec!["write".to_string()],
+                    required_evidence: Vec::new(),
+                    forbidden_directions: Vec::new(),
+                    progress_evidence: Vec::new(),
+                }],
+                forbidden_actions: Vec::new(),
+                progress_evidence: Vec::new(),
+                verification_rerun_condition: Some(
+                    "rerun verify-contract --behavior after source edit".to_string(),
+                ),
+                verification_cluster_id: Some("workflow-source-contract".to_string()),
+            }),
+        }),
+    };
+    diagnostic.warnings = evaluate_turn_decision_projection(&diagnostic);
+
+    diagnostic.warnings.iter().any(|warning| {
+        warning.code == "repair_target_not_in_active_work_targets"
+            && warning.severity == TurnDecisionWarningSeverity::Error
+    })
+}
+
 pub(crate) fn post_repair_edit_progress_promotes_shell_rerun_fixture_passes() -> bool {
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Verify;
-    state.active_targets = vec![Utf8PathBuf::from("test_component.py")];
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
     state.failure = Some(crate::session::FailureState {
         kind: crate::session::FailureKind::VerificationFailed,
-        summary: "verification failed: component.calculate was repaired and needs rerun"
-            .to_string(),
+        summary: "verification failed: workflow source was repaired and needs rerun".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
-        targets: vec![Utf8PathBuf::from("component.py")],
+        targets: vec![Utf8PathBuf::from("src/workflow.rs")],
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_calculate_add".to_string()];
+    state.verification.failing_labels = vec!["workflow-verification-rerun-contract".to_string()];
     state.verification.failure_cluster =
         Some(crate::agent::state::public_class_attribute_cluster_fixture());
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     let active_work = ActiveWorkContract::Verification {
         commands: state.verification.required_commands.clone(),
         failing_labels: state.verification.failing_labels.clone(),
@@ -431,7 +532,7 @@ pub(crate) fn post_repair_verify_phase_ignores_stale_unclassified_repair_fixture
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     let active_work = ActiveWorkContract::Verification {
         commands: state.verification.required_commands.clone(),
         failing_labels: Vec::new(),
@@ -456,41 +557,42 @@ pub(crate) fn post_repair_verify_phase_ignores_stale_unclassified_repair_fixture
         })
 }
 
-pub(crate) fn repair_required_active_work_ignores_shell_only_continuation_fixture_passes() -> bool {
+pub(crate) fn repair_required_active_work_rejects_shell_only_surface_fixture_passes() -> bool {
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
-    state.active_targets = vec![Utf8PathBuf::from("component.py")];
+    state.active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
     state.failure = Some(crate::session::FailureState {
         kind: crate::session::FailureKind::VerificationFailed,
-        summary: "verification failed: divide raises wrong public exception".to_string(),
+        summary: "verification failed: workflow public exception contract mismatch".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
-        targets: vec![Utf8PathBuf::from("component.py")],
+        targets: vec![Utf8PathBuf::from("src/workflow.rs")],
     });
     state.completion.verification_pending = true;
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     state.implementation_handoff = Some(crate::session::ImplementationHandoff {
         summary: "Continue from typed verification failure.".to_string(),
         completed: Vec::new(),
         remaining: Vec::new(),
         next_actions: Vec::new(),
-        target_files: vec![Utf8PathBuf::from("component.py")],
-        verification_commands: vec!["python -m unittest".to_string()],
+        target_files: vec![Utf8PathBuf::from("src/workflow.rs")],
+        verification_commands: vec!["verify-contract --behavior".to_string()],
         continuation_contract: Some(crate::session::ContinuationContract {
             route: route_label(state.route).to_string(),
             process_phase: process_phase_label(state.process_phase).to_string(),
             active_work_kind: Some("verification".to_string()),
-            active_work_summary: Some("Repair component.py before rerun.".to_string()),
-            target_files: vec![Utf8PathBuf::from("component.py")],
-            verification_commands: vec!["python -m unittest".to_string()],
+            active_work_summary: Some("Repair src/workflow.rs before rerun.".to_string()),
+            target_files: vec![Utf8PathBuf::from("src/workflow.rs")],
+            verification_commands: vec!["verify-contract --behavior".to_string()],
             failure_kind: Some("verification_failed".to_string()),
             failure_summary: Some(
-                "verification failed: divide raises wrong public exception".to_string(),
+                "verification failed: workflow public exception contract mismatch".to_string(),
             ),
             completion_blocker: None,
             invariant_refs: Vec::new(),
+            ..crate::session::ContinuationContract::default()
         }),
     });
     let active_work = ActiveWorkContract::Verification {
@@ -509,6 +611,10 @@ pub(crate) fn repair_required_active_work_ignores_shell_only_continuation_fixtur
     );
 
     diagnostic.allowed_tools == vec!["shell".to_string()]
+        && diagnostic.warnings.iter().any(|warning| {
+            warning.code == "repair_required_active_work_without_edit_surface"
+                && warning.severity == TurnDecisionWarningSeverity::Error
+        })
 }
 
 pub(crate) fn unclassified_repair_fails_closed_before_dispatch_fixture_passes() -> bool {
@@ -525,7 +631,7 @@ pub(crate) fn unclassified_repair_fails_closed_before_dispatch_fixture_passes() 
     state
         .verification
         .required_commands
-        .push("python -X utf8 -m unittest".to_string());
+        .push("verify-generated-test --contract".to_string());
     let active_work = ActiveWorkContract::Verification {
         commands: state.verification.required_commands.clone(),
         failing_labels: Vec::new(),

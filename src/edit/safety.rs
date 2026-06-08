@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::EditError;
 use crate::session::SessionId;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileReadStamp {
     pub path: Utf8PathBuf,
     pub read_at_ms: i64,
@@ -77,6 +77,42 @@ impl EditSafety {
         Ok(())
     }
 
+    pub fn snapshot_path_stamps(
+        &self,
+        session_id: SessionId,
+        paths: &[Utf8PathBuf],
+    ) -> Vec<(Utf8PathBuf, Option<FileReadStamp>)> {
+        let store = self.read_stamps.lock().expect("edit safety mutex poisoned");
+        let entries = store.get(&session_id);
+        let mut unique_paths = paths.to_vec();
+        unique_paths.sort();
+        unique_paths.dedup();
+        unique_paths
+            .into_iter()
+            .map(|path| {
+                let stamp = entries.and_then(|value| value.get(&path)).cloned();
+                (path, stamp)
+            })
+            .collect()
+    }
+
+    pub fn restore_path_stamps(
+        &self,
+        session_id: SessionId,
+        snapshot: &[(Utf8PathBuf, Option<FileReadStamp>)],
+    ) -> Result<(), EditError> {
+        let mut store = self.read_stamps.lock().expect("edit safety mutex poisoned");
+        let entries = store.entry(session_id).or_default();
+        for (path, stamp) in snapshot {
+            if let Some(stamp) = stamp {
+                entries.insert(path.clone(), stamp.clone());
+            } else {
+                entries.remove(path);
+            }
+        }
+        Ok(())
+    }
+
     pub fn get_stamp(&self, session_id: SessionId, path: &Utf8Path) -> Option<FileReadStamp> {
         let store = self.read_stamps.lock().expect("edit safety mutex poisoned");
         store
@@ -105,9 +141,9 @@ impl EditSafety {
         Ok(())
     }
 
-    pub async fn with_file_lock<T, F>(&self, path: &Utf8Path, op: F) -> Result<T, EditError>
+    pub async fn with_file_lock<T, E, F>(&self, path: &Utf8Path, op: F) -> Result<T, E>
     where
-        F: Future<Output = Result<T, EditError>>,
+        F: Future<Output = Result<T, E>>,
     {
         let lock = {
             let mut locks = self.file_locks.lock().expect("edit safety mutex poisoned");
@@ -117,6 +153,32 @@ impl EditSafety {
                 .clone()
         };
         let _guard = lock.lock().await;
+        op.await
+    }
+
+    pub async fn with_file_locks<T, E, F>(&self, paths: &[Utf8PathBuf], op: F) -> Result<T, E>
+    where
+        F: Future<Output = Result<T, E>>,
+    {
+        let mut ordered_paths = paths.to_vec();
+        ordered_paths.sort();
+        ordered_paths.dedup();
+        let locks = {
+            let mut store = self.file_locks.lock().expect("edit safety mutex poisoned");
+            ordered_paths
+                .iter()
+                .map(|path| {
+                    store
+                        .entry(path.clone())
+                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in &locks {
+            guards.push(lock.lock().await);
+        }
         op.await
     }
 
@@ -185,10 +247,66 @@ pub(crate) fn shell_mutation_syncs_confirmed_edit_baseline_fixture_passes() -> b
         .is_ok()
 }
 
+pub(crate) fn multi_path_edit_locks_are_deterministic_fixture_passes() -> bool {
+    let mut paths = vec![
+        Utf8PathBuf::from("workspace/z.rs"),
+        Utf8PathBuf::from("workspace/a.rs"),
+        Utf8PathBuf::from("workspace/z.rs"),
+    ];
+    paths.sort();
+    paths.dedup();
+    paths
+        == vec![
+            Utf8PathBuf::from("workspace/a.rs"),
+            Utf8PathBuf::from("workspace/z.rs"),
+        ]
+}
+
+pub(crate) fn edit_safety_snapshot_restore_roundtrips_baseline_fixture_passes() -> bool {
+    let temp = match tempfile::tempdir() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let path = match Utf8PathBuf::from_path_buf(temp.path().join("target.txt")) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if fs::write(&path, "before").is_err() {
+        return false;
+    }
+    let safety = EditSafety::default();
+    let session_id = SessionId::new();
+    if safety.record_current_file_state(session_id, &path).is_err() {
+        return false;
+    }
+    let before = safety.get_stamp(session_id, &path);
+    let snapshot = safety.snapshot_path_stamps(session_id, std::slice::from_ref(&path));
+    if fs::write(&path, "after").is_err()
+        || safety.record_current_file_state(session_id, &path).is_err()
+    {
+        return false;
+    }
+    if before == safety.get_stamp(session_id, &path) {
+        return false;
+    }
+    safety.restore_path_stamps(session_id, &snapshot).is_ok()
+        && safety.get_stamp(session_id, &path) == before
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn shell_mutation_syncs_confirmed_edit_baseline() {
         assert!(super::shell_mutation_syncs_confirmed_edit_baseline_fixture_passes());
+    }
+
+    #[test]
+    fn multi_path_edit_locks_are_deterministic() {
+        assert!(super::multi_path_edit_locks_are_deterministic_fixture_passes());
+    }
+
+    #[test]
+    fn edit_safety_snapshot_restore_roundtrips_baseline() {
+        assert!(super::edit_safety_snapshot_restore_roundtrips_baseline_fixture_passes());
     }
 }

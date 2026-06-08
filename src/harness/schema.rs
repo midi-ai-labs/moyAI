@@ -753,12 +753,52 @@ fn tool_no_progress_signature_schema() -> Value {
     base_schema(
         "moyai.harness.tool_no_progress_signature.v1",
         "ToolNoProgressSignature",
-        &["result_hash", "allowed_surface_snapshot", "repeat_count"],
+        &[
+            "result_hash",
+            "tool",
+            "progress_effect",
+            "allowed_surface_snapshot",
+            "repeat_count",
+        ],
         json!({
             "result_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "tool": {"type": ["string", "null"]},
+            "progress_effect": {"type": "string", "const": "no_progress"},
             "blocked_action": {"type": ["string", "null"]},
             "allowed_surface_snapshot": {"type": "array", "items": {"type": "string"}},
             "repeat_count": {"type": "integer", "minimum": 0}
         }),
     )
+}
+
+pub(crate) fn tool_no_progress_signature_schema_matches_runtime_projection_fixture_passes() -> bool
+{
+    let schema = tool_no_progress_signature_schema();
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let required_fields = [
+        "result_hash",
+        "tool",
+        "progress_effect",
+        "allowed_surface_snapshot",
+        "repeat_count",
+    ];
+    required_fields.iter().all(|field| {
+        required.iter().any(|value| value.as_str() == Some(*field))
+            && properties.contains_key(*field)
+    }) && properties.contains_key("blocked_action")
+        && schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
+        && properties
+            .get("progress_effect")
+            .and_then(|value| value.get("const"))
+            .and_then(Value::as_str)
+            == Some("no_progress")
 }

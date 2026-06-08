@@ -4,7 +4,7 @@ use crate::desktop::models::{DesktopArtifactRow, DesktopFileChangeRow};
 use crate::protocol::{
     FileChangeEvidence, TurnItem, TurnItemPayload, turn_items_in_projection_order,
 };
-use crate::session::{ChangeKind, MessagePart, Transcript};
+use crate::session::{ChangeKind, ToolCallId};
 pub fn file_change_rows_from_turn_items(turn_items: &[TurnItem]) -> Vec<DesktopFileChangeRow> {
     file_change_rows_from_turn_items_with_root(turn_items, None)
 }
@@ -16,47 +16,24 @@ pub(crate) fn file_change_rows_from_turn_items_with_root(
     let mut rows = Vec::new();
     for item in turn_items_in_projection_order(turn_items) {
         if let TurnItemPayload::FileChange {
-            changes, summary, ..
+            call_id,
+            changes,
+            summary,
+            ..
         } = &item.payload
         {
             rows.extend(
-                changes
-                    .iter()
-                    .filter(|change| file_change_is_user_visible(change))
-                    .map(|change| file_change_row(change, summary.as_str(), workspace_root)),
+                changes.iter().map(|change| {
+                    file_change_row(*call_id, change, summary.as_str(), workspace_root)
+                }),
             );
         }
     }
     dedupe_file_change_rows(rows)
 }
 
-pub(crate) fn file_change_rows_from_transcript(
-    transcript: &Transcript,
-) -> Vec<DesktopFileChangeRow> {
-    let mut rows = Vec::new();
-    for message in &transcript.messages {
-        for part in &message.parts {
-            if let MessagePart::DiffSummary(summary) = &part.payload {
-                rows.extend(
-                    summary
-                        .changes
-                        .iter()
-                        .filter(|change| file_change_is_user_visible(change))
-                        .map(|change| {
-                            file_change_row(
-                                change,
-                                summary.summary.as_str(),
-                                Some(transcript.session.cwd.as_path()),
-                            )
-                        }),
-                );
-            }
-        }
-    }
-    dedupe_file_change_rows(rows)
-}
-
 fn file_change_row(
+    call_id: ToolCallId,
     change: &FileChangeEvidence,
     fallback_summary: &str,
     workspace_root: Option<&Utf8Path>,
@@ -85,8 +62,10 @@ fn file_change_row(
     DesktopFileChangeRow {
         label,
         path,
+        kind: change.kind,
         action: change_kind_label(change.kind).to_string(),
         summary,
+        tool_call_ids: vec![call_id],
     }
 }
 
@@ -126,37 +105,21 @@ fn file_path_summary_variants(path: &str) -> Vec<String> {
     variants
 }
 
-fn file_change_is_user_visible(change: &FileChangeEvidence) -> bool {
-    change
-        .path_after
-        .as_ref()
-        .or(change.path_before.as_ref())
-        .is_some_and(|path| is_user_visible_artifact_path(path.as_str()))
-}
-
 pub(crate) fn artifact_rows_from_file_changes(
     rows: &[DesktopFileChangeRow],
 ) -> Vec<DesktopArtifactRow> {
     let mut artifacts = rows
         .iter()
-        .filter(|row| is_user_visible_artifact_path(&row.path))
         .map(|row| DesktopArtifactRow {
             label: row.label.clone(),
             path: row.path.clone(),
             kind: "ファイル".to_string(),
-            action: row.action.clone(),
+            action: change_kind_label(row.kind).to_string(),
         })
         .collect::<Vec<_>>();
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     artifacts.dedup_by(|left, right| left.path == right.path);
     artifacts
-}
-
-fn is_user_visible_artifact_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
-    !normalized.contains("/__pycache__/")
-        && !normalized.starts_with("__pycache__/")
-        && !normalized.ends_with(".pyc")
 }
 
 fn dedupe_file_change_rows(rows: Vec<DesktopFileChangeRow>) -> Vec<DesktopFileChangeRow> {
@@ -166,9 +129,15 @@ fn dedupe_file_change_rows(rows: Vec<DesktopFileChangeRow>) -> Vec<DesktopFileCh
             .iter_mut()
             .find(|existing| existing.path == row.path)
         {
-            existing.action = merged_file_change_action(&existing.action, &row.action).to_string();
+            existing.kind = merged_file_change_kind(existing.kind, row.kind);
+            existing.action = change_kind_label(existing.kind).to_string();
             if !row.summary.trim().is_empty() {
                 existing.summary = row.summary;
+            }
+            for call_id in row.tool_call_ids {
+                if !existing.tool_call_ids.contains(&call_id) {
+                    existing.tool_call_ids.push(call_id);
+                }
             }
         } else {
             deduped.push(row);
@@ -177,15 +146,15 @@ fn dedupe_file_change_rows(rows: Vec<DesktopFileChangeRow>) -> Vec<DesktopFileCh
     deduped
 }
 
-fn merged_file_change_action(existing: &str, incoming: &str) -> &'static str {
-    if existing == "追加" || incoming == "追加" {
-        "追加"
-    } else if incoming == "削除" {
-        "削除"
-    } else if incoming == "移動" {
-        "移動"
+fn merged_file_change_kind(existing: ChangeKind, incoming: ChangeKind) -> ChangeKind {
+    if matches!(existing, ChangeKind::Add) || matches!(incoming, ChangeKind::Add) {
+        ChangeKind::Add
+    } else if matches!(incoming, ChangeKind::Delete) {
+        ChangeKind::Delete
+    } else if matches!(incoming, ChangeKind::Move) {
+        ChangeKind::Move
     } else {
-        "更新"
+        ChangeKind::Update
     }
 }
 
@@ -193,10 +162,22 @@ pub(crate) fn format_file_change_summary(rows: &[DesktopFileChangeRow]) -> Strin
     if rows.is_empty() {
         return "ファイル変更はまだありません。".to_string();
     }
-    let added = rows.iter().filter(|row| row.action == "追加").count();
-    let updated = rows.iter().filter(|row| row.action == "更新").count();
-    let deleted = rows.iter().filter(|row| row.action == "削除").count();
-    let moved = rows.iter().filter(|row| row.action == "移動").count();
+    let added = rows
+        .iter()
+        .filter(|row| matches!(row.kind, ChangeKind::Add))
+        .count();
+    let updated = rows
+        .iter()
+        .filter(|row| matches!(row.kind, ChangeKind::Update))
+        .count();
+    let deleted = rows
+        .iter()
+        .filter(|row| matches!(row.kind, ChangeKind::Delete))
+        .count();
+    let moved = rows
+        .iter()
+        .filter(|row| matches!(row.kind, ChangeKind::Move))
+        .count();
     let mut lines = vec![format!(
         "{}件のファイル変更（追加{} / 更新{} / 削除{} / 移動{}）",
         rows.len(),
@@ -206,10 +187,11 @@ pub(crate) fn format_file_change_summary(rows: &[DesktopFileChangeRow]) -> Strin
         moved
     )];
     lines.extend(rows.iter().take(8).map(|row| {
+        let action = change_kind_label(row.kind);
         if row.summary.trim().is_empty() {
-            format!("- [{}] {}", row.action, row.path)
+            format!("- [{}] {}", action, row.path)
         } else {
-            format!("- [{}] {} - {}", row.action, row.path, row.summary)
+            format!("- [{}] {} - {}", action, row.path, row.summary)
         }
     }));
     lines.join("\n")
@@ -254,6 +236,8 @@ fn change_kind_label(kind: ChangeKind) -> &'static str {
 pub(crate) fn desktop_file_change_projection_uses_turn_local_sequence_fixture_passes() -> bool {
     let session_id = crate::session::SessionId::new();
     let turn_id = crate::protocol::TurnId::new();
+    let latest_call_id = crate::session::ToolCallId::new();
+    let initial_call_id = crate::session::ToolCallId::new();
     let rows = file_change_rows_from_turn_items(&[
         TurnItem {
             id: crate::protocol::TurnItemId::new(),
@@ -262,6 +246,7 @@ pub(crate) fn desktop_file_change_projection_uses_turn_local_sequence_fixture_pa
             source_item_id: None,
             sequence_no: 3,
             payload: TurnItemPayload::FileChange {
+                call_id: latest_call_id,
                 change_ids: vec![crate::session::ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: crate::session::ChangeId::new(),
@@ -280,6 +265,7 @@ pub(crate) fn desktop_file_change_projection_uses_turn_local_sequence_fixture_pa
             source_item_id: None,
             sequence_no: 2,
             payload: TurnItemPayload::FileChange {
+                call_id: initial_call_id,
                 change_ids: vec![crate::session::ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: crate::session::ChangeId::new(),
@@ -292,7 +278,91 @@ pub(crate) fn desktop_file_change_projection_uses_turn_local_sequence_fixture_pa
             },
         },
     ]);
-    rows.len() == 1 && rows[0].action == "追加" && rows[0].summary == "latest summary"
+    rows.len() == 1
+        && rows[0].action == "追加"
+        && rows[0].summary == "latest summary"
+        && rows[0].tool_call_ids == [initial_call_id, latest_call_id]
+}
+
+pub(crate) fn desktop_file_change_rows_preserve_call_id_fixture_passes() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let call_id = crate::session::ToolCallId::new();
+    let rows = file_change_rows_from_turn_items(&[TurnItem {
+        id: crate::protocol::TurnItemId::new(),
+        session_id,
+        turn_id,
+        source_item_id: None,
+        sequence_no: 1,
+        payload: TurnItemPayload::FileChange {
+            call_id,
+            change_ids: vec![crate::session::ChangeId::new()],
+            changes: vec![FileChangeEvidence {
+                change_id: crate::session::ChangeId::new(),
+                kind: ChangeKind::Update,
+                path_before: None,
+                path_after: Some(camino::Utf8PathBuf::from("src/lib.rs")),
+                summary: "Updated src/lib.rs".to_string(),
+            }],
+            summary: "Updated src/lib.rs".to_string(),
+        },
+    }]);
+    rows.len() == 1 && rows[0].tool_call_ids == [call_id]
+}
+
+pub(crate) fn desktop_file_change_rows_preserve_runtime_path_evidence_fixture_passes() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let call_id = crate::session::ToolCallId::new();
+    let rows = file_change_rows_from_turn_items(&[TurnItem {
+        id: crate::protocol::TurnItemId::new(),
+        session_id,
+        turn_id,
+        source_item_id: None,
+        sequence_no: 1,
+        payload: TurnItemPayload::FileChange {
+            call_id,
+            change_ids: vec![crate::session::ChangeId::new()],
+            changes: vec![FileChangeEvidence {
+                change_id: crate::session::ChangeId::new(),
+                kind: ChangeKind::Add,
+                path_before: None,
+                path_after: Some(camino::Utf8PathBuf::from(
+                    "__pycache__/workflow.cpython-313.pyc",
+                )),
+                summary: "Added __pycache__/workflow.cpython-313.pyc".to_string(),
+            }],
+            summary: "Added __pycache__/workflow.cpython-313.pyc".to_string(),
+        },
+    }]);
+    let artifacts = artifact_rows_from_file_changes(&rows);
+    rows.len() == 1
+        && rows[0].path == "__pycache__/workflow.cpython-313.pyc"
+        && rows[0]
+            .summary
+            .contains("__pycache__/workflow.cpython-313.pyc")
+        && rows[0].tool_call_ids == [call_id]
+        && artifacts.len() == 1
+        && artifacts[0].path == "__pycache__/workflow.cpython-313.pyc"
+}
+
+pub(crate) fn desktop_file_change_action_typed_projection_fixture_passes() -> bool {
+    let rows = vec![DesktopFileChangeRow {
+        label: "workflow.rs".to_string(),
+        path: "src/workflow.rs".to_string(),
+        kind: ChangeKind::Add,
+        action: "削除".to_string(),
+        summary: "Created src/workflow.rs".to_string(),
+        tool_call_ids: vec![crate::session::ToolCallId::new()],
+    }];
+    let summary = format_file_change_summary(&rows);
+    let artifacts = artifact_rows_from_file_changes(&rows);
+
+    summary.contains("追加1 / 更新0 / 削除0 / 移動0")
+        && summary.contains("- [追加] src/workflow.rs")
+        && !summary.contains("- [削除] src/workflow.rs")
+        && artifacts.len() == 1
+        && artifacts[0].action == "追加"
 }
 
 #[cfg(test)]
@@ -300,5 +370,20 @@ mod tests {
     #[test]
     fn desktop_file_change_projection_uses_turn_local_sequence() {
         assert!(super::desktop_file_change_projection_uses_turn_local_sequence_fixture_passes());
+    }
+
+    #[test]
+    fn desktop_file_change_rows_preserve_call_id() {
+        assert!(super::desktop_file_change_rows_preserve_call_id_fixture_passes());
+    }
+
+    #[test]
+    fn desktop_file_change_rows_preserve_runtime_path_evidence() {
+        assert!(super::desktop_file_change_rows_preserve_runtime_path_evidence_fixture_passes());
+    }
+
+    #[test]
+    fn desktop_file_change_action_typed_projection() {
+        assert!(super::desktop_file_change_action_typed_projection_fixture_passes());
     }
 }

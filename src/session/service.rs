@@ -1,14 +1,16 @@
 use crate::error::SessionError;
-use crate::protocol::{HistoryItem, ProtocolEventStore, TurnItem, UserTurn};
+use crate::protocol::{HistoryItem, ProtocolEventStore, TurnId, TurnItem, UserTurn};
 use crate::session::{
-    EditorContext, ImagePart, MessageMetadata, MessagePart, MessageRole, NewMessage, NewPart,
-    NewSession, PartKind, ProjectId, ProjectRecord, ProjectRepository, PromptDispatchPart,
-    SessionContext, SessionId, SessionRecord, SessionRepository, SessionSelector,
-    SessionStartRequest, SessionStateSnapshot, SessionStatus, Transcript, UserMessageMeta,
-    transcript_from_history_items,
+    MessageMetadata, MessagePart, MessageRole, NewMessage, NewPart, NewSession, PartKind,
+    ProjectId, ProjectRecord, ProjectRepository, RunEvent, SessionContext, SessionId,
+    SessionRecord, SessionRepository, SessionSelector, SessionStartRequest, SessionStateSnapshot,
+    SessionStatus, Transcript, UserMessageMeta, transcript_from_history_items,
 };
 use crate::storage::StoreBundle;
 use crate::workspace::Workspace;
+
+const SESSION_SERVICE_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
+const SESSION_SERVICE_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
 
 #[derive(Clone)]
 pub struct SessionService {
@@ -47,12 +49,16 @@ impl SessionService {
         };
 
         if session.status == SessionStatus::Running {
-            repository
-                .set_status(session.id, SessionStatus::Failed)
-                .await?;
-            repository
-                .fail_unfinished_tool_calls(session.id, "Previous run was interrupted.")
-                .await?;
+            self.terminalize_running_session(
+                session.id,
+                SessionStatus::Failed,
+                RunEvent::SessionFailed {
+                    session_id: session.id,
+                    message: "Previous run was interrupted.".to_string(),
+                },
+                "Previous run was interrupted.",
+            )
+            .await?;
         }
 
         Ok(SessionContext {
@@ -62,135 +68,6 @@ impl SessionService {
             },
             workspace,
         })
-    }
-
-    pub async fn store_user_turn(
-        &self,
-        ctx: &SessionContext,
-        prompt: &str,
-        requested_model: Option<String>,
-    ) -> Result<crate::session::MessageRecord, SessionError> {
-        self.store_user_turn_with_context(
-            ctx,
-            prompt,
-            requested_model,
-            None,
-            None,
-            SessionStateSnapshot::default(),
-        )
-        .await
-    }
-
-    pub async fn store_user_turn_with_dispatch(
-        &self,
-        ctx: &SessionContext,
-        prompt: &str,
-        requested_model: Option<String>,
-        prompt_dispatch: Option<PromptDispatchPart>,
-    ) -> Result<crate::session::MessageRecord, SessionError> {
-        self.store_user_turn_with_context(
-            ctx,
-            prompt,
-            requested_model,
-            prompt_dispatch,
-            None,
-            SessionStateSnapshot::default(),
-        )
-        .await
-    }
-
-    pub async fn store_user_turn_with_context(
-        &self,
-        ctx: &SessionContext,
-        prompt: &str,
-        requested_model: Option<String>,
-        prompt_dispatch: Option<PromptDispatchPart>,
-        editor_context: Option<EditorContext>,
-        initial_state: SessionStateSnapshot,
-    ) -> Result<crate::session::MessageRecord, SessionError> {
-        self.store_user_turn_with_context_and_images(
-            ctx,
-            prompt,
-            requested_model,
-            prompt_dispatch,
-            editor_context,
-            initial_state,
-            Vec::new(),
-        )
-        .await
-    }
-
-    pub async fn store_user_turn_with_context_and_images(
-        &self,
-        ctx: &SessionContext,
-        prompt: &str,
-        requested_model: Option<String>,
-        prompt_dispatch: Option<PromptDispatchPart>,
-        editor_context: Option<EditorContext>,
-        initial_state: SessionStateSnapshot,
-        images: Vec<ImagePart>,
-    ) -> Result<crate::session::MessageRecord, SessionError> {
-        let repository = self.store.session_repo();
-        repository.update_todos(ctx.session.id, &[]).await?;
-        repository
-            .update_state(ctx.session.id, &initial_state)
-            .await?;
-        let mut parts = vec![NewPart {
-            kind: PartKind::Text,
-            payload: MessagePart::Text(crate::session::TextPart {
-                text: prompt.to_string(),
-            }),
-        }];
-        for image in images {
-            parts.push(NewPart {
-                kind: PartKind::Image,
-                payload: MessagePart::Image(image),
-            });
-        }
-        if let Some(prompt_dispatch) = prompt_dispatch {
-            parts.push(NewPart {
-                kind: PartKind::PromptDispatch,
-                payload: MessagePart::PromptDispatch(prompt_dispatch),
-            });
-        }
-        let message = repository
-            .append_message(
-                NewMessage {
-                    session_id: ctx.session.id,
-                    parent_message_id: None,
-                    role: MessageRole::User,
-                    metadata: MessageMetadata::User(UserMessageMeta {
-                        cwd: ctx.workspace.cwd.clone(),
-                        requested_model,
-                        editor_context,
-                    }),
-                },
-                parts,
-            )
-            .await?;
-        repository
-            .set_status(ctx.session.id, SessionStatus::Running)
-            .await?;
-        Ok(message)
-    }
-
-    pub async fn store_user_thread_op(
-        &self,
-        ctx: &SessionContext,
-        turn: &UserTurn,
-        requested_model: Option<String>,
-        initial_state: SessionStateSnapshot,
-    ) -> Result<crate::session::MessageRecord, SessionError> {
-        self.store_user_turn_with_context_and_images(
-            ctx,
-            &turn.text(),
-            requested_model,
-            turn.prompt_dispatch.clone(),
-            turn.editor_context.clone(),
-            initial_state,
-            turn.images(),
-        )
-        .await
     }
 
     pub async fn store_user_thread_op_with_protocol_bundle(
@@ -258,14 +135,16 @@ impl SessionService {
         if session.status != SessionStatus::Running {
             return Ok(false);
         }
-        self.store
-            .session_repo()
-            .set_status(session_id, SessionStatus::Cancelled)
-            .await?;
-        self.store
-            .session_repo()
-            .fail_unfinished_tool_calls(session_id, reason)
-            .await?;
+        self.terminalize_running_session(
+            session_id,
+            SessionStatus::Cancelled,
+            RunEvent::SessionInterrupted {
+                session_id,
+                reason: reason.to_string(),
+            },
+            reason,
+        )
+        .await?;
         Ok(true)
     }
 
@@ -286,23 +165,34 @@ impl SessionService {
         Ok(cancelled)
     }
 
+    async fn terminalize_running_session(
+        &self,
+        session_id: SessionId,
+        status: SessionStatus,
+        event: RunEvent,
+        unfinished_tool_reason: &str,
+    ) -> Result<(), SessionError> {
+        let (turn_id, sequence_no) = self
+            .store
+            .protocol_event_store()
+            .latest_turn_position_for_session(session_id)?
+            .unwrap_or_else(|| (TurnId::new(), 0));
+        self.store
+            .session_repo()
+            .set_status_with_protocol_event(session_id, status, &event, turn_id, Some(sequence_no))
+            .await?;
+        self.store
+            .session_repo()
+            .fail_unfinished_tool_calls(session_id, unfinished_tool_reason)
+            .await?;
+        Ok(())
+    }
+
     pub async fn load_state(
         &self,
         session_id: crate::session::SessionId,
     ) -> Result<SessionStateSnapshot, SessionError> {
         Ok(self.store.session_repo().get_state(session_id).await?)
-    }
-
-    pub async fn persist_state(
-        &self,
-        session_id: crate::session::SessionId,
-        state: &SessionStateSnapshot,
-    ) -> Result<(), SessionError> {
-        self.store
-            .session_repo()
-            .update_state(session_id, state)
-            .await?;
-        Ok(())
     }
 
     pub async fn get_session(&self, session_id: SessionId) -> Result<SessionRecord, SessionError> {
@@ -351,10 +241,6 @@ impl SessionService {
         Ok(self.store.project_repo().list_projects(limit).await?)
     }
 
-    pub async fn transcript(&self, session_id: SessionId) -> Result<Transcript, SessionError> {
-        Ok(self.store.session_repo().transcript(session_id).await?)
-    }
-
     pub async fn canonical_transcript(
         &self,
         session_id: SessionId,
@@ -397,9 +283,129 @@ impl SessionService {
     }
 }
 
+pub(crate) fn session_service_current_provider_profile_fixture_passes() -> bool {
+    SESSION_SERVICE_FIXTURE_MODEL == "qwen/qwen3.6-35b-a3b"
+        && SESSION_SERVICE_FIXTURE_BASE_URL == "http://127.0.0.1:1234"
+        && stale_running_cleanup_records_protocol_terminal_fixture_passes()
+}
+
+pub(crate) fn stale_running_cleanup_records_protocol_terminal_fixture_passes() -> bool {
+    std::thread::spawn(|| {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(_) => return false,
+        };
+        runtime.block_on(async {
+            let temp = match tempfile::tempdir() {
+                Ok(temp) => temp,
+                Err(_) => return false,
+            };
+            let data_dir = match camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) {
+                Ok(path) => path,
+                Err(_) => return false,
+            };
+            let paths = crate::storage::StoragePaths {
+                data_dir: data_dir.clone(),
+                database_path: data_dir.join("moyai.sqlite3"),
+                truncation_dir: data_dir.join("truncation"),
+            };
+            let store = match crate::storage::SqliteStore::open(&paths) {
+                Ok(store) => store,
+                Err(_) => return false,
+            };
+            if store.migrate().is_err() {
+                return false;
+            }
+            let service = SessionService::new(StoreBundle::new(store));
+            let project_id = ProjectId::new();
+            if service
+                .store
+                .project_repo()
+                .upsert_project(
+                    project_id,
+                    camino::Utf8Path::new("C:/workspace"),
+                    "workspace",
+                    "none",
+                )
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            let repo = service.store.session_repo();
+            let running = match repo
+                .create_session(NewSession {
+                    project_id,
+                    title: "Running".to_string(),
+                    cwd: "C:/workspace".into(),
+                    model: SESSION_SERVICE_FIXTURE_MODEL.to_string(),
+                    base_url: SESSION_SERVICE_FIXTURE_BASE_URL.to_string(),
+                })
+                .await
+            {
+                Ok(session) => session,
+                Err(_) => return false,
+            };
+            if repo
+                .set_status_with_protocol_event(
+                    running.id,
+                    SessionStatus::Running,
+                    &RunEvent::SessionStarted {
+                        session_id: running.id,
+                        title: running.title.clone(),
+                    },
+                    TurnId::new(),
+                    Some(0),
+                )
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            if service
+                .mark_stale_running_sessions("desktop restart")
+                .await
+                .ok()
+                != Some(1)
+            {
+                return false;
+            }
+            let history_items = match service.canonical_history_items(running.id).await {
+                Ok(items) => items,
+                Err(_) => return false,
+            };
+            let turn_items = match service.canonical_turn_items(running.id).await {
+                Ok(items) => items,
+                Err(_) => return false,
+            };
+            history_items.iter().any(|item| {
+                matches!(
+                    &item.payload,
+                    crate::protocol::HistoryItemPayload::Error { message, .. }
+                        if message == "desktop restart"
+                )
+            }) && turn_items.iter().any(|item| {
+                matches!(
+                    &item.payload,
+                    crate::protocol::TurnItemPayload::Terminal {
+                        status: crate::protocol::TurnTerminalStatus::Interrupted,
+                        summary,
+                    } if summary == "desktop restart"
+                )
+            })
+        })
+    })
+    .join()
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{HistoryItemPayload, TurnItemPayload, TurnTerminalStatus};
     use crate::session::{NewSession, ProjectRepository, SessionRepository};
     use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 
@@ -438,21 +444,30 @@ mod tests {
                 project_id,
                 title: "Running".to_string(),
                 cwd: "C:/workspace".into(),
-                model: "local".to_string(),
-                base_url: "http://localhost:1234".to_string(),
+                model: SESSION_SERVICE_FIXTURE_MODEL.to_string(),
+                base_url: SESSION_SERVICE_FIXTURE_BASE_URL.to_string(),
             })
             .await
             .expect("create running session");
-        repo.set_status(running.id, SessionStatus::Running)
-            .await
-            .expect("mark running");
+        repo.set_status_with_protocol_event(
+            running.id,
+            SessionStatus::Running,
+            &RunEvent::SessionStarted {
+                session_id: running.id,
+                title: running.title.clone(),
+            },
+            TurnId::new(),
+            Some(0),
+        )
+        .await
+        .expect("mark running");
         let idle = repo
             .create_session(NewSession {
                 project_id,
                 title: "Idle".to_string(),
                 cwd: "C:/workspace".into(),
-                model: "local".to_string(),
-                base_url: "http://localhost:1234".to_string(),
+                model: SESSION_SERVICE_FIXTURE_MODEL.to_string(),
+                base_url: SESSION_SERVICE_FIXTURE_BASE_URL.to_string(),
             })
             .await
             .expect("create idle session");
@@ -474,5 +489,28 @@ mod tests {
             repo.get_session(idle.id).await.expect("reload idle").status,
             SessionStatus::Idle
         );
+        let history_items = service
+            .canonical_history_items(running.id)
+            .await
+            .expect("canonical history items");
+        assert!(history_items.iter().any(|item| {
+            matches!(
+                &item.payload,
+                HistoryItemPayload::Error { message, .. } if message == "desktop restart"
+            )
+        }));
+        let turn_items = service
+            .canonical_turn_items(running.id)
+            .await
+            .expect("canonical turn items");
+        assert!(turn_items.iter().any(|item| {
+            matches!(
+                &item.payload,
+                TurnItemPayload::Terminal {
+                    status: TurnTerminalStatus::Interrupted,
+                    summary,
+                } if summary == "desktop restart"
+            )
+        }));
     }
 }

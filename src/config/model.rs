@@ -459,6 +459,24 @@ impl Default for ResolvedConfig {
     }
 }
 
+pub fn config_default_provider_profile_lm_studio_fixture_passes() -> bool {
+    let config = ResolvedConfig::default();
+    config.model.base_url == "http://127.0.0.1:1234"
+        && config.model.model == "qwen/qwen3.6-35b-a3b"
+        && config.model.provider_metadata_mode == ProviderMetadataMode::LmStudioNativeRequired
+        && config.model.context_window == 131_072
+        && config.model.max_output_tokens == 8_192
+        && config.model.extra_body_json
+            == Some(serde_json::json!({
+                "num_ctx": 131072
+            }))
+}
+
+pub fn provider_metadata_mode_default_lm_studio_fixture_passes() -> bool {
+    ProviderMetadataMode::default() == ProviderMetadataMode::LmStudioNativeRequired
+        && ResolvedConfig::default().model.provider_metadata_mode == ProviderMetadataMode::default()
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PartialResolvedConfig {
     pub model: Option<PartialModelConfig>,

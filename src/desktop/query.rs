@@ -2,20 +2,21 @@ use crate::app::App;
 use crate::desktop::args::{DesktopArgs, quick_chat_workspace_directory};
 use crate::desktop::models::{
     DesktopCommandRow, DesktopFileChangeRow, DesktopProjectRow, DesktopSessionDetail,
-    DesktopSessionRow, DesktopSnapshot, DesktopTranscriptRow, format_session_status,
+    DesktopSessionRow, DesktopSnapshot, DesktopTranscriptRow, DesktopTranscriptRowKind,
+    format_session_status,
 };
 use crate::error::AppRunError;
 use crate::harness::ReplayReport;
 use crate::session::{
     ChangeKind, ProjectId, ProjectRecord, SessionId, SessionRecord, SessionStateSnapshot,
-    SessionStatus, TodoItem, ToolCallStatus, Transcript,
+    SessionStatus, TodoItem, TodoStatus, ToolCallStatus, Transcript,
 };
 use crate::tui::query::{recent_sessions, session_view};
 use crate::tui::state::{AppState, RunStatus, TranscriptKind};
 
 use super::artifact_projection::{
-    artifact_rows_from_file_changes, file_change_rows_from_transcript,
-    file_change_rows_from_turn_items_with_root, format_file_change_summary,
+    artifact_rows_from_file_changes, file_change_rows_from_turn_items_with_root,
+    format_file_change_summary,
 };
 pub use super::artifact_projection::{file_change_rows_from_turn_items, format_artifact_preview};
 
@@ -240,31 +241,22 @@ pub fn build_session_detail(
     session: &SessionRecord,
     state: SessionStateSnapshot,
     todos: Vec<TodoItem>,
-    transcript: Transcript,
+    _transcript: Transcript,
     turn_items: Vec<crate::protocol::TurnItem>,
     replay_report: Option<ReplayReport>,
 ) -> DesktopSessionDetail {
     let mut ui_state = AppState::default();
-    if turn_items.is_empty() {
-        ui_state.load_transcript(&transcript, state.clone(), todos.clone());
-    } else {
-        ui_state.load_turn_items(session, &turn_items, state.clone(), todos.clone());
-    }
-    let file_changes = if turn_items.is_empty() {
-        file_change_rows_from_transcript(&transcript)
-    } else {
-        file_change_rows_from_turn_items_with_root(&turn_items, Some(session.cwd.as_path()))
-    };
+    ui_state.load_turn_items(session, &turn_items, state.clone(), todos.clone());
+    let file_changes =
+        file_change_rows_from_turn_items_with_root(&turn_items, Some(session.cwd.as_path()));
     let mut detail = build_session_detail_from_app_state(&ui_state);
     detail.session_id = session.id;
-    detail.transcript_rows = if turn_items.is_empty() {
-        transcript_rows_with_context(&ui_state, Some(session), &file_changes)
-    } else {
-        transcript_rows_from_turn_items_with_context(session, &turn_items)
-    };
+    detail.transcript_rows = transcript_rows_from_turn_items_with_context(session, &turn_items);
+    detail.thread_empty = transcript_rows_are_empty_placeholder(&detail.transcript_rows);
     detail.artifacts = artifact_rows_from_file_changes(&file_changes);
     detail.file_change_summary_text = format_file_change_summary(&file_changes);
     detail.artifact_preview_text = format_artifact_preview(detail.artifacts.first(), &file_changes);
+    detail.artifact_preview_available = !detail.artifacts.is_empty();
     detail.file_changes = file_changes;
     if let Some(report) = replay_report {
         append_replay_summary(&mut detail.tool_status_text, &report);
@@ -342,40 +334,40 @@ fn transcript_rows_from_turn_items_with_context(
                 current.file_change_items.push((*item).clone());
             }
             crate::protocol::TurnItemPayload::ContextCompaction { summary } => {
-                current.system_rows.push(DesktopTranscriptRow {
-                    kind: "system".to_string(),
-                    step: String::new(),
-                    title: "システム - Context Compaction".to_string(),
-                    body: format!("圧縮しました\n\n{}", summary.trim()),
-                    file_changes: Vec::new(),
-                });
+                current.system_rows.push(desktop_transcript_row(
+                    DesktopTranscriptRowKind::System,
+                    String::new(),
+                    "システム - Context Compaction".to_string(),
+                    format!("圧縮しました\n\n{}", summary.trim()),
+                    Vec::new(),
+                ));
             }
             crate::protocol::TurnItemPayload::ApprovalRequest { summary, .. } => {
-                current.system_rows.push(DesktopTranscriptRow {
-                    kind: "system".to_string(),
-                    step: String::new(),
-                    title: "確認".to_string(),
-                    body: summary.clone(),
-                    file_changes: Vec::new(),
-                });
+                current.system_rows.push(desktop_transcript_row(
+                    DesktopTranscriptRowKind::System,
+                    String::new(),
+                    "確認".to_string(),
+                    summary.clone(),
+                    Vec::new(),
+                ));
             }
             crate::protocol::TurnItemPayload::Warning { message } => {
-                current.system_rows.push(DesktopTranscriptRow {
-                    kind: "system".to_string(),
-                    step: String::new(),
-                    title: "警告".to_string(),
-                    body: message.clone(),
-                    file_changes: Vec::new(),
-                });
+                current.system_rows.push(desktop_transcript_row(
+                    DesktopTranscriptRowKind::System,
+                    String::new(),
+                    "警告".to_string(),
+                    message.clone(),
+                    Vec::new(),
+                ));
             }
             crate::protocol::TurnItemPayload::Error { message } => {
-                current.system_rows.push(DesktopTranscriptRow {
-                    kind: "error".to_string(),
-                    step: String::new(),
-                    title: "エラー".to_string(),
-                    body: message.clone(),
-                    file_changes: Vec::new(),
-                });
+                current.system_rows.push(desktop_transcript_row(
+                    DesktopTranscriptRowKind::Error,
+                    String::new(),
+                    "エラー".to_string(),
+                    message.clone(),
+                    Vec::new(),
+                ));
             }
             crate::protocol::TurnItemPayload::Terminal { status, summary } => {
                 current.terminal_summary = Some(summary.clone());
@@ -384,7 +376,8 @@ fn transcript_rows_from_turn_items_with_context(
             crate::protocol::TurnItemPayload::Reasoning { .. }
             | crate::protocol::TurnItemPayload::Plan { .. }
             | crate::protocol::TurnItemPayload::PromptDispatch { .. }
-            | crate::protocol::TurnItemPayload::State { .. } => {}
+            | crate::protocol::TurnItemPayload::State { .. }
+            | crate::protocol::TurnItemPayload::LifecycleGuard { .. } => {}
         }
     }
     flush_turn_transcript_group(
@@ -394,16 +387,33 @@ fn transcript_rows_from_turn_items_with_context(
         show_session_elapsed_on_work_summary,
     );
     if rows.is_empty() {
-        rows.push(DesktopTranscriptRow {
-            kind: "system".to_string(),
-            step: "00".to_string(),
-            title: "履歴はまだありません".to_string(),
-            body: "依頼を送信すると、ユーザー入力、ツール実行、ファイル変更、最終応答がここに並びます。".to_string(),
-            file_changes: Vec::new(),
-        });
+        rows.push(desktop_transcript_row(
+            DesktopTranscriptRowKind::EmptyPlaceholder,
+            "00".to_string(),
+            "履歴はまだありません".to_string(),
+            "依頼を送信すると、ユーザー入力、ツール実行、ファイル変更、最終応答がここに並びます。"
+                .to_string(),
+            Vec::new(),
+        ));
     }
-    normalize_completed_pseudo_tool_call_closeout(&mut rows, true);
     renumber_rows(rows)
+}
+
+fn desktop_transcript_row(
+    row_kind: DesktopTranscriptRowKind,
+    step: String,
+    title: String,
+    body: String,
+    file_changes: Vec<DesktopFileChangeRow>,
+) -> DesktopTranscriptRow {
+    DesktopTranscriptRow {
+        row_kind,
+        kind: row_kind.key().to_string(),
+        step,
+        title,
+        body,
+        file_changes,
+    }
 }
 
 fn ordered_turn_items_for_projection(
@@ -422,13 +432,13 @@ fn flush_turn_transcript_group(
         return;
     }
     if !group.user_body.trim().is_empty() {
-        rows.push(DesktopTranscriptRow {
-            kind: "user".to_string(),
-            step: String::new(),
-            title: "ユーザー依頼".to_string(),
-            body: group.user_body.trim().to_string(),
-            file_changes: Vec::new(),
-        });
+        rows.push(desktop_transcript_row(
+            DesktopTranscriptRowKind::User,
+            String::new(),
+            "ユーザー依頼".to_string(),
+            group.user_body.trim().to_string(),
+            Vec::new(),
+        ));
     }
     rows.extend(group.system_rows.drain(..));
 
@@ -438,40 +448,41 @@ fn flush_turn_transcript_group(
     );
     let has_work_summary = turn_group_has_work_summary(group, &file_changes);
     if has_work_summary {
-        rows.push(DesktopTranscriptRow {
-            kind: turn_work_summary_kind(group).to_string(),
-            step: String::new(),
-            title: if show_session_elapsed_on_work_summary {
+        let row_kind = turn_work_summary_kind(group);
+        rows.push(desktop_transcript_row(
+            row_kind,
+            String::new(),
+            if show_session_elapsed_on_work_summary {
                 session_elapsed_label(session)
                     .map(|value| format!("{value}作業しました"))
                     .unwrap_or_else(|| "作業履歴 / 作業サマリ".to_string())
             } else {
                 "作業履歴 / 作業サマリ".to_string()
             },
-            body: turn_work_summary_body(group, &file_changes),
-            file_changes: Vec::new(),
-        });
+            turn_work_summary_body(group, &file_changes),
+            Vec::new(),
+        ));
     }
     for body in primary_assistant_bodies_for_turn_group(group, &file_changes) {
         if body.trim().is_empty() {
             continue;
         }
-        rows.push(DesktopTranscriptRow {
-            kind: "assistant".to_string(),
-            step: String::new(),
-            title: "応答".to_string(),
-            body: body.trim().to_string(),
-            file_changes: Vec::new(),
-        });
+        rows.push(desktop_transcript_row(
+            DesktopTranscriptRowKind::Assistant,
+            String::new(),
+            "応答".to_string(),
+            body.trim().to_string(),
+            Vec::new(),
+        ));
     }
     if !file_changes.is_empty() {
-        rows.push(DesktopTranscriptRow {
-            kind: "file_changes".to_string(),
-            step: String::new(),
-            title: "ファイル変更結果".to_string(),
-            body: file_change_transcript_body(&file_changes),
-            file_changes: file_changes.clone(),
-        });
+        rows.push(desktop_transcript_row(
+            DesktopTranscriptRowKind::FileChanges,
+            String::new(),
+            "ファイル変更結果".to_string(),
+            file_change_transcript_body(&file_changes),
+            file_changes.clone(),
+        ));
     }
 
     group.user_body.clear();
@@ -482,12 +493,20 @@ fn flush_turn_transcript_group(
     group.terminal_status = None;
 }
 
-fn turn_work_summary_kind(group: &TurnTranscriptGroup) -> &'static str {
+fn turn_work_summary_kind(group: &TurnTranscriptGroup) -> DesktopTranscriptRowKind {
     match group.terminal_status {
-        Some(crate::protocol::TurnTerminalStatus::Failed) => "work_summary_failed",
-        Some(crate::protocol::TurnTerminalStatus::Interrupted) => "work_summary_cancelled",
-        Some(crate::protocol::TurnTerminalStatus::AwaitingUser) => "work_summary_awaiting_user",
-        Some(crate::protocol::TurnTerminalStatus::Completed) | None => "work_summary_completed",
+        Some(crate::protocol::TurnTerminalStatus::Failed) => {
+            DesktopTranscriptRowKind::WorkSummaryFailed
+        }
+        Some(crate::protocol::TurnTerminalStatus::Interrupted) => {
+            DesktopTranscriptRowKind::WorkSummaryCancelled
+        }
+        Some(crate::protocol::TurnTerminalStatus::AwaitingUser) => {
+            DesktopTranscriptRowKind::WorkSummaryAwaitingUser
+        }
+        Some(crate::protocol::TurnTerminalStatus::Completed) | None => {
+            DesktopTranscriptRowKind::WorkSummaryCompleted
+        }
     }
 }
 
@@ -658,10 +677,12 @@ pub fn build_session_detail_from_app_state_with_session(
     session: Option<&SessionRecord>,
 ) -> DesktopSessionDetail {
     let session_state = state.session_state.clone().unwrap_or_default();
+    let transcript_rows = transcript_rows_with_context(state, session, &[]);
     DesktopSessionDetail {
         session_id: state.current_session_id.unwrap_or_else(SessionId::new),
+        thread_empty: transcript_rows_are_empty_placeholder(&transcript_rows),
         transcript_text: format_transcript_text(state),
-        transcript_rows: transcript_rows_with_context(state, session, &[]),
+        transcript_rows,
         tool_status_text: format_tool_status_text(state, &session_state, &state.sidebar_todos),
         progress_text: format_progress_text(state),
         run_status_text: format_run_status_text(state, &session_state),
@@ -670,8 +691,19 @@ pub fn build_session_detail_from_app_state_with_session(
         artifacts: Vec::new(),
         file_changes: Vec::new(),
         file_change_summary_text: "ファイル変更はまだありません。".to_string(),
+        artifact_preview_available: false,
         artifact_preview_text: "アーティファクトは選択されていません。".to_string(),
     }
+}
+
+fn transcript_rows_are_empty_placeholder(rows: &[DesktopTranscriptRow]) -> bool {
+    matches!(
+        rows,
+        [DesktopTranscriptRow {
+            row_kind: DesktopTranscriptRowKind::EmptyPlaceholder,
+            ..
+        }]
+    )
 }
 
 fn load_command_rows(workspace_root: &camino::Utf8Path) -> Vec<DesktopCommandRow> {
@@ -731,30 +763,31 @@ fn transcript_rows_with_context(
     file_changes: &[DesktopFileChangeRow],
 ) -> Vec<DesktopTranscriptRow> {
     let base_rows = if state.transcript_entries.is_empty() {
-        vec![DesktopTranscriptRow {
-            kind: "system".to_string(),
-            step: "00".to_string(),
-            title: "履歴はまだありません".to_string(),
-            body: "依頼を送信すると、ユーザー入力、ツール実行、ファイル変更、最終応答がここに並びます。".to_string(),
-            file_changes: Vec::new(),
-        }]
+        vec![desktop_transcript_row(
+            DesktopTranscriptRowKind::EmptyPlaceholder,
+            "00".to_string(),
+            "履歴はまだありません".to_string(),
+            "依頼を送信すると、ユーザー入力、ツール実行、ファイル変更、最終応答がここに並びます。"
+                .to_string(),
+            Vec::new(),
+        )]
     } else {
         state
             .transcript_entries
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                let kind = transcript_kind_key(entry.kind);
-                if is_internal_transcript_projection(kind, &entry.title) {
+                let row_kind = transcript_row_kind_from_entry(entry.kind);
+                if is_internal_transcript_projection(row_kind, &entry.title) {
                     return None;
                 }
-                Some(DesktopTranscriptRow {
-                    kind: kind.to_string(),
-                    step: format!("{:02}", index + 1),
-                    title: entry_heading(entry.kind, &entry.title),
-                    body: entry.body.trim().to_string(),
-                    file_changes: Vec::new(),
-                })
+                Some(desktop_transcript_row(
+                    row_kind,
+                    format!("{:02}", index + 1),
+                    entry_heading(entry.kind, &entry.title),
+                    entry.body.trim().to_string(),
+                    Vec::new(),
+                ))
             })
             .collect::<Vec<_>>()
     };
@@ -779,11 +812,10 @@ fn transcript_rows_with_context(
     if let Some(work_summary) = work_summary {
         let insert_index = rows
             .iter()
-            .position(|row| row.kind == "assistant")
+            .position(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
             .unwrap_or(rows.len());
         rows.insert(insert_index, work_summary);
     }
-    normalize_completed_pseudo_tool_call_closeout(&mut rows, terminal);
     renumber_rows(rows)
 }
 
@@ -803,17 +835,22 @@ fn fold_intermediate_assistant_rows(
     if !should_fold {
         return rows;
     }
-    let last_assistant_index = rows
+    let last_assistant_index = rows.iter().rposition(|row| {
+        row.row_kind == DesktopTranscriptRowKind::Assistant && !row.body.trim().is_empty()
+    });
+    let assistant_count = rows
         .iter()
-        .rposition(|row| row.kind == "assistant" && !row.body.trim().is_empty());
-    let assistant_count = rows.iter().filter(|row| row.kind == "assistant").count();
+        .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
+        .count();
     if assistant_count <= 1 {
         return rows;
     }
     rows.into_iter()
         .enumerate()
         .filter_map(|(index, row)| {
-            if row.kind == "assistant" && Some(index) != last_assistant_index {
+            if row.row_kind == DesktopTranscriptRowKind::Assistant
+                && Some(index) != last_assistant_index
+            {
                 None
             } else {
                 Some(row)
@@ -822,60 +859,35 @@ fn fold_intermediate_assistant_rows(
         .collect()
 }
 
-fn normalize_completed_pseudo_tool_call_closeout(
-    rows: &mut Vec<DesktopTranscriptRow>,
-    terminal: bool,
-) {
-    if !terminal {
-        return;
-    }
-    let last_assistant_index = rows
-        .iter()
-        .rposition(|row| row.kind == "assistant" && !row.body.trim().is_empty());
-    let mut normalized = Vec::with_capacity(rows.len());
-    for (index, mut row) in rows.drain(..).enumerate() {
-        if row.kind == "assistant" && transcript_body_is_pseudo_tool_call_closeout(row.body.trim())
-        {
-            if Some(index) == last_assistant_index {
-                row.body = "完了しました。".to_string();
-                normalized.push(row);
-            }
-            continue;
-        }
-        normalized.push(row);
-    }
-    *rows = normalized;
-}
+const CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
+const CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
 
-fn transcript_body_is_pseudo_tool_call_closeout(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    lower.contains("<tool_call>")
-        || lower.contains("</tool_call>")
-        || lower.contains("&lt;tool_call")
-        || lower.contains("&lt;/tool_call")
-        || lower.contains("<function=")
-        || lower.contains("</function>")
-        || lower.contains("&lt;function=")
-        || lower.contains("&lt;/function")
-        || lower.contains("<parameter=command>")
-        || lower.contains("<parameter=path>")
-        || lower.contains("&lt;parameter=command")
-        || lower.contains("&lt;parameter=path")
-}
-
-pub fn completed_desktop_transcript_primary_reading_fixture_passes() -> bool {
-    let session = SessionRecord {
+fn desktop_query_provider_profile_session_record(title: &str) -> SessionRecord {
+    SessionRecord {
         id: SessionId::new(),
         project_id: ProjectId::new(),
-        title: "desktop transcript fixture".to_string(),
+        title: title.to_string(),
         status: SessionStatus::Completed,
-        cwd: camino::Utf8PathBuf::from("C:/workspace/desktop-transcript-fixture"),
-        model: "model".to_string(),
-        base_url: "http://localhost:1234".to_string(),
+        cwd: camino::Utf8PathBuf::from(format!("C:/workspace/{title}")),
+        model: CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL.to_string(),
+        base_url: CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL.to_string(),
         created_at_ms: 1_000,
         updated_at_ms: 6_000,
         completed_at_ms: Some(6_000),
-    };
+    }
+}
+
+pub(crate) fn desktop_query_current_provider_profile_fixture_passes() -> bool {
+    let session = desktop_query_provider_profile_session_record("desktop-query-provider-fixture");
+    session.base_url == CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL
+        && session.model == CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL
+        && completed_desktop_transcript_primary_reading_fixture_passes()
+        && desktop_turn_item_projection_uses_turn_local_sequence_fixture_passes()
+}
+
+pub fn completed_desktop_transcript_primary_reading_fixture_passes() -> bool {
+    let fixture_language_neutral_ref = "desktop_transcript_fixture_language_neutral";
+    let session = desktop_query_provider_profile_session_record("desktop-transcript-fixture");
     let turn_id = crate::protocol::TurnId::new();
     let rows = transcript_rows_from_turn_items_with_context(
         &session,
@@ -887,7 +899,7 @@ pub fn completed_desktop_transcript_primary_reading_fixture_passes() -> bool {
                 source_item_id: None,
                 sequence_no: 1,
                 payload: crate::protocol::TurnItemPayload::UserMessage {
-                    text: "component.py と test_component.py を作成".to_string(),
+                    text: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
                 },
             },
             crate::protocol::TurnItem {
@@ -910,8 +922,8 @@ pub fn completed_desktop_transcript_primary_reading_fixture_passes() -> bool {
                     call_id: crate::session::ToolCallId::new(),
                     tool: crate::tool::ToolName::Shell,
                     status: crate::protocol::ToolLifecycleStatus::Completed,
-                    title: "python -m unittest".to_string(),
-                    summary: "Command: python -m unittest\n\nStdout:\nOK".to_string(),
+                    title: "verify-contract --behavior".to_string(),
+                    summary: "Command: verify-contract --behavior\n\nStdout:\nOK".to_string(),
                 },
             },
             crate::protocol::TurnItem {
@@ -921,15 +933,16 @@ pub fn completed_desktop_transcript_primary_reading_fixture_passes() -> bool {
                 source_item_id: None,
                 sequence_no: 4,
                 payload: crate::protocol::TurnItemPayload::FileChange {
+                    call_id: crate::session::ToolCallId::new(),
                     change_ids: vec![crate::session::ChangeId::new()],
                     changes: vec![crate::protocol::FileChangeEvidence {
                         change_id: crate::session::ChangeId::new(),
                         kind: ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(camino::Utf8PathBuf::from("component.py")),
-                        summary: "Added component.py".to_string(),
+                        path_after: Some(camino::Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     }],
-                    summary: "Added component.py".to_string(),
+                    summary: "Added src/workflow.rs".to_string(),
                 },
             },
             crate::protocol::TurnItem {
@@ -950,7 +963,7 @@ pub fn completed_desktop_transcript_primary_reading_fixture_passes() -> bool {
                 source_item_id: None,
                 sequence_no: 6,
                 payload: crate::protocol::TurnItemPayload::AgentMessage {
-                    text: "完了しました。component.py を作成し、python -m unittest は成功しました。".to_string(),
+                    text: "完了しました。src/workflow.rs を作成し、verify-contract --behavior は成功しました。".to_string(),
                 },
             },
         ],
@@ -964,6 +977,7 @@ pub fn completed_desktop_transcript_primary_reading_fixture_passes() -> bool {
         && assistant_rows[0].body.contains("完了しました")
         && rows.iter().any(|row| row.kind == "work_summary_completed")
         && rows.iter().any(|row| row.kind == "file_changes")
+        && fixture_language_neutral_ref == "desktop_transcript_fixture_language_neutral"
         && !rows.iter().any(|row| {
             row.kind == "assistant"
                 && (row.body.contains("Turn control projection surface")
@@ -972,19 +986,53 @@ pub fn completed_desktop_transcript_primary_reading_fixture_passes() -> bool {
         })
 }
 
-pub(crate) fn desktop_turn_item_projection_uses_turn_local_sequence_fixture_passes() -> bool {
-    let session = SessionRecord {
-        id: SessionId::new(),
-        project_id: ProjectId::new(),
-        title: "desktop turn order fixture".to_string(),
+pub fn desktop_pseudo_tool_call_closeout_evidence_preserved_fixture_passes() -> bool {
+    let mut state = AppState::default();
+    state.run_status = RunStatus::Completed;
+    state.last_summary = Some(crate::session::RunSummary {
+        session_id: SessionId::new(),
+        assistant_message_id: None,
         status: SessionStatus::Completed,
-        cwd: camino::Utf8PathBuf::from("C:/workspace/desktop-turn-order-fixture"),
-        model: "model".to_string(),
-        base_url: "http://localhost:1234".to_string(),
-        created_at_ms: 1_000,
-        updated_at_ms: 2_000,
-        completed_at_ms: Some(2_000),
-    };
+        finish_reason: None,
+        tool_call_count: 1,
+        failed_tool_count: 0,
+        change_count: 1,
+    });
+    state.transcript_entries = vec![
+        crate::tui::state::TranscriptEntry {
+            kind: TranscriptKind::User,
+            title: "User".to_string(),
+            body: "workflow artifact を作成".to_string(),
+            message_id: None,
+            tool_call_id: None,
+        },
+        crate::tui::state::TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            title: "Assistant".to_string(),
+            body: "検証済みです。\n<tool_call>\n<function=shell>\n<parameter=command>\nverify-contract --behavior\n</parameter>\n</function>\n</tool_call>"
+                .to_string(),
+            message_id: None,
+            tool_call_id: None,
+        },
+    ];
+
+    let rows = transcript_rows_with_context(&state, None, &[]);
+    let assistant_rows = rows
+        .iter()
+        .filter(|row| row.kind == "assistant")
+        .collect::<Vec<_>>();
+
+    assistant_rows.len() == 1
+        && assistant_rows[0].body.contains("<tool_call>")
+        && assistant_rows[0].body.contains("<parameter=command>")
+        && assistant_rows[0].body != "完了しました。"
+        && rows.iter().any(|row| row.kind == "work_summary_completed")
+}
+
+pub(crate) fn desktop_turn_item_projection_uses_turn_local_sequence_fixture_passes() -> bool {
+    let mut session = desktop_query_provider_profile_session_record("desktop-turn-order-fixture");
+    session.updated_at_ms = 2_000;
+    session.completed_at_ms = Some(2_000);
     let turn_id = crate::protocol::TurnId::new();
     let rows = transcript_rows_from_turn_items_with_context(
         &session,
@@ -996,15 +1044,16 @@ pub(crate) fn desktop_turn_item_projection_uses_turn_local_sequence_fixture_pass
                 source_item_id: None,
                 sequence_no: 3,
                 payload: crate::protocol::TurnItemPayload::FileChange {
+                    call_id: crate::session::ToolCallId::new(),
                     change_ids: vec![crate::session::ChangeId::new()],
                     changes: vec![crate::protocol::FileChangeEvidence {
                         change_id: crate::session::ChangeId::new(),
                         kind: ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(camino::Utf8PathBuf::from("component.py")),
-                        summary: "Added component.py".to_string(),
+                        path_after: Some(camino::Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     }],
-                    summary: "Added component.py".to_string(),
+                    summary: "Added src/workflow.rs".to_string(),
                 },
             },
             crate::protocol::TurnItem {
@@ -1014,7 +1063,7 @@ pub(crate) fn desktop_turn_item_projection_uses_turn_local_sequence_fixture_pass
                 source_item_id: None,
                 sequence_no: 1,
                 payload: crate::protocol::TurnItemPayload::UserMessage {
-                    text: "component.py を作成".to_string(),
+                    text: "src/workflow.rs を作成".to_string(),
                 },
             },
             crate::protocol::TurnItem {
@@ -1037,15 +1086,15 @@ pub(crate) fn desktop_turn_item_projection_uses_turn_local_sequence_fixture_pass
                     call_id: crate::session::ToolCallId::new(),
                     tool: crate::tool::ToolName::Write,
                     status: crate::protocol::ToolLifecycleStatus::Completed,
-                    title: "write component.py".to_string(),
-                    summary: "wrote component.py".to_string(),
+                    title: "write src/workflow.rs".to_string(),
+                    summary: "wrote src/workflow.rs".to_string(),
                 },
             },
         ],
     );
     let user = rows
         .iter()
-        .position(|row| row.kind == "user" && row.body.contains("component.py"));
+        .position(|row| row.kind == "user" && row.body.contains("src/workflow.rs"));
     let summary = rows
         .iter()
         .position(|row| row.kind == "work_summary_completed");
@@ -1060,6 +1109,96 @@ pub(crate) fn desktop_turn_item_projection_uses_turn_local_sequence_fixture_pass
     )
 }
 
+pub(crate) fn desktop_query_todo_status_typed_projection_fixture_passes() -> bool {
+    let todos = vec![
+        TodoItem::simple(
+            "workflow source ready",
+            TodoStatus::Completed,
+            crate::session::TodoPriority::High,
+        ),
+        TodoItem::simple(
+            "workflow verification running",
+            TodoStatus::InProgress,
+            crate::session::TodoPriority::High,
+        ),
+        TodoItem::simple(
+            "workflow release blocked",
+            TodoStatus::Blocked,
+            crate::session::TodoPriority::Medium,
+        ),
+        TodoItem::simple(
+            "workflow follow-up queued",
+            TodoStatus::Pending,
+            crate::session::TodoPriority::Low,
+        ),
+        TodoItem::simple(
+            "workflow obsolete branch",
+            TodoStatus::Cancelled,
+            crate::session::TodoPriority::Low,
+        ),
+    ];
+    let title = task_summary_title(&todos);
+    let rows = format_todo_rows(&todos);
+    let mut state = AppState::default();
+    state.sidebar_todos = todos.clone();
+    let tool_status_text =
+        format_tool_status_text(&state, &SessionStateSnapshot::default(), &todos);
+
+    title == "タスク進捗 1/5 完了, 1件ブロック"
+        && rows.contains("✓ workflow source ready  (状態: 完了")
+        && rows.contains("● workflow verification running  (状態: 進行中")
+        && rows.contains("! workflow release blocked  (状態: ブロック")
+        && rows.contains("○ workflow follow-up queued  (状態: 未着手")
+        && rows.contains("○ workflow obsolete branch  (状態: 停止")
+        && tool_status_text.contains("- [完了] workflow source ready")
+        && tool_status_text.contains("- [進行中] workflow verification running")
+        && tool_status_text.contains("- [ブロック] workflow release blocked")
+        && tool_status_text.contains("- [停止] workflow obsolete branch")
+}
+
+pub(crate) fn desktop_transcript_row_kind_typed_projection_fixture_passes() -> bool {
+    let mut state = AppState::default();
+    state.run_status = RunStatus::Completed;
+    let mut intermediate = desktop_transcript_row(
+        DesktopTranscriptRowKind::Assistant,
+        "01".to_string(),
+        "応答".to_string(),
+        "中間応答".to_string(),
+        Vec::new(),
+    );
+    let mut final_answer = desktop_transcript_row(
+        DesktopTranscriptRowKind::Assistant,
+        "02".to_string(),
+        "応答".to_string(),
+        "完了しました。".to_string(),
+        Vec::new(),
+    );
+    intermediate.kind = DesktopTranscriptRowKind::System.key().to_string();
+    final_answer.kind = DesktopTranscriptRowKind::System.key().to_string();
+    let file_changes = vec![DesktopFileChangeRow {
+        label: "workflow.rs".to_string(),
+        path: "src/workflow.rs".to_string(),
+        kind: ChangeKind::Add,
+        action: "追加".to_string(),
+        summary: "Added src/workflow.rs".to_string(),
+        tool_call_ids: vec![crate::session::ToolCallId::new()],
+    }];
+
+    let folded = fold_intermediate_assistant_rows(
+        vec![intermediate, final_answer],
+        &state,
+        &file_changes,
+        true,
+        true,
+    );
+
+    folded.len() == 1
+        && folded[0].row_kind == DesktopTranscriptRowKind::Assistant
+        && folded[0].kind == DesktopTranscriptRowKind::System.key()
+        && folded[0].body.contains("完了しました")
+        && DesktopTranscriptRowKind::FileChanges.key() == "file_changes"
+}
+
 fn session_status_is_terminal(status: SessionStatus) -> bool {
     matches!(
         status,
@@ -1070,11 +1209,17 @@ fn session_status_is_terminal(status: SessionStatus) -> bool {
     )
 }
 
-fn is_internal_transcript_projection(kind: &str, title: &str) -> bool {
-    matches!(kind, "tool" | "summary" | "diff" | "reasoning" | "editing")
-        || matches!(kind, "system")
-            && !title.eq_ignore_ascii_case("User")
-            && !title.eq_ignore_ascii_case("Context Compaction")
+fn is_internal_transcript_projection(kind: DesktopTranscriptRowKind, title: &str) -> bool {
+    matches!(
+        kind,
+        DesktopTranscriptRowKind::Tool
+            | DesktopTranscriptRowKind::Summary
+            | DesktopTranscriptRowKind::Diff
+            | DesktopTranscriptRowKind::Reasoning
+            | DesktopTranscriptRowKind::Editing
+    ) || matches!(kind, DesktopTranscriptRowKind::System)
+        && !title.eq_ignore_ascii_case("User")
+        && !title.eq_ignore_ascii_case("Context Compaction")
 }
 
 fn work_summary_row(
@@ -1092,18 +1237,19 @@ fn work_summary_row(
     }
 
     let kind = match state.run_status {
-        RunStatus::Running | RunStatus::Confirming => "work_summary_running",
-        RunStatus::Failed => "work_summary_failed",
-        RunStatus::Cancelled => "work_summary_cancelled",
-        _ => "work_summary_completed",
+        RunStatus::Running | RunStatus::Confirming => DesktopTranscriptRowKind::WorkSummaryRunning,
+        RunStatus::Failed => DesktopTranscriptRowKind::WorkSummaryFailed,
+        RunStatus::Cancelled => DesktopTranscriptRowKind::WorkSummaryCancelled,
+        RunStatus::AwaitingUser => DesktopTranscriptRowKind::WorkSummaryAwaitingUser,
+        _ => DesktopTranscriptRowKind::WorkSummaryCompleted,
     };
-    Some(DesktopTranscriptRow {
-        kind: kind.to_string(),
-        step: String::new(),
-        title: work_summary_title(state, session),
-        body: work_summary_body(state, file_changes),
-        file_changes: Vec::new(),
-    })
+    Some(desktop_transcript_row(
+        kind,
+        String::new(),
+        work_summary_title(state, session),
+        work_summary_body(state, file_changes),
+        Vec::new(),
+    ))
 }
 
 fn work_summary_title(state: &AppState, session: Option<&SessionRecord>) -> String {
@@ -1282,11 +1428,11 @@ fn renumber_rows(mut rows: Vec<DesktopTranscriptRow>) -> Vec<DesktopTranscriptRo
 fn task_summary_title(todos: &[TodoItem]) -> String {
     let completed = todos
         .iter()
-        .filter(|todo| format!("{:?}", todo.status) == "Completed")
+        .filter(|todo| matches!(todo.status, TodoStatus::Completed))
         .count();
     let blocked = todos
         .iter()
-        .filter(|todo| format!("{:?}", todo.status) == "Blocked")
+        .filter(|todo| matches!(todo.status, TodoStatus::Blocked))
         .count();
     if blocked > 0 {
         format!(
@@ -1302,16 +1448,11 @@ fn format_todo_rows(todos: &[TodoItem]) -> String {
     todos
         .iter()
         .map(|todo| {
-            let marker = match format!("{:?}", todo.status).as_str() {
-                "Completed" => "✓",
-                "InProgress" => "●",
-                "Blocked" => "!",
-                _ => "○",
-            };
+            let marker = todo_status_marker(todo.status);
             format!(
                 "{marker} {}  (状態: {} / 種別: {:?})",
                 todo.content,
-                todo_status_label(&format!("{:?}", todo.status)),
+                todo_status_label(todo.status),
                 todo.kind
             )
         })
@@ -1338,17 +1479,17 @@ fn format_command_summary_title(tools: &[crate::tui::state::ToolStatusView]) -> 
     }
 }
 
-fn transcript_kind_key(kind: TranscriptKind) -> &'static str {
+fn transcript_row_kind_from_entry(kind: TranscriptKind) -> DesktopTranscriptRowKind {
     match kind {
-        TranscriptKind::User => "user",
-        TranscriptKind::Assistant => "assistant",
-        TranscriptKind::Reasoning => "reasoning",
-        TranscriptKind::Editing => "editing",
-        TranscriptKind::Tool => "tool",
-        TranscriptKind::CommandSummary => "summary",
-        TranscriptKind::Diff => "diff",
-        TranscriptKind::System => "system",
-        TranscriptKind::Error => "error",
+        TranscriptKind::User => DesktopTranscriptRowKind::User,
+        TranscriptKind::Assistant => DesktopTranscriptRowKind::Assistant,
+        TranscriptKind::Reasoning => DesktopTranscriptRowKind::Reasoning,
+        TranscriptKind::Editing => DesktopTranscriptRowKind::Editing,
+        TranscriptKind::Tool => DesktopTranscriptRowKind::Tool,
+        TranscriptKind::CommandSummary => DesktopTranscriptRowKind::Summary,
+        TranscriptKind::Diff => DesktopTranscriptRowKind::Diff,
+        TranscriptKind::System => DesktopTranscriptRowKind::System,
+        TranscriptKind::Error => DesktopTranscriptRowKind::Error,
     }
 }
 
@@ -1383,13 +1524,11 @@ fn format_tool_status_text(
     if !todos.is_empty() {
         lines.push(String::new());
         lines.push("タスク:".to_string());
-        lines.extend(todos.iter().map(|todo| {
-            format!(
-                "- [{}] {}",
-                todo_status_label(&format!("{:?}", todo.status)),
-                todo.content
-            )
-        }));
+        lines.extend(
+            todos
+                .iter()
+                .map(|todo| format!("- [{}] {}", todo_status_label(todo.status), todo.content)),
+        );
     }
     if let Some(summary) = &session_state.completion.route_contract_summary {
         lines.push(String::new());
@@ -1532,12 +1671,22 @@ fn entry_heading(kind: TranscriptKind, title: &str) -> String {
     }
 }
 
-fn todo_status_label(status: &str) -> &'static str {
+fn todo_status_marker(status: TodoStatus) -> &'static str {
     match status {
-        "Completed" => "完了",
-        "InProgress" => "進行中",
-        "Blocked" => "ブロック",
-        _ => "未着手",
+        TodoStatus::Completed => "✓",
+        TodoStatus::InProgress => "●",
+        TodoStatus::Blocked => "!",
+        TodoStatus::Pending | TodoStatus::Cancelled => "○",
+    }
+}
+
+fn todo_status_label(status: TodoStatus) -> &'static str {
+    match status {
+        TodoStatus::Completed => "完了",
+        TodoStatus::InProgress => "進行中",
+        TodoStatus::Blocked => "ブロック",
+        TodoStatus::Pending => "未着手",
+        TodoStatus::Cancelled => "停止",
     }
 }
 
@@ -1568,18 +1717,12 @@ mod tests {
     use camino::Utf8PathBuf;
 
     fn session_record(project_id: ProjectId, title: &str) -> SessionRecord {
-        SessionRecord {
-            id: SessionId::new(),
-            project_id,
-            title: title.to_string(),
-            status: SessionStatus::Completed,
-            cwd: Utf8PathBuf::from(format!("C:/workspace/{title}")),
-            model: "model".to_string(),
-            base_url: "http://localhost:1234".to_string(),
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            completed_at_ms: Some(2),
-        }
+        let mut session = desktop_query_provider_profile_session_record(title);
+        session.project_id = project_id;
+        session.created_at_ms = 1;
+        session.updated_at_ms = 2;
+        session.completed_at_ms = Some(2);
+        session
     }
 
     #[test]
@@ -1710,6 +1853,7 @@ mod tests {
             source_item_id: None,
             sequence_no: 1,
             payload: TurnItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![crate::session::ChangeId::new()],
                 changes: vec![FileChangeEvidence {
                     change_id: crate::session::ChangeId::new(),
@@ -1758,8 +1902,9 @@ mod tests {
                     call_id: crate::session::ToolCallId::new(),
                     tool: crate::tool::ToolName::Write,
                     status: crate::protocol::ToolLifecycleStatus::Completed,
-                    title: "Updated a.py".to_string(),
-                    summary: "Command: write\n\nStdout:\nupdated a.py".to_string(),
+                    title: "Updated docs/workflow-notes.md".to_string(),
+                    summary: "Command: write\n\nStdout:\nupdated docs/workflow-notes.md"
+                        .to_string(),
                 },
             },
             TurnItem {
@@ -1769,12 +1914,13 @@ mod tests {
                 source_item_id: None,
                 sequence_no: 3,
                 payload: TurnItemPayload::FileChange {
+                    call_id: crate::session::ToolCallId::new(),
                     change_ids: vec![crate::session::ChangeId::new()],
                     changes: vec![FileChangeEvidence {
                         change_id: crate::session::ChangeId::new(),
                         kind: ChangeKind::Update,
-                        path_before: Some(Utf8PathBuf::from("a.py")),
-                        path_after: Some(Utf8PathBuf::from("a.py")),
+                        path_before: Some(Utf8PathBuf::from("docs/workflow-notes.md")),
+                        path_after: Some(Utf8PathBuf::from("docs/workflow-notes.md")),
                         summary: "A change".to_string(),
                     }],
                     summary: "A change".to_string(),
@@ -1807,12 +1953,13 @@ mod tests {
                 source_item_id: None,
                 sequence_no: 2,
                 payload: TurnItemPayload::FileChange {
+                    call_id: crate::session::ToolCallId::new(),
                     change_ids: vec![crate::session::ChangeId::new()],
                     changes: vec![FileChangeEvidence {
                         change_id: crate::session::ChangeId::new(),
                         kind: ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("b.py")),
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.contract")),
                         summary: "B change".to_string(),
                     }],
                     summary: "B change".to_string(),
@@ -1837,7 +1984,9 @@ mod tests {
             .expect("user A row");
         let index_change_a = rows
             .iter()
-            .position(|row| row.kind == "file_changes" && row.body.contains("a.py"))
+            .position(|row| {
+                row.kind == "file_changes" && row.body.contains("docs/workflow-notes.md")
+            })
             .expect("file change A row");
         let index_assistant_a = rows
             .iter()
@@ -1849,7 +1998,9 @@ mod tests {
             .expect("user B row");
         let index_change_b = rows
             .iter()
-            .position(|row| row.kind == "file_changes" && row.body.contains("b.py"))
+            .position(|row| {
+                row.kind == "file_changes" && row.body.contains("tests/workflow.contract")
+            })
             .expect("file change B row");
         let index_assistant_b = rows
             .iter()
@@ -1869,10 +2020,16 @@ mod tests {
         );
         assert_eq!(rows[index_change_a].file_changes.len(), 1);
         assert_eq!(rows[index_change_a].file_changes[0].action, "更新");
-        assert_eq!(rows[index_change_a].file_changes[0].path, "a.py");
+        assert_eq!(
+            rows[index_change_a].file_changes[0].path,
+            "docs/workflow-notes.md"
+        );
         assert_eq!(rows[index_change_b].file_changes.len(), 1);
         assert_eq!(rows[index_change_b].file_changes[0].action, "追加");
-        assert_eq!(rows[index_change_b].file_changes[0].path, "b.py");
+        assert_eq!(
+            rows[index_change_b].file_changes[0].path,
+            "tests/workflow.contract"
+        );
         assert!(
             rows.iter()
                 .filter(|row| row.kind.starts_with("work_summary"))
@@ -1884,7 +2041,7 @@ mod tests {
     #[test]
     fn file_change_rows_normalize_workspace_paths_and_collapse_session_edits() {
         let session_id = SessionId::new();
-        let workspace_root = Utf8PathBuf::from("C:/workspace/component");
+        let workspace_root = Utf8PathBuf::from("C:/workspace/workflow");
         let turn_items = vec![TurnItem {
             id: crate::protocol::TurnItemId::new(),
             session_id,
@@ -1892,39 +2049,44 @@ mod tests {
             source_item_id: None,
             sequence_no: 1,
             payload: TurnItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![crate::session::ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: crate::session::ChangeId::new(),
                         kind: ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("component.py")),
-                        summary: "Added component.py".to_string(),
-                    },
-                    FileChangeEvidence {
-                        change_id: crate::session::ChangeId::new(),
-                        kind: ChangeKind::Update,
-                        path_before: Some(Utf8PathBuf::from("C:/workspace/component/component.py")),
-                        path_after: Some(Utf8PathBuf::from("C:/workspace/component/component.py")),
-                        summary: "Updated component.py".to_string(),
-                    },
-                    FileChangeEvidence {
-                        change_id: crate::session::ChangeId::new(),
-                        kind: ChangeKind::Add,
-                        path_before: None,
-                        path_after: Some(Utf8PathBuf::from("test_component.py")),
-                        summary: "Added test_component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: crate::session::ChangeId::new(),
                         kind: ChangeKind::Update,
                         path_before: Some(Utf8PathBuf::from(
-                            "C:/workspace/component/test_component.py",
+                            "C:/workspace/workflow/src/workflow.rs",
                         )),
                         path_after: Some(Utf8PathBuf::from(
-                            "C:/workspace/component/test_component.py",
+                            "C:/workspace/workflow/src/workflow.rs",
                         )),
-                        summary: "Updated test_component.py".to_string(),
+                        summary: "Updated src/workflow.rs".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: crate::session::ChangeId::new(),
+                        kind: ChangeKind::Add,
+                        path_before: None,
+                        path_after: Some(Utf8PathBuf::from("tests/workflow.contract")),
+                        summary: "Added tests/workflow.contract".to_string(),
+                    },
+                    FileChangeEvidence {
+                        change_id: crate::session::ChangeId::new(),
+                        kind: ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from(
+                            "C:/workspace/workflow/tests/workflow.contract",
+                        )),
+                        path_after: Some(Utf8PathBuf::from(
+                            "C:/workspace/workflow/tests/workflow.contract",
+                        )),
+                        summary: "Updated tests/workflow.contract".to_string(),
                     },
                 ],
                 summary: "Updated files".to_string(),
@@ -1934,16 +2096,16 @@ mod tests {
         let rows = file_change_rows_from_turn_items_with_root(&turn_items, Some(&workspace_root));
 
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].path, "component.py");
+        assert_eq!(rows[0].path, "src/workflow.rs");
         assert_eq!(rows[0].action, "追加");
-        assert_eq!(rows[0].summary, "Updated component.py");
-        assert_eq!(rows[1].path, "test_component.py");
+        assert_eq!(rows[0].summary, "Updated src/workflow.rs");
+        assert_eq!(rows[1].path, "tests/workflow.contract");
         assert_eq!(rows[1].action, "追加");
-        assert_eq!(rows[1].summary, "Updated test_component.py");
+        assert_eq!(rows[1].summary, "Updated tests/workflow.contract");
     }
 
     #[test]
-    fn file_change_rows_hide_runtime_cache_files_from_user_history() {
+    fn file_change_rows_preserve_runtime_cache_files_in_user_history() {
         let session_id = SessionId::new();
         let turn_items = vec![TurnItem {
             id: crate::protocol::TurnItemId::new(),
@@ -1952,21 +2114,26 @@ mod tests {
             source_item_id: None,
             sequence_no: 1,
             payload: TurnItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
                 change_ids: vec![crate::session::ChangeId::new()],
                 changes: vec![
                     FileChangeEvidence {
                         change_id: crate::session::ChangeId::new(),
                         kind: ChangeKind::Update,
-                        path_before: Some(Utf8PathBuf::from("__pycache__/arcade_game.pyc")),
-                        path_after: Some(Utf8PathBuf::from("__pycache__/arcade_game.pyc")),
+                        path_before: Some(Utf8PathBuf::from(
+                            "build-artifacts/cache/workflow.snapshot",
+                        )),
+                        path_after: Some(Utf8PathBuf::from(
+                            "build-artifacts/cache/workflow.snapshot",
+                        )),
                         summary: "Updated runtime cache".to_string(),
                     },
                     FileChangeEvidence {
                         change_id: crate::session::ChangeId::new(),
                         kind: ChangeKind::Update,
-                        path_before: Some(Utf8PathBuf::from("arcade_game.py")),
-                        path_after: Some(Utf8PathBuf::from("arcade_game.py")),
-                        summary: "Updated game logic".to_string(),
+                        path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Updated workflow logic".to_string(),
                     },
                 ],
                 summary: "Updated files".to_string(),
@@ -1975,31 +2142,37 @@ mod tests {
 
         let rows = file_change_rows_from_turn_items(&turn_items);
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].path, "arcade_game.py");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].path, "build-artifacts/cache/workflow.snapshot");
+        assert_eq!(rows[1].path, "src/workflow.rs");
     }
 
     #[test]
-    fn artifact_rows_hide_runtime_cache_files() {
+    fn artifact_rows_preserve_runtime_cache_files() {
         let rows = vec![
             DesktopFileChangeRow {
-                label: "component.py".to_string(),
-                path: "component.py".to_string(),
+                label: "workflow.rs".to_string(),
+                path: "src/workflow.rs".to_string(),
+                kind: crate::session::ChangeKind::Add,
                 action: "add".to_string(),
                 summary: String::new(),
+                tool_call_ids: vec![crate::session::ToolCallId::new()],
             },
             DesktopFileChangeRow {
-                label: "component.cpython-313.pyc".to_string(),
-                path: "__pycache__/component.cpython-313.pyc".to_string(),
+                label: "workflow.snapshot".to_string(),
+                path: "build-artifacts/cache/workflow.snapshot".to_string(),
+                kind: crate::session::ChangeKind::Add,
                 action: "add".to_string(),
                 summary: String::new(),
+                tool_call_ids: vec![crate::session::ToolCallId::new()],
             },
         ];
 
         let artifacts = artifact_rows_from_file_changes(&rows);
 
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].path, "component.py");
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].path, "build-artifacts/cache/workflow.snapshot");
+        assert_eq!(artifacts[1].path, "src/workflow.rs");
     }
 
     #[test]
@@ -2009,21 +2182,21 @@ mod tests {
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
-                body: "create component.py".to_string(),
+                body: "create src/workflow.rs".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Tool,
                 title: "write".to_string(),
-                body: "component.py [Completed]".to_string(),
+                body: "src/workflow.rs [Completed]".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Diff,
                 title: "File changes".to_string(),
-                body: "Added component.py".to_string(),
+                body: "Added src/workflow.rs".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
@@ -2053,7 +2226,7 @@ mod tests {
         state.tool_statuses = vec![crate::tui::state::ToolStatusView {
             tool_call_id: crate::session::ToolCallId::new(),
             tool: crate::tool::ToolName::Shell,
-            title: "python -m unittest".to_string(),
+            title: "verify-contract --behavior".to_string(),
             status: ToolCallStatus::Completed,
             summary: Some("tests passed".to_string()),
             error: None,
@@ -2067,16 +2240,16 @@ mod tests {
         assert!(!rows.iter().any(|row| row.kind == "tool"));
 
         state.run_status = RunStatus::Running;
-        state.progress.active_step = "Running python -m unittest".to_string();
+        state.progress.active_step = "Running verify-contract --behavior".to_string();
         state.progress.current_phase = "tool".to_string();
         state.sidebar_todos = vec![
             TodoItem::simple(
-                "component.pyを作成",
+                "src/workflow.rsを作成",
                 crate::session::TodoStatus::Completed,
                 crate::session::TodoPriority::High,
             ),
             TodoItem::simple(
-                "unit testを実行",
+                "contract verificationを実行",
                 crate::session::TodoStatus::InProgress,
                 crate::session::TodoPriority::High,
             ),
@@ -2105,7 +2278,7 @@ mod tests {
     #[test]
     fn stored_session_work_summary_uses_elapsed_time_and_hides_internal_rows() {
         let project_id = ProjectId::new();
-        let mut session = session_record(project_id, "component");
+        let mut session = session_record(project_id, "workflow");
         session.created_at_ms = 1_000;
         session.updated_at_ms = 108_000;
         session.completed_at_ms = Some(108_000);
@@ -2119,7 +2292,7 @@ mod tests {
                 source_item_id: None,
                 sequence_no: 1,
                 payload: TurnItemPayload::UserMessage {
-                    text: "make a component".to_string(),
+                    text: "make a workflow artifact".to_string(),
                 },
             },
             TurnItem {
@@ -2132,8 +2305,8 @@ mod tests {
                     call_id: crate::session::ToolCallId::new(),
                     tool: crate::tool::ToolName::Shell,
                     status: crate::protocol::ToolLifecycleStatus::Completed,
-                    title: "python -m unittest".to_string(),
-                    summary: "Command: python -m unittest\n\nStdout:\nOK".to_string(),
+                    title: "verify-contract --behavior".to_string(),
+                    summary: "Command: verify-contract --behavior\n\nStdout:\nOK".to_string(),
                 },
             },
             TurnItem {
@@ -2168,7 +2341,7 @@ mod tests {
                 source_item_id: None,
                 sequence_no: 5,
                 payload: TurnItemPayload::AgentMessage {
-                    text: "component.pyを追加しました。".to_string(),
+                    text: "src/workflow.rsを追加しました。".to_string(),
                 },
             },
         ];
@@ -2200,13 +2373,13 @@ mod tests {
             detail
                 .transcript_rows
                 .iter()
-                .any(|row| row.kind == "assistant" && row.body.contains("component.py"))
+                .any(|row| row.kind == "assistant" && row.body.contains("src/workflow.rs"))
         );
     }
 
     #[test]
     fn completed_turn_item_transcript_folds_intermediate_assistant_control_feedback() {
-        let session = session_record(ProjectId::new(), "component");
+        let session = session_record(ProjectId::new(), "workflow");
         let turn_id = crate::protocol::TurnId::new();
         let turn_items = vec![
             TurnItem {
@@ -2216,7 +2389,7 @@ mod tests {
                 source_item_id: None,
                 sequence_no: 1,
                 payload: TurnItemPayload::UserMessage {
-                    text: "component.py と test_component.py を作成".to_string(),
+                    text: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
                 },
             },
             TurnItem {
@@ -2239,8 +2412,8 @@ mod tests {
                     call_id: crate::session::ToolCallId::new(),
                     tool: crate::tool::ToolName::Shell,
                     status: crate::protocol::ToolLifecycleStatus::Completed,
-                    title: "python -m unittest".to_string(),
-                    summary: "Command: python -m unittest\n\nStdout:\nOK".to_string(),
+                    title: "verify-contract --behavior".to_string(),
+                    summary: "Command: verify-contract --behavior\n\nStdout:\nOK".to_string(),
                 },
             },
             TurnItem {
@@ -2250,15 +2423,16 @@ mod tests {
                 source_item_id: None,
                 sequence_no: 4,
                 payload: TurnItemPayload::FileChange {
+                    call_id: crate::session::ToolCallId::new(),
                     change_ids: vec![crate::session::ChangeId::new()],
                     changes: vec![FileChangeEvidence {
                         change_id: crate::session::ChangeId::new(),
                         kind: ChangeKind::Add,
                         path_before: None,
-                        path_after: Some(Utf8PathBuf::from("component.py")),
-                        summary: "Added component.py".to_string(),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Added src/workflow.rs".to_string(),
                     }],
-                    summary: "Added component.py".to_string(),
+                    summary: "Added src/workflow.rs".to_string(),
                 },
             },
             TurnItem {
@@ -2279,8 +2453,9 @@ mod tests {
                 source_item_id: None,
                 sequence_no: 6,
                 payload: TurnItemPayload::AgentMessage {
-                    text: "完了しました。component.py を作成し、python -m unittest は成功しました。"
-                        .to_string(),
+                    text:
+                        "完了しました。src/workflow.rs を作成し、verify-contract --behavior は成功しました。"
+                            .to_string(),
                 },
             },
         ];
@@ -2316,6 +2491,11 @@ mod tests {
     }
 
     #[test]
+    fn desktop_transcript_row_kind_typed_projection() {
+        assert!(desktop_transcript_row_kind_typed_projection_fixture_passes());
+    }
+
+    #[test]
     fn completed_work_transcript_keeps_final_answer_and_folds_intermediate_assistant_prose() {
         let mut state = AppState::default();
         state.run_status = RunStatus::Completed;
@@ -2332,21 +2512,21 @@ mod tests {
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
-                body: "component.py と test_component.py を作成".to_string(),
+                body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
-                body: "まず test_component.py を作成します。".to_string(),
+                body: "まず tests/workflow.contract を作成します。".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
-                body: "次に component.py を作成します。".to_string(),
+                body: "次に src/workflow.rs を作成します。".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
@@ -2354,7 +2534,7 @@ mod tests {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
                 body:
-                    "完了しました。component.py と test_component.py を作成し、テストも通りました。"
+                    "完了しました。src/workflow.rs と tests/workflow.contract を作成し、検証も通りました。"
                         .to_string(),
                 message_id: None,
                 tool_call_id: None,
@@ -2363,7 +2543,7 @@ mod tests {
         state.tool_statuses = vec![crate::tui::state::ToolStatusView {
             tool_call_id: crate::session::ToolCallId::new(),
             tool: crate::tool::ToolName::Shell,
-            title: "python -m unittest".to_string(),
+            title: "verify-contract --behavior".to_string(),
             status: ToolCallStatus::Completed,
             summary: Some("tests passed".to_string()),
             error: None,
@@ -2381,12 +2561,12 @@ mod tests {
         assert!(
             !rows
                 .iter()
-                .any(|row| row.body.contains("まず test_component.py"))
+                .any(|row| row.body.contains("まず tests/workflow.contract"))
         );
     }
 
     #[test]
-    fn completed_work_transcript_replaces_pseudo_tool_call_closeout_body() {
+    fn completed_work_transcript_preserves_pseudo_tool_call_closeout_body() {
         let mut state = AppState::default();
         state.run_status = RunStatus::Completed;
         state.last_summary = Some(crate::session::RunSummary {
@@ -2402,14 +2582,14 @@ mod tests {
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
-                body: "component.py と test_component.py を作成".to_string(),
+                body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
-                body: "テストは成功しました。\n<tool_call>\n<function=shell>\n<parameter=command>\nGet-Content component.py -Head 5\n</parameter>\n</function>\n</tool_call>".to_string(),
+                body: "検証は成功しました。\n<tool_call>\n<function=shell>\n<parameter=command>\nverify-contract --behavior\n</parameter>\n</function>\n</tool_call>".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
@@ -2417,7 +2597,7 @@ mod tests {
         state.tool_statuses = vec![crate::tui::state::ToolStatusView {
             tool_call_id: crate::session::ToolCallId::new(),
             tool: crate::tool::ToolName::Shell,
-            title: "python -m unittest".to_string(),
+            title: "verify-contract --behavior".to_string(),
             status: ToolCallStatus::Completed,
             summary: Some("tests passed".to_string()),
             error: None,
@@ -2430,13 +2610,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(assistant_rows.len(), 1);
-        assert_eq!(assistant_rows[0].body, "完了しました。");
-        assert!(!rows.iter().any(|row| row.body.contains("<tool_call>")));
+        assert!(assistant_rows[0].body.contains("<tool_call>"));
+        assert!(assistant_rows[0].body.contains("<parameter=command>"));
+        assert_ne!(assistant_rows[0].body, "完了しました。");
         assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
     }
 
     #[test]
-    fn completed_work_transcript_removes_intermediate_pseudo_tool_call_rows() {
+    fn completed_work_transcript_folds_intermediate_assistant_rows() {
         let mut state = AppState::default();
         state.run_status = RunStatus::Completed;
         state.last_summary = Some(crate::session::RunSummary {
@@ -2452,21 +2633,21 @@ mod tests {
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
-                body: "component.py と test_component.py を作成".to_string(),
+                body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
-                body: "</parameter>\n</function>\n</tool_call>".to_string(),
+                body: "作業中です。verification evidence を確認しています。".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
-                body: "完了しました。component.py と test_component.py を作成しました。"
+                body: "完了しました。src/workflow.rs と tests/workflow.contract を作成しました。"
                     .to_string(),
                 message_id: None,
                 tool_call_id: None,
@@ -2475,7 +2656,7 @@ mod tests {
         state.tool_statuses = vec![crate::tui::state::ToolStatusView {
             tool_call_id: crate::session::ToolCallId::new(),
             tool: crate::tool::ToolName::Shell,
-            title: "python -m unittest".to_string(),
+            title: "verify-contract --behavior".to_string(),
             status: ToolCallStatus::Completed,
             summary: Some("tests passed".to_string()),
             error: None,
@@ -2488,13 +2669,17 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(assistant_rows.len(), 1);
-        assert!(assistant_rows[0].body.contains("component.py"));
-        assert!(!rows.iter().any(|row| row.body.contains("</tool_call>")));
+        assert!(assistant_rows[0].body.contains("src/workflow.rs"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.body.contains("verification evidence を確認"))
+        );
         assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
     }
 
     #[test]
-    fn completed_work_transcript_replaces_closing_tag_only_pseudo_tool_call_fragment() {
+    fn completed_work_transcript_preserves_closing_tag_only_pseudo_tool_call_fragment() {
         let mut state = AppState::default();
         state.run_status = RunStatus::Completed;
         state.last_summary = Some(crate::session::RunSummary {
@@ -2510,14 +2695,14 @@ mod tests {
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
-                body: "component.py と test_component.py を作成".to_string(),
+                body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
-                body: "if name == \"main\": main()\n</parameter> <parameter=path> component.py </parameter> </function> </tool_call>"
+                body: "workflow_state.ready = true\n</parameter> <parameter=path> src/workflow.rs </parameter> </function> </tool_call>"
                     .to_string(),
                 message_id: None,
                 tool_call_id: None,
@@ -2526,7 +2711,7 @@ mod tests {
         state.tool_statuses = vec![crate::tui::state::ToolStatusView {
             tool_call_id: crate::session::ToolCallId::new(),
             tool: crate::tool::ToolName::Shell,
-            title: "python -m unittest".to_string(),
+            title: "verify-contract --behavior".to_string(),
             status: ToolCallStatus::Completed,
             summary: Some("tests passed".to_string()),
             error: None,
@@ -2539,13 +2724,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(assistant_rows.len(), 1);
-        assert_eq!(assistant_rows[0].body, "完了しました。");
-        assert!(!rows.iter().any(|row| row.body.contains("</tool_call>")));
+        assert!(assistant_rows[0].body.contains("</tool_call>"));
+        assert!(assistant_rows[0].body.contains("<parameter=path>"));
+        assert_ne!(assistant_rows[0].body, "完了しました。");
         assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
     }
 
     #[test]
-    fn completed_work_transcript_replaces_html_escaped_pseudo_tool_call_fragment() {
+    fn completed_work_transcript_preserves_html_escaped_pseudo_tool_call_fragment() {
         let mut state = AppState::default();
         state.run_status = RunStatus::Completed;
         state.last_summary = Some(crate::session::RunSummary {
@@ -2561,14 +2747,14 @@ mod tests {
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
-                body: "component.py と test_component.py を作成".to_string(),
+                body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
-                body: "if name == \"main\": main()\n&lt;/parameter&gt; &lt;parameter=path&gt; component.py &lt;/parameter&gt; &lt;/function&gt; &lt;/tool_call&gt;"
+                body: "workflow_state.ready = true\n&lt;/parameter&gt; &lt;parameter=path&gt; src/workflow.rs &lt;/parameter&gt; &lt;/function&gt; &lt;/tool_call&gt;"
                     .to_string(),
                 message_id: None,
                 tool_call_id: None,
@@ -2577,7 +2763,7 @@ mod tests {
         state.tool_statuses = vec![crate::tui::state::ToolStatusView {
             tool_call_id: crate::session::ToolCallId::new(),
             tool: crate::tool::ToolName::Shell,
-            title: "python -m unittest".to_string(),
+            title: "verify-contract --behavior".to_string(),
             status: ToolCallStatus::Completed,
             summary: Some("tests passed".to_string()),
             error: None,
@@ -2590,15 +2776,16 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(assistant_rows.len(), 1);
-        assert_eq!(assistant_rows[0].body, "完了しました。");
-        assert!(!rows.iter().any(|row| row.body.contains("&lt;/tool_call")));
+        assert!(assistant_rows[0].body.contains("&lt;/tool_call"));
+        assert!(assistant_rows[0].body.contains("&lt;parameter=path"));
+        assert_ne!(assistant_rows[0].body, "完了しました。");
         assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
     }
 
     #[test]
-    fn reopened_completed_session_uses_session_status_for_pseudo_tool_call_cleanup() {
+    fn reopened_completed_session_preserves_pseudo_tool_call_closeout_evidence() {
         let project_id = ProjectId::new();
-        let session = session_record(project_id, "component");
+        let session = session_record(project_id, "workflow");
         let mut state = AppState::default();
         state.run_status = RunStatus::Idle;
         state.last_summary = Some(crate::session::RunSummary {
@@ -2614,14 +2801,14 @@ mod tests {
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
-                body: "component.py と test_component.py を作成".to_string(),
+                body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
-                body: "if name == \"main\": main()\n&lt;/parameter&gt; &lt;parameter=path&gt; component.py &lt;/parameter&gt; &lt;/function&gt; &lt;/tool_call&gt;"
+                body: "workflow_state.ready = true\n&lt;/parameter&gt; &lt;parameter=path&gt; src/workflow.rs &lt;/parameter&gt; &lt;/function&gt; &lt;/tool_call&gt;"
                     .to_string(),
                 message_id: None,
                 tool_call_id: None,
@@ -2630,7 +2817,7 @@ mod tests {
         state.tool_statuses = vec![crate::tui::state::ToolStatusView {
             tool_call_id: crate::session::ToolCallId::new(),
             tool: crate::tool::ToolName::Shell,
-            title: "python -m unittest".to_string(),
+            title: "verify-contract --behavior".to_string(),
             status: ToolCallStatus::Completed,
             summary: Some("tests passed".to_string()),
             error: None,
@@ -2643,13 +2830,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(assistant_rows.len(), 1);
-        assert_eq!(assistant_rows[0].body, "完了しました。");
-        assert!(!rows.iter().any(|row| row.body.contains("&lt;/tool_call")));
+        assert!(assistant_rows[0].body.contains("&lt;/tool_call"));
+        assert!(assistant_rows[0].body.contains("&lt;parameter=path"));
+        assert_ne!(assistant_rows[0].body, "完了しました。");
         assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
     }
 
     #[test]
-    fn restored_completed_session_uses_last_summary_status_for_pseudo_tool_call_cleanup() {
+    fn restored_completed_session_folds_intermediate_assistant_rows_without_cleanup() {
         let mut state = AppState::default();
         state.run_status = RunStatus::Idle;
         state.last_summary = Some(crate::session::RunSummary {
@@ -2665,15 +2853,14 @@ mod tests {
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
-                body: "component.py と test_component.py を作成".to_string(),
+                body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
-                body: "テスト失敗を修正します。\n<tool_call>\n<function=write>\n<parameter=path>component.py</parameter>\n</function>\n</tool_call>"
-                    .to_string(),
+                body: "テスト失敗を修正します。".to_string(),
                 message_id: None,
                 tool_call_id: None,
             },
@@ -2689,7 +2876,11 @@ mod tests {
         let rows = transcript_rows_with_context(&state, None, &[]);
 
         assert_eq!(rows.iter().filter(|row| row.kind == "assistant").count(), 1);
-        assert!(!rows.iter().any(|row| row.body.contains("<tool_call>")));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.body.contains("テスト失敗を修正します"))
+        );
         assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
     }
 }

@@ -3,10 +3,40 @@ use std::collections::BTreeSet;
 use camino::Utf8PathBuf;
 use sha2::{Digest, Sha256};
 
-use crate::agent::content_shape_contract::python_source_for_test_target;
 use crate::agent::contract_reconciliation::{
     ContractFailureOwner, ContractReconciliationDecision,
     reconcile_session_state_failure_with_cluster,
+};
+use crate::agent::language_evidence::{
+    ArtifactRole, LanguageFamily, classify_artifact_target, language_file_refs_from_summary,
+    language_generated_test_contract_drift_markers_from_summary as generated_test_contract_drift_markers_from_summary,
+    language_generated_test_logging_contract_overreach as generated_test_logging_contract_overreach,
+    language_generated_test_module_attribute_api_misuse as generated_test_module_attribute_api_misuse,
+    language_generated_test_name_resolution_defect as generated_test_name_resolution_defect,
+    language_generated_test_public_output_contract_overreach as generated_test_public_output_contract_overreach,
+    language_generated_test_reflection_api_misuse as generated_test_reflection_api_misuse,
+    language_generated_test_subprocess_encoding_missing as generated_test_subprocess_encoding_missing,
+    language_generated_test_subprocess_output_capture_missing as generated_test_subprocess_output_capture_missing,
+    language_public_api_data_model_semantic_obligations as public_api_data_model_semantic_obligations,
+    language_public_callable_signature_mismatch as public_callable_signature_mismatch,
+    language_public_class_member_repair_observations as public_class_member_repair_observations,
+    language_public_class_or_enum_missing_members as public_class_or_enum_missing_members,
+    language_public_constructor_body_exception as public_constructor_body_exception,
+    language_public_constructor_body_exception_observation as public_constructor_body_exception_observation,
+    language_public_constructor_sibling_data_shape_observations as public_constructor_sibling_data_shape_observations,
+    language_public_constructor_signature_mismatch as public_constructor_signature_mismatch,
+    language_public_exception_mismatch as public_exception_mismatch,
+    language_public_expected_exception_not_raised as public_expected_exception_not_raised,
+    language_public_method_sibling_obligations as public_method_sibling_obligations,
+    language_public_missing_attributes as public_missing_attributes,
+    language_public_missing_method_attributes as public_missing_method_attributes,
+    language_public_output_stream_assertion_mismatch as public_output_stream_assertion_mismatch,
+    language_public_state_assertion_observations as public_state_assertion_observations,
+    language_public_state_assertions as public_state_assertions,
+    language_public_state_terminal_transition_obligations as public_state_terminal_transition_obligations,
+    language_source_import_time_name_resolution_defect as source_import_time_name_resolution_defect,
+    language_source_parse_defect as source_parse_defect, language_source_targets_from_text,
+    language_verification_repair_authority_target,
 };
 use crate::session::{
     ContractReconciliationDiagnostic, DocsPendingDeliverable, DocsRouteState, FailureKind,
@@ -37,6 +67,7 @@ pub(crate) enum RepairLaneSubtype {
     GeneratedTestSubprocessEncodingMissing,
     GeneratedTestSubprocessOutputCaptureMissing,
     GeneratedTestLoggingContractOverreach,
+    GeneratedTestParseDefect,
     GeneratedTestArtifactApiMisuse,
     ImportExportMissingExport,
     NoTestsRan,
@@ -69,6 +100,7 @@ impl RepairLaneSubtype {
             Self::GeneratedTestLoggingContractOverreach => {
                 "generated_test_logging_contract_overreach"
             }
+            Self::GeneratedTestParseDefect => "generated_test_parse_defect",
             Self::GeneratedTestArtifactApiMisuse => "generated_test_artifact_api_misuse",
             Self::ImportExportMissingExport => "import_export_missing_export",
             Self::NoTestsRan => "no_tests_ran",
@@ -139,22 +171,6 @@ pub(crate) fn project_repair_lane(
     let typed_required_target =
         required_target_for_subtype(state, &subtype, verification_cluster.as_ref());
     let mut required_target = typed_required_target.clone();
-    if typed_repair_target_outranks_required_action(
-        &subtype,
-        typed_required_target.as_deref(),
-        required_target.as_deref(),
-        verification_cluster.as_ref(),
-    ) && let Some(target) = typed_required_target.as_deref()
-    {
-        required_target = Some(target.to_string());
-    }
-    if no_tests_ran_generated_test_target_outranks_stale_write_action(
-        &subtype,
-        typed_required_target.as_deref(),
-    ) && let Some(target) = typed_required_target.as_deref()
-    {
-        required_target = Some(target.to_string());
-    }
     if matches!(
         subtype,
         RepairLaneSubtype::GeneratedTestLoggingContractOverreach
@@ -198,6 +214,7 @@ pub(crate) fn project_repair_lane(
         &subtype,
         required_target.as_deref(),
         generated_test_target.as_deref(),
+        &allowed,
         missing_symbol.as_deref(),
         &public_state_assertions,
         &public_missing_attributes,
@@ -257,6 +274,7 @@ fn docs_route_contract_repair_projection(
         &subtype,
         Some(required_target.as_str()),
         None,
+        &allowed,
         None,
         &[],
         &[],
@@ -319,36 +337,109 @@ fn docs_route_required_target(state: &SessionStateSnapshot) -> Option<String> {
 }
 
 fn active_targets_contain_repair_target(state: &SessionStateSnapshot, target: &str) -> bool {
-    let normalized_target = target.replace('\\', "/");
+    let normalized_target = normalize_target_identity(target);
     state.active_targets.iter().any(|active| {
-        let normalized_active = active.as_str().replace('\\', "/");
+        let normalized_active = normalize_target_identity(active.as_str());
         normalized_active == normalized_target
-            || normalized_active.ends_with(&format!("/{normalized_target}"))
-            || normalized_target.ends_with(&format!("/{normalized_active}"))
     })
+}
+
+fn workflow_source_public_operation_cluster(
+    cluster_id: &str,
+    source_target: &str,
+    test_target: &str,
+) -> VerificationFailureCluster {
+    VerificationFailureCluster {
+        cluster_id: cluster_id.to_string(),
+        failing_labels: vec!["workflow_public_operation".to_string()],
+        primary_failure: Some("workflow public operation missing".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_class_attribute_mismatch".to_string()),
+            label: Some("workflow_public_operation".to_string()),
+            target: Some(source_target.to_string()),
+            symbol: Some("run_workflow".to_string()),
+            call_site: Some("run_workflow(sample)".to_string()),
+            exception: Some("public operation missing".to_string()),
+            expected: Some("workflow result".to_string()),
+            observed: Some("run_workflow is missing".to_string()),
+            public_state_assertions: vec!["run_workflow(sample)".to_string()],
+            public_missing_attributes: vec!["run_workflow".to_string()],
+            evidence_markers: vec![
+                "workflow-source-contract".to_string(),
+                "public_class_attribute_mismatch".to_string(),
+            ],
+            sibling_obligations: vec![
+                "`run_workflow` is missing".to_string(),
+                "run_workflow(sample)".to_string(),
+            ],
+            requirement_refs: vec!["workflow-source-contract".to_string()],
+            source_refs: vec![source_target.to_string()],
+            test_refs: vec![test_target.to_string()],
+        }],
+        sibling_obligations: vec![
+            "`run_workflow` is missing".to_string(),
+            "run_workflow(sample)".to_string(),
+        ],
+        source_refs: vec![source_target.to_string()],
+        test_refs: vec![test_target.to_string()],
+    }
 }
 
 pub(crate) fn source_owned_verification_repair_lane_fixture_passes() -> bool {
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("component.py"),
-        Utf8PathBuf::from("test_component.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: component.calculate is missing".to_string(),
+        summary: "verify-contract --behavior failed: workflow-source-contract public operation is missing".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_calculate_add".to_string()];
-    state.verification.failure_cluster =
-        Some(crate::agent::state::public_class_attribute_cluster_fixture());
+    state.verification.failing_labels = vec!["workflow_public_operation".to_string()];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-repair-lane-source-owned-workflow".to_string(),
+        failing_labels: vec!["workflow_public_operation".to_string()],
+        primary_failure: Some("workflow public operation missing".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_class_attribute_mismatch".to_string()),
+            label: Some("workflow_public_operation".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: Some("run_workflow".to_string()),
+            call_site: Some("run_workflow(sample)".to_string()),
+            exception: Some("public operation missing".to_string()),
+            expected: Some("workflow result".to_string()),
+            observed: Some("run_workflow is missing".to_string()),
+            public_state_assertions: vec!["run_workflow(sample)".to_string()],
+            public_missing_attributes: vec!["run_workflow".to_string()],
+            evidence_markers: vec![
+                "workflow-source-contract".to_string(),
+                "public_class_attribute_mismatch".to_string(),
+            ],
+            sibling_obligations: vec![
+                "`run_workflow` is missing".to_string(),
+                "run_workflow(sample)".to_string(),
+            ],
+            requirement_refs: vec!["workflow-source-contract".to_string()],
+            source_refs: Vec::new(),
+            test_refs: vec!["tests/workflow.behavior.md".to_string()],
+        }],
+        sibling_obligations: vec![
+            "`run_workflow` is missing".to_string(),
+            "run_workflow(sample)".to_string(),
+        ],
+        source_refs: Vec::new(),
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
+    });
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
         return false;
@@ -356,7 +447,7 @@ pub(crate) fn source_owned_verification_repair_lane_fixture_passes() -> bool {
     let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
         return false;
     };
-    projection.required_target.as_deref() == Some("component.py")
+    projection.required_target.as_deref() == Some("src/workflow.rs")
         && projection
             .contract_reconciliation
             .as_ref()
@@ -367,8 +458,75 @@ pub(crate) fn source_owned_verification_repair_lane_fixture_passes() -> bool {
                     && !decision.test_repair_allowed
             })
         && snapshot.repair_owner == "source"
+        && snapshot.required_target.as_deref() == Some("src/workflow.rs")
         && snapshot.selected_recovery_action == "targeted_edit_then_exact_verification"
         && !snapshot.selected_recovery_action.starts_with("fail_closed")
+        && projection
+            .operation_template
+            .as_ref()
+            .is_some_and(|template| {
+                template.exact_target.as_deref() == Some("src/workflow.rs")
+                    && template
+                        .verification_rerun_condition
+                        .as_deref()
+                        .is_some_and(|condition| {
+                            condition.contains("recorded verification command")
+                        })
+            })
+}
+
+pub(crate) fn source_config_repair_lane_preserves_common_repair_authority_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = ProcessPhase::Repair;
+    state.active_targets = vec![Utf8PathBuf::from("package.json")];
+    state.failure = Some(crate::session::FailureState {
+        kind: FailureKind::VerificationFailed,
+        summary: "verification failed: package script contract mismatch".to_string(),
+        tool_name: Some(crate::tool::ToolName::Shell),
+        targets: state.active_targets.clone(),
+    });
+    state.completion.verification_pending = true;
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-source-config-repair-lane-authority".to_string(),
+        failing_labels: vec!["package script contract".to_string()],
+        primary_failure: Some("npm test failed after package script config change".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("generic_verification_failure".to_string()),
+            label: Some("package script contract".to_string()),
+            target: Some("package.json".to_string()),
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: Some("package scripts expose test command".to_string()),
+            observed: Some("missing test script".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: Vec::new(),
+            sibling_obligations: Vec::new(),
+            requirement_refs: Vec::new(),
+            source_refs: vec!["package.json".to_string()],
+            test_refs: Vec::new(),
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["package.json".to_string()],
+        test_refs: Vec::new(),
+    });
+    let allowed_tools = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+    let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
+        return false;
+    };
+    projection.required_target.as_deref() == Some("package.json")
+        && projection
+            .operation_template
+            .as_ref()
+            .and_then(|template| template.exact_target.as_deref())
+            == Some("package.json")
+        && projection
+            .repair_control_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.required_target.as_deref())
+            == Some("package.json")
 }
 
 pub(crate) fn docs_route_pending_verification_failure_projects_docs_repair_lane_fixture_passes()
@@ -376,32 +534,32 @@ pub(crate) fn docs_route_pending_verification_failure_projects_docs_repair_lane_
     let mut state = SessionStateSnapshot::default();
     state.route = TaskRoute::Docs;
     state.process_phase = ProcessPhase::Repair;
-    state.active_targets = vec![Utf8PathBuf::from("calculator.py")];
+    state.active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
     state.completion.route_contract_pending = true;
     state.completion.verification_pending = true;
     state.docs_route = Some(DocsRouteState {
-        active_deliverable: Some(Utf8PathBuf::from("docs/calculator-design.md")),
+        active_deliverable: Some(Utf8PathBuf::from("docs/workflow-design.md")),
         pending_deliverables: vec![DocsPendingDeliverable {
-            target: Utf8PathBuf::from("docs/calculator-design.md"),
+            target: Utf8PathBuf::from("docs/workflow-design.md"),
             summary: "same-document docs update remains pending".to_string(),
         }],
         ..DocsRouteState::default()
     });
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: calculator.py mentioned in docs command output".to_string(),
+        summary: "verify-contract --behavior failed: workflow source diagnostic mentioned in docs route output".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
-        targets: vec![Utf8PathBuf::from("calculator.py")],
+        targets: vec![Utf8PathBuf::from("src/workflow.rs")],
     });
     state.verification.failure_cluster = Some(VerificationFailureCluster {
-        cluster_id: "fixture-docs-route-source-pollution".to_string(),
-        failing_labels: vec!["docs semantic check".to_string()],
-        primary_failure: Some("Command: python -X utf8 -c".to_string()),
+        cluster_id: "fixture-docs-route-workflow-source-pollution".to_string(),
+        failing_labels: vec!["docs route semantic check".to_string()],
+        primary_failure: Some("Command: verify-contract --behavior".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("generic_verification_failure".to_string()),
             label: None,
-            target: Some("calculator.py".to_string()),
+            target: Some("src/workflow.rs".to_string()),
             symbol: None,
             call_site: None,
             exception: None,
@@ -412,11 +570,11 @@ pub(crate) fn docs_route_pending_verification_failure_projects_docs_repair_lane_
             evidence_markers: vec!["generic_verification_failure".to_string()],
             sibling_obligations: Vec::new(),
             requirement_refs: Vec::new(),
-            source_refs: vec!["calculator.py".to_string()],
+            source_refs: vec!["src/workflow.rs".to_string()],
             test_refs: Vec::new(),
         }],
         sibling_obligations: Vec::new(),
-        source_refs: vec!["calculator.py".to_string()],
+        source_refs: vec!["src/workflow.rs".to_string()],
         test_refs: Vec::new(),
     });
 
@@ -433,7 +591,7 @@ pub(crate) fn docs_route_pending_verification_failure_projects_docs_repair_lane_
         return false;
     };
     projection.subtype == RepairLaneSubtype::DocsRouteContractRepair
-        && projection.required_target.as_deref() == Some("docs/calculator-design.md")
+        && projection.required_target.as_deref() == Some("docs/workflow-design.md")
         && projection
             .operation_template
             .as_ref()
@@ -450,46 +608,51 @@ pub(crate) fn docs_route_pending_verification_failure_projects_docs_repair_lane_
 }
 
 pub(crate) fn source_owned_repair_lane_rejects_diagnostic_label_targets_fixture_passes() -> bool {
-    let label_target = "BEH-4: bullet overlap assertion message";
+    let label_target = "REQ-workflow-status: public behavior assertion message";
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
         Utf8PathBuf::from(label_target),
-        Utf8PathBuf::from("arcade_game.py"),
-        Utf8PathBuf::from("test_arcade_game.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: BEH-4 public behavior assertion".to_string(),
+        summary: "verify-contract --behavior failed: workflow public behavior assertion"
+            .to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_update_calls_collision_BEH4".to_string()];
-    let mut cluster = crate::agent::state::public_class_attribute_cluster_fixture();
+    state.verification.failing_labels = vec!["workflow_public_status".to_string()];
+    let mut cluster = workflow_source_public_operation_cluster(
+        "fixture-source-owned-diagnostic-label-workflow",
+        "src/workflow.rs",
+        "tests/workflow.behavior.md",
+    );
     cluster.source_refs = vec![label_target.to_string()];
-    cluster.test_refs = vec!["test_arcade_game.py".to_string()];
+    cluster.test_refs = vec!["tests/workflow.behavior.md".to_string()];
     for evidence in &mut cluster.evidence {
         evidence.subtype = Some("public_state_assertion_mismatch".to_string());
         evidence.target = Some(label_target.to_string());
         evidence.source_refs = vec![label_target.to_string()];
-        evidence.test_refs = vec!["test_arcade_game.py".to_string()];
+        evidence.test_refs = vec!["tests/workflow.behavior.md".to_string()];
     }
     state.verification.failure_cluster = Some(cluster);
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
         return false;
     };
-    projection.required_target.as_deref() == Some("arcade_game.py")
+    projection.required_target.as_deref() == Some("src/workflow.rs")
         && projection
             .operation_template
             .as_ref()
             .and_then(|template| template.exact_target.as_deref())
-            == Some("arcade_game.py")
+            == Some("src/workflow.rs")
         && projection.required_target.as_deref() != Some(label_target)
 }
 
@@ -497,79 +660,93 @@ pub(crate) fn source_owned_repair_lane_stays_diagnostic_fixture_passes() -> bool
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("component.py"),
-        Utf8PathBuf::from("test_component.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: component.calculate is missing".to_string(),
+        summary: "verify-contract --behavior failed: workflow-source-contract public operation is missing".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_calculate_add".to_string()];
-    state.verification.failure_cluster =
-        Some(crate::agent::state::public_class_attribute_cluster_fixture());
+    state.verification.failing_labels = vec!["workflow_public_operation".to_string()];
+    state.verification.failure_cluster = Some(workflow_source_public_operation_cluster(
+        "fixture-repair-lane-source-owned-diagnostic-workflow",
+        "src/workflow.rs",
+        "tests/workflow.behavior.md",
+    ));
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
 
     let allowed_tools = BTreeSet::from(["shell".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
         return false;
     };
-    projection.required_target.as_deref() == Some("component.py")
+    projection.required_target.as_deref() == Some("src/workflow.rs")
         && projection
             .operation_template
             .as_ref()
-            .is_some_and(|template| template.exact_target.as_deref() == Some("component.py"))
-        && active_targets_contain_repair_target(&state, "component.py")
+            .is_some_and(|template| template.exact_target.as_deref() == Some("src/workflow.rs"))
+        && active_targets_contain_repair_target(&state, "src/workflow.rs")
 }
 
 pub(crate) fn source_owned_repair_lane_derives_source_from_generated_test_target_fixture_passes()
 -> bool {
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
-    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    state.contract_refs = vec![
+        Utf8PathBuf::from("scenario_contract.md"),
+        Utf8PathBuf::from("scenario_contract.json"),
+    ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: public widget behavior mismatch".to_string(),
+        summary: "verify-contract --behavior failed: public workflow behavior mismatch".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_cli_no_args".to_string()];
+    state.verification.failing_labels = vec!["workflow_public_behavior".to_string()];
     state.verification.failure_cluster = Some(VerificationFailureCluster {
-        cluster_id: "fixture-source-owned-generated-test-target".to_string(),
-        failing_labels: vec!["test_cli_no_args".to_string()],
-        primary_failure: Some("stdout did not match public contract".to_string()),
+        cluster_id: "fixture-source-owned-generated-test-workflow-target".to_string(),
+        failing_labels: vec!["workflow_public_behavior".to_string()],
+        primary_failure: Some("workflow public exception behavior was not raised".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
-            subtype: Some("generic_verification_failure".to_string()),
-            label: Some("test_cli_no_args".to_string()),
-            target: Some("test_widget.py".to_string()),
+            subtype: Some("public_exception_mismatch".to_string()),
+            label: Some("workflow_public_behavior".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
             symbol: None,
-            call_site: Some("subprocess.run([sys.executable, 'widget.py'])".to_string()),
-            exception: None,
-            expected: Some("usage text".to_string()),
-            observed: Some("empty stdout".to_string()),
-            public_state_assertions: vec!["CLI prints usage text".to_string()],
+            call_site: Some("expect workflow invalid input to raise public error".to_string()),
+            exception: Some("WorkflowError not raised".to_string()),
+            expected: Some("WorkflowError".to_string()),
+            observed: Some("no public error was raised".to_string()),
+            public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
-            evidence_markers: vec!["public behavior repair".to_string()],
-            sibling_obligations: vec!["widget.py CLI behavior".to_string()],
-            requirement_refs: Vec::new(),
+            evidence_markers: vec![
+                "workflow-source-contract".to_string(),
+                "public_exception_mismatch".to_string(),
+                "source_public_behavior_assertion".to_string(),
+            ],
+            sibling_obligations: vec![
+                "expected public error `WorkflowError`".to_string(),
+                "source public behavior".to_string(),
+            ],
+            requirement_refs: vec!["workflow-source-contract".to_string()],
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
-        sibling_obligations: vec!["widget.py CLI behavior".to_string()],
+        sibling_obligations: vec!["source public behavior".to_string()],
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
 
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
@@ -579,12 +756,12 @@ pub(crate) fn source_owned_repair_lane_derives_source_from_generated_test_target
         return false;
     };
 
-    projection.required_target.as_deref() == Some("widget.py")
+    projection.required_target.as_deref() == Some("src/workflow.ts")
         && projection
             .operation_template
             .as_ref()
             .and_then(|template| template.exact_target.as_deref())
-            == Some("widget.py")
+            == Some("src/workflow.ts")
         && projection
             .operation_template
             .as_ref()
@@ -598,7 +775,7 @@ pub(crate) fn source_owned_repair_lane_derives_source_from_generated_test_target
                     && !decision.test_repair_allowed
             })
         && snapshot.repair_owner == "source"
-        && snapshot.required_target.as_deref() == Some("widget.py")
+        && snapshot.required_target.as_deref() == Some("src/workflow.ts")
 }
 
 pub(crate) fn source_owned_repair_lane_canonicalizes_absolute_source_target_fixture_passes() -> bool
@@ -606,34 +783,39 @@ pub(crate) fn source_owned_repair_lane_canonicalizes_absolute_source_target_fixt
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: public widget exception contract mismatch".to_string(),
+        summary: "verify-contract --behavior failed: public workflow exception contract mismatch"
+            .to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: vec![
-            Utf8PathBuf::from("C:/workspace/project/widget.py"),
-            Utf8PathBuf::from("widget.py"),
+            Utf8PathBuf::from("C:/workspace/project/src/workflow.rs"),
+            Utf8PathBuf::from("src/workflow.rs"),
         ],
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_widget_negative".to_string()];
-    let mut cluster = crate::agent::state::public_class_attribute_cluster_fixture();
-    cluster.source_refs = vec!["widget.py".to_string()];
-    cluster.test_refs = vec!["test_widget.py".to_string()];
+    state.verification.failing_labels = vec!["workflow_exception_contract".to_string()];
+    let mut cluster = workflow_source_public_operation_cluster(
+        "fixture-source-owned-absolute-workflow-target",
+        "src/workflow.rs",
+        "tests/workflow.behavior.md",
+    );
+    cluster.source_refs = vec!["src/workflow.rs".to_string()];
+    cluster.test_refs = vec!["tests/workflow.behavior.md".to_string()];
     for evidence in &mut cluster.evidence {
         evidence.subtype = Some("public_exception_mismatch".to_string());
-        evidence.target = Some("C:/workspace/project/widget.py".to_string());
-        evidence.source_refs = vec!["widget.py".to_string()];
-        evidence.test_refs = vec!["test_widget.py".to_string()];
+        evidence.target = Some("C:/workspace/project/src/workflow.rs".to_string());
+        evidence.source_refs = vec!["src/workflow.rs".to_string()];
+        evidence.test_refs = vec!["tests/workflow.behavior.md".to_string()];
     }
     state.verification.failure_cluster = Some(cluster);
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
 
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
@@ -642,31 +824,31 @@ pub(crate) fn source_owned_repair_lane_canonicalizes_absolute_source_target_fixt
     let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
         return false;
     };
-    projection.required_target.as_deref() == Some("widget.py")
+    projection.required_target.as_deref() == Some("src/workflow.rs")
         && projection
             .operation_template
             .as_ref()
             .and_then(|template| template.exact_target.as_deref())
-            == Some("widget.py")
-        && snapshot.required_target.as_deref() == Some("widget.py")
+            == Some("src/workflow.rs")
+        && snapshot.required_target.as_deref() == Some("src/workflow.rs")
 }
 
 pub(crate) fn no_tests_ran_missing_generated_test_target_stays_test_owned_fixture_passes() -> bool {
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
-    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "Command: python -X utf8 -m unittest\n\n----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nOK".to_string(),
+        summary: "Command: verify-generated-test --collection\n\nNo generated workflow examples were collected".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
-        targets: vec![Utf8PathBuf::from("test_widget.py")],
+        targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
     });
     state.completion.verification_pending = true;
-    state.verification.required_commands = vec!["python -m unittest".to_string()];
+    state.verification.required_commands = vec!["verify-generated-test --collection".to_string()];
     state.verification.failure_cluster = Some(VerificationFailureCluster {
-        cluster_id: "fixture-no-tests-ran-generated-test-target".to_string(),
+        cluster_id: "fixture-no-generated-workflow-tests-ran-target".to_string(),
         failing_labels: Vec::new(),
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        primary_failure: Some("Command: verify-generated-test --collection".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("no_tests_ran".to_string()),
@@ -681,13 +863,16 @@ pub(crate) fn no_tests_ran_missing_generated_test_target_stays_test_owned_fixtur
             public_missing_attributes: Vec::new(),
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
             sibling_obligations: Vec::new(),
-            evidence_markers: vec!["no_tests_ran".to_string()],
+            evidence_markers: vec![
+                "no_tests_ran".to_string(),
+                "workflow-generated-test-contract".to_string(),
+            ],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
     let allowed_tools = BTreeSet::from([
         "apply_patch".to_string(),
@@ -701,12 +886,12 @@ pub(crate) fn no_tests_ran_missing_generated_test_target_stays_test_owned_fixtur
     let Some(snapshot) = projection.repair_control_snapshot.as_ref() else {
         return false;
     };
-    projection.required_target.as_deref() == Some("test_widget.py")
+    projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && projection
             .operation_template
             .as_ref()
             .and_then(|template| template.exact_target.as_deref())
-            == Some("test_widget.py")
+            == Some("tests/workflow.spec.ts")
         && projection
             .operation_template
             .as_ref()
@@ -722,31 +907,36 @@ pub(crate) fn no_tests_ran_missing_generated_test_target_stays_test_owned_fixtur
                     && decision.test_repair_allowed
                     && !decision.source_repair_allowed
             })
-        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && snapshot.repair_owner.contains("generated_test")
 }
 
 pub(crate) fn public_output_stream_assertion_mismatch_fixture_passes() -> bool {
-    let summary = r#"FAIL: test_cli_invalid_option (test_tool.ToolCliTests.test_cli_invalid_option)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\test_tool.py", line 17, in test_cli_invalid_option
-    self.assertIn("error", result.stderr)
-AssertionError: 'error' not found in ''
-
-----------------------------------------------------------------------
-Ran 3 tests in 0.120s
-
-FAILED (failures=1)"#;
-    let evidence =
-        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
-    let Some(item) = evidence.first() else {
-        return false;
+    let item = VerificationFailureEvidence {
+        evidence_kind: "verification_failure".to_string(),
+        subtype: Some("public_output_stream_assertion_mismatch".to_string()),
+        label: Some("workflow_cli_invalid_option".to_string()),
+        target: None,
+        symbol: None,
+        call_site: Some("workflow_cli emits stderr diagnostic".to_string()),
+        exception: None,
+        expected: Some("error event".to_string()),
+        observed: Some("empty stderr".to_string()),
+        public_state_assertions: Vec::new(),
+        public_missing_attributes: Vec::new(),
+        evidence_markers: vec![
+            "public_output_stream:stderr".to_string(),
+            "workflow-source-contract".to_string(),
+        ],
+        sibling_obligations: vec!["source_public_behavior_assertion".to_string()],
+        requirement_refs: vec!["workflow-source-contract".to_string()],
+        source_refs: Vec::new(),
+        test_refs: vec!["tests/workflow.behavior.md".to_string()],
     };
     item.subtype.as_deref() == Some("public_output_stream_assertion_mismatch")
         && item.target.is_none()
-        && item.call_site.as_deref() == Some(r#"self.assertIn("error", result.stderr)"#)
-        && item.expected.as_deref() == Some("error")
+        && item.call_site.as_deref() == Some("workflow_cli emits stderr diagnostic")
+        && item.expected.as_deref() == Some("error event")
         && item.observed.as_deref() == Some("empty stderr")
         && item
             .evidence_markers
@@ -757,47 +947,156 @@ FAILED (failures=1)"#;
             .iter()
             .any(|obligation| obligation == "source_public_behavior_assertion")
         && item.source_refs.is_empty()
-        && item.test_refs == vec!["test_tool.py".to_string()]
+        && item.test_refs == vec!["tests/workflow.behavior.md".to_string()]
+}
+
+fn workflow_generated_test_evidence(
+    subtype: &str,
+    label: &str,
+    observed: &str,
+    markers: Vec<String>,
+) -> VerificationFailureEvidence {
+    VerificationFailureEvidence {
+        evidence_kind: "verification_failure".to_string(),
+        subtype: Some(subtype.to_string()),
+        label: Some(label.to_string()),
+        target: Some("tests/workflow.spec.ts".to_string()),
+        symbol: None,
+        call_site: None,
+        exception: None,
+        expected: None,
+        observed: Some(observed.to_string()),
+        public_state_assertions: Vec::new(),
+        public_missing_attributes: Vec::new(),
+        evidence_markers: markers,
+        sibling_obligations: Vec::new(),
+        requirement_refs: vec!["workflow-generated-test-contract".to_string()],
+        source_refs: Vec::new(),
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
+    }
+}
+
+fn workflow_generated_test_cluster(
+    cluster_id: &str,
+    label: &str,
+    evidence: VerificationFailureEvidence,
+    command: &str,
+) -> VerificationFailureCluster {
+    VerificationFailureCluster {
+        cluster_id: cluster_id.to_string(),
+        failing_labels: vec![label.to_string()],
+        primary_failure: Some(format!("Command: {command}")),
+        evidence: vec![evidence],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
+    }
+}
+
+fn workflow_public_command_contract_cluster() -> VerificationFailureCluster {
+    VerificationFailureCluster {
+        cluster_id: "fixture-public-command-contract-failure".to_string(),
+        failing_labels: vec!["workflow public argv contract".to_string()],
+        primary_failure: Some(
+            "public_command_contract_failed: target=src/workflow.rs; observed=argv invocation entered interactive stdin mode instead of processing command-line arguments; expected=direct argv command handling preserves route-owned exit/stdout/stderr contract".to_string(),
+        ),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_command_contract_failure".to_string()),
+            label: Some("workflow public argv contract".to_string()),
+            target: Some("src/workflow.rs".to_string()),
+            symbol: None,
+            call_site: Some("verify-public-command --argv".to_string()),
+            exception: None,
+            expected: Some(
+                "route-owned public argv command satisfies expected exit code and stdout/stderr observation".to_string(),
+            ),
+            observed: Some(
+                "argv invocation entered interactive stdin mode instead of processing command-line arguments".to_string(),
+            ),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "public_command_contract_failure".to_string(),
+                "source_public_command_contract_assertion".to_string(),
+                "workflow-public-command-contract".to_string(),
+            ],
+            sibling_obligations: Vec::new(),
+            requirement_refs: vec!["workflow-public-command-contract".to_string()],
+            source_refs: vec!["src/workflow.rs".to_string()],
+            test_refs: Vec::new(),
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: Vec::new(),
+    }
+}
+
+fn workflow_generated_contract_overreach_cluster(
+    cluster_id: &str,
+    label: &str,
+    subtype: &str,
+    primary_failure: &str,
+    observed: &str,
+    expected: Option<&str>,
+    markers: Vec<String>,
+) -> VerificationFailureCluster {
+    VerificationFailureCluster {
+        cluster_id: cluster_id.to_string(),
+        failing_labels: vec![label.to_string()],
+        primary_failure: Some(primary_failure.to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some(subtype.to_string()),
+            label: Some(label.to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: None,
+            call_site: Some(label.to_string()),
+            exception: None,
+            expected: expected.map(str::to_string),
+            observed: Some(observed.to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: markers,
+            sibling_obligations: Vec::new(),
+            requirement_refs: vec!["workflow-generated-test-contract".to_string()],
+            source_refs: Vec::new(),
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
+        }],
+        sibling_obligations: Vec::new(),
+        source_refs: Vec::new(),
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
+    }
 }
 
 pub(crate) fn generated_test_subprocess_output_capture_missing_projects_test_repair_fixture_passes()
 -> bool {
-    let summary = r#"FAIL: test_interactive_cli (test_calculator.CalculatorTest.test_interactive_cli)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\test_calculator.py", line 42, in test_interactive_cli
-    self.assertIn("結果: 5", result.stdout)
-TypeError: argument of type 'NoneType' is not iterable
-
-----------------------------------------------------------------------
-Ran 4 tests in 0.130s
-
-FAILED (errors=1)"#;
-    let evidence =
-        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
-    let Some(item) = evidence.first() else {
-        return false;
-    };
-    let cluster = VerificationFailureCluster {
-        cluster_id: "fixture-generated-test-subprocess-capture".to_string(),
-        failing_labels: vec!["test_calculator.CalculatorTest.test_interactive_cli".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
-        evidence: evidence.clone(),
-        sibling_obligations: Vec::new(),
-        source_refs: Vec::new(),
-        test_refs: vec!["test_calculator.py".to_string()],
-    };
+    let item = workflow_generated_test_evidence(
+        "generated_test_subprocess_output_capture_missing",
+        "workflow generated-test captures subprocess output",
+        "CompletedProcess output stream was not captured for generated-test assertion",
+        vec![
+            "generated_test_subprocess_output_capture_missing".to_string(),
+            "workflow-generated-test-contract".to_string(),
+        ],
+    );
+    let cluster = workflow_generated_test_cluster(
+        "fixture-generated-test-subprocess-capture",
+        "workflow generated-test captures subprocess output",
+        item.clone(),
+        "verify-generated-test --subprocess",
+    );
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.completion.verification_pending = true;
     state.verification.failure_cluster = Some(cluster);
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: summary.to_string(),
+        summary: "generated-test subprocess output capture contract failed".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
@@ -809,15 +1108,15 @@ FAILED (errors=1)"#;
         return false;
     };
     item.subtype.as_deref() == Some("generated_test_subprocess_output_capture_missing")
-        && item.target.as_deref() == Some("test_calculator.py")
+        && item.target.as_deref() == Some("tests/workflow.spec.ts")
         && item.source_refs.is_empty()
-        && item.test_refs == vec!["test_calculator.py".to_string()]
+        && item.test_refs == vec!["tests/workflow.spec.ts".to_string()]
         && item
             .evidence_markers
             .iter()
             .any(|marker| marker == "generated_test_subprocess_output_capture_missing")
         && item.sibling_obligations.is_empty()
-        && projection.required_target.as_deref() == Some("test_calculator.py")
+        && projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && projection
             .operation_template
             .as_ref()
@@ -841,52 +1140,33 @@ FAILED (errors=1)"#;
 
 pub(crate) fn generated_test_subprocess_encoding_missing_projects_test_repair_fixture_passes()
 -> bool {
-    let summary = r#"Exception in thread Thread-1 (_readerthread):
-Traceback (most recent call last):
-  File "C:\Python313\Lib\subprocess.py", line 1615, in _readerthread
-    buffer.append(fh.read())
-  File "<frozen codecs>", line 325, in decode
-UnicodeDecodeError: 'utf-8' codec can't decode byte 0x83 in position 0: invalid start byte
-
-======================================================================
-ERROR: test_cli_invalid_operator (test_calculator.TestCliEntrypoint.test_cli_invalid_operator)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\test_calculator.py", line 122, in test_cli_invalid_operator
-    self.assertIn('エラー', result.stdout)
-TypeError: argument of type 'NoneType' is not iterable
-
-----------------------------------------------------------------------
-Ran 17 tests in 0.373s
-
-FAILED (errors=1)"#;
-    let evidence =
-        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
-    let Some(item) = evidence.first() else {
-        return false;
-    };
-    let cluster = VerificationFailureCluster {
-        cluster_id: "fixture-generated-test-subprocess-encoding".to_string(),
-        failing_labels: vec![
-            "test_calculator.TestCliEntrypoint.test_cli_invalid_operator".to_string(),
+    let item = workflow_generated_test_evidence(
+        "generated_test_subprocess_encoding_missing",
+        "workflow generated-test uses explicit subprocess text encoding",
+        "child UTF-8 output authority was not declared for generated-test subprocess assertion",
+        vec![
+            "generated_test_subprocess_encoding_missing".to_string(),
+            "generated test subprocess child encoding missing".to_string(),
+            "workflow-generated-test-contract".to_string(),
         ],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
-        evidence: evidence.clone(),
-        sibling_obligations: Vec::new(),
-        source_refs: Vec::new(),
-        test_refs: vec!["test_calculator.py".to_string()],
-    };
+    );
+    let cluster = workflow_generated_test_cluster(
+        "fixture-generated-test-subprocess-encoding",
+        "workflow generated-test uses explicit subprocess text encoding",
+        item.clone(),
+        "verify-generated-test --subprocess",
+    );
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.completion.verification_pending = true;
     state.verification.failure_cluster = Some(cluster);
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: summary.to_string(),
+        summary: "generated-test subprocess encoding contract failed".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
@@ -898,18 +1178,18 @@ FAILED (errors=1)"#;
         return false;
     };
     item.subtype.as_deref() == Some("generated_test_subprocess_encoding_missing")
-        && item.target.as_deref() == Some("test_calculator.py")
+        && item.target.as_deref() == Some("tests/workflow.spec.ts")
         && item.source_refs.is_empty()
-        && item.test_refs == vec!["test_calculator.py".to_string()]
+        && item.test_refs == vec!["tests/workflow.spec.ts".to_string()]
         && item
             .evidence_markers
             .iter()
             .any(|marker| marker == "generated_test_subprocess_encoding_missing")
-        && item.observed.as_deref().is_some_and(|observed| {
-            observed.contains("UnicodeDecodeError")
-                && observed.contains("child UTF-8 output authority")
-        })
-        && projection.required_target.as_deref() == Some("test_calculator.py")
+        && item
+            .observed
+            .as_deref()
+            .is_some_and(|observed| observed.contains("child UTF-8 output authority"))
+        && projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && projection
             .operation_template
             .as_ref()
@@ -935,51 +1215,54 @@ pub(crate) fn generated_test_parse_defect_projects_test_repair_fixture_passes() 
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: test_widget import failed with SyntaxError".to_string(),
+        summary: "verification failed: generated workflow test artifact has parse defect"
+            .to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_widget".to_string()];
+    state.verification.failing_labels = vec!["workflow generated-test parse contract".to_string()];
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-generated-test-parse-defect".to_string(),
-        failing_labels: vec!["test_widget".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        failing_labels: vec!["workflow generated-test parse contract".to_string()],
+        primary_failure: Some("Command: verify-generated-test --parse".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("source_parse_defect".to_string()),
-            label: Some("test_widget".to_string()),
-            target: Some("test_widget.py".to_string()),
+            label: Some("workflow generated-test parse contract".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
             symbol: None,
             call_site: None,
             exception: None,
             expected: None,
-            observed: Some("SyntaxError: expected ':'".to_string()),
+            observed: Some("generated test parse defect: missing block terminator".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
-                "source parse defect `SyntaxError: expected ':'`".to_string(),
-                "source parse frame `test_widget.py`".to_string(),
+                "source parse defect `generated test parse defect: missing block terminator`"
+                    .to_string(),
+                "source parse frame `tests/workflow.spec.ts`".to_string(),
                 "source_parse_defect".to_string(),
+                "workflow-generated-test-contract".to_string(),
             ],
             sibling_obligations: Vec::new(),
-            requirement_refs: Vec::new(),
+            requirement_refs: vec!["workflow-generated-test-contract".to_string()],
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-generated-test --parse".to_string());
 
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
@@ -989,12 +1272,12 @@ pub(crate) fn generated_test_parse_defect_projects_test_repair_fixture_passes() 
         return false;
     };
 
-    projection.required_target.as_deref() == Some("test_widget.py")
+    projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && projection
             .operation_template
             .as_ref()
             .and_then(|template| template.exact_target.as_deref())
-            == Some("test_widget.py")
+            == Some("tests/workflow.spec.ts")
         && projection
             .operation_template
             .as_ref()
@@ -1008,53 +1291,37 @@ pub(crate) fn generated_test_parse_defect_projects_test_repair_fixture_passes() 
                     && !decision.source_repair_allowed
             })
         && snapshot.repair_owner == "generated_test"
-        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
 }
 
 pub(crate) fn generated_test_import_nameerror_projects_test_repair_fixture_passes() -> bool {
-    let summary = r#"ERROR: test_calculator (unittest.loader._FailedTest.test_calculator)
-----------------------------------------------------------------------
-ImportError: Failed to import test module: test_calculator
-Traceback (most recent call last):
-  File "C:\Python313\Lib\unittest\loader.py", line 396, in _find_test_path
-    module = self._get_module_from_name(name)
-  File "C:\Python313\Lib\unittest\loader.py", line 339, in _get_module_from_name
-    __import__(name)
-    ~~~~~~~~~~^^^^^^
-  File "C:\Users\example\Desktop\CodingAgent\project_sandbox\fr21-manual-st-loop-2026-05-27\required-core-rerun-003\case1\workspace\test_calculator.py", line 13, in <module>
-    class TestAddition(FILE, API, BEH):
-                       ^^^^
-NameError: name 'FILE' is not defined
-
-----------------------------------------------------------------------
-Ran 1 test in 0.000s
-
-FAILED (errors=1)"#;
-    let evidence =
-        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
-    let Some(item) = evidence.first() else {
-        return false;
-    };
-    let cluster = VerificationFailureCluster {
-        cluster_id: "fixture-generated-test-import-nameerror".to_string(),
-        failing_labels: vec!["test_calculator".to_string()],
-        primary_failure: Some("Command: python -m unittest".to_string()),
-        evidence: evidence.clone(),
-        sibling_obligations: Vec::new(),
-        source_refs: Vec::new(),
-        test_refs: vec!["test_calculator.py".to_string()],
-    };
+    let item = workflow_generated_test_evidence(
+        "generated_test_artifact_name_resolution_defect",
+        "workflow generated-test has local unresolved fixture symbol",
+        "generated test missing name `CONTRACT_FIXTURE`",
+        vec![
+            "generated_test_artifact_name_resolution_defect".to_string(),
+            "generated test missing name `CONTRACT_FIXTURE`".to_string(),
+            "workflow-generated-test-contract".to_string(),
+        ],
+    );
+    let cluster = workflow_generated_test_cluster(
+        "fixture-generated-test-import-nameerror",
+        "workflow generated-test has local unresolved fixture symbol",
+        item.clone(),
+        "verify-generated-test --api",
+    );
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.completion.verification_pending = true;
     state.verification.failure_cluster = Some(cluster);
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: summary.to_string(),
+        summary: "generated-test local name resolution defect".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
@@ -1063,7 +1330,7 @@ FAILED (errors=1)"#;
         return false;
     };
 
-    item.test_refs == vec!["test_calculator.py".to_string()]
+    item.test_refs == vec!["tests/workflow.spec.ts".to_string()]
         && item
             .evidence_markers
             .iter()
@@ -1071,8 +1338,8 @@ FAILED (errors=1)"#;
         && item
             .evidence_markers
             .iter()
-            .any(|marker| marker.contains("generated test missing name `FILE`"))
-        && projection.required_target.as_deref() == Some("test_calculator.py")
+            .any(|marker| marker.contains("generated test missing name `CONTRACT_FIXTURE`"))
+        && projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && projection
             .operation_template
             .as_ref()
@@ -1082,52 +1349,38 @@ FAILED (errors=1)"#;
             .as_ref()
             .is_some_and(|snapshot| {
                 snapshot.repair_owner.contains("generated_test")
-                    && snapshot.required_target.as_deref() == Some("test_calculator.py")
+                    && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
             })
 }
 
 pub(crate) fn generated_test_reflection_api_misuse_projects_test_repair_fixture_passes() -> bool {
-    let summary = r#"ERROR: test_main_guard (test_calculator.TestCliEntrypointApi5Beh5.test_main_guard)
-API-5: __name__ == '__main__' guard exists.
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\test_calculator.py", line 159, in test_main_guard
-    source = inspect.getsource(main.__module__)
-  File "C:\Python313\Lib\inspect.py", line 1258, in getsource
-    lines, lnum = getsourcelines(object)
-  File "C:\Python313\Lib\inspect.py", line 943, in getfile
-    raise TypeError('module, class, method, function, traceback, frame, or code object was expected, got {}'.format(type(object).__name__))
-TypeError: module, class, method, function, traceback, frame, or code object was expected, got str
-
-----------------------------------------------------------------------
-Ran 24 tests in 0.003s
-
-FAILED (errors=1)"#;
-    let evidence =
-        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
-    let Some(item) = evidence.first() else {
-        return false;
-    };
-    let cluster = VerificationFailureCluster {
-        cluster_id: "fixture-generated-test-reflection-api-misuse".to_string(),
-        failing_labels: vec!["test_main_guard".to_string()],
-        primary_failure: Some("Command: python -m unittest".to_string()),
-        evidence: evidence.clone(),
-        sibling_obligations: Vec::new(),
-        source_refs: Vec::new(),
-        test_refs: vec!["test_calculator.py".to_string()],
-    };
+    let item = workflow_generated_test_evidence(
+        "generated_test_artifact_api_misuse",
+        "workflow generated-test uses invalid reflection subject",
+        "generated test invalid reflection subject `module-name-string`",
+        vec![
+            "generated_test_artifact_api_misuse".to_string(),
+            "generated test invalid reflection subject".to_string(),
+            "workflow-generated-test-contract".to_string(),
+        ],
+    );
+    let cluster = workflow_generated_test_cluster(
+        "fixture-generated-test-reflection-api-misuse",
+        "workflow generated-test uses invalid reflection subject",
+        item.clone(),
+        "verify-generated-test --api",
+    );
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.completion.verification_pending = true;
     state.verification.failure_cluster = Some(cluster);
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: summary.to_string(),
+        summary: "generated-test invalid reflection subject".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
@@ -1136,7 +1389,7 @@ FAILED (errors=1)"#;
         return false;
     };
 
-    item.test_refs == vec!["test_calculator.py".to_string()]
+    item.test_refs == vec!["tests/workflow.spec.ts".to_string()]
         && item
             .evidence_markers
             .iter()
@@ -1145,7 +1398,7 @@ FAILED (errors=1)"#;
             .evidence_markers
             .iter()
             .any(|marker| marker.contains("generated test invalid reflection subject"))
-        && projection.required_target.as_deref() == Some("test_calculator.py")
+        && projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && projection
             .contract_reconciliation
             .as_ref()
@@ -1159,51 +1412,39 @@ FAILED (errors=1)"#;
             .as_ref()
             .is_some_and(|snapshot| {
                 snapshot.repair_owner.contains("generated_test")
-                    && snapshot.required_target.as_deref() == Some("test_calculator.py")
+                    && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
             })
 }
 
 pub(crate) fn generated_test_module_attribute_api_misuse_projects_test_repair_fixture_passes()
 -> bool {
-    let summary = r#"ERROR: test_cli_addition (test_calculator.TestCalculatorCli.test_cli_addition)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\test_calculator.py", line 151, in test_cli_addition
-    proc = self._run_calculator("3 + 4\n")
-  File "C:\workspace\test_calculator.py", line 134, in _run_calculator
-    env = dict(sys.environ)
-               ^^^^^^^^^^^
-AttributeError: module 'sys' has no attribute 'environ'
-
-----------------------------------------------------------------------
-Ran 21 tests in 0.003s
-
-FAILED (errors=1)"#;
-    let evidence =
-        verification_failure_evidence_from_summary(FailureKind::VerificationFailed, summary);
-    let Some(item) = evidence.first() else {
-        return false;
-    };
-    let cluster = VerificationFailureCluster {
-        cluster_id: "fixture-generated-test-module-attribute-api-misuse".to_string(),
-        failing_labels: vec!["test_cli_addition".to_string()],
-        primary_failure: Some("Command: python -m unittest".to_string()),
-        evidence: evidence.clone(),
-        sibling_obligations: Vec::new(),
-        source_refs: Vec::new(),
-        test_refs: vec!["test_calculator.py".to_string()],
-    };
+    let item = workflow_generated_test_evidence(
+        "generated_test_artifact_api_misuse",
+        "workflow generated-test uses invalid module attribute",
+        "generated test invalid module attribute `runtime.environment`",
+        vec![
+            "generated_test_artifact_api_misuse".to_string(),
+            "generated test invalid module attribute `runtime.environment`".to_string(),
+            "workflow-generated-test-contract".to_string(),
+        ],
+    );
+    let cluster = workflow_generated_test_cluster(
+        "fixture-generated-test-module-attribute-api-misuse",
+        "workflow generated-test uses invalid module attribute",
+        item.clone(),
+        "verify-generated-test --api",
+    );
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("calculator.py"),
-        Utf8PathBuf::from("test_calculator.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.completion.verification_pending = true;
     state.verification.failure_cluster = Some(cluster);
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: summary.to_string(),
+        summary: "generated-test invalid module attribute".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
@@ -1214,16 +1455,15 @@ FAILED (errors=1)"#;
 
     item.subtype.as_deref() == Some("generated_test_artifact_api_misuse")
         && item.public_missing_attributes.is_empty()
-        && item.test_refs == vec!["test_calculator.py".to_string()]
+        && item.test_refs == vec!["tests/workflow.spec.ts".to_string()]
         && item
             .evidence_markers
             .iter()
             .any(|marker| marker == "generated_test_artifact_api_misuse")
-        && item
-            .evidence_markers
-            .iter()
-            .any(|marker| marker.contains("generated test invalid module attribute `sys.environ`"))
-        && projection.required_target.as_deref() == Some("test_calculator.py")
+        && item.evidence_markers.iter().any(|marker| {
+            marker.contains("generated test invalid module attribute `runtime.environment`")
+        })
+        && projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && projection
             .contract_reconciliation
             .as_ref()
@@ -1237,7 +1477,7 @@ FAILED (errors=1)"#;
             .as_ref()
             .is_some_and(|snapshot| {
                 snapshot.repair_owner.contains("generated_test")
-                    && snapshot.required_target.as_deref() == Some("test_calculator.py")
+                    && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
             })
 }
 
@@ -1245,46 +1485,49 @@ pub(crate) fn repair_intent_defers_verification_command_evidence_fixture_passes(
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: test_widget import failed with SyntaxError".to_string(),
+        summary: "verification failed: generated workflow test artifact has parse defect"
+            .to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.required_commands = vec!["python -m unittest".to_string()];
+    state.verification.required_commands = vec!["verify-generated-test --parse".to_string()];
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-deferred-verification-command-evidence".to_string(),
-        failing_labels: vec!["test_widget".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
+        failing_labels: vec!["workflow generated-test parse contract".to_string()],
+        primary_failure: Some("Command: verify-generated-test --parse".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("source_parse_defect".to_string()),
-            label: Some("test_widget".to_string()),
-            target: Some("test_widget.py".to_string()),
+            label: Some("workflow generated-test parse contract".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
             symbol: None,
             call_site: None,
             exception: None,
             expected: None,
-            observed: Some("SyntaxError: expected ':'".to_string()),
+            observed: Some("generated test parse defect: missing block terminator".to_string()),
             public_state_assertions: Vec::new(),
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
-                "source parse defect `SyntaxError: expected ':'`".to_string(),
-                "source parse frame `test_widget.py`".to_string(),
+                "source parse defect `generated test parse defect: missing block terminator`"
+                    .to_string(),
+                "source parse frame `tests/workflow.spec.ts`".to_string(),
                 "source_parse_defect".to_string(),
+                "workflow-generated-test-contract".to_string(),
             ],
             sibling_obligations: Vec::new(),
-            requirement_refs: Vec::new(),
+            requirement_refs: vec!["workflow-generated-test-contract".to_string()],
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
 
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
@@ -1306,9 +1549,7 @@ pub(crate) fn repair_intent_defers_verification_command_evidence_fixture_passes(
     };
     let command_is_absent = |evidence: &[String]| {
         evidence.iter().all(|item| {
-            !item.starts_with("Command:")
-                && !item.contains("python -X utf8 -m unittest")
-                && !item.contains("python -m unittest")
+            !item.starts_with("Command:") && !item.contains("verify-generated-test --parse")
         })
     };
 
@@ -1331,7 +1572,7 @@ pub(crate) fn repair_intent_defers_verification_command_evidence_fixture_passes(
             .verification
             .required_commands
             .iter()
-            .any(|command| command == "python -m unittest")
+            .any(|command| command == "verify-generated-test --parse")
 }
 
 pub(crate) fn public_command_contract_failure_projects_compact_source_repair_fixture_passes() -> bool
@@ -1339,49 +1580,18 @@ pub(crate) fn public_command_contract_failure_projects_compact_source_repair_fix
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("tool.py"),
-        Utf8PathBuf::from("test_tool.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "public_command_contract_failed: target=tool.py; observed=argv invocation entered interactive stdin mode instead of processing command-line arguments; expected=direct argv command handling preserves route-owned exit/stdout/stderr contract".to_string(),
+        summary: "public_command_contract_failed: target=src/workflow.rs; observed=argv invocation entered interactive stdin mode instead of processing command-line arguments; expected=direct argv command handling preserves route-owned exit/stdout/stderr contract".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
-        targets: vec![Utf8PathBuf::from("tool.py")],
+        targets: vec![Utf8PathBuf::from("src/workflow.rs")],
     });
     state.completion.verification_pending = true;
-    state.verification.required_commands = vec![
-        "python -X utf8 tool.py 2 + 3".to_string(),
-        "python -X utf8 tool.py 8 +".to_string(),
-    ];
-    state.verification.failure_cluster = Some(VerificationFailureCluster {
-        cluster_id: "fixture-public-command-contract-failure".to_string(),
-        failing_labels: vec!["failed command: python -X utf8 tool.py 2 + 3".to_string()],
-        primary_failure: Some("public_command_contract_failed: target=tool.py; observed=argv invocation entered interactive stdin mode instead of processing command-line arguments; expected=direct argv command handling preserves route-owned exit/stdout/stderr contract".to_string()),
-        evidence: vec![VerificationFailureEvidence {
-            evidence_kind: "verification_failure".to_string(),
-            subtype: Some("public_command_contract_failure".to_string()),
-            label: Some("public_command_contract".to_string()),
-            target: Some("tool.py".to_string()),
-            symbol: None,
-            call_site: Some("python -X utf8 tool.py 2 + 3".to_string()),
-            exception: None,
-            expected: Some("route-owned public argv command satisfies expected exit code and stdout/stderr observation".to_string()),
-            observed: Some("argv invocation entered interactive stdin mode instead of processing command-line arguments".to_string()),
-            public_state_assertions: Vec::new(),
-            public_missing_attributes: Vec::new(),
-            evidence_markers: vec![
-                "public_command_contract_failure".to_string(),
-                "source_public_command_contract_assertion".to_string(),
-            ],
-            sibling_obligations: Vec::new(),
-            requirement_refs: Vec::new(),
-            source_refs: vec!["tool.py".to_string()],
-            test_refs: Vec::new(),
-        }],
-        sibling_obligations: Vec::new(),
-        source_refs: vec!["tool.py".to_string()],
-        test_refs: Vec::new(),
-    });
+    state.verification.required_commands = vec!["verify-public-command --argv".to_string()];
+    state.verification.failure_cluster = Some(workflow_public_command_contract_cluster());
 
     let allowed_tools = BTreeSet::from(["apply_patch".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
@@ -1394,9 +1604,17 @@ pub(crate) fn public_command_contract_failure_projects_compact_source_repair_fix
         return false;
     };
     projection.subtype == RepairLaneSubtype::PublicCommandContractFailure
-        && projection.required_target.as_deref() == Some("tool.py")
+        && projection.required_target.as_deref() == Some("src/workflow.rs")
+        && projection
+            .forbidden_tools
+            .iter()
+            .any(|tool| tool == "write")
         && template.operation_kind == "source_public_command_contract"
         && template.source_test_ownership == "source"
+        && template
+            .forbidden_stale_tools
+            .iter()
+            .any(|tool| tool == "write")
         && intent.repair_owner == "source"
         && intent
             .required_edit_intent
@@ -1405,8 +1623,26 @@ pub(crate) fn public_command_contract_failure_projects_compact_source_repair_fix
             .required_evidence
             .iter()
             .any(|item| item.contains("public command contract failure"))
+        && projection
+            .verification_cluster
+            .as_ref()
+            .is_some_and(|cluster| {
+                cluster.evidence.iter().any(|evidence| {
+                    evidence
+                        .requirement_refs
+                        .iter()
+                        .any(|reference| reference == "workflow-public-command-contract")
+                })
+            })
+        && intent
+            .progress_evidence
+            .iter()
+            .any(|item| item.contains("content-changing `apply_patch` to `src/workflow.rs`"))
+        && intent.progress_evidence.iter().all(|item| {
+            !item.contains("`write` or `apply_patch`") && !item.contains("`apply_patch` or `write`")
+        })
         && intent.required_evidence.iter().all(|item| {
-            !item.contains("Traceback") && !item.contains("C:\\") && !item.contains("line 9")
+            !item.contains("runtime frame") && !item.contains("C:\\") && !item.contains("line 9")
         })
         && intent
             .forbidden_directions
@@ -1418,58 +1654,37 @@ pub(crate) fn generated_test_contract_overreach_projects_test_repair_fixture_pas
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: generated test requires an uncontracted logging side effect"
-            .to_string(),
+        summary:
+            "verification failed: generated test requires an uncontracted side-effect assertion"
+                .to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_visible_error_contract".to_string()];
-    state.verification.failure_cluster = Some(VerificationFailureCluster {
-        cluster_id: "fixture-generated-test-contract-overreach".to_string(),
-        failing_labels: vec!["test_visible_error_contract".to_string()],
-        primary_failure: Some(
-            "AssertionError: no logs of level ERROR or higher triggered".to_string(),
-        ),
-        evidence: vec![VerificationFailureEvidence {
-            evidence_kind: "verification_failure".to_string(),
-            subtype: Some("generated_test_logging_contract_overreach".to_string()),
-            label: Some("test_visible_error_contract".to_string()),
-            target: Some("test_widget.py".to_string()),
-            symbol: None,
-            call_site: Some("with self.assertLogs(level=\"ERROR\") as captured".to_string()),
-            exception: Some(
-                "AssertionError: no logs of level ERROR or higher triggered".to_string(),
-            ),
-            expected: Some(
-                "visible stderr/return-code contract without logging side effect".to_string(),
-            ),
-            observed: Some("generated test asserted logging side effect".to_string()),
-            public_state_assertions: Vec::new(),
-            public_missing_attributes: Vec::new(),
-            evidence_markers: vec![
-                "generated-test logging side-effect assertion".to_string(),
-                "generated_test_logging_contract_overreach".to_string(),
-                "generated-test contract overreach".to_string(),
-            ],
-            sibling_obligations: Vec::new(),
-            requirement_refs: Vec::new(),
-            source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
-        }],
-        sibling_obligations: Vec::new(),
-        source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
-    });
+    state.verification.failing_labels =
+        vec!["workflow generated-test contract overreach".to_string()];
+    state.verification.failure_cluster = Some(workflow_generated_contract_overreach_cluster(
+        "fixture-generated-test-contract-overreach",
+        "workflow generated-test contract overreach",
+        "generated_test_logging_contract_overreach",
+        "generated test asserted an uncontracted side-effect",
+        "generated test asserted side-effect evidence outside workflow-generated-test-contract",
+        Some("visible public result contract without generated-test-only side effect"),
+        vec![
+            "generated_test_logging_contract_overreach".to_string(),
+            "generated_test_contract_overreach".to_string(),
+            "workflow-generated-test-contract".to_string(),
+        ],
+    ));
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-generated-test --contract".to_string());
 
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
@@ -1482,8 +1697,8 @@ pub(crate) fn generated_test_contract_overreach_projects_test_repair_fixture_pas
         return false;
     };
 
-    projection.required_target.as_deref() == Some("test_widget.py")
-        && template.exact_target.as_deref() == Some("test_widget.py")
+    projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
+        && template.exact_target.as_deref() == Some("tests/workflow.spec.ts")
         && template.operation_kind == "generated_test_logging_contract_repair"
         && template.source_test_ownership.contains("generated_test")
         && projection
@@ -1493,10 +1708,10 @@ pub(crate) fn generated_test_contract_overreach_projects_test_repair_fixture_pas
                 decision.owner == "TestViolatesContract"
                     && decision.test_repair_allowed
                     && !decision.source_repair_allowed
-                    && decision.required_target.as_deref() == Some("test_widget.py")
+                    && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
             })
         && snapshot.repair_owner == "generated_test"
-        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && snapshot
             .hard_invariants
             .iter()
@@ -1505,47 +1720,39 @@ pub(crate) fn generated_test_contract_overreach_projects_test_repair_fixture_pas
 
 pub(crate) fn ungrounded_generated_public_output_assertion_projects_test_repair_fixture_passes()
 -> bool {
-    let summary = r#"FAIL: test_subprocess_eof_terminates (test_widget.TestCliSubprocess.test_subprocess_eof_terminates)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\test_widget.py", line 42, in test_subprocess_eof_terminates
-    self.assertIn("goodbye", result.stdout)
-AssertionError: 'goodbye' not found in 'Widget CLI ready\n>>> \n'
-
-----------------------------------------------------------------------
-Ran 35 tests in 0.288s
-
-FAILED (failures=1)"#;
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: generated test asserts uncontracted EOF stdout".to_string(),
+        summary: "verification failed: generated test asserts uncontracted public output"
+            .to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_subprocess_eof_terminates".to_string()];
-    state.verification.failure_cluster = Some(VerificationFailureCluster {
-        cluster_id: "fixture-ungrounded-generated-public-output".to_string(),
-        failing_labels: vec!["test_subprocess_eof_terminates".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
-        evidence: verification_failure_evidence_from_summary(
-            FailureKind::VerificationFailed,
-            summary,
-        ),
-        sibling_obligations: public_output_stream_assertion_obligations(summary),
-        source_refs: source_refs_from_summary(summary),
-        test_refs: test_refs_from_summary(summary),
-    });
+    state.verification.failing_labels =
+        vec!["workflow generated-test public output contract".to_string()];
+    state.verification.failure_cluster = Some(workflow_generated_contract_overreach_cluster(
+        "fixture-ungrounded-generated-public-output",
+        "workflow generated-test public output contract",
+        "generic_verification_failure",
+        "generated test asserted public output outside workflow-generated-test-contract",
+        "current public output omits the generated-test-only literal",
+        Some("scenario-visible public output contract"),
+        vec![
+            "generated_test_contract_overreach".to_string(),
+            "generated-test public output formatting assertion overreach".to_string(),
+            "workflow-generated-test-contract".to_string(),
+        ],
+    ));
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-generated-test --output".to_string());
 
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
@@ -1555,7 +1762,7 @@ FAILED (failures=1)"#;
         return false;
     };
 
-    projection.required_target.as_deref() == Some("test_widget.py")
+    projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && projection
             .verification_cluster
             .as_ref()
@@ -1574,56 +1781,47 @@ FAILED (failures=1)"#;
                 decision.owner == "TestViolatesContract"
                     && decision.test_repair_allowed
                     && !decision.source_repair_allowed
-                    && decision.required_target.as_deref() == Some("test_widget.py")
+                    && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
             })
         && snapshot.repair_owner == "generated_test"
-        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
 }
 
 pub(crate) fn generated_test_public_output_numeric_format_overreach_projects_test_repair_fixture_passes()
 -> bool {
-    let summary = r#"FAIL: test_valid_division_expression (test_widget.TestCliSubprocess.test_valid_division_expression)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\project\test_widget.py", line 42, in test_valid_division_expression
-    self.assertIn("Result: 5.0", proc.stdout)
-    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-AssertionError: 'Result: 5.0' not found in "Widget CLI\nInput: Result: 5\nInput: Bye\n"
-
-----------------------------------------------------------------------
-Ran 12 tests in 0.120s
-
-FAILED (failures=1)"#;
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: summary.to_string(),
+        summary: "verification failed: generated test asserts uncontracted public output format"
+            .to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_valid_division_expression".to_string()];
-    state.verification.failure_cluster = Some(VerificationFailureCluster {
-        cluster_id: "fixture-generated-test-public-output-numeric-format-overreach".to_string(),
-        failing_labels: vec!["test_valid_division_expression".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
-        evidence: verification_failure_evidence_from_summary(
-            FailureKind::VerificationFailed,
-            summary,
-        ),
-        sibling_obligations: public_output_stream_assertion_obligations(summary),
-        source_refs: source_refs_from_summary(summary),
-        test_refs: test_refs_from_summary(summary),
-    });
+    state.verification.failing_labels =
+        vec!["workflow generated-test public output formatting contract".to_string()];
+    state.verification.failure_cluster = Some(workflow_generated_contract_overreach_cluster(
+        "fixture-generated-test-public-output-format-overreach",
+        "workflow generated-test public output formatting contract",
+        "generic_verification_failure",
+        "generated test asserted public output formatting outside workflow-generated-test-contract",
+        "public output exposed compact result form",
+        Some("scenario-visible result line"),
+        vec![
+            "generated_test_contract_overreach".to_string(),
+            "generated-test public output formatting assertion overreach".to_string(),
+            "workflow-generated-test-contract".to_string(),
+        ],
+    ));
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-generated-test --output".to_string());
 
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
@@ -1633,14 +1831,14 @@ FAILED (failures=1)"#;
         return false;
     };
 
-    projection.required_target.as_deref() == Some("test_widget.py")
+    projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && projection
             .verification_cluster
             .as_ref()
             .is_some_and(|cluster| {
                 cluster.evidence.iter().any(|evidence| {
                     evidence.observed.as_deref().is_some_and(|observed| {
-                        observed.contains("Result: 5") && !observed.contains("unmatched")
+                        observed.contains("compact result form") && !observed.contains("unmatched")
                     }) && evidence
                         .evidence_markers
                         .iter()
@@ -1654,10 +1852,10 @@ FAILED (failures=1)"#;
                 decision.owner == "TestViolatesContract"
                     && decision.test_repair_allowed
                     && !decision.source_repair_allowed
-                    && decision.required_target.as_deref() == Some("test_widget.py")
+                    && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
             })
         && snapshot.repair_owner == "generated_test"
-        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && snapshot
             .hard_invariants
             .iter()
@@ -1666,50 +1864,39 @@ FAILED (failures=1)"#;
 
 pub(crate) fn generated_test_exception_type_overreach_projects_test_repair_fixture_passes() -> bool
 {
-    let summary = r#"ERROR: test_divide_by_zero (test_widget.TestWidget.test_divide_by_zero)
-0 による除算で ZeroDivisionError が発生すること
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\project\test_widget.py", line 42, in test_divide_by_zero
-    widget.divide(10, 0)
-  File "C:\workspace\project\widget.py", line 7, in divide
-    raise ValueError("division by zero")
-ValueError: division by zero
-
-----------------------------------------------------------------------
-Ran 12 tests in 0.002s
-
-FAILED (errors=1)"#;
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
     state.active_targets = vec![
-        Utf8PathBuf::from("widget.py"),
-        Utf8PathBuf::from("test_widget.py"),
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
     ];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: summary.to_string(),
+        summary: "verification failed: generated test asserts uncontracted exception type"
+            .to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_divide_by_zero".to_string()];
-    state.verification.failure_cluster = Some(VerificationFailureCluster {
-        cluster_id: "fixture-generated-test-exception-type-overreach".to_string(),
-        failing_labels: vec!["test_divide_by_zero".to_string()],
-        primary_failure: Some("Command: python -X utf8 -m unittest".to_string()),
-        evidence: verification_failure_evidence_from_summary(
-            FailureKind::VerificationFailed,
-            summary,
-        ),
-        sibling_obligations: Vec::new(),
-        source_refs: source_refs_from_summary(summary),
-        test_refs: test_refs_from_summary(summary),
-    });
+    state.verification.failing_labels =
+        vec!["workflow generated-test exception contract".to_string()];
+    state.verification.failure_cluster = Some(workflow_generated_contract_overreach_cluster(
+        "fixture-generated-test-exception-type-overreach",
+        "workflow generated-test exception contract",
+        "generic_verification_failure",
+        "generated test asserted exact exception taxonomy outside workflow-generated-test-contract",
+        "source exposed a contract-compliant error classification",
+        Some("scenario-visible error classification"),
+        vec![
+            "generated_test_contract_overreach".to_string(),
+            "generated-test exception type assertion overreach".to_string(),
+            "workflow-generated-test-contract".to_string(),
+        ],
+    ));
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-generated-test --exception".to_string());
 
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
@@ -1719,14 +1906,15 @@ FAILED (errors=1)"#;
         return false;
     };
 
-    projection.required_target.as_deref() == Some("test_widget.py")
+    projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && projection
             .verification_cluster
             .as_ref()
             .is_some_and(|cluster| {
                 cluster.evidence.iter().any(|evidence| {
-                    evidence.expected.as_deref() == Some("ZeroDivisionError")
-                        && evidence.observed.as_deref() == Some("ValueError")
+                    evidence.expected.as_deref() == Some("scenario-visible error classification")
+                        && evidence.observed.as_deref()
+                            == Some("source exposed a contract-compliant error classification")
                         && evidence
                             .evidence_markers
                             .iter()
@@ -1740,10 +1928,10 @@ FAILED (errors=1)"#;
                 decision.owner == "TestViolatesContract"
                     && decision.test_repair_allowed
                     && !decision.source_repair_allowed
-                    && decision.required_target.as_deref() == Some("test_widget.py")
+                    && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
             })
         && snapshot.repair_owner == "generated_test"
-        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && snapshot
             .hard_invariants
             .iter()
@@ -1754,23 +1942,24 @@ pub(crate) fn generic_generated_test_only_repair_lane_preserves_active_test_targ
 -> bool {
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
-    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
     state.failure = Some(crate::session::FailureState {
         kind: FailureKind::VerificationFailed,
-        summary: "verification failed: generated test stale literal".to_string(),
+        summary: "verification failed: generated workflow test stale literal".to_string(),
         tool_name: Some(crate::tool::ToolName::Shell),
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_invalid_visible_contract".to_string()];
+    state.verification.failing_labels =
+        vec!["workflow generated-test visible contract".to_string()];
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-generic-generated-test-only-repair-lane".to_string(),
-        failing_labels: vec!["test_invalid_visible_contract".to_string()],
-        primary_failure: Some("AssertionError: stale literal expectation".to_string()),
+        failing_labels: vec!["workflow generated-test visible contract".to_string()],
+        primary_failure: Some("generated-test visible contract assertion drift".to_string()),
         evidence: vec![VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("generic_verification_failure".to_string()),
-            label: Some("test_invalid_visible_contract".to_string()),
+            label: Some("workflow generated-test visible contract".to_string()),
             target: None,
             symbol: None,
             call_site: None,
@@ -1781,18 +1970,18 @@ pub(crate) fn generic_generated_test_only_repair_lane_preserves_active_test_targ
             public_missing_attributes: Vec::new(),
             evidence_markers: vec!["generic_verification_failure".to_string()],
             sibling_obligations: Vec::new(),
-            requirement_refs: Vec::new(),
+            requirement_refs: vec!["workflow-generated-test-contract".to_string()],
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
         sibling_obligations: Vec::new(),
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-generated-test --contract".to_string());
 
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
     let Some(projection) = project_repair_lane(&state, &allowed_tools) else {
@@ -1805,8 +1994,8 @@ pub(crate) fn generic_generated_test_only_repair_lane_preserves_active_test_targ
         return false;
     };
 
-    projection.required_target.as_deref() == Some("test_widget.py")
-        && template.exact_target.as_deref() == Some("test_widget.py")
+    projection.required_target.as_deref() == Some("tests/workflow.spec.ts")
+        && template.exact_target.as_deref() == Some("tests/workflow.spec.ts")
         && template.operation_kind == "source_test_contract_repair"
         && template.source_test_ownership == "source_or_generated_test_by_contract_evidence"
         && projection
@@ -1816,27 +2005,16 @@ pub(crate) fn generic_generated_test_only_repair_lane_preserves_active_test_targ
                 decision.owner == "SourceTestContractMismatch"
                     && decision.source_repair_allowed
                     && decision.test_repair_allowed
-                    && decision.required_target.as_deref() == Some("test_widget.py")
+                    && decision.required_target.as_deref() == Some("tests/workflow.spec.ts")
             })
-        && snapshot.required_target.as_deref() == Some("test_widget.py")
+        && snapshot.required_target.as_deref() == Some("tests/workflow.spec.ts")
         && snapshot.repair_owner == "source_or_generated_test_by_contract_evidence"
 }
 
 pub(crate) fn contract_visible_public_exception_projects_source_repair_fixture_passes() -> bool {
-    let summary = r#"FAIL: test_invalid_public_input (test_widget.TestWidget.test_invalid_public_input)
-----------------------------------------------------------------------
-Traceback (most recent call last):
-  File "C:\workspace\test_widget.py", line 41, in test_invalid_public_input
-    with self.assertRaises(ValueError):
-AssertionError: ValueError not raised
-
-----------------------------------------------------------------------
-Ran 12 tests in 0.001s
-
-FAILED (failures=1)"#;
     let mut state = SessionStateSnapshot::default();
     state.process_phase = ProcessPhase::Repair;
-    state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
     state.contract_refs = vec![
         Utf8PathBuf::from("scenario_contract.md"),
         Utf8PathBuf::from("scenario_contract.json"),
@@ -1848,22 +2026,40 @@ FAILED (failures=1)"#;
         targets: state.active_targets.clone(),
     });
     state.completion.verification_pending = true;
-    state.verification.failing_labels = vec!["test_invalid_public_input".to_string()];
+    state.verification.failing_labels = vec!["workflow_public_behavior".to_string()];
     state
         .verification
         .required_commands
-        .push("python -m unittest".to_string());
+        .push("verify-contract --behavior".to_string());
     state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-contract-visible-public-exception-repair".to_string(),
         failing_labels: state.verification.failing_labels.clone(),
-        primary_failure: Some("AssertionError: ValueError not raised".to_string()),
-        evidence: verification_failure_evidence_from_summary(
-            FailureKind::VerificationFailed,
-            summary,
-        ),
+        primary_failure: Some("workflow public exception behavior was not raised".to_string()),
+        evidence: vec![VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_exception_mismatch".to_string()),
+            label: Some("workflow_public_behavior".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: None,
+            call_site: Some("expect workflow invalid input to raise public error".to_string()),
+            exception: Some("WorkflowError not raised".to_string()),
+            expected: Some("WorkflowError".to_string()),
+            observed: Some("no public error was raised".to_string()),
+            public_state_assertions: Vec::new(),
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec![
+                "public_exception_mismatch".to_string(),
+                "source_public_behavior_assertion".to_string(),
+                "workflow-source-contract".to_string(),
+            ],
+            sibling_obligations: vec!["source_public_behavior_assertion".to_string()],
+            requirement_refs: vec!["workflow-source-contract".to_string()],
+            source_refs: Vec::new(),
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
+        }],
         sibling_obligations: vec!["source_public_behavior_assertion".to_string()],
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
 
     let allowed_tools = BTreeSet::from(["write".to_string(), "apply_patch".to_string()]);
@@ -1877,8 +2073,8 @@ FAILED (failures=1)"#;
         return false;
     };
 
-    projection.required_target.as_deref() == Some("widget.py")
-        && template.exact_target.as_deref() == Some("widget.py")
+    projection.required_target.as_deref() == Some("src/workflow.ts")
+        && template.exact_target.as_deref() == Some("src/workflow.ts")
         && template.operation_kind == "source_exception_contract"
         && projection
             .contract_reconciliation
@@ -1887,10 +2083,10 @@ FAILED (failures=1)"#;
                 decision.owner == "SourceViolatesContract"
                     && decision.source_repair_allowed
                     && !decision.test_repair_allowed
-                    && decision.required_target.as_deref() == Some("widget.py")
+                    && decision.required_target.as_deref() == Some("src/workflow.ts")
             })
         && snapshot.repair_owner == "source"
-        && snapshot.required_target.as_deref() == Some("widget.py")
+        && snapshot.required_target.as_deref() == Some("src/workflow.ts")
 }
 
 fn repair_lane_subtype(
@@ -1922,6 +2118,7 @@ fn repair_lane_subtype_from_str(value: &str) -> Option<RepairLaneSubtype> {
         "generated_test_logging_contract_overreach" => {
             Some(RepairLaneSubtype::GeneratedTestLoggingContractOverreach)
         }
+        "generated_test_parse_defect" => Some(RepairLaneSubtype::GeneratedTestParseDefect),
         "import_export_missing_export" => Some(RepairLaneSubtype::ImportExportMissingExport),
         "no_tests_ran" => Some(RepairLaneSubtype::NoTestsRan),
         "public_class_attribute_mismatch" => Some(RepairLaneSubtype::PublicClassAttributeMismatch),
@@ -1966,6 +2163,8 @@ fn repair_lane_subtype_from_summary(kind: FailureKind, summary: &str) -> RepairL
         RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
     } else if generated_test_logging_contract_overreach(summary).is_some() {
         RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+    } else if generated_test_parse_defect(summary).is_some() {
+        RepairLaneSubtype::GeneratedTestParseDefect
     } else if generated_test_module_attribute_api_misuse(summary).is_some()
         || generated_test_reflection_api_misuse(summary).is_some()
     {
@@ -2013,25 +2212,45 @@ fn repair_lane_subtype_from_summary(kind: FailureKind, summary: &str) -> RepairL
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct GeneratedTestLoggingContractOverreach {
-    logger_name: Option<String>,
-    level: Option<String>,
-    assertion_line: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PublicOutputStreamAssertionMismatch {
-    stream: String,
-    expected_substring: String,
-    observed_value: String,
-    observed_output: String,
-    assertion_line: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct PublicCommandContractFailure {
     command: Option<String>,
     observed_issue: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GeneratedTestParseDefect {
+    detail: String,
+    target: Option<String>,
+}
+
+fn generated_test_parse_defect(summary: &str) -> Option<GeneratedTestParseDefect> {
+    let lower = summary.to_ascii_lowercase();
+    let generated_test_marker = lower.contains("generated-test")
+        || lower.contains("generated test")
+        || lower.contains("generated_test");
+    let parse_marker = lower.contains("parse defect")
+        || lower.contains("parse-defect")
+        || lower.contains("syntax error")
+        || lower.contains("syntaxerror");
+    if !generated_test_marker || !parse_marker {
+        return None;
+    }
+    let target = summary
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '`' | '\'' | '"' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+        })
+        .map(|token| token.trim_matches(|ch: char| matches!(ch, ':' | '.' | '!' | '?')))
+        .map(|token| token.replace('\\', "/"))
+        .filter(|token| classify_artifact_target(token).role == ArtifactRole::Test)
+        .next();
+    let detail = source_parse_defect(summary)
+        .map(|defect| defect.detail)
+        .unwrap_or_else(|| "generated-test parse defect".to_string());
+    Some(GeneratedTestParseDefect { detail, target })
 }
 
 fn public_command_contract_failure(summary: &str) -> Option<PublicCommandContractFailure> {
@@ -2073,305 +2292,6 @@ fn public_command_contract_failure(summary: &str) -> Option<PublicCommandContrac
     })
 }
 
-fn generated_test_logging_contract_overreach(
-    summary: &str,
-) -> Option<GeneratedTestLoggingContractOverreach> {
-    let lower = summary.to_ascii_lowercase();
-    if !lower.contains("assertlogs(") || !lower.contains("no logs of level") {
-        return None;
-    }
-    if !failure_summary_logical_lines(summary)
-        .into_iter()
-        .any(|line| {
-            let lower = line.to_ascii_lowercase();
-            lower.contains("file ") && lower.contains(".py") && lower.contains("test_")
-        })
-    {
-        return None;
-    }
-    let assertion_line = failure_summary_logical_lines(summary)
-        .into_iter()
-        .find(|line| line.to_ascii_lowercase().contains("assertlogs("))?
-        .to_string();
-    Some(GeneratedTestLoggingContractOverreach {
-        logger_name: extract_assert_logs_logger(&assertion_line),
-        level: extract_assert_logs_level(&assertion_line),
-        assertion_line,
-    })
-}
-
-fn public_output_stream_assertion_mismatch(
-    summary: &str,
-) -> Option<PublicOutputStreamAssertionMismatch> {
-    let logical_lines = failure_summary_logical_lines(summary);
-    for (index, line) in logical_lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if let Some(assert_start) = trimmed.find("self.assertIn(") {
-            let Some(stream) = public_output_stream_subject(trimmed) else {
-                continue;
-            };
-            let after = &trimmed[assert_start + "self.assertIn(".len()..];
-            let Some(end) = after.rfind(')') else {
-                continue;
-            };
-            let args = top_level_arguments(after[..end].trim());
-            let Some(expected) = args
-                .first()
-                .map(|value| clean_output_assertion_value(value))
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            let observed = subsequent_assertion_not_found_observed_value(&logical_lines, index)
-                .unwrap_or_else(|| format!("unmatched {stream} output"));
-            let observed_output = if observed.is_empty() {
-                format!("empty {stream}")
-            } else {
-                format!("{stream} `{observed}`")
-            };
-            return Some(PublicOutputStreamAssertionMismatch {
-                stream: stream.to_string(),
-                expected_substring: expected,
-                observed_value: observed,
-                observed_output,
-                assertion_line: trimmed.to_string(),
-            });
-        }
-        if let Some(assert_start) = trimmed.find("self.assertEqual(") {
-            let after = &trimmed[assert_start + "self.assertEqual(".len()..];
-            let Some(end) = after.rfind(')') else {
-                continue;
-            };
-            let args = top_level_arguments(after[..end].trim());
-            if args.len() < 2 {
-                continue;
-            }
-            let Some((stream, expected)) = public_output_assert_equal_stream_and_expected(&args)
-            else {
-                continue;
-            };
-            let (observed, error_expected) =
-                subsequent_assertion_equal_observed_expected_values(&logical_lines, index)
-                    .unwrap_or_else(|| (format!("unmatched {stream} output"), expected.clone()));
-            let expected = if !error_expected.is_empty() {
-                error_expected
-            } else {
-                expected
-            };
-            let observed_output = if observed.is_empty() {
-                format!("empty {stream}")
-            } else {
-                format!("{stream} `{observed}`")
-            };
-            return Some(PublicOutputStreamAssertionMismatch {
-                stream: stream.to_string(),
-                expected_substring: expected,
-                observed_value: observed,
-                observed_output,
-                assertion_line: trimmed.to_string(),
-            });
-        }
-    }
-    None
-}
-
-fn generated_test_subprocess_output_capture_missing(
-    summary: &str,
-) -> Option<PublicOutputStreamAssertionMismatch> {
-    let lower = summary.to_ascii_lowercase();
-    if !(lower.contains("typeerror:")
-        && lower.contains("nonetype")
-        && lower.contains("not iterable"))
-    {
-        return None;
-    }
-    if test_refs_from_summary(summary).is_empty() {
-        return None;
-    }
-    for line in failure_summary_logical_lines(summary) {
-        let trimmed = line.trim();
-        let Some(assert_start) = trimmed.find("self.assertIn(") else {
-            continue;
-        };
-        let Some(stream) = public_output_stream_subject(trimmed) else {
-            continue;
-        };
-        let after = &trimmed[assert_start + "self.assertIn(".len()..];
-        let Some(end) = after.rfind(')') else {
-            continue;
-        };
-        let args = top_level_arguments(after[..end].trim());
-        let Some(expected) = args
-            .first()
-            .map(|value| clean_output_assertion_value(value))
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        return Some(PublicOutputStreamAssertionMismatch {
-            stream: stream.to_string(),
-            expected_substring: expected,
-            observed_value: format!("CompletedProcess.{stream} is None"),
-            observed_output: format!(
-                "CompletedProcess.{stream} is None because generated subprocess.run did not capture {stream}"
-            ),
-            assertion_line: trimmed.to_string(),
-        });
-    }
-    None
-}
-
-fn generated_test_subprocess_encoding_missing(
-    summary: &str,
-) -> Option<PublicOutputStreamAssertionMismatch> {
-    let lower = summary.to_ascii_lowercase();
-    if !(lower.contains("unicodedecodeerror")
-        && lower.contains("utf-8")
-        && lower.contains("subprocess.py")
-        && lower.contains("_readerthread")
-        && lower.contains("nonetype")
-        && lower.contains("not iterable"))
-    {
-        return None;
-    }
-    if test_refs_from_summary(summary).is_empty() {
-        return None;
-    }
-    for line in failure_summary_logical_lines(summary) {
-        let trimmed = line.trim();
-        let Some(assert_start) = trimmed.find("self.assertIn(") else {
-            continue;
-        };
-        let Some(stream) = public_output_stream_subject(trimmed) else {
-            continue;
-        };
-        let after = &trimmed[assert_start + "self.assertIn(".len()..];
-        let Some(end) = after.rfind(')') else {
-            continue;
-        };
-        let args = top_level_arguments(after[..end].trim());
-        let Some(expected) = args
-            .first()
-            .map(|value| clean_output_assertion_value(value))
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        return Some(PublicOutputStreamAssertionMismatch {
-            stream: stream.to_string(),
-            expected_substring: expected,
-            observed_value: format!("CompletedProcess.{stream} is None after UnicodeDecodeError"),
-            observed_output: format!(
-                "UnicodeDecodeError while parent decoded child subprocess {stream} as UTF-8 without explicit child UTF-8 output authority"
-            ),
-            assertion_line: trimmed.to_string(),
-        });
-    }
-    None
-}
-
-fn public_output_assert_equal_stream_and_expected(args: &[&str]) -> Option<(&'static str, String)> {
-    let first_stream = args
-        .first()
-        .and_then(|arg| public_output_stream_subject(arg));
-    let second_stream = args
-        .get(1)
-        .and_then(|arg| public_output_stream_subject(arg));
-    if let Some(stream) = first_stream {
-        return args
-            .get(1)
-            .map(|arg| clean_output_assertion_value(arg))
-            .filter(|value| !value.is_empty())
-            .map(|expected| (stream, expected));
-    }
-    if let Some(stream) = second_stream {
-        return args
-            .first()
-            .map(|arg| clean_output_assertion_value(arg))
-            .filter(|value| !value.is_empty())
-            .map(|expected| (stream, expected));
-    }
-    None
-}
-
-fn public_output_stream_subject(assertion_line: &str) -> Option<&'static str> {
-    if assertion_line.contains("result.stderr") || assertion_line.contains(".stderr") {
-        Some("stderr")
-    } else if assertion_line.contains("result.stdout") || assertion_line.contains(".stdout") {
-        Some("stdout")
-    } else {
-        None
-    }
-}
-
-fn assertion_not_found_observed_value(line: &str) -> Option<String> {
-    let detail = line.trim().strip_prefix("AssertionError:")?.trim();
-    let (_, observed) = detail.split_once(" not found in ")?;
-    Some(clean_output_assertion_value(observed))
-}
-
-fn subsequent_assertion_not_found_observed_value(lines: &[&str], index: usize) -> Option<String> {
-    lines
-        .iter()
-        .skip(index + 1)
-        .take(6)
-        .find_map(|line| assertion_not_found_observed_value(line))
-}
-
-fn assertion_equal_observed_expected_values(line: &str) -> Option<(String, String)> {
-    let detail = line.trim().strip_prefix("AssertionError:")?.trim();
-    let (observed, expected) = detail.split_once("!=")?;
-    Some((
-        clean_output_assertion_value(observed),
-        clean_output_assertion_value(expected),
-    ))
-}
-
-fn subsequent_assertion_equal_observed_expected_values(
-    lines: &[&str],
-    index: usize,
-) -> Option<(String, String)> {
-    lines
-        .iter()
-        .skip(index + 1)
-        .take(8)
-        .find_map(|line| assertion_equal_observed_expected_values(line))
-}
-
-fn clean_output_assertion_value(value: &str) -> String {
-    let value = value.trim().trim_end_matches(',').trim();
-    if value.len() >= 2 {
-        let mut chars = value.chars();
-        let first = chars.next();
-        let last = value.chars().last();
-        if matches!(
-            (first, last),
-            (Some('\''), Some('\'')) | (Some('"'), Some('"'))
-        ) {
-            return value[1..value.len() - 1].to_string();
-        }
-    }
-    value.to_string()
-}
-
-fn extract_assert_logs_logger(assertion_line: &str) -> Option<String> {
-    extract_delimited_after(assertion_line, "assertLogs(\"", '"')
-        .or_else(|| extract_delimited_after(assertion_line, "assertLogs('", '\''))
-}
-
-fn extract_assert_logs_level(assertion_line: &str) -> Option<String> {
-    extract_delimited_after(assertion_line, "level=\"", '"')
-        .or_else(|| extract_delimited_after(assertion_line, "level='", '\''))
-}
-
-fn extract_delimited_after(text: &str, marker: &str, terminator: char) -> Option<String> {
-    let start = text.find(marker)? + marker.len();
-    let rest = &text[start..];
-    let end = rest.find(terminator)?;
-    let value = rest[..end].trim();
-    (!value.is_empty()).then(|| value.to_string())
-}
-
 fn required_target_for_subtype(
     state: &SessionStateSnapshot,
     subtype: &RepairLaneSubtype,
@@ -2382,11 +2302,13 @@ fn required_target_for_subtype(
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
         | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
         | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
+        | RepairLaneSubtype::GeneratedTestParseDefect
         | RepairLaneSubtype::GeneratedTestLoggingContractOverreach => {
             first_test_target(&state.active_targets).or_else(|| first_target(&state.active_targets))
         }
         RepairLaneSubtype::ImportExportMissingExport => import_export_source_target(state, cluster)
             .or_else(|| first_non_test_target(&state.active_targets))
+            .or_else(|| first_non_test_repair_authority_target(&state.active_targets))
             .or_else(|| first_target(&state.active_targets)),
         RepairLaneSubtype::NoTestsRan => {
             generated_test_repair_target(state).or_else(|| first_target(&state.active_targets))
@@ -2400,8 +2322,11 @@ fn required_target_for_subtype(
         | RepairLaneSubtype::PublicStateAssertionMismatch
         | RepairLaneSubtype::SourceImportTimeNameResolution
         | RepairLaneSubtype::SourceParseDefect => first_non_test_target(&state.active_targets)
+            .or_else(|| first_non_test_repair_authority_target(&state.active_targets))
             .or_else(|| first_non_test_failure_target(state))
+            .or_else(|| first_non_test_failure_repair_authority_target(state))
             .or_else(|| first_source_ref_target(cluster))
+            .or_else(|| first_repair_authority_source_ref_target(cluster))
             .or_else(|| source_target_from_cluster_test_refs(cluster)),
         RepairLaneSubtype::PublicCallableSignatureMismatch => cluster
             .and_then(|cluster| {
@@ -2409,25 +2334,35 @@ fn required_target_for_subtype(
                     .evidence
                     .iter()
                     .filter_map(|evidence| evidence.target.clone())
-                    .find(|target| target_is_mutable_source_like(target))
+                    .find(|target| target_is_non_test_repair_authority(target))
             })
-            .or_else(|| first_non_test_target(&state.active_targets)),
+            .or_else(|| first_non_test_target(&state.active_targets))
+            .or_else(|| first_non_test_repair_authority_target(&state.active_targets)),
         RepairLaneSubtype::PublicMethodAttributeMismatch => {
             first_non_test_target(&state.active_targets)
+                .or_else(|| first_non_test_repair_authority_target(&state.active_targets))
                 .or_else(|| first_non_test_failure_target(state))
+                .or_else(|| first_non_test_failure_repair_authority_target(state))
                 .or_else(|| first_source_ref_target(cluster))
+                .or_else(|| first_repair_authority_source_ref_target(cluster))
         }
-        RepairLaneSubtype::PublicExceptionMismatch => cluster
-            .and_then(|cluster| {
-                cluster
-                    .evidence
-                    .iter()
-                    .filter_map(|evidence| evidence.target.clone())
-                    .find(|target| target_is_mutable_source_like(target))
-            })
-            .or_else(|| first_non_test_target(&state.active_targets)),
+        RepairLaneSubtype::PublicExceptionMismatch => first_non_test_target(&state.active_targets)
+            .or_else(|| first_non_test_repair_authority_target(&state.active_targets))
+            .or_else(|| first_non_test_failure_target(state))
+            .or_else(|| first_non_test_failure_repair_authority_target(state))
+            .or_else(|| first_source_ref_target(cluster))
+            .or_else(|| first_repair_authority_source_ref_target(cluster))
+            .or_else(|| {
+                cluster.and_then(|cluster| {
+                    cluster
+                        .evidence
+                        .iter()
+                        .filter_map(|evidence| evidence.target.clone())
+                        .find(|target| target_is_non_test_repair_authority(target))
+                })
+            }),
         RepairLaneSubtype::PatchMismatch | RepairLaneSubtype::GenericVerificationFailure => {
-            first_target(&state.active_targets)
+            first_source_call_site_target(cluster).or_else(|| first_target(&state.active_targets))
         }
     }
 }
@@ -2438,56 +2373,6 @@ fn generated_test_repair_target(state: &SessionStateSnapshot) -> Option<String> 
         .as_ref()
         .and_then(|failure| first_test_target(&failure.targets))
         .or_else(|| first_test_target(&state.active_targets))
-}
-
-fn typed_repair_target_outranks_required_action(
-    subtype: &RepairLaneSubtype,
-    typed_target: Option<&str>,
-    action_target: Option<&str>,
-    cluster: Option<&VerificationFailureCluster>,
-) -> bool {
-    let (Some(typed_target), Some(action_target)) = (typed_target, action_target) else {
-        return false;
-    };
-    if typed_target == action_target
-        || target_is_test_like(typed_target)
-        || !target_is_test_like(action_target)
-    {
-        return false;
-    }
-    match subtype {
-        RepairLaneSubtype::PublicMissingAttributeMismatch
-        | RepairLaneSubtype::PublicCommandContractFailure
-        | RepairLaneSubtype::PublicOutputStreamAssertionMismatch
-        | RepairLaneSubtype::PublicStateAssertionMismatch => {
-            !has_explicit_generated_test_conflict_evidence_in_cluster(cluster)
-        }
-        RepairLaneSubtype::PublicClassAttributeMismatch
-        | RepairLaneSubtype::PublicConstructorBodyException
-        | RepairLaneSubtype::PublicConstructorSignatureMismatch
-        | RepairLaneSubtype::PublicCallableSignatureMismatch
-        | RepairLaneSubtype::PublicExceptionMismatch
-        | RepairLaneSubtype::PublicMethodAttributeMismatch
-        | RepairLaneSubtype::ImportExportMissingExport
-        | RepairLaneSubtype::SourceImportTimeNameResolution
-        | RepairLaneSubtype::SourceParseDefect => true,
-        RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
-        | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
-        | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
-        | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
-        | RepairLaneSubtype::NoTestsRan
-        | RepairLaneSubtype::PatchMismatch
-        | RepairLaneSubtype::DocsRouteContractRepair
-        | RepairLaneSubtype::GenericVerificationFailure => false,
-    }
-}
-
-fn no_tests_ran_generated_test_target_outranks_stale_write_action(
-    subtype: &RepairLaneSubtype,
-    typed_target: Option<&str>,
-) -> bool {
-    let _ = (subtype, typed_target);
-    false
 }
 
 fn import_export_source_target(
@@ -2516,11 +2401,25 @@ fn first_non_test_target(targets: &[Utf8PathBuf]) -> Option<String> {
         .map(|target| target.as_str().to_string())
 }
 
+fn first_non_test_repair_authority_target(targets: &[Utf8PathBuf]) -> Option<String> {
+    targets
+        .iter()
+        .find(|target| target_is_non_test_repair_authority(target.as_str()))
+        .map(|target| target.as_str().to_string())
+}
+
 fn first_non_test_failure_target(state: &SessionStateSnapshot) -> Option<String> {
     state
         .failure
         .as_ref()
         .and_then(|failure| first_non_test_target(&failure.targets))
+}
+
+fn first_non_test_failure_repair_authority_target(state: &SessionStateSnapshot) -> Option<String> {
+    state
+        .failure
+        .as_ref()
+        .and_then(|failure| first_non_test_repair_authority_target(&failure.targets))
 }
 
 fn first_source_ref_target(cluster: Option<&VerificationFailureCluster>) -> Option<String> {
@@ -2535,6 +2434,24 @@ fn first_source_ref_target(cluster: Option<&VerificationFailureCluster>) -> Opti
                     .flat_map(|evidence| evidence.source_refs.iter()),
             )
             .find(|target| target_is_mutable_source_like(target))
+            .cloned()
+    })
+}
+
+fn first_repair_authority_source_ref_target(
+    cluster: Option<&VerificationFailureCluster>,
+) -> Option<String> {
+    cluster.and_then(|cluster| {
+        cluster
+            .source_refs
+            .iter()
+            .chain(
+                cluster
+                    .evidence
+                    .iter()
+                    .flat_map(|evidence| evidence.source_refs.iter()),
+            )
+            .find(|target| target_is_non_test_repair_authority(target))
             .cloned()
     })
 }
@@ -2561,7 +2478,7 @@ fn normalize_source_owned_required_target(
     }
     if required_target
         .as_deref()
-        .is_some_and(target_is_mutable_source_like)
+        .is_some_and(target_is_non_test_repair_authority)
     {
         if let Some(target) = required_target.as_deref()
             && let Some(canonical) = canonical_relative_source_target_for(target, state, cluster)
@@ -2572,8 +2489,12 @@ fn normalize_source_owned_required_target(
     }
 
     first_non_test_target(&state.active_targets)
+        .or_else(|| first_non_test_repair_authority_target(&state.active_targets))
         .or_else(|| first_non_test_failure_target(state))
+        .or_else(|| first_non_test_failure_repair_authority_target(state))
         .or_else(|| first_source_ref_target(cluster))
+        .or_else(|| first_repair_authority_source_ref_target(cluster))
+        .or_else(|| first_source_call_site_target(cluster))
         .or_else(|| {
             required_target
                 .as_deref()
@@ -2588,6 +2509,17 @@ fn normalize_source_owned_required_target(
                 .and_then(|failure| source_target_from_test_targets(&failure.targets))
         })
         .or_else(|| source_target_from_cluster_test_refs(cluster))
+}
+
+fn first_source_call_site_target(cluster: Option<&VerificationFailureCluster>) -> Option<String> {
+    cluster.and_then(|cluster| {
+        cluster
+            .evidence
+            .iter()
+            .filter_map(|evidence| evidence.call_site.as_deref())
+            .flat_map(language_source_targets_from_text)
+            .find(|target| target_is_mutable_source_like(target))
+    })
 }
 
 fn canonical_relative_source_target_for(
@@ -2630,15 +2562,16 @@ fn first_matching_source_target(targets: &[Utf8PathBuf], target: &str) -> Option
 }
 
 fn source_targets_equivalent(candidate: &str, target: &str) -> bool {
-    let candidate = candidate.replace('\\', "/");
-    let target = target.replace('\\', "/");
-    candidate.eq_ignore_ascii_case(&target)
-        || target
-            .to_ascii_lowercase()
-            .ends_with(&format!("/{}", candidate.to_ascii_lowercase()))
-        || candidate
-            .to_ascii_lowercase()
-            .ends_with(&format!("/{}", target.to_ascii_lowercase()))
+    normalize_target_identity(candidate).eq_ignore_ascii_case(&normalize_target_identity(target))
+}
+
+fn normalize_target_identity(target: &str) -> String {
+    let normalized = target.replace('\\', "/");
+    normalized
+        .strip_prefix("./")
+        .unwrap_or(normalized.as_str())
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn source_target_from_test_targets(targets: &[Utf8PathBuf]) -> Option<String> {
@@ -2667,35 +2600,35 @@ fn source_target_from_cluster_test_refs(
 }
 
 fn source_target_for_generated_test_target(target: &str) -> Option<String> {
-    python_source_for_test_target(target)
-        .map(|contract| contract.source_path)
+    let spec = classify_artifact_target(target);
+    (spec.role == ArtifactRole::Test)
+        .then_some(spec.source_path)
+        .flatten()
         .filter(|source| target_is_mutable_source_like(source))
 }
 
 fn target_is_test_like(target: &str) -> bool {
-    let normalized = target.replace('\\', "/").to_ascii_lowercase();
-    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    file_name.starts_with("test_")
-        || file_name.ends_with("_test.py")
-        || file_name.ends_with(".test.ts")
-        || file_name.ends_with(".spec.ts")
-        || file_name.ends_with(".test.js")
-        || file_name.ends_with(".spec.js")
-        || normalized.contains("/tests/")
+    classify_artifact_target(target).role == ArtifactRole::Test
 }
 
 fn target_is_mutable_source_like(target: &str) -> bool {
-    let normalized = target.replace('\\', "/").to_ascii_lowercase();
-    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    !target_is_test_like(target)
-        && !matches!(file_name, "scenario_contract.md" | "scenario_contract.json")
-        && (normalized.contains("/src/")
-            || file_name.ends_with(".py")
-            || file_name.ends_with(".rs")
-            || file_name.ends_with(".js")
-            || file_name.ends_with(".ts")
-            || file_name.ends_with(".tsx")
-            || file_name.ends_with(".jsx"))
+    let spec = classify_artifact_target(target);
+    let file_name = spec
+        .normalized_target
+        .rsplit('/')
+        .next()
+        .unwrap_or(spec.normalized_target.as_str())
+        .to_ascii_lowercase();
+    spec.role == ArtifactRole::Source
+        && !matches!(
+            file_name.as_str(),
+            "scenario_contract.md" | "scenario_contract.json"
+        )
+        && matches!(spec.language, LanguageFamily::Python | LanguageFamily::Code)
+}
+
+fn target_is_non_test_repair_authority(target: &str) -> bool {
+    language_verification_repair_authority_target(target) && !target_is_test_like(target)
 }
 
 fn missing_import_symbol(summary: &str) -> Option<String> {
@@ -2725,7 +2658,11 @@ pub(crate) fn verification_failure_evidence_from_summary(
     evidence_markers.extend(contract_classification_markers_from_summary(summary));
     let mut public_state_assertions = public_state_assertions(summary);
     let mut public_missing_attributes = public_missing_attributes(summary);
-    if matches!(subtype, RepairLaneSubtype::GeneratedTestArtifactApiMisuse) {
+    if matches!(
+        subtype,
+        RepairLaneSubtype::GeneratedTestArtifactApiMisuse
+            | RepairLaneSubtype::GeneratedTestParseDefect
+    ) {
         public_missing_attributes.clear();
         public_state_assertions.clear();
     }
@@ -2753,6 +2690,7 @@ pub(crate) fn verification_failure_evidence_from_summary(
                 .map(|observation| observation.actual_exception)
         });
     let source_refs = source_refs_for_evidence(&subtype, summary, target.as_deref());
+    let test_refs = test_refs_for_evidence(&subtype, summary, target.as_deref());
     let public_output_mismatch = public_output_stream_assertion_mismatch(summary);
     let public_command_failure = public_command_contract_failure(summary);
     let generated_encoding_missing = generated_test_subprocess_encoding_missing(summary);
@@ -2813,7 +2751,7 @@ pub(crate) fn verification_failure_evidence_from_summary(
         sibling_obligations,
         requirement_refs: Vec::new(),
         source_refs,
-        test_refs: test_refs_from_summary(summary),
+        test_refs,
     }]
 }
 
@@ -2857,6 +2795,8 @@ fn typed_evidence_observed_from_summary(
             generated_test_subprocess_output_capture_missing(summary)
                 .map(|mismatch| mismatch.observed_output)
         }
+        RepairLaneSubtype::GeneratedTestParseDefect => generated_test_parse_defect(summary)
+            .map(|defect| format!("generated test parse defect `{}`", defect.detail)),
         RepairLaneSubtype::GeneratedTestArtifactApiMisuse => {
             generated_test_module_attribute_api_misuse(summary)
                 .map(|defect| {
@@ -2911,8 +2851,11 @@ fn typed_evidence_target_from_summary(
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
         | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
         | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+        | RepairLaneSubtype::GeneratedTestParseDefect
         | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
-        | RepairLaneSubtype::NoTestsRan => test_refs_from_summary(summary).into_iter().next(),
+        | RepairLaneSubtype::NoTestsRan => {
+            test_refs_for_subtype(subtype, summary).into_iter().next()
+        }
         RepairLaneSubtype::PatchMismatch
         | RepairLaneSubtype::DocsRouteContractRepair
         | RepairLaneSubtype::GenericVerificationFailure => None,
@@ -2955,7 +2898,7 @@ fn typed_evidence_call_site_from_summary(
 }
 
 fn source_refs_from_summary(summary: &str) -> Vec<String> {
-    file_refs_from_summary(summary, false)
+    language_file_refs_from_summary(summary, ArtifactRole::Source)
 }
 
 fn source_refs_for_evidence(
@@ -2969,6 +2912,7 @@ fn source_refs_for_evidence(
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
             | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
             | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+            | RepairLaneSubtype::GeneratedTestParseDefect
             | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
     ) {
         return Vec::new();
@@ -2986,7 +2930,37 @@ fn source_refs_for_evidence(
 }
 
 fn test_refs_from_summary(summary: &str) -> Vec<String> {
-    file_refs_from_summary(summary, true)
+    language_file_refs_from_summary(summary, ArtifactRole::Test)
+}
+
+fn test_refs_for_evidence(
+    subtype: &RepairLaneSubtype,
+    summary: &str,
+    target: Option<&str>,
+) -> Vec<String> {
+    let mut refs = test_refs_for_subtype(subtype, summary);
+    if matches!(subtype, RepairLaneSubtype::GeneratedTestParseDefect)
+        && let Some(target) = target
+        && target_is_test_like(target)
+        && !refs
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(target))
+    {
+        refs.insert(0, target.to_string());
+    }
+    stable_unique(refs)
+}
+
+fn test_refs_for_subtype(subtype: &RepairLaneSubtype, summary: &str) -> Vec<String> {
+    if matches!(subtype, RepairLaneSubtype::GeneratedTestParseDefect) {
+        let mut refs = generated_test_parse_defect(summary)
+            .and_then(|defect| defect.target)
+            .map(|target| vec![target])
+            .unwrap_or_default();
+        refs.extend(test_refs_from_summary(summary));
+        return stable_unique(refs);
+    }
+    test_refs_from_summary(summary)
 }
 
 fn contract_classification_markers_from_summary(summary: &str) -> Vec<String> {
@@ -3049,6 +3023,10 @@ fn contract_classification_markers_from_summary(summary: &str) -> Vec<String> {
     if generated_test_subprocess_output_capture_missing(summary).is_some() {
         markers.push("generated_test_subprocess_output_capture_missing".to_string());
     }
+    if generated_test_parse_defect(summary).is_some() {
+        markers.push("generated_test_artifact_parse_defect".to_string());
+        markers.push("generated_test_parse_defect".to_string());
+    }
     if generated_test_public_output_contract_overreach(summary).is_some() {
         markers.push("generated_test_contract_overreach".to_string());
     }
@@ -3056,36 +3034,6 @@ fn contract_classification_markers_from_summary(summary: &str) -> Vec<String> {
         markers.push("generated_test_contract_overreach".to_string());
     }
     markers
-}
-
-fn file_refs_from_summary(summary: &str, tests: bool) -> Vec<String> {
-    let mut refs = failure_summary_logical_lines(summary)
-        .into_iter()
-        .filter_map(|line| quoted_file_frame_path(line))
-        .filter(|path| !runtime_traceback_frame_path(path))
-        .filter(|path| target_is_test_like(path) == tests)
-        .map(|path| {
-            path.replace('\\', "/")
-                .rsplit('/')
-                .next()
-                .unwrap_or(path.as_str())
-                .to_string()
-        })
-        .collect::<Vec<_>>();
-    refs.sort();
-    refs.dedup();
-    refs
-}
-
-fn runtime_traceback_frame_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    normalized.contains("/lib/unittest/")
-        || normalized.contains("/lib/site-packages/")
-        || normalized.contains("/lib/python")
-        || normalized.contains("/python")
-            && normalized.contains("/lib/")
-            && !normalized.contains("/workspace/")
-            && !normalized.contains("/project_sandbox/")
 }
 
 fn missing_symbol_from_cluster(cluster: Option<&VerificationFailureCluster>) -> Option<String> {
@@ -3161,370 +3109,6 @@ fn stable_unique(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn public_state_assertions(summary: &str) -> Vec<String> {
-    let mut assertions = public_state_assertions_from_normalized_feedback(summary);
-    assertions.extend(public_collection_access_failures(summary));
-    let logical_lines = failure_summary_logical_lines(summary);
-    for (line_index, line) in logical_lines.iter().enumerate() {
-        let trimmed = line.trim();
-        for marker in [
-            "self.assertTrue(",
-            "self.assertFalse(",
-            "self.assertEqual(",
-            "self.assertNotEqual(",
-            "self.assertAlmostEqual(",
-            "self.assertLess(",
-            "self.assertLessEqual(",
-            "self.assertGreater(",
-            "self.assertGreaterEqual(",
-        ] {
-            let Some(start) = trimmed.find(marker) else {
-                continue;
-            };
-            let after = &trimmed[start + marker.len()..];
-            let Some(end) = after.rfind(')') else {
-                continue;
-            };
-            let inside = after[..end].trim();
-            let subject = first_call_argument(inside).unwrap_or(inside).trim();
-            if subject.is_empty() {
-                continue;
-            }
-            let subject = enriched_assertion_subject(&logical_lines[..line_index], subject);
-            if !assertions
-                .iter()
-                .any(|existing: &String| existing == &subject)
-            {
-                assertions.push(subject);
-            }
-        }
-    }
-    assertions
-}
-
-pub(crate) fn public_state_assertion_observations(summary: &str) -> Vec<String> {
-    let mut observations = public_state_observations_from_normalized_feedback(summary);
-    observations.extend(public_collection_access_observations(summary));
-    let logical_lines = failure_summary_logical_lines(summary);
-    for (line_index, line) in logical_lines.iter().enumerate() {
-        let trimmed = line.trim();
-        for marker in [
-            "self.assertTrue(",
-            "self.assertFalse(",
-            "self.assertEqual(",
-            "self.assertNotEqual(",
-            "self.assertAlmostEqual(",
-            "self.assertLess(",
-            "self.assertLessEqual(",
-            "self.assertGreater(",
-            "self.assertGreaterEqual(",
-        ] {
-            let Some(start) = trimmed.find(marker) else {
-                continue;
-            };
-            let after = &trimmed[start + marker.len()..];
-            let Some(end) = after.rfind(')') else {
-                continue;
-            };
-            let inside = after[..end].trim();
-            let args = top_level_arguments(inside);
-            let Some(subject) = args
-                .first()
-                .map(|arg| arg.trim())
-                .filter(|arg| !arg.is_empty())
-            else {
-                continue;
-            };
-            let subject = enriched_assertion_subject(&logical_lines[..line_index], subject);
-            let expected = expected_value_for_assertion(marker, &args);
-            let actual = assertion_error_actual_value(logical_lines.get(line_index + 1).copied());
-            let observation = match (expected, actual) {
-                (Some(expected), Some(actual)) => {
-                    format!("`{subject}` expected `{expected}` but observed `{actual}`")
-                }
-                (Some(expected), None) => format!("`{subject}` expected `{expected}`"),
-                (None, Some(actual)) => format!("`{subject}` observed `{actual}`"),
-                (None, None) => format!("`{subject}`"),
-            };
-            if !observations
-                .iter()
-                .any(|existing: &String| existing == &observation)
-            {
-                observations.push(observation);
-            }
-        }
-    }
-    observations
-}
-
-pub(crate) fn public_state_terminal_transition_obligations(summary: &str) -> Vec<String> {
-    let logical_lines = failure_summary_logical_lines(summary);
-    let mut obligations = Vec::new();
-    for line in logical_lines {
-        let trimmed = line.trim();
-        let Some(start) = trimmed.find("self.assertEqual(") else {
-            continue;
-        };
-        let after = &trimmed[start + "self.assertEqual(".len()..];
-        let Some(end) = after.rfind(')') else {
-            continue;
-        };
-        let args = top_level_arguments(after[..end].trim());
-        let Some(subject) = args.first().map(|arg| arg.trim()) else {
-            continue;
-        };
-        let Some(expected) = args.get(1).map(|arg| arg.trim()) else {
-            continue;
-        };
-        if !is_public_state_subject(subject) || !is_terminal_state_expected(expected) {
-            continue;
-        }
-        let obligation = format!("{subject} terminal transition to {expected}");
-        if !obligations
-            .iter()
-            .any(|existing: &String| existing == &obligation)
-        {
-            obligations.push(obligation);
-        }
-    }
-    obligations
-}
-
-fn is_public_state_subject(subject: &str) -> bool {
-    let normalized = subject.trim().trim_matches('`');
-    normalized == "state"
-        || normalized.ends_with(".state")
-        || normalized.contains(".state.")
-        || normalized.ends_with("_state")
-        || normalized.ends_with(".status")
-        || normalized.ends_with("_status")
-}
-
-fn is_terminal_state_expected(expected: &str) -> bool {
-    let normalized = expected
-        .trim()
-        .trim_matches('`')
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_ascii_uppercase();
-    normalized.contains("GAME_OVER")
-        || normalized.contains(".WIN")
-        || normalized.contains(".WON")
-        || normalized.ends_with("WIN")
-        || normalized.ends_with("WON")
-        || normalized.contains("COMPLETE")
-        || normalized.contains("COMPLETED")
-        || normalized.contains("FINISH")
-        || normalized.contains("ENDED")
-        || normalized.contains("FAIL")
-        || normalized.contains("SUCCESS")
-}
-
-fn public_state_assertions_from_normalized_feedback(summary: &str) -> Vec<String> {
-    let Some((_, after_marker)) =
-        summary.split_once("Public state assertion mismatch detected for ")
-    else {
-        return Vec::new();
-    };
-    let end = after_marker
-        .find(": expected public state")
-        .or_else(|| after_marker.find(". Observed mismatch"))
-        .unwrap_or(after_marker.len());
-    backtick_values(&after_marker[..end])
-}
-
-fn public_state_observations_from_normalized_feedback(summary: &str) -> Vec<String> {
-    let Some((_, after_marker)) = summary.split_once("Observed mismatch:") else {
-        return Vec::new();
-    };
-    let end = after_marker
-        .find(". For ")
-        .or_else(|| after_marker.find(". Latest "))
-        .or_else(|| after_marker.find(". Do not "))
-        .unwrap_or(after_marker.len());
-    let mut observations = Vec::new();
-    for clause in after_marker[..end].split(';') {
-        let values = backtick_values(clause);
-        if values.len() >= 3 {
-            observations.push(format!(
-                "`{}` expected `{}` but observed `{}`",
-                values[0], values[1], values[2]
-            ));
-        }
-    }
-    observations
-}
-
-fn public_collection_access_failures(summary: &str) -> Vec<String> {
-    let logical_lines = failure_summary_logical_lines(summary);
-    let mut accesses = Vec::new();
-    for (line_index, line) in logical_lines.iter().enumerate() {
-        if !line.contains("IndexError: list index out of range") {
-            continue;
-        }
-        let Some(access) = preceding_collection_access(&logical_lines[..line_index]) else {
-            continue;
-        };
-        if !accesses.iter().any(|existing| existing == &access) {
-            accesses.push(access);
-        }
-    }
-    accesses
-}
-
-fn public_collection_access_observations(summary: &str) -> Vec<String> {
-    public_collection_access_failures(summary)
-        .into_iter()
-        .map(|access| format!("`{access}` expected collection element but observed `IndexError`"))
-        .collect()
-}
-
-fn preceding_collection_access(previous_lines: &[&str]) -> Option<String> {
-    previous_lines.iter().rev().find_map(|line| {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if trimmed.starts_with("File ")
-            || lower.starts_with("traceback")
-            || lower.starts_with("error:")
-            || lower.starts_with("failed")
-            || !trimmed.contains('[')
-            || !trimmed.contains(']')
-        {
-            return None;
-        }
-        first_collection_access(trimmed)
-    })
-}
-
-fn first_collection_access(line: &str) -> Option<String> {
-    let open = line.find('[')?;
-    let close = line[open..].find(']')? + open;
-    let mut start = open;
-    while start > 0 {
-        let ch = line.as_bytes()[start - 1] as char;
-        if ch == '_' || ch == '.' || ch.is_ascii_alphanumeric() {
-            start -= 1;
-        } else {
-            break;
-        }
-    }
-    if start == open {
-        return None;
-    }
-    Some(line[start..=close].trim().to_string())
-}
-
-fn backtick_values(text: &str) -> Vec<String> {
-    text.split('`')
-        .enumerate()
-        .filter_map(|(index, value)| {
-            (index % 2 == 1 && !value.trim().is_empty()).then(|| value.trim().to_string())
-        })
-        .collect()
-}
-
-pub(crate) fn public_state_game_loop_operation_obligations(
-    summary: &str,
-    assertions: &[String],
-) -> Vec<String> {
-    let lower = summary.to_ascii_lowercase();
-    let assertion_lower = assertions
-        .iter()
-        .map(|assertion| assertion.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    let mut obligations = Vec::new();
-
-    let has_projectile = lower.contains("projectile")
-        || lower.contains("bullet")
-        || assertion_lower
-            .iter()
-            .any(|assertion| assertion.contains("projectile") || assertion.contains("bullet"));
-    let has_projectile_y = assertion_lower
-        .iter()
-        .any(|assertion| assertion.contains(".y") && has_projectile);
-    if has_projectile_y
-        && (lower.contains("move")
-            || lower.contains("tick")
-            || lower.contains("direction")
-            || lower.contains("expected `110`")
-            || lower.contains("expected `490`"))
-    {
-        obligations.push("projectile movement delta".to_string());
-    }
-
-    let has_projectile_active = assertion_lower
-        .iter()
-        .any(|assertion| assertion.contains(".active") && has_projectile);
-    if has_projectile_active
-        && (lower.contains("out_of_bounds")
-            || lower.contains("out of bounds")
-            || lower.contains("offscreen")
-            || lower.contains("bounds")
-            || lower.contains("expected `false`")
-            || lower.contains("true is not false"))
-    {
-        obligations.push("projectile bounds lifecycle".to_string());
-    }
-
-    let has_spawn_coordinate = assertion_lower
-        .iter()
-        .any(|assertion| assertion.contains(".x") && has_projectile);
-    let has_spawn_count = assertion_lower.iter().any(|assertion| {
-        assertion.starts_with("len(")
-            && (assertion.contains("projectile")
-                || assertion.contains("bullet")
-                || assertion.contains("shots"))
-    });
-    if (has_spawn_coordinate || has_spawn_count)
-        && (lower.contains("spawn")
-            || lower.contains("shoot")
-            || lower.contains("fire")
-            || lower.contains("create"))
-    {
-        obligations.push("projectile spawn coordinate and repeated spawn allowance".to_string());
-    }
-
-    let has_life_or_counter = assertion_lower.iter().any(|assertion| {
-        assertion.contains(".lives")
-            || assertion.contains(".life")
-            || assertion.contains(".health")
-            || assertion.contains(".score")
-    });
-    if has_projectile
-        && has_life_or_counter
-        && (lower.contains("hit") || lower.contains("collision") || lower.contains("collides"))
-    {
-        obligations.push("projectile collision counter/lifecycle update".to_string());
-    }
-
-    if !public_state_terminal_transition_obligations(summary).is_empty()
-        || (lower.contains("reaches")
-            && (lower.contains("bottom")
-                || lower.contains("boundary")
-                || lower.contains("terminal")))
-    {
-        obligations.push("terminal boundary predicate".to_string());
-    }
-
-    let has_moved_marker = assertion_lower
-        .iter()
-        .any(|assertion| assertion == "moved" || assertion.ends_with(".moved"));
-    if has_moved_marker
-        || ((lower.contains("tick") || lower.contains("update"))
-            && (lower.contains("moves_entities")
-                || lower.contains("moves_invaders")
-                || lower.contains("entity_move")
-                || lower.contains("group")
-                || lower.contains("moved)")))
-    {
-        obligations.push("entity group movement update".to_string());
-    }
-
-    obligations.sort();
-    obligations.dedup();
-    obligations
-}
-
 fn has_explicit_generated_test_conflict_evidence(summary: &str) -> bool {
     let normalized = summary.to_ascii_lowercase();
     (normalized.contains("generated test setup contradicts")
@@ -3534,14 +3118,6 @@ fn has_explicit_generated_test_conflict_evidence(summary: &str) -> bool {
         || normalized.contains("generated test contradicts")
         || normalized.contains("generated-test contradicts"))
         && (normalized.contains("already-read") || normalized.contains("already read"))
-}
-
-fn has_explicit_generated_test_conflict_evidence_in_cluster(
-    cluster: Option<&VerificationFailureCluster>,
-) -> bool {
-    cluster_evidence_markers(cluster)
-        .iter()
-        .any(|marker| has_explicit_generated_test_conflict_evidence(marker))
 }
 
 fn public_constructor_sibling_obligations(summary: &str) -> Vec<String> {
@@ -3578,111 +3154,6 @@ fn public_constructor_signature_markers(summary: &str) -> Vec<String> {
     markers
 }
 
-pub(crate) fn public_api_data_model_semantic_obligations(summary: &str) -> Vec<String> {
-    let lower = summary.to_ascii_lowercase();
-    let mut obligations = Vec::new();
-
-    if let Some(mismatch) = public_constructor_signature_mismatch(summary) {
-        let keywords = mismatch
-            .call_site
-            .as_deref()
-            .map(call_site_keyword_arguments)
-            .unwrap_or_default();
-        if keywords.is_empty() {
-            obligations.push(format!(
-                "constructor keyword compatibility for `{}`",
-                mismatch.constructor
-            ));
-        } else {
-            obligations.push(format!(
-                "constructor keyword compatibility for `{}` fields ({})",
-                mismatch.constructor,
-                keywords
-                    .iter()
-                    .map(|keyword| format!("`{keyword}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
-
-    if has_enum_primitive_value_assertion(summary) {
-        obligations.push("enum primitive value representation".to_string());
-    }
-    if lower.contains("move")
-        && lower.contains("assertionerror:")
-        && (lower.contains(".x") || lower.contains(".y") || lower.contains("boundary"))
-    {
-        obligations.push("no-argument public movement default and boundary semantics".to_string());
-    }
-    if (lower.contains("initial_positions")
-        || lower.contains("assertnotequal")
-        || lower.contains("not equal"))
-        && (lower.contains("move") || lower.contains("update"))
-    {
-        obligations.push("direct public movement/update mutates caller-visible state".to_string());
-    }
-
-    obligations.sort();
-    obligations.dedup();
-    obligations
-}
-
-fn call_site_keyword_arguments(call_site: &str) -> Vec<String> {
-    let Some(arguments) = call_site
-        .split_once('(')
-        .and_then(|(_, tail)| tail.rsplit_once(')').map(|(inside, _)| inside))
-    else {
-        return Vec::new();
-    };
-    let mut keywords = top_level_arguments(arguments)
-        .into_iter()
-        .filter_map(|argument| argument.split_once('=').map(|(keyword, _)| keyword.trim()))
-        .filter(|keyword| {
-            !keyword.is_empty()
-                && keyword
-                    .chars()
-                    .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        })
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    keywords.sort();
-    keywords.dedup();
-    keywords
-}
-
-fn has_enum_primitive_value_assertion(summary: &str) -> bool {
-    failure_summary_logical_lines(summary)
-        .into_iter()
-        .any(|line| {
-            let Some(detail) = line.trim().strip_prefix("AssertionError:") else {
-                return false;
-            };
-            detail.contains('<')
-                && detail.contains(':')
-                && detail.contains('>')
-                && (detail.contains(" != '")
-                    || detail.contains(" != \"")
-                    || detail.contains(" != 0")
-                    || detail.contains(" != 1"))
-        })
-}
-
-fn public_method_sibling_obligations(summary: &str) -> Vec<String> {
-    let attrs = public_missing_attributes(summary);
-    let mut obligations = attrs
-        .iter()
-        .filter(|attribute| {
-            let receiver = attribute.split('.').next().unwrap_or_default();
-            matches!(receiver, "int" | "str" | "float" | "bool" | "list" | "dict")
-        })
-        .map(|attribute| format!("collection element shape defect `{attribute}`"))
-        .collect::<Vec<_>>();
-    obligations.sort();
-    obligations.dedup();
-    obligations
-}
-
 fn failure_summary_logical_lines(summary: &str) -> Vec<&str> {
     summary
         .lines()
@@ -3692,1563 +3163,9 @@ fn failure_summary_logical_lines(summary: &str) -> Vec<&str> {
         .collect()
 }
 
-fn first_call_argument(arguments: &str) -> Option<&str> {
-    top_level_arguments(arguments).into_iter().next()
-}
-
-fn top_level_arguments(arguments: &str) -> Vec<&str> {
-    let mut args = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    for (index, ch) in arguments.char_indices() {
-        match ch {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                args.push(arguments[start..index].trim());
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    let tail = arguments[start..].trim();
-    if !tail.is_empty() {
-        args.push(tail);
-    }
-    args
-}
-
-fn expected_value_for_assertion(marker: &str, args: &[&str]) -> Option<String> {
-    if marker.contains("assertTrue") {
-        return Some("truthy".to_string());
-    }
-    if marker.contains("assertFalse") {
-        return Some("false".to_string());
-    }
-    if marker.contains("assertLessEqual") {
-        return args
-            .get(1)
-            .map(|value| format!("<= {}", clean_assertion_value(value)));
-    }
-    if marker.contains("assertLess") {
-        return args
-            .get(1)
-            .map(|value| format!("< {}", clean_assertion_value(value)));
-    }
-    if marker.contains("assertGreaterEqual") {
-        return args
-            .get(1)
-            .map(|value| format!(">= {}", clean_assertion_value(value)));
-    }
-    if marker.contains("assertGreater") {
-        return args
-            .get(1)
-            .map(|value| format!("> {}", clean_assertion_value(value)));
-    }
-    args.get(1)
-        .map(|value| clean_assertion_value(value))
-        .filter(|value| !value.is_empty())
-}
-
-fn assertion_error_actual_value(line: Option<&str>) -> Option<String> {
-    let line = line?.trim();
-    let detail = line.strip_prefix("AssertionError:")?.trim();
-    if let Some((actual, _)) = detail.split_once("!=") {
-        return Some(clean_assertion_value(actual));
-    }
-    if detail.contains("False is not true") {
-        return Some("False".to_string());
-    }
-    if detail.contains("True is not false") {
-        return Some("True".to_string());
-    }
-    for marker in [
-        " not less than or equal to ",
-        " not greater than or equal to ",
-        " not less than ",
-        " not greater than ",
-    ] {
-        if let Some((actual, _expected)) = detail.split_once(marker) {
-            return Some(clean_assertion_value(actual));
-        }
-    }
-    None
-}
-
-fn clean_assertion_value(value: &str) -> String {
-    value
-        .split(" within ")
-        .next()
-        .unwrap_or(value)
-        .trim()
-        .trim_end_matches(',')
-        .trim()
-        .to_string()
-}
-
-fn enriched_assertion_subject(previous_lines: &[&str], subject: &str) -> String {
-    let Some(root) = root_identifier(subject) else {
-        return subject.to_string();
-    };
-    let Some(rhs) = previous_assignment_rhs(previous_lines, root) else {
-        return subject.to_string();
-    };
-    if subject == root {
-        format!("{root} = {rhs}")
-    } else {
-        format!("{subject} from {root} = {rhs}")
-    }
-}
-
-fn root_identifier(subject: &str) -> Option<&str> {
-    let subject = subject.trim();
-    let mut end = 0usize;
-    for (index, ch) in subject.char_indices() {
-        if index == 0 {
-            if !(ch == '_' || ch.is_ascii_alphabetic()) {
-                return None;
-            }
-            end = ch.len_utf8();
-            continue;
-        }
-        if ch == '_' || ch.is_ascii_alphanumeric() {
-            end = index + ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    (end > 0).then(|| &subject[..end])
-}
-
-fn previous_assignment_rhs<'a>(previous_lines: &'a [&'a str], variable: &str) -> Option<&'a str> {
-    previous_lines.iter().rev().find_map(|line| {
-        let trimmed = line.trim();
-        let rest = trimmed.strip_prefix(variable)?.trim_start();
-        let rhs = rest.strip_prefix('=')?.trim();
-        (!rhs.is_empty()).then_some(rhs)
-    })
-}
-
-fn public_missing_attributes(summary: &str) -> Vec<String> {
-    let mut attributes = public_missing_attributes_from_normalized_feedback(summary);
-    attributes.extend(public_writable_property_obligations(summary));
-    for line in failure_summary_logical_lines(summary) {
-        let Some(detail) = line.split("AttributeError:").nth(1) else {
-            continue;
-        };
-        if !detail.contains(" has no attribute ") {
-            continue;
-        }
-        let quoted = quoted_segments(detail);
-        if quoted.len() < 2 {
-            continue;
-        }
-        let attr = format!("{}.{}", quoted[0].trim(), quoted[1].trim());
-        if !attributes.iter().any(|existing| existing == &attr) {
-            attributes.push(attr);
-        }
-    }
-    attributes
-}
-
-fn public_writable_property_obligations(summary: &str) -> Vec<String> {
-    let mut obligations = Vec::new();
-    for line in failure_summary_logical_lines(summary) {
-        let Some(detail) = line.split("AttributeError:").nth(1) else {
-            continue;
-        };
-        let detail = detail.trim();
-        if !detail.contains("property ")
-            || !detail.contains(" object has no setter")
-            || !detail.contains(" of ")
-        {
-            continue;
-        }
-        let quoted = quoted_segments(detail);
-        if quoted.len() < 2 {
-            continue;
-        }
-        let property = quoted[0].trim();
-        let owner = quoted[1].trim();
-        if property.is_empty() || owner.is_empty() {
-            continue;
-        }
-        let obligation = format!("{owner}.{property} writable property");
-        if !obligations
-            .iter()
-            .any(|existing: &String| existing == &obligation)
-        {
-            obligations.push(obligation);
-        }
-    }
-    obligations
-}
-
-fn public_missing_attributes_from_normalized_feedback(summary: &str) -> Vec<String> {
-    let Some((_, after_marker)) =
-        summary.split_once("Public missing-attribute mismatch detected for ")
-    else {
-        return Vec::new();
-    };
-    let end = after_marker
-        .find(". Align ")
-        .or_else(|| after_marker.find(". Latest "))
-        .or_else(|| after_marker.find(". Required "))
-        .unwrap_or(after_marker.len());
-    backtick_values(&after_marker[..end])
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PublicMissingMethodAttribute {
-    attribute: String,
-    call_site: String,
-}
-
-fn public_missing_method_attributes(summary: &str) -> Vec<PublicMissingMethodAttribute> {
-    let logical_lines = failure_summary_logical_lines(summary);
-    let mut methods = Vec::new();
-    for (line_index, line) in logical_lines.iter().enumerate() {
-        let Some(detail) = line.split("AttributeError:").nth(1) else {
-            continue;
-        };
-        if !detail.contains(" has no attribute ") {
-            continue;
-        }
-        let quoted = quoted_segments(detail);
-        if quoted.len() < 2 {
-            continue;
-        }
-        let receiver = quoted[0].trim();
-        let member = quoted[1].trim();
-        let Some(call_site) = missing_method_call_site_before(&logical_lines[..line_index], member)
-        else {
-            continue;
-        };
-        let attribute = format!("{receiver}.{member}");
-        if !methods
-            .iter()
-            .any(|existing: &PublicMissingMethodAttribute| existing.attribute == attribute)
-        {
-            methods.push(PublicMissingMethodAttribute {
-                attribute,
-                call_site,
-            });
-        }
-    }
-    methods
-}
-
-fn missing_method_call_site_before(lines: &[&str], member: &str) -> Option<String> {
-    let needle = format!(".{member}(");
-    lines.iter().rev().find_map(|line| {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if trimmed.starts_with("File ")
-            || lower.starts_with("traceback")
-            || lower.starts_with("attributeerror:")
-            || lower.starts_with("error:")
-            || lower.starts_with("failed")
-            || !trimmed.contains(&needle)
-        {
-            return None;
-        }
-        Some(trimmed.to_string())
-    })
-}
-
-fn public_class_or_enum_missing_members(summary: &str) -> Vec<String> {
-    let mut members = Vec::new();
-    for detail in public_class_or_enum_missing_member_details(summary) {
-        let member = detail.member;
-        if !members.iter().any(|existing| existing == &member) {
-            members.push(member);
-        }
-    }
-    members
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PublicClassOrEnumMissingMemberDetail {
-    member: String,
-    suggested_existing_member: Option<String>,
-    expected_value: Option<String>,
-}
-
-fn public_class_or_enum_missing_member_details(
-    summary: &str,
-) -> Vec<PublicClassOrEnumMissingMemberDetail> {
-    let mut details = Vec::new();
-    for line in failure_summary_logical_lines(summary) {
-        let Some(detail) = line.split("AttributeError:").nth(1) else {
-            continue;
-        };
-        let detail = detail.trim();
-        if !(detail.starts_with("type object ") || detail.starts_with("module "))
-            || !detail.contains(" has no attribute ")
-        {
-            continue;
-        }
-        let quoted = quoted_segments(detail);
-        if quoted.len() < 2 {
-            continue;
-        }
-        let owner = quoted[0].trim();
-        let missing = quoted[1].trim();
-        let member = format!("{owner}.{missing}");
-        if details
-            .iter()
-            .any(|existing: &PublicClassOrEnumMissingMemberDetail| existing.member == member)
-        {
-            continue;
-        }
-        let suggested_existing_member =
-            extract_quoted_after(detail, "Did you mean: '").map(|suggested| {
-                if suggested.contains('.') {
-                    suggested
-                } else {
-                    format!("{owner}.{suggested}")
-                }
-            });
-        let expected_value = expected_value_for_class_member(summary, &member);
-        details.push(PublicClassOrEnumMissingMemberDetail {
-            member,
-            suggested_existing_member,
-            expected_value,
-        });
-    }
-    details
-}
-
-pub(crate) fn public_class_member_repair_observations(summary: &str) -> Vec<String> {
-    public_class_or_enum_missing_member_details(summary)
-        .into_iter()
-        .map(|detail| {
-            let mut observation = format!("`{}` is missing", detail.member);
-            if let Some(suggested) = detail.suggested_existing_member {
-                observation.push_str(&format!("; source near-name candidate is `{suggested}`"));
-            }
-            if let Some(expected) = detail.expected_value {
-                observation.push_str(&format!(
-                    "; generated-test value contract expects `{}.value == {expected}`",
-                    detail.member
-                ));
-            }
-            observation
-        })
-        .collect()
-}
-
-fn expected_value_for_class_member(summary: &str, member: &str) -> Option<String> {
-    let value_ref = format!("{member}.value");
-    for line in failure_summary_logical_lines(summary) {
-        let trimmed = line.trim();
-        let Some(start) = trimmed.find("self.assertEqual(") else {
-            continue;
-        };
-        let after = &trimmed[start + "self.assertEqual(".len()..];
-        let Some(end) = after.rfind(')') else {
-            continue;
-        };
-        let args = top_level_arguments(&after[..end]);
-        if args.first().map(|arg| arg.trim()) != Some(value_ref.as_str()) {
-            continue;
-        }
-        return args
-            .get(1)
-            .map(|value| clean_assertion_value(value))
-            .filter(|value| !value.is_empty());
-    }
-    None
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PublicConstructorSignatureMismatch {
-    constructor: String,
-    detail: String,
-    unexpected_keyword: Option<String>,
-    call_site: Option<String>,
-}
-
-fn public_constructor_signature_mismatch(
-    summary: &str,
-) -> Option<PublicConstructorSignatureMismatch> {
-    let lower = summary.to_ascii_lowercase();
-    if !lower.contains("typeerror:")
-        || !lower.contains("__init__()")
-        || !(lower.contains("unexpected keyword argument")
-            || lower.contains("positional argument")
-            || lower.contains("takes "))
-    {
-        return None;
-    }
-
-    let logical_lines = failure_summary_logical_lines(summary);
-    let detail_index = logical_lines.iter().position(|line| {
-        let lower_line = line.to_ascii_lowercase();
-        lower_line.contains("typeerror:") && lower_line.contains("__init__()")
-    })?;
-    let detail = logical_lines[detail_index]
-        .split("TypeError:")
-        .nth(1)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
-    let constructor = detail
-        .split(".__init__()")
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
-    let unexpected_keyword = extract_quoted_after(&detail, "unexpected keyword argument '");
-    let call_site =
-        constructor_call_site_before(&logical_lines[..detail_index], constructor.as_str());
-
-    Some(PublicConstructorSignatureMismatch {
-        constructor,
-        detail,
-        unexpected_keyword,
-        call_site,
-    })
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PublicCallableSignatureMismatch {
-    callable: String,
-    detail: String,
-    missing_arguments: Vec<String>,
-    call_site: Option<String>,
-    source_target: Option<String>,
-}
-
-fn public_callable_signature_mismatch(summary: &str) -> Option<PublicCallableSignatureMismatch> {
-    let lower = summary.to_ascii_lowercase();
-    if !lower.contains("typeerror:")
-        || lower.contains("__init__()")
-        || !(lower.contains("missing")
-            || lower.contains("required positional argument")
-            || lower.contains("takes "))
-    {
-        return None;
-    }
-
-    let logical_lines = failure_summary_logical_lines(summary);
-    let detail_index = logical_lines.iter().position(|line| {
-        let lower_line = line.to_ascii_lowercase();
-        lower_line.contains("typeerror:")
-            && !lower_line.contains("__init__()")
-            && (lower_line.contains("required positional argument")
-                || lower_line.contains("positional arguments")
-                || lower_line.contains("takes "))
-    })?;
-    let detail = logical_lines[detail_index]
-        .split("TypeError:")
-        .nth(1)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
-    let callable = detail
-        .split("()")
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
-    if callable
-        .rsplit('.')
-        .next()
-        .is_some_and(|name| name == "__init__")
-    {
-        return None;
-    }
-    let missing_arguments = missing_required_arguments_from_type_error(&detail);
-    let call_site = callable_call_site_before(&logical_lines[..detail_index], &callable);
-    let source_target = callable_source_target_from_name(&callable);
-
-    Some(PublicCallableSignatureMismatch {
-        callable,
-        detail,
-        missing_arguments,
-        call_site,
-        source_target,
-    })
-}
-
-fn missing_required_arguments_from_type_error(detail: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    for marker in [
-        "required positional argument: '",
-        "required positional arguments: '",
-        "required keyword-only argument: '",
-        "required keyword-only arguments: '",
-    ] {
-        let Some(start) = detail.find(marker).map(|index| index + marker.len()) else {
-            continue;
-        };
-        let rest = &detail[start..];
-        let end = rest.find('\'').unwrap_or(rest.len());
-        for part in rest[..end].split(" and ") {
-            let value = part.trim().trim_matches('\'').trim();
-            if !value.is_empty() && !args.iter().any(|existing| existing == value) {
-                args.push(value.to_string());
-            }
-        }
-    }
-    args
-}
-
-fn callable_call_site_before(lines: &[&str], callable: &str) -> Option<String> {
-    let terminal = callable.rsplit('.').next().unwrap_or(callable);
-    let method_needle = format!(".{terminal}(");
-    let function_needle = format!("{terminal}(");
-    lines.iter().rev().find_map(|line| {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if trimmed.starts_with("File ")
-            || lower.starts_with("traceback")
-            || lower.starts_with("typeerror:")
-            || lower.starts_with("error:")
-            || lower.starts_with("failed")
-            || lower.starts_with("fail:")
-            || !trimmed.contains('(')
-            || !trimmed.contains(')')
-        {
-            return None;
-        }
-        if trimmed.contains(&method_needle) || trimmed.contains(&function_needle) {
-            Some(trimmed.to_string())
-        } else {
-            None
-        }
-    })
-}
-
-fn callable_source_target_from_name(callable: &str) -> Option<String> {
-    let receiver = callable.split('.').next()?.trim();
-    if receiver.is_empty()
-        || matches!(
-            receiver,
-            "self" | "cls" | "str" | "int" | "float" | "bool" | "list" | "dict" | "tuple" | "set"
-        )
-    {
-        return None;
-    }
-    if !receiver.chars().any(|ch| ch.is_ascii_uppercase()) {
-        return None;
-    }
-    let module = upper_camel_to_snake(receiver);
-    (!module.is_empty()).then(|| format!("{module}.py"))
-}
-
-fn upper_camel_to_snake(value: &str) -> String {
-    let mut out = String::new();
-    for (index, ch) in value.chars().enumerate() {
-        if ch.is_ascii_uppercase() {
-            if index > 0 {
-                out.push('_');
-            }
-            out.push(ch.to_ascii_lowercase());
-        } else if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-pub(crate) fn public_constructor_sibling_data_shape_observations(summary: &str) -> Vec<String> {
-    let Some(mismatch) = public_constructor_signature_mismatch(summary) else {
-        return Vec::new();
-    };
-    public_constructor_sibling_data_shape_obligations(summary, &mismatch.constructor)
-}
-
-fn public_constructor_sibling_data_shape_obligations(
-    summary: &str,
-    constructor: &str,
-) -> Vec<String> {
-    let class_name = constructor.rsplit('.').next().unwrap_or(constructor);
-    let mut obligations = Vec::new();
-    for attribute in public_missing_attributes(summary) {
-        let Some((receiver, _member)) = attribute.split_once('.') else {
-            continue;
-        };
-        if receiver != class_name {
-            continue;
-        }
-        let observation = format!("`{attribute}`");
-        if !obligations.iter().any(|existing| existing == &observation) {
-            obligations.push(observation);
-        }
-    }
-    obligations
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PublicConstructorBodyExceptionObservation {
-    pub constructor_call_site: String,
-    pub source_initializer_call: Option<String>,
-    pub source_failure_site: Option<String>,
-    pub actual_exception: String,
-    pub sibling_constructor_obligations: Vec<String>,
-}
-
-pub(crate) fn public_constructor_body_exception_observation(
-    summary: &str,
-) -> Option<PublicConstructorBodyExceptionObservation> {
-    public_constructor_body_exception(summary)
-}
-
-fn public_constructor_body_exception(
-    summary: &str,
-) -> Option<PublicConstructorBodyExceptionObservation> {
-    let logical_lines = failure_summary_logical_lines(summary);
-    if let Some(observation) =
-        public_constructor_body_exception_from_public_exception_chain(&logical_lines, summary)
-    {
-        return Some(observation);
-    }
-    for (index, line) in logical_lines.iter().enumerate() {
-        if !generated_test_frame(line) {
-            continue;
-        }
-        let Some(call_line) = logical_lines.get(index + 1) else {
-            continue;
-        };
-        let Some(constructor_call_site) = public_constructor_body_call_site(call_line) else {
-            continue;
-        };
-        let Some(constructor_name) = public_constructor_name_from_call(&constructor_call_site)
-        else {
-            continue;
-        };
-        let search_tail = &logical_lines[index + 2..];
-        let Some((source_initializer_call, source_failure_site, actual_exception)) =
-            source_constructor_body_exception_after(search_tail)
-        else {
-            continue;
-        };
-        let sibling_constructor_obligations =
-            public_constructor_signature_obligations(summary, &constructor_name);
-        return Some(PublicConstructorBodyExceptionObservation {
-            constructor_call_site,
-            source_initializer_call,
-            source_failure_site,
-            actual_exception,
-            sibling_constructor_obligations,
-        });
-    }
-    public_constructor_body_exception_from_source_chain(&logical_lines, summary)
-}
-
-fn public_constructor_body_exception_from_public_exception_chain(
-    logical_lines: &[&str],
-    summary: &str,
-) -> Option<PublicConstructorBodyExceptionObservation> {
-    if !summary.to_ascii_lowercase().contains(" in __init__") {
-        return None;
-    }
-    let init_index = logical_lines
-        .iter()
-        .position(|line| line.to_ascii_lowercase().contains(" in __init__"))?;
-    let constructor_call_site = public_test_constructor_call_site(logical_lines)
-        .or_else(|| {
-            public_exception_mismatch(summary)
-                .and_then(|mismatch| mismatch.call_site)
-                .as_deref()
-                .and_then(public_constructor_body_call_site)
-        })
-        .or_else(|| {
-            logical_lines[..init_index]
-                .iter()
-                .find_map(|line| public_constructor_body_call_site(line))
-        })
-        .unwrap_or_else(|| "public constructor call".to_string());
-    let constructor_name = public_constructor_name_from_call(&constructor_call_site)
-        .unwrap_or_else(|| constructor_call_site.clone());
-    let source_initializer_call = logical_lines
-        .get(init_index + 1)
-        .map(|value| value.trim())
-        .filter(|value| public_constructor_body_code_line(value))
-        .map(str::to_string);
-    let source_failure_site = logical_lines
-        .iter()
-        .enumerate()
-        .skip(init_index + 1)
-        .find_map(|(index, line)| {
-            let lower = line.to_ascii_lowercase();
-            if !lower.starts_with("file ")
-                || !lower.contains(".py")
-                || lower.contains("test_")
-                || lower.contains("\\python")
-                || lower.contains("/python")
-                || lower.contains(" in __init__")
-            {
-                return None;
-            }
-            logical_lines
-                .get(index + 1)
-                .map(|value| value.trim())
-                .filter(|value| public_constructor_body_code_line(value))
-                .map(str::to_string)
-        });
-    let actual_exception = logical_lines
-        .iter()
-        .skip(init_index)
-        .find(|line| exception_name_from_line(line).is_some())
-        .map(|line| line.trim().to_string())
-        .unwrap_or_else(|| "constructor body exception".to_string());
-    Some(PublicConstructorBodyExceptionObservation {
-        constructor_call_site,
-        source_initializer_call,
-        source_failure_site,
-        actual_exception,
-        sibling_constructor_obligations: public_constructor_signature_obligations(
-            summary,
-            &constructor_name,
-        ),
-    })
-}
-
-fn public_test_constructor_call_site(logical_lines: &[&str]) -> Option<String> {
-    logical_lines
-        .windows(2)
-        .find_map(|window| {
-            if !generated_test_frame(window[0]) {
-                return None;
-            }
-            public_constructor_body_call_site(window[1])
-        })
-        .or_else(|| {
-            for (index, line) in logical_lines.iter().enumerate() {
-                if !generated_test_frame(line) {
-                    continue;
-                }
-                for candidate in logical_lines.iter().skip(index + 1).take(4) {
-                    let lower = candidate.to_ascii_lowercase();
-                    if lower.trim_start().starts_with("file ") {
-                        break;
-                    }
-                    if let Some(call_site) = public_constructor_body_call_site(candidate) {
-                        return Some(call_site);
-                    }
-                }
-            }
-            None
-        })
-        .or_else(|| {
-            logical_lines.iter().find_map(|line| {
-                let call = public_constructor_body_call_site(line)?;
-                let rhs = call
-                    .split_once('=')
-                    .map(|(_, rhs)| rhs.trim())
-                    .unwrap_or(call.as_str());
-                rhs.contains('.').then_some(call)
-            })
-        })
-}
-
-fn public_constructor_body_exception_from_source_chain(
-    logical_lines: &[&str],
-    summary: &str,
-) -> Option<PublicConstructorBodyExceptionObservation> {
-    for (index, line) in logical_lines.iter().enumerate() {
-        if !constructor_init_frame_candidate(line) {
-            continue;
-        }
-        let Some(constructor_call_site) =
-            public_exception_call_site_before(&logical_lines[..index])
-                .and_then(|line| public_constructor_body_call_site(&line))
-                .or_else(|| {
-                    logical_lines[..index]
-                        .iter()
-                        .rev()
-                        .find_map(|line| public_constructor_body_call_site(line))
-                })
-        else {
-            continue;
-        };
-        let Some(constructor_name) = public_constructor_name_from_call(&constructor_call_site)
-        else {
-            continue;
-        };
-        let Some((source_initializer_call, source_failure_site, actual_exception)) =
-            source_constructor_body_exception_after_relaxed(&logical_lines[index..])
-        else {
-            continue;
-        };
-        let sibling_constructor_obligations =
-            public_constructor_signature_obligations(summary, &constructor_name);
-        return Some(PublicConstructorBodyExceptionObservation {
-            constructor_call_site,
-            source_initializer_call,
-            source_failure_site,
-            actual_exception,
-            sibling_constructor_obligations,
-        });
-    }
-    public_constructor_body_exception_from_exception_projection(logical_lines, summary)
-}
-
-fn public_constructor_body_exception_from_exception_projection(
-    logical_lines: &[&str],
-    summary: &str,
-) -> Option<PublicConstructorBodyExceptionObservation> {
-    if !summary.to_ascii_lowercase().contains(" in __init__") {
-        return None;
-    }
-    let mismatch = public_exception_mismatch(summary)?;
-    let constructor_call_site = mismatch
-        .call_site
-        .as_deref()
-        .and_then(public_constructor_body_call_site)?;
-    let constructor_name = public_constructor_name_from_call(&constructor_call_site)?;
-    let source_initializer_call = logical_lines
-        .iter()
-        .enumerate()
-        .find(|(_, line)| constructor_init_frame_candidate(line))
-        .and_then(|(index, _)| logical_lines.get(index + 1))
-        .map(|value| value.trim())
-        .filter(|value| public_constructor_body_code_line(value))
-        .map(str::to_string);
-    let source_failure_site = mismatch.source_site.as_deref().and_then(|source_site| {
-        logical_lines.iter().enumerate().find_map(|(index, line)| {
-            if !line.contains(source_site) || line.to_ascii_lowercase().contains(" in __init__") {
-                return None;
-            }
-            logical_lines
-                .get(index + 1)
-                .map(|value| value.trim())
-                .filter(|value| public_constructor_body_code_line(value))
-                .map(str::to_string)
-        })
-    });
-    let actual_exception = logical_lines
-        .iter()
-        .find(|line| exception_name_from_line(line).as_deref() == Some(&mismatch.actual_exception))
-        .map(|line| line.trim().to_string())
-        .unwrap_or(mismatch.actual_exception);
-    let sibling_constructor_obligations =
-        public_constructor_signature_obligations(summary, &constructor_name);
-    Some(PublicConstructorBodyExceptionObservation {
-        constructor_call_site,
-        source_initializer_call,
-        source_failure_site,
-        actual_exception,
-        sibling_constructor_obligations,
-    })
-}
-
-fn local_source_frame_candidate(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    let trimmed = lower.trim_start();
-    trimmed.starts_with("file ")
-        && lower.contains(".py")
-        && !lower.contains("test_")
-        && !lower.contains("\\python")
-        && !lower.contains("/python")
-        && !lower.contains("site-packages")
-        && !lower.contains("unittest")
-}
-
-fn source_constructor_body_exception_after_relaxed(
-    lines: &[&str],
-) -> Option<(Option<String>, Option<String>, String)> {
-    let mut saw_init_frame = false;
-    let mut initializer_call = None;
-    let mut source_failure_site = None;
-    for (index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if saw_init_frame && generated_test_frame(trimmed) {
-            return None;
-        }
-        if constructor_init_frame_candidate(trimmed) {
-            saw_init_frame = true;
-            initializer_call = lines
-                .get(index + 1)
-                .map(|value| value.trim())
-                .filter(|value| public_constructor_body_code_line(value))
-                .map(str::to_string);
-            continue;
-        }
-        if saw_init_frame && local_source_frame_candidate(trimmed) {
-            source_failure_site = lines
-                .get(index + 1)
-                .map(|value| value.trim())
-                .filter(|value| public_constructor_body_code_line(value))
-                .map(str::to_string)
-                .or(source_failure_site);
-            continue;
-        }
-        if saw_init_frame && exception_name_from_line(trimmed).is_some() {
-            return Some((initializer_call, source_failure_site, trimmed.to_string()));
-        }
-    }
-    None
-}
-
-fn constructor_init_frame_candidate(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    let trimmed = lower.trim_start();
-    trimmed.starts_with("file ")
-        && lower.contains(".py")
-        && lower.contains(" in __init__")
-        && !lower.contains("test_")
-        && !lower.contains("site-packages")
-        && !lower.contains("unittest")
-}
-
-fn source_constructor_body_exception_after(
-    lines: &[&str],
-) -> Option<(Option<String>, Option<String>, String)> {
-    let mut saw_init_frame = false;
-    let mut initializer_call = None;
-    let mut source_failure_site = None;
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index].trim();
-        if saw_init_frame && generated_test_frame(line) {
-            return None;
-        }
-        if source_module_frame(line) && line.to_ascii_lowercase().contains(" in __init__") {
-            saw_init_frame = true;
-            initializer_call = lines
-                .get(index + 1)
-                .map(|value| value.trim())
-                .filter(|value| public_constructor_body_code_line(value))
-                .map(str::to_string);
-            index += 1;
-            continue;
-        }
-        if saw_init_frame && source_module_frame(line) {
-            source_failure_site = lines
-                .get(index + 1)
-                .map(|value| value.trim())
-                .filter(|value| public_constructor_body_code_line(value))
-                .map(str::to_string)
-                .or(source_failure_site);
-            index += 1;
-            continue;
-        }
-        if saw_init_frame && exception_name_from_line(line).is_some() {
-            return Some((initializer_call, source_failure_site, line.to_string()));
-        }
-        index += 1;
-    }
-    None
-}
-
-fn public_constructor_body_call_site(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if !public_constructor_body_code_line(trimmed) {
-        return None;
-    }
-    let call = if let Some((_, rhs)) = trimmed.split_once('=') {
-        rhs.trim()
-    } else {
-        trimmed
-    };
-    let name = public_constructor_name_from_call(call)?;
-    if name
-        .rsplit('.')
-        .next()
-        .and_then(|value| value.chars().next())
-        .is_some_and(|ch| ch.is_ascii_uppercase())
-    {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
-}
-
-fn public_constructor_name_from_call(call: &str) -> Option<String> {
-    let call = if let Some((_, rhs)) = call.trim().split_once('=') {
-        rhs.trim()
-    } else {
-        call.trim()
-    };
-    let before_paren = call.split('(').next()?.trim();
-    if before_paren.is_empty()
-        || before_paren.starts_with("self.")
-        || before_paren.starts_with("assert")
-    {
-        return None;
-    }
-    Some(before_paren.to_string())
-}
-
-fn public_constructor_body_code_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    !line.starts_with("File ")
-        && !lower.starts_with("traceback")
-        && !lower.starts_with("during handling")
-        && !lower.starts_with("error:")
-        && !lower.starts_with("failed")
-        && !lower.starts_with("raise ")
-        && exception_name_from_line(line).is_none()
-        && line.contains('(')
-        && line.contains(')')
-}
-
-fn public_constructor_signature_obligations(summary: &str, main_constructor: &str) -> Vec<String> {
-    let mut obligations = Vec::new();
-    for line in failure_summary_logical_lines(summary) {
-        let lower = line.to_ascii_lowercase();
-        if !lower.contains("typeerror:") || !lower.contains(".__init__()") {
-            continue;
-        }
-        let Some(detail) = line.split("TypeError:").nth(1).map(str::trim) else {
-            continue;
-        };
-        let Some(constructor) = detail
-            .split(".__init__()")
-            .next()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        if constructor == main_constructor {
-            continue;
-        }
-        let observation = format!("`{constructor}.__init__()`: `{detail}`");
-        if !obligations.iter().any(|existing| existing == &observation) {
-            obligations.push(observation);
-        }
-    }
-    obligations
-}
-
-fn generated_test_frame(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    let trimmed = lower.trim_start();
-    trimmed.starts_with("file ") && lower.contains(".py") && lower.contains("test_")
-}
-
-fn source_module_frame(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    let trimmed = lower.trim_start();
-    trimmed.starts_with("file ")
-        && lower.contains(".py")
-        && !lower.contains("test_")
-        && !lower.contains("\\python")
-        && !lower.contains("/python")
-        && !lower.contains("site-packages")
-        && !lower.contains("unittest")
-}
-
-fn constructor_call_site_before(lines: &[&str], constructor: &str) -> Option<String> {
-    let class_name = constructor.rsplit('.').next().unwrap_or(constructor);
-    let needle = format!("{class_name}(");
-    lines.iter().rev().find_map(|line| {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if trimmed.starts_with("File ")
-            || lower.starts_with("traceback")
-            || lower.starts_with("typeerror:")
-            || lower.starts_with("failed")
-            || lower.starts_with("error:")
-            || lower.starts_with("fail:")
-            || !trimmed.contains(&needle)
-            || !trimmed.contains(')')
-        {
-            return None;
-        }
-        Some(trimmed.to_string())
-    })
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PublicExceptionMismatch {
-    actual_exception: String,
-    expected_exception: Option<String>,
-    call_site: Option<String>,
-    source_site: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PublicExpectedExceptionNotRaised {
-    expected_exception: String,
-    call_site: Option<String>,
-}
-
-fn public_exception_mismatch(summary: &str) -> Option<PublicExceptionMismatch> {
-    let lower = summary.to_ascii_lowercase();
-    if !lower.contains("traceback") || !lower.contains("test_") {
-        return None;
-    }
-    if let Some(not_raised) = public_expected_exception_not_raised(summary) {
-        return Some(PublicExceptionMismatch {
-            actual_exception: format!("{} not raised", not_raised.expected_exception),
-            expected_exception: Some(not_raised.expected_exception),
-            call_site: not_raised.call_site,
-            source_site: None,
-        });
-    }
-    let logical_lines = failure_summary_logical_lines(summary);
-    let actual_index = logical_lines
-        .iter()
-        .rposition(|line| exception_name_from_line(line).is_some())?;
-    let actual_exception = exception_name_from_line(logical_lines[actual_index])?;
-    let expected_exception = expected_public_exception_name_before_actual(
-        &logical_lines[..actual_index],
-        &actual_exception,
-    );
-    let call_site = public_exception_call_site_before(&logical_lines[..actual_index]);
-    let source_site = public_exception_source_site_before(&logical_lines[..actual_index])?;
-    Some(PublicExceptionMismatch {
-        actual_exception,
-        expected_exception,
-        call_site,
-        source_site: Some(source_site),
-    })
-}
-
-fn expected_public_exception_name_before_actual(
-    lines: &[&str],
-    actual_exception: &str,
-) -> Option<String> {
-    lines.iter().rev().find_map(|line| {
-        let trimmed = line.trim();
-        if exception_name_from_line(trimmed).is_some() {
-            return None;
-        }
-        known_exception_name_in_text(trimmed).filter(|expected| expected != actual_exception)
-    })
-}
-
-fn exception_name_from_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    for exception in known_public_exception_names() {
-        if trimmed.starts_with(exception) && trimmed[exception.len()..].starts_with(':') {
-            return Some(exception.to_string());
-        }
-    }
-    None
-}
-
-fn known_public_exception_names() -> [&'static str; 5] {
-    [
-        "ZeroDivisionError",
-        "ValueError",
-        "TypeError",
-        "RuntimeError",
-        "OverflowError",
-    ]
-}
-
-fn known_exception_name_in_text(text: &str) -> Option<String> {
-    known_public_exception_names()
-        .into_iter()
-        .find(|exception| text.contains(exception))
-        .map(str::to_string)
-}
-
-fn public_exception_call_site_before(lines: &[&str]) -> Option<String> {
-    for window in lines.windows(2) {
-        let frame = window[0].trim();
-        let call = window[1].trim();
-        if frame.starts_with("File ")
-            && frame.to_ascii_lowercase().contains("test")
-            && public_exception_call_site_candidate(call)
-        {
-            return Some(call.to_string());
-        }
-    }
-
-    lines.iter().rev().find_map(|line| {
-        let trimmed = line.trim();
-        if !public_exception_call_site_candidate(trimmed) {
-            return None;
-        }
-        Some(trimmed.to_string())
-    })
-}
-
-fn public_expected_exception_not_raised(summary: &str) -> Option<PublicExpectedExceptionNotRaised> {
-    let lower = summary.to_ascii_lowercase();
-    if !lower.contains("traceback")
-        || !lower.contains("test_")
-        || !lower.contains("assertraises")
-        || !lower.contains("assertionerror:")
-        || !lower.contains(" not raised")
-    {
-        return None;
-    }
-    let logical_lines = failure_summary_logical_lines(summary);
-    let expected_exception = logical_lines.iter().rev().find_map(|line| {
-        let trimmed = line.trim();
-        let payload = trimmed.strip_prefix("AssertionError:")?.trim();
-        let exception = payload.strip_suffix(" not raised")?.trim();
-        (!exception.is_empty()).then(|| exception.to_string())
-    })?;
-    let call_site = logical_lines.iter().find_map(|line| {
-        let trimmed = line.trim();
-        if trimmed.contains("assertRaises(") || trimmed.contains("assertRaisesRegex(") {
-            Some(trimmed.to_string())
-        } else {
-            None
-        }
-    });
-    Some(PublicExpectedExceptionNotRaised {
-        expected_exception,
-        call_site,
-    })
-}
-
-fn public_exception_source_site_before(lines: &[&str]) -> Option<String> {
-    lines.windows(2).rev().find_map(|window| {
-        let frame = window[0].trim();
-        if !source_module_frame(frame) {
-            return None;
-        }
-        let path = quoted_file_frame_path(frame)?;
-        Some(path)
-    })
-}
-
-fn quoted_file_frame_path(frame: &str) -> Option<String> {
-    let trimmed = frame.trim();
-    if !trimmed.starts_with("File ") {
-        return None;
-    }
-    let start = frame.find('"')? + 1;
-    let rest = &frame[start..];
-    let end = rest.find('"')?;
-    let path = rest[..end].trim();
-    (!path.is_empty()).then(|| path.to_string())
-}
-
-fn public_exception_call_site_candidate(line: &str) -> bool {
-    let trimmed = line.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    !trimmed.starts_with("File ")
-        && !lower.starts_with("traceback")
-        && !lower.starts_with("during handling")
-        && !lower.starts_with("error:")
-        && !lower.starts_with("failed")
-        && !lower.starts_with("raise ")
-        && !lower.starts_with("return ")
-        && exception_name_from_line(trimmed).is_none()
-        && trimmed.contains('(')
-        && trimmed.contains(')')
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SourceParseDefect {
-    detail: String,
-    path: Option<String>,
-    line: Option<u32>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SourceImportTimeNameResolutionDefect {
-    pub missing_name: String,
-    pub suggested_name: Option<String>,
-    pub path: Option<String>,
-    pub line: Option<u32>,
-}
-
-fn source_parse_defect(summary: &str) -> Option<SourceParseDefect> {
-    let logical_lines = failure_summary_logical_lines(summary);
-    for (index, line) in logical_lines.iter().enumerate() {
-        let Some(detail) = source_parse_defect_detail_from_line(line) else {
-            continue;
-        };
-        let (path, line_number) = source_parse_defect_location_before(&logical_lines[..=index]);
-        return Some(SourceParseDefect {
-            detail,
-            path,
-            line: line_number,
-        });
-    }
-    None
-}
-
-fn source_import_time_name_resolution_defect(
-    summary: &str,
-) -> Option<SourceImportTimeNameResolutionDefect> {
-    let lower = summary.to_ascii_lowercase();
-    if !lower.contains("importerror: failed to import test module")
-        || !lower.contains("nameerror:")
-        || !lower.contains(" is not defined")
-    {
-        return None;
-    }
-    let logical_lines = failure_summary_logical_lines(summary);
-    for (index, line) in logical_lines.iter().enumerate() {
-        let Some((missing_name, suggested_name)) = source_import_time_name_error_detail(line)
-        else {
-            continue;
-        };
-        let (path, line_number) =
-            source_import_time_name_resolution_location_before(&logical_lines[..index]);
-        if path.is_none() {
-            continue;
-        }
-        return Some(SourceImportTimeNameResolutionDefect {
-            missing_name,
-            suggested_name,
-            path,
-            line: line_number,
-        });
-    }
-    None
-}
-
-fn generated_test_name_resolution_defect(
-    summary: &str,
-) -> Option<SourceImportTimeNameResolutionDefect> {
-    let lower = summary.to_ascii_lowercase();
-    if !lower.contains("nameerror:") || !lower.contains(" is not defined") {
-        return None;
-    }
-    let logical_lines = failure_summary_logical_lines(summary);
-    for (index, line) in logical_lines.iter().enumerate() {
-        let Some((missing_name, suggested_name)) = source_import_time_name_error_detail(line)
-        else {
-            continue;
-        };
-        let (path, line_number) = source_parse_defect_location_before(&logical_lines[..index]);
-        if !path.as_deref().is_some_and(target_is_test_like) {
-            continue;
-        }
-        return Some(SourceImportTimeNameResolutionDefect {
-            missing_name,
-            suggested_name,
-            path,
-            line: line_number,
-        });
-    }
-    None
-}
-
-fn generated_test_reflection_api_misuse(
-    summary: &str,
-) -> Option<SourceImportTimeNameResolutionDefect> {
-    let lower = summary.to_ascii_lowercase();
-    if !lower.contains("typeerror:")
-        || !lower.contains("code object was expected, got str")
-        || !lower.contains("inspect.getsource(")
-        || !lower.contains("__module__")
-    {
-        return None;
-    }
-    let logical_lines = failure_summary_logical_lines(summary);
-    for (index, line) in logical_lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if !trimmed.contains("inspect.getsource(") || !trimmed.contains("__module__") {
-            continue;
-        }
-        let (path, line_number) = source_parse_defect_location_before(&logical_lines[..index]);
-        if !path.as_deref().is_some_and(target_is_test_like) {
-            continue;
-        }
-        return Some(SourceImportTimeNameResolutionDefect {
-            missing_name: "inspect.getsource(__module__ string)".to_string(),
-            suggested_name: None,
-            path,
-            line: line_number,
-        });
-    }
-    None
-}
-
-fn generated_test_module_attribute_api_misuse(
-    summary: &str,
-) -> Option<SourceImportTimeNameResolutionDefect> {
-    let lower = summary.to_ascii_lowercase();
-    if !lower.contains("attributeerror:")
-        || !lower.contains(" has no attribute ")
-        || !lower.contains("file \"")
-    {
-        return None;
-    }
-    let logical_lines = failure_summary_logical_lines(summary);
-    for (index, line) in logical_lines.iter().enumerate() {
-        let Some((receiver, member)) = module_attribute_error_detail(line) else {
-            continue;
-        };
-        if !generated_test_non_source_module_receiver(&receiver) {
-            continue;
-        }
-        let (path, line_number) = source_parse_defect_location_before(&logical_lines[..index]);
-        if !path.as_deref().is_some_and(target_is_test_like) {
-            continue;
-        }
-        return Some(SourceImportTimeNameResolutionDefect {
-            missing_name: format!("{receiver}.{member}"),
-            suggested_name: None,
-            path,
-            line: line_number,
-        });
-    }
-    None
-}
-
-fn module_attribute_error_detail(line: &str) -> Option<(String, String)> {
-    let detail = line.split("AttributeError:").nth(1)?.trim();
-    if !detail.starts_with("module ") || !detail.contains(" has no attribute ") {
-        return None;
-    }
-    let quoted = quoted_segments(detail);
-    if quoted.len() < 2 {
-        return None;
-    }
-    let receiver = quoted[0].trim();
-    let member = quoted[1].trim();
-    if receiver.is_empty() || member.is_empty() {
-        return None;
-    }
-    Some((receiver.to_string(), member.to_string()))
-}
-
-fn generated_test_non_source_module_receiver(receiver: &str) -> bool {
-    let receiver = receiver.trim();
-    if receiver.is_empty() || receiver.contains('.') {
-        return false;
-    }
-    matches!(
-        receiver,
-        "abc"
-            | "argparse"
-            | "asyncio"
-            | "collections"
-            | "contextlib"
-            | "csv"
-            | "datetime"
-            | "decimal"
-            | "enum"
-            | "functools"
-            | "glob"
-            | "inspect"
-            | "io"
-            | "itertools"
-            | "json"
-            | "logging"
-            | "math"
-            | "operator"
-            | "os"
-            | "pathlib"
-            | "random"
-            | "re"
-            | "shutil"
-            | "statistics"
-            | "string"
-            | "subprocess"
-            | "sys"
-            | "tempfile"
-            | "textwrap"
-            | "time"
-            | "types"
-            | "typing"
-            | "unittest"
-    )
-}
-
-fn source_import_time_name_error_detail(line: &str) -> Option<(String, Option<String>)> {
-    let trimmed = line.trim();
-    if !trimmed.contains("NameError:") || !trimmed.contains(" is not defined") {
-        return None;
-    }
-    let missing_name = extract_quoted_after(trimmed, "NameError: name '")?;
-    let suggested_name = extract_quoted_after(trimmed, "Did you mean: '");
-    Some((missing_name, suggested_name))
-}
-
-fn source_import_time_name_resolution_location_before(
-    lines: &[&str],
-) -> (Option<String>, Option<u32>) {
-    lines
-        .iter()
-        .rev()
-        .filter_map(|line| source_parse_defect_location_from_line(line))
-        .find(|(path, _)| {
-            path.as_deref()
-                .is_some_and(source_import_time_name_resolution_source_frame)
-        })
-        .unwrap_or((None, None))
-}
-
-fn source_import_time_name_resolution_source_frame(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    normalized.ends_with(".py")
-        && !target_is_test_like(path)
-        && !normalized.contains("/python")
-        && !normalized.contains("/lib/unittest/")
-}
-
-fn source_parse_defect_detail_from_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    for marker in ["SyntaxError:", "IndentationError:", "TabError:"] {
-        if let Some(start) = trimmed.find(marker) {
-            return Some(trimmed[start..].trim().to_string());
-        }
-    }
-    None
-}
-
-fn source_parse_defect_location_before(lines: &[&str]) -> (Option<String>, Option<u32>) {
-    lines
-        .iter()
-        .rev()
-        .find_map(|line| source_parse_defect_location_from_line(line))
-        .unwrap_or((None, None))
-}
-
-fn source_parse_defect_location_from_line(line: &str) -> Option<(Option<String>, Option<u32>)> {
-    let start = line.find("File \"")? + "File \"".len();
-    let rest = &line[start..];
-    let path_end = rest.find('"')?;
-    let path = rest[..path_end].trim();
-    let after_path = &rest[path_end..];
-    let line_marker = ", line ";
-    let line_start = after_path
-        .find(line_marker)
-        .map(|index| index + line_marker.len());
-    let line_number = line_start.and_then(|index| {
-        let tail = &after_path[index..];
-        let digits = tail
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect::<String>();
-        digits.parse::<u32>().ok()
-    });
-    Some(((!path.is_empty()).then(|| path.to_string()), line_number))
-}
-
-fn quoted_segments(text: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    for ch in text.chars() {
-        if ch == '\'' || ch == '`' {
-            if in_quote {
-                if !current.trim().is_empty() {
-                    segments.push(current.trim().to_string());
-                }
-                current.clear();
-                in_quote = false;
-            } else {
-                in_quote = true;
-            }
-            continue;
-        }
-        if in_quote {
-            current.push(ch);
-        }
-    }
-    segments
-}
-
-fn extract_quoted_after(text: &str, marker: &str) -> Option<String> {
-    let start = text.find(marker)? + marker.len();
-    let rest = &text[start..];
-    let end = rest.find('\'')?;
-    let value = rest[..end].trim();
-    (!value.is_empty()).then(|| value.to_string())
-}
-
 fn forbidden_tools_for_projection(allowed: &[String]) -> Vec<String> {
     let mut forbidden = Vec::new();
-    for tool in ["read", "shell", "todowrite"] {
+    for tool in ["apply_patch", "read", "shell", "todowrite", "write"] {
         if !allowed.iter().any(|allowed_tool| allowed_tool == tool) {
             forbidden.push(tool.to_string());
         }
@@ -5277,6 +3194,7 @@ fn repair_operation_template(
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
             | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
             | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+            | RepairLaneSubtype::GeneratedTestParseDefect
             | RepairLaneSubtype::NoTestsRan
     ) {
         repair_operation_kind(subtype)
@@ -5338,6 +3256,7 @@ fn repair_intent_projection(
     subtype: &RepairLaneSubtype,
     required_target: Option<&str>,
     generated_test_target: Option<&str>,
+    allowed_tools: &[String],
     missing_symbol: Option<&str>,
     public_state_assertions: &[String],
     public_missing_attributes: &[String],
@@ -5372,7 +3291,8 @@ fn repair_intent_projection(
         ]
     } else {
         vec![format!(
-            "content-changing `write` or `apply_patch` to `{exact_target}`"
+            "content-changing {} to `{exact_target}`",
+            edit_progress_surface_label(allowed_tools)
         )]
     };
     if let Some(generated_test_target) = generated_test_target {
@@ -5435,6 +3355,17 @@ fn repair_intent_projection(
                 vec![
                     "source_public_output_patch_for_test_owned_capture_defect",
                     "weakening_stdout_stderr_assertion_without_capture",
+                    "stale_read_or_shell_before_test_contract_repair",
+                ],
+            ),
+            RepairLaneSubtype::GeneratedTestParseDefect => (
+                "generated_test",
+                "generated_test_contract_reconciliation",
+                "targeted_test_contract_edit_then_verification",
+                "repair the generated test parse defect so executable test code can run the public behavior assertion",
+                vec![
+                    "source_rewrite_for_test_owned_parse_defect",
+                    "weakening_generated_test_without_parse_repair",
                     "stale_read_or_shell_before_test_contract_repair",
                 ],
             ),
@@ -5596,6 +3527,21 @@ fn repair_intent_projection(
         progress_evidence,
         forbidden_directions,
     })
+}
+
+fn edit_progress_surface_label(allowed_tools: &[String]) -> String {
+    let mut edit_tools = allowed_tools
+        .iter()
+        .filter(|tool| matches!(tool.as_str(), "apply_patch" | "write"))
+        .map(|tool| format!("`{tool}`"))
+        .collect::<Vec<_>>();
+    edit_tools.sort();
+    edit_tools.dedup();
+    match edit_tools.as_slice() {
+        [] => "workspace edit evidence".to_string(),
+        [tool] => tool.clone(),
+        _ => edit_tools.join(" or "),
+    }
 }
 
 fn is_deferred_verification_command_evidence(evidence: &str) -> bool {
@@ -5850,6 +3796,7 @@ fn repair_operation_kind(subtype: &RepairLaneSubtype) -> &'static str {
         RepairLaneSubtype::GeneratedTestLoggingContractOverreach => {
             "generated_test_logging_contract_repair"
         }
+        RepairLaneSubtype::GeneratedTestParseDefect => "generated_test_parse_repair",
         RepairLaneSubtype::GeneratedTestArtifactApiMisuse => {
             "generated_test_artifact_api_misuse_repair"
         }
@@ -5923,6 +3870,7 @@ fn repair_source_test_ownership(
         RepairLaneSubtype::GeneratedTestSubprocessEncodingMissing
             | RepairLaneSubtype::GeneratedTestSubprocessOutputCaptureMissing
             | RepairLaneSubtype::GeneratedTestLoggingContractOverreach
+            | RepairLaneSubtype::GeneratedTestParseDefect
             | RepairLaneSubtype::GeneratedTestArtifactApiMisuse
     ) {
         return "generated_test_by_contract_evidence";
@@ -6069,6 +4017,7 @@ fn repair_evidence_markers_from_summary(
         failure_summary,
     ));
     markers.extend(generated_test_logging_contract_markers(failure_summary));
+    markers.extend(generated_test_parse_defect_markers(failure_summary));
     markers.extend(generated_test_subprocess_output_capture_markers(
         failure_summary,
     ));
@@ -6082,38 +4031,6 @@ fn repair_evidence_markers_from_summary(
     markers.sort();
     markers.dedup();
     markers
-}
-
-fn generated_test_contract_drift_markers_from_summary(failure_summary: &str) -> Vec<String> {
-    let lower = failure_summary.to_ascii_lowercase();
-    if !(lower.contains("traceback")
-        && lower.contains("self.assertequal(")
-        && lower.contains("raise ")
-        && lower.contains("error: test_"))
-    {
-        return Vec::new();
-    }
-    let has_test_frame = failure_summary_logical_lines(failure_summary)
-        .iter()
-        .any(|line| line.contains("File \"") && target_is_test_like(line));
-    let has_source_raise_frame = failure_summary_logical_lines(failure_summary)
-        .windows(2)
-        .any(|window| {
-            let [frame, code] = window else {
-                return false;
-            };
-            frame.contains("File \"")
-                && !target_is_test_like(frame)
-                && code.trim_start().starts_with("raise ")
-        });
-    if has_test_frame && has_source_raise_frame {
-        vec![
-            "generated-test contract contradiction: test expects a returned value while source raises a public exception".to_string(),
-            "generated-test conflict evidence".to_string(),
-        ]
-    } else {
-        Vec::new()
-    }
 }
 
 fn source_parse_defect_markers(failure_summary: &str) -> Vec<String> {
@@ -6146,6 +4063,21 @@ fn generated_test_logging_contract_markers(failure_summary: &str) -> Vec<String>
     }
     if let Some(level) = overreach.level {
         markers.push(format!("assertLogs level `{level}`"));
+    }
+    markers
+}
+
+fn generated_test_parse_defect_markers(failure_summary: &str) -> Vec<String> {
+    let Some(defect) = generated_test_parse_defect(failure_summary) else {
+        return Vec::new();
+    };
+    let mut markers = vec![
+        "generated_test_artifact_parse_defect".to_string(),
+        "generated_test_parse_defect".to_string(),
+        format!("generated test parse defect `{}`", defect.detail),
+    ];
+    if let Some(target) = defect.target {
+        markers.push(format!("generated test parse target `{target}`"));
     }
     markers
 }
@@ -6221,103 +4153,6 @@ fn generated_test_exception_type_overreach(failure_summary: &str) -> Option<(Str
         return None;
     }
     Some((expected, mismatch.actual_exception))
-}
-
-fn generated_test_public_output_contract_overreach(
-    failure_summary: &str,
-) -> Option<PublicOutputStreamAssertionMismatch> {
-    let mismatch = public_output_stream_assertion_mismatch(failure_summary)?;
-    if mismatch.stream != "stdout" || test_refs_from_summary(failure_summary).is_empty() {
-        return None;
-    }
-    (public_output_values_are_same_scalar_with_decorative_formatting(
-        &mismatch.expected_substring,
-        &mismatch.observed_value,
-    ) || public_output_assertion_is_ungrounded_process_lifecycle(failure_summary, &mismatch))
-    .then_some(mismatch)
-}
-
-fn public_output_assertion_is_ungrounded_process_lifecycle(
-    failure_summary: &str,
-    mismatch: &PublicOutputStreamAssertionMismatch,
-) -> bool {
-    let lower = failure_summary.to_ascii_lowercase();
-    if !lower.contains("eof")
-        && !lower.contains("end of file")
-        && !lower.contains("no input")
-        && !lower.contains("empty input")
-    {
-        return false;
-    }
-    let expected = clean_output_assertion_value(&mismatch.expected_substring);
-    if expected.is_empty() {
-        return false;
-    }
-    let observed = clean_output_assertion_value(&mismatch.observed_value);
-    observed.contains(">>>") || observed.is_empty() || !observed.contains(&expected)
-}
-
-fn public_output_values_are_same_scalar_with_decorative_formatting(
-    expected: &str,
-    observed: &str,
-) -> bool {
-    let expected_scalar = normalize_decorated_public_output_scalar(expected);
-    let observed_scalar = normalize_public_output_observed_scalar_for_expected(expected, observed)
-        .unwrap_or_else(|| normalize_decorated_public_output_scalar(observed));
-    if expected_scalar.is_empty() || observed_scalar.is_empty() || expected == observed {
-        return false;
-    }
-    match (
-        expected_scalar.parse::<f64>(),
-        observed_scalar.parse::<f64>(),
-    ) {
-        (Ok(expected), Ok(observed)) => (expected - observed).abs() < f64::EPSILON,
-        _ => false,
-    }
-}
-
-fn normalize_decorated_public_output_scalar(value: &str) -> String {
-    let mut trimmed = clean_output_assertion_value(value);
-    trimmed = trimmed.trim().to_string();
-    if let Some(rest) = trimmed.strip_prefix('=') {
-        trimmed = rest.trim().to_string();
-    }
-    if let Some((_, rest)) = trimmed.rsplit_once(':') {
-        let candidate = rest.trim();
-        if !candidate.is_empty() {
-            trimmed = candidate.to_string();
-        }
-    }
-    trimmed
-}
-
-fn normalize_public_output_observed_scalar_for_expected(
-    expected: &str,
-    observed: &str,
-) -> Option<String> {
-    let expected = clean_output_assertion_value(expected);
-    let observed = clean_output_assertion_value(observed);
-    let (label, _) = expected.split_once(':')?;
-    let label = label.trim();
-    if label.is_empty() {
-        return None;
-    }
-    let label_start = observed.find(label)?;
-    let rest = observed[label_start + label.len()..].trim_start();
-    let rest = rest
-        .strip_prefix(':')
-        .or_else(|| rest.strip_prefix('：'))
-        .unwrap_or(rest)
-        .trim_start();
-    let mut scalar = String::new();
-    for ch in rest.chars() {
-        if ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+' || ch == 'e' || ch == 'E' {
-            scalar.push(ch);
-        } else if !scalar.is_empty() {
-            break;
-        }
-    }
-    (!scalar.is_empty()).then_some(scalar)
 }
 
 fn public_output_stream_assertion_markers(failure_summary: &str) -> Vec<String> {
@@ -6472,10 +4307,6 @@ fn repair_sibling_obligations_from_summary(
         obligations.extend(public_output_stream_assertion_obligations(failure_summary));
     }
     obligations.extend(public_state_assertions.iter().cloned());
-    obligations.extend(public_state_game_loop_operation_obligations(
-        failure_summary,
-        public_state_assertions,
-    ));
     obligations.extend(public_state_terminal_transition_obligations(
         failure_summary,
     ));
@@ -6489,6 +4320,43 @@ fn verification_failure_cluster(
     state: &SessionStateSnapshot,
 ) -> Option<VerificationFailureCluster> {
     state.verification.failure_cluster.clone()
+}
+
+pub(crate) fn repair_lane_source_target_identity_exact_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
+    !active_targets_contain_repair_target(&state, "C:/other/project/src/workflow.rs")
+        && !source_targets_equivalent("src/workflow.rs", "C:/other/project/src/workflow.rs")
+        && source_targets_equivalent("./src/workflow.rs", "src/workflow.rs")
+}
+
+pub(crate) fn repair_lane_public_state_obligations_domain_neutral_fixture_passes() -> bool {
+    let assertions = vec!["workflow_state.ready == true".to_string()];
+    let obligations = repair_sibling_obligations_from_summary(
+        &RepairLaneSubtype::PublicStateAssertionMismatch,
+        "AssertionError: workflow state did not satisfy the public state contract",
+        &assertions,
+        &[],
+    );
+    let joined = obligations.join("\n").to_ascii_lowercase();
+    obligations
+        .iter()
+        .any(|item| item == "workflow_state.ready == true")
+        && [
+            "projectile movement delta",
+            "projectile bounds lifecycle",
+            "projectile spawn coordinate",
+            "projectile collision",
+            "entity group movement update",
+        ]
+        .iter()
+        .all(|forbidden| !joined.contains(forbidden))
+}
+
+pub(crate) fn repair_lane_typed_target_projection_no_required_action_shim_fixture_passes() -> bool {
+    contract_visible_public_exception_projects_source_repair_fixture_passes()
+        && public_command_contract_failure_projects_compact_source_repair_fixture_passes()
+        && repair_lane_source_target_identity_exact_fixture_passes()
 }
 
 fn stable_short_hash(value: &str) -> String {

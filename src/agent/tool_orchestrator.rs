@@ -3,6 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::{Map, Value, json};
 
+use crate::agent::language_evidence::{
+    ArtifactRole, classify_artifact_target as classify_language_artifact_target,
+    language_failure_label_from_output_line, language_verification_command_evidence,
+};
 use crate::agent::state::ActiveWorkContract;
 use crate::agent::verification::{
     canonical_verification_command_identity_key, verification_command_identity_key,
@@ -17,9 +21,8 @@ use crate::protocol::{
 };
 use crate::runtime::RunEventSink;
 use crate::session::{
-    DiffSummaryPart, FailureKind, MessageId, MessagePart, NewPart, PartKind, SessionContext,
-    SessionId, SessionStateSnapshot, TaskRoute, ToolCallId, ToolCallRecord,
-    VerificationFailureCluster,
+    DiffSummaryPart, FailureKind, MessageId, SessionContext, SessionId, SessionStateSnapshot,
+    TaskRoute, ToolCallId, ToolCallRecord, VerificationFailureCluster,
 };
 use crate::storage::SqliteSessionRepository;
 use crate::tool::context::{ToolContext, ToolServices};
@@ -319,6 +322,8 @@ impl ToolLifecycleRuntime {
             route.completion_metadata(result_metadata),
             truncated_output_path,
         );
+        let provider_output_text =
+            render_provider_visible_operation_progress_feedback(summary, &metadata);
         let event = session_repo
             .complete_tool_call_with_protocol_bundle(
                 session_id,
@@ -327,7 +332,7 @@ impl ToolLifecycleRuntime {
                 tool_name,
                 title,
                 metadata.clone(),
-                summary,
+                &provider_output_text,
                 truncated_output_path,
                 protocol_turn_id,
                 sink.reserve_protocol_sequence_no(),
@@ -362,8 +367,12 @@ impl ToolLifecycleRuntime {
         active_targets: &[Utf8PathBuf],
         sink: &mut dyn RunEventSink,
     ) -> Result<Value, AgentError> {
-        let result_metadata =
-            classify_executed_result_for_operation_intent(tool_name, result, route);
+        let result_metadata = classify_executed_result_for_operation_intent(
+            tool_name,
+            result,
+            route,
+            Some(workspace_root),
+        );
         let metadata = with_active_targets_for_operation_feedback(
             with_verification_run_result(
                 tool_name,
@@ -375,27 +384,28 @@ impl ToolLifecycleRuntime {
         );
         let provider_output_text =
             render_provider_visible_operation_progress_feedback(&result.output_text, &metadata);
-        let event = session_repo
-            .complete_tool_call_with_protocol_bundle(
-                session_id,
-                assistant_message_id,
-                tool_call_id,
-                tool_name,
-                &result.title,
-                metadata.clone(),
-                &provider_output_text,
-                result.truncated_output_path.as_deref(),
-                protocol_turn_id,
-                sink.reserve_protocol_sequence_no(),
-            )
-            .await?;
-        sink.emit_pre_recorded(event)?;
-        if !result.recorded_changes.is_empty() {
-            let content_satisfying_changes =
-                content_satisfying_change_summaries_for_protocol(result, &metadata);
-            if content_satisfying_changes.is_empty() {
-                return Ok(metadata);
-            }
+        let content_satisfying_changes = if result.recorded_changes.is_empty() {
+            Vec::new()
+        } else {
+            content_satisfying_change_summaries_for_protocol(result, &metadata)
+        };
+        if content_satisfying_changes.is_empty() {
+            let event = session_repo
+                .complete_tool_call_with_protocol_bundle(
+                    session_id,
+                    assistant_message_id,
+                    tool_call_id,
+                    tool_name,
+                    &result.title,
+                    metadata.clone(),
+                    &provider_output_text,
+                    result.truncated_output_path.as_deref(),
+                    protocol_turn_id,
+                    sink.reserve_protocol_sequence_no(),
+                )
+                .await?;
+            sink.emit_pre_recorded(event)?;
+        } else {
             let summary = content_satisfying_changes
                 .iter()
                 .map(|change| change.summary_line(Some(workspace_root)))
@@ -405,37 +415,39 @@ impl ToolLifecycleRuntime {
                 .iter()
                 .map(|change| change.change_id)
                 .collect::<Vec<_>>();
-            let event = crate::session::RunEvent::FileChangesRecorded {
-                tool_call_id,
-                changes: content_satisfying_changes.clone(),
-            };
-            session_repo
-                .append_part_with_protocol_bundle(
+            let (tool_output_event, file_changes_event) = session_repo
+                .complete_tool_call_with_file_changes_protocol_bundle(
                     session_id,
                     assistant_message_id,
-                    NewPart {
-                        kind: PartKind::DiffSummary,
-                        payload: MessagePart::DiffSummary(DiffSummaryPart {
-                            change_ids: content_satisfying_change_ids,
-                            changes: content_satisfying_changes
-                                .iter()
-                                .map(|change| crate::protocol::FileChangeEvidence {
-                                    change_id: change.change_id,
-                                    kind: change.kind,
-                                    path_before: change.path_before.clone(),
-                                    path_after: change.path_after.clone(),
-                                    summary: change.summary_line(Some(workspace_root)),
-                                })
-                                .collect(),
-                            summary,
-                        }),
+                    tool_call_id,
+                    tool_name,
+                    &result.title,
+                    metadata.clone(),
+                    &provider_output_text,
+                    result.truncated_output_path.as_deref(),
+                    DiffSummaryPart {
+                        tool_call_id: Some(tool_call_id),
+                        change_ids: content_satisfying_change_ids,
+                        changes: content_satisfying_changes
+                            .iter()
+                            .map(|change| crate::protocol::FileChangeEvidence {
+                                change_id: change.change_id,
+                                kind: change.kind,
+                                path_before: change.path_before.clone(),
+                                path_after: change.path_after.clone(),
+                                summary: change.summary_line(Some(workspace_root)),
+                            })
+                            .collect(),
+                        summary,
                     },
-                    &event,
+                    content_satisfying_changes.clone(),
                     protocol_turn_id,
+                    sink.reserve_protocol_sequence_no(),
                     sink.reserve_protocol_sequence_no(),
                 )
                 .await?;
-            sink.emit_pre_recorded(event)?;
+            sink.emit_pre_recorded(tool_output_event)?;
+            sink.emit_pre_recorded(file_changes_event)?;
         }
         Ok(metadata)
     }
@@ -507,6 +519,18 @@ impl ToolLifecycleRuntime {
     pub(crate) fn classify_pre_execution_corrective_result(
         input: PreExecutionCorrectiveInput<'_>,
     ) -> Option<PreExecutionCorrectiveDecision> {
+        if let Some(result) = Self::exact_required_target_content_shape_result(
+            input.effective_tool_name,
+            input.parsed_arguments,
+            input.active_work,
+            input.workspace_root,
+            input.allowed_tools,
+        ) {
+            return Some(PreExecutionCorrectiveDecision {
+                kind: PreExecutionCorrectiveKind::ArtifactContentShapeViolation,
+                result,
+            });
+        }
         if let Some(result) = Self::artifact_content_shape_violation_result(
             input.effective_tool_name,
             input.parsed_arguments,
@@ -548,6 +572,7 @@ impl ToolLifecycleRuntime {
             input.parsed_arguments,
             input.active_work,
             input.workspace_root,
+            input.allowed_tools,
         ) {
             return Some(PreExecutionCorrectiveDecision {
                 kind: PreExecutionCorrectiveKind::WrongAuthoringTarget,
@@ -597,6 +622,145 @@ impl ToolLifecycleRuntime {
             });
         }
         None
+    }
+
+    fn exact_required_target_content_shape_result(
+        effective_tool_name: &str,
+        parsed_arguments: &Value,
+        active_work: Option<&ActiveWorkContract>,
+        workspace_root: &Utf8Path,
+        allowed_tools: &BTreeSet<String>,
+    ) -> Option<ToolResult> {
+        if !matches!(effective_tool_name, "write" | "apply_patch") {
+            return None;
+        }
+        match effective_tool_name {
+            "write"
+                if !allowed_tools.contains("write") || allowed_tools.contains("apply_patch") =>
+            {
+                return None;
+            }
+            "apply_patch" if !allowed_tools.contains("apply_patch") => return None,
+            _ => {}
+        }
+        let active_targets = active_requested_work_targets(active_work)?;
+        if active_targets.len() != 1 {
+            return None;
+        }
+        let active_target = active_targets.first()?.as_str();
+        let submitted_targets = submitted_authoring_targets(effective_tool_name, parsed_arguments);
+        if submitted_targets.is_empty() {
+            return None;
+        }
+        let active_keys = normalized_target_keys(active_target, workspace_root);
+        if submitted_targets.iter().any(|submitted_target| {
+            submitted_target.trim().is_empty()
+                || submitted_target == active_target
+                || (!active_keys.is_empty()
+                    && normalized_target_keys(submitted_target, workspace_root)
+                        .iter()
+                        .any(|submitted_key| active_keys.contains(submitted_key)))
+        }) {
+            return None;
+        }
+        let mut projected_arguments = parsed_arguments.clone();
+        match effective_tool_name {
+            "write" => {
+                if let Some(object) = projected_arguments.as_object_mut() {
+                    object.insert("path".to_string(), Value::String(active_target.to_string()));
+                }
+            }
+            "apply_patch" => {
+                let patch_text = parsed_arguments.get("patch_text").and_then(Value::as_str)?;
+                let projected_patch_text = project_apply_patch_declared_targets_to_active_target(
+                    patch_text,
+                    active_target,
+                )?;
+                if let Some(object) = projected_arguments.as_object_mut() {
+                    object.insert(
+                        "patch_text".to_string(),
+                        Value::String(projected_patch_text),
+                    );
+                }
+            }
+            _ => return None,
+        }
+        let result = if effective_tool_name == "write" {
+            let requested_target = submitted_targets.first().map(String::as_str);
+            crate::agent::content_shape_contract::required_write_content_shape_violation_result_with_requested_target(
+                effective_tool_name,
+                &projected_arguments,
+                active_target,
+                requested_target,
+            )
+        } else {
+            crate::agent::content_shape_contract::artifact_content_shape_violation_result(
+                effective_tool_name,
+                &projected_arguments,
+                Some(workspace_root),
+            )
+        }?;
+        Some(Self::annotate_exact_required_content_shape_result(
+            result,
+            effective_tool_name,
+            active_target,
+            &submitted_targets,
+        ))
+    }
+
+    fn annotate_exact_required_content_shape_result(
+        mut result: ToolResult,
+        effective_tool_name: &str,
+        active_target: &str,
+        submitted_targets: &[String],
+    ) -> ToolResult {
+        let required_action_projection = format!("{effective_tool_name}:{active_target}");
+        let current_operation_template =
+            current_operation_template_feedback(&required_action_projection).unwrap_or_default();
+        let submitted_values = submitted_targets
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect::<Vec<_>>();
+        let submitted_value = Value::Array(submitted_values);
+        if let Some(object) = result.metadata.as_object_mut() {
+            object.insert(
+                "required_action_projection".to_string(),
+                Value::String(required_action_projection.clone()),
+            );
+            if !current_operation_template.is_empty() {
+                object.insert(
+                    "current_operation_template".to_string(),
+                    Value::String(current_operation_template.clone()),
+                );
+            }
+            object.insert("submitted_targets".to_string(), submitted_value.clone());
+            object.insert(
+                "required_target".to_string(),
+                Value::String(active_target.to_string()),
+            );
+            if let Some(feedback) = object
+                .get_mut("tool_feedback_envelope")
+                .and_then(Value::as_object_mut)
+            {
+                feedback.insert(
+                    "required_action_projection".to_string(),
+                    Value::String(required_action_projection),
+                );
+                if !current_operation_template.is_empty() {
+                    feedback.insert(
+                        "current_operation_template".to_string(),
+                        Value::String(current_operation_template),
+                    );
+                }
+                feedback.insert("submitted_targets".to_string(), submitted_value);
+                feedback.insert(
+                    "required_target".to_string(),
+                    Value::String(active_target.to_string()),
+                );
+            }
+        }
+        result
     }
 
     pub(crate) fn record_pre_execution_corrective_no_progress(
@@ -676,7 +840,7 @@ impl ToolLifecycleRuntime {
             let required_action_projection = request
                 .required_action
                 .map(RequiredAction::projection_label)
-                .unwrap_or("none");
+                .unwrap_or_else(|| "none".to_string());
             return format!(
                 "model_action_rejection|semantic={}|tool={}|allowed={}|choice={}|required_action={required_action_projection}",
                 request.semantic_class,
@@ -740,13 +904,17 @@ impl ToolLifecycleRuntime {
         let submitted_keys = canonical_shell_command_keys(submitted);
         let required_keys = required_commands
             .iter()
-            .filter_map(|required| canonical_verification_command_identity_key(required))
+            .flat_map(|required| required_verification_command_identity_keys(required))
             .collect::<BTreeSet<_>>();
-        if verification_command_key_family_matches(&submitted_keys, &required_keys) {
-            return None;
-        }
         let executable_commands =
             executable_verification_command_forms(&required_commands, shell_family);
+        let submitted_matches_required_identity =
+            verification_command_key_family_matches(&submitted_keys, &required_keys);
+        if submitted_matches_required_identity
+            && submitted_matches_executable_verification_form(submitted, &executable_commands)
+        {
+            return None;
+        }
         let executable_guidance = if executable_commands.is_empty() {
             String::new()
         } else {
@@ -1002,6 +1170,7 @@ impl ToolLifecycleRuntime {
         parsed_arguments: &Value,
         active_work: Option<&ActiveWorkContract>,
         workspace_root: &Utf8Path,
+        allowed_tools: &BTreeSet<String>,
     ) -> Option<ToolResult> {
         if !operation_content_changing_tool_name(effective_tool_name) {
             return None;
@@ -1037,6 +1206,11 @@ impl ToolLifecycleRuntime {
             .map(|target| format!("`{target}`"))
             .collect::<Vec<_>>()
             .join(", ");
+        let required_action_projection =
+            current_authoring_required_action_projection(&active_target_strings, allowed_tools);
+        let current_operation_template = required_action_projection
+            .as_ref()
+            .and_then(|action| current_operation_template_feedback(action));
         Some(ToolResult {
             title: "Wrong authoring target".to_string(),
             output_text: format!(
@@ -1058,7 +1232,9 @@ impl ToolLifecycleRuntime {
                     "progress_effect": "no_progress",
                     "submitted_targets": submitted_targets,
                     "active_targets": active_target_strings,
-                    "side_effects_applied": false
+                    "side_effects_applied": false,
+                    "required_action_projection": required_action_projection,
+                    "current_operation_template": current_operation_template
                 },
                 "terminal_guard_policy": {
                     "owner": "tool_lifecycle_runtime",
@@ -1392,9 +1568,10 @@ impl ToolLifecycleRuntime {
             .and_then(Value::as_str)
             .unwrap_or("<missing path>");
         let submitted_normalized = submitted_path.replace('\\', "/");
-        let submitted_consumed = envelope.consumed_targets.iter().any(|target| {
-            target == &submitted_normalized || submitted_normalized.ends_with(&format!("/{target}"))
-        });
+        let submitted_consumed = envelope
+            .consumed_targets
+            .iter()
+            .any(|target| target_key_family_matches_exactly(&submitted_normalized, target));
         let reason = if submitted_consumed {
             format!(
                 "`{submitted_path}` is already grounded for this authoring recovery. Remaining read target(s): {}.",
@@ -1682,18 +1859,23 @@ impl ToolLifecycleRuntime {
         let progress_class = operation_progress_class_from_metadata(metadata)
             .unwrap_or("")
             .to_string();
-        let repair_supporting_context_exhausted =
-            repair_supporting_context_budget_applies(
+        let repair_supporting_context_budget_applies =
+            repair_supporting_context_budget_applies_for_metadata(
                 &progress_class,
+                metadata,
                 state,
                 open_authoring_required,
-            ) && repair_supporting_context_budget_exhausts_for_metadata(
+            );
+        let repair_supporting_context_exhausted = repair_supporting_context_budget_applies
+            && repair_supporting_context_budget_exhausts_for_metadata(
                 effective_tool_name,
                 metadata,
                 state,
-            ) && *count >= REPAIR_SUPPORTING_CONTEXT_BUDGET_THRESHOLD;
-        let terminal =
-            should_terminalize_operation_non_content_no_progress_for_state(*count, state);
+            )
+            && *count >= REPAIR_SUPPORTING_CONTEXT_BUDGET_THRESHOLD;
+        let terminal = should_terminalize_operation_non_content_no_progress_for_metadata(
+            *count, metadata, state,
+        );
         let budget_exhaustion = if terminal
             && docs_route_semantic_operation_no_progress(state, &progress_class)
             && progress_class == "supporting_context"
@@ -1708,11 +1890,7 @@ impl ToolLifecycleRuntime {
         {
             Some(OperationNoProgressBudgetExhaustion::AuthoringSupportingContext)
         } else if (terminal || repair_supporting_context_exhausted)
-            && repair_supporting_context_budget_applies(
-                &progress_class,
-                state,
-                open_authoring_required,
-            )
+            && repair_supporting_context_budget_applies
         {
             Some(OperationNoProgressBudgetExhaustion::RepairSupportingContext)
         } else {
@@ -1743,7 +1921,18 @@ impl ToolLifecycleRuntime {
         tool_choice: &ToolChoice,
         open_authoring_required: bool,
     ) -> Option<ToolTerminalGuardDecision> {
-        if operation_progress_class_from_metadata(metadata) != Some("no_progress") {
+        let progress_class = operation_progress_class_from_metadata(metadata);
+        let progress_effect = tool_progress_effect_from_metadata(metadata);
+        if progress_effect != ToolProgressEffect::NoProgress
+            || !matches!(
+                progress_class,
+                Some(
+                    "required_write_content_shape_mismatch"
+                        | "artifact_content_shape_violation"
+                        | "artifact_content_shape_no_progress"
+                )
+            )
+        {
             return None;
         }
         Self::record_operation_non_content_no_progress(
@@ -2067,13 +2256,15 @@ fn classify_executed_result_for_operation_intent(
     tool_name: ToolName,
     result: &ToolResult,
     route: &ToolRouteDecision,
+    workspace_root: Option<&Utf8Path>,
 ) -> Value {
-    let metadata = result.metadata.clone();
+    let metadata =
+        with_file_change_content_shape_evidence(result.metadata.clone(), result, workspace_root);
     if !route_has_operation_intent(route, OperationIntent::ContentChangingAuthoringRequired) {
         return metadata;
     }
 
-    let progress_class = operation_progress_class(tool_name, result);
+    let progress_class = operation_progress_class(tool_name, result, &metadata);
     let progress_effect = operation_progress_effect(progress_class);
     let operation_intent = OperationIntent::ContentChangingAuthoringRequired.as_str();
     let result_hash = crate::harness::artifact::hash_bytes(
@@ -2120,7 +2311,7 @@ fn classify_executed_result_for_operation_intent(
         .unwrap_or_default();
     feedback.insert(
         "kind".to_string(),
-        Value::String("operation_progress_classification".to_string()),
+        Value::String(operation_feedback_kind(progress_class).to_string()),
     );
     feedback.insert(
         "operation_intent".to_string(),
@@ -2143,6 +2334,34 @@ fn classify_executed_result_for_operation_intent(
         "content_changing_progress_required".to_string(),
         Value::Bool(true),
     );
+    if !feedback.contains_key("required_action_projection")
+        && let Some(required_action_projection) = route_required_action_projection(route)
+    {
+        feedback.insert(
+            "required_action_projection".to_string(),
+            Value::String(required_action_projection.clone()),
+        );
+        if let Some(template) = current_operation_template_feedback(&required_action_projection) {
+            feedback.insert(
+                "current_operation_template".to_string(),
+                Value::String(template),
+            );
+        }
+    }
+    if let Some(obligation_ids) = route_string_array_projection(route, "obligation_ids") {
+        let value = Value::Array(obligation_ids.iter().cloned().map(Value::String).collect());
+        object.insert("obligation_ids".to_string(), value.clone());
+        feedback.insert("obligation_ids".to_string(), value);
+    }
+    if let Some(contract_refs) = route_string_array_projection(route, "contract_refs") {
+        let value = Value::Array(contract_refs.iter().cloned().map(Value::String).collect());
+        object.insert("contract_refs".to_string(), value.clone());
+        feedback.insert("contract_refs".to_string(), value);
+    }
+    if let Some(evidence_refs) = route_evidence_refs_projection(route) {
+        object.insert("evidence_refs".to_string(), evidence_refs.clone());
+        feedback.insert("evidence_refs".to_string(), evidence_refs);
+    }
     object.insert(
         "tool_feedback_envelope".to_string(),
         Value::Object(feedback),
@@ -2223,19 +2442,64 @@ fn route_operation_intents(route: &ToolRouteDecision) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn operation_intents_from_value(value: Option<&Value>) -> Option<Vec<String>> {
-    value?.get("operation_intents")?.as_array().map(|items| {
-        items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect::<Vec<_>>()
+fn route_required_action_projection(route: &ToolRouteDecision) -> Option<String> {
+    route_control_projection(route)
+        .and_then(|projection| projection.get("required_action"))
+        .and_then(render_required_action_projection_from_typed_value)
+}
+
+fn route_control_projection(route: &ToolRouteDecision) -> Option<&Value> {
+    route.metadata.get("control_projection").or_else(|| {
+        route
+            .metadata
+            .get("tool_route")
+            .and_then(|tool_route| tool_route.get("control_projection"))
     })
 }
 
-fn operation_progress_class(tool_name: ToolName, result: &ToolResult) -> &'static str {
+fn route_string_array_projection(route: &ToolRouteDecision, key: &str) -> Option<Vec<String>> {
+    route_control_projection(route)
+        .and_then(|projection| projection.get(key))
+        .and_then(Value::as_array)
+        .map(|items| json_string_array(items))
+        .filter(|values| !values.is_empty())
+}
+
+fn route_evidence_refs_projection(route: &ToolRouteDecision) -> Option<Value> {
+    route_control_projection(route)
+        .and_then(|projection| projection.get("evidence_refs"))
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .map(|items| Value::Array(items.clone()))
+}
+
+fn operation_intents_from_value(value: Option<&Value>) -> Option<Vec<String>> {
+    value?
+        .get("operation_intents")?
+        .as_array()
+        .map(|items| json_string_array(items))
+}
+
+fn json_string_array(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+}
+
+fn operation_progress_class(
+    tool_name: ToolName,
+    result: &ToolResult,
+    metadata: &Value,
+) -> &'static str {
     if !result.recorded_changes.is_empty() || !result.change_summaries.is_empty() {
-        if file_change_content_evidence_is_non_satisfying(&result.metadata) {
+        if file_change_content_evidence_has_shape_violation(metadata) {
+            return "artifact_content_shape_no_progress";
+        }
+        if file_change_content_evidence_is_non_satisfying(metadata) {
             return "empty_artifact_no_progress";
         }
         return "content_changing_progress";
@@ -2247,6 +2511,15 @@ fn operation_progress_class(tool_name: ToolName, result: &ToolResult) -> &'stati
         .unwrap_or(false)
     {
         return "progress_projection";
+    }
+    if matches!(tool_name, ToolName::Write | ToolName::ApplyPatch)
+        && result
+            .metadata
+            .get("no_content_change")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return "idempotent_file_write_no_progress";
     }
     match tool_name {
         ToolName::List
@@ -2269,6 +2542,15 @@ fn operation_progress_effect(progress_class: &str) -> &'static str {
         "content_changing_progress" => "made_progress",
         "blocked_failure" => "blocked",
         _ => "no_progress",
+    }
+}
+
+fn operation_feedback_kind(progress_class: &str) -> &'static str {
+    match progress_class {
+        "required_write_content_shape_mismatch" => "required_write_content_shape_mismatch",
+        "artifact_content_shape_violation" => "artifact_content_shape_violation",
+        "artifact_content_shape_no_progress" => "artifact_content_shape_no_progress",
+        _ => "operation_progress_classification",
     }
 }
 
@@ -2316,6 +2598,27 @@ fn render_provider_visible_operation_progress_feedback(
             active_targets.join(", ")
         )
     };
+    let required_action_line = operation_feedback_required_action_projection(metadata)
+        .map(|action| format!("\nrequired_action: {action}"))
+        .unwrap_or_default();
+    let obligation_line = operation_feedback_obligation_identity(metadata)
+        .map(|identity| format!("\nobligation_identity: {identity}"))
+        .unwrap_or_default();
+    let template_line = operation_feedback_current_template(metadata)
+        .map(|template| format!("\ncurrent_operation_template: {template}"))
+        .unwrap_or_default();
+    let submitted_targets = operation_feedback_submitted_targets(metadata);
+    let submitted_line = if submitted_targets.is_empty() {
+        String::new()
+    } else {
+        format!("\nsubmitted_targets: {}", submitted_targets.join(", "))
+    };
+    if progress_class == "wrong_authoring_target" {
+        return format!(
+            "[tool feedback]\noperation_intent: content_changing_authoring_required\noperation_progress_class: wrong_authoring_target\nprogress_effect: no_progress{active_target_line}{required_action_line}{obligation_line}{template_line}{submitted_line}\nThe submitted content-changing call was rejected before filesystem side effects. The submitted target is historical failed-call evidence only; satisfy the current active target and required action before verification or final answer.\n\n{output_text}"
+        );
+    }
+
     let note = match progress_class {
         "progress_projection" => {
             "This plan update is recorded, but it did not create or modify any required workspace artifact."
@@ -2326,13 +2629,25 @@ fn render_provider_visible_operation_progress_feedback(
         "no_progress" => {
             "This tool output is recorded, but it did not create or modify any required workspace artifact."
         }
+        "idempotent_file_write_no_progress" => {
+            "This file-changing tool output is recorded as idempotent no-progress because it produced no content change and no file-change evidence."
+        }
         "empty_artifact_no_progress" => {
             "This tool changed filesystem state, but the changed artifact has no content-bearing after-state and does not satisfy requested authoring work."
+        }
+        "required_write_content_shape_mismatch" => {
+            "This content-changing tool call was rejected before filesystem side effects because the submitted content violates the current required target's content-shape contract."
+        }
+        "artifact_content_shape_violation" => {
+            "This content-changing tool output is rejected because the artifact content violates its typed content-shape contract and does not satisfy requested authoring work."
+        }
+        "artifact_content_shape_no_progress" => {
+            "This tool changed filesystem state, but the changed artifact after-state violates its content-shape contract and does not satisfy requested authoring work."
         }
         _ => return output_text.to_string(),
     };
     format!(
-        "{output_text}\n\n[tool feedback]\noperation_intent: content_changing_authoring_required\noperation_progress_class: {progress_class}\nprogress_effect: no_progress{active_target_line}\n{note}\n{continuation}"
+        "{output_text}\n\n[tool feedback]\noperation_intent: content_changing_authoring_required\noperation_progress_class: {progress_class}\nprogress_effect: no_progress{active_target_line}{required_action_line}{obligation_line}{template_line}{submitted_line}\n{note}\n{continuation}"
     )
 }
 
@@ -2352,12 +2667,423 @@ fn operation_feedback_active_targets(metadata: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn operation_feedback_submitted_targets(metadata: &Value) -> Vec<String> {
+    metadata
+        .get("tool_feedback_envelope")
+        .and_then(|feedback| feedback.get("submitted_targets"))
+        .or_else(|| metadata.get("submitted_targets"))
+        .and_then(Value::as_array)
+        .map(|targets| {
+            targets
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn operation_feedback_required_action_projection(metadata: &Value) -> Option<String> {
+    metadata
+        .get("tool_feedback_envelope")
+        .and_then(|feedback| feedback.get("required_action_projection"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            metadata
+                .get("control_projection")
+                .and_then(|projection| projection.get("required_action"))
+                .and_then(render_required_action_projection_from_typed_value)
+        })
+        .or_else(|| {
+            metadata
+                .get("tool_route")
+                .and_then(|route| route.get("control_projection"))
+                .and_then(|projection| projection.get("required_action"))
+                .and_then(render_required_action_projection_from_typed_value)
+        })
+}
+
+fn render_required_action_projection_from_typed_value(action: &Value) -> Option<String> {
+    let kind = action.get("kind").and_then(Value::as_str)?;
+    let tool = action.get("tool").and_then(Value::as_str)?;
+    match kind {
+        "shell_command" => {
+            let command = action
+                .get("command")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty());
+            Some(format!(
+                "{}:{}",
+                tool,
+                command.unwrap_or("<missing-command>")
+            ))
+        }
+        "edit_target" => {
+            let target = action
+                .get("target")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("<missing-target>");
+            let prefix = match tool {
+                "apply_patch" => "apply_patch",
+                "write" => "write",
+                _ => "edit",
+            };
+            Some(format!("{prefix}:{target}"))
+        }
+        _ => None,
+    }
+}
+
+fn operation_feedback_current_template(metadata: &Value) -> Option<String> {
+    metadata
+        .get("tool_feedback_envelope")
+        .and_then(|feedback| feedback.get("current_operation_template"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            operation_feedback_required_action_projection(metadata)
+                .as_deref()
+                .and_then(current_operation_template_feedback)
+        })
+}
+
+fn operation_feedback_obligation_identity(metadata: &Value) -> Option<String> {
+    let obligation_ids = operation_feedback_string_array_from_paths(
+        metadata,
+        &[
+            &["tool_feedback_envelope", "obligation_ids"],
+            &["control_projection", "obligation_ids"],
+            &["tool_route", "control_projection", "obligation_ids"],
+        ],
+    );
+    if !obligation_ids.is_empty() {
+        return Some(format!(
+            "obligations:{}",
+            sorted_join(obligation_ids.iter().map(String::as_str))
+        ));
+    }
+    let contract_refs = operation_feedback_string_array_from_paths(
+        metadata,
+        &[
+            &["tool_feedback_envelope", "contract_refs"],
+            &["control_projection", "contract_refs"],
+            &["tool_route", "control_projection", "contract_refs"],
+        ],
+    );
+    (!contract_refs.is_empty()).then(|| {
+        format!(
+            "contracts:{}",
+            sorted_join(contract_refs.iter().map(String::as_str))
+        )
+    })
+}
+
+fn operation_feedback_string_array_from_paths(metadata: &Value, paths: &[&[&str]]) -> Vec<String> {
+    let mut values = Vec::new();
+    for path in paths {
+        let mut current = Some(metadata);
+        for segment in *path {
+            current = current.and_then(|value| value.get(*segment));
+        }
+        if let Some(items) = current.and_then(Value::as_array) {
+            values.extend(json_string_array(items));
+        }
+    }
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn current_authoring_required_action_projection(
+    active_targets: &[String],
+    allowed_tools: &BTreeSet<String>,
+) -> Option<String> {
+    let target = active_targets.first()?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    if allowed_tools.contains("apply_patch") {
+        Some(format!("apply_patch:{target}"))
+    } else if allowed_tools.contains("write") {
+        Some(format!("write:{target}"))
+    } else {
+        None
+    }
+}
+
+fn current_operation_template_feedback(required_action_projection: &str) -> Option<String> {
+    let (tool, target) = required_action_projection.split_once(':')?;
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    match tool {
+        "apply_patch" => Some(format!(
+            "use `*** Add File: {target}` if the active target is missing, or `*** Update File: {target}` if it already exists; the patch must touch only the active target"
+        )),
+        "write" => Some(format!(
+            "write the content directly to `{target}`; the write must touch only the active target"
+        )),
+        _ => None,
+    }
+}
+
 fn file_change_content_evidence_is_non_satisfying(metadata: &Value) -> bool {
     metadata
         .get("file_change_content_evidence")
         .and_then(|value| value.get("content_bearing"))
         .and_then(Value::as_bool)
         == Some(false)
+}
+
+fn file_change_content_evidence_has_shape_violation(metadata: &Value) -> bool {
+    metadata
+        .get("file_change_content_evidence")
+        .and_then(|value| value.get("content_shape_violating_change_ids"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+}
+
+fn with_file_change_content_shape_evidence(
+    metadata: Value,
+    result: &ToolResult,
+    workspace_root: Option<&Utf8Path>,
+) -> Value {
+    let Some(workspace_root) = workspace_root else {
+        return metadata;
+    };
+    if result.change_summaries.is_empty() {
+        return metadata;
+    }
+    let mut evidence = file_change_admission_evidence(result, workspace_root);
+    let existing_content_bearing_ids = evidence_string_set(&evidence, "content_bearing_change_ids");
+    if existing_content_bearing_ids.is_empty() {
+        return metadata_with_file_change_admission(metadata, evidence);
+    }
+
+    let mut content_shape_violating_ids = BTreeSet::new();
+    let mut content_shape_violating_paths = BTreeSet::new();
+    let mut unreadable_text_after_state_ids = BTreeSet::new();
+    let mut unreadable_text_after_state_paths = BTreeSet::new();
+    for change in &result.change_summaries {
+        let change_id = change.change_id.to_string();
+        if !existing_content_bearing_ids.contains(&change_id) {
+            continue;
+        }
+        let Some(path_after) = change.path_after.as_ref() else {
+            continue;
+        };
+        let target = crate::agent::content_shape_contract::canonical_artifact_content_shape_target(
+            path_after.as_str(),
+            Some(workspace_root),
+        );
+        if crate::agent::content_shape_contract::artifact_target_requires_content_shape(&target)
+            .is_none()
+        {
+            continue;
+        }
+        let after_path = workspace_root.join(target.as_str());
+        let Ok(content) = std::fs::read_to_string(after_path.as_std_path()) else {
+            content_shape_violating_ids.insert(change_id.clone());
+            content_shape_violating_paths.insert(target.clone());
+            unreadable_text_after_state_ids.insert(change_id);
+            unreadable_text_after_state_paths.insert(target);
+            continue;
+        };
+        if !crate::agent::content_shape_contract::write_content_matches_required_target(
+            &target, &content,
+        ) {
+            content_shape_violating_ids.insert(change_id);
+            content_shape_violating_paths.insert(target);
+        }
+    }
+    let existing_non_satisfying_ids = evidence_string_set(&evidence, "non_satisfying_change_ids");
+    let existing_non_satisfying_paths = evidence_string_set(&evidence, "non_satisfying_paths");
+    let satisfying_ids = existing_content_bearing_ids
+        .difference(&content_shape_violating_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut non_satisfying_ids = existing_non_satisfying_ids;
+    non_satisfying_ids.extend(content_shape_violating_ids.iter().cloned());
+    let mut non_satisfying_paths = existing_non_satisfying_paths;
+    non_satisfying_paths.extend(content_shape_violating_paths.iter().cloned());
+
+    if let Some(object) = evidence.as_object_mut() {
+        object.insert(
+            "content_bearing".to_string(),
+            Value::Bool(!satisfying_ids.is_empty()),
+        );
+        object.insert(
+            "all_changes_content_bearing".to_string(),
+            Value::Bool(non_satisfying_ids.is_empty() && !satisfying_ids.is_empty()),
+        );
+        object.insert(
+            "content_bearing_change_ids".to_string(),
+            Value::Array(satisfying_ids.into_iter().map(Value::String).collect()),
+        );
+        object.insert(
+            "non_satisfying_change_ids".to_string(),
+            Value::Array(non_satisfying_ids.into_iter().map(Value::String).collect()),
+        );
+        object.insert(
+            "non_satisfying_paths".to_string(),
+            Value::Array(
+                non_satisfying_paths
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "content_shape_violating_change_ids".to_string(),
+            Value::Array(
+                content_shape_violating_ids
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "content_shape_violating_paths".to_string(),
+            Value::Array(
+                content_shape_violating_paths
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "unreadable_text_after_state_change_ids".to_string(),
+            Value::Array(
+                unreadable_text_after_state_ids
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "unreadable_text_after_state_paths".to_string(),
+            Value::Array(
+                unreadable_text_after_state_paths
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "content_shape_contract_enforced".to_string(),
+            Value::Bool(true),
+        );
+    }
+    metadata_with_file_change_admission(metadata, evidence)
+}
+
+fn file_change_admission_evidence(result: &ToolResult, workspace_root: &Utf8Path) -> Value {
+    let mut content_bearing_change_ids = Vec::new();
+    let mut non_satisfying_change_ids = Vec::new();
+    let mut content_bearing_paths = Vec::new();
+    let mut non_satisfying_paths = Vec::new();
+
+    for change in &result.change_summaries {
+        let path = change
+            .path_after
+            .as_ref()
+            .or(change.path_before.as_ref())
+            .map(|path| render_change_path(path, workspace_root))
+            .unwrap_or_default();
+        if change_summary_has_content_bearing_after_state(change, workspace_root) {
+            content_bearing_change_ids.push(change.change_id.to_string());
+            if !path.is_empty() {
+                content_bearing_paths.push(path);
+            }
+        } else {
+            non_satisfying_change_ids.push(change.change_id.to_string());
+            if !path.is_empty() {
+                non_satisfying_paths.push(path);
+            }
+        }
+    }
+
+    json!({
+        "kind": "file_change_content_evidence",
+        "owner": "tool_lifecycle_runtime",
+        "admission_source": "recorded_file_change_after_state",
+        "content_bearing": !content_bearing_change_ids.is_empty(),
+        "all_changes_content_bearing": !result.change_summaries.is_empty() && non_satisfying_change_ids.is_empty(),
+        "content_bearing_change_ids": content_bearing_change_ids,
+        "non_satisfying_change_ids": non_satisfying_change_ids,
+        "content_bearing_paths": content_bearing_paths,
+        "non_satisfying_paths": non_satisfying_paths,
+        "content_shape_contract_enforced": false,
+        "content_shape_violating_change_ids": [],
+        "content_shape_violating_paths": [],
+        "unreadable_text_after_state_change_ids": [],
+        "unreadable_text_after_state_paths": [],
+    })
+}
+
+fn metadata_with_file_change_admission(metadata: Value, evidence: Value) -> Value {
+    let mut object = match metadata {
+        Value::Object(map) => map,
+        other => {
+            let mut map = Map::new();
+            if !other.is_null() {
+                map.insert("tool_result_metadata".to_string(), other);
+            }
+            map
+        }
+    };
+    object.insert("file_change_content_evidence".to_string(), evidence);
+    Value::Object(object)
+}
+
+fn evidence_string_set(evidence: &Value, key: &str) -> BTreeSet<String> {
+    evidence
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn change_summary_has_content_bearing_after_state(
+    change: &crate::edit::ChangeSummary,
+    workspace_root: &Utf8Path,
+) -> bool {
+    if matches!(change.kind, crate::session::ChangeKind::Delete) {
+        return false;
+    }
+    let Some(path_after) = change.path_after.as_ref() else {
+        return false;
+    };
+    let absolute = resolve_change_path(path_after, workspace_root);
+    std::fs::metadata(absolute.as_std_path())
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+fn resolve_change_path(path: &Utf8Path, workspace_root: &Utf8Path) -> Utf8PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    }
+}
+
+fn render_change_path(path: &Utf8Path, workspace_root: &Utf8Path) -> String {
+    crate::workspace::project::workspace_relative_key_for_match(
+        path.as_str(),
+        workspace_root.as_str(),
+    )
+    .filter(|relative| !relative.is_empty())
+    .unwrap_or_else(|| path.as_str().replace('\\', "/"))
 }
 
 fn content_satisfying_change_summaries_for_protocol(
@@ -2425,7 +3151,7 @@ pub(crate) fn rejected_tool_no_progress_key(
     let _ = effective_arguments_json;
     let required_action_projection = required_action
         .map(RequiredAction::projection_label)
-        .unwrap_or("none");
+        .unwrap_or_else(|| "none".to_string());
     format!(
         "rejected_tool|tool={}|allowed={}|choice={}|required_action={required_action_projection}",
         effective_tool_name,
@@ -2447,7 +3173,7 @@ pub(crate) fn rejected_tool_no_progress_terminal_message(
     let allowed = allowed_tools.iter().cloned().collect::<Vec<_>>().join(", ");
     let required = required_action
         .map(RequiredAction::projection_label)
-        .map(str::trim)
+        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(|value| format!(" Required action: {value}."))
         .unwrap_or_default();
@@ -2458,18 +3184,7 @@ pub(crate) fn rejected_tool_no_progress_terminal_message(
 }
 
 fn fixture_required_edit_action(tool: ToolName, target: &str) -> RequiredAction {
-    let prefix = match tool {
-        ToolName::ApplyPatch => "apply_patch",
-        ToolName::Write => "write",
-        _ => "edit",
-    };
-    RequiredAction {
-        kind: crate::protocol::RequiredActionKind::EditTarget,
-        tool,
-        target: Some(Utf8PathBuf::from(target)),
-        command: None,
-        projection_text: format!("{prefix}:{target}"),
-    }
+    RequiredAction::edit(tool, Utf8PathBuf::from(target))
 }
 
 pub(crate) fn executed_tool_failure_no_progress_key(
@@ -2523,6 +3238,9 @@ fn canonical_shell_command_keys(command: &str) -> BTreeSet<String> {
     if let Some(key) = canonical_verification_command_identity_key(command) {
         keys.insert(key);
     }
+    if let Some(key) = literal_verification_command_identity_key(command) {
+        keys.insert(key);
+    }
     keys
 }
 
@@ -2558,6 +3276,82 @@ fn canonical_required_verification_commands(required_commands: &[String]) -> Vec
         }
     }
     commands
+}
+
+fn required_verification_command_identity_keys(command: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    if let Some(key) = canonical_verification_command_identity_key(command) {
+        keys.insert(key);
+    }
+    if let Some(key) = literal_verification_command_identity_key(command) {
+        keys.insert(key);
+    }
+    keys
+}
+
+fn literal_verification_command_identity_key(command: &str) -> Option<String> {
+    let normalized = normalize_shell_command_identity_text(command);
+    (!normalized.is_empty()).then(|| {
+        format!(
+            "literal:{}",
+            crate::harness::artifact::hash_bytes(normalized.as_bytes())
+        )
+    })
+}
+
+fn normalize_shell_command_identity_text(command: &str) -> String {
+    let unwrapped = strip_shell_encoding_prelude(command.trim());
+    unwrapped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn strip_shell_encoding_prelude(command: &str) -> &str {
+    let mut remaining = command.trim_start();
+    loop {
+        let before = remaining;
+        for prefix in [
+            "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new();",
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new();",
+            "$env:LANG='C.UTF-8';",
+            "$env:LC_ALL='C.UTF-8';",
+            "$env:PYTHONUTF8='1';",
+            "$env:PYTHONIOENCODING='utf-8';",
+            "LC_ALL=C.UTF-8",
+            "LANG=C.UTF-8",
+            "PYTHONUTF8=1",
+            "PYTHONIOENCODING=utf-8",
+        ] {
+            if let Some(rest) = remaining.strip_prefix(prefix) {
+                remaining = rest.trim_start();
+            }
+        }
+        if before == remaining {
+            break;
+        }
+    }
+    remaining
+}
+
+fn submitted_matches_executable_verification_form(
+    submitted: &str,
+    executable_commands: &[String],
+) -> bool {
+    let submitted_normalized = normalize_shell_command_text_for_exact_match(submitted);
+    !submitted_normalized.is_empty()
+        && executable_commands.iter().any(|command| {
+            normalize_shell_command_text_for_exact_match(command) == submitted_normalized
+        })
+}
+
+fn normalize_shell_command_text_for_exact_match(command: &str) -> String {
+    command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn executable_verification_command_forms(
@@ -2735,6 +3529,33 @@ fn apply_patch_declared_targets(patch_text: &str) -> BTreeSet<String> {
     targets
 }
 
+fn project_apply_patch_declared_targets_to_active_target(
+    patch_text: &str,
+    active_target: &str,
+) -> Option<String> {
+    let mut changed = false;
+    let mut lines = Vec::new();
+    for line in patch_text.lines() {
+        let mut projected_line = None;
+        for marker in [
+            "*** Add File: ",
+            "*** Update File: ",
+            "*** Delete File: ",
+            "*** Move to: ",
+        ] {
+            if let Some(target) = line.strip_prefix(marker)
+                && !target.trim().is_empty()
+            {
+                projected_line = Some(format!("{marker}{active_target}"));
+                changed = true;
+                break;
+            }
+        }
+        lines.push(projected_line.unwrap_or_else(|| line.to_string()));
+    }
+    changed.then(|| lines.join("\n"))
+}
+
 fn wrong_authoring_target_key(
     effective_tool_name: &str,
     parsed_arguments: &Value,
@@ -2856,9 +3677,9 @@ fn authoring_target_grounding_required_terminal_message(
         .and_then(Value::as_str)
         .unwrap_or("<unknown>");
     let submitted_normalized = normalize_target_key(submitted);
-    let submitted_consumed = consumed_targets.iter().any(|target| {
-        submitted_normalized == *target || submitted_normalized.ends_with(&format!("/{target}"))
-    });
+    let submitted_consumed = consumed_targets
+        .iter()
+        .any(|target| target_key_family_matches_exactly(&submitted_normalized, target));
     let proposal_kind = if submitted_consumed {
         "consumed active target read proposals"
     } else {
@@ -2914,20 +3735,34 @@ fn operation_non_content_no_progress_key(
         .or_else(|| metadata.get("operation_progress_class"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let result_hash = if docs_route_semantic_operation_no_progress(state, progress_class) {
+    let repair_control_no_progress = repair_supporting_context_budget_applies_for_metadata(
+        progress_class,
+        metadata,
+        state,
+        true,
+    );
+    let result_hash = if docs_route_semantic_operation_no_progress(state, progress_class)
+        || repair_control_no_progress
+    {
         None
     } else {
         tool_result_result_hash(metadata)
     };
-    let tool_name = if docs_route_semantic_operation_no_progress(state, progress_class) {
-        "docs_route_supporting_context"
+    let tool_name = if repair_control_no_progress {
+        operation_feedback_obligation_identity(metadata)
+            .map(|identity| format!("verification_repair_supporting_context|{identity}"))
+            .unwrap_or_else(|| {
+                "verification_repair_supporting_context|obligation_identity=missing".to_string()
+            })
+    } else if docs_route_semantic_operation_no_progress(state, progress_class) {
+        "docs_route_supporting_context".to_string()
     } else {
-        effective_tool_name
+        effective_tool_name.to_string()
     };
     format!(
         "operation_intent=content_changing_authoring_required|progress_class={progress_class}|{}",
         progress_projection_no_progress_key(
-            tool_name,
+            &tool_name,
             state,
             allowed_tools,
             tool_choice,
@@ -2960,7 +3795,16 @@ fn operation_non_content_no_progress_under_open_authoring(
     operation_intent == Some(OperationIntent::ContentChangingAuthoringRequired.as_str())
         && matches!(
             progress_class,
-            Some("supporting_context" | "no_progress" | "docs_spec_semantic_reconciliation_failed")
+            Some(
+                "supporting_context"
+                    | "no_progress"
+                    | "required_write_content_shape_mismatch"
+                    | "artifact_content_shape_violation"
+                    | "idempotent_file_write_no_progress"
+                    | "empty_artifact_no_progress"
+                    | "artifact_content_shape_no_progress"
+                    | "docs_spec_semantic_reconciliation_failed",
+            )
         )
 }
 
@@ -3019,6 +3863,18 @@ fn docs_route_semantic_operation_no_progress(
         )
 }
 
+fn should_terminalize_operation_non_content_no_progress_for_metadata(
+    progress_count: usize,
+    metadata: &Value,
+    state: &SessionStateSnapshot,
+) -> bool {
+    if operation_progress_class_from_metadata(metadata) == Some("idempotent_file_write_no_progress")
+    {
+        return progress_count >= OPERATION_NON_CONTENT_NO_PROGRESS_TERMINAL_THRESHOLD;
+    }
+    should_terminalize_operation_non_content_no_progress_for_state(progress_count, state)
+}
+
 fn should_terminalize_operation_non_content_no_progress_for_state(
     progress_count: usize,
     state: &SessionStateSnapshot,
@@ -3047,12 +3903,21 @@ fn repair_supporting_context_budget_applies(
     state: &SessionStateSnapshot,
     open_authoring_required: bool,
 ) -> bool {
-    state.route != TaskRoute::Docs
-        && open_authoring_required
+    open_authoring_required
         && state.process_phase == crate::session::ProcessPhase::Repair
         && state.completion.verification_pending
         && !state.active_targets.is_empty()
         && progress_class == "supporting_context"
+}
+
+fn repair_supporting_context_budget_applies_for_metadata(
+    progress_class: &str,
+    metadata: &Value,
+    state: &SessionStateSnapshot,
+    open_authoring_required: bool,
+) -> bool {
+    repair_supporting_context_budget_applies(progress_class, state, open_authoring_required)
+        && operation_feedback_obligation_identity(metadata).is_some()
 }
 
 fn repair_supporting_context_budget_exhausts_for_metadata(
@@ -3060,23 +3925,50 @@ fn repair_supporting_context_budget_exhausts_for_metadata(
     metadata: &Value,
     state: &SessionStateSnapshot,
 ) -> bool {
-    effective_tool_name == "read" && metadata_path_matches_active_target(metadata, state)
+    verification_supporting_context_tool_name(effective_tool_name)
+        && state.process_phase == crate::session::ProcessPhase::Repair
+        && state.completion.verification_pending
+        && !state.active_targets.is_empty()
+        && (effective_tool_name != "read"
+            || metadata_path_matches_repair_obligation(metadata, state))
 }
 
-fn metadata_path_matches_active_target(metadata: &Value, state: &SessionStateSnapshot) -> bool {
+fn metadata_path_matches_repair_obligation(metadata: &Value, state: &SessionStateSnapshot) -> bool {
     let Some(path) = metadata.get("path").and_then(Value::as_str) else {
         return false;
     };
     let normalized_path = normalize_path_for_target_match(path);
-    state.active_targets.iter().any(|target| {
-        let normalized_target = normalize_path_for_target_match(target.as_str());
-        normalized_path == normalized_target
-            || normalized_path.ends_with(&format!("/{normalized_target}"))
-    })
+    if normalized_path.is_empty() {
+        return false;
+    }
+    let target_matches = state
+        .active_targets
+        .iter()
+        .any(|target| target_key_family_matches_exactly(&normalized_path, target.as_str()));
+    if target_matches {
+        return true;
+    }
+    state
+        .verification
+        .failure_cluster
+        .as_ref()
+        .is_some_and(|cluster| {
+            cluster
+                .source_refs
+                .iter()
+                .chain(cluster.test_refs.iter())
+                .any(|target| target_key_family_matches_exactly(&normalized_path, target))
+        })
 }
 
 fn normalize_path_for_target_match(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
+fn target_key_family_matches_exactly(candidate: &str, authority: &str) -> bool {
+    let candidate = normalize_path_for_target_match(candidate);
+    let authority = normalize_path_for_target_match(authority);
+    !candidate.is_empty() && !authority.is_empty() && candidate == authority
 }
 
 fn operation_non_content_no_progress_terminal_message(
@@ -3093,6 +3985,11 @@ fn operation_non_content_no_progress_terminal_message(
         .collect::<Vec<_>>()
         .join(", ");
     if state.route == TaskRoute::Docs && state.completion.route_contract_pending {
+        if progress_class == "idempotent_file_write_no_progress" {
+            return format!(
+                "Tool `{tool_name}` returned an idempotent file write with no content changes {progress_count} time(s) while docs authoring is required. Runtime stopped before allowing repeated equivalent writes to stand in for closeout or fresh artifact progress. Close the satisfied docs item or make a content-changing edit for open targets: {targets}."
+            );
+        }
         format!(
             "Tool `{tool_name}` returned `{progress_class}` output {progress_count} time(s) while docs authoring is required. Runtime stopped before allowing more no-progress docs-route turns to grow provider history. Use write/apply_patch for one pending docs deliverable, remove contradictory docs/spec claims, and use `不明` for still-unconfirmed details. Open targets: {targets}."
         )
@@ -3137,11 +4034,9 @@ fn verification_supporting_context_no_progress_key(
     allowed_tools: &BTreeSet<String>,
     tool_choice: &ToolChoice,
 ) -> String {
-    let normalized_args = serde_json::from_str::<Value>(arguments_json)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|_| arguments_json.trim().to_string());
+    let _ = (effective_tool_name, arguments_json);
     format!(
-        "verification_supporting_context|tool={effective_tool_name}|args={normalized_args}|{}",
+        "verification_supporting_context|obligation={}",
         progress_projection_no_progress_key(
             "verification_supporting_context",
             state,
@@ -3365,16 +4260,17 @@ fn normalize_target_key(target: &str) -> String {
     crate::workspace::project::path_key_for_workspace_match(target)
 }
 
+pub(crate) fn tool_orchestrator_target_matching_exact_path_authority_fixture_passes() -> bool {
+    target_key_family_matches_exactly("src/workflow.rs", "src/workflow.rs")
+        && target_key_family_matches_exactly("./src/workflow.rs", "src/workflow.rs")
+        && !target_key_family_matches_exactly("archive/src/workflow.rs", "src/workflow.rs")
+        && !target_key_family_matches_exactly("tests/workflow.rs", "src/workflow.rs")
+        && !target_key_family_matches_exactly("C:/workspace/src/workflow.rs", "src/workflow.rs")
+        && !target_key_family_matches_exactly("C:/foreign/src/workflow.rs", "src/workflow.rs")
+}
+
 fn repair_admission_target_is_test_like(target: &str) -> bool {
-    let normalized = target.replace('\\', "/").to_ascii_lowercase();
-    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    file_name.starts_with("test_")
-        || file_name.ends_with("_test.py")
-        || file_name.ends_with(".test.ts")
-        || file_name.ends_with(".spec.ts")
-        || file_name.ends_with(".test.js")
-        || file_name.ends_with(".spec.js")
-        || normalized.contains("/tests/")
+    classify_language_artifact_target(target).role == ArtifactRole::Test
 }
 
 fn tool_error_class(error_text: &str) -> String {
@@ -3415,7 +4311,18 @@ pub(crate) fn open_authoring_operation_intent_classification_fixture_passes() ->
         tool_choice: Some("required"),
         control_projection: Some(json!({
             "operation_intents": ["content_changing_authoring_required"],
-            "allowed_tools": ["read", "todowrite", "write"]
+            "allowed_tools": ["read", "todowrite", "write"],
+            "obligation_ids": ["authoring-obligation-fixture"],
+            "contract_refs": [
+                "runtime-contract:tool-lifecycle",
+                "workflow-tool-lifecycle-contract",
+                "workflow-source-contract",
+                "workflow-generated-test-contract"
+            ],
+            "evidence_refs": [{
+                "source": "turn_control_envelope",
+                "reference": "authoring-obligation-fixture"
+            }]
         })),
         sandbox_decision: json!({
             "profile": "workspace_write",
@@ -3440,13 +4347,18 @@ pub(crate) fn open_authoring_operation_intent_classification_fixture_passes() ->
         change_summaries: Vec::new(),
     };
 
-    let active_targets = vec![Utf8PathBuf::from("test_source.py")];
+    let active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
     let read_metadata = with_active_targets_for_operation_feedback(
-        classify_executed_result_for_operation_intent(ToolName::Read, &read_result, &route),
+        classify_executed_result_for_operation_intent(ToolName::Read, &read_result, &route, None),
         &active_targets,
     );
     let todo_metadata = with_active_targets_for_operation_feedback(
-        classify_executed_result_for_operation_intent(ToolName::TodoWrite, &todo_result, &route),
+        classify_executed_result_for_operation_intent(
+            ToolName::TodoWrite,
+            &todo_result,
+            &route,
+            None,
+        ),
         &active_targets,
     );
     let read_output = render_provider_visible_operation_progress_feedback(
@@ -3467,6 +4379,22 @@ pub(crate) fn open_authoring_operation_intent_classification_fixture_passes() ->
             .and_then(Value::as_str)
             == Some("supporting_context")
         && read_metadata.get("progress_effect").and_then(Value::as_str) == Some("no_progress")
+        && read_metadata
+            .pointer("/tool_feedback_envelope/obligation_ids/0")
+            .and_then(Value::as_str)
+            == Some("authoring-obligation-fixture")
+        && read_metadata
+            .pointer("/tool_feedback_envelope/contract_refs/0")
+            .and_then(Value::as_str)
+            == Some("runtime-contract:tool-lifecycle")
+        && read_metadata
+            .pointer("/tool_feedback_envelope/contract_refs/1")
+            .and_then(Value::as_str)
+            == Some("workflow-tool-lifecycle-contract")
+        && read_metadata
+            .pointer("/tool_feedback_envelope/evidence_refs/0/reference")
+            .and_then(Value::as_str)
+            == Some("authoring-obligation-fixture")
         && todo_metadata
             .get("operation_progress_class")
             .and_then(Value::as_str)
@@ -3474,15 +4402,426 @@ pub(crate) fn open_authoring_operation_intent_classification_fixture_passes() ->
         && todo_metadata.get("progress_effect").and_then(Value::as_str) == Some("no_progress")
         && read_output.contains("[tool feedback]")
         && read_output.contains("supporting_context")
-        && read_output.contains("active_targets: test_source.py")
+        && read_output.contains("active_targets: tests/workflow.spec.ts")
+        && read_output.contains("obligation_identity: obligations:authoring-obligation-fixture")
         && read_output.contains("file-changing tool output")
         && todo_output.contains("[tool feedback]")
         && todo_output.contains("progress_projection")
-        && todo_output.contains("active_targets: test_source.py")
+        && todo_output.contains("active_targets: tests/workflow.spec.ts")
         && todo_output.contains("file-changing tool output")
 }
 
+pub(crate) fn no_content_apply_patch_metadata_projects_idempotent_no_progress_fixture_passes()
+-> bool {
+    let allowed = BTreeSet::from(["apply_patch".to_string(), "read".to_string()]);
+    let route = ToolLifecycleRuntime::route_adjudicated_call(ToolRouteRequest {
+        requested_tool: "apply_patch".to_string(),
+        effective_tool: "apply_patch".to_string(),
+        record_tool: "apply_patch".to_string(),
+        original_arguments_json: serde_json::to_string(&json!({
+            "patch_text": "*** Begin Patch\n*** Update File: docs/workflow-design.md\n@@\n-# Workflow Design\n+# Workflow Design\n*** End Patch"
+        }))
+        .unwrap_or_default(),
+        effective_arguments_json: serde_json::to_string(&json!({
+            "patch_text": "*** Begin Patch\n*** Update File: docs/workflow-design.md\n@@\n-# Workflow Design\n+# Workflow Design\n*** End Patch"
+        }))
+        .unwrap_or_default(),
+        allowed_tool_names: &allowed,
+        tool_exists: true,
+        tool_allowed: true,
+        redirected_from_arguments_json: None,
+        redirect_reason: None,
+        tool_choice: Some("required"),
+        control_projection: Some(json!({
+            "allowed_tools": ["apply_patch", "read"],
+            "operation_intents": ["content_changing_authoring_required"],
+            "required_action": {
+                "kind": "edit_target",
+                "tool": "apply_patch",
+                "target": "docs/workflow-design.md"
+            }
+        })),
+        sandbox_decision: json!({
+            "profile": "workspace_write",
+            "network_allowed": false,
+            "escalated": false
+        }),
+    });
+    let result = ToolResult {
+        title: "No content changes made by apply_patch".to_string(),
+        output_text: "apply_patch made no content changes to `docs/workflow-design.md`. No file-change evidence was produced; submit a patch with actual content changes or leave the file unchanged.".to_string(),
+        metadata: json!({
+            "no_content_change": true,
+            "path": "docs/workflow-design.md",
+            "success": false,
+            "progress_effect": "no_progress",
+            "tool_feedback_envelope": {
+                "success": false,
+                "progress_effect": "no_progress",
+                "tool": "apply_patch",
+                "target": "docs/workflow-design.md",
+                "side_effects_applied": false
+            }
+        }),
+        truncated_output_path: None,
+        recorded_changes: Vec::new(),
+        change_summaries: Vec::new(),
+    };
+    let active_targets = vec![Utf8PathBuf::from("docs/workflow-design.md")];
+    let metadata = with_active_targets_for_operation_feedback(
+        route.completion_metadata(classify_executed_result_for_operation_intent(
+            ToolName::ApplyPatch,
+            &result,
+            &route,
+            None,
+        )),
+        &active_targets,
+    );
+    let provider_output =
+        render_provider_visible_operation_progress_feedback(&result.output_text, &metadata);
+
+    metadata.get("success").and_then(Value::as_bool) == Some(false)
+        && metadata
+            .get("operation_progress_class")
+            .and_then(Value::as_str)
+            == Some("idempotent_file_write_no_progress")
+        && metadata.get("progress_effect").and_then(Value::as_str) == Some("no_progress")
+        && metadata
+            .pointer("/tool_feedback_envelope/operation_progress_class")
+            .and_then(Value::as_str)
+            == Some("idempotent_file_write_no_progress")
+        && metadata
+            .pointer("/tool_feedback_envelope/side_effects_applied")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && metadata
+            .pointer("/tool_feedback_envelope/required_action_projection")
+            .and_then(Value::as_str)
+            == Some("apply_patch:docs/workflow-design.md")
+        && provider_output.contains("[tool feedback]")
+        && provider_output.contains("idempotent_file_write_no_progress")
+        && provider_output.contains("produced no content change")
+        && provider_output.contains("active_targets: docs/workflow-design.md")
+        && provider_output.contains("required_action: apply_patch:docs/workflow-design.md")
+        && matches!(
+            tool_progress_effect_from_metadata(&metadata),
+            ToolProgressEffect::NoProgress
+        )
+}
+
+pub(crate) fn wrong_authoring_target_feedback_projects_current_action_fixture_passes() -> bool {
+    let active = ActiveWorkContract::RequestedWorkAuthoring {
+        pending_targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
+        verification_commands: vec!["verify-generated-test --contract".to_string()],
+    };
+    let allowed = BTreeSet::from(["apply_patch".to_string(), "read".to_string()]);
+    let Some(result) = ToolLifecycleRuntime::wrong_authoring_target_result(
+        "apply_patch",
+        &json!({
+            "patch_text": "*** Begin Patch\n*** Add File: src/workflow.rs\n+workflow-tool-lifecycle-contract\n+workflow_source_contract\n*** End Patch"
+        }),
+        Some(&active),
+        Utf8Path::new("C:/workspace"),
+        &allowed,
+    ) else {
+        return false;
+    };
+    let route = ToolLifecycleRuntime::route_adjudicated_call(ToolRouteRequest {
+        requested_tool: "apply_patch".to_string(),
+        effective_tool: "apply_patch".to_string(),
+        record_tool: "apply_patch".to_string(),
+        original_arguments_json: r#"{"patch_text":"*** Begin Patch\n*** Add File: src/workflow.rs\n+workflow-tool-lifecycle-contract\n+workflow_source_contract\n*** End Patch"}"#.to_string(),
+        effective_arguments_json: r#"{"patch_text":"*** Begin Patch\n*** Add File: src/workflow.rs\n+workflow-tool-lifecycle-contract\n+workflow_source_contract\n*** End Patch"}"#.to_string(),
+        allowed_tool_names: &allowed,
+        tool_exists: true,
+        tool_allowed: true,
+        redirected_from_arguments_json: None,
+        redirect_reason: None,
+        tool_choice: Some("required"),
+        control_projection: Some(json!({
+            "allowed_tools": ["apply_patch", "read"],
+            "operation_intents": ["content_changing_authoring_required"],
+            "required_action": {
+                "kind": "edit_target",
+                "tool": "apply_patch",
+                "target": "tests/workflow.spec.ts"
+            }
+        })),
+        sandbox_decision: json!({
+            "profile": "workspace_write",
+            "network_allowed": false,
+            "escalated": false
+        }),
+    });
+    let metadata = route.completion_metadata(result.metadata.clone());
+    let provider_output =
+        render_provider_visible_operation_progress_feedback(&result.output_text, &metadata);
+
+    provider_output.starts_with("[tool feedback]\n")
+        && provider_output.contains("operation_progress_class: wrong_authoring_target")
+        && provider_output.contains("active_targets: tests/workflow.spec.ts")
+        && provider_output.contains("required_action: apply_patch:tests/workflow.spec.ts")
+        && provider_output.contains("*** Add File: tests/workflow.spec.ts")
+        && provider_output.contains("*** Update File: tests/workflow.spec.ts")
+        && provider_output.contains("submitted_targets: src/workflow.rs")
+        && provider_output.contains("historical failed-call evidence only")
+        && !provider_output.contains("required_action: apply_patch:src/workflow.rs")
+        && metadata
+            .pointer("/tool_feedback_envelope/required_action_projection")
+            .and_then(Value::as_str)
+            == Some("apply_patch:tests/workflow.spec.ts")
+}
+
+pub(crate) fn exact_write_wrong_path_content_shape_uses_active_target_fixture_passes() -> bool {
+    let active = ActiveWorkContract::RequestedWorkAuthoring {
+        pending_targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
+        verification_commands: vec!["verify-generated-test --contract".to_string()],
+    };
+    let allowed = BTreeSet::from(["write".to_string()]);
+    let source_payload =
+        "workflow-tool-lifecycle-contract\nworkflow_source_contract\nworkflow_state.ready = true\n";
+    let Some(decision) = ToolLifecycleRuntime::classify_pre_execution_corrective_result(
+        PreExecutionCorrectiveInput {
+            effective_tool_name: "write",
+            parsed_arguments: &json!({
+                "path": "src/workflow.rs",
+                "content": source_payload
+            }),
+            active_work: Some(&active),
+            state: &SessionStateSnapshot {
+                route: TaskRoute::Code,
+                process_phase: crate::session::ProcessPhase::Author,
+                active_targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
+                ..SessionStateSnapshot::default()
+            },
+            workspace_root: Utf8Path::new("C:/workspace"),
+            workspace_cwd: None,
+            allowed_tools: &allowed,
+            history_items: &[],
+            shell_family: crate::config::ShellFamily::PowerShell,
+        },
+    ) else {
+        return false;
+    };
+    let passes = decision.kind == PreExecutionCorrectiveKind::ArtifactContentShapeViolation
+        && decision.result.title == "Required write content shape mismatch"
+        && decision
+            .result
+            .metadata
+            .get("target")
+            .and_then(Value::as_str)
+            == Some("tests/workflow.spec.ts")
+        && decision
+            .result
+            .metadata
+            .pointer("/tool_feedback_envelope/content_shape_contract/kind")
+            .and_then(Value::as_str)
+            == Some("generic_code_artifact_effective_content_shape")
+        && decision
+            .result
+            .output_text
+            .contains("tests/workflow.spec.ts")
+        && decision
+            .result
+            .metadata
+            .pointer("/tool_feedback_envelope/required_action_projection")
+            .and_then(Value::as_str)
+            == Some("write:tests/workflow.spec.ts")
+        && decision
+            .result
+            .metadata
+            .pointer("/tool_feedback_envelope/current_operation_template")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("tests/workflow.spec.ts"))
+        && decision
+            .result
+            .metadata
+            .pointer("/tool_feedback_envelope/submitted_targets/0")
+            .and_then(Value::as_str)
+            == Some("src/workflow.rs")
+        && decision
+            .result
+            .output_text
+            .contains("Required positive code artifact shape:");
+    passes
+}
+
+pub(crate) fn exact_apply_patch_wrong_path_content_shape_uses_active_target_fixture_passes() -> bool
+{
+    let active = ActiveWorkContract::RequestedWorkAuthoring {
+        pending_targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
+        verification_commands: vec!["verify-generated-test --contract".to_string()],
+    };
+    let allowed = BTreeSet::from(["apply_patch".to_string(), "read".to_string()]);
+    let Some(decision) = ToolLifecycleRuntime::classify_pre_execution_corrective_result(
+        PreExecutionCorrectiveInput {
+            effective_tool_name: "apply_patch",
+            parsed_arguments: &json!({
+                "patch_text": "*** Begin Patch\n*** Add File: src/workflow.rs\n+workflow-tool-lifecycle-contract\n+workflow_source_contract\n+workflow_state.ready = true\n*** End Patch"
+            }),
+            active_work: Some(&active),
+            state: &SessionStateSnapshot {
+                route: TaskRoute::Code,
+                process_phase: crate::session::ProcessPhase::Author,
+                active_targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
+                ..SessionStateSnapshot::default()
+            },
+            workspace_root: Utf8Path::new("C:/workspace"),
+            workspace_cwd: None,
+            allowed_tools: &allowed,
+            history_items: &[],
+            shell_family: crate::config::ShellFamily::PowerShell,
+        },
+    ) else {
+        return false;
+    };
+    decision.kind == PreExecutionCorrectiveKind::WrongAuthoringTarget
+        && decision.result.title == "Wrong authoring target"
+        && decision
+            .result
+            .output_text
+            .contains("tests/workflow.spec.ts")
+        && decision.result.output_text.contains("src/workflow.rs")
+        && decision
+            .result
+            .metadata
+            .pointer("/tool_feedback_envelope/required_action_projection")
+            .and_then(Value::as_str)
+            == Some("apply_patch:tests/workflow.spec.ts")
+        && decision
+            .result
+            .metadata
+            .pointer("/tool_feedback_envelope/current_operation_template")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("*** Add File: tests/workflow.spec.ts"))
+        && decision
+            .result
+            .metadata
+            .pointer("/tool_feedback_envelope/operation_progress_class")
+            .and_then(Value::as_str)
+            == Some("wrong_authoring_target")
+        && decision
+            .result
+            .metadata
+            .pointer("/tool_feedback_envelope/submitted_targets/0")
+            .and_then(Value::as_str)
+            == Some("src/workflow.rs")
+}
+
+pub(crate) fn content_shape_mismatch_feedback_projects_current_action_fixture_passes() -> bool {
+    let active = ActiveWorkContract::RequestedWorkAuthoring {
+        pending_targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
+        verification_commands: vec!["verify-generated-test --contract".to_string()],
+    };
+    let allowed = BTreeSet::from(["write".to_string()]);
+    let source_payload =
+        "workflow-tool-lifecycle-contract\nworkflow_source_contract\nworkflow_state.ready = true\n";
+    let Some(decision) = ToolLifecycleRuntime::classify_pre_execution_corrective_result(
+        PreExecutionCorrectiveInput {
+            effective_tool_name: "write",
+            parsed_arguments: &json!({
+                "path": "src/workflow.rs",
+                "content": source_payload
+            }),
+            active_work: Some(&active),
+            state: &SessionStateSnapshot {
+                route: TaskRoute::Code,
+                process_phase: crate::session::ProcessPhase::Author,
+                active_targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
+                ..SessionStateSnapshot::default()
+            },
+            workspace_root: Utf8Path::new("C:/workspace"),
+            workspace_cwd: None,
+            allowed_tools: &allowed,
+            history_items: &[],
+            shell_family: crate::config::ShellFamily::PowerShell,
+        },
+    ) else {
+        return false;
+    };
+    let route = ToolLifecycleRuntime::route_adjudicated_call(ToolRouteRequest {
+        requested_tool: "write".to_string(),
+        effective_tool: "write".to_string(),
+        record_tool: "write".to_string(),
+        original_arguments_json: serde_json::to_string(&json!({
+            "path": "src/workflow.rs",
+            "content": source_payload
+        }))
+        .unwrap_or_default(),
+        effective_arguments_json: serde_json::to_string(&json!({
+            "path": "src/workflow.rs",
+            "content": source_payload
+        }))
+        .unwrap_or_default(),
+        allowed_tool_names: &allowed,
+        tool_exists: true,
+        tool_allowed: true,
+        redirected_from_arguments_json: None,
+        redirect_reason: None,
+        tool_choice: Some("required"),
+        control_projection: Some(json!({
+            "allowed_tools": ["write"],
+            "operation_intents": ["content_changing_authoring_required"],
+            "required_action": {
+                "kind": "edit_target",
+                "tool": "write",
+                "target": "tests/workflow.spec.ts"
+            }
+        })),
+        sandbox_decision: json!({
+            "profile": "workspace_write",
+            "network_allowed": false,
+            "escalated": false
+        }),
+    });
+    let metadata = route.completion_metadata(decision.result.metadata.clone());
+    let provider_output = render_provider_visible_operation_progress_feedback(
+        &decision.result.output_text,
+        &metadata,
+    );
+
+    provider_output.contains("[tool feedback]")
+        && provider_output
+            .contains("operation_progress_class: required_write_content_shape_mismatch")
+        && provider_output.contains("progress_effect: no_progress")
+        && provider_output.contains("active_targets: tests/workflow.spec.ts")
+        && provider_output.contains("required_action: write:tests/workflow.spec.ts")
+        && provider_output.contains(
+            "current_operation_template: write the content directly to `tests/workflow.spec.ts`",
+        )
+        && provider_output.contains("submitted_targets: src/workflow.rs")
+        && provider_output.contains("Required positive code artifact shape:")
+        && metadata
+            .pointer("/tool_feedback_envelope/required_action_projection")
+            .and_then(Value::as_str)
+            == Some("write:tests/workflow.spec.ts")
+        && metadata
+            .pointer("/tool_feedback_envelope/current_operation_template")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("tests/workflow.spec.ts"))
+        && metadata
+            .pointer("/tool_feedback_envelope/submitted_targets/0")
+            .and_then(Value::as_str)
+            == Some("src/workflow.rs")
+}
+
 pub(crate) fn empty_file_change_is_not_authoring_progress_fixture_passes() -> bool {
+    let temp = match tempfile::tempdir() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap_or_default();
+    if root.as_str().is_empty() {
+        return false;
+    }
+    let tests_dir = root.join("tests");
+    if std::fs::create_dir_all(tests_dir.as_std_path()).is_err() {
+        return false;
+    }
+    let target = tests_dir.join("workflow.spec.ts");
+    if std::fs::write(target.as_std_path(), "").is_err() {
+        return false;
+    }
     let allowed = BTreeSet::from([
         "apply_patch".to_string(),
         "shell".to_string(),
@@ -3493,9 +4832,11 @@ pub(crate) fn empty_file_change_is_not_authoring_progress_fixture_passes() -> bo
         effective_tool: "shell".to_string(),
         record_tool: "shell".to_string(),
         original_arguments_json:
-            r#"{"command":"New-Item -Path test_component.py -ItemType File -Force"}"#.to_string(),
+            r#"{"command":"New-Item -Path tests/workflow.spec.ts -ItemType File -Force"}"#
+                .to_string(),
         effective_arguments_json:
-            r#"{"command":"New-Item -Path test_component.py -ItemType File -Force"}"#.to_string(),
+            r#"{"command":"New-Item -Path tests/workflow.spec.ts -ItemType File -Force"}"#
+                .to_string(),
         allowed_tool_names: &allowed,
         tool_exists: true,
         tool_allowed: true,
@@ -3515,19 +4856,10 @@ pub(crate) fn empty_file_change_is_not_authoring_progress_fixture_passes() -> bo
     let change_id = crate::session::ChangeId::new();
     let result = ToolResult {
         title: "Create empty file".to_string(),
-        output_text: "Length 0 test_component.py".to_string(),
+        output_text: "Length 0 tests/workflow.spec.ts".to_string(),
         metadata: json!({
             "success": true,
             "changed_files": [change_id],
-            "file_change_content_evidence": {
-                "kind": "file_change_content_evidence",
-                "content_bearing": false,
-                "all_changes_content_bearing": false,
-                "content_bearing_change_ids": [],
-                "non_satisfying_change_ids": [change_id.to_string()],
-                "content_bearing_paths": [],
-                "non_satisfying_paths": ["test_component.py"]
-            }
         }),
         truncated_output_path: None,
         recorded_changes: vec![change_id],
@@ -3535,12 +4867,17 @@ pub(crate) fn empty_file_change_is_not_authoring_progress_fixture_passes() -> bo
             change_id,
             kind: crate::session::ChangeKind::Add,
             path_before: None,
-            path_after: Some(Utf8PathBuf::from("test_component.py")),
+            path_after: Some(Utf8PathBuf::from("tests/workflow.spec.ts")),
         }],
     };
-    let active_targets = vec![Utf8PathBuf::from("test_component.py")];
+    let active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
     let metadata = with_active_targets_for_operation_feedback(
-        classify_executed_result_for_operation_intent(ToolName::Shell, &result, &route),
+        classify_executed_result_for_operation_intent(
+            ToolName::Shell,
+            &result,
+            &route,
+            Some(root.as_path()),
+        ),
         &active_targets,
     );
     let provider_output =
@@ -3550,6 +4887,10 @@ pub(crate) fn empty_file_change_is_not_authoring_progress_fixture_passes() -> bo
         .get("operation_progress_class")
         .and_then(Value::as_str)
         == Some("empty_artifact_no_progress")
+        && metadata
+            .pointer("/file_change_content_evidence/owner")
+            .and_then(Value::as_str)
+            == Some("tool_lifecycle_runtime")
         && metadata.get("progress_effect").and_then(Value::as_str) == Some("no_progress")
         && metadata
             .pointer("/tool_feedback_envelope/side_effects_applied")
@@ -3558,11 +4899,375 @@ pub(crate) fn empty_file_change_is_not_authoring_progress_fixture_passes() -> bo
         && content_satisfying_change_summaries_for_protocol(&result, &metadata).is_empty()
         && provider_output.contains("empty_artifact_no_progress")
         && provider_output.contains("no content-bearing after-state")
-        && provider_output.contains("active_targets: test_component.py")
+        && provider_output.contains("active_targets: tests/workflow.spec.ts")
         && matches!(
             tool_progress_effect_from_metadata(&metadata),
             ToolProgressEffect::NoProgress
         )
+}
+
+pub(crate) fn empty_artifact_no_progress_terminal_guard_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = crate::session::ProcessPhase::Author;
+    state.completion.open_work_count = 1;
+    state.active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
+    let metadata = json!({
+        "operation_intent": "content_changing_authoring_required",
+        "operation_progress_class": "empty_artifact_no_progress",
+        "progress_effect": "no_progress",
+        "result_hash": "empty-artifact-fixture-hash",
+        "file_change_content_evidence": {
+            "kind": "file_change_content_evidence",
+            "owner": "tool_lifecycle_runtime",
+            "admission_source": "recorded_file_change_after_state",
+            "content_bearing": false,
+            "content_bearing_paths": [],
+            "non_satisfying_paths": ["src/workflow.rs"]
+        },
+        "tool_feedback_envelope": {
+            "kind": "operation_progress_classification",
+            "operation_intent": "content_changing_authoring_required",
+            "operation_progress_class": "empty_artifact_no_progress",
+            "progress_effect": "no_progress",
+            "side_effects_applied": true
+        }
+    });
+    let allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "shell".to_string(),
+        "write".to_string(),
+    ]);
+    let mut counts = BTreeMap::new();
+    let first = ToolLifecycleRuntime::record_operation_non_content_no_progress(
+        &mut counts,
+        "shell",
+        &metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+        true,
+    );
+    let second = ToolLifecycleRuntime::record_operation_non_content_no_progress(
+        &mut counts,
+        "shell",
+        &metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+        true,
+    );
+    let third = ToolLifecycleRuntime::record_operation_non_content_no_progress(
+        &mut counts,
+        "shell",
+        &metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+        true,
+    );
+
+    ToolLifecycleRuntime::operation_non_content_no_progress_under_open_authoring(&metadata, &state)
+        && first
+            .as_ref()
+            .is_some_and(|decision| decision.count == 1 && decision.terminal_message.is_none())
+        && second
+            .as_ref()
+            .is_some_and(|decision| decision.count == 2 && decision.terminal_message.is_none())
+        && third.as_ref().is_some_and(|decision| {
+            decision.count == OPERATION_NON_CONTENT_NO_PROGRESS_TERMINAL_THRESHOLD
+                && decision.terminal_message.as_deref().is_some_and(|message| {
+                    message.contains("empty_artifact_no_progress")
+                        && message.contains("content-changing authoring is required")
+                })
+        })
+}
+
+pub(crate) fn shell_file_change_content_shape_violation_is_no_progress_fixture_passes() -> bool {
+    let temp = match tempfile::tempdir() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap_or_default();
+    if root.as_str().is_empty() {
+        return false;
+    }
+    let src_dir = root.join("src");
+    if std::fs::create_dir_all(src_dir.as_std_path()).is_err() {
+        return false;
+    }
+    let target = src_dir.join("workflow.rs");
+    if std::fs::write(
+        target.as_std_path(),
+        "\\\"\\\"\\\"\\ninvalid escaped workflow source\\n",
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "shell".to_string(),
+        "write".to_string(),
+    ]);
+    let route = ToolLifecycleRuntime::route_adjudicated_call(ToolRouteRequest {
+        requested_tool: "shell".to_string(),
+        effective_tool: "shell".to_string(),
+        record_tool: "shell".to_string(),
+        original_arguments_json: r#"{"command":"Set-Content src/workflow.rs"}"#.to_string(),
+        effective_arguments_json: r#"{"command":"Set-Content src/workflow.rs"}"#.to_string(),
+        allowed_tool_names: &allowed,
+        tool_exists: true,
+        tool_allowed: true,
+        redirected_from_arguments_json: None,
+        redirect_reason: None,
+        tool_choice: Some("auto"),
+        control_projection: Some(json!({
+            "operation_intents": ["content_changing_authoring_required"],
+            "allowed_tools": ["apply_patch", "shell", "write"]
+        })),
+        sandbox_decision: json!({
+            "profile": "workspace_write",
+            "network_allowed": false,
+            "escalated": false
+        }),
+    });
+    let change_id = crate::session::ChangeId::new();
+    let result = ToolResult {
+        title: "Write escaped source through shell".to_string(),
+        output_text: "Updated src/workflow.rs".to_string(),
+        metadata: json!({
+            "success": true,
+            "changed_files": [change_id],
+        }),
+        truncated_output_path: None,
+        recorded_changes: vec![change_id],
+        change_summaries: vec![crate::edit::ChangeSummary {
+            change_id,
+            kind: crate::session::ChangeKind::Update,
+            path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+            path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+        }],
+    };
+    let active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
+    let metadata = with_active_targets_for_operation_feedback(
+        classify_executed_result_for_operation_intent(
+            ToolName::Shell,
+            &result,
+            &route,
+            Some(root.as_path()),
+        ),
+        &active_targets,
+    );
+    let provider_output =
+        render_provider_visible_operation_progress_feedback(&result.output_text, &metadata);
+
+    metadata
+        .get("operation_progress_class")
+        .and_then(Value::as_str)
+        == Some("artifact_content_shape_no_progress")
+        && metadata
+            .pointer("/tool_feedback_envelope/kind")
+            .and_then(Value::as_str)
+            == Some("artifact_content_shape_no_progress")
+        && metadata.get("progress_effect").and_then(Value::as_str) == Some("no_progress")
+        && metadata
+            .pointer("/file_change_content_evidence/content_bearing")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && metadata
+            .pointer("/file_change_content_evidence/owner")
+            .and_then(Value::as_str)
+            == Some("tool_lifecycle_runtime")
+        && metadata
+            .pointer("/file_change_content_evidence/content_shape_violating_paths")
+            .and_then(Value::as_array)
+            .is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str() == Some("src/workflow.rs"))
+            })
+        && content_satisfying_change_summaries_for_protocol(&result, &metadata).is_empty()
+        && provider_output.contains("artifact_content_shape_no_progress")
+        && provider_output.contains("content-shape contract")
+        && provider_output.contains("active_targets: src/workflow.rs")
+        && matches!(
+            tool_progress_effect_from_metadata(&metadata),
+            ToolProgressEffect::NoProgress
+        )
+}
+
+pub(crate) fn file_change_non_utf8_after_state_is_content_shape_no_progress_fixture_passes() -> bool
+{
+    let temp = match tempfile::tempdir() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap_or_default();
+    if root.as_str().is_empty() {
+        return false;
+    }
+    let tests_dir = root.join("tests");
+    if std::fs::create_dir_all(tests_dir.as_std_path()).is_err() {
+        return false;
+    }
+    let target = tests_dir.join("workflow.spec.ts");
+    if std::fs::write(target.as_std_path(), [0xff, 0xfe, 0x00, 0x7b]).is_err() {
+        return false;
+    }
+    let allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "shell".to_string(),
+        "write".to_string(),
+    ]);
+    let route = ToolLifecycleRuntime::route_adjudicated_call(ToolRouteRequest {
+        requested_tool: "shell".to_string(),
+        effective_tool: "shell".to_string(),
+        record_tool: "shell".to_string(),
+        original_arguments_json:
+            r#"{"command":"Set-Content tests/workflow.spec.ts -Encoding Byte"}"#.to_string(),
+        effective_arguments_json:
+            r#"{"command":"Set-Content tests/workflow.spec.ts -Encoding Byte"}"#.to_string(),
+        allowed_tool_names: &allowed,
+        tool_exists: true,
+        tool_allowed: true,
+        redirected_from_arguments_json: None,
+        redirect_reason: None,
+        tool_choice: Some("auto"),
+        control_projection: Some(json!({
+            "operation_intents": ["content_changing_authoring_required"],
+            "allowed_tools": ["apply_patch", "shell", "write"]
+        })),
+        sandbox_decision: json!({
+            "profile": "workspace_write",
+            "network_allowed": false,
+            "escalated": false
+        }),
+    });
+    let change_id = crate::session::ChangeId::new();
+    let result = ToolResult {
+        title: "Write non UTF-8 test through shell".to_string(),
+        output_text: "Updated tests/workflow.spec.ts".to_string(),
+        metadata: json!({
+            "success": true,
+            "changed_files": [change_id],
+        }),
+        truncated_output_path: None,
+        recorded_changes: vec![change_id],
+        change_summaries: vec![crate::edit::ChangeSummary {
+            change_id,
+            kind: crate::session::ChangeKind::Update,
+            path_before: Some(Utf8PathBuf::from("tests/workflow.spec.ts")),
+            path_after: Some(Utf8PathBuf::from("tests/workflow.spec.ts")),
+        }],
+    };
+    let active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    let metadata = with_active_targets_for_operation_feedback(
+        classify_executed_result_for_operation_intent(
+            ToolName::Shell,
+            &result,
+            &route,
+            Some(root.as_path()),
+        ),
+        &active_targets,
+    );
+    let provider_output =
+        render_provider_visible_operation_progress_feedback(&result.output_text, &metadata);
+
+    metadata
+        .get("operation_progress_class")
+        .and_then(Value::as_str)
+        == Some("artifact_content_shape_no_progress")
+        && metadata
+            .pointer("/tool_feedback_envelope/kind")
+            .and_then(Value::as_str)
+            == Some("artifact_content_shape_no_progress")
+        && metadata.get("progress_effect").and_then(Value::as_str) == Some("no_progress")
+        && metadata
+            .pointer("/file_change_content_evidence/content_bearing")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && metadata
+            .pointer("/file_change_content_evidence/unreadable_text_after_state_paths")
+            .and_then(Value::as_array)
+            .is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str() == Some("tests/workflow.spec.ts"))
+            })
+        && metadata
+            .pointer("/file_change_content_evidence/content_shape_violating_paths")
+            .and_then(Value::as_array)
+            .is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str() == Some("tests/workflow.spec.ts"))
+            })
+        && content_satisfying_change_summaries_for_protocol(&result, &metadata).is_empty()
+        && provider_output.contains("artifact_content_shape_no_progress")
+        && provider_output.contains("content-shape contract")
+        && provider_output.contains("active_targets: tests/workflow.spec.ts")
+        && matches!(
+            tool_progress_effect_from_metadata(&metadata),
+            ToolProgressEffect::NoProgress
+        )
+}
+
+pub(crate) fn corrective_content_shape_guard_rejects_untyped_no_progress_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = crate::session::ProcessPhase::Author;
+    state.completion.open_work_count = 1;
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    let metadata = json!({
+        "operation_intent": OperationIntent::ContentChangingAuthoringRequired.as_str(),
+        "operation_progress_class": "no_progress",
+        "progress_effect": "no_progress",
+        "result_hash": "legacy-untyped-content-shape-no-progress",
+        "content_shape_contract": {
+            "kind": "workflow-generated-test-content-shape",
+            "target": "tests/workflow.spec.ts"
+        },
+        "tool_feedback_envelope": {
+            "kind": "operation_progress_classification",
+            "operation_intent": OperationIntent::ContentChangingAuthoringRequired.as_str(),
+            "operation_progress_class": "no_progress",
+            "progress_effect": "no_progress",
+            "side_effects_applied": false,
+            "result_hash": "legacy-untyped-content-shape-no-progress"
+        }
+    });
+    let allowed = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+    let mut counts = BTreeMap::new();
+    let first = ToolLifecycleRuntime::record_corrective_content_shape_no_progress(
+        &mut counts,
+        "write",
+        &metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Required,
+        true,
+    );
+    let second = ToolLifecycleRuntime::record_corrective_content_shape_no_progress(
+        &mut counts,
+        "write",
+        &metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Required,
+        true,
+    );
+    let third = ToolLifecycleRuntime::record_corrective_content_shape_no_progress(
+        &mut counts,
+        "write",
+        &metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Required,
+        true,
+    );
+
+    counts.is_empty() && first.is_none() && second.is_none() && third.is_none()
 }
 
 pub(crate) fn executed_tool_failure_metadata_fixture_passes() -> bool {
@@ -3571,8 +5276,8 @@ pub(crate) fn executed_tool_failure_metadata_fixture_passes() -> bool {
         requested_tool: "read".to_string(),
         effective_tool: "read".to_string(),
         record_tool: "read".to_string(),
-        original_arguments_json: r#"{"path":"missing.py"}"#.to_string(),
-        effective_arguments_json: r#"{"path":"missing.py"}"#.to_string(),
+        original_arguments_json: r#"{"path":"missing-workflow.md"}"#.to_string(),
+        effective_arguments_json: r#"{"path":"missing-workflow.md"}"#.to_string(),
         allowed_tool_names: &allowed,
         tool_exists: true,
         tool_allowed: true,
@@ -3611,14 +5316,14 @@ pub(crate) fn rejected_tool_semantic_terminal_guard_fixture_passes() -> bool {
     ]);
     let first_key = rejected_tool_no_progress_key(
         "write",
-        r#"{"path":"arcade_game.py","content":"source v1"}"#,
+        r#"{"path":"src/workflow.rs","content":"source v1"}"#,
         &allowed,
         &ToolChoice::Auto,
         None,
     );
     let second_key = rejected_tool_no_progress_key(
         "write",
-        r#"{"path":"arcade_game.py","content":"source v2 with a different payload"}"#,
+        r#"{"path":"src/workflow.rs","content":"source v2 with a different payload"}"#,
         &allowed,
         &ToolChoice::Auto,
         None,
@@ -3630,7 +5335,7 @@ pub(crate) fn rejected_tool_semantic_terminal_guard_fixture_passes() -> bool {
         &ToolChoice::Auto,
         None,
     );
-    let required_write = fixture_required_edit_action(ToolName::Write, "test_widget.py");
+    let required_write = fixture_required_edit_action(ToolName::Write, "tests/workflow.spec.ts");
     let exact_action_key = rejected_tool_no_progress_key(
         "inspect_directory",
         r#"{"path":"."}"#,
@@ -3649,7 +5354,7 @@ pub(crate) fn rejected_tool_semantic_terminal_guard_fixture_passes() -> bool {
         &mut counts,
         RejectedToolNoProgressGuardRequest {
             effective_tool_name: "write",
-            effective_arguments_json: r#"{"path":"arcade_game.py","content":"source v1"}"#,
+            effective_arguments_json: r#"{"path":"src/workflow.rs","content":"source v1"}"#,
             allowed_tools: &allowed,
             tool_choice: &ToolChoice::Auto,
             required_action: None,
@@ -3663,7 +5368,7 @@ pub(crate) fn rejected_tool_semantic_terminal_guard_fixture_passes() -> bool {
         &mut counts,
         RejectedToolNoProgressGuardRequest {
             effective_tool_name: "write",
-            effective_arguments_json: r#"{"path":"arcade_game.py","content":"source v2"}"#,
+            effective_arguments_json: r#"{"path":"src/workflow.rs","content":"source v2"}"#,
             allowed_tools: &allowed,
             tool_choice: &ToolChoice::Auto,
             required_action: None,
@@ -3677,7 +5382,7 @@ pub(crate) fn rejected_tool_semantic_terminal_guard_fixture_passes() -> bool {
         &mut counts,
         RejectedToolNoProgressGuardRequest {
             effective_tool_name: "write",
-            effective_arguments_json: r#"{"path":"arcade_game.py","content":"source v3"}"#,
+            effective_arguments_json: r#"{"path":"src/workflow.rs","content":"source v3"}"#,
             allowed_tools: &allowed,
             tool_choice: &ToolChoice::Auto,
             required_action: None,
@@ -3692,7 +5397,7 @@ pub(crate) fn rejected_tool_semantic_terminal_guard_fixture_passes() -> bool {
         &mut provider_counts,
         RejectedToolNoProgressGuardRequest {
             effective_tool_name: "shell",
-            effective_arguments_json: r#"{"command":"python -m unittest"}"#,
+            effective_arguments_json: r#"{"command":"verify-generated-test --contract"}"#,
             allowed_tools: &BTreeSet::from(["apply_patch".to_string(), "write".to_string()]),
             tool_choice: &ToolChoice::Required,
             required_action: Some(&required_write),
@@ -3706,7 +5411,7 @@ pub(crate) fn rejected_tool_semantic_terminal_guard_fixture_passes() -> bool {
         &mut provider_counts,
         RejectedToolNoProgressGuardRequest {
             effective_tool_name: "shell",
-            effective_arguments_json: r#"{"command":"python -m unittest"}"#,
+            effective_arguments_json: r#"{"command":"verify-generated-test --contract"}"#,
             allowed_tools: &BTreeSet::from(["apply_patch".to_string(), "write".to_string()]),
             tool_choice: &ToolChoice::Required,
             required_action: Some(&required_write),
@@ -3720,7 +5425,7 @@ pub(crate) fn rejected_tool_semantic_terminal_guard_fixture_passes() -> bool {
         &mut provider_counts,
         RejectedToolNoProgressGuardRequest {
             effective_tool_name: "shell",
-            effective_arguments_json: r#"{"command":"python -m unittest"}"#,
+            effective_arguments_json: r#"{"command":"verify-generated-test --contract"}"#,
             allowed_tools: &BTreeSet::from(["apply_patch".to_string(), "write".to_string()]),
             tool_choice: &ToolChoice::Required,
             required_action: Some(&required_write),
@@ -3820,7 +5525,7 @@ pub(crate) fn rejected_tool_semantic_terminal_guard_fixture_passes() -> bool {
         },
     );
     let mut recovery_counts = BTreeMap::new();
-    let recovery_key = "invalid_edit_recovery|tool=apply_patch|parser_family=apply_patch_malformed_patch|candidate_target=calculator.py|targets=calculator.py,test_calculator.py|submitted=calculator.py,test_calculator.py|active_submitted=calculator.py,test_calculator.py|inactive_submitted=";
+    let recovery_key = "invalid_edit_recovery|tool=apply_patch|parser_family=apply_patch_malformed_patch|candidate_target=src/workflow.rs|targets=src/workflow.rs,tests/workflow.spec.ts|submitted=src/workflow.rs,tests/workflow.spec.ts|active_submitted=src/workflow.rs,tests/workflow.spec.ts|inactive_submitted=";
     let recovery_decision_a = ToolLifecycleRuntime::record_rejected_tool_no_progress(
         &mut recovery_counts,
         RejectedToolNoProgressGuardRequest {
@@ -3867,7 +5572,7 @@ pub(crate) fn rejected_tool_semantic_terminal_guard_fixture_passes() -> bool {
     first_key == second_key
         && first_key != different_tool_key
         && first_key.contains("rejected_tool|tool=write")
-        && exact_action_key.contains("required_action=write:test_widget.py")
+        && exact_action_key.contains("required_action=write:tests/workflow.spec.ts")
         && first_decision.count == 1
         && first_decision.terminal_message.is_none()
         && second_decision.count == 2
@@ -3877,7 +5582,7 @@ pub(crate) fn rejected_tool_semantic_terminal_guard_fixture_passes() -> bool {
             .terminal_message
             .as_deref()
             .is_some_and(|message| message.contains("Allowed tools for this turn"))
-        && exact_action_message.contains("Required action: write:test_widget.py")
+        && exact_action_message.contains("Required action: write:tests/workflow.spec.ts")
         && provider_decision_a.terminal_message.is_none()
         && provider_decision_b.terminal_message.is_none()
         && provider_decision_c
@@ -3910,18 +5615,18 @@ pub(crate) fn docs_spec_semantic_reconciliation_no_progress_terminal_guard_fixtu
     state.process_phase = crate::session::ProcessPhase::Author;
     state.completion.route_contract_pending = true;
     state.completion.open_work_count = 1;
-    state.active_targets = vec![Utf8PathBuf::from("docs/calculator-design.md")];
+    state.active_targets = vec![Utf8PathBuf::from("docs/workflow-design.md")];
     let active_work = ActiveWorkContract::RequestedWorkAuthoring {
         pending_targets: state.active_targets.clone(),
         verification_commands: Vec::new(),
     };
-    let authority = "Docs only. Unknown two-token `python calculator.py log 10` must be a usage error with exit code 1; do not document it as an undefined function exit code 2.";
+    let authority = "Docs only. Unknown two-token `workflow-cli beta 42` must be a usage error with exit code 1; do not document it as an undefined function exit code 2.";
     let first_result =
         crate::agent::docs_semantic_contract::docs_spec_semantic_reconciliation_result(
             "write",
             &json!({
-                "path": "docs/calculator-design.md",
-                "content": "Unknown two-token `python calculator.py log 10` is an undefined function and exits with code 2."
+                "path": "docs/workflow-design.md",
+                "content": "Unknown two-token `workflow-cli beta 42` is an undefined function and exits with code 2."
             }),
             &state,
             Some(&active_work),
@@ -3932,8 +5637,8 @@ pub(crate) fn docs_spec_semantic_reconciliation_no_progress_terminal_guard_fixtu
         crate::agent::docs_semantic_contract::docs_spec_semantic_reconciliation_result(
             "write",
             &json!({
-                "path": "docs/calculator-design.md",
-                "content": "The CLI may treat `python calculator.py log 10` as undefined function exit code 2."
+                "path": "docs/workflow-design.md",
+                "content": "The CLI may treat `workflow-cli beta 42` as undefined function exit code 2."
             }),
             &state,
             Some(&active_work),
@@ -4000,7 +5705,7 @@ pub(crate) fn docs_spec_semantic_reconciliation_no_progress_terminal_guard_fixtu
             .as_deref()
             .is_some_and(|message| {
                 message.contains("Docs/spec semantic reconciliation rejected")
-                    && message.contains("docs/calculator-design.md")
+                    && message.contains("docs/workflow-design.md")
             })
         && first_result
             .metadata
@@ -4010,6 +5715,184 @@ pub(crate) fn docs_spec_semantic_reconciliation_no_progress_terminal_guard_fixtu
                 crate::agent::docs_semantic_contract::DOCS_SPEC_SEMANTIC_RECONCILIATION_TERMINAL_THRESHOLD
                     as u64,
             )
+}
+
+pub(crate) fn verification_repair_supporting_context_converges_by_obligation_fixture_passes() -> bool
+{
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Docs;
+    state.process_phase = crate::session::ProcessPhase::Repair;
+    state.completion.verification_pending = true;
+    state.completion.open_work_count = 1;
+    state.active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
+    state
+        .verification
+        .required_commands
+        .push("verify-contract --behavior".to_string());
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-repair-supporting-context".to_string(),
+        failing_labels: vec!["workflow_public_state".to_string()],
+        primary_failure: Some("workflow public state mismatch".to_string()),
+        evidence: vec![crate::session::VerificationFailureEvidence {
+            evidence_kind: "verification_failure".to_string(),
+            subtype: Some("public_state_assertion_mismatch".to_string()),
+            label: Some("workflow_public_state".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
+            symbol: None,
+            call_site: None,
+            exception: None,
+            expected: Some("workflow_state.ready=true".to_string()),
+            observed: Some("workflow_state.ready=false".to_string()),
+            public_state_assertions: vec!["workflow_state.ready".to_string()],
+            public_missing_attributes: Vec::new(),
+            evidence_markers: vec!["source_public_behavior_assertion".to_string()],
+            sibling_obligations: vec!["repair src/workflow.rs state update".to_string()],
+            requirement_refs: Vec::new(),
+            source_refs: vec!["src/workflow.rs".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
+        }],
+        sibling_obligations: vec!["repair src/workflow.rs state update".to_string()],
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
+    });
+    let allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "read".to_string(),
+        "todowrite".to_string(),
+        "write".to_string(),
+    ]);
+    let alpha_projection = json!({
+        "operation_intents": ["content_changing_authoring_required"],
+        "obligation_ids": ["repair-obligation-alpha"],
+        "contract_refs": ["repair-control:fixture-alpha"],
+        "evidence_refs": [{
+            "source": "verification_failure_cluster",
+            "reference": "fixture-repair-supporting-context"
+        }]
+    });
+    let beta_projection = json!({
+        "operation_intents": ["content_changing_authoring_required"],
+        "obligation_ids": ["repair-obligation-beta"],
+        "contract_refs": ["repair-control:fixture-beta"],
+        "evidence_refs": [{
+            "source": "verification_failure_cluster",
+            "reference": "fixture-repair-supporting-context-beta"
+        }]
+    });
+    let sibling_read = json!({
+        "operation_intent": "content_changing_authoring_required",
+        "operation_progress_class": "supporting_context",
+        "progress_effect": "no_progress",
+        "path": "tests/workflow.spec.ts",
+        "result_hash": "sibling-read-hash",
+        "control_projection": alpha_projection.clone()
+    });
+    let todo_projection = json!({
+        "operation_intent": "content_changing_authoring_required",
+        "operation_progress_class": "supporting_context",
+        "progress_effect": "no_progress",
+        "result_hash": "todo-projection-hash",
+        "tool_feedback_envelope": {
+            "obligation_ids": ["repair-obligation-alpha"],
+            "contract_refs": ["repair-control:fixture-alpha"]
+        }
+    });
+    let source_read = json!({
+        "operation_intent": "content_changing_authoring_required",
+        "operation_progress_class": "supporting_context",
+        "progress_effect": "no_progress",
+        "path": "src/workflow.rs",
+        "result_hash": "source-read-hash",
+        "tool_route": {
+            "control_projection": alpha_projection.clone()
+        }
+    });
+    let different_obligation_read = json!({
+        "operation_intent": "content_changing_authoring_required",
+        "operation_progress_class": "supporting_context",
+        "progress_effect": "no_progress",
+        "path": "src/workflow.rs",
+        "result_hash": "different-obligation-read-hash",
+        "control_projection": beta_projection.clone()
+    });
+    let first_key = operation_non_content_no_progress_key(
+        "read",
+        &sibling_read,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let second_key = operation_non_content_no_progress_key(
+        "todowrite",
+        &todo_projection,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let third_key = operation_non_content_no_progress_key(
+        "read",
+        &source_read,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let different_key = operation_non_content_no_progress_key(
+        "read",
+        &different_obligation_read,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let mut counts = BTreeMap::new();
+    let first = ToolLifecycleRuntime::record_operation_non_content_no_progress(
+        &mut counts,
+        "read",
+        &sibling_read,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+        true,
+    )
+    .expect("first no-progress");
+    let second = ToolLifecycleRuntime::record_operation_non_content_no_progress(
+        &mut counts,
+        "todowrite",
+        &todo_projection,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+        true,
+    )
+    .expect("second no-progress");
+    let third = ToolLifecycleRuntime::record_operation_non_content_no_progress(
+        &mut counts,
+        "read",
+        &source_read,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+        true,
+    )
+    .expect("third no-progress");
+
+    first_key == second_key
+        && second_key == third_key
+        && first_key != different_key
+        && first_key.contains("repair-obligation-alpha")
+        && different_key.contains("repair-obligation-beta")
+        && !first_key.contains("sibling-read-hash")
+        && !first_key.contains("todo-projection-hash")
+        && !first_key.contains("source-read-hash")
+        && !different_key.contains("different-obligation-read-hash")
+        && first.count == 1
+        && second.count == 2
+        && third.count == 3
+        && first.budget_exhaustion
+            == Some(OperationNoProgressBudgetExhaustion::RepairSupportingContext)
+        && second.budget_exhaustion
+            == Some(OperationNoProgressBudgetExhaustion::RepairSupportingContext)
+        && third.budget_exhaustion
+            == Some(OperationNoProgressBudgetExhaustion::RepairSupportingContext)
 }
 
 pub(crate) fn pre_execution_corrective_order_authority_fixture_passes() -> bool {
@@ -4025,9 +5908,10 @@ pub(crate) fn pre_execution_corrective_order_authority_fixture_passes() -> bool 
 
     let mut repair_state = SessionStateSnapshot::default();
     repair_state.process_phase = crate::session::ProcessPhase::Repair;
-    repair_state.active_targets = vec![Utf8PathBuf::from("test_widget.py")];
+    repair_state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
     repair_state.completion.verification_pending = true;
-    repair_state.verification.required_commands = vec!["python -m unittest".to_string()];
+    repair_state.verification.required_commands =
+        vec!["verify-generated-test --contract".to_string()];
     repair_state.failure = Some(crate::session::FailureState {
         kind: crate::session::FailureKind::VerificationFailed,
         summary: "verification failed: generated-test public output overreach".to_string(),
@@ -4036,44 +5920,44 @@ pub(crate) fn pre_execution_corrective_order_authority_fixture_passes() -> bool 
     });
     repair_state.verification.failure_cluster = Some(VerificationFailureCluster {
         cluster_id: "fixture-pre-execution-corrective-order".to_string(),
-        failing_labels: vec!["test_widget_cli".to_string()],
-        primary_failure: Some("stdout assertion overreach".to_string()),
+        failing_labels: vec!["workflow_cli_contract".to_string()],
+        primary_failure: Some("workflow output assertion overreach".to_string()),
         evidence: vec![crate::session::VerificationFailureEvidence {
             evidence_kind: "verification_failure".to_string(),
             subtype: Some("public_output_stream_assertion_mismatch".to_string()),
-            label: Some("test_widget_cli".to_string()),
-            target: Some("test_widget.py".to_string()),
+            label: Some("workflow_cli_contract".to_string()),
+            target: Some("tests/workflow.spec.ts".to_string()),
             symbol: None,
-            call_site: Some("self.assertIn(\"decorative\", proc.stdout)".to_string()),
+            call_site: Some("workflow_public_output_assertion".to_string()),
             exception: None,
-            expected: Some("decorative".to_string()),
-            observed: Some("stdout `7`".to_string()),
-            public_state_assertions: vec!["proc.returncode".to_string()],
+            expected: Some("workflow_state.ready".to_string()),
+            observed: Some("workflow_state.pending".to_string()),
+            public_state_assertions: vec!["workflow_state.ready".to_string()],
             public_missing_attributes: Vec::new(),
             evidence_markers: vec![
                 "generated_test_contract_overreach".to_string(),
                 "public_output_stream_assertion_mismatch".to_string(),
             ],
-            sibling_obligations: vec!["proc.returncode".to_string()],
+            sibling_obligations: vec!["workflow_state.ready".to_string()],
             requirement_refs: Vec::new(),
             source_refs: Vec::new(),
-            test_refs: vec!["test_widget.py".to_string()],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
         }],
-        sibling_obligations: vec!["proc.returncode".to_string()],
+        sibling_obligations: vec!["workflow_state.ready".to_string()],
         source_refs: Vec::new(),
-        test_refs: vec!["test_widget.py".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
     });
     let repair_active = ActiveWorkContract::Verification {
-        commands: vec!["python -m unittest".to_string()],
-        failing_labels: vec!["test_widget_cli".to_string()],
+        commands: vec!["verify-generated-test --contract".to_string()],
+        failing_labels: vec!["workflow_cli_contract".to_string()],
         repair_required: true,
-        targets: vec![Utf8PathBuf::from("test_widget.py")],
+        targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
     };
 
     let exact_repair_probe = ToolLifecycleRuntime::classify_pre_execution_corrective_result(
         PreExecutionCorrectiveInput {
             effective_tool_name: "shell",
-            parsed_arguments: &json!({"command": "Get-Content -Encoding UTF8 test_widget.py"}),
+            parsed_arguments: &json!({"command": "Get-Content -Encoding UTF8 tests/workflow.spec.ts"}),
             active_work: Some(&repair_active),
             state: &repair_state,
             workspace_root,
@@ -4086,7 +5970,7 @@ pub(crate) fn pre_execution_corrective_order_authority_fixture_passes() -> bool 
     let wrong_repair_probe = ToolLifecycleRuntime::classify_pre_execution_corrective_result(
         PreExecutionCorrectiveInput {
             effective_tool_name: "shell",
-            parsed_arguments: &json!({"command": "Get-Content -Encoding UTF8 widget.py"}),
+            parsed_arguments: &json!({"command": "Get-Content -Encoding UTF8 src/workflow.rs"}),
             active_work: Some(&repair_active),
             state: &repair_state,
             workspace_root,
@@ -4098,9 +5982,10 @@ pub(crate) fn pre_execution_corrective_order_authority_fixture_passes() -> bool 
     );
 
     let mut verify_state = SessionStateSnapshot::default();
-    verify_state.verification.required_commands = vec!["python -m unittest".to_string()];
+    verify_state.verification.required_commands =
+        vec!["verify-generated-test --contract".to_string()];
     let verify_active = ActiveWorkContract::Verification {
-        commands: vec!["python -m unittest".to_string()],
+        commands: vec!["verify-generated-test --contract".to_string()],
         failing_labels: Vec::new(),
         repair_required: false,
         targets: Vec::new(),
@@ -4108,7 +5993,7 @@ pub(crate) fn pre_execution_corrective_order_authority_fixture_passes() -> bool 
     let wrong_verification = ToolLifecycleRuntime::classify_pre_execution_corrective_result(
         PreExecutionCorrectiveInput {
             effective_tool_name: "shell",
-            parsed_arguments: &json!({"command": "python -m py_compile widget.py"}),
+            parsed_arguments: &json!({"command": "verify-contract --behavior"}),
             active_work: Some(&verify_active),
             state: &verify_state,
             workspace_root,
@@ -4120,15 +6005,19 @@ pub(crate) fn pre_execution_corrective_order_authority_fixture_passes() -> bool 
     );
 
     let authoring_active = ActiveWorkContract::RequestedWorkAuthoring {
-        pending_targets: vec![Utf8PathBuf::from("test_widget.py")],
-        verification_commands: vec!["python -m unittest".to_string()],
+        pending_targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
+        verification_commands: vec!["verify-generated-test --contract".to_string()],
     };
+    let mut authoring_state = SessionStateSnapshot::default();
+    authoring_state.route = TaskRoute::Code;
+    authoring_state.process_phase = crate::session::ProcessPhase::Author;
+    authoring_state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
     let wrong_authoring = ToolLifecycleRuntime::classify_pre_execution_corrective_result(
         PreExecutionCorrectiveInput {
             effective_tool_name: "write",
-            parsed_arguments: &json!({"path": "widget.py", "content": "def render():\n    return 'ok'\n"}),
+            parsed_arguments: &json!({"path": "src/workflow.rs", "content": "pub fn workflow_source_contract() -> bool {\n    let workflow_state_ready = true;\n    workflow_state_ready\n}\n"}),
             active_work: Some(&authoring_active),
-            state: &SessionStateSnapshot::default(),
+            state: &authoring_state,
             workspace_root,
             workspace_cwd: Some(workspace_cwd),
             allowed_tools: &allowed_tools,
@@ -4349,7 +6238,7 @@ pub(crate) fn synthetic_corrective_shell_feedback_is_not_verification_run_fixtur
             "timeout": false,
             "tool_route": {
                 "effective_arguments": {
-                    "command": "python -m unittest"
+                    "command": "verify-generated-test --contract"
                 }
             }
         }),
@@ -4363,7 +6252,7 @@ pub(crate) fn synthetic_corrective_shell_feedback_is_not_verification_run_fixtur
             "timeout": false,
             "tool_route": {
                 "effective_arguments": {
-                    "command": "python -m unittest"
+                    "command": "verify-generated-test --contract"
                 }
             }
         }),
@@ -4376,7 +6265,21 @@ pub(crate) fn synthetic_corrective_shell_feedback_is_not_verification_run_fixtur
             "exit_code": 1,
             "timeout": false,
             "tool_route": {
-                "effective_arguments_json": "{\"command\":\"python -X utf8 -m unittest\"}"
+                "effective_arguments_json": "{\"command\":\"verify-generated-test --contract\"}"
+            }
+        }),
+        None,
+    );
+    let executed_generic_runner = with_verification_run_result(
+        ToolName::Shell,
+        "FAIL tests/workflow.spec.ts",
+        serde_json::json!({
+            "exit_code": 1,
+            "timeout": false,
+            "tool_route": {
+                "effective_arguments": {
+                    "command": "npm test"
+                }
             }
         }),
         None,
@@ -4391,7 +6294,12 @@ pub(crate) fn synthetic_corrective_shell_feedback_is_not_verification_run_fixtur
             .get("verification_run_result")
             .and_then(|value| value.get("command"))
             .and_then(Value::as_str)
-            == Some("python -X utf8 -m unittest")
+            == Some("verify-generated-test --contract")
+        && executed_generic_runner
+            .get("verification_run_result")
+            .and_then(|value| value.get("command"))
+            .and_then(Value::as_str)
+            == Some("npm test")
 }
 
 pub(crate) fn no_content_write_metadata_projects_no_progress_fixture_passes() -> bool {
@@ -4403,7 +6311,7 @@ pub(crate) fn no_content_write_metadata_projects_no_progress_fixture_passes() ->
             "success": false,
             "progress_effect": "no_progress",
             "tool": "write",
-            "target": "component.py"
+            "target": "src/workflow.rs"
         }
     });
 
@@ -4412,6 +6320,31 @@ pub(crate) fn no_content_write_metadata_projects_no_progress_fixture_passes() ->
             tool_progress_effect_from_metadata(&metadata),
             ToolProgressEffect::NoProgress
         )
+}
+
+pub(crate) fn repair_supporting_context_is_scoped_to_typed_obligation_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.process_phase = crate::session::ProcessPhase::Repair;
+    state.completion.verification_pending = true;
+    state.active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
+    state.verification.failure_cluster = Some(VerificationFailureCluster {
+        cluster_id: "fixture-repair-context-scope".to_string(),
+        failing_labels: vec!["workflow-contract".to_string()],
+        primary_failure: Some("cannot find workflow_state.ready".to_string()),
+        evidence: Vec::new(),
+        sibling_obligations: Vec::new(),
+        source_refs: vec!["src/workflow.rs".to_string()],
+        test_refs: vec!["tests/workflow.spec.ts".to_string()],
+    });
+
+    let exact_active =
+        metadata_path_matches_repair_obligation(&json!({"path": "src/workflow.rs"}), &state);
+    let exact_evidence =
+        metadata_path_matches_repair_obligation(&json!({"path": "tests/workflow.spec.ts"}), &state);
+    let unrelated = metadata_path_matches_repair_obligation(&json!({"path": "README.md"}), &state);
+    let missing = metadata_path_matches_repair_obligation(&json!({}), &state);
+
+    exact_active && exact_evidence && !unrelated && !missing
 }
 
 fn verification_artifact_refs(
@@ -4484,20 +6417,7 @@ fn command_from_arguments_json(arguments_json: &str) -> Option<String> {
 
 fn looks_like_verification_command(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
-    [
-        "cargo test",
-        "pytest",
-        "unittest",
-        "py_compile",
-        "npm test",
-        "pnpm test",
-        "yarn test",
-        "go test",
-        "mvn test",
-        "gradle test",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    language_verification_command_evidence(&lower)
 }
 
 fn verification_cluster_from_output(command: &str, summary: &str) -> VerificationFailureCluster {
@@ -4548,19 +6468,7 @@ fn verification_cluster_from_output(command: &str, summary: &str) -> Verificatio
 }
 
 fn failing_label_from_output_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix("FAIL: ") {
-        return Some(rest.split_whitespace().next().unwrap_or(rest).to_string());
-    }
-    if let Some(rest) = trimmed.strip_prefix("ERROR: ") {
-        return Some(rest.split_whitespace().next().unwrap_or(rest).to_string());
-    }
-    if trimmed.starts_with("test_")
-        && (trimmed.contains(" ... FAIL") || trimmed.contains(" ... ERROR"))
-    {
-        return trimmed.split_whitespace().next().map(str::to_string);
-    }
-    None
+    language_failure_label_from_output_line(line)
 }
 
 fn requirement_refs_from_output(summary: &str) -> Vec<String> {

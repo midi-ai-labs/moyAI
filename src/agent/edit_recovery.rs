@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use camino::Utf8PathBuf;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::agent::grounding_evidence::{
@@ -17,7 +18,7 @@ use crate::session::{ProcessPhase, SessionStateSnapshot, TaskRoute};
 use crate::tool::{ToolName, ToolResult};
 
 const INVALID_EDIT_ARGUMENTS_TERMINAL_THRESHOLD: usize = 3;
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InvalidEditRecoveryEnvelope {
     pub(crate) failure_kind: String,
     pub(crate) tool_name: String,
@@ -151,9 +152,9 @@ pub(crate) fn failed_edit_control_recovery_envelope(
     let mixed_patch_target_evidence = tool_name == "apply_patch"
         && !active_submitted_targets.is_empty()
         && !inactive_submitted_targets.is_empty();
-    let candidate_target_is_open = candidate_target
-        .as_ref()
-        .is_some_and(|target| active_targets.iter().any(|active| active == target));
+    let candidate_target_is_open = candidate_target.as_ref().is_some_and(|target| {
+        active_target_keys.contains(&normalize_path_for_target_match(target))
+    });
     let recovery_target = if active_submitted_targets.len() == 1 {
         active_submitted_targets.first().cloned()
     } else if candidate_target_is_open {
@@ -222,9 +223,9 @@ pub(crate) fn failed_edit_control_recovery_envelope(
         if tool_name == "apply_patch"
             && parser_error_family.as_deref() == Some("apply_patch_malformed_patch")
         {
-            "Use the exact apply_patch grammar. Add File body lines must start with `+`, including blank lines and top-level `def`/`class`/`import` lines. Update File hunks must use `@@` and every hunk line must start with ` `, `+`, or `-`; a single patch may contain multiple `*** Add File` or `*** Update File` sections. If the OpenAI-compatible function-tool payload keeps corrupting `patch_text` line prefixes, use `write` with complete content for the current open target when the recovery surface provides `write`."
+            "Use the exact apply_patch grammar. Add File body lines must start with `+`, including blank lines and every content line. Update File hunks must use `@@` and every hunk line must start with ` `, `+`, or `-`; a single patch may contain multiple `*** Add File` or `*** Update File` sections. If the OpenAI-compatible function-tool payload keeps corrupting `patch_text` line prefixes, use `write` with complete content for the current open target when the recovery surface provides `write`."
         } else {
-            "Use the exact apply_patch grammar. Add File body lines must start with `+`, including blank lines and top-level `def`/`class`/`import` lines. Update File hunks must use `@@` and every hunk line must start with ` `, `+`, or `-`; a single patch may contain multiple `*** Add File` or `*** Update File` sections."
+            "Use the exact apply_patch grammar. Add File body lines must start with `+`, including blank lines and every content line. Update File hunks must use `@@` and every hunk line must start with ` `, `+`, or `-`; a single patch may contain multiple `*** Add File` or `*** Update File` sections."
         }
     } else {
         "Use a schema-valid edit call for the active target. Do not treat malformed edit output, planning, or text-only responses as progress."
@@ -250,20 +251,17 @@ pub(crate) fn failed_edit_control_recovery_envelope(
             (failure_kind == "required_write_content_shape_mismatch")
                 .then(|| "rewrite_content_for_required_shape".to_string())
         });
-    let active_test_contract = if active_targets.len() == 1 {
-        crate::agent::content_shape_contract::python_source_for_test_target(&active_targets[0])
-            .map(|contract| {
-                format!(
-                    "\nActive generated-test target contract:\n{}",
-                    contract.prompt_contract()
-                )
-            })
-            .unwrap_or_default()
+    let active_shape_contract = if active_targets.len() == 1 {
+        crate::agent::content_shape_contract::artifact_content_shape_prompt_contract(
+            &active_targets[0],
+        )
+        .map(|contract| format!("\nActive content-shape target contract:\n{contract}"))
+        .unwrap_or_default()
     } else {
         String::new()
     };
     let prompt = format!(
-        "The latest `{tool_name}` edit output was rejected before filesystem side effects and is no-progress evidence, not authoring progress.\nFailure kind: {failure_kind}.\nOpen targets: {target_text}.\n{candidate_target_line}\nAllowed tools for recovery: {allowed}. Tool choice remains `{}` unless the TurnControlEnvelope says otherwise.\nLatest parser/content-shape error: {parser_error}\n{grammar_line}{active_test_contract}{content_shape_contract}\nRequired recovery operation: submit a corrected `{tool_name}` content-changing edit for {recovery_target_text} before any verification, progress-only todo update, or final answer.",
+        "The latest `{tool_name}` edit output was rejected before filesystem side effects and is no-progress evidence, not authoring progress.\nFailure kind: {failure_kind}.\nOpen targets: {target_text}.\n{candidate_target_line}\nAllowed tools for recovery: {allowed}. Tool choice remains `{}` unless the TurnControlEnvelope says otherwise.\nLatest parser/content-shape error: {parser_error}\n{grammar_line}{active_shape_contract}{content_shape_contract}\nRequired recovery operation: submit a corrected `{tool_name}` content-changing edit for {recovery_target_text} before any verification, progress-only todo update, or final answer.",
         tool_choice_label(tool_choice)
     );
     Some(InvalidEditRecoveryEnvelope {
@@ -606,11 +604,33 @@ pub(crate) fn invalid_apply_patch_arguments_need_write_recovery(
             targets
                 .iter()
                 .filter_map(Value::as_str)
-                .map(|target| target.replace('\\', "/"))
+                .map(normalize_path_for_target_match)
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
     if active_targets.is_empty() {
+        return false;
+    }
+    let submitted_targets = feedback
+        .get("submitted_targets")
+        .and_then(Value::as_array)
+        .map(|targets| {
+            targets
+                .iter()
+                .filter_map(Value::as_str)
+                .map(normalize_path_for_target_match)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let active_submitted_targets = submitted_targets
+        .iter()
+        .filter(|target| active_targets.contains(*target))
+        .collect::<Vec<_>>();
+    let inactive_submitted_targets = submitted_targets
+        .iter()
+        .filter(|target| !active_targets.contains(*target))
+        .collect::<Vec<_>>();
+    if active_submitted_targets.is_empty() && !inactive_submitted_targets.is_empty() {
         return false;
     }
     matches!(
@@ -793,11 +813,7 @@ pub(crate) fn patch_context_mismatch_target_grounding_surface_active(
         && !targets.is_empty()
         && state.active_targets.iter().any(|target| {
             let normalized = normalize_path_for_target_match(target.as_str());
-            targets.iter().any(|recorded| {
-                normalized == *recorded
-                    || normalized.ends_with(&format!("/{recorded}"))
-                    || recorded.ends_with(&format!("/{normalized}"))
-            })
+            targets.iter().any(|recorded| normalized == *recorded)
         })
 }
 
@@ -1063,10 +1079,10 @@ pub(crate) fn is_invalid_tool_arguments_error(message: &str) -> bool {
 
 pub(crate) fn apply_patch_context_mismatch_enters_invalid_edit_lifecycle_fixture_passes() -> bool {
     is_invalid_tool_arguments_error("context mismatch while applying patch")
-        && is_invalid_tool_arguments_error("Failed to find expected lines in component.py")
+        && is_invalid_tool_arguments_error("Failed to find expected lines in src/workflow.rs")
         && invalid_edit_parser_error_family("context mismatch while applying patch")
             == "apply_patch_context_mismatch"
-        && invalid_edit_parser_error_family("Failed to find expected lines in component.py")
+        && invalid_edit_parser_error_family("Failed to find expected lines in src/workflow.rs")
             == "apply_patch_context_mismatch"
 }
 
@@ -1153,12 +1169,12 @@ impl EscapedSourceWriteCandidate {
             target_path: Some(self.target),
             original_arguments: self.original_arguments,
             normalized_edit_intent:
-                "admit escaped whole-file Python source candidate as real-newline source write"
+                "admit escaped whole-file source/code candidate as real-newline artifact write"
                     .to_string(),
             semantic_class: "escaped_source_write_candidate_normalized".to_string(),
             validity: CandidateRepairValidity::Admitted,
             payload_hash: self.payload_hash,
-            aligned_failure_refs: vec!["python_source_executable_content_shape".to_string()],
+            aligned_failure_refs: vec!["artifact_executable_content_shape".to_string()],
             evidence_refs: vec![
                 "candidate_repair_edit".to_string(),
                 "escaped_source_write_normalized".to_string(),
@@ -1184,7 +1200,7 @@ pub(crate) fn normalized_escaped_source_write_candidate(
         .trim()
         .to_string();
     if target.is_empty()
-        || !crate::agent::content_shape_contract::python_source_target_requires_executable_shape(
+        || !crate::agent::content_shape_contract::source_artifact_target_requires_executable_shape(
             &target,
         )
     {
@@ -1201,8 +1217,8 @@ pub(crate) fn normalized_escaped_source_write_candidate(
     if crate::agent::content_shape_contract::write_content_matches_required_target(
         &target, &content,
     )
-        || !crate::agent::content_shape_contract::python_source_content_is_escaped_whole_file_string(
-            &content,
+        || !crate::agent::content_shape_contract::source_artifact_content_is_escaped_whole_file_string(
+            &target, &content,
         )
     {
         return None;
@@ -1378,23 +1394,32 @@ pub(crate) fn normalize_repaired_write_arguments_value(value: &mut Value) {
     let Some(object) = value.as_object_mut() else {
         return;
     };
-    let path_is_python = object
-        .get("path")
-        .and_then(Value::as_str)
-        .is_some_and(|path| path.ends_with(".py"));
-    if !path_is_python {
+    let Some(path) = object.get("path").and_then(Value::as_str) else {
+        return;
+    };
+    if !crate::agent::content_shape_contract::source_artifact_target_requires_executable_shape(path)
+    {
         return;
     }
     let Some(content) = object.get("content").and_then(Value::as_str) else {
         return;
     };
-    let normalized = normalize_python_source_literal_newlines(content);
-    if normalized != content {
+    if let Some(normalized) = normalize_escaped_whole_file_source_candidate(path, content) {
+        object.insert("content".to_string(), Value::String(normalized));
+        return;
+    }
+    let normalized = normalize_source_literal_newlines(content);
+    if normalized != content
+        && crate::agent::content_shape_contract::write_content_matches_required_target(
+            path,
+            &normalized,
+        )
+    {
         object.insert("content".to_string(), Value::String(normalized));
     }
 }
 
-fn normalize_python_source_literal_newlines(content: &str) -> String {
+fn normalize_source_literal_newlines(content: &str) -> String {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum QuoteState {
         None,
@@ -1494,13 +1519,13 @@ pub(crate) fn invalid_edit_recovery_uses_open_target_when_candidate_is_inactive_
     let mut state = SessionStateSnapshot {
         route: TaskRoute::Code,
         process_phase: ProcessPhase::Author,
-        active_targets: vec![Utf8PathBuf::from("test_widget.py")],
+        active_targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
         ..SessionStateSnapshot::default()
     };
     state.completion.closeout_ready = false;
     let allowed = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
     let arguments = json!({
-        "patch_text": "*** Begin Patch\n*** Update File: widget.py\n+def add(a, b):\n+    return a + b\n*** End Patch\n*** Update File: test_widget.py\n*** Begin Patch\n*** Update File: test_widget.py\n+import unittest\n+import widget\n*** End Patch\n"
+        "patch_text": "*** Begin Patch\n*** Update File: src/workflow.rs\n+pub fn advance_workflow() -> bool { true }\n*** End Patch\n*** Update File: tests/workflow.spec.ts\n*** Begin Patch\n*** Update File: tests/workflow.spec.ts\n+import { runWorkflow } from '../src/workflow';\n*** End Patch\n"
     })
     .to_string();
     let result = invalid_tool_arguments_result(
@@ -1520,26 +1545,26 @@ pub(crate) fn invalid_edit_recovery_uses_open_target_when_candidate_is_inactive_
     ) else {
         return false;
     };
-    envelope.candidate_target.as_deref() == Some("widget.py")
+    envelope.candidate_target.as_deref() == Some("src/workflow.rs")
         && envelope
             .submitted_targets
-            .contains(&"widget.py".to_string())
+            .contains(&"src/workflow.rs".to_string())
         && envelope
             .submitted_targets
-            .contains(&"test_widget.py".to_string())
+            .contains(&"tests/workflow.spec.ts".to_string())
         && envelope
             .active_submitted_targets
-            .contains(&"test_widget.py".to_string())
+            .contains(&"tests/workflow.spec.ts".to_string())
         && envelope
             .inactive_submitted_targets
-            .contains(&"widget.py".to_string())
-        && envelope.active_targets == vec!["test_widget.py".to_string()]
+            .contains(&"src/workflow.rs".to_string())
+        && envelope.active_targets == vec!["tests/workflow.spec.ts".to_string()]
         && envelope
             .prompt
-            .contains("Submitted patch declared active target(s) `test_widget.py`")
+            .contains("Submitted patch declared active target(s) `tests/workflow.spec.ts`")
         && envelope
             .prompt
-            .contains("inactive target(s) `widget.py`")
+            .contains("inactive target(s) `src/workflow.rs`")
         && envelope
             .prompt
             .contains("resend a target-only edit")
@@ -1548,25 +1573,25 @@ pub(crate) fn invalid_edit_recovery_uses_open_target_when_candidate_is_inactive_
             .contains("It is not currently an open target")
         && envelope
             .prompt
-            .contains("Required recovery operation: submit a corrected `apply_patch` content-changing edit for `test_widget.py`")
+            .contains("Required recovery operation: submit a corrected `apply_patch` content-changing edit for `tests/workflow.spec.ts`")
         && !envelope.prompt.contains("latest attempted open target")
         && envelope
             .prompt
-            .contains("Active generated-test target contract")
-        && envelope.prompt.contains("test_widget.py")
+            .contains("Active content-shape target contract")
+        && envelope.prompt.contains("tests/workflow.spec.ts")
 }
 
 pub(crate) fn mixed_target_apply_patch_preserves_active_hunk_evidence_fixture_passes() -> bool {
     let mut state = SessionStateSnapshot {
         route: TaskRoute::Code,
         process_phase: ProcessPhase::Author,
-        active_targets: vec![Utf8PathBuf::from("test_calculator.py")],
+        active_targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
         ..SessionStateSnapshot::default()
     };
     state.completion.open_work_count = 1;
     let allowed = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
     let arguments = json!({
-        "patch_text": "*** Begin Patch\n*** Add File: calculator.py\n+def calculate(a, b):\n+    return a + b\n*** End Patch\n*** Add File: test_calculator.py\n+import unittest\n+import calculator\n+\n+class TestCalculator(unittest.TestCase):\n+    def test_add(self):\n+        self.assertEqual(calculator.calculate(2, 3), 5)\n*** End Patch"
+        "patch_text": "*** Begin Patch\n*** Add File: src/workflow.rs\n+export function runWorkflow(input: string): string {\n+  return input.trim();\n+}\n*** End Patch\n*** Add File: tests/workflow.spec.ts\n+import { runWorkflow } from '../src/workflow';\n+\n+assert.equal(runWorkflow(' draft '), 'draft');\n*** End Patch"
     })
     .to_string();
     let result = invalid_tool_arguments_result(
@@ -1609,27 +1634,124 @@ pub(crate) fn mixed_target_apply_patch_preserves_active_hunk_evidence_fixture_pa
             .get("recovery_action")
             .and_then(Value::as_str)
             == Some("mixed_target_apply_patch_rewrite_target_only")
-        && feedback_array_contains("active_submitted_targets", "test_calculator.py")
-        && feedback_array_contains("inactive_submitted_targets", "calculator.py")
-        && envelope.candidate_target.as_deref() == Some("calculator.py")
+        && feedback_array_contains("active_submitted_targets", "tests/workflow.spec.ts")
+        && feedback_array_contains("inactive_submitted_targets", "src/workflow.rs")
+        && envelope.candidate_target.as_deref() == Some("src/workflow.rs")
         && envelope
             .submitted_targets
-            .contains(&"test_calculator.py".to_string())
+            .contains(&"tests/workflow.spec.ts".to_string())
         && envelope
             .active_submitted_targets
-            .contains(&"test_calculator.py".to_string())
+            .contains(&"tests/workflow.spec.ts".to_string())
         && envelope
             .inactive_submitted_targets
-            .contains(&"calculator.py".to_string())
+            .contains(&"src/workflow.rs".to_string())
         && envelope
             .prompt
-            .contains("Submitted patch declared active target(s) `test_calculator.py`")
+            .contains("Submitted patch declared active target(s) `tests/workflow.spec.ts`")
         && envelope
             .prompt
             .contains("do not include inactive source hunks")
         && envelope
             .prompt
-            .contains("Required recovery operation: submit a corrected `apply_patch` content-changing edit for `test_calculator.py`")
+            .contains("Required recovery operation: submit a corrected `apply_patch` content-changing edit for `tests/workflow.spec.ts`")
+}
+
+pub(crate) fn edit_recovery_targets_and_fixtures_are_workflow_neutral_fixture_passes() -> bool {
+    let mut repair_state = SessionStateSnapshot {
+        route: TaskRoute::Code,
+        process_phase: ProcessPhase::Repair,
+        active_targets: vec![Utf8PathBuf::from("src/workflow.rs")],
+        ..SessionStateSnapshot::default()
+    };
+    repair_state.completion.verification_pending = true;
+    let suffix_collision = BTreeSet::from(["C:/other-project/src/workflow.rs".to_string()]);
+    !patch_context_mismatch_target_grounding_surface_active(&repair_state, &suffix_collision)
+        && apply_patch_context_mismatch_enters_invalid_edit_lifecycle_fixture_passes()
+        && invalid_edit_recovery_uses_open_target_when_candidate_is_inactive_fixture_passes()
+        && mixed_target_apply_patch_preserves_active_hunk_evidence_fixture_passes()
+        && invalid_apply_patch_write_recovery_normalizes_active_targets_fixture_passes()
+        && invalid_edit_recovery_candidate_target_normalized_fixture_passes()
+}
+
+pub(crate) fn invalid_edit_recovery_candidate_target_normalized_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot {
+        route: TaskRoute::Code,
+        process_phase: ProcessPhase::Author,
+        active_targets: vec![
+            Utf8PathBuf::from("./tests/workflow.spec.ts"),
+            Utf8PathBuf::from("docs/workflow-notes.md"),
+        ],
+        ..SessionStateSnapshot::default()
+    };
+    state.completion.open_work_count = 2;
+    let allowed = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+    let metadata = json!({
+        "tool_feedback_envelope": {
+            "kind": "invalid_edit_arguments",
+            "submitted_tool": "apply_patch",
+            "progress_effect": "no_progress",
+            "side_effects_applied": false,
+            "parser_error": "tool patch error: malformed patch",
+            "parser_error_family": "apply_patch_malformed_patch",
+            "candidate_target_from_arguments": "tests/workflow.spec.ts",
+            "submitted_targets": [],
+            "result_hash": "invalid-edit-normalized-candidate-fixture",
+            "recovery_action": "correct_edit_call_for_active_target"
+        }
+    });
+    let Some(envelope) = invalid_edit_arguments_control_recovery_envelope(
+        "apply_patch",
+        &metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Required,
+    ) else {
+        return false;
+    };
+    envelope.candidate_target.as_deref() == Some("tests/workflow.spec.ts")
+        && envelope.recovery_target.as_deref() == Some("tests/workflow.spec.ts")
+        && envelope
+            .prompt
+            .contains("This target is still open; retry the same bounded edit operation")
+        && envelope
+            .prompt
+            .contains("Required recovery operation: submit a corrected `apply_patch` content-changing edit for `tests/workflow.spec.ts`")
+        && !envelope
+            .prompt
+            .contains("It is not currently an open target")
+        && !envelope.prompt.contains("one open target")
+}
+
+pub(crate) fn invalid_apply_patch_write_recovery_normalizes_active_targets_fixture_passes() -> bool
+{
+    let mut state = SessionStateSnapshot {
+        route: TaskRoute::Code,
+        process_phase: ProcessPhase::Author,
+        active_targets: vec![Utf8PathBuf::from("./tests/workflow.spec.ts")],
+        ..SessionStateSnapshot::default()
+    };
+    state.completion.open_work_count = 1;
+    let allowed = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+    let arguments = json!({
+        "patch_text": "*** Begin Patch\n*** Update File: tests/workflow.spec.ts\n@@\n-import { runWorkflow } from '../src/workflow';\n+import { runWorkflow } from '../src/workflow';\n*** End Patch"
+    })
+    .to_string();
+    let result = invalid_tool_arguments_result(
+        "apply_patch",
+        &arguments,
+        "Tool patch error: Add File body line must start with +",
+        &state,
+        Some(&allowed),
+        Some(&ToolChoice::Required),
+    );
+    invalid_apply_patch_arguments_need_write_recovery(
+        "apply_patch",
+        &result.metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Required,
+    )
 }
 
 #[cfg(test)]
@@ -1645,5 +1767,17 @@ mod tests {
             super::invalid_edit_recovery_uses_open_target_when_candidate_is_inactive_fixture_passes(
             )
         );
+    }
+
+    #[test]
+    fn invalid_apply_patch_write_recovery_normalizes_active_targets() {
+        assert!(
+            super::invalid_apply_patch_write_recovery_normalizes_active_targets_fixture_passes()
+        );
+    }
+
+    #[test]
+    fn invalid_edit_recovery_candidate_target_normalized() {
+        assert!(super::invalid_edit_recovery_candidate_target_normalized_fixture_passes());
     }
 }

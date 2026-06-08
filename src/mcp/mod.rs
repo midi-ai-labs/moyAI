@@ -7,6 +7,9 @@ use crate::config::{McpConfig, McpServerConfig};
 use crate::error::ToolError;
 use crate::tool::truncate::clip_text_with_ellipsis;
 
+pub const MCP_TOOLS_LIST_DESCRIPTOR_SCHEMA_VALIDATION_MARKER: &str =
+    "mcp_tools_list_descriptor_schema_validation";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolDescriptor {
     pub name: String,
@@ -295,20 +298,37 @@ fn parse_tools(response: &Value) -> Result<Vec<McpToolDescriptor>, ToolError> {
         .ok_or_else(|| {
             ToolError::Message("mcp tools/list response is missing `result.tools`".to_string())
         })?;
-    Ok(tools
-        .iter()
-        .filter_map(|tool| {
-            let name = tool.get("name").and_then(Value::as_str)?.to_string();
-            Some(McpToolDescriptor {
-                name,
-                description: tool
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                input_schema: tool.get("inputSchema").cloned(),
-            })
-        })
-        .collect())
+    let mut descriptors = Vec::with_capacity(tools.len());
+    for (index, tool) in tools.iter().enumerate() {
+        descriptors.push(parse_tool_descriptor(index, tool)?);
+    }
+    Ok(descriptors)
+}
+
+fn parse_tool_descriptor(index: usize, tool: &Value) -> Result<McpToolDescriptor, ToolError> {
+    let name = tool.get("name").and_then(Value::as_str).ok_or_else(|| {
+        ToolError::Message(format!(
+            "mcp tools/list descriptor at index {index} is missing typed string `name`"
+        ))
+    })?;
+    if name.trim().is_empty() {
+        return Err(ToolError::Message(format!(
+            "mcp tools/list descriptor at index {index} has an empty `name`"
+        )));
+    }
+    let description = match tool.get("description") {
+        Some(value) => Some(value.as_str().ok_or_else(|| {
+            ToolError::Message(format!(
+                "mcp tools/list descriptor `{name}` has non-string `description`"
+            ))
+        })?),
+        None => None,
+    };
+    Ok(McpToolDescriptor {
+        name: name.to_string(),
+        description: description.map(str::to_string),
+        input_schema: tool.get("inputSchema").cloned(),
+    })
 }
 
 fn render_tool_call_output(result: &Value) -> String {
@@ -367,4 +387,56 @@ fn compact_body(body: &str) -> String {
     } else {
         clip_text_with_ellipsis(&single_line, 243)
     }
+}
+
+pub fn mcp_tools_list_rejects_malformed_tool_descriptors_fixture_passes() -> bool {
+    let valid = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "tools": [
+                {
+                    "name": "inspect_repo",
+                    "description": "Inspect repository state",
+                    "inputSchema": {
+                        "type": "object"
+                    }
+                }
+            ]
+        }
+    });
+    let malformed = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "tools": [
+                {
+                    "description": "descriptor without a typed name",
+                    "inputSchema": {
+                        "type": "object"
+                    }
+                }
+            ]
+        }
+    });
+    let non_string_name = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "tools": [
+                {
+                    "name": 42,
+                    "description": "non-string name"
+                }
+            ]
+        }
+    });
+
+    MCP_TOOLS_LIST_DESCRIPTOR_SCHEMA_VALIDATION_MARKER
+        == "mcp_tools_list_descriptor_schema_validation"
+        && parse_tools(&valid)
+            .map(|tools| tools.len() == 1 && tools[0].name == "inspect_repo")
+            .unwrap_or(false)
+        && parse_tools(&malformed).is_err()
+        && parse_tools(&non_string_name).is_err()
 }

@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 use camino::Utf8PathBuf;
@@ -24,6 +24,7 @@ use moyai::session::EditorContext;
 use moyai::session::SessionStatus;
 use moyai::storage::{SqliteStore, StoragePaths};
 use moyai::tui;
+use tempfile::NamedTempFile;
 
 const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
@@ -412,11 +413,7 @@ async fn run_model_availability_command(args: ModelAvailabilityArgs) -> Result<(
     .await;
     let encoded = serde_json::to_string_pretty(&report).map_err(|error| (4, error.to_string()))?;
     if let Some(output) = args.output.as_ref() {
-        if let Some(parent) = output.parent() {
-            std::fs::create_dir_all(parent.as_std_path())
-                .map_err(|error| (4, error.to_string()))?;
-        }
-        std::fs::write(output.as_std_path(), &encoded).map_err(|error| (4, error.to_string()))?;
+        write_cli_artifact_atomic(output, &encoded).map_err(|error| (4, error))?;
     }
     println!("{encoded}");
     if !matches!(report.status, moyai::llm::ModelAvailabilityStatus::Pass) {
@@ -547,14 +544,9 @@ fn run_harness_command(command: &CliCommand) -> Result<bool, String> {
                     args.scenario_id
                 )),
             };
-            if let Some(parent) = args.output.parent() {
-                std::fs::create_dir_all(parent.as_std_path()).map_err(|error| error.to_string())?;
-            }
-            std::fs::write(
-                args.output.as_std_path(),
-                serde_json::to_string_pretty(&vec![record]).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
+            let encoded =
+                serde_json::to_string_pretty(&vec![record]).map_err(|error| error.to_string())?;
+            write_cli_artifact_atomic(&args.output, &encoded)?;
             println!(
                 "{}",
                 serde_json::json!({
@@ -647,4 +639,22 @@ fn harness_run_status(status: ReplayStatus) -> HarnessRunStatus {
 fn current_utf8_dir() -> Result<Utf8PathBuf, String> {
     Utf8PathBuf::from_path_buf(std::env::current_dir().map_err(|error| error.to_string())?)
         .map_err(|_| "current directory is not valid UTF-8".to_string())
+}
+
+fn write_cli_artifact_atomic(path: &Utf8PathBuf, text: &str) -> Result<(), String> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_str().is_empty() => parent.to_path_buf(),
+        _ => current_utf8_dir()?,
+    };
+    std::fs::create_dir_all(parent.as_std_path()).map_err(|error| error.to_string())?;
+    let mut temp =
+        NamedTempFile::new_in(parent.as_std_path()).map_err(|error| error.to_string())?;
+    temp.write_all(text.as_bytes())
+        .map_err(|error| error.to_string())?;
+    temp.as_file_mut()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temp.persist(path.as_std_path())
+        .map(|_| ())
+        .map_err(|error| error.error.to_string())
 }

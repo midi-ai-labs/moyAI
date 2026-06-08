@@ -386,8 +386,6 @@ pub(crate) fn target_matches_required_output(target: &str, required_targets: &[S
     required_targets.iter().any(|required| {
         let normalized_required = normalize_target(required).to_ascii_lowercase();
         normalized_target == normalized_required
-            || normalized_target.ends_with(&format!("/{normalized_required}"))
-            || normalized_required.ends_with(&format!("/{normalized_target}"))
     })
 }
 

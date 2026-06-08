@@ -4,9 +4,10 @@
 
 - case の履歴、修正理由、残課題は repository root の `docs/logs/manual-st-history.md` を正本とする
 - 日次の判断記録は repository root の `docs/logs/worklog.md` を正本とする
-- current harness 実装とその境界は repository root の `docs/design/verification-harness.md` を正本とする
-- この README と各 `spec.md` は scenario spec / acceptance policy / rerun rule の正本とする
-- ここに置く `spec.md` は「別チャットから case 名で再実行できるようにするための実行仕様」であり、再現手順、入力、合格条件、失敗時ルールを固定する
+- current harness 実装とその境界は repository root の `docs/design/verification-harness.md` を参照する
+- この README と各 `spec.md` は `README.md` / `ProjectBrief.md` の Phase12 route taxonomy を具体化する scenario fixture input / acceptance evidence policy / rerun instruction であり、root authority を上書きしない
+- ここに置く `spec.md` は「別チャットから case 名で再実行できるようにするための実行仕様」であり、再現手順、入力、合格条件、失敗時ルールを固定する。ただし case 名や固有 artifact 名は preflight gate / runtime branch / fixture primary key の正本にしない
+- `manual_ST_exports_removed/` の Markdown export は Codex comparison evidence であり、完成品志向と衝突する縮小語を reference authority として保持しない
 
 収録ケース:
 
@@ -50,4 +51,4 @@ Desktop GUI e2e route taxonomy:
 - residual fix は `Codex` の Thread / Turn / Item protocol、tool lifecycle、control-plane、harness engineering を第一比較基準にし、local LLM 起因に切り分けた場合のみ `Roo Code` を補助比較、`opencode` を第三比較基準にする
 - prompt も製品機能として扱い、仮 wording のまま放置しない
 - 各 case の合格条件は scenario / user-visible contract と harness evidence の gate として扱う。failure handling や detailed regression signal は、そのまま e2e assertion に昇格させず、Failure Registry 登録後に下位 deterministic test へ分解してから固定する
-- 現在の FR21 convergence loop で出た representative manual ST failure は `FR21-xxx` prefix で登録する。既存 `FR-...` / `FR2-...` / `FR03-...` / `FR10-...` は historical evidence として保持する
+- 現在の user override では、新規 representative manual ST failure / route NG / preflight NG は `FR22-YYYY-MM-DD-NNN` prefix で登録する。既存 `FR-...` / `FR2-...` / `FR03-...` / `FR10-...` / `FR20-...` / `FR21-...` は historical evidence として保持する

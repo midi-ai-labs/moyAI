@@ -22,11 +22,33 @@ pub enum SessionStatus {
     Failed,
 }
 
+impl SessionStatus {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::AwaitingUser => "awaiting_user",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     User,
     Assistant,
+}
+
+impl MessageRole {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +63,22 @@ pub enum PartKind {
     DiffSummary,
     PromptDispatch,
     RequestDiagnostics,
+}
+
+impl PartKind {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Reasoning => "reasoning",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+            Self::Image => "image",
+            Self::Error => "error",
+            Self::DiffSummary => "diff_summary",
+            Self::PromptDispatch => "prompt_dispatch",
+            Self::RequestDiagnostics => "request_diagnostics",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +264,8 @@ pub struct ErrorPart {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffSummaryPart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<ToolCallId>,
     pub change_ids: Vec<ChangeId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<FileChangeEvidence>,
@@ -439,10 +479,18 @@ pub struct RequestDiagnosticsPart {
     pub effective_max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_budget_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_tools: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_images: Option<bool>,
     pub system_prompt_chars: usize,
     pub tool_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     pub provider_message_count: usize,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub image_count: usize,
@@ -910,6 +958,10 @@ pub enum RunEvent {
     StateUpdated {
         session_id: SessionId,
         state: SessionStateSnapshot,
+    },
+    LifecycleGuardUpdated {
+        session_id: SessionId,
+        snapshot: crate::protocol::LifecycleGuardSnapshot,
     },
     SessionCompleted {
         session_id: SessionId,

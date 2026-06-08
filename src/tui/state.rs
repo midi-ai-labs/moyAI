@@ -4,9 +4,8 @@ use crate::protocol::{
     turn_items_in_projection_order,
 };
 use crate::session::{
-    DispatchTransformKind, MessageMetadata, MessagePart, MessageRole, PromptDispatchPart, RunEvent,
-    RunSummary, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus, TodoItem,
-    ToolCallId, ToolCallStatus, Transcript,
+    DispatchTransformKind, PromptDispatchPart, RunEvent, RunSummary, SessionId, SessionRecord,
+    SessionStateSnapshot, SessionStatus, TodoItem, ToolCallId, ToolCallStatus,
 };
 use crate::tool::{PermissionRequest, ToolName};
 
@@ -190,43 +189,6 @@ impl Default for AppState {
 }
 
 impl AppState {
-    pub fn load_transcript(
-        &mut self,
-        transcript: &Transcript,
-        state: SessionStateSnapshot,
-        todos: Vec<TodoItem>,
-    ) {
-        self.route = Route::Session;
-        self.current_session_id = Some(transcript.session.id);
-        self.current_session_title = transcript.session.title.clone();
-        self.transcript_entries = transcript_entries_from_transcript(transcript);
-        self.tool_statuses = tool_statuses_from_transcript(transcript);
-        self.run_status = match transcript.session.status {
-            SessionStatus::Idle => RunStatus::Idle,
-            SessionStatus::Running => RunStatus::Running,
-            SessionStatus::Completed => RunStatus::Completed,
-            SessionStatus::AwaitingUser => RunStatus::AwaitingUser,
-            SessionStatus::Cancelled => RunStatus::Cancelled,
-            SessionStatus::Failed => RunStatus::Failed,
-        };
-        self.progress = progress_from_loaded_state(self.run_status, &self.tool_statuses, &todos);
-        self.sidebar_todos = todos;
-        self.session_state = Some(state);
-        self.status_message = self.run_status.default_status_message();
-        self.permission = None;
-        self.prompt_review = None;
-        self.active_assistant_message_id = self.transcript_entries.iter().rev().find_map(|entry| {
-            (entry.kind == TranscriptKind::Assistant)
-                .then_some(entry.message_id)
-                .flatten()
-        });
-        self.active_reasoning_message_id = self.transcript_entries.iter().rev().find_map(|entry| {
-            (entry.kind == TranscriptKind::Reasoning)
-                .then_some(entry.message_id)
-                .flatten()
-        });
-    }
-
     pub fn load_turn_items(
         &mut self,
         session: &SessionRecord,
@@ -473,6 +435,15 @@ impl AppState {
             RunEvent::StateUpdated { state, .. } => {
                 self.session_state = Some(state.clone());
                 self.progress.current_phase = format!("{:?}", state.process_phase).to_lowercase();
+            }
+            RunEvent::LifecycleGuardUpdated { snapshot, .. } => {
+                self.progress.current_phase = "lifecycle_guard".to_string();
+                self.progress.active_step = format!(
+                    "Lifecycle guard updated: counters={} flags={} targets={}",
+                    snapshot.counters.len(),
+                    snapshot.active_flags.len(),
+                    snapshot.scoped_targets.len()
+                );
             }
             RunEvent::SessionCompleted { .. } => {
                 self.run_status = RunStatus::Completed;
@@ -846,116 +817,10 @@ fn prompt_dispatch_summary(prompt_dispatch: &PromptDispatchPart) -> String {
     lines.join("\n")
 }
 
-pub fn transcript_entries_from_transcript(transcript: &Transcript) -> Vec<TranscriptEntry> {
-    let mut entries = Vec::new();
-    for message in &transcript.messages {
-        let role_title = match message.record.role {
-            MessageRole::User => "User",
-            MessageRole::Assistant => "Assistant",
-        };
-        for part in &message.parts {
-            match &part.payload {
-                MessagePart::Text(value) => entries.push(TranscriptEntry {
-                    kind: match message.record.role {
-                        MessageRole::User => TranscriptKind::User,
-                        MessageRole::Assistant => TranscriptKind::Assistant,
-                    },
-                    title: role_title.to_string(),
-                    body: value.text.clone(),
-                    message_id: Some(message.record.id),
-                    tool_call_id: None,
-                }),
-                MessagePart::Image(value) => entries.push(TranscriptEntry {
-                    kind: TranscriptKind::User,
-                    title: "Image Attachment".to_string(),
-                    body: match &value.source_path {
-                        Some(path) => {
-                            format!("{} ({} bytes)\n{}", path, value.byte_len, value.mime_type)
-                        }
-                        None => format!("{} bytes\n{}", value.byte_len, value.mime_type),
-                    },
-                    message_id: Some(message.record.id),
-                    tool_call_id: None,
-                }),
-                MessagePart::Reasoning(value) => entries.push(TranscriptEntry {
-                    kind: TranscriptKind::Reasoning,
-                    title: "Reasoning".to_string(),
-                    body: value.text.clone(),
-                    message_id: Some(message.record.id),
-                    tool_call_id: None,
-                }),
-                MessagePart::ToolCall(value) => entries.push(TranscriptEntry {
-                    kind: transcript_kind_for_tool_pending(value.tool_name),
-                    title: pending_tool_transcript_title(value.tool_name).to_string(),
-                    body: format!("arguments: {}", value.arguments_json),
-                    message_id: Some(message.record.id),
-                    tool_call_id: Some(value.tool_call_id),
-                }),
-                MessagePart::ToolResult(value) => entries.push(TranscriptEntry {
-                    kind: if value.status == ToolCallStatus::Failed {
-                        TranscriptKind::Error
-                    } else {
-                        TranscriptKind::Tool
-                    },
-                    title: if value.status == ToolCallStatus::Failed {
-                        value.title.clone()
-                    } else {
-                        "実行済コマンド".to_string()
-                    },
-                    body: if value.status == ToolCallStatus::Failed {
-                        value.summary.clone()
-                    } else {
-                        format!("{}\n{}", value.title, value.summary)
-                    },
-                    message_id: Some(message.record.id),
-                    tool_call_id: Some(value.tool_call_id),
-                }),
-                MessagePart::Error(value) => entries.push(TranscriptEntry {
-                    kind: TranscriptKind::Error,
-                    title: "Error".to_string(),
-                    body: value.message.clone(),
-                    message_id: Some(message.record.id),
-                    tool_call_id: None,
-                }),
-                MessagePart::DiffSummary(value) => entries.push(TranscriptEntry {
-                    kind: TranscriptKind::Diff,
-                    title: "ファイルが変更されました".to_string(),
-                    body: value.summary.clone(),
-                    message_id: Some(message.record.id),
-                    tool_call_id: None,
-                }),
-                MessagePart::PromptDispatch(value) => {
-                    if should_render_prompt_dispatch_summary(value) {
-                        entries.push(TranscriptEntry {
-                            kind: TranscriptKind::System,
-                            title: "Prompt Review".to_string(),
-                            body: prompt_dispatch_summary(value),
-                            message_id: Some(message.record.id),
-                            tool_call_id: None,
-                        });
-                    }
-                }
-                MessagePart::RequestDiagnostics(_) => {}
-            }
-        }
-        if matches!(&message.record.metadata, MessageMetadata::Assistant(_))
-            && message.parts.is_empty()
-        {
-            entries.push(TranscriptEntry {
-                kind: TranscriptKind::Assistant,
-                title: role_title.to_string(),
-                body: String::new(),
-                message_id: Some(message.record.id),
-                tool_call_id: None,
-            });
-        }
-    }
-    entries
-}
-
 pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<TranscriptEntry> {
     turn_items_in_projection_order(turn_items)
         .into_iter()
+        .filter(|item| !item.payload.is_internal_projection_only())
         .filter_map(|item| match &item.payload {
             TurnItemPayload::UserMessage { text } => Some(TranscriptEntry {
                 kind: TranscriptKind::User,
@@ -978,15 +843,10 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
                 message_id: None,
                 tool_call_id: None,
             }),
-            TurnItemPayload::Plan { summary }
-            | TurnItemPayload::PromptDispatch { summary }
-            | TurnItemPayload::State { summary } => Some(TranscriptEntry {
-                kind: TranscriptKind::System,
-                title: "Context".to_string(),
-                body: summary.clone(),
-                message_id: None,
-                tool_call_id: None,
-            }),
+            TurnItemPayload::Plan { .. }
+            | TurnItemPayload::PromptDispatch { .. }
+            | TurnItemPayload::State { .. }
+            | TurnItemPayload::LifecycleGuard { .. } => None,
             TurnItemPayload::ContextCompaction { summary } => Some(TranscriptEntry {
                 kind: TranscriptKind::System,
                 title: "Context Compaction".to_string(),
@@ -1020,13 +880,16 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
                 tool_call_id: Some(*call_id),
             }),
             TurnItemPayload::FileChange {
-                changes, summary, ..
+                call_id,
+                changes,
+                summary,
+                ..
             } => Some(TranscriptEntry {
                 kind: TranscriptKind::Diff,
                 title: format!("{}個のファイルが変更されました", changes.len()),
                 body: summary.clone(),
                 message_id: None,
-                tool_call_id: None,
+                tool_call_id: Some(*call_id),
             }),
             TurnItemPayload::ApprovalRequest { summary, .. } => Some(TranscriptEntry {
                 kind: TranscriptKind::System,
@@ -1174,6 +1037,87 @@ pub(crate) fn tui_turn_item_projection_uses_turn_local_sequence_fixture_passes()
         == vec![first_call, second_call]
 }
 
+pub fn tui_primary_transcript_omits_internal_projection_items_fixture_passes() -> bool {
+    let turn_id = crate::protocol::TurnId::new();
+    let session_id = SessionId::new();
+    let items = vec![
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 1,
+            payload: TurnItemPayload::UserMessage {
+                text: "build the artifact".to_string(),
+            },
+        },
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 2,
+            payload: TurnItemPayload::Plan {
+                summary: "internal plan cache".to_string(),
+            },
+        },
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 3,
+            payload: TurnItemPayload::PromptDispatch {
+                summary: "prompt dispatch cache".to_string(),
+            },
+        },
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 4,
+            payload: TurnItemPayload::State {
+                summary: "state cache".to_string(),
+            },
+        },
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 5,
+            payload: TurnItemPayload::LifecycleGuard {
+                summary: "guard cache".to_string(),
+            },
+        },
+        TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 6,
+            payload: TurnItemPayload::AgentMessage {
+                text: "done".to_string(),
+            },
+        },
+    ];
+    let entries = transcript_entries_from_turn_items(&items);
+    let rendered = entries
+        .iter()
+        .map(|entry| format!("{}:{}", entry.title, entry.body))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    entries.len() == 2
+        && matches!(entries.first(), Some(entry) if entry.kind == TranscriptKind::User)
+        && matches!(entries.last(), Some(entry) if entry.kind == TranscriptKind::Assistant)
+        && !rendered.contains("internal plan cache")
+        && !rendered.contains("prompt dispatch cache")
+        && !rendered.contains("state cache")
+        && !rendered.contains("guard cache")
+}
+
 fn session_tool_status_from_lifecycle(status: ToolLifecycleStatus) -> ToolCallStatus {
     match status {
         ToolLifecycleStatus::Pending
@@ -1199,44 +1143,9 @@ mod tests {
     fn tui_turn_item_projection_uses_turn_local_sequence() {
         assert!(super::tui_turn_item_projection_uses_turn_local_sequence_fixture_passes());
     }
-}
 
-pub fn tool_statuses_from_transcript(transcript: &Transcript) -> Vec<ToolStatusView> {
-    let mut statuses = Vec::new();
-    for message in &transcript.messages {
-        for part in &message.parts {
-            match &part.payload {
-                MessagePart::ToolCall(value) => {
-                    update_tool_status(
-                        &mut statuses,
-                        value.tool_call_id,
-                        value.tool_name,
-                        &value.tool_name.to_string(),
-                        ToolCallStatus::Pending,
-                        None,
-                        None,
-                    );
-                }
-                MessagePart::ToolResult(value) => {
-                    update_tool_status(
-                        &mut statuses,
-                        value.tool_call_id,
-                        ToolName::Invalid,
-                        &value.title,
-                        value.status,
-                        (value.status != ToolCallStatus::Failed).then_some(value.summary.clone()),
-                        (value.status == ToolCallStatus::Failed).then_some(value.summary.clone()),
-                    );
-                }
-                MessagePart::PromptDispatch(_)
-                | MessagePart::Text(_)
-                | MessagePart::Image(_)
-                | MessagePart::Reasoning(_)
-                | MessagePart::Error(_)
-                | MessagePart::DiffSummary(_)
-                | MessagePart::RequestDiagnostics(_) => {}
-            }
-        }
+    #[test]
+    fn tui_primary_transcript_omits_internal_projection_items() {
+        assert!(super::tui_primary_transcript_omits_internal_projection_items_fixture_passes());
     }
-    statuses
 }

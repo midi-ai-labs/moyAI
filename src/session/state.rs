@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
+
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::tool::ToolName;
 
@@ -17,6 +20,19 @@ pub enum TaskRoute {
     Summary,
 }
 
+impl TaskRoute {
+    pub fn key(self) -> &'static str {
+        match self {
+            TaskRoute::Code => "code",
+            TaskRoute::Docs => "docs",
+            TaskRoute::Review => "review",
+            TaskRoute::Debug => "debug",
+            TaskRoute::Ask => "ask",
+            TaskRoute::Summary => "summary",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessPhase {
@@ -26,6 +42,18 @@ pub enum ProcessPhase {
     Verify,
     Repair,
     Closeout,
+}
+
+impl ProcessPhase {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Discover => "discover",
+            Self::Author => "author",
+            Self::Verify => "verify",
+            Self::Repair => "repair",
+            Self::Closeout => "closeout",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +106,12 @@ pub struct ContinuationContract {
     pub completion_blocker: Option<String>,
     #[serde(default)]
     pub invariant_refs: Vec<String>,
+    #[serde(default)]
+    pub lifecycle_guard_snapshot_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_guard_snapshot_payload: Option<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lifecycle_guard_snapshot_metadata: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -19,7 +19,8 @@ use crate::llm::dto::{
 };
 use crate::llm::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary, ModelCapabilities,
-    ModelMessage, ModelProfile, ToolSchema,
+    ModelMessage, ModelProfile, ProviderToolChoice, ToolSchema,
+    tool_surface_scoped_parallel_tool_calls_projection,
 };
 use crate::session::{FinishReason, TokenUsage};
 use crate::tool::truncate::clip_text_with_ellipsis;
@@ -212,16 +213,18 @@ impl LlmClient for OpenAiCompatClient {
                                     entry.arguments.push_str(&arguments);
                                 }
                             }
-                            let (call_id, tool_name) = entry.stable_projection(delta_index);
+                            let call_id = entry.stable_call_id(delta_index);
                             if !entry.started {
-                                sink.push(LlmEvent::ToolCallStart {
-                                    call_id: call_id.clone(),
-                                    tool_name: tool_name.clone(),
-                                })?;
-                                emitted_events += 1;
-                                entry.started = true;
+                                if let Some(tool_name) = entry.typed_tool_name() {
+                                    sink.push(LlmEvent::ToolCallStart {
+                                        call_id: call_id.clone(),
+                                        tool_name,
+                                    })?;
+                                    emitted_events += 1;
+                                    entry.started = true;
+                                }
                             }
-                            if !entry.arguments.is_empty() {
+                            if entry.started && !entry.arguments.is_empty() {
                                 sink.push(LlmEvent::ToolCallArgsDelta {
                                     call_id,
                                     delta: entry.arguments_delta(),
@@ -239,6 +242,12 @@ impl LlmClient for OpenAiCompatClient {
 
             if ended_by_eof && !saw_terminal_signal {
                 return Err(stream_missing_terminal_signal_error());
+            }
+
+            for (delta_index, entry) in tool_calls.iter() {
+                if !entry.started && !entry.arguments.is_empty() {
+                    return Err(stream_missing_tool_name_error(*delta_index));
+                }
             }
 
             let finish_reason = finish_reason.unwrap_or(FinishReason::Stop);
@@ -384,6 +393,12 @@ fn stream_missing_terminal_signal_error() -> LlmError {
     LlmError::Message(
         "openai-compatible stream ended without terminal [DONE] event or finish_reason".to_string(),
     )
+}
+
+fn stream_missing_tool_name_error(delta_index: usize) -> LlmError {
+    LlmError::Message(format!(
+        "openai-compatible stream ended with tool-call arguments but no function.name for delta index {delta_index}"
+    ))
 }
 
 async fn sleep_retry_delay(delay_ms: u64, cancel: &CancellationToken) -> bool {
@@ -536,7 +551,7 @@ struct PartialToolCall {
 }
 
 impl PartialToolCall {
-    fn stable_projection(&mut self, delta_index: usize) -> (String, String) {
+    fn stable_call_id(&mut self, delta_index: usize) -> String {
         if self.projected_call_id.is_none() {
             self.projected_call_id = Some(
                 self.call_id
@@ -544,17 +559,24 @@ impl PartialToolCall {
                     .unwrap_or_else(|| format!("tool_call_{delta_index}")),
             );
         }
+        self.projected_call_id.clone().unwrap_or_default()
+    }
+
+    fn typed_tool_name(&mut self) -> Option<String> {
         if self.projected_tool_name.is_none() {
-            self.projected_tool_name = Some(
-                self.tool_name
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-            );
+            if let Some(tool_name) = self.tool_name.clone() {
+                self.projected_tool_name = Some(tool_name);
+            }
         }
-        (
-            self.projected_call_id.clone().unwrap_or_default(),
-            self.projected_tool_name.clone().unwrap_or_default(),
-        )
+        self.projected_tool_name.clone()
+    }
+
+    fn stable_projection(&mut self, delta_index: usize) -> (String, String) {
+        let call_id = self.stable_call_id(delta_index);
+        let tool_name = self
+            .typed_tool_name()
+            .unwrap_or_else(|| "unknown".to_string());
+        (call_id, tool_name)
     }
 
     fn arguments_delta(&mut self) -> String {
@@ -575,12 +597,34 @@ pub(crate) fn streaming_tool_call_projection_uses_delta_index_stable_ids_fixture
     let second_projection = second.stable_projection(1);
 
     first_projection == ("tool_call_0".to_string(), "unknown".to_string())
-        && first_late_projection == first_projection
+        && first_late_projection == ("tool_call_0".to_string(), "write".to_string())
         && second_projection == ("tool_call_1".to_string(), "unknown".to_string())
         && first_projection.0 != second_projection.0
 }
 
+pub fn streaming_tool_call_late_name_preserves_typed_tool_identity_fixture_passes() -> bool {
+    let mut call = PartialToolCall::default();
+    call.arguments.push_str("{\"path\":\"src/main.rs\"}");
+    let early_call_id = call.stable_call_id(0);
+    let no_typed_name_before_name_delta = call.typed_tool_name().is_none();
+    let buffered_without_emission = call.emitted_len == 0;
+    call.tool_name = Some("write".to_string());
+    let typed_name = call.typed_tool_name();
+    let flushed_delta = call.arguments_delta();
+
+    early_call_id == "tool_call_0"
+        && no_typed_name_before_name_delta
+        && buffered_without_emission
+        && typed_name.as_deref() == Some("write")
+        && call.stable_call_id(0) == early_call_id
+        && flushed_delta == "{\"path\":\"src/main.rs\"}"
+        && stream_missing_tool_name_error(0)
+            .to_string()
+            .contains("tool-call arguments but no function.name")
+}
+
 fn to_openai_request(request: &ChatRequest) -> Result<Value, LlmError> {
+    request.validate_provider_lifecycle()?;
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
     let mut system_segments = vec![request.provider_system_prompt()];
     let mut non_system_messages = Vec::with_capacity(request.messages.len());
@@ -682,25 +726,76 @@ fn to_openai_request(request: &ChatRequest) -> Result<Value, LlmError> {
         frequency_penalty: request.frequency_penalty,
         seed: request.seed,
         stop_sequences: request.stop_sequences.clone(),
-        tools: request
-            .tools
-            .iter()
-            .map(|tool| OpenAiToolSchema {
-                schema_type: "function".to_string(),
-                function: OpenAiFunctionSchema {
-                    name: tool.name.clone(),
-                    description: tool.description.clone(),
-                    parameters: tool.input_schema.clone(),
-                    strict: tool.strict.then_some(true),
-                },
-            })
-            .collect(),
+        tools: request.tools.iter().map(openai_tool_schema).collect(),
+        parallel_tool_calls: tool_surface_scoped_parallel_tool_calls_projection(
+            request.tools.len(),
+            request.parallel_tool_calls,
+        ),
     };
     let mut body = serde_json::to_value(base)?;
     if let Some(extra) = &request.extra_body {
         merge_extra_body(&mut body, extra.clone());
     }
+    if let Some(tool_choice) = request
+        .tool_choice
+        .as_ref()
+        .map(|choice| provider_tool_choice_json(choice, request.model.provider_metadata_mode))
+        && let Value::Object(base_map) = &mut body
+    {
+        base_map.insert("tool_choice".to_string(), tool_choice);
+    }
     Ok(body)
+}
+
+pub(crate) fn provider_tool_choice_json(
+    tool_choice: &ProviderToolChoice,
+    provider_metadata_mode: ProviderMetadataMode,
+) -> Value {
+    match tool_choice {
+        ProviderToolChoice::Required => serde_json::json!("required"),
+        ProviderToolChoice::Named { name } => match provider_metadata_mode {
+            ProviderMetadataMode::LmStudioNativeRequired => serde_json::json!("required"),
+            ProviderMetadataMode::OpenAiCompatibleOnly => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": name
+                }
+            }),
+        },
+    }
+}
+
+fn openai_tool_schema(tool: &ToolSchema) -> OpenAiToolSchema {
+    OpenAiToolSchema {
+        schema_type: "function".to_string(),
+        function: OpenAiFunctionSchema {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters: tool.input_schema.clone(),
+            strict: tool.strict.then_some(true),
+        },
+    }
+}
+
+pub(crate) fn openai_tool_schema_json(tool: &ToolSchema) -> Result<Value, LlmError> {
+    Ok(serde_json::to_value(openai_tool_schema(tool))?)
+}
+
+pub(crate) fn provider_metadata_mode_serializes_named_tool_choice_fixture_passes() -> bool {
+    let choice = ProviderToolChoice::Named {
+        name: "shell".to_string(),
+    };
+    let lm_studio =
+        provider_tool_choice_json(&choice, ProviderMetadataMode::LmStudioNativeRequired);
+    let openai_compatible =
+        provider_tool_choice_json(&choice, ProviderMetadataMode::OpenAiCompatibleOnly);
+
+    lm_studio == serde_json::json!("required")
+        && openai_compatible
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            == Some("shell")
 }
 
 fn apply_extra_headers(
@@ -722,6 +817,9 @@ fn merge_extra_body(base: &mut Value, extra: Value) {
     match (base, extra) {
         (Value::Object(base_map), Value::Object(extra_map)) => {
             for (key, value) in extra_map {
+                if is_runtime_owned_openai_request_key(&key) {
+                    continue;
+                }
                 base_map.insert(key, value);
             }
         }
@@ -732,26 +830,48 @@ fn merge_extra_body(base: &mut Value, extra: Value) {
     }
 }
 
+fn is_runtime_owned_openai_request_key(key: &str) -> bool {
+    matches!(
+        key,
+        "model"
+            | "stream"
+            | "messages"
+            | "max_tokens"
+            | "temperature"
+            | "top_p"
+            | "top_k"
+            | "presence_penalty"
+            | "frequency_penalty"
+            | "seed"
+            | "stop"
+            | "tools"
+            | "tool_choice"
+            | "parallel_tool_calls"
+    )
+}
+
 pub(crate) fn payload_merges_provider_policy_and_runtime_system_control_fixture_passes() -> bool {
+    let fixture_marker = "openai_compat_fixture_language_neutral";
     let request = ChatRequest {
         model: ModelProfile {
-            name: "qwen3.6-35b-a3b-4bit".to_string(),
+            name: "openai-compatible-fixture-model".to_string(),
             context_window: 131_072,
             max_output_tokens: 8_192,
             provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
             capabilities: ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: false,
+                supports_images: false,
             },
         },
-        base_url: "http://127.0.0.1:8110".to_string(),
+        base_url: "http://openai-compatible.fixture.invalid".to_string(),
         system_prompt: "Base coding prompt".to_string(),
         messages: vec![
             ModelMessage::System {
                 content: "Turn control projection surface: prompt".to_string(),
             },
             ModelMessage::User {
-                content: "Create calculator.py and test_calculator.py".to_string(),
+                content: "Create src/workflow.rs and tests/workflow.contract".to_string(),
             },
             ModelMessage::System {
                 content: "Open-obligation final-message recovery".to_string(),
@@ -769,6 +889,10 @@ pub(crate) fn payload_merges_provider_policy_and_runtime_system_control_fixture_
             }),
             strict: false,
         }],
+        tool_choice: Some(ProviderToolChoice::Named {
+            name: "apply_patch".to_string(),
+        }),
+        parallel_tool_calls: false,
         timeout_ms: 30_000,
         stream_idle_timeout_ms: 300_000,
         stream_max_retries: 0,
@@ -806,6 +930,430 @@ pub(crate) fn payload_merges_provider_policy_and_runtime_system_control_fixture_
         && system_prompt.contains("Base coding prompt")
         && system_prompt.contains("Turn control projection surface: prompt")
         && system_prompt.contains("Open-obligation final-message recovery")
+        && fixture_marker == "openai_compat_fixture_language_neutral"
+}
+
+pub(crate) fn provider_extra_body_cannot_override_runtime_request_fields_fixture_passes() -> bool {
+    let request = ChatRequest {
+        model: ModelProfile {
+            name: "openai-compatible-fixture-model".to_string(),
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
+            },
+        },
+        base_url: "http://openai-compatible.fixture.invalid".to_string(),
+        system_prompt: "Base coding prompt".to_string(),
+        messages: vec![ModelMessage::User {
+            content: "Create src/workflow.rs".to_string(),
+        }],
+        tools: vec![ToolSchema {
+            name: "apply_patch".to_string(),
+            description: "apply a patch".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["patch_text"],
+                "properties": {
+                    "patch_text": {"type": "string"}
+                }
+            }),
+            strict: false,
+        }],
+        tool_choice: Some(ProviderToolChoice::Named {
+            name: "apply_patch".to_string(),
+        }),
+        parallel_tool_calls: false,
+        timeout_ms: 30_000,
+        stream_idle_timeout_ms: 300_000,
+        stream_max_retries: 0,
+        extra_headers: BTreeMap::new(),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        stop_sequences: Vec::new(),
+        extra_body: Some(serde_json::json!({
+            "tool_choice": "required",
+            "tools": [],
+            "messages": [],
+            "model": "other-model",
+            "max_tokens": 1,
+            "num_ctx": 131072
+        })),
+    };
+
+    let Ok(body) = to_openai_request(&request) else {
+        return false;
+    };
+    let tool_names = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    body.get("tool_choice")
+        .and_then(|value| value.get("function"))
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        == Some("apply_patch")
+        && body.get("num_ctx").and_then(Value::as_u64) == Some(131_072)
+        && body.get("model").and_then(Value::as_str) == Some("openai-compatible-fixture-model")
+        && body.get("max_tokens").and_then(Value::as_u64) == Some(8_192)
+        && body
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| !messages.is_empty())
+        && tool_names == vec!["apply_patch"]
+}
+
+pub(crate) fn provider_extra_body_cannot_override_parallel_tool_calls_fixture_passes() -> bool {
+    let request = ChatRequest {
+        model: ModelProfile {
+            name: "openai-compatible-fixture-model".to_string(),
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
+            },
+        },
+        base_url: "http://openai-compatible.fixture.invalid".to_string(),
+        system_prompt: "Base coding prompt".to_string(),
+        messages: vec![ModelMessage::User {
+            content: "Create src/workflow.rs".to_string(),
+        }],
+        tools: vec![ToolSchema {
+            name: "apply_patch".to_string(),
+            description: "apply a patch".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["patch_text"],
+                "properties": {
+                    "patch_text": {"type": "string"}
+                }
+            }),
+            strict: false,
+        }],
+        tool_choice: Some(ProviderToolChoice::Named {
+            name: "apply_patch".to_string(),
+        }),
+        parallel_tool_calls: true,
+        timeout_ms: 30_000,
+        stream_idle_timeout_ms: 300_000,
+        stream_max_retries: 0,
+        extra_headers: BTreeMap::new(),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        stop_sequences: Vec::new(),
+        extra_body: Some(serde_json::json!({
+            "parallel_tool_calls": false,
+            "num_ctx": 131072
+        })),
+    };
+
+    let Ok(body) = to_openai_request(&request) else {
+        return false;
+    };
+
+    body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(true)
+        && body.get("num_ctx").and_then(Value::as_u64) == Some(131_072)
+}
+
+pub(crate) fn provider_payload_preserves_parallel_tool_calls_false_fixture_passes() -> bool {
+    let request = ChatRequest {
+        model: ModelProfile {
+            name: "openai-compatible-fixture-model".to_string(),
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
+            },
+        },
+        base_url: "http://openai-compatible.fixture.invalid".to_string(),
+        system_prompt: "Base coding prompt".to_string(),
+        messages: vec![ModelMessage::User {
+            content: "Create src/workflow.rs".to_string(),
+        }],
+        tools: vec![ToolSchema {
+            name: "apply_patch".to_string(),
+            description: "apply a patch".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["patch_text"],
+                "properties": {
+                    "patch_text": {"type": "string"}
+                }
+            }),
+            strict: false,
+        }],
+        tool_choice: None,
+        parallel_tool_calls: false,
+        timeout_ms: 30_000,
+        stream_idle_timeout_ms: 300_000,
+        stream_max_retries: 0,
+        extra_headers: BTreeMap::new(),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        stop_sequences: Vec::new(),
+        extra_body: Some(serde_json::json!({
+            "parallel_tool_calls": true,
+            "num_ctx": 131072
+        })),
+    };
+
+    let Ok(body) = to_openai_request(&request) else {
+        return false;
+    };
+
+    body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
+        && body.get("num_ctx").and_then(Value::as_u64) == Some(131_072)
+}
+
+pub(crate) fn provider_payload_omits_parallel_tool_calls_without_tool_surface_fixture_passes()
+-> bool {
+    let request = ChatRequest {
+        model: ModelProfile {
+            name: "openai-compatible-fixture-model".to_string(),
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
+            },
+        },
+        base_url: "http://openai-compatible.fixture.invalid".to_string(),
+        system_prompt: "Base coding prompt".to_string(),
+        messages: vec![ModelMessage::User {
+            content: "Summarize the completed work.".to_string(),
+        }],
+        tools: Vec::new(),
+        tool_choice: None,
+        parallel_tool_calls: false,
+        timeout_ms: 30_000,
+        stream_idle_timeout_ms: 300_000,
+        stream_max_retries: 0,
+        extra_headers: BTreeMap::new(),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        stop_sequences: Vec::new(),
+        extra_body: Some(serde_json::json!({
+            "parallel_tool_calls": true,
+            "num_ctx": 131072
+        })),
+    };
+
+    let Ok(body) = to_openai_request(&request) else {
+        return false;
+    };
+
+    body.get("parallel_tool_calls").is_none()
+        && body.get("num_ctx").and_then(Value::as_u64) == Some(131_072)
+}
+
+pub(crate) fn chat_request_tool_lifecycle_fields_match_tool_surface_fixture_passes() -> bool {
+    let base = ChatRequest {
+        model: ModelProfile {
+            name: "openai-compatible-fixture-model".to_string(),
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
+            },
+        },
+        base_url: "http://openai-compatible.fixture.invalid".to_string(),
+        system_prompt: "Base coding prompt".to_string(),
+        messages: vec![ModelMessage::User {
+            content: "Create src/workflow.rs".to_string(),
+        }],
+        tools: Vec::new(),
+        tool_choice: None,
+        parallel_tool_calls: false,
+        timeout_ms: 30_000,
+        stream_idle_timeout_ms: 300_000,
+        stream_max_retries: 0,
+        extra_headers: BTreeMap::new(),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        stop_sequences: Vec::new(),
+        extra_body: None,
+    };
+
+    let mut required_without_tools = base.clone();
+    required_without_tools.tool_choice = Some(ProviderToolChoice::Required);
+
+    let mut parallel_without_tools = base.clone();
+    parallel_without_tools.parallel_tool_calls = true;
+
+    let mut named_missing_tool = base.clone();
+    named_missing_tool.tools = vec![ToolSchema {
+        name: "apply_patch".to_string(),
+        description: "apply a patch".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["patch_text"],
+            "properties": {
+                "patch_text": {"type": "string"}
+            }
+        }),
+        strict: false,
+    }];
+    named_missing_tool.tool_choice = Some(ProviderToolChoice::Named {
+        name: "shell".to_string(),
+    });
+
+    let mut valid_named_parallel = named_missing_tool.clone();
+    valid_named_parallel.tool_choice = Some(ProviderToolChoice::Named {
+        name: "apply_patch".to_string(),
+    });
+    valid_named_parallel.parallel_tool_calls = true;
+
+    to_openai_request(&required_without_tools).is_err()
+        && to_openai_request(&parallel_without_tools).is_err()
+        && to_openai_request(&named_missing_tool).is_err()
+        && to_openai_request(&valid_named_parallel)
+            .ok()
+            .and_then(|body| body.get("parallel_tool_calls").and_then(Value::as_bool))
+            == Some(true)
+}
+
+pub(crate) fn chat_request_image_parts_require_vision_capability_fixture_passes() -> bool {
+    let mut request = ChatRequest {
+        model: ModelProfile {
+            name: "openai-compatible-fixture-model".to_string(),
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
+            },
+        },
+        base_url: "http://openai-compatible.fixture.invalid".to_string(),
+        system_prompt: "Base coding prompt".to_string(),
+        messages: vec![ModelMessage::UserParts {
+            parts: vec![
+                crate::llm::ModelContentPart::Text {
+                    text: "Inspect this image.".to_string(),
+                },
+                crate::llm::ModelContentPart::Image {
+                    mime_type: "image/png".to_string(),
+                    data_base64: "aW1hZ2U=".to_string(),
+                },
+            ],
+        }],
+        tools: Vec::new(),
+        tool_choice: None,
+        parallel_tool_calls: false,
+        timeout_ms: 30_000,
+        stream_idle_timeout_ms: 300_000,
+        stream_max_retries: 0,
+        extra_headers: BTreeMap::new(),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        stop_sequences: Vec::new(),
+        extra_body: None,
+    };
+
+    let non_vision_rejected = to_openai_request(&request).is_err();
+    request.model.capabilities.supports_images = true;
+    non_vision_rejected && to_openai_request(&request).is_ok()
+}
+
+pub(crate) fn chat_request_tools_require_tool_capability_fixture_passes() -> bool {
+    let mut request = ChatRequest {
+        model: ModelProfile {
+            name: "openai-compatible-fixture-model".to_string(),
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: false,
+                supports_reasoning: false,
+                supports_images: false,
+            },
+        },
+        base_url: "http://openai-compatible.fixture.invalid".to_string(),
+        system_prompt: "Base coding prompt".to_string(),
+        messages: vec![ModelMessage::User {
+            content: "Create src/workflow.rs".to_string(),
+        }],
+        tools: vec![ToolSchema {
+            name: "apply_patch".to_string(),
+            description: "apply a patch".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["patch_text"],
+                "properties": {
+                    "patch_text": {"type": "string"}
+                }
+            }),
+            strict: false,
+        }],
+        tool_choice: None,
+        parallel_tool_calls: false,
+        timeout_ms: 30_000,
+        stream_idle_timeout_ms: 300_000,
+        stream_max_retries: 0,
+        extra_headers: BTreeMap::new(),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        stop_sequences: Vec::new(),
+        extra_body: None,
+    };
+
+    let non_tool_rejected = to_openai_request(&request).is_err();
+    request.model.capabilities.supports_tools = true;
+    non_tool_rejected && to_openai_request(&request).is_ok()
 }
 
 fn parse_finish_reason(value: &str) -> FinishReason {
@@ -871,25 +1419,30 @@ mod tests {
     use super::to_openai_request;
     use crate::config::ProviderMetadataMode;
     use crate::llm::contract::OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY;
-    use crate::llm::{ChatRequest, ModelCapabilities, ModelMessage, ModelProfile, ToolSchema};
+    use crate::llm::{
+        ChatRequest, ModelCapabilities, ModelMessage, ModelProfile, ProviderToolChoice, ToolSchema,
+    };
 
     #[test]
     fn openai_compatible_only_payload_sends_language_policy_as_system_prompt() {
         let request = ChatRequest {
             model: ModelProfile {
-                name: "qwen3.6-35b-a3b-4bit".to_string(),
+                name: "openai-compatible-fixture-model".to_string(),
                 context_window: 131_072,
                 max_output_tokens: 8_192,
                 provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
                 capabilities: ModelCapabilities {
                     supports_tools: true,
                     supports_reasoning: false,
+                    supports_images: false,
                 },
             },
-            base_url: "http://127.0.0.1:8110".to_string(),
+            base_url: "http://openai-compatible.fixture.invalid".to_string(),
             system_prompt: "Base coding prompt".to_string(),
             messages: Vec::new(),
             tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: false,
             timeout_ms: 30_000,
             stream_idle_timeout_ms: 300_000,
             stream_max_retries: 0,
@@ -915,19 +1468,20 @@ mod tests {
     fn tool_enabled_payload_uses_configured_output_budget() {
         let mut request = ChatRequest {
             model: ModelProfile {
-                name: "qwen3.6-35b-a3b-4bit".to_string(),
+                name: "openai-compatible-fixture-model".to_string(),
                 context_window: 131_072,
                 max_output_tokens: 131_072,
                 provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
                 capabilities: ModelCapabilities {
                     supports_tools: true,
                     supports_reasoning: false,
+                    supports_images: false,
                 },
             },
-            base_url: "http://127.0.0.1:8110".to_string(),
+            base_url: "http://openai-compatible.fixture.invalid".to_string(),
             system_prompt: "Base coding prompt".to_string(),
             messages: vec![ModelMessage::User {
-                content: "Create test_component.py".to_string(),
+                content: "Create src/workflow.rs".to_string(),
             }],
             tools: vec![ToolSchema {
                 name: "write".to_string(),
@@ -942,6 +1496,8 @@ mod tests {
                 }),
                 strict: false,
             }],
+            tool_choice: Some(ProviderToolChoice::Required),
+            parallel_tool_calls: true,
             timeout_ms: 30_000,
             stream_idle_timeout_ms: 300_000,
             stream_max_retries: 0,
@@ -953,11 +1509,13 @@ mod tests {
             frequency_penalty: None,
             seed: None,
             stop_sequences: Vec::new(),
-            extra_body: Some(serde_json::json!({"tool_choice": "required"})),
+            extra_body: None,
         };
 
         let tool_body = to_openai_request(&request).expect("request serialization succeeds");
         request.tools.clear();
+        request.tool_choice = None;
+        request.parallel_tool_calls = false;
         request.extra_body = None;
         let no_tool_body = to_openai_request(&request).expect("request serialization succeeds");
 
@@ -971,23 +1529,24 @@ mod tests {
 
         let request = ChatRequest {
             model: ModelProfile {
-                name: "qwen3.6-35b-a3b-4bit".to_string(),
+                name: "openai-compatible-fixture-model".to_string(),
                 context_window: 131_072,
                 max_output_tokens: 8_192,
                 provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
                 capabilities: ModelCapabilities {
                     supports_tools: true,
                     supports_reasoning: false,
+                    supports_images: false,
                 },
             },
-            base_url: "http://127.0.0.1:8110".to_string(),
+            base_url: "http://openai-compatible.fixture.invalid".to_string(),
             system_prompt: "Base coding prompt".to_string(),
             messages: vec![
                 ModelMessage::System {
                     content: "Turn control projection surface: prompt".to_string(),
                 },
                 ModelMessage::User {
-                    content: "Create calculator.py and test_calculator.py".to_string(),
+                    content: "Create src/workflow.rs and tests/workflow.contract".to_string(),
                 },
                 ModelMessage::System {
                     content: "Open-obligation final-message recovery".to_string(),
@@ -1005,6 +1564,8 @@ mod tests {
                 }),
                 strict: false,
             }],
+            tool_choice: None,
+            parallel_tool_calls: false,
             timeout_ms: 30_000,
             stream_idle_timeout_ms: 300_000,
             stream_max_retries: 0,
@@ -1034,6 +1595,11 @@ mod tests {
         assert!(system_prompt.contains("Base coding prompt"));
         assert!(system_prompt.contains("Turn control projection surface: prompt"));
         assert!(system_prompt.contains("Open-obligation final-message recovery"));
+    }
+
+    #[test]
+    fn provider_extra_body_cannot_override_runtime_request_fields() {
+        assert!(super::provider_extra_body_cannot_override_runtime_request_fields_fixture_passes());
     }
 
     #[test]

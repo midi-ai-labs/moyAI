@@ -1,9 +1,12 @@
 use assert_cmd::Command;
 use moyai::harness::manual_st::{
-    ManualStRouteKind, closeout_continuation_budget_blocks_same_workspace_stall_fixture_passes,
+    ManualStRouteKind, authoring_grounding_terminal_fail_stops_route_fixture_passes,
+    closeout_artifact_roles_use_language_adapter_fixture_passes,
+    closeout_continuation_budget_blocks_same_workspace_stall_fixture_passes,
     closeout_continuation_budget_is_scoped_by_failure_signature_fixture_passes,
     closeout_continuation_is_text_only_fixture_passes,
     completed_expected_artifact_clears_stale_authoring_obligation_fixture_passes,
+    content_changing_authoring_no_progress_terminal_fail_stops_route_fixture_passes,
     final_assistant_open_obligation_continuation_hook_fixture_passes,
     final_assistant_open_obligation_not_clean_closeout_fixture_passes,
     latest_verification_result_drives_closeout_fixture_passes,
@@ -12,6 +15,7 @@ use moyai::harness::manual_st::{
     manual_st_route_plan,
     open_obligation_continuation_expected_inventory_is_non_authoring_fixture_passes,
     post_repair_route_verification_clears_stale_repair_fixture_passes,
+    route_authoring_content_paths_use_language_adapter_fixture_passes,
     route_case_progress_phase_boundaries_fixture_passes,
     route_inflight_case_progress_artifact_fixture_passes,
     route_owned_command_timeout_fixture_passes,
@@ -23,13 +27,23 @@ use moyai::harness::manual_st::{
     stage_scoped_verification_commands_are_spec_owned_fixture_passes,
     successful_closeout_continuation_rematerializes_case_verdict_fixture_passes,
     terminalized_session_continuation_ledger_bounds_same_stage_recovery_fixture_passes,
+    unknown_terminal_reason_fail_stops_open_route_fixture_passes,
     verification_evidence_after_content_change_invalidated_fixture_passes,
     verification_failed_closeout_builds_repair_hook_prompt_fixture_passes,
     verification_failure_labels_do_not_become_authoring_obligations_fixture_passes,
     verification_failure_preserves_closeout_evidence_fixture_passes,
+    verification_repair_terminal_ledger_blocks_non_obligation_workspace_progress_fixture_passes,
     vision_prompt_uses_labeled_attachment_fixture_passes,
 };
 use serde_json::Value;
+
+fn write_valid_preflight_report(path: &std::path::Path) {
+    std::fs::write(
+        path,
+        r#"{"status":"pass","generated_by":"codex_style_preflight_v2","results":[{"fixture_id":"fixture.protocol.history_item_lifecycle_authority","status":"pass"},{"fixture_id":"fixture.control_envelope.dispatch_projection_authority","status":"pass"},{"fixture_id":"fixture.tool_lifecycle.typed_route_metadata_authority","status":"pass"},{"fixture_id":"fixture.manual_st.route_evidence_schema","status":"pass"}]}"#,
+    )
+    .expect("preflight");
+}
 
 #[test]
 fn manual_st_route_plan_owns_required_core_route_shape() {
@@ -50,6 +64,11 @@ fn manual_st_route_plan_owns_required_core_route_shape() {
             "timeout_classification.json"
         ]
     );
+}
+
+#[test]
+fn route_workspace_diff_uses_language_adapter_content_roles() {
+    assert!(route_authoring_content_paths_use_language_adapter_fixture_passes());
 }
 
 #[test]
@@ -161,6 +180,11 @@ fn failed_verification_closeout_builds_repair_hook_prompt() {
 }
 
 #[test]
+fn closeout_artifact_roles_use_language_adapter() {
+    assert!(closeout_artifact_roles_use_language_adapter_fixture_passes());
+}
+
+#[test]
 fn closeout_continuation_budget_is_failure_signature_scoped() {
     assert!(closeout_continuation_budget_is_scoped_by_failure_signature_fixture_passes());
 }
@@ -173,6 +197,29 @@ fn closeout_continuation_budget_blocks_same_workspace_stall() {
 #[test]
 fn terminalized_session_continuation_ledger_bounds_same_stage_recovery() {
     assert!(terminalized_session_continuation_ledger_bounds_same_stage_recovery_fixture_passes());
+}
+
+#[test]
+fn authoring_grounding_terminal_fail_stops_route() {
+    assert!(authoring_grounding_terminal_fail_stops_route_fixture_passes());
+}
+
+#[test]
+fn content_changing_authoring_no_progress_terminal_fail_stops_route() {
+    assert!(content_changing_authoring_no_progress_terminal_fail_stops_route_fixture_passes());
+}
+
+#[test]
+fn verification_repair_terminal_ledger_blocks_non_obligation_workspace_progress() {
+    assert!(
+        verification_repair_terminal_ledger_blocks_non_obligation_workspace_progress_fixture_passes(
+        )
+    );
+}
+
+#[test]
+fn unknown_terminal_reason_fail_stops_open_route() {
+    assert!(unknown_terminal_reason_fail_stops_open_route_fixture_passes());
 }
 
 #[test]
@@ -205,11 +252,7 @@ fn manual_st_route_cli_dry_run_writes_route_owned_artifacts() {
     let temp = tempfile::tempdir().expect("tempdir");
     let preflight = temp.path().join("preflight_report.json");
     let output = temp.path().join("route");
-    std::fs::write(
-        &preflight,
-        r#"{"status":"pass","generated_by":"test","results":[]}"#,
-    )
-    .expect("preflight");
+    write_valid_preflight_report(&preflight);
 
     Command::cargo_bin("moyai")
         .expect("binary")
@@ -265,11 +308,7 @@ fn manual_st_route_cli_timeout_materializes_route_fail_artifacts() {
     let temp = tempfile::tempdir().expect("tempdir");
     let preflight = temp.path().join("preflight_report.json");
     let output = temp.path().join("route");
-    std::fs::write(
-        &preflight,
-        r#"{"status":"pass","generated_by":"test","results":[]}"#,
-    )
-    .expect("preflight");
+    write_valid_preflight_report(&preflight);
 
     Command::cargo_bin("moyai")
         .expect("binary")
@@ -334,6 +373,31 @@ fn manual_st_route_cli_refuses_non_green_preflight() {
     std::fs::write(
         &preflight,
         r#"{"status":"fail","generated_by":"test","results":[]}"#,
+    )
+    .expect("preflight");
+
+    Command::cargo_bin("moyai")
+        .expect("binary")
+        .args([
+            "manual-st",
+            "route",
+            "--route",
+            "required-core",
+            "--preflight-report",
+            preflight.to_str().expect("utf8"),
+            "--dry-run",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn manual_st_route_requires_codex_style_preflight_report() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let preflight = temp.path().join("preflight_report.json");
+    std::fs::write(
+        &preflight,
+        r#"{"status":"pass","generated_by":"test","results":[]}"#,
     )
     .expect("preflight");
 

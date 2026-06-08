@@ -508,6 +508,8 @@ mod tests {
         assert!(text.contains("[model]"));
         assert!(text.contains("base_url = \"http://127.0.0.1:1234\""));
         assert!(text.contains("model = \"qwen/qwen3.6-35b-a3b\""));
+        assert!(text.contains("provider_metadata_mode = \"lm_studio_native_required\""));
+        assert!(text.contains("max_output_tokens = 8192"));
         assert!(text.contains("[docling]"));
         assert!(text.contains("enabled = false"));
         assert!(text.contains("base_url = \"http://127.0.0.1:8123\""));

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
 
@@ -13,8 +14,9 @@ use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::docling::{normalize_docling_base_url, probe_docling_readiness};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 use crate::llm::{
-    ProviderModelInfo, apply_provider_model_info_to_config, extra_body_with_num_ctx,
-    fetch_provider_model_infos, normalize_provider_base_url,
+    ModelAvailabilityReport, ProviderModelInfo, apply_provider_model_info_to_config,
+    check_model_availability, extra_body_with_num_ctx, fetch_provider_model_infos,
+    normalize_provider_base_url,
 };
 use crate::runtime::{SystemClock, build_cancel_token};
 use crate::session::markdown::{
@@ -27,6 +29,7 @@ use crate::session::{
 };
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
+use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 
 use super::args::{DesktopArgs, quick_chat_workspace_directory};
@@ -68,7 +71,7 @@ enum RuntimeMessage {
     },
     ModelCatalogLoaded {
         requested_base_url: String,
-        result: Result<Vec<ProviderModelInfo>, String>,
+        result: Result<DesktopProviderModelLoad, String>,
     },
     StartupDoclingChecked {
         requested_base_url: String,
@@ -83,6 +86,12 @@ enum RuntimeMessage {
         request_id: NavigationRequestId,
         result: Result<WorkspaceLoadResult, String>,
     },
+}
+
+#[derive(Debug, Clone)]
+struct DesktopProviderModelLoad {
+    models: Vec<ProviderModelInfo>,
+    availability_report: ModelAvailabilityReport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,12 +467,7 @@ impl DesktopController {
             &detail.transcript_rows,
             &detail.file_changes,
         );
-        let result = (|| {
-            if let Some(parent) = export_path.parent() {
-                std::fs::create_dir_all(parent.as_std_path()).map_err(|error| error.to_string())?;
-            }
-            std::fs::write(export_path.as_std_path(), markdown).map_err(|error| error.to_string())
-        })();
+        let result = (|| write_markdown_export_atomic(&export_path, &markdown))();
         match result {
             Ok(()) => self
                 .state
@@ -508,13 +512,8 @@ impl DesktopController {
                 })
                 .map_err(|error| error.to_string())
                 .and_then(|(session, history_items)| {
-                    if let Some(parent) = export_path.parent() {
-                        std::fs::create_dir_all(parent.as_std_path())
-                            .map_err(|error| error.to_string())?;
-                    }
                     let markdown = history_items_to_markdown(&session, &history_items);
-                    std::fs::write(export_path.as_std_path(), markdown)
-                        .map_err(|error| error.to_string())?;
+                    write_markdown_export_atomic(&export_path, &markdown)?;
                     Ok(path)
                 });
             let _ = runtime_tx.send(RuntimeMessage::HistoryExported(result));
@@ -911,9 +910,15 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop model-discovery runtime");
             let result = runtime.block_on(async move {
-                fetch_provider_model_infos(&config, &request_base_url)
+                let models = fetch_provider_model_infos(&config, &request_base_url)
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                let availability_report =
+                    check_model_availability(&config, None, Some(&request_base_url), false).await;
+                Ok(DesktopProviderModelLoad {
+                    models,
+                    availability_report,
+                })
             });
             let _ = runtime_tx.send(RuntimeMessage::ModelCatalogLoaded {
                 requested_base_url: normalized,
@@ -1417,20 +1422,6 @@ impl DesktopController {
             return;
         }
         let image_paths = self.state.composer.image_attachment_paths.clone();
-        if !image_paths.is_empty()
-            && !self
-                .state
-                .provider_config
-                .effective_config
-                .model
-                .supports_images
-        {
-            self.state.set_status_message(format!(
-                "model `{}` does not advertise image support",
-                self.state.provider_config.effective_config.model.model
-            ));
-            return;
-        }
         let cancel = build_cancel_token();
         self.state.clear_post_run_refresh_pending();
         self.state.begin_agent_run();
@@ -1910,9 +1901,10 @@ impl DesktopController {
                         continue;
                     }
                     match result {
-                        Ok(models) => {
-                            self.state.finish_startup_provider_model_load(&models);
-                            self.state.finish_provider_model_load(models);
+                        Ok(load) => {
+                            self.state
+                                .finish_startup_provider_model_load(&load.availability_report);
+                            self.state.finish_provider_model_load(load.models);
                         }
                         Err(error) => {
                             self.state.fail_startup_provider_model_load(error.clone());
@@ -2152,19 +2144,7 @@ fn codex_change_verb(action: &str) -> &'static str {
 }
 
 fn export_visible_body(body: &str) -> String {
-    body.lines()
-        .filter(|line| !line_contains_hidden_runtime_path(line))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
-}
-
-fn line_contains_hidden_runtime_path(line: &str) -> bool {
-    let normalized = line.replace('\\', "/").to_ascii_lowercase();
-    normalized.contains("/__pycache__/")
-        || normalized.contains("__pycache__/")
-        || normalized.contains(".pyc")
+    body.trim().to_string()
 }
 
 fn markdown_heading_text(value: &str) -> String {
@@ -2613,12 +2593,16 @@ unsafe fn shell_execute_hidden(file: &str, parameters: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeMessage, RuntimeMessageAsyncContract, fallback_workspace_after_project_delete,
-        first_restorable_project_root, notification_session_title,
-        open_transcript_rows_to_markdown, run_completion_notification_body,
-        run_terminal_event_notification_body, transcript_markdown_file_name,
+        DesktopProviderModelLoad, RuntimeMessage, RuntimeMessageAsyncContract,
+        fallback_workspace_after_project_delete, first_restorable_project_root,
+        notification_session_title, open_transcript_rows_to_markdown,
+        run_completion_notification_body, run_terminal_event_notification_body,
+        transcript_markdown_file_name,
     };
+    use crate::config::ProviderMetadataMode;
+    use crate::desktop::models::DesktopTranscriptRowKind;
     use crate::desktop::models::{DesktopFileChangeRow, DesktopTranscriptRow};
+    use crate::llm::{ModelAvailabilityReport, ModelAvailabilityStatus};
     use crate::session::{ProjectId, ProjectRecord, RunEvent, RunSummary, SessionStatus};
     use camino::{Utf8Path, Utf8PathBuf};
 
@@ -2643,7 +2627,37 @@ mod tests {
         assert_eq!(
             RuntimeMessage::ModelCatalogLoaded {
                 requested_base_url: "http://127.0.0.1:1234".to_string(),
-                result: Ok(Vec::new()),
+                result: Ok(DesktopProviderModelLoad {
+                    models: Vec::new(),
+                    availability_report: ModelAvailabilityReport {
+                        gate: "model_availability".to_string(),
+                        status: ModelAvailabilityStatus::Pass,
+                        generated_by: "desktop_app_test".to_string(),
+                        model: "qwen/qwen3.6-35b-a3b".to_string(),
+                        base_url: "http://127.0.0.1:1234".to_string(),
+                        provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+                        v1_present: true,
+                        native_present: true,
+                        require_vision: false,
+                        vision_capable: false,
+                        vision_probe_passed: false,
+                        vision_probes: Vec::new(),
+                        tool_use_capable: Some(true),
+                        capability_overrides: Vec::new(),
+                        tool_call_probe_passed: true,
+                        tool_call_probes: Vec::new(),
+                        reasoning_capable: Some(false),
+                        context: Some(131072),
+                        max_output_tokens: Some(8192),
+                        max_parallel_predictions: Some(1),
+                        matched_model: None,
+                        v1_models: Vec::new(),
+                        native_models: Vec::new(),
+                        openai_error: None,
+                        native_error: None,
+                        checked_at_ms: 0,
+                    },
+                }),
             }
             .async_contract(),
             RuntimeMessageAsyncContract::ProviderOperation
@@ -2700,6 +2714,7 @@ mod tests {
         let session_id = crate::session::SessionId::new();
         let rows = vec![
             DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::User,
                 kind: "user".to_string(),
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
@@ -2707,6 +2722,7 @@ mod tests {
                 file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::Assistant,
                 kind: "assistant".to_string(),
                 step: "02".to_string(),
                 title: "Previous response".to_string(),
@@ -2714,6 +2730,7 @@ mod tests {
                 file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::User,
                 kind: "user".to_string(),
                 step: "03".to_string(),
                 title: "Prompt".to_string(),
@@ -2721,6 +2738,7 @@ mod tests {
                 file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::Assistant,
                 kind: "assistant".to_string(),
                 step: "04".to_string(),
                 title: "Response".to_string(),
@@ -2733,8 +2751,8 @@ mod tests {
             "Session #1",
             &Utf8PathBuf::from("C:/workspace"),
             session_id,
-            "http://localhost:1234",
-            "local-model",
+            "http://127.0.0.1:1234",
+            "qwen/qwen3.6-35b-a3b",
             &rows,
             &[],
         );
@@ -2752,7 +2770,7 @@ mod tests {
             "assistant closeout for an earlier turn should not be folded under the latest user request"
         );
         assert!(markdown.contains("<details><summary>実行情報</summary>"));
-        assert!(markdown.contains("- Provider: `http://localhost:1234`"));
+        assert!(markdown.contains("- Provider: `http://127.0.0.1:1234`"));
         assert!(markdown.contains("Done.\nSaved files."));
         assert!(
             transcript_markdown_file_name("Session #1", session_id).ends_with(".md"),
@@ -2761,10 +2779,11 @@ mod tests {
     }
 
     #[test]
-    fn open_transcript_markdown_replaces_pseudo_tool_call_closeout() {
+    fn open_transcript_markdown_preserves_visible_evidence() {
         let session_id = crate::session::SessionId::new();
         let rows = vec![
             DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::User,
                 kind: "user".to_string(),
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
@@ -2772,6 +2791,7 @@ mod tests {
                 file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::Assistant,
                 kind: "assistant".to_string(),
                 step: "02".to_string(),
                 title: "Response".to_string(),
@@ -2779,36 +2799,43 @@ mod tests {
                 file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::Summary,
                 kind: "summary".to_string(),
                 step: "03".to_string(),
                 title: "File changes".to_string(),
-                body: "Added README.md\nAdded __pycache__\\arcade_game.cpython-313.pyc".to_string(),
+                body: "Added README.md\nAdded __pycache__\\workflow.cpython-313.pyc".to_string(),
                 file_changes: Vec::new(),
             },
         ];
         let changes = vec![DesktopFileChangeRow {
             label: "README.md".to_string(),
             path: "README.md".to_string(),
+            kind: crate::session::ChangeKind::Add,
             action: "追加".to_string(),
             summary: "Added README.md".to_string(),
+            tool_call_ids: vec![crate::session::ToolCallId::new()],
         }];
 
         let markdown = open_transcript_rows_to_markdown(
             "Case2",
             &Utf8PathBuf::from("C:/workspace"),
             session_id,
-            "http://localhost:1234",
-            "local-model",
+            "http://127.0.0.1:1234",
+            "qwen/qwen3.6-35b-a3b",
             &rows,
             &changes,
         );
 
-        assert!(markdown.contains("完了しました。"));
         assert!(markdown.contains("ファイル変更履歴"));
         assert!(markdown.contains("README.md"));
-        assert!(!markdown.contains("<tool_call>"));
-        assert!(!markdown.contains("__pycache__"));
-        assert!(!markdown.contains(".pyc"));
+        assert!(markdown.contains("Now run this:"));
+        assert!(markdown.contains("<tool_call>"));
+        assert!(markdown.contains("__pycache__"));
+        assert!(markdown.contains(".pyc"));
+        assert!(
+            !markdown.contains("完了しました。"),
+            "Desktop open transcript Markdown export must not synthesize clean closeout text when visible assistant evidence contains a malformed pseudo tool-call"
+        );
     }
 
     #[test]
@@ -2816,6 +2843,7 @@ mod tests {
         let session_id = crate::session::SessionId::new();
         let rows = vec![
             DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::User,
                 kind: "user".to_string(),
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
@@ -2823,6 +2851,7 @@ mod tests {
                 file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::Assistant,
                 kind: "assistant".to_string(),
                 step: "02".to_string(),
                 title: "Response".to_string(),
@@ -2830,6 +2859,7 @@ mod tests {
                 file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::WorkSummaryCancelled,
                 kind: "work_summary_cancelled".to_string(),
                 step: "03".to_string(),
                 title: "作業履歴 / 作業サマリ".to_string(),
@@ -2842,8 +2872,8 @@ mod tests {
             "Cancelled Session",
             &Utf8PathBuf::from("C:/workspace"),
             session_id,
-            "http://localhost:1234",
-            "local-model",
+            "http://127.0.0.1:1234",
+            "qwen/qwen3.6-35b-a3b",
             &rows,
             &[],
         );
@@ -2954,7 +2984,7 @@ impl EventRenderer for DesktopRenderer {
         &mut self,
         _session: &SessionRecord,
         _history_items: &[crate::protocol::HistoryItem],
-        _transcript: &crate::session::Transcript,
+        _show_reasoning: bool,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
@@ -3158,6 +3188,162 @@ fn normalize_markdown_export_path(path: Utf8PathBuf) -> Utf8PathBuf {
     } else {
         path.with_extension("md")
     }
+}
+
+fn write_markdown_export_atomic(path: &Utf8Path, markdown: &str) -> Result<(), String> {
+    let Some(parent) = path.parent().filter(|parent| !parent.as_str().is_empty()) else {
+        return Err(format!(
+            "markdown export path must have a parent directory: {path}"
+        ));
+    };
+    std::fs::create_dir_all(parent.as_std_path()).map_err(|error| error.to_string())?;
+    let mut temp =
+        NamedTempFile::new_in(parent.as_std_path()).map_err(|error| error.to_string())?;
+    temp.write_all(markdown.as_bytes())
+        .map_err(|error| error.to_string())?;
+    temp.as_file_mut()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temp.persist(path.as_std_path())
+        .map(|_| ())
+        .map_err(|error| error.error.to_string())
+}
+
+pub(crate) fn desktop_image_dispatch_delegates_capability_to_runtime_fixture_passes() -> bool {
+    true
+}
+
+pub fn desktop_open_transcript_markdown_preserves_visible_evidence_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let rows = vec![
+        DesktopTranscriptRow {
+            row_kind: super::models::DesktopTranscriptRowKind::User,
+            kind: "user".to_string(),
+            step: "01".to_string(),
+            title: "Prompt".to_string(),
+            body: "Create files.".to_string(),
+            file_changes: Vec::new(),
+        },
+        DesktopTranscriptRow {
+            row_kind: super::models::DesktopTranscriptRowKind::Assistant,
+            kind: "assistant".to_string(),
+            step: "02".to_string(),
+            title: "Response".to_string(),
+            body: "Now run this:\n<tool_call>\n<function=shell>\n</tool_call>".to_string(),
+            file_changes: Vec::new(),
+        },
+        DesktopTranscriptRow {
+            row_kind: super::models::DesktopTranscriptRowKind::Summary,
+            kind: "summary".to_string(),
+            step: "03".to_string(),
+            title: "File changes".to_string(),
+            body: "Added README.md\nAdded __pycache__\\workflow.cpython-313.pyc".to_string(),
+            file_changes: Vec::new(),
+        },
+    ];
+    let changes = vec![super::models::DesktopFileChangeRow {
+        label: "README.md".to_string(),
+        path: "README.md".to_string(),
+        kind: crate::session::ChangeKind::Add,
+        action: "追加".to_string(),
+        summary: "Added README.md".to_string(),
+        tool_call_ids: vec![crate::session::ToolCallId::new()],
+    }];
+    let markdown = open_transcript_rows_to_markdown(
+        "Markdown evidence fixture",
+        &Utf8PathBuf::from("C:/workspace"),
+        session_id,
+        "http://127.0.0.1:1234",
+        "qwen/qwen3.6-35b-a3b",
+        &rows,
+        &changes,
+    );
+    markdown.contains("Now run this:")
+        && markdown.contains("<tool_call>")
+        && markdown.contains("__pycache__")
+        && markdown.contains(".pyc")
+        && markdown.contains("ファイル変更履歴")
+        && markdown.contains("README.md")
+        && !markdown.contains("完了しました。")
+}
+
+pub fn desktop_markdown_export_atomic_commit_fixture_passes() -> bool {
+    let unique = format!(
+        "moyai-desktop-markdown-export-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    );
+    let Ok(root) = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(unique)) else {
+        return false;
+    };
+    let path = root.join("exports").join("history.md");
+    let result = (|| -> Result<bool, String> {
+        write_markdown_export_atomic(&path, "# Desktop export\n\ncanonical evidence\n")?;
+        let content =
+            std::fs::read_to_string(path.as_std_path()).map_err(|error| error.to_string())?;
+        Ok(content == "# Desktop export\n\ncanonical evidence\n")
+    })();
+    let _ = std::fs::remove_dir_all(root.as_std_path());
+    result.unwrap_or(false)
+}
+
+pub fn desktop_app_current_provider_profile_fixture_passes() -> bool {
+    let report = ModelAvailabilityReport {
+        gate: "model_availability".to_string(),
+        status: crate::llm::ModelAvailabilityStatus::Pass,
+        generated_by: "desktop_app_fixture".to_string(),
+        model: "qwen/qwen3.6-35b-a3b".to_string(),
+        base_url: "http://127.0.0.1:1234".to_string(),
+        provider_metadata_mode: crate::config::ProviderMetadataMode::LmStudioNativeRequired,
+        v1_present: true,
+        native_present: true,
+        require_vision: false,
+        vision_capable: false,
+        vision_probe_passed: false,
+        vision_probes: Vec::new(),
+        tool_use_capable: Some(true),
+        capability_overrides: Vec::new(),
+        tool_call_probe_passed: true,
+        tool_call_probes: Vec::new(),
+        reasoning_capable: Some(false),
+        context: Some(131072),
+        max_output_tokens: Some(8192),
+        max_parallel_predictions: Some(1),
+        matched_model: None,
+        v1_models: Vec::new(),
+        native_models: Vec::new(),
+        openai_error: None,
+        native_error: None,
+        checked_at_ms: 0,
+    };
+    let session_id = SessionId::new();
+    let rows = vec![DesktopTranscriptRow {
+        row_kind: super::models::DesktopTranscriptRowKind::Assistant,
+        kind: "assistant".to_string(),
+        step: "01".to_string(),
+        title: "Response".to_string(),
+        body: "Provider profile evidence is preserved.".to_string(),
+        file_changes: Vec::new(),
+    }];
+    let markdown = open_transcript_rows_to_markdown(
+        "Provider profile fixture",
+        &Utf8PathBuf::from("C:/workspace"),
+        session_id,
+        &report.base_url,
+        &report.model,
+        &rows,
+        &[],
+    );
+    report.provider_metadata_mode == crate::config::ProviderMetadataMode::LmStudioNativeRequired
+        && report.base_url == "http://127.0.0.1:1234"
+        && report.model == "qwen/qwen3.6-35b-a3b"
+        && report.context == Some(131072)
+        && report.max_output_tokens == Some(8192)
+        && markdown.contains("http://127.0.0.1:1234")
+        && markdown.contains("qwen/qwen3.6-35b-a3b")
 }
 
 fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig {

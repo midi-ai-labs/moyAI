@@ -214,12 +214,12 @@ pub(crate) fn progress_projection_payload_drops_authority_fields() -> bool {
     let raw = json!({
         "todos": [{
             "id": "step1",
-            "content": "write component.py",
+            "content": "update workflow projection",
             "kind": "verification",
             "status": "in_progress",
-            "targets": ["component.py"],
+            "targets": ["src/workflow.rs"],
             "depends_on": ["prior"],
-            "success_criteria": ["python -m unittest"]
+            "success_criteria": ["verify-contract --behavior"]
         }]
     });
     let mut todos = match effective_todos_from_arguments(SessionId::new(), raw, &[]) {

@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
 
+use crate::agent::language_evidence::{
+    ArtifactRole, LanguageFamily, classify_artifact_target as classify_language_artifact_target,
+};
 use crate::agent::state::{ActiveWorkContract, active_work_contract_for_history_items};
 use crate::app::{App, AppBootstrap, AppCommand, RunRequest};
 use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode};
@@ -1191,6 +1194,7 @@ async fn classify_manual_st_closeout_for_session(
         actual_files,
         verification_commands,
     );
+    evidence.terminal_cluster = latest_route_stage_terminal_cluster_evidence(&history_items);
     let repair_targets = repair_targets_from_closeout_evidence(
         active_work.as_ref(),
         expected_artifacts,
@@ -1301,6 +1305,7 @@ fn classify_manual_st_closeout_from_evidence(
             &latest_verification.into_iter().cloned().collect::<Vec<_>>(),
         ),
         diagnostics,
+        terminal_cluster: None,
     }
 }
 
@@ -1434,13 +1439,34 @@ fn route_authoring_content_path(path: &Utf8Path, workspace_root: &Utf8Path) -> b
     {
         return false;
     }
-    lower.ends_with(".py")
-        || lower.ends_with(".md")
-        || lower.ends_with(".json")
-        || lower.ends_with(".toml")
-        || lower.ends_with(".yaml")
-        || lower.ends_with(".yml")
-        || lower.ends_with(".txt")
+    let spec = classify_language_artifact_target(&relative);
+    if matches!(
+        spec.role,
+        ArtifactRole::Source | ArtifactRole::Test | ArtifactRole::Document
+    ) {
+        return true;
+    }
+    matches!(
+        lower.rsplit_once('.').map(|(_, ext)| ext),
+        Some("json" | "toml" | "yaml" | "yml")
+    )
+}
+
+pub fn route_authoring_content_paths_use_language_adapter_fixture_passes() -> bool {
+    let workspace_root = Utf8Path::new("C:/workspace/project");
+    route_authoring_content_path(
+        Utf8Path::new("C:/workspace/project/src/tool.test.ts"),
+        workspace_root,
+    ) && route_authoring_content_path(
+        Utf8Path::new("C:/workspace/project/src/tool.rs"),
+        workspace_root,
+    ) && route_authoring_content_path(
+        Utf8Path::new("C:/workspace/project/docs/tool.md"),
+        workspace_root,
+    ) && !route_authoring_content_path(
+        Utf8Path::new("C:/workspace/project/__pycache__/tool.cpython-313.pyc"),
+        workspace_root,
+    )
 }
 
 fn should_continue_after_closeout(closeout: &ManualStCloseoutEvidence) -> bool {
@@ -1534,29 +1560,36 @@ impl RouteStageTerminalContinuationLedger {
         terminal_reason: Option<&str>,
     ) -> bool {
         let Some(reason) = terminal_reason else {
-            return true;
+            return closeout.closeout_class == ManualStCloseoutClass::CleanCloseout;
         };
-        let Some(cluster) = route_stage_terminal_continuation_cluster(closeout, reason) else {
-            return true;
+        let Some(cluster) = classify_route_stage_terminal_cluster(closeout, Some(reason)) else {
+            return closeout.closeout_class == ManualStCloseoutClass::CleanCloseout;
         };
+        if cluster.fail_stop {
+            return false;
+        }
         if self.total_attempts >= MAX_TERMINALIZED_CLOSEOUT_CONTINUATIONS_PER_STAGE {
             return false;
         }
-        let prior_attempts = self.attempts_by_cluster.get(&cluster).copied().unwrap_or(0);
+        let prior_attempts = self
+            .attempts_by_cluster
+            .get(&cluster.key)
+            .copied()
+            .unwrap_or(0);
         if prior_attempts >= MAX_TERMINALIZED_CLOSEOUT_CONTINUATIONS_PER_CLUSTER {
             return false;
         }
         let same_workspace = self
             .last_workspace_fingerprint_by_cluster
-            .get(&cluster)
+            .get(&cluster.key)
             .is_some_and(|fingerprint| fingerprint == workspace_fingerprint);
-        if prior_attempts > 0 && same_workspace {
+        if prior_attempts > 0 && (same_workspace || !cluster.workspace_progress_can_reset) {
             return false;
         }
         self.attempts_by_cluster
-            .insert(cluster.clone(), prior_attempts + 1);
+            .insert(cluster.key.clone(), prior_attempts + 1);
         self.last_workspace_fingerprint_by_cluster
-            .insert(cluster, workspace_fingerprint.to_string());
+            .insert(cluster.key, workspace_fingerprint.to_string());
         self.total_attempts += 1;
         true
     }
@@ -1579,25 +1612,249 @@ fn route_stage_terminal_continuation_cluster(
     closeout: &ManualStCloseoutEvidence,
     reason: &str,
 ) -> Option<String> {
+    classify_route_stage_terminal_cluster(closeout, Some(reason)).map(|cluster| cluster.key)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteStageTerminalCluster {
+    key: String,
+    fail_stop: bool,
+    workspace_progress_can_reset: bool,
+}
+
+fn classify_route_stage_terminal_cluster(
+    closeout: &ManualStCloseoutEvidence,
+    reason: Option<&str>,
+) -> Option<RouteStageTerminalCluster> {
+    if let Some(typed) = closeout.terminal_cluster.as_ref() {
+        return Some(route_stage_terminal_cluster_from_typed(closeout, typed));
+    }
+    let reason = reason?;
+    classify_route_stage_terminal_cluster_from_reason(closeout, reason)
+}
+
+fn route_stage_terminal_cluster_from_typed(
+    closeout: &ManualStCloseoutEvidence,
+    typed: &ManualStTerminalClusterEvidence,
+) -> RouteStageTerminalCluster {
+    let closeout_signature = closeout_continuation_signature(closeout)
+        .unwrap_or_else(|| "no_closeout_signature".to_string());
+    RouteStageTerminalCluster {
+        key: format!("{}|{closeout_signature}", typed.failure_family),
+        fail_stop: typed.fail_stop,
+        workspace_progress_can_reset: typed.workspace_progress_can_reset,
+    }
+}
+
+fn classify_route_stage_terminal_cluster_from_reason(
+    closeout: &ManualStCloseoutEvidence,
+    reason: &str,
+) -> Option<RouteStageTerminalCluster> {
     let lower = reason.to_ascii_lowercase();
-    let failure_family = if lower.contains("model returned a final assistant message") {
-        Some("final_assistant_with_open_obligation".to_string())
+    let (failure_family, fail_stop, workspace_progress_can_reset) = if lower
+        .contains("model returned a final assistant message")
+    {
+        (
+            "final_assistant_with_open_obligation".to_string(),
+            false,
+            true,
+        )
     } else if let Some(tool) =
         terminal_reason_word_after(reason, "Provider repeated invalid arguments for ")
     {
-        Some(format!("invalid_tool_arguments:{tool}"))
+        (format!("invalid_tool_arguments:{tool}"), false, true)
     } else if let Some(cluster) =
         terminal_reason_backtick_after(reason, "lifecycle adjudication cluster `")
     {
-        Some(format!("lifecycle_cluster:{cluster}"))
+        (format!("lifecycle_cluster:{cluster}"), false, true)
     } else if let Some(cluster) = terminal_reason_backtick_after(reason, "no-progress cluster `") {
-        Some(format!("no_progress_cluster:{cluster}"))
+        (format!("no_progress_cluster:{cluster}"), false, true)
+    } else if terminal_reason_is_content_changing_authoring_no_progress(reason)
+        && let Some(tool) = terminal_reason_backtick_after(reason, "Tool `")
+    {
+        (
+            format!("content_changing_authoring_no_progress:{tool}"),
+            true,
+            false,
+        )
+    } else if lower.contains("returned `no_progress` output")
+        && let Some(tool) = terminal_reason_backtick_after(reason, "Tool `")
+    {
+        (format!("tool_no_progress:{tool}"), false, true)
+    } else if lower.contains("same verification failure evidence repeated") {
+        ("verification_non_convergence".to_string(), false, false)
+    } else if terminal_reason_is_authoring_grounding_budget_exhausted(reason) {
+        (
+            "authoring_grounding_budget_exhausted".to_string(),
+            true,
+            false,
+        )
     } else {
-        None
-    }?;
+        return None;
+    };
     let closeout_signature = closeout_continuation_signature(closeout)
         .unwrap_or_else(|| "no_closeout_signature".to_string());
-    Some(format!("{failure_family}|{closeout_signature}"))
+    Some(RouteStageTerminalCluster {
+        key: format!("{failure_family}|{closeout_signature}"),
+        fail_stop,
+        workspace_progress_can_reset,
+    })
+}
+
+fn latest_route_stage_terminal_cluster_evidence(
+    history_items: &[HistoryItem],
+) -> Option<ManualStTerminalClusterEvidence> {
+    let mut tool_names_by_call = BTreeMap::new();
+    for item in history_items {
+        if let HistoryItemPayload::ToolCall { call_id, tool, .. } = &item.payload {
+            tool_names_by_call.insert(call_id.to_string(), tool.to_string());
+        }
+    }
+    history_items
+        .iter()
+        .rev()
+        .find_map(|item| match &item.payload {
+            HistoryItemPayload::RejectedToolProposal { proposal }
+                if proposal.semantic_class == "text_final_while_obligations_open" =>
+            {
+                Some(ManualStTerminalClusterEvidence {
+                    failure_family: "final_assistant_with_open_obligation".to_string(),
+                    fail_stop: false,
+                    workspace_progress_can_reset: true,
+                    source: "rejected_tool_proposal.semantic_class".to_string(),
+                })
+            }
+            HistoryItemPayload::RejectedToolProposal { proposal } => {
+                Some(ManualStTerminalClusterEvidence {
+                    failure_family: format!("lifecycle_cluster:{}", proposal.semantic_class),
+                    fail_stop: false,
+                    workspace_progress_can_reset: true,
+                    source: "rejected_tool_proposal.semantic_class".to_string(),
+                })
+            }
+            HistoryItemPayload::ToolOutput {
+                call_id,
+                metadata,
+                progress_effect,
+                verification_run,
+                ..
+            } => typed_terminal_cluster_from_tool_output(
+                *call_id,
+                metadata,
+                progress_effect.clone(),
+                verification_run.as_ref(),
+                &tool_names_by_call,
+            ),
+            _ => None,
+        })
+}
+
+fn typed_terminal_cluster_from_tool_output(
+    call_id: ToolCallId,
+    metadata: &Value,
+    progress_effect: ToolProgressEffect,
+    verification_run: Option<&VerificationRunResult>,
+    tool_names_by_call: &BTreeMap<String, String>,
+) -> Option<ManualStTerminalClusterEvidence> {
+    if metadata
+        .get("authoring_target_grounding_required")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || metadata
+            .pointer("/tool_feedback_envelope/kind")
+            .and_then(Value::as_str)
+            == Some("authoring_target_grounding_required")
+    {
+        return Some(ManualStTerminalClusterEvidence {
+            failure_family: "authoring_grounding_budget_exhausted".to_string(),
+            fail_stop: true,
+            workspace_progress_can_reset: false,
+            source: "tool_output.authoring_target_grounding_required".to_string(),
+        });
+    }
+
+    let operation_intent = metadata
+        .pointer("/tool_feedback_envelope/operation_intent")
+        .or_else(|| metadata.get("operation_intent"))
+        .and_then(Value::as_str);
+    let operation_progress_class = metadata
+        .pointer("/tool_feedback_envelope/operation_progress_class")
+        .or_else(|| metadata.get("operation_progress_class"))
+        .and_then(Value::as_str);
+    let tool = metadata
+        .pointer("/tool_feedback_envelope/tool")
+        .or_else(|| metadata.pointer("/tool_route/effective_tool"))
+        .or_else(|| metadata.get("effective_tool"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| tool_names_by_call.get(&call_id.to_string()).cloned())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if operation_intent == Some("content_changing_authoring_required")
+        && progress_effect == ToolProgressEffect::NoProgress
+        && matches!(
+            operation_progress_class,
+            Some("no_progress" | "idempotent_file_write_no_progress")
+        )
+    {
+        return Some(ManualStTerminalClusterEvidence {
+            failure_family: format!("content_changing_authoring_no_progress:{tool}"),
+            fail_stop: true,
+            workspace_progress_can_reset: false,
+            source: "tool_output.tool_feedback_envelope".to_string(),
+        });
+    }
+
+    if operation_intent == Some("content_changing_authoring_required")
+        && progress_effect == ToolProgressEffect::NoProgress
+        && operation_progress_class == Some("supporting_context")
+    {
+        return Some(ManualStTerminalClusterEvidence {
+            failure_family: format!("tool_no_progress:{tool}"),
+            fail_stop: false,
+            workspace_progress_can_reset: true,
+            source: "tool_output.tool_feedback_envelope".to_string(),
+        });
+    }
+
+    if verification_run.is_some_and(|run| {
+        matches!(
+            run.status,
+            VerificationRunStatus::Failed | VerificationRunStatus::TimedOut
+        )
+    }) && metadata
+        .pointer("/terminal_guard_policy/no_progress_guard")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Some(ManualStTerminalClusterEvidence {
+            failure_family: "verification_non_convergence".to_string(),
+            fail_stop: false,
+            workspace_progress_can_reset: false,
+            source: "tool_output.verification_run.terminal_guard_policy".to_string(),
+        });
+    }
+
+    None
+}
+
+fn terminal_reason_is_authoring_grounding_budget_exhausted(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("authoring supporting-context budget was exhausted")
+        && lower.contains("non-remaining active target read proposals")
+}
+
+fn terminal_reason_is_content_changing_authoring_no_progress(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("returned `no_progress` output")
+        && lower.contains("content-changing authoring is required")
+        && lower
+            .contains("runtime stopped before treating non-content tool calls as artifact progress")
+}
+
+fn terminal_reason_requires_route_fail_stop(reason: &str) -> bool {
+    terminal_reason_is_authoring_grounding_budget_exhausted(reason)
+        || terminal_reason_is_content_changing_authoring_no_progress(reason)
 }
 
 fn terminal_reason_word_after(reason: &str, marker: &str) -> Option<String> {
@@ -2009,10 +2266,10 @@ fn verification_evidence_is_generated_test_parse_defect(
     evidence: &crate::session::VerificationFailureEvidence,
 ) -> bool {
     let is_parse_defect = evidence.subtype.as_deref() == Some("source_parse_defect")
-        || evidence
-            .evidence_markers
-            .iter()
-            .any(|marker| marker == "source_parse_defect");
+        || evidence.subtype.as_deref() == Some("generated_test_parse_defect")
+        || evidence.evidence_markers.iter().any(|marker| {
+            marker == "source_parse_defect" || marker == "generated_test_parse_defect"
+        });
     is_parse_defect
         && evidence
             .source_refs
@@ -2038,11 +2295,25 @@ fn expected_artifact_for_closeout_target(
         .find(|artifact| {
             let expected = normalize_closeout_target_path(artifact);
             normalized == expected
-                || normalized.ends_with(&format!("/{expected}"))
-                || closeout_file_name(&normalized) == closeout_file_name(&expected)
         })
         .cloned()
-        .or_else(|| closeout_file_name(&normalized).map(str::to_string))
+}
+
+pub(crate) fn manual_st_closeout_repair_targets_preserve_exact_identity_fixture_passes() -> bool {
+    let expected_artifacts = vec!["tests/workflow.test.ts".to_string()];
+    expected_artifact_for_closeout_target("tests/workflow.test.ts", &expected_artifacts)
+        == Some("tests/workflow.test.ts".to_string())
+        && expected_artifact_for_closeout_target(
+            "foreign/tests/workflow.test.ts",
+            &expected_artifacts,
+        )
+        .is_none()
+        && expected_artifact_for_closeout_target("workflow.test.ts", &expected_artifacts).is_none()
+        && expected_artifact_for_closeout_target(
+            "tests/other-workflow.test.ts",
+            &expected_artifacts,
+        )
+        .is_none()
 }
 
 fn closeout_targets_match(left: &str, right: &str) -> bool {
@@ -2050,32 +2321,14 @@ fn closeout_targets_match(left: &str, right: &str) -> bool {
 }
 
 fn closeout_target_is_test_like(target: &str) -> bool {
-    closeout_file_name(&normalize_closeout_target_path(target))
-        .map(|name| {
-            let lower = name.to_ascii_lowercase();
-            lower.starts_with("test_") || lower.ends_with("_test.py")
-        })
-        .unwrap_or(false)
+    classify_language_artifact_target(&normalize_closeout_target_path(target)).role
+        == ArtifactRole::Test
 }
 
 fn closeout_target_is_mutable_source(target: &str) -> bool {
     let normalized = normalize_closeout_target_path(target);
-    let Some(name) = closeout_file_name(&normalized) else {
-        return false;
-    };
-    let lower_name = name.to_ascii_lowercase();
-    !closeout_target_is_test_like(&normalized)
-        && !matches!(
-            lower_name.as_str(),
-            "scenario_contract.md" | "scenario_contract.json"
-        )
-        && (normalized.to_ascii_lowercase().contains("/src/")
-            || lower_name.ends_with(".py")
-            || lower_name.ends_with(".rs")
-            || lower_name.ends_with(".js")
-            || lower_name.ends_with(".ts")
-            || lower_name.ends_with(".tsx")
-            || lower_name.ends_with(".jsx"))
+    let spec = classify_language_artifact_target(&normalized);
+    spec.role == ArtifactRole::Source && !closeout_target_is_contract_artifact(&normalized)
 }
 
 fn normalize_closeout_target_path(target: &str) -> String {
@@ -2097,7 +2350,6 @@ fn closeout_target_is_deliverable_artifact(target: &str) -> bool {
     let normalized = target.replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
     let filename = lower.rsplit('/').next().unwrap_or(lower.as_str());
-    let extension = filename.rsplit('.').next().unwrap_or_default();
     if filename.is_empty() {
         return false;
     }
@@ -2110,45 +2362,30 @@ fn closeout_target_is_deliverable_artifact(target: &str) -> bool {
     ) {
         return true;
     }
+    let spec = classify_language_artifact_target(&normalized);
     matches!(
-        extension,
-        "md" | "rst"
-            | "adoc"
-            | "txt"
-            | "rs"
-            | "py"
-            | "js"
-            | "ts"
-            | "tsx"
-            | "jsx"
-            | "java"
-            | "kt"
-            | "go"
-            | "c"
-            | "cc"
-            | "cpp"
-            | "h"
-            | "hpp"
-            | "cs"
-            | "swift"
-            | "rb"
-            | "php"
-            | "scala"
-            | "sh"
-            | "ps1"
-            | "toml"
-            | "yaml"
-            | "yml"
-            | "json"
-    ) || (normalized.contains('/') && filename.starts_with("test_"))
+        spec.role,
+        ArtifactRole::Source | ArtifactRole::Test | ArtifactRole::Document
+    )
 }
 
 fn likely_repair_source_artifact(artifact: &str) -> bool {
-    let lower = artifact.to_ascii_lowercase();
-    lower.ends_with(".py")
-        && !lower.starts_with("test_")
-        && !lower.contains("/test_")
-        && !lower.ends_with("_test.py")
+    let normalized = normalize_closeout_target_path(artifact);
+    let spec = classify_language_artifact_target(&normalized);
+    spec.role == ArtifactRole::Source
+        && !closeout_target_is_contract_artifact(&normalized)
+        && spec.language != LanguageFamily::Text
+}
+
+fn closeout_target_is_contract_artifact(target: &str) -> bool {
+    closeout_file_name(target)
+        .map(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "scenario_contract.md" | "scenario_contract.json"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn render_verification_failure_evidence(evidence: &VerificationCommandEvidence) -> String {
@@ -2341,12 +2578,125 @@ fn validate_preflight_report(path: &Utf8Path) -> Result<(), String> {
         .map_err(|error| format!("failed to read preflight report `{path}`: {error}"))?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("preflight report `{path}` is not valid JSON: {error}"))?;
+    validate_preflight_report_value(path.as_str(), &value)
+}
+
+fn validate_preflight_report_value(path: &str, value: &Value) -> Result<(), String> {
     if value.get("status").and_then(Value::as_str) != Some("pass") {
         return Err(format!(
             "preflight report `{path}` is not pass; representative route will not start"
         ));
     }
+    if value.get("generated_by").and_then(Value::as_str) != Some("codex_style_preflight_v2") {
+        return Err(format!(
+            "preflight report `{path}` was not generated by codex_style_preflight_v2"
+        ));
+    }
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("preflight report `{path}` has no results array"))?;
+    if results.is_empty() {
+        return Err(format!(
+            "preflight report `{path}` has no active preflight results"
+        ));
+    }
+    let mut fixture_ids = Vec::new();
+    for result in results {
+        if result.get("status").and_then(Value::as_str) != Some("pass") {
+            return Err(format!(
+                "preflight report `{path}` contains a non-pass preflight result"
+            ));
+        }
+        let fixture_id = result
+            .get("fixture_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                format!("preflight report `{path}` contains a result without fixture_id")
+            })?;
+        fixture_ids.push(fixture_id);
+    }
+    for required_fixture in [
+        "fixture.protocol.history_item_lifecycle_authority",
+        "fixture.control_envelope.dispatch_projection_authority",
+        "fixture.tool_lifecycle.typed_route_metadata_authority",
+        "fixture.manual_st.route_evidence_schema",
+    ] {
+        if !fixture_ids.contains(&required_fixture) {
+            return Err(format!(
+                "preflight report `{path}` is missing required active fixture `{required_fixture}`"
+            ));
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn manual_st_route_preflight_report_codex_style_admission_fixture_passes() -> bool {
+    let valid = json!({
+        "status": "pass",
+        "generated_by": "codex_style_preflight_v2",
+        "results": [
+            {
+                "fixture_id": "fixture.protocol.history_item_lifecycle_authority",
+                "status": "pass"
+            },
+            {
+                "fixture_id": "fixture.control_envelope.dispatch_projection_authority",
+                "status": "pass"
+            },
+            {
+                "fixture_id": "fixture.tool_lifecycle.typed_route_metadata_authority",
+                "status": "pass"
+            },
+            {
+                "fixture_id": "fixture.manual_st.route_evidence_schema",
+                "status": "pass"
+            }
+        ]
+    });
+    let fabricated_pass = json!({
+        "status": "pass",
+        "generated_by": "test",
+        "results": []
+    });
+    let missing_fixture = json!({
+        "status": "pass",
+        "generated_by": "codex_style_preflight_v2",
+        "results": [
+            {
+                "fixture_id": "fixture.protocol.history_item_lifecycle_authority",
+                "status": "pass"
+            }
+        ]
+    });
+    let failing_result = json!({
+        "status": "pass",
+        "generated_by": "codex_style_preflight_v2",
+        "results": [
+            {
+                "fixture_id": "fixture.protocol.history_item_lifecycle_authority",
+                "status": "fail"
+            },
+            {
+                "fixture_id": "fixture.control_envelope.dispatch_projection_authority",
+                "status": "pass"
+            },
+            {
+                "fixture_id": "fixture.tool_lifecycle.typed_route_metadata_authority",
+                "status": "pass"
+            },
+            {
+                "fixture_id": "fixture.manual_st.route_evidence_schema",
+                "status": "pass"
+            }
+        ]
+    });
+
+    validate_preflight_report_value("valid", &valid).is_ok()
+        && validate_preflight_report_value("fabricated", &fabricated_pass).is_err()
+        && validate_preflight_report_value("missing_fixture", &missing_fixture).is_err()
+        && validate_preflight_report_value("failing_result", &failing_result).is_err()
 }
 
 fn prepare_case_workspace(
@@ -2550,10 +2900,7 @@ impl ManualStCaseSpec {
                 }
             })
             .collect::<Vec<_>>();
-        let mut expected_artifacts = extract_expected_artifacts(&spec);
-        if case_id == "case7" && expected_artifacts.is_empty() {
-            expected_artifacts.push("docs.md".to_string());
-        }
+        let expected_artifacts = extract_expected_artifacts(&spec);
         let task_file = extract_heading_fenced_blocks(&spec, "canonical task file")
             .into_iter()
             .next()
@@ -2675,6 +3022,34 @@ fn extract_expected_artifacts(markdown: &str) -> Vec<String> {
     artifacts
 }
 
+pub fn expected_artifacts_are_spec_owned_fixture_passes() -> bool {
+    let spec_path = manual_st_root().join("case7").join("spec.md");
+    let Ok(spec) = fs::read_to_string(spec_path.as_std_path()) else {
+        return false;
+    };
+    let pass_criteria_only = r#"
+## pass criteria
+
+- `docs.md` exists.
+"#;
+    let hidden_case_fallback = [
+        "case_id == ",
+        "\"case7\"",
+        " && expected_artifacts.is_empty",
+    ]
+    .join("");
+    let hidden_docs_push = ["expected_artifacts.push(", "\"docs.md\"", ")"].join("");
+    let source = include_str!("manual_st.rs");
+
+    extract_expected_artifacts(&spec) == vec!["docs.md".to_string()]
+        && ManualStCaseSpec::load("case7")
+            .map(|loaded| loaded.expected_artifacts == vec!["docs.md".to_string()])
+            .unwrap_or(false)
+        && extract_expected_artifacts(pass_criteria_only).is_empty()
+        && !source.contains(&hidden_case_fallback)
+        && !source.contains(&hidden_docs_push)
+}
+
 fn extract_verification_command_specs(markdown: &str) -> Vec<VerificationCommandSpec> {
     let mut specs = Vec::new();
     let mut in_section = false;
@@ -2701,7 +3076,41 @@ fn extract_verification_command_specs(markdown: &str) -> Vec<VerificationCommand
 }
 
 fn route_verification_command_like(value: &str) -> bool {
-    value.contains("python ") || value.starts_with("cargo ") || value.starts_with("uv ")
+    let command = value.trim();
+    if command.is_empty() || command.contains('\n') {
+        return false;
+    }
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let Some(program) = tokens.first().copied() else {
+        return false;
+    };
+    if program.starts_with('-') {
+        return false;
+    }
+    if tokens.len() == 1 {
+        let normalized = normalize_closeout_target_path(command);
+        let spec = classify_language_artifact_target(&normalized);
+        if matches!(
+            spec.role,
+            ArtifactRole::Source | ArtifactRole::Test | ArtifactRole::Document
+        ) || normalized.contains('/')
+            || normalized.contains('.')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn manual_st_verification_commands_are_generic_public_commands_fixture_passes() -> bool {
+    route_verification_command_like("npm test")
+        && route_verification_command_like("pnpm test")
+        && route_verification_command_like("go test ./...")
+        && route_verification_command_like("node cli.js --help")
+        && route_verification_command_like("pytest")
+        && !route_verification_command_like("README.md")
+        && !route_verification_command_like("docs/output.md")
+        && !route_verification_command_like("src/workflow.rs")
 }
 
 fn verification_commands_for_stage(
@@ -2893,6 +3302,7 @@ async fn run_manual_st_route_command_with_timeout(
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| format!("failed to spawn route command `{command}`: {error}"))?;
+    let child_pid = child.id();
     match tokio::time::timeout(
         Duration::from_secs(timeout_seconds),
         child.wait_with_output(),
@@ -2901,7 +3311,12 @@ async fn run_manual_st_route_command_with_timeout(
     {
         Ok(Ok(output)) => Ok(ManualStRouteCommandOutput::Completed(output)),
         Ok(Err(error)) => Err(format!("route command `{command}` failed to wait: {error}")),
-        Err(_) => Ok(ManualStRouteCommandOutput::TimedOut { timeout_seconds }),
+        Err(_) => {
+            if let Some(pid) = child_pid {
+                cleanup_manual_st_route_process_tree(pid).await?;
+            }
+            Ok(ManualStRouteCommandOutput::TimedOut { timeout_seconds })
+        }
     }
 }
 
@@ -2921,6 +3336,68 @@ fn manual_st_route_command(command: &str, workspace: &Utf8Path) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     process
+}
+
+#[cfg(windows)]
+async fn cleanup_manual_st_route_process_tree(pid: u32) -> Result<(), String> {
+    let script = format!(
+        r#"
+$root = {pid}
+$all = Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId
+$children = @{{}}
+foreach ($p in $all) {{
+  if (-not $children.ContainsKey([int]$p.ParentProcessId)) {{ $children[[int]$p.ParentProcessId] = @() }}
+  $children[[int]$p.ParentProcessId] += [int]$p.ProcessId
+}}
+$stack = New-Object System.Collections.Generic.Stack[int]
+$stack.Push($root)
+$ids = New-Object System.Collections.Generic.List[int]
+while ($stack.Count -gt 0) {{
+  $current = $stack.Pop()
+  if ($ids.Contains($current)) {{ continue }}
+  $ids.Add($current)
+  if ($children.ContainsKey($current)) {{
+    foreach ($child in $children[$current]) {{ $stack.Push($child) }}
+  }}
+}}
+foreach ($id in $ids | Sort-Object -Descending) {{
+  Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+}}
+"#
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|error| format!("failed to cleanup manual ST route process tree: {error}"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn cleanup_manual_st_route_process_tree(pid: u32) -> Result<(), String> {
+    let _ = Command::new("pkill")
+        .args(["-TERM", "-P", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    Ok(())
+}
+
+#[cfg(not(any(windows, unix)))]
+async fn cleanup_manual_st_route_process_tree(_pid: u32) -> Result<(), String> {
+    Ok(())
 }
 
 fn timeout_verification_evidence(
@@ -3053,12 +3530,18 @@ fn write_route_artifacts(
         route_root.join("route_manifest.json"),
         &route_manifest(result),
     )?;
-    if !route_root.join("timeout_classification.json").exists() {
+    if matches!(result.route_level_verdict, RouteVerdict::Running) {
+        if !route_root.join("timeout_classification.json").exists() {
+            write_timeout_classification_with_reason(route_root, false, false, None)?;
+        }
+    } else {
+        let reason = result.stop_reason.as_deref();
+        let outer_timeout = reason.is_some_and(is_route_owned_turn_timeout_reason);
         write_timeout_classification_with_reason(
             route_root,
-            false,
-            !matches!(result.route_level_verdict, RouteVerdict::Running),
-            result.stop_reason.as_deref(),
+            outer_timeout,
+            !outer_timeout,
+            reason,
         )?;
     }
     Ok(())
@@ -3100,7 +3583,11 @@ fn write_case_progress_artifact(
     route_root: &Utf8Path,
     progress: &ManualStCaseProgress,
 ) -> Result<(), String> {
-    write_json(route_root.join("case_progress.json"), progress)
+    write_json(route_root.join("case_progress.json"), progress)?;
+    if matches!(progress.route_level_verdict, RouteVerdict::Running) {
+        write_running_timeout_classification_for_progress(route_root, progress)?;
+    }
+    Ok(())
 }
 
 fn write_json(path: Utf8PathBuf, value: &impl Serialize) -> Result<(), String> {
@@ -3264,6 +3751,7 @@ fn timeout_classification_value(
     classified_terminal_before_timeout: bool,
     reason: Option<&str>,
 ) -> Value {
+    let route_owned_turn_timeout = reason.is_some_and(is_route_owned_turn_timeout_reason);
     let provider_stream_stall = reason.is_some_and(is_provider_stream_stall_reason);
     let provider_stream_retry_exhausted =
         reason.is_some_and(is_provider_stream_retry_exhausted_reason);
@@ -3274,13 +3762,16 @@ fn timeout_classification_value(
     let evidence_refs = reason
         .filter(|_| {
             provider_stream_stall
+                || provider_stream_retry_exhausted
                 || provider_transport_stream_error
                 || semantic_no_progress_terminal
         })
         .map(|reason| vec![reason.to_string()])
         .unwrap_or_default();
-    let primary_timeout_owner = if outer_timeout {
+    let primary_timeout_owner = if outer_timeout || route_owned_turn_timeout {
         Some("harness_wait_policy")
+    } else if provider_stream_retry_exhausted {
+        Some("provider_stream_retry_exhausted")
     } else if provider_transport_stream_error {
         Some("provider_transport_stream_error")
     } else if provider_stream_stall {
@@ -3304,6 +3795,84 @@ fn timeout_classification_value(
         "primary_timeout_owner": primary_timeout_owner,
         "evidence_refs": evidence_refs
     })
+}
+
+fn write_running_timeout_classification_for_progress(
+    root: &Utf8Path,
+    progress: &ManualStCaseProgress,
+) -> Result<(), String> {
+    let mut value = timeout_classification_value(false, false, None);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "route_progress_status".to_string(),
+            Value::String(progress.progress_status.clone()),
+        );
+        object.insert(
+            "active_case_id".to_string(),
+            progress
+                .active_case_id
+                .as_ref()
+                .map(|value| Value::String(value.clone()))
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "stage_index".to_string(),
+            progress
+                .stage_index
+                .map(|value| json!(value))
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "stage_label".to_string(),
+            progress
+                .stage_label
+                .as_ref()
+                .map(|value| Value::String(value.clone()))
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "session_id".to_string(),
+            progress
+                .session_id
+                .as_ref()
+                .map(|value| Value::String(value.clone()))
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "last_progress_at".to_string(),
+            Value::String(progress.last_progress_at.clone()),
+        );
+        object.insert(
+            "inflight_owner".to_string(),
+            route_inflight_owner_for_progress(&progress.progress_status)
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "interruption_classification_hint".to_string(),
+            Value::String(
+                "If this route process is killed externally while route_level_verdict is running, use route_progress_status and inflight_owner as the last event-sourced wait boundary before consulting provider artifacts."
+                    .to_string(),
+            ),
+        );
+    }
+    write_json(root.join("timeout_classification.json"), &value)
+}
+
+fn route_inflight_owner_for_progress(progress_status: &str) -> Option<String> {
+    match progress_status {
+        "model_request_inflight" => Some("provider_model_request".to_string()),
+        "route_verification_evaluating" => Some("harness_verification".to_string()),
+        "closeout_continuation_pending" => Some("route_closeout_reducer".to_string()),
+        "case_started" | "case_running" | "route_started" => Some("route_harness".to_string()),
+        _ => None,
+    }
+}
+
+fn is_route_owned_turn_timeout_reason(reason: &str) -> bool {
+    reason
+        .to_ascii_lowercase()
+        .contains("exceeded max_turn_seconds")
 }
 
 fn is_provider_stream_stall_reason(reason: &str) -> bool {
@@ -3337,9 +3906,12 @@ fn is_semantic_no_progress_terminal_guard_reason(reason: &str) -> bool {
         || lower.contains("supporting_context output")
         || lower.contains("same verification failure evidence repeated")
         || lower.contains("representative survey budget is exhausted")
+        || lower.contains("content-changing authoring is required")
         || lower.contains("runtime stopped before allowing more broad docs-route discovery"))
         && (lower.contains("no-progress")
             || lower.contains("docs authoring")
+            || lower.contains("file-change evidence")
+            || lower.contains("artifact progress")
             || lower.contains("repair/rerun loop"))
 }
 
@@ -3352,13 +3924,43 @@ fn is_verification_non_convergence_reason(reason: &str) -> bool {
 pub(crate) fn provider_stream_idle_timeout_classification_fixture_passes() -> bool {
     let reason = "case2a stage1 failed before completion: provider stream idle timeout after 300000ms without any SSE event; stream retries exhausted after 3 attempt(s) with stream_max_retries=2";
     let value = timeout_classification_value(false, true, Some(reason));
+    let idle_only_reason = "case2a stage1 failed before completion: provider stream idle timeout after 300000ms without any SSE event";
+    let idle_only_value = timeout_classification_value(false, true, Some(idle_only_reason));
     value.get("provider_stream_stall").and_then(Value::as_bool) == Some(true)
         && value
             .get("provider_stream_retry_exhausted")
             .and_then(Value::as_bool)
             == Some(true)
         && value.get("primary_timeout_owner").and_then(Value::as_str)
+            == Some("provider_stream_retry_exhausted")
+        && value
+            .get("evidence_refs")
+            .and_then(Value::as_array)
+            .is_some_and(|refs| refs.iter().any(|item| item.as_str() == Some(reason)))
+        && idle_only_value
+            .get("provider_stream_stall")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && idle_only_value
+            .get("provider_stream_retry_exhausted")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && idle_only_value
+            .get("primary_timeout_owner")
+            .and_then(Value::as_str)
             == Some("provider_stream_idle_timeout")
+}
+
+pub(crate) fn manual_st_provider_retry_exhausted_timeout_classification_fixture_passes() -> bool {
+    let reason = "case2a stage1 failed before completion: provider stream idle timeout after 300000ms without any SSE event; stream retries exhausted after 3 attempt(s) with stream_max_retries=2";
+    let value = timeout_classification_value(false, true, Some(reason));
+    value
+        .get("provider_stream_retry_exhausted")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && value.get("provider_stream_stall").and_then(Value::as_bool) == Some(true)
+        && value.get("primary_timeout_owner").and_then(Value::as_str)
+            == Some("provider_stream_retry_exhausted")
         && value
             .get("evidence_refs")
             .and_then(Value::as_array)
@@ -3457,6 +4059,10 @@ pub fn route_owned_command_timeout_fixture_passes() -> bool {
     })
     .join()
     .unwrap_or(false)
+}
+
+pub fn route_owned_command_timeout_cleans_process_tree_fixture_passes() -> bool {
+    route_owned_command_timeout_fixture_passes()
 }
 
 pub(crate) fn route_evidence_filters_generated_dependency_paths_fixture_passes() -> bool {
@@ -3890,25 +4496,35 @@ pub struct ManualStCloseoutEvidence {
     #[serde(default)]
     pub repair_targets: Vec<String>,
     pub diagnostics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_cluster: Option<ManualStTerminalClusterEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualStTerminalClusterEvidence {
+    pub failure_family: String,
+    pub fail_stop: bool,
+    pub workspace_progress_can_reset: bool,
+    pub source: String,
 }
 
 pub fn final_assistant_open_obligation_not_clean_closeout_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::RequestedWorkAuthoring {
-        pending_targets: vec![Utf8PathBuf::from("test_calculator.py")],
-        verification_commands: vec!["python -m unittest".to_string()],
+        pending_targets: vec![Utf8PathBuf::from("tests/workflow.contract")],
+        verification_commands: vec!["verify-workflow --behavior".to_string()],
     };
     let evidence = classify_manual_st_closeout_from_evidence(
         true,
         Some(
-            "calculator.py was created. Next I will create test_calculator.py and run tests."
+            "src/workflow.rs was created. Next I will create tests/workflow.contract and run verification."
                 .to_string(),
         ),
         Some(&active_work),
         &[
-            "calculator.py".to_string(),
-            "test_calculator.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
-        &["calculator.py".to_string()],
+        &["src/workflow.rs".to_string()],
         &[],
     );
 
@@ -3916,27 +4532,27 @@ pub fn final_assistant_open_obligation_not_clean_closeout_fixture_passes() -> bo
         && evidence.runtime_completed
         && evidence
             .missing_artifacts
-            .contains(&"test_calculator.py".to_string())
+            .contains(&"tests/workflow.contract".to_string())
         && evidence
             .open_obligations
-            .contains(&"author `test_calculator.py`".to_string())
+            .contains(&"author `tests/workflow.contract`".to_string())
         && !evidence.diagnostics.is_empty()
 }
 
 pub fn final_assistant_open_obligation_continuation_hook_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::RequestedWorkAuthoring {
-        pending_targets: vec![Utf8PathBuf::from("test_calculator.py")],
-        verification_commands: vec!["python -m unittest".to_string()],
+        pending_targets: vec![Utf8PathBuf::from("tests/workflow.contract")],
+        verification_commands: vec!["verify-workflow --behavior".to_string()],
     };
     let evidence = classify_manual_st_closeout_from_evidence(
         true,
-        Some("Next I will create test_calculator.py.".to_string()),
+        Some("Next I will create tests/workflow.contract.".to_string()),
         Some(&active_work),
         &[
-            "calculator.py".to_string(),
-            "test_calculator.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
-        &["calculator.py".to_string()],
+        &["src/workflow.rs".to_string()],
         &[],
     );
     let prompt = build_closeout_continuation_prompt("caseX", "stage1", 1, &evidence);
@@ -3946,8 +4562,8 @@ pub fn final_assistant_open_obligation_continuation_hook_fixture_passes() -> boo
         && prompt.contains("explicit text-only user turn")
         && prompt.contains("text-only user turn")
         && prompt.contains("Codex stop-hook continuation")
-        && prompt.contains("test_calculator.py")
-        && prompt.contains("python -m unittest")
+        && prompt.contains("tests/workflow.contract")
+        && prompt.contains("verify-workflow --behavior")
         && prompt.contains("must use provider-visible file-changing tool calls")
         && prompt.contains("text-only promise about future work does not satisfy closeout")
         && !prompt.contains("[error]")
@@ -3956,24 +4572,24 @@ pub fn final_assistant_open_obligation_continuation_hook_fixture_passes() -> boo
 
 pub fn open_obligation_continuation_expected_inventory_is_non_authoring_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::DocsRepair {
-        deliverable: Some(Utf8PathBuf::from("docs/widget-design.md")),
+        deliverable: Some(Utf8PathBuf::from("docs/workflow-design.md")),
         pending_deliverables: Vec::new(),
         pending_summary: "docs route contract is pending".to_string(),
         route_contract_satisfied: false,
     };
     let evidence = classify_manual_st_closeout_from_evidence(
         true,
-        Some("Next I will repair docs/widget-design.md.".to_string()),
+        Some("Next I will repair docs/workflow-design.md.".to_string()),
         Some(&active_work),
         &[
-            "widget.py".to_string(),
-            "docs/widget-design.md".to_string(),
-            "test_widget.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "docs/workflow-design.md".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
         &[
-            "widget.py".to_string(),
-            "docs/widget-design.md".to_string(),
-            "test_widget.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "docs/workflow-design.md".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
         &[],
     );
@@ -3983,7 +4599,7 @@ pub fn open_obligation_continuation_expected_inventory_is_non_authoring_fixture_
         && evidence.missing_artifacts.is_empty()
         && evidence
             .open_obligations
-            .contains(&"repair docs `docs/widget-design.md`".to_string())
+            .contains(&"repair docs `docs/workflow-design.md`".to_string())
         && prompt.contains("Open obligations:")
         && prompt.contains("Expected artifacts:")
         && prompt.contains("route inventory evidence only")
@@ -3993,59 +4609,68 @@ pub fn open_obligation_continuation_expected_inventory_is_non_authoring_fixture_
 
 pub fn route_verification_waits_for_authored_artifacts_fixture_passes() -> bool {
     let authoring_work = ActiveWorkContract::RequestedWorkAuthoring {
-        pending_targets: vec![Utf8PathBuf::from("test_widget.py")],
-        verification_commands: vec!["python -m unittest".to_string()],
+        pending_targets: vec![Utf8PathBuf::from("tests/workflow.contract")],
+        verification_commands: vec!["verify-workflow --behavior".to_string()],
     };
     let open_authoring_closeout = classify_manual_st_closeout_from_evidence(
         true,
-        Some("widget.py is ready; next I will create test_widget.py.".to_string()),
+        Some("src/workflow.rs is ready; next I will create tests/workflow.contract.".to_string()),
         Some(&authoring_work),
-        &["widget.py".to_string(), "test_widget.py".to_string()],
-        &["widget.py".to_string()],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &["src/workflow.rs".to_string()],
         &[],
     );
     let verification_work = ActiveWorkContract::Verification {
-        commands: vec!["python -m unittest".to_string()],
+        commands: vec!["verify-workflow --behavior".to_string()],
         failing_labels: Vec::new(),
         repair_required: false,
         targets: vec![
-            Utf8PathBuf::from("widget.py"),
-            Utf8PathBuf::from("test_widget.py"),
+            Utf8PathBuf::from("src/workflow.rs"),
+            Utf8PathBuf::from("tests/workflow.contract"),
         ],
     };
     let verification_only_closeout = classify_manual_st_closeout_from_evidence(
         true,
         Some("Files are ready; I will verify them.".to_string()),
         Some(&verification_work),
-        &["widget.py".to_string(), "test_widget.py".to_string()],
-        &["widget.py".to_string(), "test_widget.py".to_string()],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
         &[],
     );
 
     !manual_st_route_verification_may_run(&open_authoring_closeout)
         && open_authoring_closeout
             .missing_artifacts
-            .contains(&"test_widget.py".to_string())
+            .contains(&"tests/workflow.contract".to_string())
         && open_authoring_closeout
             .open_obligations
-            .contains(&"author `test_widget.py`".to_string())
+            .contains(&"author `tests/workflow.contract`".to_string())
         && manual_st_route_verification_may_run(&verification_only_closeout)
         && verification_only_closeout.verification_required
-            == vec!["python -m unittest".to_string()]
+            == vec!["verify-workflow --behavior".to_string()]
 }
 
 pub fn post_repair_route_verification_clears_stale_repair_fixture_passes() -> bool {
     let verification_work = ActiveWorkContract::Verification {
         commands: vec![
-            "python -X utf8 tool.py ok".to_string(),
-            "python -X utf8 tool.py bad".to_string(),
+            "workflow-check --mode ok".to_string(),
+            "workflow-check --mode bad".to_string(),
         ],
-        failing_labels: vec!["failed command: python -X utf8 tool.py ok".to_string()],
+        failing_labels: vec!["failed command: workflow-check --mode ok".to_string()],
         repair_required: true,
-        targets: vec![Utf8PathBuf::from("tool.py")],
+        targets: vec![Utf8PathBuf::from("src/workflow.rs")],
     };
     let stale_failure = VerificationCommandEvidence {
-        command: "python -X utf8 tool.py ok".to_string(),
+        command: "workflow-check --mode ok".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "100".to_string(),
         end_time: "110".to_string(),
@@ -4060,7 +4685,7 @@ pub fn post_repair_route_verification_clears_stale_repair_fixture_passes() -> bo
         requirement_id: Some("public_command_contract".to_string()),
     };
     let post_repair_pass = VerificationCommandEvidence {
-        command: "python -X utf8 tool.py ok".to_string(),
+        command: "workflow-check --mode ok".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "200".to_string(),
         end_time: "210".to_string(),
@@ -4073,7 +4698,7 @@ pub fn post_repair_route_verification_clears_stale_repair_fixture_passes() -> bo
         requirement_id: Some("public_command_contract".to_string()),
     };
     let second_post_repair_pass = VerificationCommandEvidence {
-        command: "python -X utf8 tool.py bad".to_string(),
+        command: "workflow-check --mode bad".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "211".to_string(),
         end_time: "220".to_string(),
@@ -4089,8 +4714,8 @@ pub fn post_repair_route_verification_clears_stale_repair_fixture_passes() -> bo
         false,
         None,
         Some(&verification_work),
-        &["tool.py".to_string()],
-        &["tool.py".to_string()],
+        &["src/workflow.rs".to_string()],
+        &["src/workflow.rs".to_string()],
         &[stale_failure, post_repair_pass, second_post_repair_pass],
     );
 
@@ -4238,7 +4863,7 @@ Finish the public command surface.
 
 pub fn manual_st_visible_scenario_contract_prompt_fixture_passes() -> bool {
     let root = manual_st_root().join("case1");
-    let prompt = "Create calculator.py and test_calculator.py.";
+    let prompt = "Create src/workflow.rs and tests/workflow.contract.";
     root.join("scenario_contract.md").exists() && root.join("scenario_contract.json").exists() && {
         let rendered = append_visible_scenario_contract_prompt(prompt, root.as_path());
         rendered.contains("scenario_contract.md")
@@ -4250,12 +4875,13 @@ pub fn manual_st_visible_scenario_contract_prompt_fixture_passes() -> bool {
 }
 
 pub fn route_result_progress_fields_fixture_passes() -> bool {
+    let current_model = ResolvedConfig::default().model;
     let config = ManualStRouteRunConfig {
         route: ManualStRouteKind::RequiredCore,
         output_root: None,
         preflight_report: Utf8PathBuf::from("preflight.json"),
-        model_override: Some("local-model".to_string()),
-        base_url_override: Some("http://localhost:1234".to_string()),
+        model_override: Some(current_model.model.clone()),
+        base_url_override: Some(current_model.base_url.clone()),
         provider_metadata_mode_override: None,
         context_window_override: None,
         max_output_tokens_override: None,
@@ -4288,12 +4914,13 @@ pub fn route_result_progress_fields_fixture_passes() -> bool {
 }
 
 pub fn route_inflight_case_progress_artifact_fixture_passes() -> bool {
+    let current_model = ResolvedConfig::default().model;
     let config = ManualStRouteRunConfig {
         route: ManualStRouteKind::RequiredCore,
         output_root: None,
         preflight_report: Utf8PathBuf::from("preflight.json"),
-        model_override: Some("local-model".to_string()),
-        base_url_override: Some("http://localhost:1234".to_string()),
+        model_override: Some(current_model.model.clone()),
+        base_url_override: Some(current_model.base_url.clone()),
         provider_metadata_mode_override: None,
         context_window_override: None,
         max_output_tokens_override: None,
@@ -4333,6 +4960,9 @@ pub fn route_inflight_case_progress_artifact_fixture_passes() -> bool {
     let parsed = fs::read(route_root.join("case_progress.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let parsed_timeout = fs::read(route_root.join("timeout_classification.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
     let _ = fs::remove_dir_all(route_root.as_std_path());
 
     write_ok
@@ -4366,15 +4996,41 @@ pub fn route_inflight_case_progress_artifact_fixture_passes() -> bool {
             .and_then(|value| value.get("harness_event_root"))
             .and_then(Value::as_str)
             .is_some()
+        && parsed_timeout
+            .as_ref()
+            .and_then(|value| value.get("route_progress_status"))
+            .and_then(Value::as_str)
+            == Some("model_request_inflight")
+        && parsed_timeout
+            .as_ref()
+            .and_then(|value| value.get("inflight_owner"))
+            .and_then(Value::as_str)
+            == Some("provider_model_request")
+        && parsed_timeout
+            .as_ref()
+            .and_then(|value| value.get("outer_timeout"))
+            .and_then(Value::as_bool)
+            == Some(false)
+        && parsed_timeout
+            .as_ref()
+            .and_then(|value| value.get("classified_terminal_before_timeout"))
+            .and_then(Value::as_bool)
+            == Some(false)
+        && parsed_timeout
+            .as_ref()
+            .and_then(|value| value.get("interruption_classification_hint"))
+            .and_then(Value::as_str)
+            .is_some_and(|hint| hint.contains("event-sourced wait boundary"))
 }
 
 pub fn route_case_progress_phase_boundaries_fixture_passes() -> bool {
+    let current_model = ResolvedConfig::default().model;
     let config = ManualStRouteRunConfig {
         route: ManualStRouteKind::RequiredCore,
         output_root: None,
         preflight_report: Utf8PathBuf::from("preflight.json"),
-        model_override: Some("local-model".to_string()),
-        base_url_override: Some("http://localhost:1234".to_string()),
+        model_override: Some(current_model.model.clone()),
+        base_url_override: Some(current_model.base_url.clone()),
         provider_metadata_mode_override: None,
         context_window_override: None,
         max_output_tokens_override: None,
@@ -4421,18 +5077,18 @@ pub fn route_case_progress_phase_boundaries_fixture_passes() -> bool {
 
 pub fn successful_closeout_continuation_rematerializes_case_verdict_fixture_passes() -> bool {
     let expected_artifacts = vec![
-        "calculator.py".to_string(),
-        "test_calculator.py".to_string(),
+        "src/workflow.rs".to_string(),
+        "tests/workflow.contract".to_string(),
     ];
     let actual_files = expected_artifacts.clone();
     let passed_verification = VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "1".to_string(),
         end_time: "2".to_string(),
         exit_code: Some(0),
-        stdout_summary: String::new(),
-        stderr_summary: "Ran 21 tests\nOK".to_string(),
+        stdout_summary: "workflow contract passed".to_string(),
+        stderr_summary: String::new(),
         normalized_failure_class: None,
         required: true,
         case_id: "caseX".to_string(),
@@ -4475,12 +5131,13 @@ pub fn successful_closeout_continuation_rematerializes_case_verdict_fixture_pass
 }
 
 pub fn route_terminal_verdict_rematerializes_from_case_results_fixture_passes() -> bool {
+    let current_model = ResolvedConfig::default().model;
     let config = ManualStRouteRunConfig {
         route: ManualStRouteKind::RequiredCore,
         output_root: None,
         preflight_report: Utf8PathBuf::from("preflight.json"),
-        model_override: Some("local-model".to_string()),
-        base_url_override: Some("http://localhost:1234".to_string()),
+        model_override: Some(current_model.model.clone()),
+        base_url_override: Some(current_model.base_url.clone()),
         provider_metadata_mode_override: None,
         context_window_override: None,
         max_output_tokens_override: None,
@@ -4527,13 +5184,13 @@ pub fn route_terminal_verdict_rematerializes_from_case_results_fixture_passes() 
 
 pub fn latest_verification_result_drives_closeout_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::Verification {
-        commands: vec!["python -m unittest".to_string()],
+        commands: vec!["verify-workflow --behavior".to_string()],
         failing_labels: Vec::new(),
         repair_required: false,
-        targets: vec![Utf8PathBuf::from("test_calculator.py")],
+        targets: vec![Utf8PathBuf::from("tests/workflow.contract")],
     };
     let failed = VerificationCommandEvidence {
-        command: "python   -m   unittest".to_string(),
+        command: "verify-workflow   --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "0".to_string(),
         end_time: "1".to_string(),
@@ -4546,12 +5203,12 @@ pub fn latest_verification_result_drives_closeout_fixture_passes() -> bool {
         requirement_id: None,
     };
     let passed = VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "2".to_string(),
         end_time: "3".to_string(),
         exit_code: Some(0),
-        stdout_summary: "Ran 3 tests".to_string(),
+        stdout_summary: "workflow contract passed".to_string(),
         stderr_summary: String::new(),
         normalized_failure_class: None,
         required: true,
@@ -4563,12 +5220,12 @@ pub fn latest_verification_result_drives_closeout_fixture_passes() -> bool {
         Some("All work is complete.".to_string()),
         Some(&active_work),
         &[
-            "calculator.py".to_string(),
-            "test_calculator.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
         &[
-            "calculator.py".to_string(),
-            "test_calculator.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
         &[failed, passed],
     );
@@ -4576,20 +5233,20 @@ pub fn latest_verification_result_drives_closeout_fixture_passes() -> bool {
     evidence.closeout_class == ManualStCloseoutClass::CleanCloseout
         && evidence
             .verification_passed
-            .contains(&"python -m unittest".to_string())
+            .contains(&"verify-workflow --behavior".to_string())
         && evidence.verification_failed.is_empty()
         && evidence.verification_required.is_empty()
 }
 
 pub fn verification_evidence_after_content_change_invalidated_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::Verification {
-        commands: vec!["python -m unittest".to_string()],
+        commands: vec!["verify-workflow --behavior".to_string()],
         failing_labels: Vec::new(),
         repair_required: false,
         targets: Vec::new(),
     };
     let mut verification_commands = vec![VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "10".to_string(),
         end_time: "20".to_string(),
@@ -4610,8 +5267,8 @@ pub fn verification_evidence_after_content_change_invalidated_fixture_passes() -
         true,
         Some("Done.".to_string()),
         Some(&active_work),
-        &["widget.py".to_string()],
-        &["widget.py".to_string()],
+        &["src/workflow.rs".to_string()],
+        &["src/workflow.rs".to_string()],
         &verification_commands,
     );
 
@@ -4623,13 +5280,13 @@ pub fn verification_evidence_after_content_change_invalidated_fixture_passes() -
         && evidence.verification_passed.is_empty()
         && evidence
             .verification_failed
-            .contains(&"python -m unittest".to_string())
+            .contains(&"verify-workflow --behavior".to_string())
 }
 
 pub fn stage_without_required_verification_ignores_prior_stale_verification_fixture_passes() -> bool
 {
     let route_verification_log = vec![VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "10".to_string(),
         end_time: "20".to_string(),
@@ -4667,13 +5324,13 @@ pub fn stage_without_required_verification_ignores_prior_stale_verification_fixt
 pub fn runtime_verification_pass_after_content_change_satisfies_route_closeout_fixture_passes()
 -> bool {
     let active_work = ActiveWorkContract::Verification {
-        commands: vec!["python -m unittest".to_string()],
+        commands: vec!["verify-workflow --behavior".to_string()],
         failing_labels: Vec::new(),
         repair_required: false,
         targets: Vec::new(),
     };
     let mut verification_commands = vec![VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "10".to_string(),
         end_time: "20".to_string(),
@@ -4696,21 +5353,21 @@ pub fn runtime_verification_pass_after_content_change_satisfies_route_closeout_f
         payload: HistoryItemPayload::ToolOutput {
             call_id: ToolCallId::new(),
             status: ToolLifecycleStatus::Completed,
-            title: "Run shell command: python -X utf8 -m unittest".to_string(),
-            output_text: "Ran 3 tests\n\nOK".to_string(),
+            title: "Run shell command: verify-workflow --behavior".to_string(),
+            output_text: "workflow contract passed".to_string(),
             metadata: Value::Null,
             success: Some(true),
             progress_effect: ToolProgressEffect::VerificationPassed,
             blocked_action: None,
             result_hash: Some("verification-pass".to_string()),
             verification_run: Some(VerificationRunResult {
-                command: "python -X utf8 -m unittest".to_string(),
+                command: "verify-workflow --behavior".to_string(),
                 status: VerificationRunStatus::Passed,
                 exit_code: Some(0),
                 timed_out: false,
-                output_summary: "Ran 3 tests\n\nOK".to_string(),
+                output_summary: "workflow contract passed".to_string(),
                 failure_cluster: None,
-                satisfies_command_identities: vec!["python -m unittest".to_string()],
+                satisfies_command_identities: vec!["verify-workflow --behavior".to_string()],
                 artifact_refs: Vec::new(),
                 requirement_refs: Vec::new(),
             }),
@@ -4725,8 +5382,8 @@ pub fn runtime_verification_pass_after_content_change_satisfies_route_closeout_f
         true,
         Some("Done.".to_string()),
         Some(&active_work),
-        &["widget.py".to_string()],
-        &["widget.py".to_string()],
+        &["src/workflow.rs".to_string()],
+        &["src/workflow.rs".to_string()],
         &verification_commands,
     );
 
@@ -4734,17 +5391,17 @@ pub fn runtime_verification_pass_after_content_change_satisfies_route_closeout_f
         && evidence.closeout_class == ManualStCloseoutClass::CleanCloseout
         && evidence
             .verification_passed
-            .contains(&"python -m unittest".to_string())
+            .contains(&"verify-workflow --behavior".to_string())
         && evidence.verification_failed.is_empty()
 }
 
 pub fn verification_failure_preserves_closeout_evidence_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::RequestedWorkAuthoring {
-        pending_targets: vec![Utf8PathBuf::from("test_calculator.py")],
-        verification_commands: vec!["python -m unittest".to_string()],
+        pending_targets: vec![Utf8PathBuf::from("tests/workflow.contract")],
+        verification_commands: vec!["verify-workflow --behavior".to_string()],
     };
     let verification = VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "0".to_string(),
         end_time: "1".to_string(),
@@ -4759,28 +5416,28 @@ pub fn verification_failure_preserves_closeout_evidence_fixture_passes() -> bool
     let evidence = classify_manual_st_closeout_from_evidence(
         true,
         Some(
-            "calculator.py was created. Next I will create test_calculator.py and run tests."
+            "src/workflow.rs was created. Next I will create tests/workflow.contract and run verification."
                 .to_string(),
         ),
         Some(&active_work),
         &[
-            "calculator.py".to_string(),
-            "test_calculator.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
-        &["calculator.py".to_string()],
+        &["src/workflow.rs".to_string()],
         &[verification],
     );
 
     evidence.closeout_class == ManualStCloseoutClass::ContinuationPromised
         && evidence
             .verification_failed
-            .contains(&"python -m unittest".to_string())
+            .contains(&"verify-workflow --behavior".to_string())
         && evidence
             .missing_artifacts
-            .contains(&"test_calculator.py".to_string())
+            .contains(&"tests/workflow.contract".to_string())
         && evidence
             .open_obligations
-            .contains(&"author `test_calculator.py`".to_string())
+            .contains(&"author `tests/workflow.contract`".to_string())
         && evidence
             .diagnostics
             .iter()
@@ -4789,20 +5446,19 @@ pub fn verification_failure_preserves_closeout_evidence_fixture_passes() -> bool
 
 pub fn verification_failed_closeout_builds_repair_hook_prompt_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::Verification {
-        commands: vec!["python -m unittest".to_string()],
+        commands: vec!["verify-workflow --behavior".to_string()],
         failing_labels: vec!["public_api".to_string()],
         repair_required: false,
-        targets: vec![Utf8PathBuf::from("space_invader.py")],
+        targets: vec![Utf8PathBuf::from("src/workflow.rs")],
     };
     let verification = VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "0".to_string(),
         end_time: "1".to_string(),
         exit_code: Some(1),
         stdout_summary: String::new(),
-        stderr_summary: "AttributeError: 'GameState' object has no attribute 'update_bullets'"
-            .to_string(),
+        stderr_summary: "PublicApiError: WorkflowState has no operation `advance_step`".to_string(),
         normalized_failure_class: Some("verification_failed".to_string()),
         required: true,
         case_id: "caseX".to_string(),
@@ -4810,21 +5466,21 @@ pub fn verification_failed_closeout_builds_repair_hook_prompt_fixture_passes() -
     };
     let evidence = classify_manual_st_closeout_from_evidence(
         true,
-        Some("The tests failed; next I will fix space_invader.py.".to_string()),
+        Some("The verification failed; next I will fix src/workflow.rs.".to_string()),
         Some(&active_work),
         &[
             "README.md".to_string(),
             "scenario_contract.json".to_string(),
             "scenario_contract.md".to_string(),
-            "space_invader.py".to_string(),
-            "test_space_invader.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
         &[
             "README.md".to_string(),
             "scenario_contract.json".to_string(),
             "scenario_contract.md".to_string(),
-            "space_invader.py".to_string(),
-            "test_space_invader.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
         &[verification],
     );
@@ -4834,16 +5490,16 @@ pub fn verification_failed_closeout_builds_repair_hook_prompt_fixture_passes() -
         && should_continue_after_closeout(&evidence)
         && evidence
             .repair_targets
-            .contains(&"space_invader.py".to_string())
+            .contains(&"src/workflow.rs".to_string())
         && evidence
             .verification_failed
-            .contains(&"python -m unittest".to_string())
+            .contains(&"verify-workflow --behavior".to_string())
         && prompt.contains("verification-repair continuation")
         && prompt.contains("explicit text-only user turn")
         && prompt.contains("Codex stop-hook continuation")
-        && prompt.contains("space_invader.py")
-        && prompt.contains("python -m unittest")
-        && prompt.contains("update_bullets")
+        && prompt.contains("src/workflow.rs")
+        && prompt.contains("verify-workflow --behavior")
+        && prompt.contains("advance_step")
         && prompt.contains("apply_patch")
         && prompt.contains("rerun the failed required verification command")
         && prompt.contains("Do not answer with a text-only promise")
@@ -4853,19 +5509,19 @@ pub fn verification_failed_closeout_builds_repair_hook_prompt_fixture_passes() -
 
 pub fn public_command_contract_closeout_prompt_compacts_failure_evidence_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::Verification {
-        commands: vec!["python -X utf8 tool.py 2 + 3".to_string()],
-        failing_labels: vec!["failed command: python -X utf8 tool.py 2 + 3".to_string()],
+        commands: vec!["workflow-cli --sum 2 3".to_string()],
+        failing_labels: vec!["failed command: workflow-cli --sum 2 3".to_string()],
         repair_required: false,
-        targets: vec![Utf8PathBuf::from("tool.py")],
+        targets: vec![Utf8PathBuf::from("src/workflow.rs")],
     };
     let verification = VerificationCommandEvidence {
-        command: "python -X utf8 tool.py 2 + 3".to_string(),
+        command: "workflow-cli --sum 2 3".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "0".to_string(),
         end_time: "1".to_string(),
         exit_code: Some(1),
         stdout_summary: "Usage\n\n> ".to_string(),
-        stderr_summary: "Traceback (most recent call last):\n  File \"C:\\workspace\\tool.py\", line 9, in <module>\n    input()\nEOFError: EOF when reading a line".to_string(),
+        stderr_summary: "Interactive input requested from public command without stdin".to_string(),
         normalized_failure_class: Some(
             "public_command_contract_failed: expected exit 0 but got Some(1); stdout had no line ending with `5`".to_string(),
         ),
@@ -4877,8 +5533,14 @@ pub fn public_command_contract_closeout_prompt_compacts_failure_evidence_fixture
         true,
         Some("Done.".to_string()),
         Some(&active_work),
-        &["tool.py".to_string(), "test_tool.py".to_string()],
-        &["tool.py".to_string(), "test_tool.py".to_string()],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
         &[verification],
     );
     let prompt = build_closeout_continuation_prompt("routeX", "stage", 1, &evidence);
@@ -4890,27 +5552,29 @@ pub fn public_command_contract_closeout_prompt_compacts_failure_evidence_fixture
             .any(|item| item.contains("requirement_id: public_command_contract"))
         && prompt.contains("public argv command contract")
         && prompt.contains("argv invocation entered interactive stdin mode")
-        && prompt.contains("python -X utf8 tool.py 2 + 3")
-        && !prompt.contains("Traceback")
+        && prompt.contains("workflow-cli --sum 2 3")
+        && !prompt.contains("Interactive input requested")
         && !prompt.contains("C:\\workspace")
         && !prompt.contains("line 9")
 }
 
 pub fn verification_failed_closeout_uses_generated_test_parse_target_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::Verification {
-        commands: vec!["python -m unittest".to_string()],
-        failing_labels: vec!["failed command: python -m unittest".to_string()],
+        commands: vec!["verify-workflow --behavior".to_string()],
+        failing_labels: vec!["failed command: verify-workflow --behavior".to_string()],
         repair_required: false,
-        targets: vec![Utf8PathBuf::from("widget.py")],
+        targets: vec![Utf8PathBuf::from("src/workflow.rs")],
     };
     let verification = VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "0".to_string(),
         end_time: "1".to_string(),
         exit_code: Some(1),
         stdout_summary: String::new(),
-        stderr_summary: "E\n======================================================================\nERROR: test_widget (unittest.loader._FailedTest.test_widget)\n----------------------------------------------------------------------\nImportError: Failed to import test module: test_widget\nTraceback (most recent call last):\n  File \"C:\\Python313\\Lib\\unittest\\loader.py\", line 396, in _find_test_path\n    module = self._get_module_from_name(name)\n  File \"C:\\workspace\\test_widget.py\", line 42\n    \"\"\"\n    ^\nSyntaxError: unterminated triple-quoted string literal (detected at line 42)\n\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nFAILED (errors=1)".to_string(),
+        stderr_summary:
+            "Generated test parse defect:\nTraceback (most recent call last):\n  File \"tests/workflow.spec.rs\", line 42\nSyntaxError: unterminated generated test block"
+                .to_string(),
         normalized_failure_class: Some("verification_failed".to_string()),
         required: true,
         case_id: "caseX".to_string(),
@@ -4920,48 +5584,71 @@ pub fn verification_failed_closeout_uses_generated_test_parse_target_fixture_pas
         true,
         Some("Latest evidence: verification failed.".to_string()),
         Some(&active_work),
-        &["widget.py".to_string(), "test_widget.py".to_string()],
-        &["widget.py".to_string(), "test_widget.py".to_string()],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.spec.rs".to_string(),
+        ],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.spec.rs".to_string(),
+        ],
         &[verification],
     );
     let prompt = build_closeout_continuation_prompt("caseX", "stage1", 1, &evidence);
 
     evidence.closeout_class == ManualStCloseoutClass::VerificationRequired
-        && evidence.repair_targets == vec!["test_widget.py".to_string()]
+        && evidence.repair_targets == vec!["tests/workflow.spec.rs".to_string()]
         && evidence
             .verification_failure_evidence
             .iter()
-            .any(|item| item.contains("SyntaxError: unterminated triple-quoted string literal"))
+            .any(|item| item.contains("unterminated generated test block"))
         && prompt.contains("Manual ST verification-repair continuation")
         && prompt.contains("Repair targets")
-        && prompt.contains("test_widget.py")
-        && !prompt.contains("Repair targets\n- widget.py")
+        && prompt.contains("tests/workflow.spec.rs")
+        && !prompt.contains("Repair targets\n- src/workflow.rs")
+}
+
+pub fn closeout_artifact_roles_use_language_adapter_fixture_passes() -> bool {
+    closeout_target_is_test_like("src/widget.spec.ts")
+        && closeout_target_is_test_like("tests/test_widget.py")
+        && !closeout_target_is_test_like("src/widget.ts")
+        && closeout_target_is_mutable_source("src/widget.ts")
+        && closeout_target_is_mutable_source("src/widget.py")
+        && !closeout_target_is_mutable_source("src/widget.spec.ts")
+        && !closeout_target_is_mutable_source("scenario_contract.json")
+        && likely_repair_source_artifact("src/widget.ts")
+        && likely_repair_source_artifact("src/widget.py")
+        && !likely_repair_source_artifact("tests/test_widget.py")
+        && !likely_repair_source_artifact("docs/widget-design.md")
+        && closeout_target_is_deliverable_artifact("src/widget.spec.ts")
+        && closeout_target_is_deliverable_artifact("src/widget.ts")
+        && closeout_target_is_deliverable_artifact("docs/widget-design.md")
 }
 
 pub fn closeout_continuation_budget_is_scoped_by_failure_signature_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::RequestedWorkAuthoring {
-        pending_targets: vec![Utf8PathBuf::from("test_space_invader.py")],
-        verification_commands: vec!["python -m unittest".to_string()],
+        pending_targets: vec![Utf8PathBuf::from("tests/workflow.contract")],
+        verification_commands: vec!["verify-workflow --behavior".to_string()],
     };
     let open_evidence = classify_manual_st_closeout_from_evidence(
         true,
-        Some("Next I will create test_space_invader.py.".to_string()),
+        Some("Next I will create tests/workflow.contract.".to_string()),
         Some(&active_work),
         &[
-            "space_invader.py".to_string(),
-            "test_space_invader.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
-        &["space_invader.py".to_string()],
+        &["src/workflow.rs".to_string()],
         &[],
     );
     let repair_active_work = ActiveWorkContract::Verification {
-        commands: vec!["python -m unittest".to_string()],
+        commands: vec!["verify-workflow --behavior".to_string()],
         failing_labels: vec!["public_api".to_string()],
         repair_required: false,
-        targets: vec![Utf8PathBuf::from("space_invader.py")],
+        targets: vec![Utf8PathBuf::from("src/workflow.rs")],
     };
     let failed_verification = VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "0".to_string(),
         end_time: "1".to_string(),
@@ -4975,15 +5662,15 @@ pub fn closeout_continuation_budget_is_scoped_by_failure_signature_fixture_passe
     };
     let repair_evidence = classify_manual_st_closeout_from_evidence(
         true,
-        Some("Next I will fix space_invader.py.".to_string()),
+        Some("Next I will fix src/workflow.rs.".to_string()),
         Some(&repair_active_work),
         &[
-            "space_invader.py".to_string(),
-            "test_space_invader.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
         &[
-            "space_invader.py".to_string(),
-            "test_space_invader.py".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
         ],
         &[failed_verification],
     );
@@ -5006,13 +5693,13 @@ pub fn closeout_continuation_budget_is_scoped_by_failure_signature_fixture_passe
 
 pub fn closeout_continuation_budget_blocks_same_workspace_stall_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::Verification {
-        commands: vec!["python -m unittest".to_string()],
+        commands: vec!["verify-workflow --behavior".to_string()],
         failing_labels: vec!["test_public_behavior".to_string()],
         repair_required: true,
-        targets: vec![Utf8PathBuf::from("widget.py")],
+        targets: vec![Utf8PathBuf::from("src/workflow.rs")],
     };
     let failed_verification = VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "0".to_string(),
         end_time: "1".to_string(),
@@ -5026,10 +5713,16 @@ pub fn closeout_continuation_budget_blocks_same_workspace_stall_fixture_passes()
     };
     let evidence = classify_manual_st_closeout_from_evidence(
         true,
-        Some("I will inspect widget.py again.".to_string()),
+        Some("I will inspect src/workflow.rs again.".to_string()),
         Some(&active_work),
-        &["widget.py".to_string(), "test_widget.py".to_string()],
-        &["widget.py".to_string(), "test_widget.py".to_string()],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
         &[failed_verification],
     );
 
@@ -5055,21 +5748,21 @@ pub fn closeout_continuation_budget_blocks_same_workspace_stall_fixture_passes()
 pub fn verification_failure_labels_do_not_become_authoring_obligations_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::RequestedWorkAuthoring {
         pending_targets: vec![
-            Utf8PathBuf::from("test_space_invader.TestBulletClass.test_bullet_creation"),
-            Utf8PathBuf::from("test_space_invader.TestBulletClass.test_bullet_destroy"),
-            Utf8PathBuf::from("test_space_invader.TestBulletClass.test_bullet_rect"),
+            Utf8PathBuf::from("workflow_contract.behavior.creates_transition"),
+            Utf8PathBuf::from("workflow_contract.behavior.rejects_invalid_transition"),
+            Utf8PathBuf::from("workflow_contract.behavior.records_status"),
         ],
-        verification_commands: vec!["python -m unittest".to_string()],
+        verification_commands: vec!["verify-workflow --behavior".to_string()],
     };
     let verification = VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "0".to_string(),
         end_time: "1".to_string(),
         exit_code: Some(1),
         stdout_summary: String::new(),
-        stderr_summary:
-            "TypeError: Bullet.__init__() got an unexpected keyword argument 'is_enemy'".to_string(),
+        stderr_summary: "TypeError: WorkflowTransition received unexpected field 'external_state'"
+            .to_string(),
         normalized_failure_class: Some("verification_failed".to_string()),
         required: true,
         case_id: "caseX".to_string(),
@@ -5079,8 +5772,8 @@ pub fn verification_failure_labels_do_not_become_authoring_obligations_fixture_p
         "README.md".to_string(),
         "scenario_contract.json".to_string(),
         "scenario_contract.md".to_string(),
-        "space_invader.py".to_string(),
-        "test_space_invader.py".to_string(),
+        "src/workflow.rs".to_string(),
+        "tests/workflow.contract".to_string(),
     ];
     let evidence = classify_manual_st_closeout_from_evidence(
         true,
@@ -5097,28 +5790,28 @@ pub fn verification_failure_labels_do_not_become_authoring_obligations_fixture_p
         && evidence.missing_artifacts.is_empty()
         && evidence
             .verification_failed
-            .contains(&"python -m unittest".to_string())
+            .contains(&"verify-workflow --behavior".to_string())
         && evidence
             .repair_targets
-            .contains(&"space_invader.py".to_string())
+            .contains(&"src/workflow.rs".to_string())
         && closeout_continuation_kind(&evidence) == Some("verification_failed")
         && prompt.contains("Manual ST verification-repair continuation")
-        && prompt.contains("space_invader.py")
-        && prompt.contains("python -m unittest")
+        && prompt.contains("src/workflow.rs")
+        && prompt.contains("verify-workflow --behavior")
         && prompt.contains("apply_patch")
-        && !prompt.contains("author `test_space_invader.TestBulletClass")
+        && !prompt.contains("author `workflow_contract.behavior")
         && !prompt.contains("tool_choice=required")
 }
 
 pub fn runtime_failure_closeout_recomputes_current_artifacts_fixture_passes() -> bool {
     let active_work = ActiveWorkContract::Verification {
-        commands: vec!["python -m unittest".to_string()],
-        failing_labels: vec!["test_calculator".to_string()],
+        commands: vec!["verify-workflow --behavior".to_string()],
+        failing_labels: vec!["workflow_contract".to_string()],
         repair_required: true,
-        targets: vec![Utf8PathBuf::from("calculator.py")],
+        targets: vec![Utf8PathBuf::from("src/workflow.rs")],
     };
     let verification = VerificationCommandEvidence {
-        command: "python -m unittest".to_string(),
+        command: "verify-workflow --behavior".to_string(),
         working_directory: "workspace".to_string(),
         start_time: "0".to_string(),
         end_time: "1".to_string(),
@@ -5131,8 +5824,8 @@ pub fn runtime_failure_closeout_recomputes_current_artifacts_fixture_passes() ->
         requirement_id: None,
     };
     let expected = vec![
-        "calculator.py".to_string(),
-        "test_calculator.py".to_string(),
+        "src/workflow.rs".to_string(),
+        "tests/workflow.contract".to_string(),
     ];
     let actual = expected.clone();
     let evidence = classify_manual_st_closeout_from_evidence(
@@ -5148,13 +5841,13 @@ pub fn runtime_failure_closeout_recomputes_current_artifacts_fixture_passes() ->
         && evidence.missing_artifacts.is_empty()
         && evidence
             .open_obligations
-            .contains(&"repair `calculator.py`".to_string())
+            .contains(&"repair `src/workflow.rs`".to_string())
         && evidence
             .verification_failed
-            .contains(&"python -m unittest".to_string())
+            .contains(&"verify-workflow --behavior".to_string())
         && evidence
             .repair_targets
-            .contains(&"calculator.py".to_string())
+            .contains(&"src/workflow.rs".to_string())
         && !evidence
             .diagnostics
             .iter()
@@ -5167,12 +5860,15 @@ pub fn run_error_closeout_replaces_stale_continuation_evidence_fixture_passes() 
         Some("I will create both files next.".to_string()),
         Some(&ActiveWorkContract::RequestedWorkAuthoring {
             pending_targets: vec![
-                Utf8PathBuf::from("widget.py"),
-                Utf8PathBuf::from("test_widget.py"),
+                Utf8PathBuf::from("src/workflow.rs"),
+                Utf8PathBuf::from("tests/workflow.contract"),
             ],
-            verification_commands: vec!["python -m unittest".to_string()],
+            verification_commands: vec!["verify-workflow --behavior".to_string()],
         }),
-        &["widget.py".to_string(), "test_widget.py".to_string()],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
         &[],
         &[],
     );
@@ -5180,29 +5876,36 @@ pub fn run_error_closeout_replaces_stale_continuation_evidence_fixture_passes() 
         false,
         None,
         Some(&ActiveWorkContract::RequestedWorkAuthoring {
-            pending_targets: vec![Utf8PathBuf::from("test_widget.py")],
-            verification_commands: vec!["python -m unittest".to_string()],
+            pending_targets: vec![Utf8PathBuf::from("tests/workflow.contract")],
+            verification_commands: vec!["verify-workflow --behavior".to_string()],
         }),
-        &["widget.py".to_string(), "test_widget.py".to_string()],
-        &["widget.py".to_string()],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &["src/workflow.rs".to_string()],
         &[],
     );
 
-    stale.missing_artifacts.contains(&"widget.py".to_string())
+    stale
+        .missing_artifacts
+        .contains(&"src/workflow.rs".to_string())
         && stale
             .missing_artifacts
-            .contains(&"test_widget.py".to_string())
+            .contains(&"tests/workflow.contract".to_string())
         && current.closeout_class == ManualStCloseoutClass::RuntimeDidNotComplete
-        && !current.missing_artifacts.contains(&"widget.py".to_string())
+        && !current
+            .missing_artifacts
+            .contains(&"src/workflow.rs".to_string())
         && current
             .missing_artifacts
-            .contains(&"test_widget.py".to_string())
+            .contains(&"tests/workflow.contract".to_string())
         && !current
             .open_obligations
-            .contains(&"author `widget.py`".to_string())
+            .contains(&"author `src/workflow.rs`".to_string())
         && current
             .open_obligations
-            .contains(&"author `test_widget.py`".to_string())
+            .contains(&"author `tests/workflow.contract`".to_string())
 }
 
 pub fn run_error_open_obligation_uses_closeout_continuation_budget_fixture_passes() -> bool {
@@ -5210,11 +5913,14 @@ pub fn run_error_open_obligation_uses_closeout_continuation_budget_fixture_passe
         false,
         None,
         Some(&ActiveWorkContract::RequestedWorkAuthoring {
-            pending_targets: vec![Utf8PathBuf::from("test_widget.py")],
-            verification_commands: vec!["python -m unittest".to_string()],
+            pending_targets: vec![Utf8PathBuf::from("tests/workflow.contract")],
+            verification_commands: vec!["verify-workflow --behavior".to_string()],
         }),
-        &["widget.py".to_string(), "test_widget.py".to_string()],
-        &["widget.py".to_string()],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &["src/workflow.rs".to_string()],
         &[],
     );
     let mut budget = CloseoutContinuationBudget::default();
@@ -5224,17 +5930,17 @@ pub fn run_error_open_obligation_uses_closeout_continuation_budget_fixture_passe
         false,
         None,
         Some(&ActiveWorkContract::DocsRepair {
-            deliverable: Some(Utf8PathBuf::from("docs/widget-design.md")),
+            deliverable: Some(Utf8PathBuf::from("docs/workflow-design.md")),
             pending_deliverables: vec![crate::session::DocsPendingDeliverable {
-                target: Utf8PathBuf::from("docs/widget-design.md"),
+                target: Utf8PathBuf::from("docs/workflow-design.md"),
                 summary: "same-document docs update requested after the latest user turn"
                     .to_string(),
             }],
             pending_summary: "docs route contract is pending".to_string(),
             route_contract_satisfied: false,
         }),
-        &["docs/widget-design.md".to_string()],
-        &["docs/widget-design.md".to_string()],
+        &["docs/workflow-design.md".to_string()],
+        &["docs/workflow-design.md".to_string()],
         &[],
     );
     let mut docs_budget = CloseoutContinuationBudget::default();
@@ -5247,17 +5953,17 @@ pub fn run_error_open_obligation_uses_closeout_continuation_budget_fixture_passe
         && prompt.contains("ended before clean route closeout")
         && prompt.contains("Continuation attempt: 1/")
         && prompt.contains("Missing expected artifacts")
-        && prompt.contains("test_widget.py")
+        && prompt.contains("tests/workflow.contract")
         && prompt.contains("Open obligations")
-        && prompt.contains("author `test_widget.py`")
+        && prompt.contains("author `tests/workflow.contract`")
         && docs_evidence.closeout_class == ManualStCloseoutClass::RuntimeDidNotComplete
         && docs_attempt == Some(1)
         && closeout_continuation_kind(&docs_evidence) == Some("open_obligation")
         && docs_evidence.missing_artifacts.is_empty()
         && docs_evidence
             .open_obligations
-            .contains(&"repair docs `docs/widget-design.md`".to_string())
-        && docs_prompt.contains("repair docs `docs/widget-design.md`")
+            .contains(&"repair docs `docs/workflow-design.md`".to_string())
+        && docs_prompt.contains("repair docs `docs/workflow-design.md`")
 }
 
 pub fn runtime_terminal_status_uses_closeout_continuation_budget_fixture_passes() -> bool {
@@ -5265,11 +5971,14 @@ pub fn runtime_terminal_status_uses_closeout_continuation_budget_fixture_passes(
         false,
         None,
         Some(&ActiveWorkContract::RequestedWorkAuthoring {
-            pending_targets: vec![Utf8PathBuf::from("test_widget.py")],
-            verification_commands: vec!["python -m unittest".to_string()],
+            pending_targets: vec![Utf8PathBuf::from("tests/workflow.contract")],
+            verification_commands: vec!["verify-workflow --behavior".to_string()],
         }),
-        &["widget.py".to_string(), "test_widget.py".to_string()],
-        &["widget.py".to_string()],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &["src/workflow.rs".to_string()],
         &[],
     );
     let reason = "caseX stage1 ended with session status Failed: Provider repeated a rejected model action with no progress 3 time(s). Runtime stopped on the lifecycle adjudication cluster `provider_ignored_edit_only_surface` before applying side effects outside the compiled TurnControlEnvelope lifecycle.";
@@ -5289,7 +5998,7 @@ pub fn runtime_terminal_status_uses_closeout_continuation_budget_fixture_passes(
         && first_attempt == Some(1)
         && closeout_continuation_kind(&evidence) == Some("open_obligation")
         && prompt.contains("ended before clean route closeout")
-        && prompt.contains("test_widget.py")
+        && prompt.contains("tests/workflow.contract")
         && !is_provider_stream_stall_reason(reason)
         && !is_provider_transport_stream_error_reason(reason)
         && is_provider_stream_stall_reason(transport_reason)
@@ -5301,17 +6010,21 @@ pub fn terminalized_session_continuation_ledger_bounds_same_stage_recovery_fixtu
         false,
         None,
         Some(&ActiveWorkContract::RequestedWorkAuthoring {
-            pending_targets: vec![Utf8PathBuf::from("test_widget.py")],
-            verification_commands: vec!["python -m unittest".to_string()],
+            pending_targets: vec![Utf8PathBuf::from("tests/workflow.contract")],
+            verification_commands: vec!["verify-workflow --behavior".to_string()],
         }),
-        &["widget.py".to_string(), "test_widget.py".to_string()],
-        &["widget.py".to_string()],
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &["src/workflow.rs".to_string()],
         &[],
     );
     let invalid_read_reason = "caseX stage1 ended with session status Failed: Provider repeated invalid arguments for read while typed work remained open.";
     let final_message_reason = "caseX stage1 ended with session status Failed: model returned a final assistant message 3 time(s) while typed work remained open.";
     let lifecycle_reason = "caseX stage1 ended with session status Failed: Runtime stopped on the lifecycle adjudication cluster `provider_ignored_edit_only_surface` before applying side effects.";
     let invalid_write_reason = "caseX stage1 ended with session status Failed: Provider repeated invalid arguments for write while typed work remained open.";
+    let content_shape_no_progress_reason = "caseX stage1 ended with session status Failed: Tool `apply_patch` returned `no_progress` output 3 time(s) while content-changing authoring is required. Runtime stopped before treating non-content tool calls as artifact progress.";
 
     let mut plain_budget = CloseoutContinuationBudget::default();
     let plain_first =
@@ -5334,6 +6047,22 @@ pub fn terminalized_session_continuation_ledger_bounds_same_stage_recovery_fixtu
         &evidence,
         "workspace-a",
         Some(invalid_read_reason),
+    );
+    let mut no_progress_budget = CloseoutContinuationBudget::default();
+    let mut no_progress_ledger = RouteStageTerminalContinuationLedger::default();
+    let first_no_progress = next_stage_closeout_continuation_attempt(
+        &mut no_progress_budget,
+        &mut no_progress_ledger,
+        &evidence,
+        "workspace-a",
+        Some(content_shape_no_progress_reason),
+    );
+    let repeated_no_progress_same_workspace = next_stage_closeout_continuation_attempt(
+        &mut no_progress_budget,
+        &mut no_progress_ledger,
+        &evidence,
+        "workspace-a",
+        Some(content_shape_no_progress_reason),
     );
 
     let mut stage_budget = CloseoutContinuationBudget::default();
@@ -5367,28 +6096,304 @@ pub fn terminalized_session_continuation_ledger_bounds_same_stage_recovery_fixtu
         Some(invalid_write_reason),
     );
 
+    let no_progress_cluster =
+        route_stage_terminal_continuation_cluster(&evidence, content_shape_no_progress_reason)
+            .unwrap_or_default();
+    let mut typed_no_progress_evidence = evidence.clone();
+    typed_no_progress_evidence.terminal_cluster = Some(ManualStTerminalClusterEvidence {
+        failure_family: "content_changing_authoring_no_progress:apply_patch".to_string(),
+        fail_stop: true,
+        workspace_progress_can_reset: false,
+        source: "tool_output.tool_feedback_envelope".to_string(),
+    });
+    let mut typed_budget = CloseoutContinuationBudget::default();
+    let mut typed_ledger = RouteStageTerminalContinuationLedger::default();
+    let typed_attempt = next_stage_closeout_continuation_attempt(
+        &mut typed_budget,
+        &mut typed_ledger,
+        &typed_no_progress_evidence,
+        "workspace-a",
+        Some("opaque terminal summary without parseable marker"),
+    );
+    let typed_cluster = route_stage_terminal_continuation_cluster(
+        &typed_no_progress_evidence,
+        "opaque terminal summary without parseable marker",
+    )
+    .unwrap_or_default();
+
     plain_first == Some(1)
         && plain_second == Some(2)
         && first == Some(1)
         && repeated_same_cluster.is_none()
+        && first_no_progress.is_none()
+        && repeated_no_progress_same_workspace.is_none()
         && first_cluster == Some(1)
         && second_cluster == Some(2)
         && third_cluster == Some(3)
         && stage_blocked.is_none()
         && route_stage_terminal_continuation_cluster(&evidence, invalid_read_reason)
             == route_stage_terminal_continuation_cluster(&evidence, invalid_read_reason)
+        && no_progress_cluster
+            .starts_with("content_changing_authoring_no_progress:apply_patch|open_obligation")
+        && typed_attempt.is_none()
+        && typed_cluster
+            .starts_with("content_changing_authoring_no_progress:apply_patch|open_obligation")
+        && no_progress_cluster.contains("tests/workflow.contract")
         && route_stage_terminal_continuation_cluster(&evidence, invalid_read_reason)
             != route_stage_terminal_continuation_cluster(&evidence, final_message_reason)
 }
 
+pub fn route_terminal_cluster_uses_typed_tool_output_fixture_passes() -> bool {
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let call_id = ToolCallId::new();
+    let history = vec![HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::ToolOutput {
+            call_id,
+            status: ToolLifecycleStatus::Completed,
+            title: "No progress".to_string(),
+            output_text: "opaque provider-facing text".to_string(),
+            metadata: json!({
+                "tool_feedback_envelope": {
+                    "tool": "write",
+                    "operation_intent": "content_changing_authoring_required",
+                    "operation_progress_class": "no_progress",
+                    "progress_effect": "no_progress",
+                    "side_effects_applied": false
+                }
+            }),
+            success: Some(false),
+            progress_effect: ToolProgressEffect::NoProgress,
+            blocked_action: None,
+            result_hash: Some("typed-no-progress".to_string()),
+            verification_run: None,
+        },
+    }];
+    let Some(cluster) = latest_route_stage_terminal_cluster_evidence(&history) else {
+        return false;
+    };
+    cluster.failure_family == "content_changing_authoring_no_progress:write"
+        && cluster.fail_stop
+        && !cluster.workspace_progress_can_reset
+        && cluster.source == "tool_output.tool_feedback_envelope"
+}
+
+pub fn authoring_grounding_terminal_fail_stops_route_fixture_passes() -> bool {
+    let evidence = classify_manual_st_closeout_from_evidence(
+        false,
+        Some("case2a stage1 ended with session status Failed: Authoring supporting-context budget was exhausted and the model repeated non-remaining active target read proposals 3 time(s) for `tests/workflow.contract` instead of reading the remaining target or producing file-change evidence. Runtime stopped before growing provider history with more no-progress corrections. Consumed target paths: src/workflow.rs. Remaining read target paths: . Active target set: src/workflow.rs.".to_string()),
+        Some(&ActiveWorkContract::Verification {
+            commands: vec!["verify-workflow --behavior".to_string()],
+            failing_labels: vec!["workflow_contract_public_api".to_string()],
+            repair_required: true,
+            targets: vec![Utf8PathBuf::from("src/workflow.rs")],
+        }),
+        &[
+            "README.md".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &[
+            "README.md".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &[VerificationCommandEvidence {
+            command: "verify-workflow --behavior".to_string(),
+            working_directory: "workspace".to_string(),
+            start_time: "0".to_string(),
+            end_time: "1".to_string(),
+            exit_code: Some(1),
+            stdout_summary: String::new(),
+            stderr_summary: "PublicApiError: missing workflow operation `emit_event`".to_string(),
+            normalized_failure_class: Some("verification_failed".to_string()),
+            required: true,
+            case_id: "caseX".to_string(),
+            requirement_id: Some("API-4".to_string()),
+        }],
+    );
+    let reason = "case2a stage1 ended with session status Failed: Authoring supporting-context budget was exhausted and the model repeated non-remaining active target read proposals 3 time(s) for `tests/workflow.contract` instead of reading the remaining target or producing file-change evidence. Runtime stopped before growing provider history with more no-progress corrections. Consumed target paths: src/workflow.rs. Remaining read target paths: . Active target set: src/workflow.rs.";
+    let mut budget = CloseoutContinuationBudget::default();
+    let mut ledger = RouteStageTerminalContinuationLedger::default();
+    let attempt = next_stage_closeout_continuation_attempt(
+        &mut budget,
+        &mut ledger,
+        &evidence,
+        "workspace-with-open-source-repair",
+        Some(reason),
+    );
+    let cluster = route_stage_terminal_continuation_cluster(&evidence, reason).unwrap_or_default();
+    let timeout = timeout_classification_value(false, true, Some(reason));
+
+    attempt.is_none()
+        && terminal_reason_requires_route_fail_stop(reason)
+        && cluster.starts_with("authoring_grounding_budget_exhausted|")
+        && timeout
+            .get("semantic_no_progress_terminal_guard")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && timeout
+            .get("repeated_no_progress_repair")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+pub fn content_changing_authoring_no_progress_terminal_fail_stops_route_fixture_passes() -> bool {
+    let evidence = classify_manual_st_closeout_from_evidence(
+        false,
+        Some("case2a stage1 ended with session status Failed: Tool `write` returned `no_progress` output 3 time(s) while content-changing authoring is required. Runtime stopped before treating non-content tool calls as artifact progress. Use apply_patch or equivalent file-change evidence for open targets: README.md, src/workflow.rs, tests/workflow.contract.".to_string()),
+        Some(&ActiveWorkContract::RequestedWorkAuthoring {
+            pending_targets: vec![
+                Utf8PathBuf::from("README.md"),
+                Utf8PathBuf::from("src/workflow.rs"),
+                Utf8PathBuf::from("tests/workflow.contract"),
+            ],
+            verification_commands: vec!["verify-workflow --behavior".to_string()],
+        }),
+        &[
+            "README.md".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &[],
+        &[],
+    );
+    let reason = "case2a stage1 ended with session status Failed: Tool `write` returned `no_progress` output 3 time(s) while content-changing authoring is required. Runtime stopped before treating non-content tool calls as artifact progress. Use apply_patch or equivalent file-change evidence for open targets: README.md, src/workflow.rs, tests/workflow.contract.";
+    let mut budget = CloseoutContinuationBudget::default();
+    let mut ledger = RouteStageTerminalContinuationLedger::default();
+    let attempt = next_stage_closeout_continuation_attempt(
+        &mut budget,
+        &mut ledger,
+        &evidence,
+        "workspace-without-authored-targets",
+        Some(reason),
+    );
+    let cluster = route_stage_terminal_continuation_cluster(&evidence, reason).unwrap_or_default();
+    let timeout = timeout_classification_value(false, true, Some(reason));
+
+    attempt.is_none()
+        && terminal_reason_requires_route_fail_stop(reason)
+        && cluster.starts_with("content_changing_authoring_no_progress:write|")
+        && timeout
+            .get("semantic_no_progress_terminal_guard")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && timeout
+            .get("repeated_no_progress_repair")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+pub fn verification_repair_terminal_ledger_blocks_non_obligation_workspace_progress_fixture_passes()
+-> bool {
+    let evidence = classify_manual_st_closeout_from_evidence(
+        false,
+        Some("case2a stage1 ended with session status Failed: The same verification failure evidence repeated 3 time(s). Runtime stopped before continuing an unbounded repair/rerun loop.".to_string()),
+        Some(&ActiveWorkContract::Verification {
+            commands: vec!["verify-workflow --behavior".to_string()],
+            failing_labels: vec!["failed command: verify-workflow --behavior".to_string()],
+            repair_required: true,
+            targets: vec![Utf8PathBuf::from("src/workflow.rs")],
+        }),
+        &[
+            "README.md".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &[
+            "README.md".to_string(),
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &[VerificationCommandEvidence {
+            command: "verify-workflow --behavior".to_string(),
+            working_directory: "workspace".to_string(),
+            start_time: "0".to_string(),
+            end_time: "1".to_string(),
+            exit_code: Some(1),
+            stdout_summary: String::new(),
+            stderr_summary:
+                "PublicApiError: WorkflowState has no operation `resolve_conflict`".to_string(),
+            normalized_failure_class: Some("verification_failed".to_string()),
+            required: true,
+            case_id: "caseX".to_string(),
+            requirement_id: Some("BEH-4".to_string()),
+        }],
+    );
+    let reason = "case2a stage1 ended with session status Failed: The same verification failure evidence repeated 3 time(s). Runtime stopped before continuing an unbounded repair/rerun loop. Inspect the latest stdout/stderr and make a materially different repair before rerunning verification.";
+    let mut budget = CloseoutContinuationBudget::default();
+    let mut ledger = RouteStageTerminalContinuationLedger::default();
+    let first = next_stage_closeout_continuation_attempt(
+        &mut budget,
+        &mut ledger,
+        &evidence,
+        "workspace-with-gui-entrypoint-added",
+        Some(reason),
+    );
+    let unrelated_workspace_progress = next_stage_closeout_continuation_attempt(
+        &mut budget,
+        &mut ledger,
+        &evidence,
+        "workspace-with-different-non-obligation-edit",
+        Some(reason),
+    );
+    let cluster = route_stage_terminal_continuation_cluster(&evidence, reason).unwrap_or_default();
+
+    first == Some(1)
+        && unrelated_workspace_progress.is_none()
+        && cluster.starts_with("verification_non_convergence|")
+        && cluster.contains("src/workflow.rs")
+}
+
+pub fn unknown_terminal_reason_fail_stops_open_route_fixture_passes() -> bool {
+    let evidence = classify_manual_st_closeout_from_evidence(
+        false,
+        Some("caseX stage1 ended with session status Failed: opaque runtime terminal".to_string()),
+        Some(&ActiveWorkContract::RequestedWorkAuthoring {
+            pending_targets: vec![Utf8PathBuf::from("src/widget.rs")],
+            verification_commands: vec!["cargo test".to_string()],
+        }),
+        &["src/widget.rs".to_string()],
+        &[],
+        &[],
+    );
+    let mut budget = CloseoutContinuationBudget::default();
+    let mut ledger = RouteStageTerminalContinuationLedger::default();
+    let unknown_reason = "caseX stage1 ended with session status Failed: opaque runtime terminal";
+    let missing_reason = None;
+
+    next_stage_closeout_continuation_attempt(
+        &mut budget,
+        &mut ledger,
+        &evidence,
+        "workspace-a",
+        Some(unknown_reason),
+    )
+    .is_none()
+        && next_stage_closeout_continuation_attempt(
+            &mut budget,
+            &mut ledger,
+            &evidence,
+            "workspace-b",
+            missing_reason,
+        )
+        .is_none()
+        && route_stage_terminal_continuation_cluster(&evidence, unknown_reason).is_none()
+}
+
 pub fn completed_expected_artifact_clears_stale_authoring_obligation_fixture_passes() -> bool {
-    let expected_artifacts = vec!["docs/widget-design.md".to_string()];
-    let actual_files = vec!["docs/widget-design.md".to_string()];
+    let expected_artifacts = vec!["docs/workflow-design.md".to_string()];
+    let actual_files = vec!["docs/workflow-design.md".to_string()];
     let completed = classify_manual_st_closeout_from_evidence(
         false,
         None,
         Some(&ActiveWorkContract::RequestedWorkAuthoring {
-            pending_targets: vec![Utf8PathBuf::from("docs/widget-design.md")],
+            pending_targets: vec![Utf8PathBuf::from("docs/workflow-design.md")],
             verification_commands: Vec::new(),
         }),
         &expected_artifacts,
@@ -5399,7 +6404,7 @@ pub fn completed_expected_artifact_clears_stale_authoring_obligation_fixture_pas
         false,
         None,
         Some(&ActiveWorkContract::RequestedWorkAuthoring {
-            pending_targets: vec![Utf8PathBuf::from("docs/widget-design.md")],
+            pending_targets: vec![Utf8PathBuf::from("docs/workflow-design.md")],
             verification_commands: Vec::new(),
         }),
         &expected_artifacts,
@@ -5410,9 +6415,9 @@ pub fn completed_expected_artifact_clears_stale_authoring_obligation_fixture_pas
         false,
         None,
         Some(&ActiveWorkContract::DocsRepair {
-            deliverable: Some(Utf8PathBuf::from("docs/widget-design.md")),
+            deliverable: Some(Utf8PathBuf::from("docs/workflow-design.md")),
             pending_deliverables: Vec::new(),
-            pending_summary: "docs/widget-design.md still needs semantic repair".to_string(),
+            pending_summary: "docs/workflow-design.md still needs semantic repair".to_string(),
             route_contract_satisfied: false,
         }),
         &expected_artifacts,
@@ -5425,20 +6430,20 @@ pub fn completed_expected_artifact_clears_stale_authoring_obligation_fixture_pas
         && !should_continue_after_closeout(&completed)
         && missing
             .open_obligations
-            .contains(&"author `docs/widget-design.md`".to_string())
+            .contains(&"author `docs/workflow-design.md`".to_string())
         && repair_remains_open
             .open_obligations
-            .contains(&"repair docs `docs/widget-design.md`".to_string())
+            .contains(&"repair docs `docs/workflow-design.md`".to_string())
 }
 
 pub fn satisfied_docs_repair_does_not_reopen_route_closeout_fixture_passes() -> bool {
-    let expected_artifacts = vec!["docs/widget-design.md".to_string()];
-    let actual_files = vec!["docs/widget-design.md".to_string()];
+    let expected_artifacts = vec!["docs/workflow-design.md".to_string()];
+    let actual_files = vec!["docs/workflow-design.md".to_string()];
     let evidence = classify_manual_st_closeout_from_evidence(
         true,
         Some("The docs route contract is satisfied; run verification next.".to_string()),
         Some(&ActiveWorkContract::DocsRepair {
-            deliverable: Some(Utf8PathBuf::from("docs/widget-design.md")),
+            deliverable: Some(Utf8PathBuf::from("docs/workflow-design.md")),
             pending_deliverables: Vec::new(),
             pending_summary: "docs route contract satisfied".to_string(),
             route_contract_satisfied: true,
@@ -5451,7 +6456,7 @@ pub fn satisfied_docs_repair_does_not_reopen_route_closeout_fixture_passes() -> 
         true,
         Some("The docs route contract is satisfied; run verification next.".to_string()),
         Some(&ActiveWorkContract::DocsRepair {
-            deliverable: Some(Utf8PathBuf::from("docs/widget-design.md")),
+            deliverable: Some(Utf8PathBuf::from("docs/workflow-design.md")),
             pending_deliverables: Vec::new(),
             pending_summary: "docs route contract satisfied".to_string(),
             route_contract_satisfied: false,
@@ -5468,7 +6473,137 @@ pub fn satisfied_docs_repair_does_not_reopen_route_closeout_fixture_passes() -> 
         && closeout_continuation_kind(&evidence).is_none()
         && text_only_satisfied
             .open_obligations
-            .contains(&"repair docs `docs/widget-design.md`".to_string())
+            .contains(&"repair docs `docs/workflow-design.md`".to_string())
+}
+
+pub(crate) fn manual_st_closeout_and_route_fixture_workflow_neutral_failures() -> Vec<&'static str>
+{
+    [
+        (
+            "final_assistant_open_obligation_not_clean_closeout",
+            final_assistant_open_obligation_not_clean_closeout_fixture_passes(),
+        ),
+        (
+            "final_assistant_open_obligation_continuation_hook",
+            final_assistant_open_obligation_continuation_hook_fixture_passes(),
+        ),
+        (
+            "open_obligation_continuation_expected_inventory_is_non_authoring",
+            open_obligation_continuation_expected_inventory_is_non_authoring_fixture_passes(),
+        ),
+        (
+            "route_verification_waits_for_authored_artifacts",
+            route_verification_waits_for_authored_artifacts_fixture_passes(),
+        ),
+        (
+            "post_repair_route_verification_clears_stale_repair",
+            post_repair_route_verification_clears_stale_repair_fixture_passes(),
+        ),
+        (
+            "route_result_progress_fields",
+            route_result_progress_fields_fixture_passes(),
+        ),
+        (
+            "route_inflight_case_progress_artifact",
+            route_inflight_case_progress_artifact_fixture_passes(),
+        ),
+        (
+            "route_case_progress_phase_boundaries",
+            route_case_progress_phase_boundaries_fixture_passes(),
+        ),
+        (
+            "successful_closeout_continuation_rematerializes_case_verdict",
+            successful_closeout_continuation_rematerializes_case_verdict_fixture_passes(),
+        ),
+        (
+            "route_terminal_verdict_rematerializes_from_case_results",
+            route_terminal_verdict_rematerializes_from_case_results_fixture_passes(),
+        ),
+        (
+            "latest_verification_result_drives_closeout",
+            latest_verification_result_drives_closeout_fixture_passes(),
+        ),
+        (
+            "verification_evidence_after_content_change_invalidated",
+            verification_evidence_after_content_change_invalidated_fixture_passes(),
+        ),
+        (
+            "runtime_verification_pass_after_content_change_satisfies_route_closeout",
+            runtime_verification_pass_after_content_change_satisfies_route_closeout_fixture_passes(),
+        ),
+        (
+            "verification_failure_preserves_closeout_evidence",
+            verification_failure_preserves_closeout_evidence_fixture_passes(),
+        ),
+        (
+            "verification_failed_closeout_builds_repair_hook_prompt",
+            verification_failed_closeout_builds_repair_hook_prompt_fixture_passes(),
+        ),
+        (
+            "public_command_contract_closeout_prompt_compacts_failure_evidence",
+            public_command_contract_closeout_prompt_compacts_failure_evidence_fixture_passes(),
+        ),
+        (
+            "verification_failed_closeout_uses_generated_test_parse_target",
+            verification_failed_closeout_uses_generated_test_parse_target_fixture_passes(),
+        ),
+        (
+            "closeout_continuation_budget_is_scoped_by_failure_signature",
+            closeout_continuation_budget_is_scoped_by_failure_signature_fixture_passes(),
+        ),
+        (
+            "closeout_continuation_budget_blocks_same_workspace_stall",
+            closeout_continuation_budget_blocks_same_workspace_stall_fixture_passes(),
+        ),
+        (
+            "verification_failure_labels_do_not_become_authoring_obligations",
+            verification_failure_labels_do_not_become_authoring_obligations_fixture_passes(),
+        ),
+        (
+            "runtime_failure_closeout_recomputes_current_artifacts",
+            runtime_failure_closeout_recomputes_current_artifacts_fixture_passes(),
+        ),
+        (
+            "run_error_closeout_replaces_stale_continuation_evidence",
+            run_error_closeout_replaces_stale_continuation_evidence_fixture_passes(),
+        ),
+        (
+            "run_error_open_obligation_uses_closeout_continuation_budget",
+            run_error_open_obligation_uses_closeout_continuation_budget_fixture_passes(),
+        ),
+        (
+            "runtime_terminal_status_uses_closeout_continuation_budget",
+            runtime_terminal_status_uses_closeout_continuation_budget_fixture_passes(),
+        ),
+        (
+            "terminalized_session_continuation_ledger_bounds_same_stage_recovery",
+            terminalized_session_continuation_ledger_bounds_same_stage_recovery_fixture_passes(),
+        ),
+        (
+            "content_changing_authoring_no_progress_terminal_fail_stops_route",
+            content_changing_authoring_no_progress_terminal_fail_stops_route_fixture_passes(),
+        ),
+        (
+            "verification_repair_terminal_ledger_blocks_non_obligation_workspace_progress",
+            verification_repair_terminal_ledger_blocks_non_obligation_workspace_progress_fixture_passes(),
+        ),
+        (
+            "completed_expected_artifact_clears_stale_authoring_obligation",
+            completed_expected_artifact_clears_stale_authoring_obligation_fixture_passes(),
+        ),
+        (
+            "satisfied_docs_repair_does_not_reopen_route_closeout",
+            satisfied_docs_repair_does_not_reopen_route_closeout_fixture_passes(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, passed)| (!passed).then_some(label))
+    .collect()
+}
+
+pub(crate) fn manual_st_closeout_and_route_fixtures_are_workflow_neutral_and_current_profile_fixture_passes()
+-> bool {
+    manual_st_closeout_and_route_fixture_workflow_neutral_failures().is_empty()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5592,7 +6727,7 @@ impl EventRenderer for RecordingRenderer {
         &mut self,
         _session: &crate::session::SessionRecord,
         _history_items: &[crate::protocol::HistoryItem],
-        _transcript: &crate::session::Transcript,
+        _show_reasoning: bool,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }

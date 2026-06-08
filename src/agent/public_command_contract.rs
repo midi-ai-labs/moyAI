@@ -3,7 +3,9 @@ use std::hash::{Hash, Hasher};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::{Value, json};
 
-use crate::agent::content_shape_contract::python_source_for_test_target;
+use crate::agent::language_evidence::{
+    ArtifactRole, LanguageFamily, classify_artifact_target as classify_language_artifact_target,
+};
 use crate::edit::{PatchOperation, PatchParser};
 use crate::protocol::OperationIntent;
 use crate::tool::ToolResult;
@@ -14,6 +16,12 @@ struct PublicCommandObligation {
     script_path: String,
     argv_after_script: Vec<String>,
     output_observation_alternatives: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicCommandTestTargetContract {
+    source_path: Option<String>,
+    language: LanguageFamily,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,19 +87,19 @@ impl PublicCommandContractIssueKind {
         match self {
             Self::CoverageMissing => "Public command contract coverage missing",
             Self::EncodingMissing => "Public command contract encoding missing",
-            Self::TimeoutMissing => "Public command subprocess timeout missing",
-            Self::CaptureMissing => "Public command subprocess output capture missing",
+            Self::TimeoutMissing => "Public command child-process timeout missing",
+            Self::CaptureMissing => "Public command child-process output capture missing",
             Self::CoverageAndEncodingMissing => {
                 "Public command contract coverage and encoding missing"
             }
             Self::CoverageAndTimeoutMissing => {
-                "Public command contract coverage and subprocess timeout missing"
+                "Public command contract coverage and child-process timeout missing"
             }
             Self::EncodingAndTimeoutMissing => {
-                "Public command contract encoding and subprocess timeout missing"
+                "Public command contract encoding and child-process timeout missing"
             }
             Self::CoverageEncodingAndTimeoutMissing => {
-                "Public command contract coverage, encoding, and subprocess timeout missing"
+                "Public command contract coverage, encoding, and child-process timeout missing"
             }
         }
     }
@@ -107,15 +115,31 @@ pub(crate) fn public_command_contract_result(
         return None;
     }
     let candidate = public_command_candidate_from_tool(tool_name, arguments, workspace_root)?;
-    let target_contract = python_source_for_test_target(&candidate.target)?;
-    let source_name = target_contract.source_path.replace('\\', "/");
+    let target_contract = public_command_test_target_contract(&candidate.target)?;
+    let source_name = target_contract
+        .source_path
+        .as_ref()
+        .map(|path| path.replace('\\', "/"));
     let obligations = latest_user_text
         .map(public_command_obligations_from_text)
         .unwrap_or_default();
-    let relevant = obligations
-        .into_iter()
-        .filter(|obligation| obligation.script_path == source_name)
-        .collect::<Vec<_>>();
+    let source_matched = source_name
+        .as_deref()
+        .map(|source_name| {
+            obligations
+                .iter()
+                .filter(|obligation| {
+                    public_command_subject_matches_source(&obligation.script_path, source_name)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let relevant = if source_matched.is_empty() {
+        obligations
+    } else {
+        source_matched
+    };
     let missing = relevant
         .iter()
         .filter(|obligation| !candidate_covers_public_command(&candidate.content, obligation))
@@ -243,17 +267,17 @@ pub(crate) fn public_command_contract_terminal_message(
         }
         Some("public_command_contract_subprocess_timeout_missing") => {
             format!(
-                "Public command subprocess timeout was missing {correction_count} time(s). Runtime stopped before accepting generated tests that can block indefinitely on a child process. Target: {target}."
+                "Public command child-process timeout was missing {correction_count} time(s). Runtime stopped before accepting generated tests that can block indefinitely on a child process. Target: {target}."
             )
         }
         Some("public_command_contract_subprocess_output_capture_missing") => {
             format!(
-                "Public command subprocess output capture was missing {correction_count} time(s). Runtime stopped before accepting generated tests that assert CompletedProcess stdout/stderr without capturing those streams. Target: {target}."
+                "Public command child-process output capture was missing {correction_count} time(s). Runtime stopped before accepting generated tests that assert child process stdout/stderr without capturing those streams. Target: {target}."
             )
         }
         Some(issue) if issue.contains("subprocess_timeout_missing") => {
             format!(
-                "Public command subprocess contract was incomplete {correction_count} time(s). Runtime stopped before accepting generated tests that can block indefinitely on a child process. Target: {target}.{}",
+                "Public command child-process contract was incomplete {correction_count} time(s). Runtime stopped before accepting generated tests that can block indefinitely on a child process. Target: {target}.{}",
                 missing_observation_terminal_suffix(result)
             )
         }
@@ -539,6 +563,108 @@ class TestToolCli(unittest.TestCase):
         self.assertIn("usage", result.stderr.lower())
 "#
     });
+    let generic_node_bad = json!({
+        "path": "test_tool.py",
+        "content": r#"
+import os
+import subprocess
+import sys
+import unittest
+
+class TestToolCli(unittest.TestCase):
+    def test_status_only(self):
+        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+        result = subprocess.run(
+            [sys.executable, "tool.py", "status"],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0)
+"#
+    });
+    let generic_node_good = json!({
+        "path": "test_tool.py",
+        "content": r#"
+import os
+import subprocess
+import unittest
+
+class TestToolCli(unittest.TestCase):
+    def test_node_render(self):
+        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+        result = subprocess.run(
+            ["node", "tool.js", "render", "sample"],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("rendered", result.stdout)
+"#
+    });
+    let non_command_support_phrase = json!({
+        "path": "test_tool.py",
+        "content": r#"
+import unittest
+
+class TestToolUi(unittest.TestCase):
+    def test_dark_mode_copy(self):
+        self.assertTrue("dark mode")
+"#
+    });
+    let generic_js_bad = json!({
+        "path": "tool.test.js",
+        "content": r#"
+import { describe, expect, test } from "vitest";
+import { status } from "./tool.js";
+
+describe("tool cli", () => {
+  test("status helper", () => {
+    expect(status()).toBe("ready");
+  });
+});
+"#
+    });
+    let generic_js_good = json!({
+        "path": "tool.test.js",
+        "content": r#"
+import { describe, expect, test } from "vitest";
+import { spawnSync } from "node:child_process";
+
+describe("tool cli", () => {
+  test("render command", () => {
+    const result = spawnSync("node", ["tool.js", "render", "sample"], {
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("rendered");
+  });
+});
+"#
+    });
+    let generic_js_no_timeout = json!({
+        "path": "tool.test.js",
+        "content": r#"
+import { describe, expect, test } from "vitest";
+import { spawnSync } from "node:child_process";
+
+describe("tool cli", () => {
+  test("render command lacks timeout", () => {
+    const result = spawnSync("node", ["tool.js", "render", "sample"], {
+      encoding: "utf8",
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("rendered");
+  });
+});
+"#
+    });
     public_command_contract_result("write", &good, Some(authority), None).is_none()
         && public_command_contract_result(
             "write",
@@ -664,7 +790,7 @@ class TestToolCli(unittest.TestCase):
                     .is_some_and(|issues| !issues.is_empty())
                 && result.output_text.contains("bounded timeout")
                 && public_command_contract_terminal_message(&result, 2)
-                    .contains("subprocess timeout was missing 2 time(s)")
+                    .contains("child-process timeout was missing 2 time(s)")
         })
         && public_command_contract_result(
             "write",
@@ -706,7 +832,7 @@ class TestToolCli(unittest.TestCase):
                     .is_some_and(|issues| !issues.is_empty())
                 && result.output_text.contains("CompletedProcess.stdout")
                 && public_command_contract_terminal_message(&result, 2)
-                    .contains("subprocess output capture was missing 2 time(s)")
+                    .contains("child-process output capture was missing 2 time(s)")
         })
         && public_command_contract_result(
             "write",
@@ -770,6 +896,23 @@ class TestToolCli(unittest.TestCase):
                                     .is_some_and(|value| value.contains("usage | 使い方 | 使用方法"))
                             })
                     })
+                && result
+                    .metadata
+                    .pointer("/tool_feedback_envelope/required_public_command_assertion_templates")
+                    .and_then(Value::as_array)
+                    .is_some_and(|templates| {
+                        templates.iter().any(|template| {
+                            template.as_str().is_some_and(|value| {
+                                value.contains("self._run_cli")
+                                    && value.contains("proc.returncode")
+                                    && value.contains("proc.stdout + proc.stderr")
+                                    && value.contains("usage")
+                            })
+                        })
+                    })
+                && result
+                    .output_text
+                    .contains("required_public_command_assertion_templates:")
                 && public_command_contract_key(&result).contains("usage | 使い方 | 使用方法")
                 && public_command_contract_terminal_message(&result, 3)
                     .contains("usage | 使い方 | 使用方法")
@@ -828,6 +971,78 @@ class TestToolCli(unittest.TestCase):
             None,
         )
         .is_none()
+        && public_command_contract_result(
+            "write",
+            &generic_node_bad,
+            Some("CLI must support `node tool.js render sample` and print rendered output."),
+            None,
+        )
+        .is_some_and(|result| {
+            result
+                .metadata
+                .get("missing_public_commands")
+                .and_then(Value::as_array)
+                .is_some_and(|commands| {
+                    commands
+                        .iter()
+                        .any(|command| command.as_str() == Some("node tool.js render sample"))
+                })
+        })
+        && public_command_contract_result(
+            "write",
+            &generic_node_good,
+            Some("CLI must support `node tool.js render sample` and print rendered output."),
+            None,
+        )
+        .is_none()
+        && public_command_contract_result(
+            "write",
+            &non_command_support_phrase,
+            Some("The command palette should support `dark mode` in the settings panel."),
+            None,
+        )
+        .is_none()
+        && public_command_contract_result(
+            "write",
+            &generic_js_bad,
+            Some("CLI must support `node tool.js render sample` and print rendered output."),
+            None,
+        )
+        .is_some_and(|result| {
+            result
+                .metadata
+                .get("missing_public_commands")
+                .and_then(Value::as_array)
+                .is_some_and(|commands| {
+                    commands
+                        .iter()
+                        .any(|command| command.as_str() == Some("node tool.js render sample"))
+                })
+        })
+        && public_command_contract_result(
+            "write",
+            &generic_js_good,
+            Some("CLI must support `node tool.js render sample` and print rendered output."),
+            None,
+        )
+        .is_none()
+        && public_command_contract_result(
+            "write",
+            &generic_js_no_timeout,
+            Some("CLI must support `node tool.js render sample` and print rendered output."),
+            None,
+        )
+        .is_some_and(|result| {
+            result
+                .metadata
+                .get("subprocess_timeout_contract_issues")
+                .and_then(Value::as_array)
+                .is_some_and(|issues| !issues.is_empty())
+                && result.output_text.contains("child-process")
+                && !result
+                    .output_text
+                    .contains("every generated `subprocess.run(...)` call")
+        })
 }
 
 pub fn public_command_contract_apply_patch_uses_post_patch_content_fixture_passes() -> bool {
@@ -908,6 +1123,156 @@ class TestToolCli(unittest.TestCase):
     incremental_passes && deleting_rejected
 }
 
+pub fn public_command_contract_helper_argv_operator_fixture_passes() -> bool {
+    let authority =
+        "Update tests. CLI must support `workflow-tool combine draft + review` and print combined.";
+    let candidate = json!({
+        "path": "test_tool.py",
+        "content": r#"
+import os
+import subprocess
+import unittest
+
+class TestToolCli(unittest.TestCase):
+    def _run_cli(self, *args):
+        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+        return subprocess.run(
+            ["workflow-tool", *args],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+            timeout=10,
+        )
+
+    def test_combined_public_command(self):
+        proc = self._run_cli("combine", "draft", "+", "review")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout.strip(), "combined")
+"#
+    });
+    public_command_contract_result("write", &candidate, Some(authority), None).is_none()
+}
+
+pub fn public_command_contract_feedback_projects_typed_missing_coverage_fixture_passes() -> bool {
+    let authority =
+        "Update tests. CLI must support `workflow-tool combine draft + review` and print combined.";
+    let alternate_command = "workflow-tool inspect draft + review";
+    let candidate = json!({
+        "path": "test_tool.py",
+        "content": r#"
+import os
+import subprocess
+import unittest
+
+class TestToolCli(unittest.TestCase):
+    def _run_cli(self, *args):
+        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+        return subprocess.run(
+            ["workflow-tool", *args],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+            timeout=10,
+        )
+
+    def test_other_public_command(self):
+        proc = self._run_cli("inspect", "draft", "+", "review")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout.strip(), "inspected")
+"#
+    });
+    public_command_contract_result("write", &candidate, Some(authority), None).is_some_and(
+        |result| {
+            result.output_text.contains("[tool feedback]")
+                && result
+                    .output_text
+                    .contains("operation_progress_class: public_command_contract_coverage_missing")
+                && result.output_text.contains("candidate_target: test_tool.py")
+                && result
+                    .output_text
+                    .contains("required_next_action: add child-process-based tests for the missing public command argv contracts")
+                && result
+                    .output_text
+                    .contains("missing_public_commands: workflow-tool combine draft + review")
+                && result
+                    .metadata
+                    .pointer("/tool_feedback_envelope/missing_public_commands")
+                    .and_then(Value::as_array)
+                    .is_some_and(|commands| {
+                        commands
+                            .iter()
+                            .any(|command| {
+                                command.as_str()
+                                    == Some("workflow-tool combine draft + review")
+                            })
+                    })
+                && alternate_command == "workflow-tool inspect draft + review"
+        },
+    )
+}
+
+pub fn public_command_feedback_templates_follow_target_language_fixture_passes() -> bool {
+    let public_command_feedback_template_language_adapter_projection =
+        "public_command_feedback_template_language_adapter_projection";
+    let candidate = json!({
+        "path": "workflow.test.js",
+        "content": r#"
+import { describe, expect, test } from "vitest";
+import { spawnSync } from "node:child_process";
+
+describe("workflow cli", () => {
+  test("missing command exits with usage status", () => {
+    const result = spawnSync("node", ["workflow.js", "missing", "input.txt"], {
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout || result.stderr).toBeTruthy();
+  });
+});
+"#
+    });
+    public_command_contract_result(
+        "write",
+        &candidate,
+        Some("CLI must treat `node workflow.js missing input.txt` as a usage error with exit code 1."),
+        None,
+    )
+    .is_some_and(|result| {
+        let templates = result
+            .metadata
+            .get("required_public_command_assertion_templates")
+            .and_then(Value::as_array)
+            .map(|templates| {
+                templates
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        !templates.contains("self._run_cli")
+            && !templates.contains("self.assertEqual")
+            && !templates.contains("self.assertTrue")
+            && result.output_text.contains(
+                "required_public_command_assertion_templates:",
+            )
+            && public_command_feedback_template_language_adapter_projection
+                == "public_command_feedback_template_language_adapter_projection"
+    })
+}
+
+pub(crate) fn public_command_contract_fixtures_are_workflow_neutral_fixture_passes() -> bool {
+    let public_command_contract_fixture_workflow_neutral =
+        "public_command_contract_fixture_workflow_neutral";
+    public_command_contract_helper_argv_operator_fixture_passes()
+        && public_command_contract_feedback_projects_typed_missing_coverage_fixture_passes()
+        && public_command_contract_fixture_workflow_neutral
+            == "public_command_contract_fixture_workflow_neutral"
+}
+
 fn public_command_obligations_from_text(text: &str) -> Vec<PublicCommandObligation> {
     text.lines()
         .flat_map(|line| {
@@ -946,31 +1311,26 @@ fn public_command_obligation_from_command(
     command: &str,
     context: &str,
 ) -> Option<PublicCommandObligation> {
-    let parts = command.split_whitespace().collect::<Vec<_>>();
-    let first = parts.first()?.to_ascii_lowercase();
-    if !matches!(first.as_str(), "python" | "python3" | "py") {
+    let parts = command
+        .split_whitespace()
+        .map(|part| part.trim_matches('"').trim_matches('\'').to_string())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 2 {
         return None;
     }
-    let mut script_index = None;
-    let mut index = 1usize;
-    while index < parts.len() {
-        let token = parts[index];
-        if token.ends_with(".py") {
-            script_index = Some(index);
-            break;
-        }
-        if matches!(token, "-X" | "-m" | "-c") {
-            index += 2;
-        } else {
-            index += 1;
-        }
+    let (subject_index, explicit_command_surface) = public_command_subject_index(&parts)?;
+    if !explicit_command_surface && !public_command_context_allows_command_span(context) {
+        return None;
     }
-    let script_index = script_index?;
-    let script_path = parts[script_index].replace('\\', "/");
+    if subject_index + 1 >= parts.len() {
+        return None;
+    }
+    let script_path = parts[subject_index].replace('\\', "/");
     let argv_after_script = parts
         .iter()
-        .skip(script_index + 1)
-        .map(|part| part.trim_matches('"').trim_matches('\'').to_string())
+        .skip(subject_index + 1)
+        .cloned()
         .collect::<Vec<_>>();
     if argv_after_script.is_empty() {
         return None;
@@ -981,6 +1341,138 @@ fn public_command_obligation_from_command(
         argv_after_script,
         output_observation_alternatives: output_observation_alternatives_from_context(context),
     })
+}
+
+fn public_command_context_allows_command_span(context: &str) -> bool {
+    let lower = context.to_ascii_lowercase();
+    [
+        "cli",
+        "public command",
+        "shell command",
+        "command line",
+        "command-line",
+        "command form",
+        "command forms",
+        "argv",
+        "exit code",
+        "stdout",
+        "stderr",
+        "コマンド",
+        "実行",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn public_command_subject_index(parts: &[String]) -> Option<(usize, bool)> {
+    let first = parts.first()?.to_ascii_lowercase();
+    if matches!(first.as_str(), "python" | "python3" | "py") {
+        return python_public_command_subject_index(parts).map(|index| (index, true));
+    }
+    if matches!(
+        first.as_str(),
+        "node"
+            | "deno"
+            | "bun"
+            | "ruby"
+            | "perl"
+            | "php"
+            | "java"
+            | "go"
+            | "cargo"
+            | "npm"
+            | "npx"
+            | "pnpm"
+            | "yarn"
+            | "dotnet"
+            | "bash"
+            | "sh"
+            | "pwsh"
+            | "powershell"
+    ) {
+        return Some((public_command_runner_subject_index(parts), true));
+    }
+    if command_token_is_explicit_path_or_extension(&first) {
+        return Some((0, true));
+    }
+    command_token_can_be_direct_public_command(&first).then_some((0, false))
+}
+
+fn python_public_command_subject_index(parts: &[String]) -> Option<usize> {
+    let mut index = 1usize;
+    while index < parts.len() {
+        let token = parts[index].as_str();
+        if token.ends_with(".py") {
+            return Some(index);
+        }
+        if matches!(token, "-X" | "-W") {
+            index += 2;
+        } else if token == "-m" {
+            let module_index = index + 1;
+            let module = parts.get(module_index)?;
+            if !matches!(module.as_str(), "unittest" | "py_compile" | "pytest") {
+                return Some(module_index);
+            }
+            index += 2;
+        } else if token.starts_with('-') {
+            index += 1;
+        } else {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn public_command_runner_subject_index(parts: &[String]) -> usize {
+    let first = parts
+        .first()
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(first.as_str(), "cargo" | "npm" | "pnpm" | "yarn" | "dotnet") {
+        return 0;
+    }
+    parts
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, token)| !token.starts_with('-') && !matches!(token.as_str(), "-X" | "utf8"))
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn command_token_can_be_direct_public_command(token: &str) -> bool {
+    command_token_is_explicit_path_or_extension(token)
+        || token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn command_token_is_explicit_path_or_extension(token: &str) -> bool {
+    token.starts_with("./")
+        || token.starts_with(".\\")
+        || token.contains('/')
+        || token.contains('\\')
+        || token.ends_with(".exe")
+        || token.ends_with(".cmd")
+        || token.ends_with(".bat")
+        || token.ends_with(".sh")
+}
+
+fn public_command_subject_matches_source(subject: &str, source_name: &str) -> bool {
+    let subject = normalize_path(subject);
+    let source_name = normalize_path(source_name);
+    subject == source_name
+}
+
+pub fn public_command_source_match_exact_target_identity_fixture_passes() -> bool {
+    let public_command_source_match_exact_target_identity =
+        "public_command_source_match_exact_target_identity";
+    public_command_subject_matches_source("src/workflow.rs", "src/workflow.rs")
+        && public_command_subject_matches_source("src\\workflow.rs", "src/workflow.rs")
+        && !public_command_subject_matches_source("tools/workflow.rs", "src/workflow.rs")
+        && !public_command_subject_matches_source("workflow.rs", "src/workflow.rs")
+        && public_command_source_match_exact_target_identity
+            == "public_command_source_match_exact_target_identity"
 }
 
 fn output_observation_alternatives_from_context(context: &str) -> Vec<String> {
@@ -1046,7 +1538,7 @@ fn public_command_candidate_from_patch(
         match operation {
             PatchOperation::Add { path, contents } => {
                 let target = normalize_path(path.as_str());
-                if python_source_for_test_target(&target).is_some() {
+                if public_command_test_target_contract(&target).is_some() {
                     return Some(PublicCommandCandidate {
                         target,
                         content: contents,
@@ -1063,7 +1555,7 @@ fn public_command_candidate_from_patch(
                     .as_ref()
                     .map(|path| normalize_path(path.as_str()))
                     .unwrap_or_else(|| source.clone());
-                if python_source_for_test_target(&target).is_none() {
+                if public_command_test_target_contract(&target).is_none() {
                     continue;
                 }
                 let root = workspace_root?;
@@ -1077,7 +1569,7 @@ fn public_command_candidate_from_patch(
             }
             PatchOperation::Delete { path } => {
                 let target = normalize_path(path.as_str());
-                if python_source_for_test_target(&target).is_some() {
+                if public_command_test_target_contract(&target).is_some() {
                     return Some(PublicCommandCandidate {
                         target,
                         content: String::new(),
@@ -1089,11 +1581,23 @@ fn public_command_candidate_from_patch(
     None
 }
 
+fn public_command_test_target_contract(target: &str) -> Option<PublicCommandTestTargetContract> {
+    let spec = classify_language_artifact_target(target);
+    if spec.role != ArtifactRole::Test
+        || !matches!(spec.language, LanguageFamily::Python | LanguageFamily::Code)
+    {
+        return None;
+    }
+    Some(PublicCommandTestTargetContract {
+        source_path: spec.source_path,
+        language: spec.language,
+    })
+}
+
 fn candidate_covers_public_command(content: &str, obligation: &PublicCommandObligation) -> bool {
-    let lower = content.to_ascii_lowercase();
-    if !lower.contains("subprocess")
-        || !lower.contains("returncode")
-        || !(lower.contains("stdout") || lower.contains("stderr"))
+    if !candidate_has_child_process_command_evidence(content)
+        || !candidate_asserts_child_exit_status(content)
+        || !candidate_observes_child_output(content)
     {
         return false;
     }
@@ -1120,6 +1624,45 @@ fn candidate_covers_public_command(content: &str, obligation: &PublicCommandObli
             content,
             &obligation.output_observation_alternatives,
         )
+}
+
+fn candidate_has_child_process_command_evidence(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    [
+        "subprocess.run",
+        "spawnsync",
+        "execfilesync",
+        "execfile(",
+        "execsync",
+        "child_process",
+        "command::new",
+        "processbuilder",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn candidate_asserts_child_exit_status(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    [
+        "returncode",
+        ".status",
+        "status)",
+        "status.",
+        "exitstatus",
+        "exit_status",
+        ".code",
+        "success()",
+        "return code",
+        "exit code",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn candidate_observes_child_output(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("stdout") || lower.contains("stderr")
 }
 
 fn observed_public_command_invocations(content: &str, script_path: &str) -> Vec<Vec<String>> {
@@ -1352,6 +1895,15 @@ fn public_command_subprocess_encoding_issues(content: &str) -> Vec<String> {
 
 fn public_command_subprocess_timeout_issues(content: &str) -> Vec<String> {
     let lower = content.to_ascii_lowercase();
+    if candidate_has_child_process_command_evidence(content)
+        && !lower.contains("subprocess.run")
+        && !candidate_has_child_process_timeout_authority(content)
+    {
+        return vec![
+            "child command invocation starts a public command but no bounded timeout was found"
+                .to_string(),
+        ];
+    }
     if !lower.contains("subprocess.run") {
         return Vec::new();
     }
@@ -1376,6 +1928,25 @@ fn public_command_subprocess_timeout_issues(content: &str) -> Vec<String> {
             "{missing} subprocess.run invocation(s) start child commands without a bounded timeout argument"
         )]
     }
+}
+
+fn candidate_has_child_process_timeout_authority(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    let compact = lower
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    [
+        "timeout:",
+        "timeout=",
+        ".timeout(",
+        "timeout_ms:",
+        "timeout_ms=",
+        "wait_timeout",
+        "with_timeout",
+    ]
+    .iter()
+    .any(|needle| compact.contains(needle))
 }
 
 fn public_command_subprocess_output_capture_issues(content: &str) -> Vec<String> {
@@ -1500,6 +2071,26 @@ fn temp_contract_workspace() -> Option<Utf8PathBuf> {
     Utf8PathBuf::from_path_buf(path).ok()
 }
 
+fn timeout_issue_feedback_sentence(target: &str, timeout_issues: &[String]) -> String {
+    let issues = timeout_issues.join("; ");
+    if timeout_issues_are_python_subprocess_run_specific(timeout_issues) {
+        format!(
+            "`{target}` starts Python `subprocess.run(...)` child commands without bounded timeout authority. Timeout issue(s): {issues}. Add a finite `timeout=` argument to every generated `subprocess.run(...)` call that can execute a child command, so verification cannot block indefinitely on an interactive or stalled child process."
+        )
+    } else {
+        format!(
+            "`{target}` starts child-process public commands without bounded timeout authority. Timeout issue(s): {issues}. Add the target language's bounded child-process timeout option, such as a spawn/command timeout or Python `subprocess.run(timeout=...)`, to every generated child command that can execute a public command, so verification cannot block indefinitely on an interactive or stalled child process."
+        )
+    }
+}
+
+fn timeout_issues_are_python_subprocess_run_specific(timeout_issues: &[String]) -> bool {
+    !timeout_issues.is_empty()
+        && timeout_issues
+            .iter()
+            .all(|issue| issue.to_ascii_lowercase().contains("subprocess.run"))
+}
+
 fn public_command_contract_tool_result(
     tool_name: &str,
     arguments: &Value,
@@ -1523,6 +2114,11 @@ fn public_command_contract_tool_result(
                 obligation.output_observation_alternatives.join(" | ")
             )
         })
+        .collect::<Vec<_>>();
+    let required_assertion_templates = missing
+        .iter()
+        .filter(|obligation| !obligation.output_observation_alternatives.is_empty())
+        .map(|obligation| public_command_observation_assertion_template(obligation, candidate))
         .collect::<Vec<_>>();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     tool_name.hash(&mut hasher);
@@ -1554,7 +2150,7 @@ fn public_command_contract_tool_result(
     let mut issue_sentences = Vec::new();
     if !missing_commands.is_empty() {
         issue_sentences.push(format!(
-            "`{target}` does not cover prompt-visible public command contract(s): {commands}.{observations} Add subprocess-based tests that execute the exact argv forms, assert return code, and assert the listed stdout/stderr observation.",
+            "`{target}` does not cover prompt-visible public command contract(s): {commands}.{observations} Add child-process-based tests that execute the exact argv forms, assert return code, and assert the listed stdout/stderr observation.",
             target = candidate.target,
             commands = commands_display,
             observations = observations_display
@@ -1568,10 +2164,9 @@ fn public_command_contract_tool_result(
         ));
     }
     if !timeout_issues.is_empty() {
-        issue_sentences.push(format!(
-            "`{target}` starts subprocess child commands without bounded timeout authority. Timeout issue(s): {issues}. Add a finite `timeout=` argument to every generated `subprocess.run(...)` call that can execute a child command, so verification cannot block indefinitely on an interactive or stalled child process.",
-            target = candidate.target,
-            issues = timeout_issues.join("; ")
+        issue_sentences.push(timeout_issue_feedback_sentence(
+            &candidate.target,
+            timeout_issues,
         ));
     }
     if !capture_issues.is_empty() {
@@ -1581,8 +2176,18 @@ fn public_command_contract_tool_result(
             issues = capture_issues.join("; ")
         ));
     }
+    let typed_feedback = render_public_command_contract_feedback(
+        issue_kind,
+        &candidate.target,
+        &missing_commands,
+        &missing_observations,
+        &required_assertion_templates,
+        encoding_issues,
+        timeout_issues,
+        capture_issues,
+    );
     let output_text = format!(
-        "Runtime rejected `{tool_name}` before filesystem side effects because this generated test artifact violates the public command subprocess contract. {} This test artifact cannot satisfy route closeout until the typed subprocess coverage, encoding, timeout, and output-capture contract is coherent.",
+        "{typed_feedback}\n\nRuntime rejected `{tool_name}` before filesystem side effects because this generated test artifact violates the public command child-process contract. {} This test artifact cannot satisfy route closeout until the typed child-process coverage, encoding, timeout, and output-capture contract is coherent.",
         issue_sentences.join(" ")
     );
     ToolResult {
@@ -1601,6 +2206,7 @@ fn public_command_contract_tool_result(
             "target": candidate.target,
             "missing_public_commands": missing_commands,
             "missing_public_command_observations": missing_observations,
+            "required_public_command_assertion_templates": required_assertion_templates,
             "encoding_contract_issues": encoding_issues,
             "subprocess_timeout_contract_issues": timeout_issues,
             "subprocess_output_capture_contract_issues": capture_issues,
@@ -1614,6 +2220,7 @@ fn public_command_contract_tool_result(
                 "side_effects_applied": false,
                 "missing_public_commands": missing_commands,
                 "missing_public_command_observations": missing_observations,
+                "required_public_command_assertion_templates": required_assertion_templates,
                 "encoding_contract_issues": encoding_issues,
                 "subprocess_timeout_contract_issues": timeout_issues,
                 "subprocess_output_capture_contract_issues": capture_issues,
@@ -1629,5 +2236,102 @@ fn public_command_contract_tool_result(
         truncated_output_path: None,
         recorded_changes: Vec::new(),
         change_summaries: Vec::new(),
+    }
+}
+
+fn render_public_command_contract_feedback(
+    issue_kind: PublicCommandContractIssueKind,
+    target: &str,
+    missing_commands: &[String],
+    missing_observations: &[String],
+    required_assertion_templates: &[String],
+    encoding_issues: &[String],
+    timeout_issues: &[String],
+    capture_issues: &[String],
+) -> String {
+    let mut lines = vec![
+        "[tool feedback]".to_string(),
+        format!(
+            "operation_intent: {}",
+            OperationIntent::ContentChangingAuthoringRequired.as_str()
+        ),
+        format!("operation_progress_class: {}", issue_kind.as_str()),
+        "progress_effect: no_progress".to_string(),
+        format!("candidate_target: {target}"),
+        "required_next_action: add child-process-based tests for the missing public command argv contracts".to_string(),
+    ];
+    lines.push(format!(
+        "missing_public_commands: {}",
+        if missing_commands.is_empty() {
+            "none".to_string()
+        } else {
+            missing_commands.join(", ")
+        }
+    ));
+    if !missing_observations.is_empty() {
+        lines.push(format!(
+            "missing_public_command_observations: {}",
+            missing_observations.join("; ")
+        ));
+    }
+    if !required_assertion_templates.is_empty() {
+        lines.push(format!(
+            "required_public_command_assertion_templates: {}",
+            required_assertion_templates.join(" || ")
+        ));
+    }
+    if !encoding_issues.is_empty() {
+        lines.push(format!(
+            "encoding_contract_issues: {}",
+            encoding_issues.join("; ")
+        ));
+    }
+    if !timeout_issues.is_empty() {
+        lines.push(format!(
+            "subprocess_timeout_contract_issues: {}",
+            timeout_issues.join("; ")
+        ));
+    }
+    if !capture_issues.is_empty() {
+        lines.push(format!(
+            "subprocess_output_capture_contract_issues: {}",
+            capture_issues.join("; ")
+        ));
+    }
+    lines.push("side_effects_applied: false".to_string());
+    lines.push(
+        "submitted artifact remains rejected until the typed missing coverage and child-process execution contract are satisfied."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+fn public_command_observation_assertion_template(
+    obligation: &PublicCommandObligation,
+    candidate: &PublicCommandCandidate,
+) -> String {
+    let argv = obligation
+        .argv_after_script
+        .iter()
+        .map(|arg| format!("{arg:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let alternatives = obligation
+        .output_observation_alternatives
+        .iter()
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target_language = public_command_test_target_contract(&candidate.target)
+        .map(|contract| contract.language)
+        .unwrap_or(LanguageFamily::Unknown);
+    if target_language == LanguageFamily::Python {
+        format!(
+            "proc = self._run_cli({argv}); self.assertEqual(proc.returncode, 1, f\"stdout={{proc.stdout!r}} stderr={{proc.stderr!r}}\"); self.assertTrue(any(token in (proc.stdout + proc.stderr) for token in [{alternatives}]), f\"stdout={{proc.stdout!r}} stderr={{proc.stderr!r}}\")"
+        )
+    } else {
+        format!(
+            "execute public command argv [{argv}] with the target language child-process helper; assert exit_status == 1; assert stdout/stderr contains one of [{alternatives}]"
+        )
     }
 }
