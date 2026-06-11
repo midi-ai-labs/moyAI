@@ -3,7 +3,10 @@ use std::process::ExitCode;
 
 use camino::Utf8PathBuf;
 use moyai::app::{
-    AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionListRequest, SessionShowRequest,
+    AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionForkRequest,
+    SessionHistoryRequest, SessionListRequest, SessionLoadedRequest, SessionReadRequest,
+    SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
+    SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest, SessionTurnsRequest,
 };
 use moyai::cli::parse::parse as parse_cli;
 use moyai::cli::{
@@ -43,8 +46,19 @@ fn run() -> Result<(), (u8, String)> {
     let command = hydrate_run_prompt(command).map_err(|error| (2, error))?;
     match command {
         CliCommand::Run(_)
+        | CliCommand::SessionArchive(_)
         | CliCommand::SessionList(_)
+        | CliCommand::SessionLoaded(_)
+        | CliCommand::SessionSearch(_)
+        | CliCommand::SessionSettings(_)
         | CliCommand::SessionShow(_)
+        | CliCommand::SessionHistory(_)
+        | CliCommand::SessionRead(_)
+        | CliCommand::SessionRejoin(_)
+        | CliCommand::SessionRollback(_)
+        | CliCommand::SessionFork(_)
+        | CliCommand::SessionTurns(_)
+        | CliCommand::SessionSteer(_)
         | CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
         | CliCommand::PreflightRun(_)
@@ -333,9 +347,83 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             project_id: app.workspace.project_id,
             limit: args.limit,
         }),
+        CliCommand::SessionLoaded(args) => AppCommand::SessionLoaded(SessionLoadedRequest {
+            project_id: app.workspace.project_id,
+            limit: args.limit,
+            include_archived: args.include_archived,
+        }),
+        CliCommand::SessionSearch(args) => AppCommand::SessionSearch(SessionSearchRequest {
+            project_id: app.workspace.project_id,
+            query: args.query.clone(),
+            limit: args.limit,
+            include_archived: args.include_archived,
+        }),
+        CliCommand::SessionArchive(args) => AppCommand::SessionArchive(SessionArchiveRequest {
+            session_id: args.session_id,
+            archived: args.archived,
+        }),
+        CliCommand::SessionSettings(args) => {
+            AppCommand::SessionSettingsUpdate(SessionSettingsUpdateRequest {
+                session_id: args.session_id,
+                cwd: args.cwd.clone(),
+                model: args.model.clone(),
+                base_url: args.base_url.clone(),
+                access_mode: args.access_mode,
+            })
+        }
         CliCommand::SessionShow(args) => AppCommand::SessionShow(SessionShowRequest {
             session_id: args.session_id,
             show_reasoning: args.show_reasoning,
+        }),
+        CliCommand::SessionHistory(args) => AppCommand::SessionHistory(SessionHistoryRequest {
+            session_id: args.session_id,
+            offset: args.offset,
+            limit: args.limit,
+        }),
+        CliCommand::SessionRead(args) => AppCommand::SessionRead(SessionReadRequest {
+            session_id: args.session_id,
+            history_offset: args.history_offset,
+            history_limit: args.history_limit,
+            turn_offset: args.turn_offset,
+            turn_limit: args.turn_limit,
+        }),
+        CliCommand::SessionRejoin(args) => AppCommand::SessionRejoin(SessionRejoinRequest {
+            session_id: args.session_id,
+            history_offset: args.history_offset,
+            history_limit: args.history_limit,
+            turn_offset: args.turn_offset,
+            turn_limit: args.turn_limit,
+        }),
+        CliCommand::SessionRollback(args) => AppCommand::SessionRollback(SessionRollbackRequest {
+            session_id: args.session_id,
+            num_turns: args.num_turns,
+            history_offset: args.history_offset,
+            history_limit: args.history_limit,
+            turn_offset: args.turn_offset,
+            turn_limit: args.turn_limit,
+        }),
+        CliCommand::SessionFork(args) => AppCommand::SessionFork(SessionForkRequest {
+            source_session_id: args.source_session_id,
+            title: args.title.clone(),
+            history_offset: args.history_offset,
+            history_limit: args.history_limit,
+            turn_offset: args.turn_offset,
+            turn_limit: args.turn_limit,
+        }),
+        CliCommand::SessionTurns(args) => AppCommand::SessionTurns(SessionTurnsRequest {
+            session_id: args.session_id,
+            offset: args.offset,
+            limit: args.limit,
+        }),
+        CliCommand::SessionSteer(args) => AppCommand::SessionSteer(SessionSteerRequest {
+            session_id: args.session_id,
+            prompt: args.prompt.clone(),
+            cwd: args
+                .directory
+                .clone()
+                .unwrap_or_else(|| app.workspace.cwd.clone()),
+            image_paths: args.image_paths.clone(),
+            client_user_message_id: None,
         }),
         CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
@@ -356,8 +444,19 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
 fn command_output_mode(command: &CliCommand) -> OutputMode {
     match command {
         CliCommand::Run(args) => args.output_mode,
+        CliCommand::SessionArchive(args) => args.output_mode,
         CliCommand::SessionList(args) => args.output_mode,
+        CliCommand::SessionLoaded(args) => args.output_mode,
+        CliCommand::SessionSearch(args) => args.output_mode,
+        CliCommand::SessionSettings(args) => args.output_mode,
         CliCommand::SessionShow(args) => args.output_mode,
+        CliCommand::SessionHistory(args) => args.output_mode,
+        CliCommand::SessionRead(args) => args.output_mode,
+        CliCommand::SessionRejoin(args) => args.output_mode,
+        CliCommand::SessionRollback(args) => args.output_mode,
+        CliCommand::SessionFork(args) => args.output_mode,
+        CliCommand::SessionTurns(args) => args.output_mode,
+        CliCommand::SessionSteer(args) => args.output_mode,
         CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
         | CliCommand::PreflightRun(_)

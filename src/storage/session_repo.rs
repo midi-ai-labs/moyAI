@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use camino::Utf8Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::config::AccessMode;
 use crate::error::StorageError;
 use crate::protocol::{
     ProtocolEventStore, ToolProgressEffect, TurnId, UserTurn, VerificationRunResult,
@@ -13,10 +14,11 @@ use crate::runtime::{Clock, SystemClock};
 use crate::session::{
     CompletionState, DiffSummaryPart, FailureKind, FailureState, MessageId, MessageMetadata,
     MessagePart, MessageRecord, MessageRole, NewMessage, NewPart, NewSession, PartKind, PartRecord,
-    ProcessPhase, ProjectRepository, RunEvent, SessionId, SessionRecord, SessionRepository,
-    SessionStateSnapshot, SessionStatus, TaskRoute, TextPart, TodoItem, TodoKind, TodoPriority,
-    TodoStatus, ToolCallId, ToolCallPart, ToolCallRecord, ToolCallStatus, ToolResultPart,
-    Transcript, TranscriptMessage, VerificationState,
+    ProcessPhase, ProjectId, ProjectRepository, RunEvent, SessionId, SessionRecord,
+    SessionRepository, SessionSettingsPatch, SessionSettingsUpdate, SessionStateSnapshot,
+    SessionStatus, TaskRoute, TextPart, TodoItem, TodoKind, TodoPriority, TodoStatus, ToolCallId,
+    ToolCallPart, ToolCallRecord, ToolCallStatus, ToolResultPart, Transcript, TranscriptMessage,
+    VerificationState,
 };
 
 const STORAGE_REPOSITORY_FIXTURE_MODEL: &str = crate::storage::STORAGE_REPOSITORY_FIXTURE_MODEL;
@@ -166,6 +168,76 @@ impl SqliteSessionRepository {
             "UPDATE messages SET metadata_json = ?2 WHERE id = ?1",
             params![message_id.to_string(), serde_json::to_string(metadata)?],
         )?;
+        Ok(())
+    }
+
+    pub async fn reset_state_after_protocol_rollback(
+        &self,
+        session_id: SessionId,
+        state: &SessionStateSnapshot,
+    ) -> Result<SessionRecord, StorageError> {
+        let now = SystemClock.now_ms();
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM session_todos WHERE session_id = ?1",
+            params![session_id.to_string()],
+        )?;
+        upsert_session_state_row(&transaction, session_id, state, now)?;
+        transaction.execute(
+            "UPDATE sessions
+             SET status = 'idle', updated_at_ms = ?2, completed_at_ms = NULL
+             WHERE id = ?1",
+            params![session_id.to_string(), now],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_session(session_id).await
+    }
+
+    pub async fn copy_session_state_and_todos(
+        &self,
+        source_session_id: SessionId,
+        target_session_id: SessionId,
+    ) -> Result<(), StorageError> {
+        if source_session_id == target_session_id {
+            return Err(StorageError::Message(
+                "cannot copy session state into the same session".to_string(),
+            ));
+        }
+        let state = self.get_state(source_session_id).await?;
+        let todos = self.list_todos(source_session_id).await?;
+        let now = SystemClock.now_ms();
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        upsert_session_state_row(&transaction, target_session_id, &state, now)?;
+        transaction.execute(
+            "DELETE FROM session_todos WHERE session_id = ?1",
+            params![target_session_id.to_string()],
+        )?;
+        for (position, todo) in todos.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO session_todos (
+                     session_id, todo_id, position, content, kind, status, priority, targets_json,
+                     depends_on_json, success_criteria_json, blocked_by_json
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    target_session_id.to_string(),
+                    todo.id.to_string(),
+                    position as i64,
+                    todo.content,
+                    todo_kind_text(todo.kind),
+                    todo_status_text(todo.status),
+                    todo_priority_text(todo.priority),
+                    serde_json::to_string(&todo.targets)?,
+                    serde_json::to_string(&todo.depends_on)?,
+                    serde_json::to_string(&todo.success_criteria)?,
+                    serde_json::to_string(&todo.blocked_by)?
+                ],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -950,8 +1022,8 @@ impl SessionRepository for SqliteSessionRepository {
         let now = SystemClock.now_ms();
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection.execute(
-            "INSERT INTO sessions (id, project_id, title, status, cwd_path, model_name, base_url, created_at_ms, updated_at_ms, completed_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+            "INSERT INTO sessions (id, project_id, title, status, cwd_path, model_name, base_url, access_mode, created_at_ms, updated_at_ms, completed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
             params![
                 id.to_string(),
                 draft.project_id.to_string(),
@@ -960,6 +1032,7 @@ impl SessionRepository for SqliteSessionRepository {
                 draft.cwd.as_str(),
                 draft.model,
                 draft.base_url,
+                draft.access_mode.as_str(),
                 now,
                 now
             ],
@@ -972,7 +1045,7 @@ impl SessionRepository for SqliteSessionRepository {
     async fn get_session(&self, id: SessionId) -> Result<SessionRecord, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection.query_row(
-            "SELECT project_id, title, status, cwd_path, model_name, base_url, created_at_ms, updated_at_ms, completed_at_ms
+            "SELECT project_id, title, status, cwd_path, model_name, base_url, access_mode, created_at_ms, updated_at_ms, completed_at_ms
              FROM sessions WHERE id = ?1",
             params![id.to_string()],
             |row| {
@@ -987,9 +1060,10 @@ impl SessionRepository for SqliteSessionRepository {
                     cwd: row.get::<_, String>(3)?.into(),
                     model: row.get(4)?,
                     base_url: row.get(5)?,
-                    created_at_ms: row.get(6)?,
-                    updated_at_ms: row.get(7)?,
-                    completed_at_ms: row.get(8)?,
+                    access_mode: parse_access_mode(&row.get::<_, String>(6)?),
+                    created_at_ms: row.get(7)?,
+                    updated_at_ms: row.get(8)?,
+                    completed_at_ms: row.get(9)?,
                 })
             },
         ).map_err(StorageError::from)
@@ -1003,7 +1077,7 @@ impl SessionRepository for SqliteSessionRepository {
         let id: Option<String> = connection
             .query_row(
                 "SELECT id FROM sessions
-                 WHERE project_id = ?1
+                 WHERE project_id = ?1 AND archived_at_ms IS NULL
                  ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
                  LIMIT 1",
                 params![project_id.to_string()],
@@ -1029,13 +1103,29 @@ impl SessionRepository for SqliteSessionRepository {
         project_id: crate::session::ProjectId,
         limit: usize,
     ) -> Result<Vec<SessionRecord>, StorageError> {
+        self.list_sessions_with_archived(project_id, limit, false)
+            .await
+    }
+
+    async fn list_sessions_with_archived(
+        &self,
+        project_id: crate::session::ProjectId,
+        limit: usize,
+        include_archived: bool,
+    ) -> Result<Vec<SessionRecord>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let mut statement = connection.prepare(
+        let archived_filter = if include_archived {
+            ""
+        } else {
+            " AND archived_at_ms IS NULL"
+        };
+        let sql = format!(
             "SELECT id FROM sessions
-             WHERE project_id = ?1
+             WHERE project_id = ?1{archived_filter}
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
-             LIMIT ?2",
-        )?;
+             LIMIT ?2"
+        );
+        let mut statement = connection.prepare(&sql)?;
         let ids = statement
             .query_map(params![project_id.to_string(), limit as i64], |row| {
                 row.get::<_, String>(0)
@@ -1061,6 +1151,7 @@ impl SessionRepository for SqliteSessionRepository {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id FROM sessions
+             WHERE archived_at_ms IS NULL
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
              LIMIT ?1",
         )?;
@@ -1081,6 +1172,117 @@ impl SessionRepository for SqliteSessionRepository {
             );
         }
         Ok(sessions)
+    }
+
+    async fn search_sessions(
+        &self,
+        project_id: ProjectId,
+        query: &str,
+        limit: usize,
+        include_archived: bool,
+    ) -> Result<Vec<SessionRecord>, StorageError> {
+        let normalized = format!("%{}%", query.trim().to_ascii_lowercase());
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let archived_filter = if include_archived {
+            ""
+        } else {
+            " AND archived_at_ms IS NULL"
+        };
+        let sql = format!(
+            "SELECT id FROM sessions
+             WHERE project_id = ?1{archived_filter}
+               AND (
+                   lower(title) LIKE ?2
+                   OR lower(cwd_path) LIKE ?2
+                   OR lower(model_name) LIKE ?2
+                   OR lower(base_url) LIKE ?2
+                   OR lower(access_mode) LIKE ?2
+               )
+             ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
+             LIMIT ?3"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let ids = statement
+            .query_map(
+                params![project_id.to_string(), normalized, limit as i64],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+        let mut sessions = Vec::new();
+        for value in ids {
+            sessions.push(
+                self.get_session(
+                    value
+                        .parse::<SessionId>()
+                        .map_err(|error| StorageError::Message(error.to_string()))?,
+                )
+                .await?,
+            );
+        }
+        Ok(sessions)
+    }
+
+    async fn set_session_archived(
+        &self,
+        id: SessionId,
+        archived: bool,
+    ) -> Result<SessionRecord, StorageError> {
+        let now = SystemClock::now_ms();
+        let archived_at_ms = archived.then_some(now);
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE sessions SET archived_at_ms = ?2, updated_at_ms = ?3 WHERE id = ?1",
+            params![id.to_string(), archived_at_ms, now],
+        )?;
+        drop(connection);
+        self.get_session(id).await
+    }
+
+    async fn update_session_settings(
+        &self,
+        id: SessionId,
+        patch: &SessionSettingsPatch,
+    ) -> Result<SessionSettingsUpdate, StorageError> {
+        let current = self.get_session(id).await?;
+        let next_cwd = patch.cwd.clone().unwrap_or_else(|| current.cwd.clone());
+        let next_model = patch.model.clone().unwrap_or_else(|| current.model.clone());
+        let next_base_url = patch
+            .base_url
+            .clone()
+            .unwrap_or_else(|| current.base_url.clone());
+        let next_access_mode = patch.access_mode.unwrap_or(current.access_mode);
+        let changed = next_cwd != current.cwd
+            || next_model != current.model
+            || next_base_url != current.base_url
+            || next_access_mode != current.access_mode;
+        if !changed {
+            return Ok(SessionSettingsUpdate {
+                session: current,
+                changed: false,
+            });
+        }
+        let now = SystemClock::now_ms();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE sessions
+             SET cwd_path = ?2, model_name = ?3, base_url = ?4, access_mode = ?5, updated_at_ms = ?6
+             WHERE id = ?1",
+            params![
+                id.to_string(),
+                next_cwd.as_str(),
+                next_model,
+                next_base_url,
+                next_access_mode.as_str(),
+                now
+            ],
+        )?;
+        drop(connection);
+        Ok(SessionSettingsUpdate {
+            session: self.get_session(id).await?,
+            changed: true,
+        })
     }
 
     async fn delete_session(&self, id: SessionId) -> Result<(), StorageError> {
@@ -1464,6 +1666,10 @@ fn parse_status(value: &str) -> SessionStatus {
         "failed" => SessionStatus::Failed,
         _ => SessionStatus::Failed,
     }
+}
+
+fn parse_access_mode(value: &str) -> AccessMode {
+    AccessMode::parse(value).unwrap_or(AccessMode::Default)
 }
 
 fn parse_part_kind(value: &str) -> PartKind {
@@ -2037,6 +2243,7 @@ fn todo_update_uses_single_unit_of_work_fixture_inner() -> bool {
                 cwd: root.to_path_buf(),
                 model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
                 base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
+                access_mode: crate::config::AccessMode::Default,
             })
             .await
         {
@@ -2143,6 +2350,7 @@ fn protocol_message_parts_use_single_unit_of_work_fixture_inner() -> bool {
                 cwd: root.to_path_buf(),
                 model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
                 base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
+                access_mode: crate::config::AccessMode::Default,
             })
             .await
         {
@@ -2262,6 +2470,7 @@ fn tool_output_filechange_projection_single_unit_of_work_fixture_inner() -> bool
                 cwd: root.to_path_buf(),
                 model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
                 base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
+                access_mode: crate::config::AccessMode::Default,
             })
             .await
         {
@@ -2511,6 +2720,7 @@ fn tool_output_filechange_projection_owner_coherence_fixture_inner() -> bool {
                 cwd: root.to_path_buf(),
                 model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
                 base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
+                access_mode: crate::config::AccessMode::Default,
             })
             .await
         {
@@ -2741,6 +2951,151 @@ fn tool_output_filechange_projection_owner_coherence_fixture_inner() -> bool {
     })
 }
 
+pub(crate) fn session_archive_search_lifecycle_fixture_passes() -> bool {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::Builder::new()
+            .name("moyai-session-archive-search-fixture".to_string())
+            .spawn(session_archive_search_lifecycle_fixture_inner)
+            .ok()
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or(false);
+    }
+    session_archive_search_lifecycle_fixture_inner()
+}
+
+fn session_archive_search_lifecycle_fixture_inner() -> bool {
+    let Ok(temp) = tempfile::tempdir() else {
+        return false;
+    };
+    let Some(data_dir) = Utf8Path::from_path(temp.path()) else {
+        return false;
+    };
+    let paths = crate::storage::StoragePaths {
+        data_dir: data_dir.to_path_buf(),
+        database_path: data_dir.join("moyai.sqlite3"),
+        truncation_dir: data_dir.join("truncation"),
+    };
+    let Ok(store) = crate::storage::SqliteStore::open(&paths) else {
+        return false;
+    };
+    if store.migrate().is_err() {
+        return false;
+    }
+    let project_repo = store.project_repo();
+    let session_repo = store.session_repo();
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+
+    runtime.block_on(async {
+        let project_id = ProjectId::new();
+        let root = Utf8Path::new("C:/workspace/session-lifecycle");
+        if project_repo
+            .upsert_project(project_id, root, "Archive Search Lifecycle", "none")
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let visible = match session_repo
+            .create_session(NewSession {
+                project_id,
+                title: "visible session".to_string(),
+                cwd: root.to_path_buf(),
+                model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
+                base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+        {
+            Ok(session) => session,
+            Err(_) => return false,
+        };
+        let archived = match session_repo
+            .create_session(NewSession {
+                project_id,
+                title: "hidden needle target".to_string(),
+                cwd: root.to_path_buf(),
+                model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
+                base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+        {
+            Ok(session) => session,
+            Err(_) => return false,
+        };
+        if session_repo
+            .set_session_archived(archived.id, true)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+
+        let Ok(default_list) = session_repo.list_sessions(project_id, 10).await else {
+            return false;
+        };
+        if default_list.iter().any(|session| session.id == archived.id)
+            || !default_list.iter().any(|session| session.id == visible.id)
+        {
+            return false;
+        }
+        let Ok(default_search) = session_repo
+            .search_sessions(project_id, "needle", 10, false)
+            .await
+        else {
+            return false;
+        };
+        if !default_search.is_empty() {
+            return false;
+        }
+        let Ok(inclusive_search) = session_repo
+            .search_sessions(project_id, "needle", 10, true)
+            .await
+        else {
+            return false;
+        };
+        if !inclusive_search
+            .iter()
+            .any(|session| session.id == archived.id)
+        {
+            return false;
+        }
+        let Ok(inclusive_list) = session_repo
+            .list_sessions_with_archived(project_id, 10, true)
+            .await
+        else {
+            return false;
+        };
+        if !inclusive_list
+            .iter()
+            .any(|session| session.id == archived.id)
+            || !inclusive_list
+                .iter()
+                .any(|session| session.id == visible.id)
+        {
+            return false;
+        }
+        if session_repo
+            .set_session_archived(archived.id, false)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(unarchived_list) = session_repo.list_sessions(project_id, 10).await else {
+            return false;
+        };
+        unarchived_list
+            .iter()
+            .any(|session| session.id == archived.id)
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn storage_repository_current_provider_profile_fixture_passes() -> bool {
     STORAGE_REPOSITORY_FIXTURE_MODEL == "qwen/qwen3.6-35b-a3b"
@@ -2793,6 +3148,7 @@ mod tests {
                     cwd: root.to_path_buf(),
                     model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
                     base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
+                    access_mode: crate::config::AccessMode::Default,
                 })
                 .await
                 .expect("insert session");
@@ -2902,6 +3258,7 @@ mod tests {
                     cwd: root.to_path_buf(),
                     model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
                     base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
+                    access_mode: crate::config::AccessMode::Default,
                 })
                 .await
                 .expect("insert session");
@@ -2989,5 +3346,10 @@ mod tests {
     #[test]
     fn storage_repository_fixtures_use_current_provider_profile() {
         assert!(super::storage_repository_current_provider_profile_fixture_passes());
+    }
+
+    #[test]
+    fn session_archive_search_lifecycle_is_non_destructive_metadata() {
+        assert!(super::session_archive_search_lifecycle_fixture_passes());
     }
 }

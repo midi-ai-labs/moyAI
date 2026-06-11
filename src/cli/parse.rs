@@ -1,6 +1,7 @@
 use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 
+use crate::config::AccessMode;
 use crate::error::CliUsageError;
 use crate::session::SessionId;
 
@@ -38,10 +39,111 @@ pub struct SessionListArgs {
 }
 
 #[derive(Debug, Clone)]
+pub struct SessionLoadedArgs {
+    pub directory: Option<Utf8PathBuf>,
+    pub limit: usize,
+    pub include_archived: bool,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSearchArgs {
+    pub directory: Option<Utf8PathBuf>,
+    pub query: String,
+    pub limit: usize,
+    pub include_archived: bool,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionArchiveArgs {
+    pub session_id: SessionId,
+    pub archived: bool,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSettingsArgs {
+    pub session_id: SessionId,
+    pub cwd: Option<Utf8PathBuf>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub access_mode: Option<AccessMode>,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionShowArgs {
     pub session_id: SessionId,
     pub output_mode: OutputMode,
     pub show_reasoning: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionHistoryArgs {
+    pub session_id: SessionId,
+    pub offset: usize,
+    pub limit: usize,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionReadArgs {
+    pub session_id: SessionId,
+    pub history_offset: usize,
+    pub history_limit: usize,
+    pub turn_offset: usize,
+    pub turn_limit: usize,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRejoinArgs {
+    pub session_id: SessionId,
+    pub history_offset: usize,
+    pub history_limit: usize,
+    pub turn_offset: usize,
+    pub turn_limit: usize,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRollbackArgs {
+    pub session_id: SessionId,
+    pub num_turns: usize,
+    pub history_offset: usize,
+    pub history_limit: usize,
+    pub turn_offset: usize,
+    pub turn_limit: usize,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionForkArgs {
+    pub source_session_id: SessionId,
+    pub title: Option<String>,
+    pub history_offset: usize,
+    pub history_limit: usize,
+    pub turn_offset: usize,
+    pub turn_limit: usize,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionTurnsArgs {
+    pub session_id: SessionId,
+    pub offset: usize,
+    pub limit: usize,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSteerArgs {
+    pub session_id: SessionId,
+    pub prompt: String,
+    pub directory: Option<Utf8PathBuf>,
+    pub image_paths: Vec<Utf8PathBuf>,
+    pub output_mode: OutputMode,
 }
 
 #[derive(Debug, Clone)]
@@ -127,8 +229,19 @@ pub struct ManualStRouteArgs {
 #[derive(Debug, Clone)]
 pub enum CliCommand {
     Run(RunArgs),
+    SessionArchive(SessionArchiveArgs),
     SessionList(SessionListArgs),
+    SessionLoaded(SessionLoadedArgs),
+    SessionSearch(SessionSearchArgs),
+    SessionSettings(SessionSettingsArgs),
     SessionShow(SessionShowArgs),
+    SessionHistory(SessionHistoryArgs),
+    SessionRead(SessionReadArgs),
+    SessionRejoin(SessionRejoinArgs),
+    SessionRollback(SessionRollbackArgs),
+    SessionFork(SessionForkArgs),
+    SessionTurns(SessionTurnsArgs),
+    SessionSteer(SessionSteerArgs),
     Tui(TuiArgs),
     Desktop(DesktopArgs),
     ReplayRun(ReplayRunArgs),
@@ -234,6 +347,66 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                 limit: args.limit,
                 output_mode: args.output_mode,
             })),
+            SessionCommand::Loaded(args) => Ok(CliCommand::SessionLoaded(SessionLoadedArgs {
+                directory: args.directory,
+                limit: args.limit,
+                include_archived: args.include_archived,
+                output_mode: args.output_mode,
+            })),
+            SessionCommand::Search(args) => {
+                let query = args.query.join(" ");
+                if query.trim().is_empty() {
+                    return Err(CliUsageError::Message(
+                        "session search query must not be empty".to_string(),
+                    ));
+                }
+                Ok(CliCommand::SessionSearch(SessionSearchArgs {
+                    directory: args.directory,
+                    query,
+                    limit: args.limit,
+                    include_archived: args.include_archived,
+                    output_mode: args.output_mode,
+                }))
+            }
+            SessionCommand::Archive(args) => Ok(CliCommand::SessionArchive(SessionArchiveArgs {
+                session_id: args.session_id.parse().map_err(|error| {
+                    CliUsageError::Message(format!("invalid session id: {error}"))
+                })?,
+                archived: true,
+                output_mode: args.output_mode,
+            })),
+            SessionCommand::Unarchive(args) => Ok(CliCommand::SessionArchive(SessionArchiveArgs {
+                session_id: args.session_id.parse().map_err(|error| {
+                    CliUsageError::Message(format!("invalid session id: {error}"))
+                })?,
+                archived: false,
+                output_mode: args.output_mode,
+            })),
+            SessionCommand::Settings(args) => {
+                if args.cwd.is_none()
+                    && args.model.is_none()
+                    && args.base_url.is_none()
+                    && args.access_mode.is_none()
+                {
+                    return Err(CliUsageError::Message(
+                        "session settings requires at least one of --cwd, --model, --base-url, or --access-mode".to_string(),
+                    ));
+                }
+                Ok(CliCommand::SessionSettings(SessionSettingsArgs {
+                    session_id: args.session_id.parse().map_err(|error| {
+                        CliUsageError::Message(format!("invalid session id: {error}"))
+                    })?,
+                    cwd: args.cwd,
+                    model: args.model,
+                    base_url: args.base_url,
+                    access_mode: args
+                        .access_mode
+                        .as_deref()
+                        .map(parse_cli_access_mode)
+                        .transpose()?,
+                    output_mode: args.output_mode,
+                }))
+            }
             SessionCommand::Show(args) => Ok(CliCommand::SessionShow(SessionShowArgs {
                 session_id: args.session_id.parse().map_err(|error| {
                     CliUsageError::Message(format!("invalid session id: {error}"))
@@ -241,6 +414,88 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                 output_mode: args.output_mode,
                 show_reasoning: args.show_reasoning,
             })),
+            SessionCommand::History(args) => Ok(CliCommand::SessionHistory(SessionHistoryArgs {
+                session_id: args.session_id.parse().map_err(|error| {
+                    CliUsageError::Message(format!("invalid session id: {error}"))
+                })?,
+                offset: args.offset,
+                limit: args.limit,
+                output_mode: args.output_mode,
+            })),
+            SessionCommand::Read(args) => Ok(CliCommand::SessionRead(SessionReadArgs {
+                session_id: args.session_id.parse().map_err(|error| {
+                    CliUsageError::Message(format!("invalid session id: {error}"))
+                })?,
+                history_offset: args.history_offset,
+                history_limit: args.history_limit,
+                turn_offset: args.turn_offset,
+                turn_limit: args.turn_limit,
+                output_mode: args.output_mode,
+            })),
+            SessionCommand::Rejoin(args) => Ok(CliCommand::SessionRejoin(SessionRejoinArgs {
+                session_id: args.session_id.parse().map_err(|error| {
+                    CliUsageError::Message(format!("invalid session id: {error}"))
+                })?,
+                history_offset: args.history_offset,
+                history_limit: args.history_limit,
+                turn_offset: args.turn_offset,
+                turn_limit: args.turn_limit,
+                output_mode: args.output_mode,
+            })),
+            SessionCommand::Rollback(args) => {
+                if args.num_turns == 0 {
+                    return Err(CliUsageError::Message(
+                        "session rollback --turns must be greater than zero".to_string(),
+                    ));
+                }
+                Ok(CliCommand::SessionRollback(SessionRollbackArgs {
+                    session_id: args.session_id.parse().map_err(|error| {
+                        CliUsageError::Message(format!("invalid session id: {error}"))
+                    })?,
+                    num_turns: args.num_turns,
+                    history_offset: args.history_offset,
+                    history_limit: args.history_limit,
+                    turn_offset: args.turn_offset,
+                    turn_limit: args.turn_limit,
+                    output_mode: args.output_mode,
+                }))
+            }
+            SessionCommand::Fork(args) => Ok(CliCommand::SessionFork(SessionForkArgs {
+                source_session_id: args.session_id.parse().map_err(|error| {
+                    CliUsageError::Message(format!("invalid session id: {error}"))
+                })?,
+                title: args.title,
+                history_offset: args.history_offset,
+                history_limit: args.history_limit,
+                turn_offset: args.turn_offset,
+                turn_limit: args.turn_limit,
+                output_mode: args.output_mode,
+            })),
+            SessionCommand::Turns(args) => Ok(CliCommand::SessionTurns(SessionTurnsArgs {
+                session_id: args.session_id.parse().map_err(|error| {
+                    CliUsageError::Message(format!("invalid session id: {error}"))
+                })?,
+                offset: args.offset,
+                limit: args.limit,
+                output_mode: args.output_mode,
+            })),
+            SessionCommand::Steer(args) => {
+                let prompt = args.prompt.join(" ");
+                if prompt.trim().is_empty() {
+                    return Err(CliUsageError::Message(
+                        "session steer prompt must not be empty".to_string(),
+                    ));
+                }
+                Ok(CliCommand::SessionSteer(SessionSteerArgs {
+                    session_id: args.session_id.parse().map_err(|error| {
+                        CliUsageError::Message(format!("invalid session id: {error}"))
+                    })?,
+                    prompt,
+                    directory: args.directory,
+                    image_paths: args.image_paths,
+                    output_mode: args.output_mode,
+                }))
+            }
         },
         RootCommand::Replay { command } => match command {
             ReplayCommand::Run(args) => Ok(CliCommand::ReplayRun(ReplayRunArgs {
@@ -311,6 +566,14 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
             })),
         },
     }
+}
+
+fn parse_cli_access_mode(value: &str) -> Result<AccessMode, CliUsageError> {
+    AccessMode::parse(value).ok_or_else(|| {
+        CliUsageError::Message(format!(
+            "invalid access mode `{value}`; expected default, auto_review, or full_access"
+        ))
+    })
 }
 
 #[derive(Parser)]
@@ -415,8 +678,20 @@ struct DesktopCommand {
 
 #[derive(Subcommand)]
 enum SessionCommand {
+    Archive(SessionArchiveCommand),
     List(SessionListCommand),
+    Loaded(SessionLoadedCommand),
+    Search(SessionSearchCommand),
+    Settings(SessionSettingsCommand),
     Show(SessionShowCommand),
+    Unarchive(SessionArchiveCommand),
+    History(SessionItemsCommand),
+    Read(SessionReadCommand),
+    Rejoin(SessionReadCommand),
+    Rollback(SessionRollbackCommand),
+    Fork(SessionForkCommand),
+    Turns(SessionItemsCommand),
+    Steer(SessionSteerCommand),
 }
 
 #[derive(Subcommand)]
@@ -462,6 +737,59 @@ struct SessionListCommand {
 }
 
 #[derive(Args)]
+struct SessionLoadedCommand {
+    #[arg(long = "dir")]
+    directory: Option<Utf8PathBuf>,
+    #[arg(long = "limit", default_value_t = 20)]
+    limit: usize,
+    #[arg(long = "include-archived")]
+    include_archived: bool,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionSearchCommand {
+    #[arg()]
+    query: Vec<String>,
+    #[arg(long = "dir")]
+    directory: Option<Utf8PathBuf>,
+    #[arg(long = "limit", default_value_t = 20)]
+    limit: usize,
+    #[arg(long = "include-archived")]
+    include_archived: bool,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionArchiveCommand {
+    #[arg()]
+    session_id: String,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionSettingsCommand {
+    #[arg()]
+    session_id: String,
+    #[arg(long = "cwd")]
+    cwd: Option<Utf8PathBuf>,
+    #[arg(long = "model")]
+    model: Option<String>,
+    #[arg(long = "base-url")]
+    base_url: Option<String>,
+    #[arg(
+        long = "access-mode",
+        value_parser = ["default", "auto_review", "full_access"]
+    )]
+    access_mode: Option<String>,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
 struct SessionShowCommand {
     #[arg()]
     session_id: String,
@@ -469,6 +797,84 @@ struct SessionShowCommand {
     output_mode: OutputMode,
     #[arg(long = "show-reasoning")]
     show_reasoning: bool,
+}
+
+#[derive(Args)]
+struct SessionItemsCommand {
+    #[arg()]
+    session_id: String,
+    #[arg(long = "offset", default_value_t = 0)]
+    offset: usize,
+    #[arg(long = "limit", default_value_t = 100)]
+    limit: usize,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionReadCommand {
+    #[arg()]
+    session_id: String,
+    #[arg(long = "history-offset", default_value_t = 0)]
+    history_offset: usize,
+    #[arg(long = "history-limit", default_value_t = 50)]
+    history_limit: usize,
+    #[arg(long = "turn-offset", default_value_t = 0)]
+    turn_offset: usize,
+    #[arg(long = "turn-limit", default_value_t = 50)]
+    turn_limit: usize,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionRollbackCommand {
+    #[arg()]
+    session_id: String,
+    #[arg(long = "turns", default_value_t = 1)]
+    num_turns: usize,
+    #[arg(long = "history-offset", default_value_t = 0)]
+    history_offset: usize,
+    #[arg(long = "history-limit", default_value_t = 50)]
+    history_limit: usize,
+    #[arg(long = "turn-offset", default_value_t = 0)]
+    turn_offset: usize,
+    #[arg(long = "turn-limit", default_value_t = 50)]
+    turn_limit: usize,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionForkCommand {
+    #[arg()]
+    session_id: String,
+    #[arg(long = "title")]
+    title: Option<String>,
+    #[arg(long = "history-offset", default_value_t = 0)]
+    history_offset: usize,
+    #[arg(long = "history-limit", default_value_t = 50)]
+    history_limit: usize,
+    #[arg(long = "turn-offset", default_value_t = 0)]
+    turn_offset: usize,
+    #[arg(long = "turn-limit", default_value_t = 50)]
+    turn_limit: usize,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionSteerCommand {
+    #[arg()]
+    session_id: String,
+    #[arg()]
+    prompt: Vec<String>,
+    #[arg(long = "dir")]
+    directory: Option<Utf8PathBuf>,
+    #[arg(long = "image", value_name = "PATH")]
+    image_paths: Vec<Utf8PathBuf>,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
 }
 
 #[derive(Args)]

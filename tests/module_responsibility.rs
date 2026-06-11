@@ -4251,6 +4251,45 @@ fn provider_replay_omits_stale_progress_projection_arguments() {
 }
 
 #[test]
+fn provider_replay_omits_inactive_target_content_shape_executable_pair() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = root.parent().expect("crate has repository parent");
+    let prompt = std::fs::read_to_string(root.join("src/agent/prompt.rs"))
+        .expect("prompt source is readable");
+    let preflight = std::fs::read_to_string(root.join("src/harness/preflight.rs"))
+        .expect("preflight source is readable");
+    let preflight_doc =
+        std::fs::read_to_string(repo_root.join("docs/testing/PreflightGateSuite.md"))
+            .expect("preflight doc is readable");
+    let runtime_contracts =
+        std::fs::read_to_string(repo_root.join("docs/design/runtime-contracts.md"))
+            .expect("runtime contracts doc is readable");
+    let detailed_design = std::fs::read_to_string(repo_root.join("docs/design/detailed-design.md"))
+        .expect("detailed design doc is readable");
+    let item_lifecycle =
+        std::fs::read_to_string(repo_root.join("docs/design/itemlifecycle-detail-design.md"))
+            .expect("item lifecycle design doc is readable");
+
+    assert!(
+        prompt.contains("inactive_target_content_shape_replay_is_target_exclusive_fixture_passes")
+            && prompt.contains("inactive_target_content_shape_executable_pair_omitted")
+            && prompt.contains("inactive_target_content_shape_pair_replay_note"),
+        "provider replay must expose inactive-target content-shape replay as target-exclusive non-executable evidence"
+    );
+    assert!(
+        preflight.contains("inactive_target_content_shape_replay_is_target_exclusive"),
+        "active preflight must execute the inactive-target content-shape replay target-exclusive fixture"
+    );
+    assert!(preflight_doc.contains("inactive_target_content_shape_replay_is_target_exclusive"));
+    assert!(runtime_contracts.contains("inactive_target_content_shape_replay_is_target_exclusive"));
+    assert!(detailed_design.contains("inactive_target_content_shape_replay_is_target_exclusive"));
+    assert!(docs_contains_or_item_lifecycle_current_authority(
+        &item_lifecycle,
+        "inactive_target_content_shape_replay_is_target_exclusive"
+    ));
+}
+
+#[test]
 fn invalid_tool_recovery_shell_success_does_not_synthesize_closeout() {
     assert!(
         moyai::agent::loop_impl::invalid_tool_recovery_shell_success_does_not_synthesize_closeout_fixture_passes()
@@ -4340,6 +4379,7 @@ fn session_markdown_module_exports_canonical_history_items() {
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: "local-model".to_string(),
         base_url: "http://localhost:1234".to_string(),
+        access_mode: moyai::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -4446,6 +4486,7 @@ fn session_markdown_cancelled_history_uses_terminal_outcome_authority() {
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: "local-model".to_string(),
         base_url: "http://localhost:1234".to_string(),
+        access_mode: moyai::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: Some(3),
@@ -4509,6 +4550,7 @@ fn session_materialized_view_excludes_internal_control_items_from_provider_visib
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: "local-model".to_string(),
         base_url: "http://localhost:1234".to_string(),
+        access_mode: moyai::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -4621,6 +4663,7 @@ fn provider_replay_uses_canonical_history_items_without_transcript_demotions() {
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: "local-model".to_string(),
         base_url: "http://localhost:1234".to_string(),
+        access_mode: moyai::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,

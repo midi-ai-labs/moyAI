@@ -7,6 +7,8 @@ pub struct DesktopViewState {
     pub window_opacity_percent: i32,
     pub artifact_selected_index: usize,
     pub local_search_text: String,
+    pub session_search_text: String,
+    pub session_search_include_archived: bool,
     pub async_operations: DesktopAsyncOperationRegistry,
 }
 
@@ -17,6 +19,8 @@ impl Default for DesktopViewState {
             window_opacity_percent: DEFAULT_WINDOW_OPACITY_PERCENT,
             artifact_selected_index: 0,
             local_search_text: String::new(),
+            session_search_text: String::new(),
+            session_search_include_archived: false,
             async_operations: DesktopAsyncOperationRegistry::default(),
         }
     }

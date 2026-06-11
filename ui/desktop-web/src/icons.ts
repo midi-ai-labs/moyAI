@@ -14,6 +14,10 @@ export function icon(name: string): string {
     sparkles: '<path d="M12 3l1.4 4.6L18 9l-4.6 1.4L12 15l-1.4-4.6L6 9l4.6-1.4z"/><path d="M19 14l.7 2.3L22 17l-2.3.7L19 20l-.7-2.3L16 17l2.3-.7z"/>',
     send: '<path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4z"/>',
     square: '<rect x="7" y="7" width="10" height="10" rx="1"/>',
+    archive: '<path d="M3 4h18v5H3z"/><path d="M5 9v11h14V9"/><path d="M10 13h4"/>',
+    undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/>',
+    "chevron-left": '<path d="m15 18-6-6 6-6"/>',
+    "chevron-right": '<path d="m9 18 6-6-6-6"/>',
     folder: '<path d="M3 6h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
     image: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m8 13 2.2-2.2a1 1 0 0 1 1.4 0L16 15"/><path d="m14 13 1-1a1 1 0 0 1 1.4 0L21 16"/><circle cx="8" cy="9" r="1"/>',
   };

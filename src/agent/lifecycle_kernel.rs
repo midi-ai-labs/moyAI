@@ -951,10 +951,6 @@ impl TurnLifecycleKernel {
         }
     }
 
-    pub(crate) fn docs_route_content_grounding_recovery_tool_visible(tool_name: &str) -> bool {
-        docs_route_content_grounding_recovery_tool_visible(tool_name)
-    }
-
     pub(crate) fn docs_patch_context_mismatch_grounding_tool_visible(tool_name: &str) -> bool {
         docs_patch_context_mismatch_grounding_tool_visible(tool_name)
     }
@@ -965,19 +961,101 @@ impl TurnLifecycleKernel {
         docs_route_content_grounding_after_progress_projection_tool_visible(tool_name)
     }
 
-    pub(crate) fn generated_test_source_reference_grounding_tool_visible(
-        tool_name: &str,
-        orientation_allowed: bool,
-    ) -> bool {
-        generated_test_source_reference_grounding_tool_visible(tool_name, orientation_allowed)
-    }
-
     pub(crate) fn authoring_target_grounding_recovery_tool_visible(tool_name: &str) -> bool {
         authoring_target_grounding_recovery_tool_visible(tool_name)
     }
 
-    pub(crate) fn existing_target_grounding_recovery_tool_visible(tool_name: &str) -> bool {
-        existing_target_grounding_recovery_tool_visible(tool_name)
+    pub(crate) fn apply_docs_route_supporting_context_budget_recovery_surface(
+        tools: &mut Vec<ToolSchema>,
+    ) {
+        tools.retain(|tool| {
+            Self::docs_route_supporting_context_budget_recovery_tool_visible(&tool.name)
+        });
+    }
+
+    pub(crate) fn apply_authoring_supporting_context_budget_recovery_surface(
+        tools: &mut Vec<ToolSchema>,
+        needs_grounding_read: bool,
+    ) {
+        tools.retain(|tool| {
+            Self::authoring_supporting_context_budget_recovery_tool_visible(
+                &tool.name,
+                needs_grounding_read,
+            )
+        });
+    }
+
+    pub(crate) fn apply_repair_supporting_context_budget_recovery_surface(
+        tools: &mut Vec<ToolSchema>,
+    ) {
+        tools.retain(|tool| {
+            Self::repair_supporting_context_budget_recovery_tool_visible(&tool.name)
+        });
+    }
+
+    pub(crate) fn apply_singleton_missing_authoring_target_create_action_surface(
+        tools: &mut Vec<ToolSchema>,
+        stable_tools: &[ToolSchema],
+    ) {
+        augment_tools_from_stable_surface(
+            tools,
+            stable_tools,
+            Self::singleton_missing_authoring_target_create_action_tool_visible,
+        );
+        tools.retain(|tool| {
+            Self::singleton_missing_authoring_target_create_action_tool_visible(&tool.name)
+        });
+    }
+
+    pub(crate) fn apply_existing_target_grounding_recovery_surface(
+        tools: &mut Vec<ToolSchema>,
+        stable_tools: &[ToolSchema],
+    ) {
+        augment_tools_from_stable_surface(
+            tools,
+            stable_tools,
+            existing_target_grounding_recovery_tool_visible,
+        );
+        tools.retain(|tool| existing_target_grounding_recovery_tool_visible(&tool.name));
+    }
+
+    pub(crate) fn apply_docs_patch_context_mismatch_grounding_surface(
+        tools: &mut Vec<ToolSchema>,
+        stable_tools: &[ToolSchema],
+    ) {
+        augment_tools_from_stable_surface(
+            tools,
+            stable_tools,
+            docs_patch_context_mismatch_grounding_tool_visible,
+        );
+        tools.retain(|tool| docs_patch_context_mismatch_grounding_tool_visible(&tool.name));
+    }
+
+    pub(crate) fn apply_verification_repair_target_grounding_surface(
+        tools: &mut Vec<ToolSchema>,
+        stable_tools: &[ToolSchema],
+    ) {
+        augment_tools_from_stable_surface(
+            tools,
+            stable_tools,
+            verification_repair_target_grounding_surface_tool_visible,
+        );
+        tools.retain(|tool| verification_repair_target_grounding_surface_tool_visible(&tool.name));
+    }
+
+    pub(crate) fn apply_provider_noncompliance_edit_recovery_surface_if_visible(
+        tools: &mut Vec<ToolSchema>,
+    ) -> bool {
+        if tools
+            .iter()
+            .any(|tool| Self::provider_noncompliance_edit_recovery_tool_visible(&tool.name))
+        {
+            tools
+                .retain(|tool| Self::provider_noncompliance_edit_recovery_tool_visible(&tool.name));
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn singleton_missing_authoring_target_create_action_tool_visible(

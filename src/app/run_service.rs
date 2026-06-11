@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 
 use base64::Engine as _;
@@ -5,7 +6,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::agent::{AgentLoop, AgentRunRequest, RuntimeInputView};
 use crate::app::session_title::{generate_session_title, is_placeholder_session_title};
-use crate::app::{AppCommand, ReviewRequest, RunRequest, SessionListRequest, SessionShowRequest};
+use crate::app::{
+    AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionForkRequest,
+    SessionHistoryRequest, SessionListRequest, SessionLoadedRequest, SessionReadRequest,
+    SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
+    SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest, SessionTurnsRequest,
+};
 use crate::cli::{ConfirmationPrompt, EventRenderer};
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::error::{AppRunError, RuntimeError};
@@ -15,14 +21,16 @@ use crate::llm::{
     check_model_availability,
 };
 use crate::protocol::{
-    ActiveWorkContractProjection, ModelCapabilities as ProtocolModelCapabilities, OutputContract,
-    ProjectionId, ProtocolEventStore, ProtocolRecordingSink, SandboxProfile, ThreadOp, ToolChoice,
+    ActiveWorkContractProjection, AdditionalContextEntry, AdditionalContextKind,
+    ModelCapabilities as ProtocolModelCapabilities, OutputContract, ProjectionId,
+    ProtocolEventStore, ProtocolRecordingSink, SandboxProfile, SteerTurn, ThreadOp, ToolChoice,
     TurnContext, UserInputItem, UserTurn,
 };
 use crate::runtime::RunEventSink;
 use crate::session::{
-    DispatchTransformKind, ImagePart, PromptDispatchPart, RunSummary, SessionRepository,
-    SessionSelector, SessionStartRequest, SessionStateSnapshot, SessionStatus, TaskRoute,
+    DispatchTransformKind, ImagePart, PromptDispatchPart, RunSummary, SessionRecord,
+    SessionRepository, SessionSelector, SessionSettingsPatch, SessionStartRequest,
+    SessionStateSnapshot, SessionStatus, TaskRoute,
 };
 use crate::storage::StoreBundle;
 use crate::workspace::{branch_review_scope, uncommitted_review_scope};
@@ -64,8 +72,38 @@ impl RunService {
     ) -> Result<RunSummary, AppRunError> {
         match command {
             AppCommand::Run(request) => self.execute_run(request, renderer, prompt).await,
+            AppCommand::SessionArchive(request) => {
+                self.execute_session_archive(request, renderer).await
+            }
             AppCommand::SessionList(request) => self.execute_session_list(request, renderer).await,
+            AppCommand::SessionLoaded(request) => {
+                self.execute_session_loaded(request, renderer).await
+            }
+            AppCommand::SessionSearch(request) => {
+                self.execute_session_search(request, renderer).await
+            }
+            AppCommand::SessionSettingsUpdate(request) => {
+                self.execute_session_settings_update(request, renderer)
+                    .await
+            }
             AppCommand::SessionShow(request) => self.execute_session_show(request, renderer).await,
+            AppCommand::SessionHistory(request) => {
+                self.execute_session_history(request, renderer).await
+            }
+            AppCommand::SessionRead(request) => self.execute_session_read(request, renderer).await,
+            AppCommand::SessionRejoin(request) => {
+                self.execute_session_rejoin(request, renderer).await
+            }
+            AppCommand::SessionRollback(request) => {
+                self.execute_session_rollback(request, renderer).await
+            }
+            AppCommand::SessionFork(request) => self.execute_session_fork(request, renderer).await,
+            AppCommand::SessionTurns(request) => {
+                self.execute_session_turns(request, renderer).await
+            }
+            AppCommand::SessionSteer(request) => {
+                self.execute_session_steer(request, renderer).await
+            }
         }
     }
 
@@ -112,6 +150,11 @@ impl RunService {
                 ));
             }
         };
+        if let Some(session_settings) = self.session_settings_for_selector(&selector).await? {
+            effective_config.model.model = session_settings.model.clone();
+            effective_config.model.base_url = session_settings.base_url.clone();
+            effective_config.permissions.access_mode = session_settings.access_mode;
+        }
         let should_generate_session_title = matches!(&selector, SessionSelector::New)
             && request
                 .title
@@ -129,6 +172,29 @@ impl RunService {
                 effective_config.model.model
             )));
         }
+        let prepared = prepare_run_turn(&self.workspace, &request)?;
+        if let Some(session_id) = request.session_id
+            && request.review_request.is_none()
+            && !prepared.prompt.trim().is_empty()
+        {
+            let existing = self.store.session_repo().get_session(session_id).await?;
+            if existing.status == SessionStatus::Running {
+                return self
+                    .store_active_turn_steer_from_parts(
+                        SessionSteerRequest {
+                            session_id,
+                            prompt: prepared.prompt.clone(),
+                            cwd: request.cwd.clone(),
+                            image_paths: request.image_paths.clone(),
+                            client_user_message_id: None,
+                        },
+                        image_parts,
+                        Some("run --session against active session".to_string()),
+                        renderer,
+                    )
+                    .await;
+            }
+        }
 
         let session_context = self
             .session_service
@@ -139,11 +205,11 @@ impl RunService {
                     cwd: request.cwd.clone(),
                     model: effective_config.model.model.clone(),
                     base_url: effective_config.model.base_url.clone(),
+                    access_mode: effective_config.permissions.access_mode,
                 },
                 self.workspace.clone(),
             )
             .await?;
-        let prepared = prepare_run_turn(&self.workspace, &request)?;
         let mut renderer_sink = RendererSink {
             renderer,
             show_reasoning: request.show_reasoning,
@@ -319,6 +385,23 @@ impl RunService {
         Ok(summary)
     }
 
+    async fn session_settings_for_selector(
+        &self,
+        selector: &SessionSelector,
+    ) -> Result<Option<SessionRecord>, AppRunError> {
+        match selector {
+            SessionSelector::New => Ok(None),
+            SessionSelector::ById(session_id) => Ok(Some(
+                self.store.session_repo().get_session(*session_id).await?,
+            )),
+            SessionSelector::Latest => Ok(self
+                .store
+                .session_repo()
+                .latest_session(self.workspace.project_id)
+                .await?),
+        }
+    }
+
     async fn execute_session_list(
         &self,
         request: SessionListRequest,
@@ -332,6 +415,103 @@ impl RunService {
         renderer.render_session_list(&sessions)?;
         Ok(RunSummary {
             session_id: crate::session::SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_loaded(
+        &self,
+        request: SessionLoadedRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let loaded = self
+            .session_service
+            .loaded_sessions(request.project_id, request.limit, request.include_archived)
+            .await?;
+        renderer.render_loaded_sessions(&loaded)?;
+        Ok(RunSummary {
+            session_id: crate::session::SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_search(
+        &self,
+        request: SessionSearchRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let sessions = self
+            .session_service
+            .search_sessions(
+                request.project_id,
+                &request.query,
+                request.limit,
+                request.include_archived,
+            )
+            .await?;
+        renderer.render_session_list(&sessions)?;
+        Ok(RunSummary {
+            session_id: crate::session::SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_archive(
+        &self,
+        request: SessionArchiveRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let session = self
+            .session_service
+            .set_session_archived(request.session_id, request.archived)
+            .await?;
+        renderer.render_session_list(std::slice::from_ref(&session))?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_settings_update(
+        &self,
+        request: SessionSettingsUpdateRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let update = self
+            .session_service
+            .update_session_settings(
+                request.session_id,
+                SessionSettingsPatch {
+                    cwd: request.cwd,
+                    model: request.model,
+                    base_url: request.base_url,
+                    access_mode: request.access_mode,
+                },
+            )
+            .await?;
+        renderer.render_session_list(std::slice::from_ref(&update.session))?;
+        Ok(RunSummary {
+            session_id: request.session_id,
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
@@ -365,6 +545,243 @@ impl RunService {
             session_id: request.session_id,
             assistant_message_id: None,
             status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_history(
+        &self,
+        request: SessionHistoryRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let page = self
+            .session_service
+            .canonical_history_page(request.session_id, request.offset, request.limit)
+            .await?;
+        renderer.render_session_history_page(&page)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_turns(
+        &self,
+        request: SessionTurnsRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let page = self
+            .session_service
+            .canonical_turn_page(request.session_id, request.offset, request.limit)
+            .await?;
+        renderer.render_session_turn_page(&page)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_read(
+        &self,
+        request: SessionReadRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let read = self
+            .session_service
+            .canonical_session_read(
+                request.session_id,
+                request.history_offset,
+                request.history_limit,
+                request.turn_offset,
+                request.turn_limit,
+            )
+            .await?;
+        renderer.render_session_read(&read)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_rejoin(
+        &self,
+        request: SessionRejoinRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let rejoin = self
+            .session_service
+            .rejoin_running_session(
+                request.session_id,
+                request.history_offset,
+                request.history_limit,
+                request.turn_offset,
+                request.turn_limit,
+            )
+            .await?;
+        renderer.render_session_rejoin(&rejoin)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Running,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_rollback(
+        &self,
+        request: SessionRollbackRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        self.session_service
+            .rollback_session(request.session_id, request.num_turns)
+            .await?;
+        let read = self
+            .session_service
+            .canonical_session_read(
+                request.session_id,
+                request.history_offset,
+                request.history_limit,
+                request.turn_offset,
+                request.turn_limit,
+            )
+            .await?;
+        renderer.render_session_read(&read)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_fork(
+        &self,
+        request: SessionForkRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let fork = self
+            .session_service
+            .fork_session(request.source_session_id, request.title)
+            .await?;
+        let read = self
+            .session_service
+            .canonical_session_read(
+                fork.forked_session.id,
+                request.history_offset,
+                request.history_limit,
+                request.turn_offset,
+                request.turn_limit,
+            )
+            .await?;
+        renderer.render_session_read(&read)?;
+        Ok(RunSummary {
+            session_id: fork.forked_session.id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_steer(
+        &self,
+        request: SessionSteerRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        if request.prompt.trim().is_empty() {
+            return Err(AppRunError::Message(
+                "active-turn steer prompt must not be empty".to_string(),
+            ));
+        }
+        let image_parts = load_image_attachments(&request.cwd, &request.image_paths)?;
+        self.store_active_turn_steer_from_parts(request, image_parts, None, renderer)
+            .await
+    }
+
+    async fn store_active_turn_steer_from_parts(
+        &self,
+        request: SessionSteerRequest,
+        image_parts: Vec<ImagePart>,
+        source_label: Option<String>,
+        _renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let (active_turn_id, _next_sequence_no) = self
+            .store
+            .protocol_event_store()
+            .latest_turn_position_for_session(request.session_id)?
+            .ok_or_else(|| {
+                AppRunError::Message(format!(
+                    "session {} has no active turn to steer",
+                    request.session_id
+                ))
+            })?;
+        let mut items = Vec::new();
+        if !request.prompt.trim().is_empty() {
+            items.push(UserInputItem::Text {
+                text: request.prompt.clone(),
+            });
+        }
+        items.extend(
+            image_parts
+                .into_iter()
+                .map(|image| UserInputItem::Image { image }),
+        );
+        let mut additional_context = BTreeMap::new();
+        additional_context.insert(
+            "moyai.surface".to_string(),
+            AdditionalContextEntry {
+                value: source_label.unwrap_or_else(|| "session steer".to_string()),
+                kind: AdditionalContextKind::Application,
+            },
+        );
+        additional_context.insert(
+            "moyai.cwd".to_string(),
+            AdditionalContextEntry {
+                value: request.cwd.to_string(),
+                kind: AdditionalContextKind::Application,
+            },
+        );
+        self.session_service
+            .store_active_turn_steer(
+                request.session_id,
+                &SteerTurn {
+                    expected_turn_id: active_turn_id,
+                    items,
+                    additional_context,
+                    client_user_message_id: request.client_user_message_id.clone(),
+                },
+            )
+            .await?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Running,
             finish_reason: None,
             tool_call_count: 0,
             failed_tool_count: 0,

@@ -32,6 +32,9 @@ const V19_SESSION_STATE_TOKEN_ACCOUNTING: &str =
     include_str!("../../migrations/V19__session_state_token_accounting.sql");
 const V20_PROTOCOL_ITEM_APPEND_ORDER: &str =
     include_str!("../../migrations/V20__protocol_item_append_order.sql");
+const V21_SESSIONS_ARCHIVE: &str = include_str!("../../migrations/V21__sessions_archive.sql");
+const V22_SESSIONS_ACCESS_MODE: &str =
+    include_str!("../../migrations/V22__sessions_access_mode.sql");
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
     connection.execute_batch(V1_INIT)?;
@@ -78,6 +81,12 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         connection.execute_batch(V19_SESSION_STATE_TOKEN_ACCOUNTING)?;
     }
     connection.execute_batch(V20_PROTOCOL_ITEM_APPEND_ORDER)?;
+    if needs_sessions_archive_migration(connection)? {
+        connection.execute_batch(V21_SESSIONS_ARCHIVE)?;
+    }
+    if needs_sessions_access_mode_migration(connection)? {
+        connection.execute_batch(V22_SESSIONS_ACCESS_MODE)?;
+    }
     Ok(())
 }
 
@@ -230,4 +239,20 @@ fn needs_session_state_token_accounting_migration(
     Ok(!columns
         .iter()
         .any(|column| column == "token_accounting_json"))
+}
+
+fn needs_sessions_archive_migration(connection: &Connection) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(!columns.iter().any(|column| column == "archived_at_ms"))
+}
+
+fn needs_sessions_access_mode_migration(connection: &Connection) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(!columns.iter().any(|column| column == "access_mode"))
 }

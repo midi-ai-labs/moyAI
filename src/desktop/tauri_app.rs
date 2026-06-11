@@ -71,7 +71,15 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             refresh_desktop,
             select_project,
             select_session,
+            rejoin_session,
+            load_previous_turn_page,
+            load_next_turn_page,
             select_chat_session,
+            set_session_search,
+            set_session_search_include_archived,
+            archive_session,
+            unarchive_session,
+            rollback_session,
             delete_project,
             delete_session,
             delete_chat_session,
@@ -348,12 +356,96 @@ async fn select_session(
 }
 
 #[tauri::command]
+async fn rejoin_session(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.select_session(index);
+        controller.rejoin_selected_session();
+    })
+    .await
+}
+
+#[tauri::command]
+async fn load_previous_turn_page(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, DesktopController::load_previous_turn_page).await
+}
+
+#[tauri::command]
+async fn load_next_turn_page(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, DesktopController::load_next_turn_page).await
+}
+
+#[tauri::command]
 async fn select_chat_session(
     controller: State<'_, SharedController>,
     index: usize,
 ) -> Result<DesktopWebState, String> {
     mutate_controller(controller, |controller| {
         controller.open_quick_chat_session(index);
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_session_search(
+    controller: State<'_, SharedController>,
+    text: String,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.set_session_search(text);
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_session_search_include_archived(
+    controller: State<'_, SharedController>,
+    include_archived: bool,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.set_session_search_include_archived(include_archived);
+    })
+    .await
+}
+
+#[tauri::command]
+async fn archive_session(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.select_session(index);
+        controller.archive_selected_session(true);
+    })
+    .await
+}
+
+#[tauri::command]
+async fn unarchive_session(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.select_session(index);
+        controller.archive_selected_session(false);
+    })
+    .await
+}
+
+#[tauri::command]
+async fn rollback_session(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.select_session(index);
+        controller.rollback_selected_session();
     })
     .await
 }

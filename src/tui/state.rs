@@ -4,8 +4,9 @@ use crate::protocol::{
     turn_items_in_projection_order,
 };
 use crate::session::{
-    DispatchTransformKind, PromptDispatchPart, RunEvent, RunSummary, SessionId, SessionRecord,
-    SessionStateSnapshot, SessionStatus, TodoItem, ToolCallId, ToolCallStatus,
+    DispatchTransformKind, LoadedSessionStatus, LoadedSessionSummary, PromptDispatchPart, RunEvent,
+    RunSummary, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus, TodoItem,
+    ToolCallId, ToolCallStatus,
 };
 use crate::tool::{PermissionRequest, ToolName};
 
@@ -148,7 +149,10 @@ pub struct AppState {
     pub current_session_id: Option<SessionId>,
     pub current_session_title: String,
     pub sessions: Vec<SessionRecord>,
+    pub loaded_sessions: Vec<LoadedSessionSummary>,
     pub selected_session_index: usize,
+    pub session_search_text: String,
+    pub session_search_include_archived: bool,
     pub transcript_entries: Vec<TranscriptEntry>,
     pub tool_statuses: Vec<ToolStatusView>,
     pub sidebar_todos: Vec<TodoItem>,
@@ -171,7 +175,10 @@ impl Default for AppState {
             current_session_id: None,
             current_session_title: "New Session".to_string(),
             sessions: Vec::new(),
+            loaded_sessions: Vec::new(),
             selected_session_index: 0,
+            session_search_text: String::new(),
+            session_search_include_archived: false,
             transcript_entries: Vec::new(),
             tool_statuses: Vec::new(),
             sidebar_todos: Vec::new(),
@@ -220,7 +227,25 @@ impl AppState {
     }
 
     pub fn set_sessions(&mut self, sessions: Vec<SessionRecord>) {
+        self.loaded_sessions = sessions
+            .iter()
+            .cloned()
+            .map(loaded_summary_from_session)
+            .collect();
         self.sessions = sessions;
+        self.normalize_selected_session_index();
+    }
+
+    pub fn set_loaded_sessions(&mut self, summaries: Vec<LoadedSessionSummary>) {
+        self.sessions = summaries
+            .iter()
+            .map(|summary| summary.session.clone())
+            .collect();
+        self.loaded_sessions = summaries;
+        self.normalize_selected_session_index();
+    }
+
+    fn normalize_selected_session_index(&mut self) {
         if self.sessions.is_empty() {
             self.selected_session_index = 0;
         } else if self.selected_session_index >= self.sessions.len() {
@@ -230,6 +255,33 @@ impl AppState {
 
     pub fn selected_session(&self) -> Option<&SessionRecord> {
         self.sessions.get(self.selected_session_index)
+    }
+
+    pub fn selected_loaded_session(&self) -> Option<&LoadedSessionSummary> {
+        self.loaded_sessions.get(self.selected_session_index)
+    }
+
+    pub fn loaded_session_at(&self, index: usize) -> Option<&LoadedSessionSummary> {
+        self.loaded_sessions.get(index)
+    }
+
+    pub fn push_session_search_char(&mut self, value: char) {
+        if !value.is_control() {
+            self.session_search_text.push(value);
+        }
+    }
+
+    pub fn pop_session_search_char(&mut self) {
+        self.session_search_text.pop();
+    }
+
+    pub fn clear_session_search(&mut self) {
+        self.session_search_text.clear();
+        self.session_search_include_archived = false;
+    }
+
+    pub fn toggle_session_search_include_archived(&mut self) {
+        self.session_search_include_archived = !self.session_search_include_archived;
     }
 
     pub fn set_sidebar_todos(&mut self, todos: Vec<TodoItem>) {
@@ -665,6 +717,17 @@ impl AppState {
     }
 }
 
+fn loaded_summary_from_session(session: SessionRecord) -> LoadedSessionSummary {
+    LoadedSessionSummary {
+        session,
+        loaded_status: LoadedSessionStatus::NotLoaded,
+        active_turn_id: None,
+        active_turn_sequence_no: None,
+        pending_permission_requests: 0,
+        pending_user_input_requests: 0,
+    }
+}
+
 fn update_tool_status(
     tool_statuses: &mut Vec<ToolStatusView>,
     tool_call_id: ToolCallId,
@@ -825,6 +888,13 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
             TurnItemPayload::UserMessage { text } => Some(TranscriptEntry {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
+                body: text.clone(),
+                message_id: None,
+                tool_call_id: None,
+            }),
+            TurnItemPayload::SteerMessage { text } => Some(TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User Steer".to_string(),
                 body: text.clone(),
                 message_id: None,
                 tool_call_id: None,
@@ -1118,6 +1188,24 @@ pub fn tui_primary_transcript_omits_internal_projection_items_fixture_passes() -
         && !rendered.contains("guard cache")
 }
 
+pub fn tui_session_search_state_is_explicit_discovery_metadata_fixture_passes() -> bool {
+    let mut state = AppState::default();
+    state.push_session_search_char('n');
+    state.push_session_search_char('e');
+    state.push_session_search_char('e');
+    state.push_session_search_char('d');
+    if state.session_search_text != "need" || state.session_search_include_archived {
+        return false;
+    }
+    state.toggle_session_search_include_archived();
+    state.pop_session_search_char();
+    if state.session_search_text != "nee" || !state.session_search_include_archived {
+        return false;
+    }
+    state.clear_session_search();
+    state.session_search_text.is_empty() && !state.session_search_include_archived
+}
+
 fn session_tool_status_from_lifecycle(status: ToolLifecycleStatus) -> ToolCallStatus {
     match status {
         ToolLifecycleStatus::Pending
@@ -1147,5 +1235,10 @@ mod tests {
     #[test]
     fn tui_primary_transcript_omits_internal_projection_items() {
         assert!(super::tui_primary_transcript_omits_internal_projection_items_fixture_passes());
+    }
+
+    #[test]
+    fn tui_session_search_state_is_explicit_discovery_metadata() {
+        assert!(super::tui_session_search_state_is_explicit_discovery_metadata_fixture_passes());
     }
 }

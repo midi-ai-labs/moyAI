@@ -1,9 +1,9 @@
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
-use crate::config::ShellFamily;
+use crate::config::{AccessMode, ShellFamily};
 use crate::error::ErrorCategory;
-use crate::protocol::{FileChangeEvidence, ToolProgressEffect};
+use crate::protocol::{FileChangeEvidence, HistoryItem, ToolProgressEffect, TurnId, TurnItem};
 use crate::tool::ToolName;
 
 use super::{
@@ -133,9 +133,52 @@ pub struct SessionRecord {
     pub cwd: Utf8PathBuf,
     pub model: String,
     pub base_url: String,
+    pub access_mode: AccessMode,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub completed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<Utf8PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_mode: Option<AccessMode>,
+}
+
+impl SessionSettingsPatch {
+    pub fn is_empty(&self) -> bool {
+        self.cwd.is_none()
+            && self.model.is_none()
+            && self.base_url.is_none()
+            && self.access_mode.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSettingsUpdate {
+    pub session: SessionRecord,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRollbackResult {
+    pub session: SessionRecord,
+    pub dropped_turn_ids: Vec<TurnId>,
+    pub remaining_history_items: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionForkResult {
+    pub source_session: SessionRecord,
+    pub forked_session: SessionRecord,
+    pub copied_history_items: usize,
+    pub copied_turn_items: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -757,6 +800,95 @@ fn is_zero_u64(value: &u64) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalHistoryPage {
+    pub session: SessionRecord,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub has_more: bool,
+    pub items: Vec<HistoryItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalTurnPage {
+    pub session: SessionRecord,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub has_more: bool,
+    pub items: Vec<TurnItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalRuntimeEventPage {
+    pub session: SessionRecord,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub has_more: bool,
+    pub items: Vec<crate::protocol::RuntimeEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalSessionRead {
+    pub session: SessionRecord,
+    pub state: SessionStateSnapshot,
+    pub history: CanonicalHistoryPage,
+    pub turns: CanonicalTurnPage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_sequence_no: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadedSessionStatus {
+    NotLoaded,
+    Idle,
+    Active,
+    SystemError,
+}
+
+impl LoadedSessionStatus {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::NotLoaded => "not_loaded",
+            Self::Idle => "idle",
+            Self::Active => "active",
+            Self::SystemError => "system_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadedSessionSummary {
+    pub session: SessionRecord,
+    pub loaded_status: LoadedSessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_sequence_no: Option<i64>,
+    #[serde(default)]
+    pub pending_permission_requests: u32,
+    #[serde(default)]
+    pub pending_user_input_requests: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadedSessionList {
+    pub project_id: ProjectId,
+    pub include_archived: bool,
+    pub sessions: Vec<LoadedSessionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunningSessionRejoin {
+    pub summary: LoadedSessionSummary,
+    pub read: CanonicalSessionRead,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessagePart {
     Text(TextPart),
     Image(ImagePart),
@@ -776,6 +908,7 @@ pub struct NewSession {
     pub cwd: Utf8PathBuf,
     pub model: String,
     pub base_url: String,
+    pub access_mode: AccessMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -827,6 +960,7 @@ pub struct SessionStartRequest {
     pub cwd: Utf8PathBuf,
     pub model: String,
     pub base_url: String,
+    pub access_mode: AccessMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -979,4 +1113,37 @@ pub enum RunEvent {
         session_id: SessionId,
         message: String,
     },
+}
+
+impl RunEvent {
+    pub fn session_id(&self) -> Option<SessionId> {
+        match self {
+            Self::SessionStarted { session_id, .. }
+            | Self::SessionTitleUpdated { session_id, .. }
+            | Self::UserTurnStored { session_id, .. }
+            | Self::ControlEnvelopePrepared { session_id, .. }
+            | Self::ModelRequestPrepared { session_id, .. }
+            | Self::RetryScheduled { session_id, .. }
+            | Self::RecoverableRuntimeFeedback { session_id, .. }
+            | Self::StateUpdated { session_id, .. }
+            | Self::LifecycleGuardUpdated { session_id, .. }
+            | Self::SessionCompleted { session_id, .. }
+            | Self::SessionAwaitingUser { session_id, .. }
+            | Self::SessionInterrupted { session_id, .. }
+            | Self::SessionFailed { session_id, .. } => Some(*session_id),
+            Self::UserMessageStored { .. }
+            | Self::AssistantStarted { .. }
+            | Self::TextDelta { .. }
+            | Self::ReasoningDelta { .. }
+            | Self::ToolCallPending { .. }
+            | Self::ToolCallCompleted { .. }
+            | Self::ToolCallFailed { .. }
+            | Self::ToolProposalRejected { .. }
+            | Self::CandidateRepairEditRecorded { .. }
+            | Self::FileChangesRecorded { .. }
+            | Self::CompactionCompleted { .. }
+            | Self::PermissionRequested { .. }
+            | Self::PermissionResolved { .. } => None,
+        }
+    }
 }

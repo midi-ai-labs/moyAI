@@ -17,22 +17,22 @@ use ratatui::{Frame, Terminal};
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest};
+use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionSteerRequest};
 use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode, TuiArgs};
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 use crate::runtime::{SystemClock, build_cancel_token};
 use crate::session::{
-    EditorContext, PromptDispatchPart, RunEvent, RunSummary, SessionId, SessionRecord,
-    SessionStateSnapshot, TodoItem, TodoStatus,
+    EditorContext, LoadedSessionStatus, LoadedSessionSummary, PromptDispatchPart, RunEvent,
+    RunSummary, SessionId, SessionRecord, SessionStateSnapshot, TodoItem, TodoStatus,
 };
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
 
 use super::config_editor::{ConfigEditorState, ConfigSaveScope};
 use super::prompt_enhance::enhance_prompt;
-use super::query::{latest_session, recent_sessions, session_view};
+use super::query::{latest_session, recent_sessions, search_sessions, session_view};
 use super::reducer::reduce_run_event;
 use super::state::{
     AppState, Modal, PromptReviewPhase, Route, RunStatus, TranscriptEntry, TranscriptKind,
@@ -84,6 +84,10 @@ struct TuiController {
     preview_entries: Vec<TranscriptEntry>,
     preview_todos: Vec<TodoItem>,
     preview_state: Option<SessionStateSnapshot>,
+    preview_turn_offset: usize,
+    preview_turn_limit: usize,
+    preview_turn_total: usize,
+    preview_turn_has_more: bool,
     next_enhance_request_id: u64,
     should_quit: bool,
     started_at: Instant,
@@ -110,11 +114,16 @@ impl TuiController {
             preview_entries: Vec::new(),
             preview_todos: Vec::new(),
             preview_state: None,
+            preview_turn_offset: 0,
+            preview_turn_limit: 80,
+            preview_turn_total: 0,
+            preview_turn_has_more: false,
             next_enhance_request_id: 1,
             should_quit: false,
             started_at: Instant::now(),
         };
-        controller.state.set_sessions(sessions);
+        let summaries = controller.loaded_summaries_for(sessions).await?;
+        controller.state.set_loaded_sessions(summaries);
         controller.refresh_preview().await?;
 
         match (args.session_id, args.continue_last) {
@@ -200,6 +209,7 @@ impl TuiController {
                 if self.state.route == Route::History && !self.state.sessions.is_empty() {
                     self.state.selected_session_index =
                         self.state.selected_session_index.saturating_sub(1);
+                    self.reset_preview_turn_page();
                     self.refresh_preview().await?;
                 }
             }
@@ -208,8 +218,58 @@ impl TuiController {
                     && self.state.selected_session_index + 1 < self.state.sessions.len()
                 {
                     self.state.selected_session_index += 1;
+                    self.reset_preview_turn_page();
                     self.refresh_preview().await?;
                 }
+            }
+            KeyCode::PageUp if self.state.route == Route::History => {
+                self.previous_preview_turn_page().await?;
+            }
+            KeyCode::PageDown if self.state.route == Route::History => {
+                self.next_preview_turn_page().await?;
+            }
+            KeyCode::Backspace if self.state.route == Route::History => {
+                self.state.pop_session_search_char();
+                self.refresh_sessions().await?;
+            }
+            KeyCode::Esc if self.state.route == Route::History => {
+                self.state.clear_session_search();
+                self.refresh_sessions().await?;
+            }
+            KeyCode::Char('i')
+                if self.state.route == Route::History
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.state.toggle_session_search_include_archived();
+                self.refresh_sessions().await?;
+            }
+            KeyCode::Char('a')
+                if self.state.route == Route::History
+                    && self.state.run_status != RunStatus::Running
+                    && self.state.run_status != RunStatus::Confirming =>
+            {
+                self.archive_selected_session(true).await?;
+            }
+            KeyCode::Char('u')
+                if self.state.route == Route::History
+                    && self.state.run_status != RunStatus::Running
+                    && self.state.run_status != RunStatus::Confirming =>
+            {
+                self.archive_selected_session(false).await?;
+            }
+            KeyCode::Char('r')
+                if self.state.route == Route::History
+                    && self.state.run_status != RunStatus::Running
+                    && self.state.run_status != RunStatus::Confirming =>
+            {
+                self.rejoin_selected_session().await?;
+            }
+            KeyCode::Char('z')
+                if self.state.route == Route::History
+                    && self.state.run_status != RunStatus::Running
+                    && self.state.run_status != RunStatus::Confirming =>
+            {
+                self.rollback_selected_session().await?;
             }
             KeyCode::Enter
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -217,9 +277,7 @@ impl TuiController {
                     && self.state.run_status != RunStatus::Confirming =>
             {
                 if self.state.route == Route::History {
-                    if let Some(session) = self.state.selected_session() {
-                        self.open_session(session.id).await?;
-                    }
+                    self.open_or_rejoin_selected_history_session().await?;
                 } else {
                     self.submit_composer_or_open_session().await?;
                 }
@@ -229,6 +287,10 @@ impl TuiController {
                 self.open_path_in_file_manager(&root);
             }
             KeyCode::Enter => {}
+            KeyCode::Char(value) if self.state.route == Route::History => {
+                self.state.push_session_search_char(value);
+                self.refresh_sessions().await?;
+            }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.state.route != Route::History {
                     self.composer.insert_newline();
@@ -530,6 +592,15 @@ impl TuiController {
         prompt_dispatch: PromptDispatchPart,
         review_request: Option<ReviewRequest>,
     ) -> Result<(), AppRunError> {
+        if review_request.is_none()
+            && !prompt.trim().is_empty()
+            && self.state.current_session_id.is_some()
+            && matches!(self.state.run_status, RunStatus::Running)
+        {
+            self.launch_active_turn_steer(prompt, prompt_dispatch)
+                .await?;
+            return Ok(());
+        }
         let request = RunRequest {
             prompt: prompt.clone(),
             session_id: self.state.current_session_id,
@@ -575,6 +646,60 @@ impl TuiController {
         Ok(())
     }
 
+    async fn launch_active_turn_steer(
+        &mut self,
+        prompt: String,
+        prompt_dispatch: PromptDispatchPart,
+    ) -> Result<(), AppRunError> {
+        let Some(session_id) = self.state.current_session_id else {
+            self.state.status_message =
+                Some("running session is not available for steer".to_string());
+            return Ok(());
+        };
+        self.state.push_local_prompt_dispatch(&prompt_dispatch);
+        self.composer = build_composer();
+        self.review_editor = build_composer();
+        self.state.status_message = Some("stored steer input for the active turn".to_string());
+        let run_service = self.app.run_service.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        let cwd = self.app.workspace.cwd.clone();
+        std::thread::spawn(move || {
+            let mut renderer = TuiRenderer {
+                tx: runtime_tx.clone(),
+            };
+            let mut prompt_ui = TuiConfirmationPrompt {
+                tx: runtime_tx.clone(),
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tui steer runtime");
+            let result = runtime
+                .block_on(async move {
+                    run_service
+                        .execute(
+                            AppCommand::SessionSteer(SessionSteerRequest {
+                                session_id,
+                                prompt,
+                                cwd,
+                                image_paths: Vec::new(),
+                                client_user_message_id: Some(format!(
+                                    "tui-steer-{}",
+                                    SystemClock::now_ms()
+                                )),
+                            }),
+                            &mut renderer,
+                            &mut prompt_ui,
+                        )
+                        .await
+                })
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let _ = runtime_tx.send(RuntimeMessage::SteerStored(result));
+        });
+        Ok(())
+    }
+
     fn current_editor_context(&self) -> EditorContext {
         let shell_family = self
             .effective_config
@@ -616,7 +741,22 @@ impl TuiController {
         while let Ok(message) = self.runtime_rx.try_recv() {
             match message {
                 RuntimeMessage::RunEvent(event) => {
+                    let live_refresh_session_id =
+                        event.session_id().or(self.state.current_session_id);
                     reduce_run_event(&mut self.state, &event);
+                    if live_event_requires_canonical_refresh(&event) {
+                        if let Some(session_id) = live_refresh_session_id {
+                            self.refresh_loaded_summary_for_session(session_id).await?;
+                            if self.state.route == Route::History
+                                && self
+                                    .state
+                                    .selected_session()
+                                    .is_some_and(|session| session.id == session_id)
+                            {
+                                self.refresh_preview().await?;
+                            }
+                        }
+                    }
                     if event_requires_sidebar_refresh(&event) {
                         self.refresh_current_session_todos().await?;
                     }
@@ -638,6 +778,16 @@ impl TuiController {
                     self.permission_response = Some(response);
                     self.state.set_permission(&request);
                 }
+                RuntimeMessage::SteerStored(result) => match result {
+                    Ok(()) => {
+                        self.state.status_message =
+                            Some("stored steer input for the active turn".to_string());
+                    }
+                    Err(message) => {
+                        self.state.status_message =
+                            Some(format!("failed to store steer input: {message}"));
+                    }
+                },
                 RuntimeMessage::EnhanceFinished { request_id, result } => match result {
                     Ok(draft) => {
                         if self.state.finish_prompt_enhance(request_id, draft.clone()) {
@@ -674,25 +824,217 @@ impl TuiController {
         Ok(())
     }
 
-    async fn refresh_sessions(&mut self) -> Result<(), AppRunError> {
-        self.state.set_sessions(
-            recent_sessions(&self.app.session_service, self.app.workspace.project_id, 20).await?,
+    async fn open_or_rejoin_selected_history_session(&mut self) -> Result<(), AppRunError> {
+        let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
+            self.state.status_message = Some("select a session first".to_string());
+            return Ok(());
+        };
+        if self
+            .state
+            .selected_loaded_session()
+            .is_some_and(|summary| summary.loaded_status == LoadedSessionStatus::Active)
+        {
+            return self.rejoin_session(session_id).await;
+        }
+        self.open_session(session_id).await
+    }
+
+    async fn rejoin_selected_session(&mut self) -> Result<(), AppRunError> {
+        let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
+            self.state.status_message = Some("select a session first".to_string());
+            return Ok(());
+        };
+        if !self
+            .state
+            .selected_loaded_session()
+            .is_some_and(|summary| summary.loaded_status == LoadedSessionStatus::Active)
+        {
+            self.state.status_message =
+                Some("selected session is not an active loaded session".to_string());
+            return Ok(());
+        }
+        self.rejoin_session(session_id).await
+    }
+
+    async fn rejoin_session(&mut self, session_id: SessionId) -> Result<(), AppRunError> {
+        let rejoin = self
+            .app
+            .session_service
+            .rejoin_running_session(session_id, 0, 200, 0, 500)
+            .await?;
+        let todos = self.app.session_service.list_todos(session_id).await?;
+        self.state.load_turn_items(
+            &rejoin.read.session,
+            &rejoin.read.turns.items,
+            rejoin.read.state,
+            todos,
         );
+        self.state.status_message = Some(format!("rejoined running session {session_id}"));
+        self.state.modal = Modal::None;
+        Ok(())
+    }
+
+    async fn archive_selected_session(&mut self, archived: bool) -> Result<(), AppRunError> {
+        let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
+            self.state.status_message = Some("select a session first".to_string());
+            return Ok(());
+        };
+        self.app
+            .session_service
+            .set_session_archived(session_id, archived)
+            .await?;
+        self.state.status_message = Some(if archived {
+            format!("archived session {session_id}")
+        } else {
+            format!("unarchived session {session_id}")
+        });
+        if self.state.current_session_id == Some(session_id) && archived {
+            self.state.current_session_id = None;
+            self.state.current_session_title = "New Session".to_string();
+            self.state.transcript_entries.clear();
+            self.state.tool_statuses.clear();
+            self.state.sidebar_todos.clear();
+            self.state.session_state = None;
+            self.state.run_status = RunStatus::Idle;
+        }
+        self.refresh_sessions().await
+    }
+
+    async fn rollback_selected_session(&mut self) -> Result<(), AppRunError> {
+        let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
+            self.state.status_message = Some("select a session first".to_string());
+            return Ok(());
+        };
+        if self
+            .state
+            .selected_loaded_session()
+            .is_some_and(|summary| summary.loaded_status == LoadedSessionStatus::Active)
+        {
+            self.state.status_message = Some("running sessions cannot be rolled back".to_string());
+            return Ok(());
+        }
+        let rolled_back = self
+            .app
+            .session_service
+            .rollback_session(session_id, 1)
+            .await?;
+        self.state.status_message = Some(format!(
+            "rolled back {} turn(s) in session {session_id}",
+            rolled_back.dropped_turn_ids.len()
+        ));
+        self.reset_preview_turn_page();
+        self.refresh_sessions().await?;
+        if self.state.current_session_id == Some(session_id) {
+            self.open_session(session_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_sessions(&mut self) -> Result<(), AppRunError> {
+        self.reset_preview_turn_page();
+        let sessions = search_sessions(
+            &self.app.session_service,
+            self.app.workspace.project_id,
+            &self.state.session_search_text,
+            self.state.session_search_include_archived,
+            50,
+        )
+        .await?;
+        let summaries = self.loaded_summaries_for(sessions).await?;
+        self.state.set_loaded_sessions(summaries);
         self.refresh_preview().await
+    }
+
+    async fn loaded_summaries_for(
+        &self,
+        sessions: Vec<SessionRecord>,
+    ) -> Result<Vec<LoadedSessionSummary>, AppRunError> {
+        let mut summaries = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            summaries.push(
+                self.app
+                    .session_service
+                    .loaded_session_summary(session)
+                    .await?,
+            );
+        }
+        Ok(summaries)
+    }
+
+    async fn refresh_loaded_summary_for_session(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<(), AppRunError> {
+        let Some(index) = self
+            .state
+            .loaded_sessions
+            .iter()
+            .position(|summary| summary.session.id == session_id)
+        else {
+            return Ok(());
+        };
+        let session = self.app.session_service.get_session(session_id).await?;
+        let summary = self
+            .app
+            .session_service
+            .loaded_session_summary(session)
+            .await?;
+        self.state.sessions[index] = summary.session.clone();
+        self.state.loaded_sessions[index] = summary;
+        Ok(())
     }
 
     async fn refresh_preview(&mut self) -> Result<(), AppRunError> {
         self.preview_entries.clear();
         self.preview_todos.clear();
         self.preview_state = None;
+        self.preview_turn_total = 0;
+        self.preview_turn_has_more = false;
         if let Some(session) = self.state.selected_session() {
-            let view = session_view(&self.app.session_service, session.id).await?;
-            self.preview_entries =
-                super::state::transcript_entries_from_turn_items(&view.turn_items);
-            self.preview_todos = view.todos;
-            self.preview_state = Some(view.state);
+            let page = self
+                .app
+                .session_service
+                .canonical_turn_page(
+                    session.id,
+                    self.preview_turn_offset,
+                    self.preview_turn_limit,
+                )
+                .await?;
+            self.preview_entries = super::state::transcript_entries_from_turn_items(&page.items);
+            self.preview_todos = self.app.session_service.list_todos(session.id).await?;
+            self.preview_state = Some(self.app.session_service.load_state(session.id).await?);
+            self.preview_turn_offset = page.offset;
+            self.preview_turn_limit = page.limit;
+            self.preview_turn_total = page.total;
+            self.preview_turn_has_more = page.has_more;
         }
         Ok(())
+    }
+
+    fn reset_preview_turn_page(&mut self) {
+        self.preview_turn_offset = 0;
+    }
+
+    async fn previous_preview_turn_page(&mut self) -> Result<(), AppRunError> {
+        if self.preview_turn_offset == 0 {
+            self.state.status_message = Some("earlier turn page is not available".to_string());
+            return Ok(());
+        }
+        self.preview_turn_offset = self
+            .preview_turn_offset
+            .saturating_sub(self.preview_turn_limit);
+        self.refresh_preview().await
+    }
+
+    async fn next_preview_turn_page(&mut self) -> Result<(), AppRunError> {
+        if !self.preview_turn_has_more {
+            self.state.status_message = Some("later turn page is not available".to_string());
+            return Ok(());
+        }
+        self.preview_turn_offset = self
+            .preview_turn_offset
+            .saturating_add(self.preview_turn_limit);
+        self.refresh_preview().await
     }
 
     async fn refresh_current_session_todos(&mut self) -> Result<(), AppRunError> {
@@ -856,14 +1198,19 @@ impl TuiController {
         if self.state.route == Route::History {
             frame.render_widget(
                 Paragraph::new(Text::from(vec![
-                    Line::from("History screen"),
-                    Line::from("Up/Down で session を選択し、Ctrl+Enter で transcript を開きます。"),
-                    Line::from("F1 で Home に戻ります。"),
+                    Line::from(format!(
+                        "History screen  search=`{}`  include_archived={}",
+                        self.state.session_search_text,
+                        self.state.session_search_include_archived
+                    )),
+                    Line::from("Up/Down で session を選択し、Ctrl+Enter で transcript / active rejoin を開きます。"),
+                    Line::from("PageUp/PageDown で canonical turn page を移動します。z で最新 turn を戻します。"),
+                    Line::from("文字入力で検索、Backspace で削除、Esc で検索解除、Ctrl+I で archived 検索を切り替えます。"),
                 ]))
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default().borders(Borders::ALL).title(
-                        "Ctrl+Enter=open  Up/Down=select  F1=home  F3=config  F4=workspace  F5=explorer  Ctrl+Q=quit",
+                        "Ctrl+Enter=open/rejoin  r=rejoin active  z=rollback latest turn  PageUp/PageDown=turn page  a=archive  u=unarchive  Ctrl+I=include_archived  F1=home  F3=config  F4=workspace  Ctrl+Q=quit",
                     ),
                 ),
                 area,
@@ -1011,11 +1358,21 @@ impl TuiController {
                 } else {
                     Style::default()
                 };
-                ListItem::new(format!("{}  {:?}", session.title, session.status)).style(style)
+                let loaded = self.state.loaded_session_at(index);
+                ListItem::new(format!(
+                    "{}  {:?}  {}",
+                    session.title,
+                    session.status,
+                    history_loaded_status_label(loaded)
+                ))
+                .style(style)
             })
             .collect::<Vec<_>>();
         frame.render_widget(
-            List::new(items).block(Block::default().borders(Borders::ALL).title("History")),
+            List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
+                "History search=`{}` include_archived={}",
+                self.state.session_search_text, self.state.session_search_include_archived
+            ))),
             columns[0],
         );
         let preview_sections = Layout::default()
@@ -1065,7 +1422,14 @@ impl TuiController {
                 "workspace={}",
                 truncate_middle(session.cwd.as_str(), 44)
             )),
+            Line::from(format!("turn_page={}", self.preview_turn_page_label())),
         ];
+        if let Some(loaded) = self.state.selected_loaded_session() {
+            lines.push(Line::from(format!(
+                "loaded={}",
+                loaded_session_status_line(loaded)
+            )));
+        }
         if let Some(state) = self.preview_state.as_ref() {
             lines.push(Line::from(format!(
                 "route={}",
@@ -1113,6 +1477,28 @@ impl TuiController {
             .and_then(|state| state.implementation_handoff.as_ref())
             .and_then(|handoff| handoff.next_actions.first().cloned())
             .or_else(|| preview_handoff_next_action(&self.preview_entries))
+    }
+
+    fn preview_turn_page_label(&self) -> String {
+        if self.preview_turn_total == 0 {
+            return "empty".to_string();
+        }
+        let start = self.preview_turn_offset.saturating_add(1);
+        let end = self
+            .preview_turn_offset
+            .saturating_add(self.preview_entries.len())
+            .min(self.preview_turn_total);
+        format!(
+            "{}-{} / {}{}",
+            start,
+            end,
+            self.preview_turn_total,
+            if self.preview_turn_has_more {
+                " has_more"
+            } else {
+                ""
+            }
+        )
     }
 
     fn render_config_editor(&self, frame: &mut Frame<'_>) {
@@ -1333,10 +1719,33 @@ enum RuntimeMessage {
     RunEvent(RunEvent),
     Finished(Result<RunSummary, String>),
     Permission(PermissionRequest, mpsc::Sender<bool>),
+    SteerStored(Result<(), String>),
     EnhanceFinished {
         request_id: u64,
         result: Result<String, String>,
     },
+}
+
+fn live_event_requires_canonical_refresh(event: &RunEvent) -> bool {
+    matches!(
+        event,
+        RunEvent::UserTurnStored { .. }
+            | RunEvent::ControlEnvelopePrepared { .. }
+            | RunEvent::ModelRequestPrepared { .. }
+            | RunEvent::ToolCallPending { .. }
+            | RunEvent::ToolCallCompleted { .. }
+            | RunEvent::ToolCallFailed { .. }
+            | RunEvent::ToolProposalRejected { .. }
+            | RunEvent::CandidateRepairEditRecorded { .. }
+            | RunEvent::FileChangesRecorded { .. }
+            | RunEvent::CompactionCompleted { .. }
+            | RunEvent::PermissionRequested { .. }
+            | RunEvent::PermissionResolved { .. }
+            | RunEvent::RetryScheduled { .. }
+            | RunEvent::RecoverableRuntimeFeedback { .. }
+            | RunEvent::StateUpdated { .. }
+            | RunEvent::LifecycleGuardUpdated { .. }
+    )
 }
 
 struct TuiRenderer {
@@ -1360,6 +1769,13 @@ impl EventRenderer for TuiRenderer {
         Ok(())
     }
 
+    fn render_loaded_sessions(
+        &mut self,
+        _loaded: &crate::session::LoadedSessionList,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
     fn render_session_show(
         &mut self,
         _transcript: &crate::session::Transcript,
@@ -1372,6 +1788,34 @@ impl EventRenderer for TuiRenderer {
         _session: &SessionRecord,
         _history_items: &[crate::protocol::HistoryItem],
         _show_reasoning: bool,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_history_page(
+        &mut self,
+        _page: &crate::session::CanonicalHistoryPage,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_read(
+        &mut self,
+        _read: &crate::session::CanonicalSessionRead,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_rejoin(
+        &mut self,
+        _rejoin: &crate::session::RunningSessionRejoin,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_turn_page(
+        &mut self,
+        _page: &crate::session::CanonicalTurnPage,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
@@ -1555,6 +1999,61 @@ fn sidebar_sections(area: Rect) -> std::rc::Rc<[Rect]> {
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area)
+}
+
+fn history_loaded_status_label(summary: Option<&LoadedSessionSummary>) -> String {
+    let Some(summary) = summary else {
+        return "loaded=unknown".to_string();
+    };
+    match summary.loaded_status {
+        LoadedSessionStatus::Active => {
+            let turn = active_turn_label(summary);
+            let pending = summary.pending_permission_requests + summary.pending_user_input_requests;
+            if pending > 0 {
+                format!("loaded=active pending={pending} {turn}")
+            } else {
+                format!("loaded=active {turn}")
+            }
+        }
+        LoadedSessionStatus::Idle => "loaded=idle".to_string(),
+        LoadedSessionStatus::NotLoaded => "loaded=not_loaded".to_string(),
+        LoadedSessionStatus::SystemError => "loaded=system_error".to_string(),
+    }
+}
+
+fn loaded_session_status_line(summary: &LoadedSessionSummary) -> String {
+    match summary.loaded_status {
+        LoadedSessionStatus::Active => {
+            let mut parts = vec!["active".to_string(), active_turn_label(summary)];
+            if summary.pending_permission_requests > 0 {
+                parts.push(format!(
+                    "permission_pending={}",
+                    summary.pending_permission_requests
+                ));
+            }
+            if summary.pending_user_input_requests > 0 {
+                parts.push(format!(
+                    "user_pending={}",
+                    summary.pending_user_input_requests
+                ));
+            }
+            parts.join(" ")
+        }
+        LoadedSessionStatus::Idle => "idle".to_string(),
+        LoadedSessionStatus::NotLoaded => "not_loaded".to_string(),
+        LoadedSessionStatus::SystemError => "system_error".to_string(),
+    }
+}
+
+fn active_turn_label(summary: &LoadedSessionSummary) -> String {
+    if let Some(sequence_no) = summary.active_turn_sequence_no {
+        return format!("turn={sequence_no}");
+    }
+    summary
+        .active_turn_id
+        .map(|turn_id| turn_id.to_string().chars().take(8).collect::<String>())
+        .map(|turn| format!("turn={turn}"))
+        .unwrap_or_else(|| "turn=active".to_string())
 }
 
 fn task_route_label(route: crate::session::TaskRoute) -> &'static str {

@@ -42,6 +42,7 @@ pub fn transcript_from_history_items(session: &SessionRecord, items: &[HistoryIt
                         | HistoryItemPayload::PromptDispatch { editor_context, .. } => {
                             editor_context.clone()
                         }
+                        HistoryItemPayload::SteerTurn { .. } => None,
                         _ => None,
                     },
                 }),
@@ -75,7 +76,9 @@ pub fn transcript_from_history_items(session: &SessionRecord, items: &[HistoryIt
 
 fn history_item_role(payload: &HistoryItemPayload) -> MessageRole {
     match payload {
-        HistoryItemPayload::UserTurn { .. } => MessageRole::User,
+        HistoryItemPayload::UserTurn { .. } | HistoryItemPayload::SteerTurn { .. } => {
+            MessageRole::User
+        }
         HistoryItemPayload::Message { role, .. } => *role,
         _ => MessageRole::Assistant,
     }
@@ -96,6 +99,24 @@ fn history_item_parts(message_id: MessageId, payload: &HistoryItemPayload) -> Ve
                     parts.len() as i64 + 1,
                     PartKind::PromptDispatch,
                     MessagePart::PromptDispatch(prompt_dispatch.clone()),
+                ));
+            }
+        }
+        HistoryItemPayload::SteerTurn {
+            content,
+            additional_context,
+            client_user_message_id,
+            ..
+        } => {
+            append_content_parts(message_id, content, &mut parts);
+            if !additional_context.is_empty() || client_user_message_id.is_some() {
+                parts.push(part_record(
+                    message_id,
+                    parts.len() as i64 + 1,
+                    PartKind::Text,
+                    MessagePart::Text(TextPart {
+                        text: steer_context_summary(additional_context, client_user_message_id),
+                    }),
                 ));
             }
         }
@@ -264,6 +285,23 @@ fn tool_status_from_lifecycle(status: ToolLifecycleStatus) -> ToolCallStatus {
     }
 }
 
+fn steer_context_summary(
+    additional_context: &std::collections::BTreeMap<
+        String,
+        crate::protocol::AdditionalContextEntry,
+    >,
+    client_user_message_id: &Option<String>,
+) -> String {
+    let mut lines = vec!["Active-turn steer metadata:".to_string()];
+    if let Some(id) = client_user_message_id {
+        lines.push(format!("- Client message ID: {id}"));
+    }
+    for (key, entry) in additional_context {
+        lines.push(format!("- {key} ({:?}): {}", entry.kind, entry.value));
+    }
+    lines.join("\n")
+}
+
 pub(crate) fn transcript_from_history_items_uses_item_sequence_fixture_passes() -> bool {
     let session = SessionRecord {
         id: crate::session::SessionId::new(),
@@ -273,6 +311,7 @@ pub(crate) fn transcript_from_history_items_uses_item_sequence_fixture_passes() 
         cwd: camino::Utf8PathBuf::from("C:/workspace"),
         model: SESSION_TRANSCRIPT_FIXTURE_MODEL.to_string(),
         base_url: SESSION_TRANSCRIPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 3,
         completed_at_ms: Some(3),

@@ -1406,6 +1406,20 @@ fn build_provider_replay_projection_from_history_items(
                     result.push(message);
                 }
             }
+            HistoryItemPayload::SteerTurn {
+                content,
+                additional_context,
+                ..
+            } => {
+                if !additional_context.is_empty() {
+                    result.push(ModelMessage::System {
+                        content: steer_additional_context_note(additional_context),
+                    });
+                }
+                if let Some(message) = content_parts_to_user_message(content, &None) {
+                    result.push(message);
+                }
+            }
             HistoryItemPayload::Message { role, content, .. } => match role {
                 MessageRole::User => {
                     if let Some(message) = content_parts_to_user_message(content, &None) {
@@ -1645,6 +1659,10 @@ fn build_provider_replay_projection_from_history_items(
             }
             HistoryItemPayload::RejectedToolProposal { proposal } => {
                 if proposal.semantic_class == "text_final_while_obligations_open" {
+                    replay_policies.push(rejected_final_assistant_message_replay_policy(
+                        proposal,
+                        &replay_context.active_authoring_targets,
+                    ));
                     result.push(ModelMessage::System {
                         content: rejected_model_action_replay_note(proposal),
                     });
@@ -1761,6 +1779,87 @@ pub(crate) fn provider_replay_sequence_order_resists_timestamp_drift_fixture_pas
         == vec![1, 2]
 }
 
+#[cfg(test)]
+pub(crate) fn provider_replay_includes_active_turn_steer_fixture_passes() -> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "active steer replay fixture".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: PROMPT_FIXTURE_MODEL.to_string(),
+        base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
+        created_at_ms: 1,
+        updated_at_ms: 3,
+        completed_at_ms: None,
+    };
+    let items = vec![
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Start the requested implementation.".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::SteerTurn {
+                expected_turn_id: turn_id,
+                content: vec![ContentPart::Text {
+                    text: "Steer: include the running-turn update before continuing.".to_string(),
+                }],
+                additional_context: BTreeMap::from([(
+                    "desktop.composer".to_string(),
+                    crate::protocol::AdditionalContextEntry {
+                        value: "submitted while the turn was running".to_string(),
+                        kind: crate::protocol::AdditionalContextKind::Application,
+                    },
+                )]),
+                client_user_message_id: Some("client-steer-fixture".to_string()),
+            },
+        },
+    ];
+
+    let messages = build_provider_replay_messages_from_history_items(&session, &items, 10);
+    let has_initial = messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::User { content } if content.contains("requested implementation")
+        )
+    });
+    let has_context = messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::System { content }
+                if content.contains("Active-turn steer additional context")
+                    && content.contains("desktop.composer")
+        )
+    });
+    let has_steer = messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::User { content } if content.contains("running-turn update")
+        )
+    });
+    has_initial && has_context && has_steer
+}
+
 fn provider_replay_repair_leading_orphans(
     history_items: &[HistoryItem],
     selected_indices: Vec<usize>,
@@ -1791,6 +1890,7 @@ fn history_item_is_user_query(history_items: &[HistoryItem], index: usize) -> bo
             matches!(
                 item.payload,
                 HistoryItemPayload::UserTurn { .. }
+                    | HistoryItemPayload::SteerTurn { .. }
                     | HistoryItemPayload::Message {
                         role: MessageRole::User,
                         ..
@@ -1809,6 +1909,7 @@ fn latest_user_turn_index_before(history_items: &[HistoryItem], index: usize) ->
             matches!(
                 item.payload,
                 HistoryItemPayload::UserTurn { .. }
+                    | HistoryItemPayload::SteerTurn { .. }
                     | HistoryItemPayload::Message {
                         role: MessageRole::User,
                         ..
@@ -1838,6 +1939,18 @@ fn rejected_model_action_replay_note(proposal: &crate::protocol::RejectedToolPro
         proposal.projection_id,
         proposal.payload_hash,
     )
+}
+
+fn steer_additional_context_note(
+    additional_context: &BTreeMap<String, crate::protocol::AdditionalContextEntry>,
+) -> String {
+    let mut lines = vec![
+        "Active-turn steer additional context follows. Treat application entries as trusted UI/session context and untrusted entries as user-supplied context.".to_string(),
+    ];
+    for (key, entry) in additional_context {
+        lines.push(format!("- {key} ({:?}): {}", entry.kind, entry.value));
+    }
+    lines.join("\n")
 }
 
 fn provider_replay_add_tool_pairs(
@@ -3063,6 +3176,20 @@ fn progress_projection_replay_policy(
     }
 }
 
+fn rejected_final_assistant_message_replay_policy(
+    proposal: &crate::protocol::RejectedToolProposal,
+    active_targets: &[String],
+) -> RequestReplayPolicyDiagnostic {
+    RequestReplayPolicyDiagnostic {
+        policy: "rejected_final_assistant_message_non_executable_replay".to_string(),
+        call_id: Some(proposal.source_call_id.to_string()),
+        tool_name: Some(proposal.effective_tool.clone()),
+        omitted_targets: Vec::new(),
+        active_targets: active_targets.to_vec(),
+        reason: "final assistant text emitted while obligations were open is preserved as typed non-executable rejected action evidence so the next provider request keeps the active edit authority instead of treating closeout prose as progress".to_string(),
+    }
+}
+
 fn content_parts_to_user_message(
     content: &[ContentPart],
     editor_context: &Option<crate::session::EditorContext>,
@@ -3127,6 +3254,7 @@ pub fn vision_input_provider_projection_fixture_passes() -> bool {
         cwd: camino::Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -3200,6 +3328,7 @@ pub(crate) fn provider_replay_uses_protocol_visibility_roles_fixture_passes() ->
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -3303,6 +3432,7 @@ pub(crate) fn provider_replay_sanitizes_content_shape_mismatch_from_typed_metada
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -3450,6 +3580,7 @@ pub(crate) fn prompt_projection_uses_typed_tool_output_feedback_fixture_passes()
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -3599,6 +3730,7 @@ pub(crate) fn message_only_history_does_not_recreate_tool_lifecycle_prompt_state
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -3728,6 +3860,7 @@ pub(crate) fn verification_repair_read_budget_exhaustion_uses_typed_history_item
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -3930,6 +4063,7 @@ pub(crate) fn verification_repair_target_rotation_uses_typed_history_item_author
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4168,6 +4302,7 @@ pub(crate) fn verification_evidence_uses_typed_history_item_authority_fixture_pa
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4353,6 +4488,7 @@ pub(crate) fn staged_task_closeout_repair_targets_use_typed_history_authority_fi
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4655,6 +4791,7 @@ pub(crate) fn staged_task_output_lifecycle_uses_typed_history_authority_fixture_
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4968,6 +5105,7 @@ pub(crate) fn documentation_prompt_lifecycle_uses_typed_history_authority_fixtur
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5217,6 +5355,7 @@ pub(crate) fn follow_up_focus_uses_typed_history_authority_fixture_passes() -> b
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5469,6 +5608,7 @@ pub(crate) fn staged_task_recovery_stall_uses_typed_history_authority_fixture_pa
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5642,6 +5782,7 @@ pub(crate) fn prompt_projection_uses_typed_verification_run_cycle_fixture_passes
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5834,6 +5975,7 @@ pub(crate) fn prompt_projection_uses_rejected_tool_proposal_fixture_passes() -> 
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5899,6 +6041,7 @@ pub(crate) fn prompt_projection_uses_typed_pseudo_tool_rejection_fixture_passes(
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5972,6 +6115,7 @@ pub(crate) fn code_block_stall_uses_typed_history_authority_fixture_passes() -> 
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6117,6 +6261,7 @@ pub(crate) fn superseded_tool_denial_uses_typed_history_authority_fixture_passes
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6313,6 +6458,7 @@ pub(crate) fn prompt_projection_uses_typed_docs_audit_metadata_fixture_passes() 
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6430,6 +6576,7 @@ pub(crate) fn prompt_projection_uses_state_patch_recovery_fixture_passes() -> bo
         cwd: Utf8PathBuf::from("."),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -7563,6 +7710,7 @@ pub(crate) fn provider_replay_compaction_boundary_uses_canonical_history_order_f
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 5,
         completed_at_ms: None,
@@ -11336,6 +11484,7 @@ pub(crate) fn stale_inactive_authoring_replay_uses_live_builder() -> bool {
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -11488,6 +11637,7 @@ pub(crate) fn provider_replay_omits_stale_inactive_authoring_prelude_text() -> b
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -11605,6 +11755,7 @@ pub(crate) fn stale_inactive_apply_patch_filechange_replay_uses_reference_snapsh
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -11777,6 +11928,7 @@ pub(crate) fn metadata_only_tool_output_does_not_create_filechange_reference_sna
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -11882,6 +12034,7 @@ pub(crate) fn stale_inactive_filechange_without_replayable_tool_call_uses_refere
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -11952,6 +12105,7 @@ pub(crate) fn failed_inactive_authoring_replay_uses_call_scoped_summary() -> boo
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12119,6 +12273,7 @@ pub(crate) fn failed_inactive_apply_patch_replay_uses_call_scoped_summary() -> b
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12274,6 +12429,7 @@ pub(crate) fn mixed_target_invalid_edit_replay_is_target_exclusive_fixture_passe
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12409,6 +12565,7 @@ pub(crate) fn inactive_target_content_shape_replay_is_target_exclusive_fixture_p
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12547,6 +12704,7 @@ pub(crate) fn failed_inactive_authoring_feedback_requires_typed_metadata() -> bo
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -12645,6 +12803,7 @@ pub(crate) fn invalid_edit_arguments_replay_requires_typed_metadata() -> bool {
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -12746,6 +12905,7 @@ pub(crate) fn stale_progress_projection_replay_uses_live_builder() -> bool {
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12901,6 +13061,7 @@ pub(crate) fn current_progress_projection_feedback_replay_preserves_call_output(
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -13113,6 +13274,7 @@ pub(crate) fn current_progress_projection_feedback_requires_typed_metadata() -> 
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -13241,6 +13403,7 @@ pub(crate) fn content_shape_mismatch_replay_preserves_tool_lifecycle_without_pay
             cwd: Utf8PathBuf::from("C:/workspace"),
             model: PROMPT_FIXTURE_MODEL.to_string(),
             base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+access_mode: crate::config::AccessMode::Default,
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: None,
@@ -13461,6 +13624,7 @@ pub(crate) fn content_shape_mismatch_replay_requires_typed_metadata() -> bool {
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -13556,6 +13720,7 @@ pub(crate) fn exact_write_repair_omits_consumed_supporting_context_replay() -> b
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -13819,6 +13984,7 @@ pub(crate) fn exact_write_repair_does_not_consume_untyped_read_as_supporting_con
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -13986,6 +14152,7 @@ pub fn provider_replay_preserves_current_invalid_edit_argument_feedback() -> boo
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -14150,6 +14317,7 @@ pub(crate) fn stale_write_prelude_replay_omits_text(
             cwd: Utf8PathBuf::from("C:/workspace"),
             model: PROMPT_FIXTURE_MODEL.to_string(),
             base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+            access_mode: crate::config::AccessMode::Default,
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: None,
@@ -14241,6 +14409,7 @@ pub(crate) fn stale_todo_progress_replay_omits_prior_plan(
             cwd: Utf8PathBuf::from("C:/workspace"),
             model: PROMPT_FIXTURE_MODEL.to_string(),
             base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+            access_mode: crate::config::AccessMode::Default,
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: None,
@@ -14398,6 +14567,7 @@ pub(crate) fn text_artifact_content_shape_repair_projection_carries_positive_con
             cwd: Utf8PathBuf::from("C:/workspace"),
             model: PROMPT_FIXTURE_MODEL.to_string(),
             base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+access_mode: crate::config::AccessMode::Default,
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: None,
@@ -14720,6 +14890,7 @@ pub(crate) fn python_source_content_shape_repair_projection_carries_positive_con
             cwd: Utf8PathBuf::from("C:/workspace"),
             model: PROMPT_FIXTURE_MODEL.to_string(),
             base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+            access_mode: crate::config::AccessMode::Default,
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: None,
@@ -14921,6 +15092,7 @@ pub fn provider_replay_preserves_latest_user_across_trailing_compaction() -> boo
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -15059,6 +15231,7 @@ pub(crate) fn compaction_provider_context_projects_typed_contract_before_summary
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -15130,6 +15303,7 @@ pub(crate) fn compaction_replay_uses_typed_history_authority_fixture_passes() ->
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 3,
         completed_at_ms: None,
@@ -15320,6 +15494,7 @@ pub(crate) fn prompt_projection_workspace_root_uses_typed_runtime_input_fixture_
         cwd: typed_root,
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -15384,6 +15559,7 @@ pub fn provider_replay_after_compaction_repairs_orphan_assistant_before_user() -
         cwd: Utf8PathBuf::from("C:/workspace"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -15489,6 +15665,7 @@ pub fn provider_replay_preserves_tool_pair_symmetry_with_model_arguments() -> bo
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -15629,6 +15806,7 @@ pub fn provider_replay_projects_rejected_final_message_evidence() -> bool {
         cwd: Utf8PathBuf::from("C:/workspace/project"),
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -15680,15 +15858,20 @@ pub fn provider_replay_projects_rejected_final_message_evidence() -> bool {
         },
     ];
 
-    let replay = build_provider_replay_messages_from_history_items(&session, &items, 32);
-    let user_index = replay.iter().position(|message| {
+    let replay_context = ProviderReplayContext {
+        active_authoring_targets: vec!["tests/workflow.spec.ts".to_string()],
+        workspace_root: Some(Utf8PathBuf::from("C:/workspace/project")),
+    };
+    let projection =
+        build_provider_replay_projection_from_history_items(&session, &items, 32, &replay_context);
+    let user_index = projection.messages.iter().position(|message| {
         matches!(
             message,
             ModelMessage::User { content }
                 if content.contains("create src/workflow.rs and tests/workflow.spec.ts")
         )
     });
-    let evidence_index = replay.iter().position(|message| {
+    let evidence_index = projection.messages.iter().position(|message| {
         matches!(
             message,
             ModelMessage::System { content }
@@ -15699,7 +15882,16 @@ pub fn provider_replay_projects_rejected_final_message_evidence() -> bool {
                     && content.contains("Allowed tool surface: [apply_patch, write, shell]")
         )
     });
+    let policy_present = projection.replay_policies.iter().any(|policy| {
+        policy.policy == "rejected_final_assistant_message_non_executable_replay"
+            && policy.tool_name.as_deref() == Some("final_assistant_message")
+            && policy
+                .active_targets
+                .iter()
+                .any(|target| target == "tests/workflow.spec.ts")
+    });
     matches!((user_index, evidence_index), (Some(user), Some(evidence)) if user < evidence)
+        && policy_present
 }
 
 pub(crate) fn prompt_residual_fixtures_are_workflow_neutral_fixture_passes() -> bool {
@@ -17014,6 +17206,11 @@ mod tests {
     #[test]
     fn compaction_replay_uses_typed_history_authority() {
         assert!(super::compaction_replay_uses_typed_history_authority_fixture_passes());
+    }
+
+    #[test]
+    fn provider_replay_includes_active_turn_steer() {
+        assert!(super::provider_replay_includes_active_turn_steer_fixture_passes());
     }
 
     #[test]

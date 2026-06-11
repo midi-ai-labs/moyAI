@@ -6716,6 +6716,13 @@ impl EventRenderer for RecordingRenderer {
         Ok(())
     }
 
+    fn render_loaded_sessions(
+        &mut self,
+        _loaded: &crate::session::LoadedSessionList,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
     fn render_session_show(
         &mut self,
         _transcript: &crate::session::Transcript,
@@ -6728,6 +6735,34 @@ impl EventRenderer for RecordingRenderer {
         _session: &crate::session::SessionRecord,
         _history_items: &[crate::protocol::HistoryItem],
         _show_reasoning: bool,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_history_page(
+        &mut self,
+        _page: &crate::session::CanonicalHistoryPage,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_read(
+        &mut self,
+        _read: &crate::session::CanonicalSessionRead,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_rejoin(
+        &mut self,
+        _rejoin: &crate::session::RunningSessionRejoin,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_turn_page(
+        &mut self,
+        _page: &crate::session::CanonicalTurnPage,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }

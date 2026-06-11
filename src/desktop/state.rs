@@ -330,6 +330,42 @@ impl DesktopState {
             .finish_one_kind(DesktopAsyncOperationKind::SessionDelete);
     }
 
+    pub fn begin_session_archive_mutation(&mut self) {
+        self.view
+            .async_operations
+            .begin(DesktopAsyncOperationKind::SessionArchive);
+    }
+
+    pub fn finish_session_archive_mutation(&mut self) {
+        self.view
+            .async_operations
+            .finish_one_kind(DesktopAsyncOperationKind::SessionArchive);
+    }
+
+    pub fn begin_session_rollback_mutation(&mut self) {
+        self.view
+            .async_operations
+            .begin(DesktopAsyncOperationKind::SessionRollback);
+    }
+
+    pub fn finish_session_rollback_mutation(&mut self) {
+        self.view
+            .async_operations
+            .finish_one_kind(DesktopAsyncOperationKind::SessionRollback);
+    }
+
+    pub fn begin_session_search(&mut self) {
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::SessionSearch);
+    }
+
+    pub fn finish_session_search(&mut self) {
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::SessionSearch);
+    }
+
     pub fn begin_project_delete_mutation(&mut self) {
         self.view
             .async_operations
@@ -350,6 +386,14 @@ impl DesktopState {
                 .view
                 .async_operations
                 .is_pending(DesktopAsyncOperationKind::SessionDelete)
+            || self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::SessionArchive)
+            || self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::SessionRollback)
     }
 
     pub fn begin_history_export(&mut self) {
@@ -485,6 +529,10 @@ impl DesktopState {
                     },
                     file_changes: Vec::new(),
                 }],
+                turn_page_offset: 0,
+                turn_page_limit: 0,
+                turn_page_total: 0,
+                turn_page_has_more: false,
                 tool_status_text: "ツール実行はまだありません。".to_string(),
                 progress_text: "待機中\nフェーズ: 準備完了\n手順: 実行中の作業はありません"
                     .to_string(),
@@ -661,6 +709,10 @@ impl DesktopState {
         turn_items: &[TurnItem],
         state: SessionStateSnapshot,
         todos: Vec<TodoItem>,
+        turn_page_offset: usize,
+        turn_page_limit: usize,
+        turn_page_total: usize,
+        turn_page_has_more: bool,
     ) {
         let open_session = OpenSessionView::from_loaded(
             session,
@@ -668,6 +720,10 @@ impl DesktopState {
             turn_items,
             state.clone(),
             todos.clone(),
+            turn_page_offset,
+            turn_page_limit,
+            turn_page_total,
+            turn_page_has_more,
         );
         self.app_state
             .load_turn_items(session, turn_items, state, todos);
@@ -682,6 +738,36 @@ impl DesktopState {
         }
         self.view.overlay = DesktopOverlay::None;
         self.view.artifact_selected_index = 0;
+    }
+
+    pub fn refresh_open_session_projection(
+        &mut self,
+        session: &SessionRecord,
+        transcript: &Transcript,
+        turn_items: &[TurnItem],
+        state: SessionStateSnapshot,
+        todos: Vec<TodoItem>,
+        turn_page_offset: usize,
+        turn_page_limit: usize,
+        turn_page_total: usize,
+        turn_page_has_more: bool,
+    ) {
+        let open_session = OpenSessionView::from_loaded(
+            session,
+            transcript,
+            turn_items,
+            state,
+            todos,
+            turn_page_offset,
+            turn_page_limit,
+            turn_page_total,
+            turn_page_has_more,
+        );
+        let detail = open_session.stored_detail().clone();
+        self.open_session = Some(open_session);
+        self.snapshot.replace_detail(detail);
+        self.update_session_row_title(session.id, &session.title);
+        self.update_session_row_status(session.id, session.status);
     }
 
     pub fn apply_run_event(&mut self, event: &crate::session::RunEvent) {
@@ -1054,6 +1140,14 @@ impl DesktopState {
         self.view.local_search_text = text;
     }
 
+    pub fn set_session_search_text(&mut self, text: String) {
+        self.view.session_search_text = text;
+    }
+
+    pub fn set_session_search_include_archived(&mut self, include_archived: bool) {
+        self.view.session_search_include_archived = include_archived;
+    }
+
     pub fn local_search_results_text(&self) -> String {
         let needle = self.view.local_search_text.trim().to_lowercase();
         if needle.is_empty() {
@@ -1230,6 +1324,7 @@ fn desktop_state_provider_profile_session_record(
         cwd: camino::Utf8PathBuf::from("C:/workspace"),
         model: CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL.to_string(),
         base_url: CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1_000,
         updated_at_ms: 34_000,
         completed_at_ms: Some(34_000),
@@ -1521,6 +1616,10 @@ mod tests {
             &turn_items,
             SessionStateSnapshot::default(),
             Vec::new(),
+            0,
+            turn_items.len(),
+            turn_items.len(),
+            false,
         );
 
         assert!(state.selected_detail().transcript_rows.iter().any(|row| {

@@ -75,8 +75,14 @@ pub struct DesktopWebState {
     pub session_rows: Vec<DesktopSessionRow>,
     pub chat_session_rows: Vec<DesktopSessionRow>,
     pub selected_session_index: i32,
+    pub session_search_text: String,
+    pub session_search_include_archived: bool,
     pub thread_empty: bool,
     pub transcript_rows: Vec<DesktopTranscriptRow>,
+    pub turn_page_offset: usize,
+    pub turn_page_limit: usize,
+    pub turn_page_total: usize,
+    pub turn_page_has_more: bool,
     pub artifact_rows: Vec<DesktopArtifactRow>,
     pub selected_artifact_index: i32,
     pub artifact_preview_available: bool,
@@ -216,8 +222,14 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         session_rows: state.snapshot.session_rows.clone(),
         chat_session_rows: state.snapshot.chat_session_rows.clone(),
         selected_session_index: state.selected_index(),
+        session_search_text: state.view.session_search_text.clone(),
+        session_search_include_archived: state.view.session_search_include_archived,
         thread_empty: detail.thread_empty,
         transcript_rows: detail.transcript_rows,
+        turn_page_offset: detail.turn_page_offset,
+        turn_page_limit: detail.turn_page_limit,
+        turn_page_total: detail.turn_page_total,
+        turn_page_has_more: detail.turn_page_has_more,
         artifact_rows: detail.artifacts,
         selected_artifact_index: state.selected_artifact_index(),
         artifact_preview_available: detail.artifact_preview_available,
@@ -350,6 +362,10 @@ pub(crate) fn desktop_gui_typed_visibility_projection_fixture_passes() -> bool {
             file_change_summary_text: String::new(),
             artifact_preview_available: false,
             artifact_preview_text: "アーティファクトは選択されていません。".to_string(),
+            turn_page_offset: 0,
+            turn_page_limit: 80,
+            turn_page_total: 0,
+            turn_page_has_more: false,
         }],
         selected_session_index: 0,
     };
@@ -809,7 +825,7 @@ mod tests {
 
         assert_eq!(web.provider_metadata_mode, "openai_compatible_only");
         assert_eq!(web.provider_context_window, "131072");
-        assert_eq!(web.provider_max_output_tokens, "131072");
+        assert_eq!(web.provider_max_output_tokens, "8192");
         assert!(
             web.provider_status_text
                 .contains("language / no-thinking system policy is active")

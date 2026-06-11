@@ -135,6 +135,7 @@ pub struct ThreadSubmission {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ThreadOp {
     UserTurn(UserTurn),
+    SteerTurn(SteerTurn),
     Interrupt {
         turn_id: TurnId,
         reason: String,
@@ -159,6 +160,10 @@ pub enum ThreadOp {
 impl ThreadOp {
     pub fn user_turn(turn: UserTurn) -> Self {
         Self::UserTurn(turn)
+    }
+
+    pub fn steer_turn(turn: SteerTurn) -> Self {
+        Self::SteerTurn(turn)
     }
 }
 
@@ -216,6 +221,91 @@ impl UserTurn {
             })
             .collect()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteerTurn {
+    pub expected_turn_id: TurnId,
+    pub items: Vec<UserInputItem>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional_context: BTreeMap<String, AdditionalContextEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_user_message_id: Option<String>,
+}
+
+impl SteerTurn {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn requires_image_capability(&self) -> bool {
+        self.items.iter().any(UserInputItem::contains_image)
+    }
+
+    pub fn text(&self) -> String {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                UserInputItem::Text { text } => Some(text.as_str()),
+                UserInputItem::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn content_parts(&self) -> Vec<ContentPart> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                UserInputItem::Text { text } if text.is_empty() => None,
+                UserInputItem::Text { text } => Some(ContentPart::Text { text: text.clone() }),
+                UserInputItem::Image { image } => Some(ContentPart::Image {
+                    image: image.clone(),
+                }),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdditionalContextKind {
+    Untrusted,
+    Application,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdditionalContextEntry {
+    pub value: String,
+    pub kind: AdditionalContextKind,
+}
+
+pub fn steer_turn_is_active_turn_mailbox_contract_fixture_passes() -> bool {
+    let expected_turn_id = TurnId::new();
+    let steer = SteerTurn {
+        expected_turn_id,
+        items: vec![UserInputItem::Text {
+            text: "Please adjust the current work before continuing.".to_string(),
+        }],
+        additional_context: BTreeMap::from([(
+            "desktop.composer".to_string(),
+            AdditionalContextEntry {
+                value: "submitted while the turn was running".to_string(),
+                kind: AdditionalContextKind::Application,
+            },
+        )]),
+        client_user_message_id: Some("client-message-1".to_string()),
+    };
+    let op = ThreadOp::steer_turn(steer.clone());
+
+    matches!(op, ThreadOp::SteerTurn(turn)
+        if turn.expected_turn_id == expected_turn_id
+            && !turn.is_empty()
+            && !turn.requires_image_capability()
+            && turn.text().contains("current work")
+            && turn.content_parts().len() == 1
+            && turn.additional_context.contains_key("desktop.composer")
+            && turn.client_user_message_id.as_deref() == Some("client-message-1"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,6 +482,11 @@ pub enum RuntimeEventMsg {
     UserInputAccepted {
         item_count: usize,
     },
+    SteerInputAccepted {
+        item_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_user_message_id: Option<String>,
+    },
     UserMessageStored {
         message_id: MessageId,
     },
@@ -520,6 +615,14 @@ pub enum HistoryItemPayload {
         editor_context: Option<EditorContext>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_context: Option<Box<TurnContext>>,
+    },
+    SteerTurn {
+        expected_turn_id: TurnId,
+        content: Vec<ContentPart>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional_context: BTreeMap<String, AdditionalContextEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_user_message_id: Option<String>,
     },
     Message {
         message_id: Option<MessageId>,
@@ -652,6 +755,7 @@ impl HistoryItemPayload {
     pub fn authority_role(&self) -> HistoryItemAuthorityRole {
         match self {
             Self::UserTurn { .. }
+            | Self::SteerTurn { .. }
             | Self::Message {
                 role: MessageRole::User,
                 ..
@@ -683,6 +787,7 @@ impl HistoryItemPayload {
     pub fn is_provider_replay_candidate(&self) -> bool {
         match self {
             Self::UserTurn { .. }
+            | Self::SteerTurn { .. }
             | Self::Message { .. }
             | Self::ToolCall { .. }
             | Self::ToolOutput { .. } => true,
@@ -1028,6 +1133,9 @@ pub enum TurnItemPayload {
     UserMessage {
         text: String,
     },
+    SteerMessage {
+        text: String,
+    },
     AgentMessage {
         text: String,
     },
@@ -1100,7 +1208,9 @@ pub enum TurnItemProjectionRole {
 impl TurnItemPayload {
     pub fn projection_role(&self) -> TurnItemProjectionRole {
         match self {
-            Self::UserMessage { .. } => TurnItemProjectionRole::UserVisibleMessage,
+            Self::UserMessage { .. } | Self::SteerMessage { .. } => {
+                TurnItemProjectionRole::UserVisibleMessage
+            }
             Self::AgentMessage { .. } => TurnItemProjectionRole::AssistantVisibleMessage,
             Self::Reasoning { .. } => TurnItemProjectionRole::ReasoningTrace,
             Self::Plan { .. } | Self::PromptDispatch { .. } | Self::State { .. } => {

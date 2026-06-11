@@ -250,6 +250,7 @@ mod tests {
                     cwd: deleted_root.to_path_buf(),
                     model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
                     base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
+                    access_mode: crate::config::AccessMode::Default,
                 })
                 .await
                 .expect("insert deleted session");
@@ -260,6 +261,7 @@ mod tests {
                     cwd: kept_root.to_path_buf(),
                     model: STORAGE_REPOSITORY_FIXTURE_MODEL.to_string(),
                     base_url: STORAGE_REPOSITORY_FIXTURE_BASE_URL.to_string(),
+                    access_mode: crate::config::AccessMode::Default,
                 })
                 .await
                 .expect("insert kept session");

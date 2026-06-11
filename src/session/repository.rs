@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use crate::error::StorageError;
 
 use super::{
-    ChangeId, NewSession, ProjectId, ProjectRecord, SessionId, SessionRecord, SessionStateSnapshot,
-    TodoItem,
+    ChangeId, NewSession, ProjectId, ProjectRecord, SessionId, SessionRecord, SessionSettingsPatch,
+    SessionSettingsUpdate, SessionStateSnapshot, TodoItem,
 };
 
 #[async_trait(?Send)]
@@ -20,7 +20,30 @@ pub trait SessionRepository: Send + Sync {
         project_id: ProjectId,
         limit: usize,
     ) -> Result<Vec<SessionRecord>, StorageError>;
+    async fn list_sessions_with_archived(
+        &self,
+        project_id: ProjectId,
+        limit: usize,
+        include_archived: bool,
+    ) -> Result<Vec<SessionRecord>, StorageError>;
     async fn list_recent_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>, StorageError>;
+    async fn search_sessions(
+        &self,
+        project_id: ProjectId,
+        query: &str,
+        limit: usize,
+        include_archived: bool,
+    ) -> Result<Vec<SessionRecord>, StorageError>;
+    async fn set_session_archived(
+        &self,
+        id: SessionId,
+        archived: bool,
+    ) -> Result<SessionRecord, StorageError>;
+    async fn update_session_settings(
+        &self,
+        id: SessionId,
+        patch: &SessionSettingsPatch,
+    ) -> Result<SessionSettingsUpdate, StorageError>;
     async fn delete_session(&self, id: SessionId) -> Result<(), StorageError>;
     async fn get_state(&self, session_id: SessionId) -> Result<SessionStateSnapshot, StorageError>;
     async fn update_todos(

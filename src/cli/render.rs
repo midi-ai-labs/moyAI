@@ -1,8 +1,9 @@
 use crate::error::CliRenderError;
 use crate::protocol::{HistoryItem, HistoryItemPayload};
 use crate::session::{
-    MessagePart, PartKind, RunEvent, RunSummary, SessionRecord, SessionStateSnapshot, Transcript,
-    transcript_from_history_items,
+    CanonicalHistoryPage, CanonicalSessionRead, CanonicalTurnPage, LoadedSessionList, MessagePart,
+    PartKind, RunEvent, RunSummary, RunningSessionRejoin, SessionRecord, SessionStateSnapshot,
+    Transcript, transcript_from_history_items,
 };
 
 const CURRENT_PROVIDER_MODEL: &str = "qwen/qwen3.6-35b-a3b";
@@ -12,6 +13,7 @@ pub trait EventRenderer {
     fn render(&mut self, event: &RunEvent) -> Result<(), CliRenderError>;
     fn finish(&mut self, summary: &RunSummary) -> Result<(), CliRenderError>;
     fn render_session_list(&mut self, sessions: &[SessionRecord]) -> Result<(), CliRenderError>;
+    fn render_loaded_sessions(&mut self, loaded: &LoadedSessionList) -> Result<(), CliRenderError>;
     fn render_session_show(&mut self, transcript: &Transcript) -> Result<(), CliRenderError>;
     fn render_session_history_items(
         &mut self,
@@ -19,6 +21,16 @@ pub trait EventRenderer {
         history_items: &[HistoryItem],
         show_reasoning: bool,
     ) -> Result<(), CliRenderError>;
+    fn render_session_history_page(
+        &mut self,
+        page: &CanonicalHistoryPage,
+    ) -> Result<(), CliRenderError>;
+    fn render_session_read(&mut self, read: &CanonicalSessionRead) -> Result<(), CliRenderError>;
+    fn render_session_rejoin(
+        &mut self,
+        rejoin: &RunningSessionRejoin,
+    ) -> Result<(), CliRenderError>;
+    fn render_session_turn_page(&mut self, page: &CanonicalTurnPage) -> Result<(), CliRenderError>;
 }
 
 pub struct HumanRenderer;
@@ -160,6 +172,20 @@ impl EventRenderer for HumanRenderer {
         Ok(())
     }
 
+    fn render_loaded_sessions(&mut self, loaded: &LoadedSessionList) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "project {} loaded include_archived={}",
+            loaded.project_id, loaded.include_archived
+        )?;
+        for summary in &loaded.sessions {
+            writeln!(stdout, "{}", human_loaded_session_summary_line(summary))?;
+        }
+        Ok(())
+    }
+
     fn render_session_show(&mut self, transcript: &Transcript) -> Result<(), CliRenderError> {
         use std::io::{self, Write};
         let mut stdout = io::stdout().lock();
@@ -190,6 +216,119 @@ impl EventRenderer for HumanRenderer {
     ) -> Result<(), CliRenderError> {
         let transcript = transcript_for_history_render(session, history_items, show_reasoning);
         self.render_session_show(&transcript)
+    }
+
+    fn render_session_history_page(
+        &mut self,
+        page: &CanonicalHistoryPage,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "session {} history offset={} limit={} total={} has_more={}",
+            page.session.id, page.offset, page.limit, page.total, page.has_more
+        )?;
+        for item in &page.items {
+            writeln!(
+                stdout,
+                "{}\t{}\t{}",
+                item.sequence_no,
+                item.id,
+                payload_kind(&item.payload)?
+            )?;
+        }
+        Ok(())
+    }
+
+    fn render_session_read(&mut self, read: &CanonicalSessionRead) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "session {} {} status={} model={} access_mode={} cwd={}",
+            read.session.id,
+            read.session.title,
+            read.session.status.key(),
+            read.session.model,
+            read.session.access_mode.as_str(),
+            read.session.cwd
+        )?;
+        writeln!(
+            stdout,
+            "state route={} phase={}",
+            read.state.route.key(),
+            read.state.process_phase.key()
+        )?;
+        if let Some(turn_id) = read.active_turn_id {
+            writeln!(
+                stdout,
+                "active_turn {} sequence={}",
+                turn_id,
+                read.active_turn_sequence_no.unwrap_or_default()
+            )?;
+        }
+        writeln!(
+            stdout,
+            "history offset={} limit={} total={} has_more={}",
+            read.history.offset, read.history.limit, read.history.total, read.history.has_more
+        )?;
+        writeln!(
+            stdout,
+            "turns offset={} limit={} total={} has_more={}",
+            read.turns.offset, read.turns.limit, read.turns.total, read.turns.has_more
+        )?;
+        Ok(())
+    }
+
+    fn render_session_rejoin(
+        &mut self,
+        rejoin: &RunningSessionRejoin,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "{}",
+            human_loaded_session_summary_line(&rejoin.summary)
+        )?;
+        writeln!(
+            stdout,
+            "history offset={} limit={} total={} has_more={}",
+            rejoin.read.history.offset,
+            rejoin.read.history.limit,
+            rejoin.read.history.total,
+            rejoin.read.history.has_more
+        )?;
+        writeln!(
+            stdout,
+            "turns offset={} limit={} total={} has_more={}",
+            rejoin.read.turns.offset,
+            rejoin.read.turns.limit,
+            rejoin.read.turns.total,
+            rejoin.read.turns.has_more
+        )?;
+        Ok(())
+    }
+
+    fn render_session_turn_page(&mut self, page: &CanonicalTurnPage) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "session {} turns offset={} limit={} total={} has_more={}",
+            page.session.id, page.offset, page.limit, page.total, page.has_more
+        )?;
+        for item in &page.items {
+            writeln!(
+                stdout,
+                "{}\t{}\t{}",
+                item.sequence_no,
+                item.id,
+                payload_kind(&item.payload)?
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -223,6 +362,13 @@ impl EventRenderer for JsonRenderer {
         Ok(())
     }
 
+    fn render_loaded_sessions(&mut self, loaded: &LoadedSessionList) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(loaded)?)?;
+        Ok(())
+    }
+
     fn render_session_show(&mut self, transcript: &Transcript) -> Result<(), CliRenderError> {
         use std::io::{self, Write};
         let mut stdout = io::stdout().lock();
@@ -250,6 +396,49 @@ impl EventRenderer for JsonRenderer {
         writeln!(stdout, "{}", serde_json::to_string(&payload)?)?;
         Ok(())
     }
+
+    fn render_session_history_page(
+        &mut self,
+        page: &CanonicalHistoryPage,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(page)?)?;
+        Ok(())
+    }
+
+    fn render_session_read(&mut self, read: &CanonicalSessionRead) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(read)?)?;
+        Ok(())
+    }
+
+    fn render_session_rejoin(
+        &mut self,
+        rejoin: &RunningSessionRejoin,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(rejoin)?)?;
+        Ok(())
+    }
+
+    fn render_session_turn_page(&mut self, page: &CanonicalTurnPage) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(page)?)?;
+        Ok(())
+    }
+}
+
+fn payload_kind<T: serde::Serialize>(payload: &T) -> Result<String, CliRenderError> {
+    let value = serde_json::to_value(payload)?;
+    Ok(value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string())
 }
 
 fn transcript_for_history_render(
@@ -299,11 +488,34 @@ fn human_run_summary_line(summary: &RunSummary) -> String {
 
 fn human_session_record_line(session: &SessionRecord) -> String {
     format!(
-        "{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}",
         session.id,
         session.status.key(),
+        session.access_mode.as_str(),
         session.updated_at_ms,
         session.title
+    )
+}
+
+fn human_loaded_session_summary_line(summary: &crate::session::LoadedSessionSummary) -> String {
+    let active_turn = summary
+        .active_turn_id
+        .map(|turn_id| turn_id.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let active_sequence = summary
+        .active_turn_sequence_no
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "{}\t{}\tsession_status={}\taccess_mode={}\tactive_turn={}\tsequence={}\tpending_user_input={}\t{}",
+        summary.session.id,
+        summary.loaded_status.key(),
+        summary.session.status.key(),
+        summary.session.access_mode.as_str(),
+        active_turn,
+        active_sequence,
+        summary.pending_user_input_requests,
+        summary.session.title
     )
 }
 
@@ -323,6 +535,7 @@ fn renderer_fixture_session_record(title: &str) -> SessionRecord {
         created_at_ms: 1,
         updated_at_ms: 3,
         completed_at_ms: Some(3),
+        access_mode: crate::config::AccessMode::Default,
     }
 }
 
@@ -474,6 +687,43 @@ pub fn cli_json_history_renderer_respects_reasoning_visibility_fixture_passes() 
         && visible_json.contains("internal reasoning")
 }
 
+pub fn cli_session_read_payload_preserves_metadata_pages_fixture_passes() -> bool {
+    let session = renderer_fixture_session_record("thread read fixture");
+    let active_turn_id = crate::protocol::TurnId::new();
+    let read = CanonicalSessionRead {
+        session: session.clone(),
+        state: SessionStateSnapshot::default(),
+        history: CanonicalHistoryPage {
+            session: session.clone(),
+            offset: 10,
+            limit: 5,
+            total: 17,
+            has_more: true,
+            items: Vec::new(),
+        },
+        turns: CanonicalTurnPage {
+            session,
+            offset: 2,
+            limit: 3,
+            total: 8,
+            has_more: true,
+            items: Vec::new(),
+        },
+        active_turn_id: Some(active_turn_id),
+        active_turn_sequence_no: Some(42),
+    };
+    let encoded = serde_json::to_string(&read).unwrap_or_default();
+
+    encoded.contains("thread read fixture")
+        && encoded.contains("\"history\"")
+        && encoded.contains("\"turns\"")
+        && encoded.contains("\"active_turn_id\"")
+        && encoded.contains("\"active_turn_sequence_no\":42")
+        && encoded.contains("\"offset\":10")
+        && encoded.contains("\"limit\":5")
+        && encoded.contains("\"total\":17")
+}
+
 pub fn cli_renderer_current_provider_profile_fixture_passes() -> bool {
     let session = renderer_fixture_session_record("cli_renderer_fixture_current_provider_profile");
     session.model == CURRENT_PROVIDER_MODEL && session.base_url == CURRENT_PROVIDER_BASE_URL
@@ -540,6 +790,11 @@ mod tests {
     #[test]
     fn cli_json_history_renderer_respects_reasoning_visibility() {
         assert!(super::cli_json_history_renderer_respects_reasoning_visibility_fixture_passes());
+    }
+
+    #[test]
+    fn cli_session_read_payload_preserves_metadata_pages() {
+        assert!(super::cli_session_read_payload_preserves_metadata_pages_fixture_passes());
     }
 
     #[test]

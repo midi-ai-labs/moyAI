@@ -12,6 +12,15 @@ pub enum AccessMode {
 }
 
 impl AccessMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "default" => Some(Self::Default),
+            "auto_review" => Some(Self::AutoReview),
+            "full_access" => Some(Self::FullAccess),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",

@@ -1,4 +1,8 @@
-use crate::session::{ChangeKind, ProjectId, SessionId, SessionRecord, SessionStatus, ToolCallId};
+use crate::protocol::TurnId;
+use crate::session::{
+    ChangeKind, LoadedSessionStatus, LoadedSessionSummary, ProjectId, SessionId, SessionStatus,
+    ToolCallId,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,13 +115,31 @@ pub struct DesktopSessionRow {
     pub title: String,
     pub status_kind: SessionStatus,
     pub status: String,
+    pub loaded_status: LoadedSessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_sequence_no: Option<i64>,
+    #[serde(default)]
+    pub pending_permission_requests: u32,
+    #[serde(default)]
+    pub pending_user_input_requests: u32,
     pub short_id: String,
     pub label: String,
 }
 
 impl DesktopSessionRow {
-    pub(crate) fn from_session(session: &SessionRecord) -> Self {
-        Self::from_parts(session.id, &session.title, session.status)
+    pub(crate) fn from_loaded_summary(summary: &LoadedSessionSummary) -> Self {
+        Self::from_parts_with_loaded(
+            summary.session.id,
+            &summary.session.title,
+            summary.session.status,
+            summary.loaded_status,
+            summary.active_turn_id,
+            summary.active_turn_sequence_no,
+            summary.pending_permission_requests,
+            summary.pending_user_input_requests,
+        )
     }
 
     pub(crate) fn set_title_preserving_status(&mut self, title: &str) {
@@ -131,11 +153,38 @@ impl DesktopSessionRow {
     }
 
     pub(crate) fn from_parts(session_id: SessionId, title: &str, status: SessionStatus) -> Self {
+        Self::from_parts_with_loaded(
+            session_id,
+            title,
+            status,
+            LoadedSessionStatus::NotLoaded,
+            None,
+            None,
+            0,
+            0,
+        )
+    }
+
+    pub(crate) fn from_parts_with_loaded(
+        session_id: SessionId,
+        title: &str,
+        status: SessionStatus,
+        loaded_status: LoadedSessionStatus,
+        active_turn_id: Option<TurnId>,
+        active_turn_sequence_no: Option<i64>,
+        pending_permission_requests: u32,
+        pending_user_input_requests: u32,
+    ) -> Self {
         let mut row = Self {
             session_id,
             title: String::new(),
             status_kind: status,
             status: String::new(),
+            loaded_status,
+            active_turn_id,
+            active_turn_sequence_no,
+            pending_permission_requests,
+            pending_user_input_requests,
             short_id: short_session_id(session_id),
             label: String::new(),
         };
@@ -158,6 +207,14 @@ pub struct DesktopSessionDetail {
     pub thread_empty: bool,
     pub transcript_text: String,
     pub transcript_rows: Vec<DesktopTranscriptRow>,
+    #[serde(default)]
+    pub turn_page_offset: usize,
+    #[serde(default)]
+    pub turn_page_limit: usize,
+    #[serde(default)]
+    pub turn_page_total: usize,
+    #[serde(default)]
+    pub turn_page_has_more: bool,
     pub tool_status_text: String,
     pub progress_text: String,
     pub run_status_text: String,
@@ -207,6 +264,18 @@ impl DesktopSnapshot {
         self.session_details
             .iter()
             .find(|detail| detail.session_id == session_id)
+    }
+
+    pub fn replace_detail(&mut self, detail: DesktopSessionDetail) {
+        if let Some(existing) = self
+            .session_details
+            .iter_mut()
+            .find(|existing| existing.session_id == detail.session_id)
+        {
+            *existing = detail;
+        } else {
+            self.session_details.push(detail);
+        }
     }
 }
 
@@ -307,5 +376,33 @@ mod tests {
     #[test]
     fn desktop_session_row_status_typed_projection() {
         assert!(desktop_session_row_status_typed_projection_fixture_passes());
+    }
+
+    #[test]
+    fn desktop_session_row_loaded_active_projection() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let row = DesktopSessionRow::from_parts_with_loaded(
+            session_id,
+            "running thread",
+            SessionStatus::Running,
+            LoadedSessionStatus::Active,
+            Some(turn_id),
+            Some(7),
+            1,
+            2,
+        );
+
+        assert_eq!(row.status_kind, SessionStatus::Running);
+        assert_eq!(row.status, "running");
+        assert_eq!(row.loaded_status, LoadedSessionStatus::Active);
+        assert_eq!(row.active_turn_id, Some(turn_id));
+        assert_eq!(row.active_turn_sequence_no, Some(7));
+        assert_eq!(row.pending_permission_requests, 1);
+        assert_eq!(row.pending_user_input_requests, 2);
+        assert_eq!(
+            row.label,
+            format_session_row_parts("running thread", SessionStatus::Running, session_id)
+        );
     }
 }

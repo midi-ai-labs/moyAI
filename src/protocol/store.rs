@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, Transaction, params};
@@ -22,6 +23,10 @@ pub trait ProtocolEventStore {
         &self,
         session_id: SessionId,
         turn_id: TurnId,
+    ) -> Result<Vec<RuntimeEvent>, StorageError>;
+    fn list_runtime_events_for_session(
+        &self,
+        session_id: SessionId,
     ) -> Result<Vec<RuntimeEvent>, StorageError>;
     fn append_history_item(&self, item: &HistoryItem) -> Result<(), StorageError>;
     fn append_history_turn_bundle(
@@ -52,6 +57,16 @@ pub trait ProtocolEventStore {
         &self,
         session_id: SessionId,
     ) -> Result<Option<(TurnId, i64)>, StorageError>;
+    fn rollback_latest_turns(
+        &self,
+        session_id: SessionId,
+        num_turns: usize,
+    ) -> Result<Vec<TurnId>, StorageError>;
+    fn fork_canonical_items(
+        &self,
+        source_session_id: SessionId,
+        target_session_id: SessionId,
+    ) -> Result<(usize, usize), StorageError>;
 }
 
 #[derive(Clone)]
@@ -124,6 +139,41 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
                 id: parse_protocol_id::<RuntimeEventId>(&id, "runtime event")?,
                 session_id,
                 turn_id,
+                sequence_no,
+                created_at_ms,
+                msg: serde_json::from_str::<RuntimeEventMsg>(&msg_json)?,
+            });
+        }
+        Ok(events)
+    }
+
+    fn list_runtime_events_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<RuntimeEvent>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, turn_id, sequence_no, msg_json, created_at_ms
+             FROM protocol_runtime_events
+             WHERE session_id = ?1
+             ORDER BY rowid ASC",
+        )?;
+        let rows = statement.query_map(params![session_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (id, turn_id, sequence_no, msg_json, created_at_ms) = row?;
+            events.push(RuntimeEvent {
+                id: parse_protocol_id::<RuntimeEventId>(&id, "runtime event")?,
+                session_id,
+                turn_id: parse_protocol_id::<TurnId>(&turn_id, "runtime event turn")?,
                 sequence_no,
                 created_at_ms,
                 msg: serde_json::from_str::<RuntimeEventMsg>(&msg_json)?,
@@ -319,6 +369,161 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         latest_turn_position_for_session(&*connection, session_id)
     }
+
+    fn rollback_latest_turns(
+        &self,
+        session_id: SessionId,
+        num_turns: usize,
+    ) -> Result<Vec<TurnId>, StorageError> {
+        if num_turns == 0 {
+            return Err(StorageError::Message(
+                "rollback turn count must be greater than zero".to_string(),
+            ));
+        }
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let turn_ids =
+            latest_protocol_turn_ids_in_transaction(&transaction, session_id, num_turns)?;
+        if turn_ids.len() < num_turns {
+            return Err(StorageError::Message(format!(
+                "cannot rollback {num_turns} turn(s); session {session_id} only has {} canonical turn(s)",
+                turn_ids.len()
+            )));
+        }
+        for turn_id in &turn_ids {
+            transaction.execute(
+                "DELETE FROM protocol_turn_items WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM protocol_history_items WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM protocol_runtime_events WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM protocol_item_append_order WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(turn_ids)
+    }
+
+    fn fork_canonical_items(
+        &self,
+        source_session_id: SessionId,
+        target_session_id: SessionId,
+    ) -> Result<(usize, usize), StorageError> {
+        if source_session_id == target_session_id {
+            return Err(StorageError::Message(
+                "cannot fork canonical items into the same session".to_string(),
+            ));
+        }
+        let source_history = self.list_history_items_for_session(source_session_id)?;
+        let source_turns = self.list_turn_items_for_session(source_session_id)?;
+        let mut history_id_map = HashMap::new();
+        let mut forked_history = Vec::with_capacity(source_history.len());
+        for item in source_history {
+            let new_id = HistoryItemId::new();
+            history_id_map.insert(item.id, new_id);
+            forked_history.push(HistoryItem {
+                id: new_id,
+                session_id: target_session_id,
+                payload: fork_history_payload_for_session(item.payload, target_session_id),
+                ..item
+            });
+        }
+        let mut forked_turns = Vec::with_capacity(source_turns.len());
+        for item in source_turns {
+            let source_item_id = item
+                .source_item_id
+                .map(|source_id| {
+                    history_id_map.get(&source_id).copied().ok_or_else(|| {
+                        StorageError::Message(format!(
+                            "cannot fork turn item {}; source history item {} was not copied",
+                            item.id, source_id
+                        ))
+                    })
+                })
+                .transpose()?;
+            forked_turns.push(TurnItem {
+                id: TurnItemId::new(),
+                session_id: target_session_id,
+                source_item_id,
+                ..item
+            });
+        }
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        for item in &forked_history {
+            insert_history_item(&transaction, item)?;
+        }
+        for item in &forked_turns {
+            insert_turn_item(&transaction, item)?;
+        }
+        transaction.commit()?;
+        Ok((forked_history.len(), forked_turns.len()))
+    }
+}
+
+fn fork_history_payload_for_session(
+    payload: HistoryItemPayload,
+    target_session_id: SessionId,
+) -> HistoryItemPayload {
+    match payload {
+        HistoryItemPayload::UserTurn {
+            message_id,
+            content,
+            prompt_dispatch,
+            editor_context,
+            turn_context,
+        } => HistoryItemPayload::UserTurn {
+            message_id,
+            content,
+            prompt_dispatch,
+            editor_context,
+            turn_context: turn_context.map(|mut context| {
+                context.session_id = target_session_id;
+                Box::new(*context)
+            }),
+        },
+        HistoryItemPayload::ControlEnvelope { mut envelope } => {
+            envelope.session_id = target_session_id;
+            envelope.context.session_id = target_session_id;
+            HistoryItemPayload::ControlEnvelope { envelope }
+        }
+        other => other,
+    }
+}
+
+fn latest_protocol_turn_ids_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    limit: usize,
+) -> Result<Vec<TurnId>, StorageError> {
+    let mut statement = transaction.prepare(
+        "SELECT turn_id
+         FROM (
+           SELECT turn_id, MAX(append_position) AS last_position
+           FROM protocol_item_append_order
+           WHERE session_id = ?1
+           GROUP BY turn_id
+         )
+         ORDER BY last_position DESC
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![session_id.to_string(), limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut turn_ids = Vec::new();
+    for row in rows {
+        let value = row?;
+        turn_ids.push(parse_protocol_id::<TurnId>(&value, "rollback turn")?);
+    }
+    Ok(turn_ids)
 }
 
 fn latest_turn_position_for_session(

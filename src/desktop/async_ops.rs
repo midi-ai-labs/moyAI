@@ -10,6 +10,9 @@ pub enum DesktopAsyncOperationKind {
     HistoryExport,
     ProjectDelete,
     SessionDelete,
+    SessionArchive,
+    SessionRollback,
+    SessionSearch,
     PromptEnhance,
 }
 
@@ -26,6 +29,9 @@ impl DesktopAsyncOperationKind {
             Self::HistoryExport => "history_export",
             Self::ProjectDelete => "project_delete",
             Self::SessionDelete => "session_delete",
+            Self::SessionArchive => "session_archive",
+            Self::SessionRollback => "session_rollback",
+            Self::SessionSearch => "session_search",
             Self::PromptEnhance => "prompt_enhance",
         }
     }

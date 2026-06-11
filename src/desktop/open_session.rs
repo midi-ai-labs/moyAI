@@ -3,7 +3,9 @@ use crate::session::{SessionRecord, SessionStateSnapshot, TodoItem, Transcript};
 use crate::tui::state::{AppState, RunStatus};
 
 use super::models::{DesktopSessionDetail, DesktopTranscriptRowKind};
-use super::query::{build_session_detail, build_session_detail_from_app_state_with_session};
+use super::query::{
+    build_session_detail_from_app_state_with_session, build_session_detail_with_page,
+};
 
 #[derive(Debug, Clone)]
 pub struct OpenSessionView {
@@ -18,13 +20,21 @@ impl OpenSessionView {
         turn_items: &[TurnItem],
         state: SessionStateSnapshot,
         todos: Vec<TodoItem>,
+        turn_page_offset: usize,
+        turn_page_limit: usize,
+        turn_page_total: usize,
+        turn_page_has_more: bool,
     ) -> Self {
-        let stored_detail = build_session_detail(
+        let stored_detail = build_session_detail_with_page(
             session,
             state,
             todos,
             transcript.clone(),
             turn_items.to_vec(),
+            turn_page_offset,
+            turn_page_limit,
+            turn_page_total,
+            turn_page_has_more,
             None,
         );
         Self {
@@ -48,6 +58,10 @@ impl OpenSessionView {
     ) -> DesktopSessionDetail {
         let mut detail =
             build_session_detail_from_app_state_with_session(app_state, Some(&self.session));
+        detail.turn_page_offset = self.stored_detail.turn_page_offset;
+        detail.turn_page_limit = self.stored_detail.turn_page_limit;
+        detail.turn_page_total = self.stored_detail.turn_page_total;
+        detail.turn_page_has_more = self.stored_detail.turn_page_has_more;
         if detail.artifacts.is_empty() {
             let fallback = fallback_snapshot_detail.unwrap_or(&self.stored_detail);
             detail.artifacts = fallback.artifacts.clone();

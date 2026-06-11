@@ -26,6 +26,24 @@ pub async fn recent_sessions(
     service.list_sessions(project_id, limit).await
 }
 
+pub async fn search_sessions(
+    service: &SessionService,
+    project_id: ProjectId,
+    query: &str,
+    include_archived: bool,
+    limit: usize,
+) -> Result<Vec<SessionRecord>, SessionError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return service
+            .list_sessions_with_archived(project_id, limit, include_archived)
+            .await;
+    }
+    service
+        .search_sessions(project_id, query, limit, include_archived)
+        .await
+}
+
 pub async fn global_recent_sessions(
     service: &SessionService,
     limit: usize,
@@ -111,6 +129,7 @@ pub(crate) fn session_view_rejects_empty_canonical_history_fixture_passes() -> b
                     cwd: "C:/workspace".into(),
                     model: TUI_QUERY_FIXTURE_MODEL.to_string(),
                     base_url: TUI_QUERY_FIXTURE_BASE_URL.to_string(),
+                    access_mode: crate::config::AccessMode::Default,
                 })
                 .await
             {

@@ -819,11 +819,9 @@ impl<'a> TurnRuntime<'a> {
                 &step_request.state,
                 &lifecycle_guard.docs_supporting_context_budget_exhausted,
             ) {
-                tools.retain(|tool| {
-                    TurnLifecycleKernel::docs_route_supporting_context_budget_recovery_tool_visible(
-                        &tool.name,
-                    )
-                });
+                TurnLifecycleKernel::apply_docs_route_supporting_context_budget_recovery_surface(
+                    &mut tools,
+                );
             }
             let authoring_grounding_missing_targets = authoring_missing_grounding_targets(
                 &step_request.runtime_input.history_items,
@@ -856,12 +854,10 @@ impl<'a> TurnRuntime<'a> {
                     &lifecycle_guard.authoring_supporting_context_budget_exhausted,
                 );
             if authoring_supporting_context_budget_recovery_active {
-                tools.retain(|tool| {
-                    TurnLifecycleKernel::authoring_supporting_context_budget_recovery_tool_visible(
-                        &tool.name,
-                        authoring_supporting_context_budget_recovery_needs_read,
-                    )
-                });
+                TurnLifecycleKernel::apply_authoring_supporting_context_budget_recovery_surface(
+                    &mut tools,
+                    authoring_supporting_context_budget_recovery_needs_read,
+                );
                 if let Some(envelope) = authoring_grounding_recovery.as_ref() {
                     constrain_read_schema_to_missing_authoring_targets(&mut tools, envelope);
                 }
@@ -914,16 +910,10 @@ impl<'a> TurnRuntime<'a> {
                         ),
                     );
             if singleton_missing_authoring_target_create_action_active {
-                TurnLifecycleKernel::augment_tools_from_stable_surface(
+                TurnLifecycleKernel::apply_singleton_missing_authoring_target_create_action_surface(
                     &mut tools,
                     &stable_tools,
-                    |tool_name| {
-                        TurnLifecycleKernel::singleton_missing_authoring_target_create_action_tool_visible(tool_name)
-                    },
                 );
-                tools.retain(|tool| {
-                    TurnLifecycleKernel::singleton_missing_authoring_target_create_action_tool_visible(&tool.name)
-                });
             }
             let existing_target_grounding_recovery_active =
                 TurnLifecycleKernel::existing_target_grounding_recovery_active(
@@ -936,14 +926,10 @@ impl<'a> TurnRuntime<'a> {
                     ),
                 );
             if existing_target_grounding_recovery_active {
-                TurnLifecycleKernel::augment_tools_from_stable_surface(
+                TurnLifecycleKernel::apply_existing_target_grounding_recovery_surface(
                     &mut tools,
                     &stable_tools,
-                    TurnLifecycleKernel::existing_target_grounding_recovery_tool_visible,
                 );
-                tools.retain(|tool| {
-                    TurnLifecycleKernel::existing_target_grounding_recovery_tool_visible(&tool.name)
-                });
                 let envelope = authoring_grounding_recovery_envelope(
                     &step_request.runtime_input.history_items,
                     &step_request.state,
@@ -965,11 +951,9 @@ impl<'a> TurnRuntime<'a> {
             if repair_supporting_context_budget_recovery_active
                 && !patch_context_mismatch_grounding_active
             {
-                tools.retain(|tool| {
-                    TurnLifecycleKernel::repair_supporting_context_budget_recovery_tool_visible(
-                        &tool.name,
-                    )
-                });
+                TurnLifecycleKernel::apply_repair_supporting_context_budget_recovery_surface(
+                    &mut tools,
+                );
             }
             let pre_authority_tool_names = tools
                 .iter()
@@ -980,25 +964,15 @@ impl<'a> TurnRuntime<'a> {
                 if step_request.state.route == TaskRoute::Docs
                     && step_request.state.process_phase == crate::session::ProcessPhase::Author
                 {
-                    TurnLifecycleKernel::augment_tools_from_stable_surface(
+                    TurnLifecycleKernel::apply_docs_patch_context_mismatch_grounding_surface(
                         &mut tools,
                         &stable_tools,
-                        TurnLifecycleKernel::docs_patch_context_mismatch_grounding_tool_visible,
                     );
-                    tools.retain(|tool| {
-                        TurnLifecycleKernel::docs_patch_context_mismatch_grounding_tool_visible(
-                            &tool.name,
-                        )
-                    });
                 } else {
-                    TurnLifecycleKernel::augment_tools_from_stable_surface(
+                    TurnLifecycleKernel::apply_verification_repair_target_grounding_surface(
                         &mut tools,
                         &stable_tools,
-                        TurnLifecycleKernel::verification_repair_target_grounding_surface_tool_visible,
                     );
-                    tools.retain(|tool| {
-                        TurnLifecycleKernel::verification_repair_target_grounding_surface_tool_visible(&tool.name)
-                    });
                     verification_target_grounding_active = true;
                 }
             } else if !repair_supporting_context_budget_recovery_active
@@ -1007,16 +981,10 @@ impl<'a> TurnRuntime<'a> {
                     &pre_authority_tool_names,
                 )
             {
-                TurnLifecycleKernel::augment_tools_from_stable_surface(
+                TurnLifecycleKernel::apply_verification_repair_target_grounding_surface(
                     &mut tools,
                     &stable_tools,
-                    TurnLifecycleKernel::verification_repair_target_grounding_surface_tool_visible,
                 );
-                tools.retain(|tool| {
-                    TurnLifecycleKernel::verification_repair_target_grounding_surface_tool_visible(
-                        &tool.name,
-                    )
-                });
                 verification_target_grounding_active = true;
             }
             let provider_noncompliance_edit_recovery_active =
@@ -1043,18 +1011,10 @@ impl<'a> TurnRuntime<'a> {
                     &lifecycle_guard.wrong_authoring_target_counts,
                 ) && !malformed_write_patch_recovery_active
                     && !malformed_apply_patch_write_recovery_active;
-            if provider_noncompliance_edit_recovery_active
-                && tools.iter().any(|tool| {
-                    TurnLifecycleKernel::provider_noncompliance_edit_recovery_tool_visible(
-                        &tool.name,
-                    )
-                })
-            {
-                tools.retain(|tool| {
-                    TurnLifecycleKernel::provider_noncompliance_edit_recovery_tool_visible(
-                        &tool.name,
-                    )
-                });
+            if provider_noncompliance_edit_recovery_active {
+                TurnLifecycleKernel::apply_provider_noncompliance_edit_recovery_surface_if_visible(
+                    &mut tools,
+                );
             }
             if !repair_supporting_context_budget_recovery_active
                 && !provider_noncompliance_edit_recovery_active
@@ -1068,16 +1028,10 @@ impl<'a> TurnRuntime<'a> {
                         .collect::<BTreeSet<_>>(),
                 )
             {
-                TurnLifecycleKernel::augment_tools_from_stable_surface(
+                TurnLifecycleKernel::apply_verification_repair_target_grounding_surface(
                     &mut tools,
                     &stable_tools,
-                    TurnLifecycleKernel::verification_repair_target_grounding_surface_tool_visible,
                 );
-                tools.retain(|tool| {
-                    TurnLifecycleKernel::verification_repair_target_grounding_surface_tool_visible(
-                        &tool.name,
-                    )
-                });
                 verification_target_grounding_active = true;
             }
             let open_obligation_final_message_recovery_active = lifecycle_guard
@@ -1586,10 +1540,17 @@ impl<'a> TurnRuntime<'a> {
                             .projection_bundle
                             .tool_result_feedback,
                     );
-                    sink.emit(crate::session::RunEvent::ToolProposalRejected {
+                    let event = crate::session::RunEvent::ToolProposalRejected {
                         tool_call_id: source_call_id,
                         proposal,
-                    })?;
+                    };
+                    record_tool_proposal_rejected_event(
+                        &self.agent.store,
+                        request.session.session.id,
+                        request.protocol_turn_id,
+                        event,
+                        sink,
+                    )?;
                 }
                 let guard_key = open_obligation_final_message_guard_key(
                     &step_request.state,
@@ -3323,6 +3284,160 @@ async fn persist_provider_token_accounting(
     Ok(())
 }
 
+fn record_tool_proposal_rejected_event(
+    store: &StoreBundle,
+    session_id: SessionId,
+    protocol_turn_id: TurnId,
+    event: crate::session::RunEvent,
+    sink: &mut dyn RunEventSink,
+) -> Result<(), AgentError> {
+    let Some(sequence_no) = sink.reserve_protocol_sequence_no() else {
+        sink.emit(event)?;
+        return Ok(());
+    };
+    if let Some(projection) = crate::protocol::project_protocol_run_event(
+        &event,
+        Some(session_id),
+        protocol_turn_id,
+        sequence_no,
+    ) {
+        store.protocol_event_store().append_event_bundle(
+            &projection.runtime_event,
+            projection.history_item.as_ref(),
+            projection.turn_item.as_ref(),
+        )?;
+    }
+    sink.emit_pre_recorded(event)?;
+    Ok(())
+}
+
+pub(crate) fn rejected_final_message_event_persists_for_provider_replay_fixture_passes() -> bool {
+    use crate::session::RunEvent;
+    use crate::storage::{SqliteStore, StoragePaths};
+
+    struct CountingSink {
+        next_sequence_no: i64,
+        emitted: Vec<RunEvent>,
+    }
+
+    impl RunEventSink for CountingSink {
+        fn emit(&mut self, event: RunEvent) -> Result<(), crate::error::RuntimeError> {
+            self.next_sequence_no += 1;
+            self.emitted.push(event);
+            Ok(())
+        }
+
+        fn reserve_protocol_sequence_no(&mut self) -> Option<i64> {
+            let sequence_no = self.next_sequence_no;
+            self.next_sequence_no += 1;
+            Some(sequence_no)
+        }
+
+        fn emit_pre_recorded(&mut self, event: RunEvent) -> Result<(), crate::error::RuntimeError> {
+            self.emitted.push(event);
+            Ok(())
+        }
+    }
+
+    let unique = format!(
+        "moyai-rejected-final-history-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    );
+    let root_path = std::env::temp_dir().join(unique);
+    let Ok(data_dir) = Utf8PathBuf::from_path_buf(root_path) else {
+        return false;
+    };
+    let paths = StoragePaths {
+        data_dir: data_dir.clone(),
+        database_path: data_dir.join("moyai.sqlite3"),
+        truncation_dir: data_dir.join("truncation"),
+    };
+    let Ok(sqlite) = SqliteStore::open(&paths) else {
+        return false;
+    };
+    if sqlite.migrate().is_err() {
+        let _ = std::fs::remove_dir_all(data_dir.as_std_path());
+        return false;
+    }
+    let store = StoreBundle::new(sqlite);
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let projection_id = ProjectionId::new();
+    let event = RunEvent::ToolProposalRejected {
+        tool_call_id: crate::session::ToolCallId::new(),
+        proposal: crate::protocol::RejectedToolProposal {
+            proposal_id: crate::protocol::ToolProposalId::new(),
+            source_call_id: crate::session::ToolCallId::new(),
+            requested_tool: "final_assistant_message".to_string(),
+            effective_tool: "final_assistant_message".to_string(),
+            resolved_tool: ToolName::Invalid,
+            original_arguments: json!({
+                "projection_id": projection_id.to_string(),
+                "text": ""
+            }),
+            adjusted_arguments: None,
+            allowed_surface: vec![ToolName::ApplyPatch],
+            blocked_reason: "The provider emitted a final message while obligations remain open."
+                .to_string(),
+            projection_id,
+            semantic_class: "text_final_while_obligations_open".to_string(),
+            candidate_repair_id: None,
+            payload_hash: "open-obligation-final-hash".to_string(),
+            contract_refs: vec!["failed_edit_control_recovery_projection".to_string()],
+            evidence_refs: vec!["required_write_content_shape_mismatch:active-target".to_string()],
+        },
+    };
+    let mut sink = CountingSink {
+        next_sequence_no: 1,
+        emitted: Vec::new(),
+    };
+    let recorded =
+        record_tool_proposal_rejected_event(&store, session_id, turn_id, event, &mut sink).is_ok();
+    let history_items = store
+        .protocol_event_store()
+        .list_history_items_for_session(session_id)
+        .unwrap_or_default();
+    let session = crate::session::SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "rejected final replay persistence fixture".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: LOOP_FIXTURE_MODEL.to_string(),
+        base_url: LOOP_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: None,
+    };
+    let replay = crate::agent::prompt::build_provider_replay_messages_from_history_items(
+        &session,
+        &history_items,
+        32,
+    );
+    let replay_text = serde_json::to_string(&replay).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(data_dir.as_std_path());
+    recorded
+        && sink.emitted.len() == 1
+        && history_items.iter().any(|item| {
+            matches!(
+                &item.payload,
+                HistoryItemPayload::RejectedToolProposal { proposal }
+                    if proposal.semantic_class == "text_final_while_obligations_open"
+                        && proposal.effective_tool == "final_assistant_message"
+                        && proposal.allowed_surface == vec![ToolName::ApplyPatch]
+            )
+        })
+        && replay_text.contains("Rejected model action evidence")
+        && replay_text.contains("text_final_while_obligations_open")
+        && replay_text.contains("Allowed tool surface: [apply_patch]")
+        && replay_text.contains("current TurnControlEnvelope")
+}
+
 pub(crate) fn terminal_token_accounting_sequence_fixture_passes() -> bool {
     use crate::protocol::{ProtocolEventStore, RuntimeEventMsg};
     use crate::session::{
@@ -3403,6 +3518,7 @@ pub(crate) fn terminal_token_accounting_sequence_fixture_passes() -> bool {
                     cwd: workspace_root.to_path_buf(),
                     model: LOOP_FIXTURE_MODEL.to_string(),
                     base_url: LOOP_FIXTURE_BASE_URL.to_string(),
+                    access_mode: crate::config::AccessMode::Default,
                 })
                 .await
                 .map_err(|error| crate::error::RuntimeError::Message(error.to_string()))?;
@@ -4325,6 +4441,7 @@ pub(crate) fn control_envelope_preserves_current_turn_id_fixture_passes() -> boo
                 cwd: root.clone(),
                 model: model.name.clone(),
                 base_url: config.model.base_url.clone(),
+                access_mode: crate::config::AccessMode::Default,
                 created_at_ms: 1,
                 updated_at_ms: 2,
                 completed_at_ms: None,
@@ -11899,6 +12016,7 @@ pub(crate) fn stale_invalid_edit_recovery_is_not_open_obligation_after_verificat
                 cwd: root.clone(),
                 model: model.name.clone(),
                 base_url: LOOP_FIXTURE_BASE_URL.to_string(),
+                access_mode: crate::config::AccessMode::Default,
                 created_at_ms: 1,
                 updated_at_ms: 2,
                 completed_at_ms: None,

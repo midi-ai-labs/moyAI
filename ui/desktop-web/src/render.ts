@@ -1,7 +1,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { icon } from "./icons";
 import { renderMarkdown } from "./markdown";
-import type { DesktopWebState, FileChangeRow, ProjectRow, TranscriptRow } from "./types";
+import type { DesktopWebState, FileChangeRow, ProjectRow, SessionRow, TranscriptRow } from "./types";
 import { displayAccessLabel, escapeHtml, fileName, shortenPath, validateConfigInput } from "./utils";
 
 export type { LocalConfirmation } from "./render_overlays";
@@ -122,21 +122,33 @@ function renderProjectSessionRows(state: DesktopWebState): string {
   if (state.selected_project_index < 0) {
     return "";
   }
+  const search = `
+    <div class="session-search">
+      <input id="session-search" value="${escapeHtml(state.session_search_text)}" placeholder="セッション検索" aria-label="セッション検索" />
+      <button class="${state.session_search_include_archived ? "selected" : ""}" data-action="toggle-session-archived-search" title="アーカイブ済みを含める" aria-label="アーカイブ済みを含める">${icon("archive")}</button>
+    </div>
+  `;
+  const archiveAction = state.session_search_include_archived ? "unarchive-session" : "archive-session";
   const rows = state.session_rows
     .map((row, index) =>
       renderNavRow(
         row.label,
-        "開発チャット",
+        sessionRowSubtitle(row, "開発チャット"),
         index === state.selected_session_index,
         "session",
         index,
+        row.loaded_status === "active" ? "rejoin-session" : "",
+        archiveAction,
+        row.loaded_status === "active" ? "" : "rollback-session",
         "delete-session",
         state.busy && index === state.selected_session_index
       )
     )
     .join("");
   const activeFallback = rows.length === 0 ? renderActiveProjectSessionPlaceholder(state) : "";
-  return rows.length > 0 || activeFallback.length > 0 ? `<div class="project-session-list">${rows}${activeFallback}</div>` : "";
+  return rows.length > 0 || activeFallback.length > 0 || state.session_search_text.trim().length > 0
+    ? `<div class="project-session-list">${search}${rows}${activeFallback}</div>`
+    : `<div class="project-session-list">${search}</div>`;
 }
 
 function renderActiveProjectSessionPlaceholder(state: DesktopWebState): string {
@@ -180,15 +192,36 @@ function renderChatRows(state: DesktopWebState): string {
     .map((row, index) =>
       renderNavRow(
         row.label,
-        "通常チャット",
+        sessionRowSubtitle(row, "通常チャット"),
         row.session_id === selectedChatSessionId,
         "chat-session",
         index,
+        "",
+        "",
+        row.loaded_status === "active" ? "" : "rollback-session",
         "delete-chat-session",
         state.selected_project_index < 0 && state.busy && row.session_id === selectedChatSessionId
       )
     )
     .join("");
+}
+
+function sessionRowSubtitle(row: SessionRow, fallback: string): string {
+  if (row.loaded_status === "active") {
+    const pending = row.pending_user_input_requests + row.pending_permission_requests;
+    const prefix = pending > 0 ? "確認待ち" : "実行中";
+    const turn =
+      typeof row.active_turn_sequence_no === "number"
+        ? `turn ${row.active_turn_sequence_no}`
+        : row.active_turn_id
+          ? `turn ${row.active_turn_id.slice(0, 8)}`
+          : "active turn";
+    return `${prefix} · ${turn}`;
+  }
+  if (row.loaded_status === "system_error") {
+    return "状態取得エラー";
+  }
+  return fallback;
 }
 
 export function renderSidebar(state: DesktopWebState): string {
@@ -226,6 +259,11 @@ export function renderTopbar(state: DesktopWebState): string {
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const exportDisabled = !state.history_export_enabled;
   const exportTitle = exportDisabled ? "保存できる表示中の履歴がありません" : "表示中の履歴をMarkdown保存";
+  const turnPageVisible = state.turn_page_total > state.turn_page_limit && state.turn_page_limit > 0;
+  const turnPageStart = state.turn_page_total === 0 ? 0 : state.turn_page_offset + 1;
+  const turnPageEnd = Math.min(state.turn_page_total, state.turn_page_offset + state.turn_page_limit);
+  const previousDisabled = state.turn_page_offset === 0 || state.busy;
+  const nextDisabled = !state.turn_page_has_more || state.busy;
   return `
     <header class="topbar">
       <div class="title-row">
@@ -247,6 +285,13 @@ export function renderTopbar(state: DesktopWebState): string {
           <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${escapeHtml(workspaceLabel)}</button>
           <button data-action="show-provider" title="${escapeHtml(state.provider_label)}">${escapeHtml(state.model_label)}</button>
           <button data-action="toggle-access" title="アクセス権限">${escapeHtml(displayAccessLabel(state.access_label))}</button>
+          ${
+            turnPageVisible
+              ? `<span class="turn-page-chip">${turnPageStart}-${turnPageEnd}/${state.turn_page_total}</span>
+                 <button class="icon-button" data-action="load-previous-turn-page" title="前の履歴ページ" aria-label="前の履歴ページ" ${previousDisabled ? "disabled" : ""}>${icon("chevron-left")}</button>
+                 <button class="icon-button" data-action="load-next-turn-page" title="次の履歴ページ" aria-label="次の履歴ページ" ${nextDisabled ? "disabled" : ""}>${icon("chevron-right")}</button>`
+              : ""
+          }
           <button class="icon-button" data-action="export-transcript" title="${exportTitle}" aria-label="${exportTitle}" ${exportDisabled ? "disabled" : ""}>${icon("download")}</button>
         </div>
       </div>
@@ -843,15 +888,34 @@ function renderNavRow(
   selected: boolean,
   kind: string,
   index: number,
+  rejoinAction: string,
+  archiveAction: string,
+  rollbackAction: string,
   deleteAction: string,
   running = false
 ): string {
+  const actionClass = `${rejoinAction ? "has-rejoin" : ""} ${archiveAction ? "has-archive" : ""} ${rollbackAction ? "has-rollback" : ""}`.trim();
   return `
-    <div class="nav-row-wrap ${selected ? "selected" : ""}">
+    <div class="nav-row-wrap ${actionClass} ${selected ? "selected" : ""}">
       <button class="nav-row" data-action="${kind}" data-index="${index}">
         <span class="nav-title">${running ? '<span class="busy-spinner" title="実行中"></span>' : ""}<span>${escapeHtml(label)}</span></span>
         <small>${escapeHtml(detail)}</small>
       </button>
+      ${
+        rejoinAction
+          ? `<button class="row-action row-rejoin" data-action="${rejoinAction}" data-index="${index}" title="実行中セッションに再参加" aria-label="実行中セッションに再参加">${icon("refresh")}</button>`
+          : ""
+      }
+      ${
+        archiveAction
+          ? `<button class="row-action row-archive" data-action="${archiveAction}" data-index="${index}" title="${archiveAction === "unarchive-session" ? "復元" : "アーカイブ"}" aria-label="${archiveAction === "unarchive-session" ? "復元" : "アーカイブ"}">${icon("archive")}</button>`
+          : ""
+      }
+      ${
+        rollbackAction
+          ? `<button class="row-action row-rollback" data-action="${rollbackAction}" data-index="${index}" title="最新turnを戻す" aria-label="最新turnを戻す">${icon("undo")}</button>`
+          : ""
+      }
       <button class="row-delete" data-action="${deleteAction}" data-index="${index}" title="削除" aria-label="削除">${icon("x")}</button>
     </div>
   `;

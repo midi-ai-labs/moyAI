@@ -131,6 +131,9 @@ export function wireEvents(state: DesktopWebState, context: EventContext): void 
   document.querySelector<HTMLInputElement>("#local-search")?.addEventListener("input", (event) => {
     void context.mutate("set_local_search", { text: (event.currentTarget as HTMLInputElement).value });
   });
+  document.querySelector<HTMLInputElement>("#session-search")?.addEventListener("input", (event) => {
+    void context.mutate("set_session_search", { text: (event.currentTarget as HTMLInputElement).value });
+  });
   document.querySelector<HTMLTextAreaElement>("#review-draft")?.addEventListener("input", (event) => {
     void command<DesktopWebState>("set_review_draft", {
       text: (event.currentTarget as HTMLTextAreaElement).value,
@@ -217,11 +220,20 @@ function dispatchAction(action: string, index: number, value: string, state: Des
   }
   if (action === "cancel-run" && (state.busy || state.confirmation_visible)) void context.mutate("cancel_run");
   if (action === "refresh") void context.mutate("refresh_desktop");
+  if (action === "load-previous-turn-page") void context.mutate("load_previous_turn_page");
+  if (action === "load-next-turn-page") void context.mutate("load_next_turn_page");
   if (action === "new-chat") void context.mutate("new_chat");
   if (action === "new-project-session") void context.mutate("new_project_session", { index });
   if (action === "project") void context.mutate("select_project", { index });
   if (action === "session") void context.mutate("select_session", { index });
+  if (action === "rejoin-session") void context.mutate("rejoin_session", { index });
   if (action === "chat-session") void context.mutate("select_chat_session", { index });
+  if (action === "toggle-session-archived-search") {
+    void context.mutate("set_session_search_include_archived", { includeArchived: !state.session_search_include_archived });
+  }
+  if (action === "archive-session") return requestLocalArchiveState("archive_session", index, state, context);
+  if (action === "unarchive-session") return requestLocalArchiveState("unarchive_session", index, state, context);
+  if (action === "rollback-session") return requestLocalRollback(index, state, context);
   if (action === "delete-project") return requestLocalDelete("project", index, state, context);
   if (action === "delete-session") return requestLocalDelete("session", index, state, context);
   if (action === "delete-chat-session") return requestLocalDelete("chat_session", index, state, context);
@@ -230,6 +242,8 @@ function dispatchAction(action: string, index: number, value: string, state: Des
     return context.render(state);
   }
   if (action === "confirm-local-delete") return confirmLocalDelete(context);
+  if (action === "confirm-local-archive-state") return confirmLocalArchiveState(context);
+  if (action === "confirm-local-rollback") return confirmLocalRollback(context);
   if (action === "artifact") void context.mutate("select_artifact", { index });
   if (action === "export-transcript" && state.history_export_enabled) void context.mutate("export_transcript_markdown");
   if (action === "export-history") void context.mutate("export_history_markdown");
@@ -279,6 +293,28 @@ function dispatchAction(action: string, index: number, value: string, state: Des
   if (action === "deny") void context.mutate("answer_permission", { allow: false });
 }
 
+function requestLocalArchiveState(
+  kind: "archive_session" | "unarchive_session",
+  index: number,
+  state: DesktopWebState,
+  context: EventContext
+): void {
+  if (state.busy) {
+    return;
+  }
+  const row = state.session_rows[index];
+  if (!row) {
+    return;
+  }
+  context.uiState.pendingLocalConfirmation = {
+    kind,
+    index,
+    title: row.label,
+    detail: row.session_id,
+  };
+  context.render(state);
+}
+
 function requestLocalDelete(
   kind: "project" | "session" | "chat_session",
   index: number,
@@ -302,6 +338,23 @@ function requestLocalDelete(
   context.render(state);
 }
 
+function requestLocalRollback(index: number, state: DesktopWebState, context: EventContext): void {
+  if (state.busy) {
+    return;
+  }
+  const row = state.session_rows[index];
+  if (!row || row.loaded_status === "active") {
+    return;
+  }
+  context.uiState.pendingLocalConfirmation = {
+    kind: "rollback_session",
+    index,
+    title: row.label,
+    detail: row.session_id,
+  };
+  context.render(state);
+}
+
 function confirmLocalDelete(context: EventContext): void {
   const pending = context.uiState.pendingLocalConfirmation;
   if (!pending) {
@@ -315,6 +368,24 @@ function confirmLocalDelete(context: EventContext): void {
   } else {
     void context.mutate("delete_session", { index: pending.index });
   }
+}
+
+function confirmLocalArchiveState(context: EventContext): void {
+  const pending = context.uiState.pendingLocalConfirmation;
+  if (!pending || (pending.kind !== "archive_session" && pending.kind !== "unarchive_session")) {
+    return;
+  }
+  context.uiState.pendingLocalConfirmation = null;
+  void context.mutate(pending.kind === "archive_session" ? "archive_session" : "unarchive_session", { index: pending.index });
+}
+
+function confirmLocalRollback(context: EventContext): void {
+  const pending = context.uiState.pendingLocalConfirmation;
+  if (!pending || pending.kind !== "rollback_session") {
+    return;
+  }
+  context.uiState.pendingLocalConfirmation = null;
+  void context.mutate("rollback_session", { index: pending.index });
 }
 
 function submitConfigAction(commandName: string, state: DesktopWebState, context: EventContext): void {

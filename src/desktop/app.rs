@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::app::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
-use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest};
+use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionSteerRequest};
 use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode};
 use crate::config::loader::global_config_path;
 use crate::config::merge::apply_patch as apply_config_patch;
@@ -24,8 +24,8 @@ use crate::session::markdown::{
     render_codex_turn_block_markdown,
 };
 use crate::session::{
-    EditorContext, ProjectId, ProjectRecord, RunEvent, RunSummary, SessionId, SessionRecord,
-    SessionStatus, TodoItem, history_items_to_markdown, history_markdown_file_name,
+    EditorContext, LoadedSessionStatus, ProjectId, ProjectRecord, RunEvent, RunSummary, SessionId,
+    SessionRecord, SessionStatus, TodoItem, history_items_to_markdown, history_markdown_file_name,
 };
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
@@ -37,7 +37,8 @@ use super::models::DesktopTranscriptRow;
 use super::navigation::NavigationRequestId;
 use super::preferences::DesktopPreferences;
 use super::query::{
-    load_session_detail, load_snapshot, load_snapshot_continue_last, load_snapshot_for_selection,
+    DESKTOP_TURN_PAGE_LIMIT, load_session_detail, load_snapshot, load_snapshot_continue_last,
+    load_snapshot_for_selection, load_snapshot_for_session_search,
 };
 use super::state::DesktopState;
 
@@ -60,6 +61,24 @@ enum RuntimeMessage {
         session_id: SessionId,
         result: Result<super::models::DesktopSnapshot, String>,
     },
+    SessionArchived {
+        session_id: SessionId,
+        archived: bool,
+        result: Result<super::models::DesktopSnapshot, String>,
+    },
+    SessionRolledBack {
+        session_id: SessionId,
+        result: Result<DesktopRollbackLoaded, String>,
+    },
+    TurnPageLoaded {
+        session_id: SessionId,
+        result: Result<LoadedSession, String>,
+    },
+    LiveSessionRefreshed {
+        session_id: SessionId,
+        result: Result<LoadedSession, String>,
+    },
+    SessionSearchLoaded(Result<super::models::DesktopSnapshot, String>),
     ProjectDeleted {
         project_id: ProjectId,
         project_root: Utf8PathBuf,
@@ -77,6 +96,7 @@ enum RuntimeMessage {
         requested_base_url: String,
         result: Result<(), String>,
     },
+    SteerStored(Result<(), String>),
     HistoryExported(Result<Utf8PathBuf, String>),
     WorkspaceSwitched {
         request_id: NavigationRequestId,
@@ -121,6 +141,19 @@ impl RuntimeMessage {
             RuntimeMessage::SessionDeleted { .. } => {
                 RuntimeMessageAsyncContract::BackgroundOperation
             }
+            RuntimeMessage::SessionArchived { .. } => {
+                RuntimeMessageAsyncContract::BackgroundOperation
+            }
+            RuntimeMessage::SessionRolledBack { .. } => {
+                RuntimeMessageAsyncContract::BackgroundOperation
+            }
+            RuntimeMessage::TurnPageLoaded { .. } => {
+                RuntimeMessageAsyncContract::NavigationOperation
+            }
+            RuntimeMessage::LiveSessionRefreshed { .. } => RuntimeMessageAsyncContract::RunStream,
+            RuntimeMessage::SessionSearchLoaded(_) => {
+                RuntimeMessageAsyncContract::NavigationOperation
+            }
             RuntimeMessage::ProjectDeleted { .. } => {
                 RuntimeMessageAsyncContract::BackgroundOperation
             }
@@ -133,6 +166,7 @@ impl RuntimeMessage {
             RuntimeMessage::StartupDoclingChecked { .. } => {
                 RuntimeMessageAsyncContract::ProviderOperation
             }
+            RuntimeMessage::SteerStored(_) => RuntimeMessageAsyncContract::BackgroundOperation,
             RuntimeMessage::HistoryExported(_) => RuntimeMessageAsyncContract::BackgroundOperation,
             RuntimeMessage::WorkspaceSwitched { .. }
             | RuntimeMessage::WorkspaceSwitchedForNewProjectSession { .. } => {
@@ -145,6 +179,7 @@ impl RuntimeMessage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionLoadReason {
     UserSelection,
+    RunningRejoin,
     CurrentRefresh,
 }
 
@@ -154,12 +189,22 @@ struct LoadedSession {
     turn_items: Vec<crate::protocol::TurnItem>,
     state: crate::session::SessionStateSnapshot,
     todos: Vec<TodoItem>,
+    turn_page_offset: usize,
+    turn_page_limit: usize,
+    turn_page_total: usize,
+    turn_page_has_more: bool,
 }
 
 #[derive(Clone)]
 struct WorkspaceLoadResult {
     app: App,
     snapshot: super::models::DesktopSnapshot,
+}
+
+struct DesktopRollbackLoaded {
+    snapshot: super::models::DesktopSnapshot,
+    loaded: LoadedSession,
+    dropped_turn_count: usize,
 }
 
 pub(crate) struct DesktopController {
@@ -273,9 +318,28 @@ impl DesktopController {
             state.set_window_opacity_percent(opacity);
         }
         if let Some(session_id) = args.session_id.or_else(|| state.selected_session_id()) {
-            let (session, transcript, turn_items, session_state, todos) =
-                load_session_detail(&app, session_id).await?;
-            state.load_open_session(&session, &transcript, &turn_items, session_state, todos);
+            let (
+                session,
+                transcript,
+                turn_items,
+                session_state,
+                todos,
+                turn_page_offset,
+                turn_page_limit,
+                turn_page_total,
+                turn_page_has_more,
+            ) = load_session_detail(&app, session_id).await?;
+            state.load_open_session(
+                &session,
+                &transcript,
+                &turn_items,
+                session_state,
+                todos,
+                turn_page_offset,
+                turn_page_limit,
+                turn_page_total,
+                turn_page_has_more,
+            );
         }
         let mut controller = Self {
             app,
@@ -354,6 +418,35 @@ impl DesktopController {
         }
     }
 
+    pub(crate) fn rejoin_selected_session(&mut self) {
+        if self.state.is_busy() {
+            self.state.set_status_message(
+                "running session cannot be rejoined while a local run is active",
+            );
+            return;
+        }
+        let Some(session_id) = self.state.selected_session_id() else {
+            self.state
+                .set_status_message("select a running session before rejoining");
+            return;
+        };
+        let is_active_loaded = self
+            .state
+            .snapshot
+            .session_rows
+            .get(self.state.snapshot.selected_session_index)
+            .is_some_and(|row| row.loaded_status == LoadedSessionStatus::Active);
+        if !is_active_loaded {
+            self.state
+                .set_status_message("selected session is not an active loaded session");
+            return;
+        }
+        self.state
+            .set_status_message(format!("rejoining running session {session_id}..."));
+        let request_id = self.state.begin_session_load(session_id);
+        self.spawn_session_rejoin(session_id, Some(request_id));
+    }
+
     pub(crate) fn open_selected_project(&mut self) {
         if self.state.is_busy() {
             self.state
@@ -388,6 +481,81 @@ impl DesktopController {
             .set_status_message(format!("deleting chat {}...", session_id));
         self.state.begin_session_delete_mutation();
         self.spawn_session_delete(session_id);
+    }
+
+    pub(crate) fn archive_selected_session(&mut self, archived: bool) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("chat archive state cannot change while a run is active");
+            return;
+        }
+        let Some(session_id) = self.state.selected_session_id() else {
+            self.state
+                .set_status_message("select a chat before changing archive state");
+            return;
+        };
+        self.state.set_status_message(if archived {
+            format!("archiving chat {}...", session_id)
+        } else {
+            format!("unarchiving chat {}...", session_id)
+        });
+        self.state.begin_session_archive_mutation();
+        self.spawn_session_archive(
+            session_id,
+            archived,
+            self.state.view.session_search_text.clone(),
+            self.state.view.session_search_include_archived,
+        );
+    }
+
+    pub(crate) fn rollback_selected_session(&mut self) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("chat rollback cannot run while a local run is active");
+            return;
+        }
+        let Some(session_id) = self.state.selected_session_id() else {
+            self.state
+                .set_status_message("select a chat before rolling back history");
+            return;
+        };
+        let is_active_loaded = self
+            .state
+            .snapshot
+            .session_rows
+            .get(self.state.snapshot.selected_session_index)
+            .is_some_and(|row| row.loaded_status == LoadedSessionStatus::Active);
+        if is_active_loaded {
+            self.state
+                .set_status_message("running sessions cannot be rolled back");
+            return;
+        }
+        self.state.set_status_message(format!(
+            "rolling back latest turn in chat {}...",
+            session_id
+        ));
+        self.state.begin_session_rollback_mutation();
+        self.spawn_session_rollback(
+            session_id,
+            self.state.view.session_search_text.clone(),
+            self.state.view.session_search_include_archived,
+        );
+    }
+
+    pub(crate) fn set_session_search(&mut self, text: String) {
+        self.state.set_session_search_text(text.clone());
+        self.state.begin_session_search();
+        self.spawn_session_search(text, self.state.view.session_search_include_archived);
+    }
+
+    pub(crate) fn set_session_search_include_archived(&mut self, include_archived: bool) {
+        self.state
+            .set_session_search_include_archived(include_archived);
+        self.state.begin_session_search();
+        self.spawn_session_search(
+            self.state.view.session_search_text.clone(),
+            include_archived,
+        );
     }
 
     pub(crate) fn delete_selected_project(&mut self) {
@@ -490,6 +658,49 @@ impl DesktopController {
         self.spawn_history_markdown_export(session_id, normalize_markdown_export_path(path));
     }
 
+    pub(crate) fn load_previous_turn_page(&mut self) {
+        let detail = self.state.selected_detail();
+        if detail.turn_page_offset == 0 || detail.turn_page_limit == 0 {
+            self.state
+                .set_status_message("earlier turn page is not available");
+            return;
+        }
+        let previous = detail
+            .turn_page_offset
+            .saturating_sub(detail.turn_page_limit);
+        self.load_selected_turn_page(previous);
+    }
+
+    pub(crate) fn load_next_turn_page(&mut self) {
+        let detail = self.state.selected_detail();
+        if !detail.turn_page_has_more || detail.turn_page_limit == 0 {
+            self.state
+                .set_status_message("later turn page is not available");
+            return;
+        }
+        self.load_selected_turn_page(
+            detail
+                .turn_page_offset
+                .saturating_add(detail.turn_page_limit),
+        );
+    }
+
+    fn load_selected_turn_page(&mut self, offset: usize) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("turn page cannot change while a local run is active");
+            return;
+        }
+        let Some(session_id) = self.state.selected_session_id() else {
+            self.state
+                .set_status_message("select a session before changing turn page");
+            return;
+        };
+        self.state
+            .set_status_message(format!("loading turn page for session {session_id}..."));
+        self.spawn_turn_page_load(session_id, offset, DESKTOP_TURN_PAGE_LIMIT);
+    }
+
     fn spawn_history_markdown_export(&self, session_id: SessionId, export_path: Utf8PathBuf) {
         let service = self.app.session_service.clone();
         let runtime_tx = self.runtime_tx.clone();
@@ -537,12 +748,26 @@ impl DesktopController {
                 load_session_detail(&app, session_id)
                     .await
                     .map(
-                        |(session, transcript, turn_items, state, todos)| LoadedSession {
+                        |(
                             session,
                             transcript,
                             turn_items,
                             state,
                             todos,
+                            turn_page_offset,
+                            turn_page_limit,
+                            turn_page_total,
+                            turn_page_has_more,
+                        )| LoadedSession {
+                            session,
+                            transcript,
+                            turn_items,
+                            state,
+                            todos,
+                            turn_page_offset,
+                            turn_page_limit,
+                            turn_page_total,
+                            turn_page_has_more,
                         },
                     )
                     .map_err(|error| error.to_string())
@@ -551,6 +776,141 @@ impl DesktopController {
                 request_id,
                 session_id,
                 reason,
+                result,
+            });
+        });
+    }
+
+    fn spawn_turn_page_load(&self, session_id: SessionId, offset: usize, limit: usize) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop turn-page runtime");
+            let result = runtime.block_on(async move {
+                let page = app
+                    .session_service
+                    .canonical_turn_page(session_id, offset, limit)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let transcript = app
+                    .session_service
+                    .canonical_transcript(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let state = app
+                    .session_service
+                    .load_state(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let todos = app
+                    .session_service
+                    .list_todos(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(LoadedSession {
+                    session: page.session,
+                    transcript,
+                    turn_items: page.items,
+                    state,
+                    todos,
+                    turn_page_offset: page.offset,
+                    turn_page_limit: page.limit,
+                    turn_page_total: page.total,
+                    turn_page_has_more: page.has_more,
+                })
+            });
+            let _ = runtime_tx.send(RuntimeMessage::TurnPageLoaded { session_id, result });
+        });
+    }
+
+    fn spawn_live_session_refresh(&self, session_id: SessionId, offset: usize, limit: usize) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop live-session-refresh runtime");
+            let result = runtime.block_on(async move {
+                let page = app
+                    .session_service
+                    .canonical_turn_page(session_id, offset, limit)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let transcript = app
+                    .session_service
+                    .canonical_transcript(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let state = app
+                    .session_service
+                    .load_state(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let todos = app
+                    .session_service
+                    .list_todos(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(LoadedSession {
+                    session: page.session,
+                    transcript,
+                    turn_items: page.items,
+                    state,
+                    todos,
+                    turn_page_offset: page.offset,
+                    turn_page_limit: page.limit,
+                    turn_page_total: page.total,
+                    turn_page_has_more: page.has_more,
+                })
+            });
+            let _ = runtime_tx.send(RuntimeMessage::LiveSessionRefreshed { session_id, result });
+        });
+    }
+
+    fn spawn_session_rejoin(&self, session_id: SessionId, request_id: Option<NavigationRequestId>) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop session rejoin runtime");
+            let result = runtime.block_on(async move {
+                let rejoin = app
+                    .session_service
+                    .rejoin_running_session(session_id, 0, 200, 0, DESKTOP_TURN_PAGE_LIMIT)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let transcript = app
+                    .session_service
+                    .canonical_transcript(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let todos = app
+                    .session_service
+                    .list_todos(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(LoadedSession {
+                    session: rejoin.read.session,
+                    transcript,
+                    turn_items: rejoin.read.turns.items,
+                    state: rejoin.read.state,
+                    todos,
+                    turn_page_offset: rejoin.read.turns.offset,
+                    turn_page_limit: rejoin.read.turns.limit,
+                    turn_page_total: rejoin.read.turns.total,
+                    turn_page_has_more: rejoin.read.turns.has_more,
+                })
+            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionLoaded {
+                request_id,
+                session_id,
+                reason: SessionLoadReason::RunningRejoin,
                 result,
             });
         });
@@ -572,12 +932,26 @@ impl DesktopController {
                 load_session_detail(&app, session_id)
                     .await
                     .map(
-                        |(session, transcript, turn_items, state, todos)| LoadedSession {
+                        |(
                             session,
                             transcript,
                             turn_items,
                             state,
                             todos,
+                            turn_page_offset,
+                            turn_page_limit,
+                            turn_page_total,
+                            turn_page_has_more,
+                        )| LoadedSession {
+                            session,
+                            transcript,
+                            turn_items,
+                            state,
+                            todos,
+                            turn_page_offset,
+                            turn_page_limit,
+                            turn_page_total,
+                            turn_page_has_more,
                         },
                     )
                     .map_err(|error| error.to_string())
@@ -609,6 +983,115 @@ impl DesktopController {
                     .map_err(|error| error.to_string())
             });
             let _ = runtime_tx.send(RuntimeMessage::SessionDeleted { session_id, result });
+        });
+    }
+
+    fn spawn_session_archive(
+        &self,
+        session_id: SessionId,
+        archived: bool,
+        query: String,
+        include_archived: bool,
+    ) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop session-archive runtime");
+            let result = runtime.block_on(async move {
+                app.session_service
+                    .set_session_archived(session_id, archived)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                load_snapshot_for_session_search(&app, &query, include_archived, None)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionArchived {
+                session_id,
+                archived,
+                result,
+            });
+        });
+    }
+
+    fn spawn_session_rollback(&self, session_id: SessionId, query: String, include_archived: bool) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop session-rollback runtime");
+            let result = runtime.block_on(async move {
+                let rollback = app
+                    .session_service
+                    .rollback_session(session_id, 1)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let snapshot = load_snapshot_for_session_search(
+                    &app,
+                    &query,
+                    include_archived,
+                    Some(session_id),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                let (
+                    session,
+                    transcript,
+                    turn_items,
+                    state,
+                    todos,
+                    turn_page_offset,
+                    turn_page_limit,
+                    turn_page_total,
+                    turn_page_has_more,
+                ) = load_session_detail(&app, session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(DesktopRollbackLoaded {
+                    snapshot,
+                    loaded: LoadedSession {
+                        session,
+                        transcript,
+                        turn_items,
+                        state,
+                        todos,
+                        turn_page_offset,
+                        turn_page_limit,
+                        turn_page_total,
+                        turn_page_has_more,
+                    },
+                    dropped_turn_count: rollback.dropped_turn_ids.len(),
+                })
+            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionRolledBack { session_id, result });
+        });
+    }
+
+    fn spawn_session_search(&self, query: String, include_archived: bool) {
+        let app = self.app.clone();
+        let selected_session_id = self.state.selected_session_id();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop session-search runtime");
+            let result = runtime.block_on(async move {
+                load_snapshot_for_session_search(
+                    &app,
+                    &query,
+                    include_archived,
+                    selected_session_id,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionSearchLoaded(result));
         });
     }
 
@@ -1413,9 +1896,24 @@ impl DesktopController {
         review_request: Option<ReviewRequest>,
     ) {
         if self.active_run_cancel.is_some() {
-            self.state.set_status_message(
-                "前回の停止処理を片付けています。状態が更新されてから再度実行してください。",
-            );
+            if review_request.is_none() && !prompt.trim().is_empty() {
+                self.launch_active_turn_steer(prompt, prompt_dispatch);
+            } else {
+                self.state.set_status_message(
+                    "前回の停止処理を片付けています。状態が更新されてから再度実行してください。",
+                );
+            }
+            return;
+        }
+        if review_request.is_none()
+            && !prompt.trim().is_empty()
+            && self.state.app_state.current_session_id.is_some()
+            && matches!(
+                self.state.app_state.run_status,
+                crate::tui::state::RunStatus::Running
+            )
+        {
+            self.launch_active_turn_steer(prompt, prompt_dispatch);
             return;
         }
         if prompt.trim().is_empty() && review_request.is_none() {
@@ -1503,6 +2001,60 @@ impl DesktopController {
         });
     }
 
+    fn launch_active_turn_steer(
+        &mut self,
+        prompt: String,
+        prompt_dispatch: crate::session::PromptDispatchPart,
+    ) {
+        let Some(session_id) = self.state.app_state.current_session_id else {
+            self.state
+                .set_status_message("実行中のセッションが見つからないため steer できません。");
+            return;
+        };
+        let image_paths = self.state.composer.image_attachment_paths.clone();
+        self.state.push_local_prompt_dispatch(&prompt_dispatch);
+        self.state.composer.draft_prompt.clear();
+        self.state.composer.image_attachment_paths.clear();
+        self.state.composer.image_attachment_input.clear();
+        self.state
+            .set_status_message("実行中の turn に追加入力を送信しました。");
+        let run_service = self.app.run_service.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        let cwd = self.app.workspace.cwd.clone();
+        std::thread::spawn(move || {
+            let mut renderer = DesktopSteerRenderer;
+            let mut prompt_ui = DesktopConfirmationPrompt {
+                tx: runtime_tx.clone(),
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop steer runtime");
+            let result = runtime
+                .block_on(async move {
+                    run_service
+                        .execute(
+                            AppCommand::SessionSteer(SessionSteerRequest {
+                                session_id,
+                                prompt,
+                                cwd,
+                                image_paths,
+                                client_user_message_id: Some(format!(
+                                    "desktop-steer-{}",
+                                    SystemClock::now_ms()
+                                )),
+                            }),
+                            &mut renderer,
+                            &mut prompt_ui,
+                        )
+                        .await
+                })
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let _ = runtime_tx.send(RuntimeMessage::SteerStored(result));
+        });
+    }
+
     fn current_editor_context(&self) -> EditorContext {
         let shell_family = self
             .state
@@ -1564,13 +2116,24 @@ impl DesktopController {
                     &loaded.turn_items,
                     loaded.state,
                     loaded.todos,
+                    loaded.turn_page_offset,
+                    loaded.turn_page_limit,
+                    loaded.turn_page_total,
+                    loaded.turn_page_has_more,
                 );
                 if reason == SessionLoadReason::CurrentRefresh {
                     self.state.clear_post_run_refresh_pending();
                     return;
                 }
-                self.state
-                    .set_status_message(format!("opened session {}", session_id));
+                self.state.set_status_message(match reason {
+                    SessionLoadReason::RunningRejoin => {
+                        format!("rejoined running session {}", session_id)
+                    }
+                    SessionLoadReason::UserSelection => format!("opened session {}", session_id),
+                    SessionLoadReason::CurrentRefresh => {
+                        format!("refreshed session {}", session_id)
+                    }
+                });
             }
             Err(error) => {
                 if reason == SessionLoadReason::CurrentRefresh {
@@ -1607,7 +2170,7 @@ impl DesktopController {
         reason: SessionLoadReason,
     ) -> bool {
         match reason {
-            SessionLoadReason::UserSelection => {
+            SessionLoadReason::UserSelection | SessionLoadReason::RunningRejoin => {
                 request_id.is_some_and(|request_id| {
                     self.state
                         .is_current_session_navigation(request_id, session_id)
@@ -1719,7 +2282,27 @@ impl DesktopController {
                         | RunEvent::SessionTitleUpdated { session_id, .. } => Some(*session_id),
                         _ => None,
                     };
+                    let live_refresh_session_id = event
+                        .session_id()
+                        .or(self.state.app_state.current_session_id);
                     self.state.apply_run_event(&event);
+                    if live_event_requires_canonical_refresh(&event)
+                        && live_refresh_session_id == self.state.app_state.current_session_id
+                    {
+                        if let Some(session_id) = live_refresh_session_id {
+                            let detail = self.state.selected_detail();
+                            let limit = if detail.turn_page_limit == 0 {
+                                DESKTOP_TURN_PAGE_LIMIT
+                            } else {
+                                detail.turn_page_limit
+                            };
+                            self.spawn_live_session_refresh(
+                                session_id,
+                                detail.turn_page_offset,
+                                limit,
+                            );
+                        }
+                    }
                     if run_event_is_terminal(&event) {
                         self.state.mark_post_run_refresh_pending();
                     }
@@ -1820,6 +2403,139 @@ impl DesktopController {
                             .set_status_message(format!("chat delete failed: {error}")),
                     }
                 }
+                RuntimeMessage::SessionArchived {
+                    session_id,
+                    archived,
+                    result,
+                } => {
+                    self.state.finish_session_archive_mutation();
+                    match result {
+                        Ok(snapshot) => {
+                            let archived_was_current = archived
+                                && self.state.app_state.current_session_id == Some(session_id);
+                            self.state.replace_snapshot(snapshot);
+                            if archived_was_current {
+                                if let Some(next_session_id) = self.state.selected_session_id() {
+                                    self.state.set_status_message(format!(
+                                        "archived chat {}; opening {}...",
+                                        session_id, next_session_id
+                                    ));
+                                    let request_id = self.state.begin_session_load(next_session_id);
+                                    self.spawn_session_load(
+                                        next_session_id,
+                                        SessionLoadReason::UserSelection,
+                                        Some(request_id),
+                                    );
+                                } else {
+                                    self.state.start_new_chat();
+                                    self.state.set_status_message(format!(
+                                        "archived chat {}",
+                                        session_id
+                                    ));
+                                }
+                            } else {
+                                self.state.set_status_message(if archived {
+                                    format!("archived chat {}", session_id)
+                                } else {
+                                    format!("unarchived chat {}", session_id)
+                                });
+                            }
+                        }
+                        Err(error) => self
+                            .state
+                            .set_status_message(format!("chat archive failed: {error}")),
+                    }
+                }
+                RuntimeMessage::SessionRolledBack { session_id, result } => {
+                    self.state.finish_session_rollback_mutation();
+                    match result {
+                        Ok(rolled_back) => {
+                            self.state.replace_snapshot(rolled_back.snapshot);
+                            if self.state.selected_session_id() == Some(session_id)
+                                && !self.session_load_is_blocked_by_active_run()
+                            {
+                                let loaded = rolled_back.loaded;
+                                self.state.load_open_session(
+                                    &loaded.session,
+                                    &loaded.transcript,
+                                    &loaded.turn_items,
+                                    loaded.state,
+                                    loaded.todos,
+                                    loaded.turn_page_offset,
+                                    loaded.turn_page_limit,
+                                    loaded.turn_page_total,
+                                    loaded.turn_page_has_more,
+                                );
+                            }
+                            self.state.set_status_message(format!(
+                                "rolled back {} turn(s) in chat {}",
+                                rolled_back.dropped_turn_count, session_id
+                            ));
+                        }
+                        Err(error) => self
+                            .state
+                            .set_status_message(format!("chat rollback failed: {error}")),
+                    }
+                }
+                RuntimeMessage::SessionSearchLoaded(result) => {
+                    self.state.finish_session_search();
+                    match result {
+                        Ok(snapshot) => self.state.replace_snapshot(snapshot),
+                        Err(error) => self
+                            .state
+                            .set_status_message(format!("session search failed: {error}")),
+                    }
+                }
+                RuntimeMessage::TurnPageLoaded { session_id, result } => match result {
+                    Ok(loaded) => {
+                        if self.state.selected_session_id() == Some(session_id)
+                            && !self.session_load_is_blocked_by_active_run()
+                        {
+                            self.state.load_open_session(
+                                &loaded.session,
+                                &loaded.transcript,
+                                &loaded.turn_items,
+                                loaded.state,
+                                loaded.todos,
+                                loaded.turn_page_offset,
+                                loaded.turn_page_limit,
+                                loaded.turn_page_total,
+                                loaded.turn_page_has_more,
+                            );
+                            self.state.set_status_message(format!(
+                                "loaded turn page {}-{} of {}",
+                                loaded.turn_page_offset.saturating_add(1),
+                                loaded
+                                    .turn_page_offset
+                                    .saturating_add(loaded.turn_items.len()),
+                                loaded.turn_page_total
+                            ));
+                        }
+                    }
+                    Err(error) => self
+                        .state
+                        .set_status_message(format!("turn page load failed: {error}")),
+                },
+                RuntimeMessage::LiveSessionRefreshed { session_id, result } => match result {
+                    Ok(loaded) => {
+                        if self.state.app_state.current_session_id == Some(session_id) {
+                            self.state.refresh_open_session_projection(
+                                &loaded.session,
+                                &loaded.transcript,
+                                &loaded.turn_items,
+                                loaded.state,
+                                loaded.todos,
+                                loaded.turn_page_offset,
+                                loaded.turn_page_limit,
+                                loaded.turn_page_total,
+                                loaded.turn_page_has_more,
+                            );
+                        }
+                    }
+                    Err(error) => self
+                        .state
+                        .set_status_message(format!("live session refresh failed: {error}")),
+                },
                 RuntimeMessage::ProjectDeleted {
                     project_id,
                     project_root,
@@ -1936,6 +2652,16 @@ impl DesktopController {
                         }
                     }
                 }
+                RuntimeMessage::SteerStored(result) => match result {
+                    Ok(()) => {
+                        self.state
+                            .set_status_message("追加入力を実行中の turn に保存しました。");
+                    }
+                    Err(error) => {
+                        self.state
+                            .set_status_message(format!("追加入力の保存に失敗しました: {error}"));
+                    }
+                },
                 RuntimeMessage::HistoryExported(result) => match result {
                     Ok(path) => {
                         self.state.finish_history_export();
@@ -1958,6 +2684,28 @@ impl DesktopController {
         }
         changed
     }
+}
+
+fn live_event_requires_canonical_refresh(event: &RunEvent) -> bool {
+    matches!(
+        event,
+        RunEvent::UserTurnStored { .. }
+            | RunEvent::ControlEnvelopePrepared { .. }
+            | RunEvent::ModelRequestPrepared { .. }
+            | RunEvent::ToolCallPending { .. }
+            | RunEvent::ToolCallCompleted { .. }
+            | RunEvent::ToolCallFailed { .. }
+            | RunEvent::ToolProposalRejected { .. }
+            | RunEvent::CandidateRepairEditRecorded { .. }
+            | RunEvent::FileChangesRecorded { .. }
+            | RunEvent::CompactionCompleted { .. }
+            | RunEvent::PermissionRequested { .. }
+            | RunEvent::PermissionResolved { .. }
+            | RunEvent::RetryScheduled { .. }
+            | RunEvent::RecoverableRuntimeFeedback { .. }
+            | RunEvent::StateUpdated { .. }
+            | RunEvent::LifecycleGuardUpdated { .. }
+    )
 }
 
 fn transcript_markdown_file_name(title: &str, session_id: SessionId) -> String {
@@ -2671,6 +3419,18 @@ mod tests {
             RuntimeMessageAsyncContract::ProviderOperation
         );
         assert_eq!(
+            RuntimeMessage::SteerStored(Ok(())).async_contract(),
+            RuntimeMessageAsyncContract::BackgroundOperation
+        );
+        assert_eq!(
+            RuntimeMessage::LiveSessionRefreshed {
+                session_id: crate::session::SessionId::new(),
+                result: Err("not loaded".to_string()),
+            }
+            .async_contract(),
+            RuntimeMessageAsyncContract::RunStream
+        );
+        assert_eq!(
             RuntimeMessage::Finished(Err("failed".to_string())).async_contract(),
             RuntimeMessageAsyncContract::TerminalRun
         );
@@ -2973,6 +3733,13 @@ impl EventRenderer for DesktopRenderer {
         Ok(())
     }
 
+    fn render_loaded_sessions(
+        &mut self,
+        _loaded: &crate::session::LoadedSessionList,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
     fn render_session_show(
         &mut self,
         _transcript: &crate::session::Transcript,
@@ -2985,6 +3752,101 @@ impl EventRenderer for DesktopRenderer {
         _session: &SessionRecord,
         _history_items: &[crate::protocol::HistoryItem],
         _show_reasoning: bool,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_history_page(
+        &mut self,
+        _page: &crate::session::CanonicalHistoryPage,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_read(
+        &mut self,
+        _read: &crate::session::CanonicalSessionRead,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_rejoin(
+        &mut self,
+        _rejoin: &crate::session::RunningSessionRejoin,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_turn_page(
+        &mut self,
+        _page: &crate::session::CanonicalTurnPage,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+}
+
+struct DesktopSteerRenderer;
+
+impl EventRenderer for DesktopSteerRenderer {
+    fn render(&mut self, _event: &RunEvent) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn finish(&mut self, _summary: &RunSummary) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_list(&mut self, _sessions: &[SessionRecord]) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_loaded_sessions(
+        &mut self,
+        _loaded: &crate::session::LoadedSessionList,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_show(
+        &mut self,
+        _transcript: &crate::session::Transcript,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_history_items(
+        &mut self,
+        _session: &SessionRecord,
+        _history_items: &[crate::protocol::HistoryItem],
+        _show_reasoning: bool,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_history_page(
+        &mut self,
+        _page: &crate::session::CanonicalHistoryPage,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_read(
+        &mut self,
+        _read: &crate::session::CanonicalSessionRead,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_rejoin(
+        &mut self,
+        _rejoin: &crate::session::RunningSessionRejoin,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_turn_page(
+        &mut self,
+        _page: &crate::session::CanonicalTurnPage,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }

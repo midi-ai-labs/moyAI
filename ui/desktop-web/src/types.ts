@@ -34,7 +34,12 @@ export interface ProjectRow {
 export interface SessionRow {
   session_id: RowId;
   title: string;
-  status: "running" | "completed" | "awaiting_user" | "cancelled" | "failed";
+  status: "idle" | "running" | "completed" | "awaiting_user" | "cancelled" | "failed";
+  loaded_status: "not_loaded" | "idle" | "active" | "system_error";
+  active_turn_id?: RowId | null;
+  active_turn_sequence_no?: number | null;
+  pending_permission_requests: number;
+  pending_user_input_requests: number;
   short_id: string;
   label: string;
 }
@@ -115,8 +120,14 @@ export interface DesktopWebState {
   session_rows: SessionRow[];
   chat_session_rows: SessionRow[];
   selected_session_index: number;
+  session_search_text: string;
+  session_search_include_archived: boolean;
   thread_empty: boolean;
   transcript_rows: TranscriptRow[];
+  turn_page_offset: number;
+  turn_page_limit: number;
+  turn_page_total: number;
+  turn_page_has_more: boolean;
   artifact_rows: ArtifactRow[];
   selected_artifact_index: number;
   artifact_preview_available: boolean;

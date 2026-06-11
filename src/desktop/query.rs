@@ -11,7 +11,7 @@ use crate::session::{
     ChangeKind, ProjectId, ProjectRecord, SessionId, SessionRecord, SessionStateSnapshot,
     SessionStatus, TodoItem, TodoStatus, ToolCallStatus, Transcript,
 };
-use crate::tui::query::{recent_sessions, session_view};
+use crate::tui::query::recent_sessions;
 use crate::tui::state::{AppState, RunStatus, TranscriptKind};
 
 use super::artifact_projection::{
@@ -19,6 +19,8 @@ use super::artifact_projection::{
     format_file_change_summary,
 };
 pub use super::artifact_projection::{file_change_rows_from_turn_items, format_artifact_preview};
+
+pub const DESKTOP_TURN_PAGE_LIMIT: usize = 80;
 
 pub async fn load_snapshot(app: &App, args: &DesktopArgs) -> Result<DesktopSnapshot, AppRunError> {
     load_snapshot_for_selection(app, args.session_id).await
@@ -45,6 +47,41 @@ pub async fn load_snapshot_continue_last(app: &App) -> Result<DesktopSnapshot, A
     build_snapshot(app, sessions, selected_session_index).await
 }
 
+pub async fn load_snapshot_for_session_search(
+    app: &App,
+    query: &str,
+    include_archived: bool,
+    selected_session_id: Option<SessionId>,
+) -> Result<DesktopSnapshot, AppRunError> {
+    let query = query.trim();
+    if query.is_empty() {
+        let sessions = app
+            .session_service
+            .list_sessions_with_archived(app.workspace.project_id, 50, include_archived)
+            .await?;
+        let selected_session_index = select_session_index(
+            &sessions,
+            selected_session_id,
+            Some(app.workspace.project_id),
+            false,
+        )
+        .unwrap_or(0);
+        return build_snapshot(app, sessions, selected_session_index).await;
+    }
+    let sessions = app
+        .session_service
+        .search_sessions(app.workspace.project_id, query, 50, include_archived)
+        .await?;
+    let selected_session_index = select_session_index(
+        &sessions,
+        selected_session_id,
+        Some(app.workspace.project_id),
+        false,
+    )
+    .unwrap_or(0);
+    build_snapshot(app, sessions, selected_session_index).await
+}
+
 pub async fn load_session_detail(
     app: &App,
     session_id: SessionId,
@@ -55,16 +92,31 @@ pub async fn load_session_detail(
         Vec<crate::protocol::TurnItem>,
         SessionStateSnapshot,
         Vec<TodoItem>,
+        usize,
+        usize,
+        usize,
+        bool,
     ),
     AppRunError,
 > {
-    let view = session_view(&app.session_service, session_id).await?;
+    let session = app.session_service.get_session(session_id).await?;
+    let page = app
+        .session_service
+        .canonical_turn_page(session_id, 0, DESKTOP_TURN_PAGE_LIMIT)
+        .await?;
+    let transcript = app.session_service.canonical_transcript(session_id).await?;
+    let state = app.session_service.load_state(session_id).await?;
+    let todos = app.session_service.list_todos(session_id).await?;
     Ok((
-        view.session,
-        view.transcript,
-        view.turn_items,
-        view.state,
-        view.todos,
+        session,
+        transcript,
+        page.items,
+        state,
+        todos,
+        page.offset,
+        page.limit,
+        page.total,
+        page.has_more,
     ))
 }
 
@@ -85,7 +137,7 @@ async fn build_snapshot(
     );
     let chat_session_rows = build_quick_chat_session_rows(app, &projects).await?;
     for session in &sessions {
-        session_rows.push(build_session_row(session));
+        session_rows.push(build_session_row(app, session).await?);
     }
     Ok(DesktopSnapshot {
         workspace_path: app.workspace.root.to_string(),
@@ -129,11 +181,22 @@ async fn build_quick_chat_session_rows(
         }
     };
     let sessions = recent_sessions(&app.session_service, project_id, 20).await?;
-    Ok(sessions.iter().map(build_session_row).collect())
+    let mut rows = Vec::with_capacity(sessions.len());
+    for session in &sessions {
+        rows.push(build_session_row(app, session).await?);
+    }
+    Ok(rows)
 }
 
-fn build_session_row(session: &SessionRecord) -> DesktopSessionRow {
-    DesktopSessionRow::from_session(session)
+async fn build_session_row(
+    app: &App,
+    session: &SessionRecord,
+) -> Result<DesktopSessionRow, AppRunError> {
+    let summary = app
+        .session_service
+        .loaded_session_summary(session.clone())
+        .await?;
+    Ok(DesktopSessionRow::from_loaded_summary(&summary))
 }
 
 fn build_project_rows(
@@ -245,11 +308,49 @@ pub fn build_session_detail(
     turn_items: Vec<crate::protocol::TurnItem>,
     replay_report: Option<ReplayReport>,
 ) -> DesktopSessionDetail {
+    build_session_detail_with_page(
+        session,
+        state,
+        todos,
+        _transcript,
+        turn_items,
+        0,
+        0,
+        0,
+        false,
+        replay_report,
+    )
+}
+
+pub fn build_session_detail_with_page(
+    session: &SessionRecord,
+    state: SessionStateSnapshot,
+    todos: Vec<TodoItem>,
+    _transcript: Transcript,
+    turn_items: Vec<crate::protocol::TurnItem>,
+    turn_page_offset: usize,
+    turn_page_limit: usize,
+    turn_page_total: usize,
+    turn_page_has_more: bool,
+    replay_report: Option<ReplayReport>,
+) -> DesktopSessionDetail {
     let mut ui_state = AppState::default();
     ui_state.load_turn_items(session, &turn_items, state.clone(), todos.clone());
     let file_changes =
         file_change_rows_from_turn_items_with_root(&turn_items, Some(session.cwd.as_path()));
     let mut detail = build_session_detail_from_app_state(&ui_state);
+    detail.turn_page_offset = turn_page_offset;
+    detail.turn_page_limit = if turn_page_limit == 0 {
+        turn_items.len()
+    } else {
+        turn_page_limit
+    };
+    detail.turn_page_total = if turn_page_total == 0 {
+        turn_items.len()
+    } else {
+        turn_page_total
+    };
+    detail.turn_page_has_more = turn_page_has_more;
     detail.session_id = session.id;
     detail.transcript_rows = transcript_rows_from_turn_items_with_context(session, &turn_items);
     detail.thread_empty = transcript_rows_are_empty_placeholder(&detail.transcript_rows);
@@ -299,6 +400,7 @@ fn transcript_rows_from_turn_items_with_context(
             matches!(
                 item.payload,
                 crate::protocol::TurnItemPayload::UserMessage { .. }
+                    | crate::protocol::TurnItemPayload::SteerMessage { .. }
             )
         })
         .count()
@@ -307,6 +409,15 @@ fn transcript_rows_from_turn_items_with_context(
     for item in ordered {
         match &item.payload {
             crate::protocol::TurnItemPayload::UserMessage { text } => {
+                flush_turn_transcript_group(
+                    &mut rows,
+                    session,
+                    &mut current,
+                    show_session_elapsed_on_work_summary,
+                );
+                current.user_body = text.clone();
+            }
+            crate::protocol::TurnItemPayload::SteerMessage { text } => {
                 flush_turn_transcript_group(
                     &mut rows,
                     session,
@@ -683,6 +794,10 @@ pub fn build_session_detail_from_app_state_with_session(
         thread_empty: transcript_rows_are_empty_placeholder(&transcript_rows),
         transcript_text: format_transcript_text(state),
         transcript_rows,
+        turn_page_offset: 0,
+        turn_page_limit: 0,
+        turn_page_total: 0,
+        turn_page_has_more: false,
         tool_status_text: format_tool_status_text(state, &session_state, &state.sidebar_todos),
         progress_text: format_progress_text(state),
         run_status_text: format_run_status_text(state, &session_state),
@@ -871,6 +986,7 @@ fn desktop_query_provider_profile_session_record(title: &str) -> SessionRecord {
         cwd: camino::Utf8PathBuf::from(format!("C:/workspace/{title}")),
         model: CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL.to_string(),
         base_url: CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1_000,
         updated_at_ms: 6_000,
         completed_at_ms: Some(6_000),

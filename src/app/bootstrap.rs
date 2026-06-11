@@ -135,6 +135,9 @@ fn command_directory(command: &CliCommand) -> Result<camino::Utf8PathBuf, AppBoo
     Ok(match command {
         CliCommand::Run(args) => args.directory.clone().unwrap_or(current),
         CliCommand::SessionList(args) => args.directory.clone().unwrap_or(current),
+        CliCommand::SessionLoaded(args) => args.directory.clone().unwrap_or(current),
+        CliCommand::SessionSearch(args) => args.directory.clone().unwrap_or(current),
+        CliCommand::SessionSteer(args) => args.directory.clone().unwrap_or(current),
         CliCommand::Tui(args) => args.directory.clone().unwrap_or(current),
         CliCommand::Desktop(args) => {
             if let Some(directory) = args.directory.clone() {
@@ -143,7 +146,15 @@ fn command_directory(command: &CliCommand) -> Result<camino::Utf8PathBuf, AppBoo
                 default_desktop_workspace_directory()?.unwrap_or(current)
             }
         }
-        CliCommand::SessionShow(_) => current,
+        CliCommand::SessionArchive(_)
+        | CliCommand::SessionSettings(_)
+        | CliCommand::SessionShow(_)
+        | CliCommand::SessionHistory(_)
+        | CliCommand::SessionRead(_)
+        | CliCommand::SessionRejoin(_)
+        | CliCommand::SessionRollback(_)
+        | CliCommand::SessionFork(_)
+        | CliCommand::SessionTurns(_) => current,
         CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
         | CliCommand::PreflightRun(_)

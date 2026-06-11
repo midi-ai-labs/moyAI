@@ -224,6 +224,20 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             "protocol store latest-turn position can still use table precedence instead of a unified protocol item stream candidate set".to_string(),
         );
     }
+    if gate.gate_id == "preflight.protocol.history_item_lifecycle_authority"
+        && !crate::protocol::steer_turn_is_active_turn_mailbox_contract_fixture_passes()
+    {
+        diagnostics.push(
+            "thread steer input can still be represented as a replacement user turn instead of an expected active-turn mailbox contract".to_string(),
+        );
+    }
+    if gate.gate_id == "preflight.protocol.history_item_lifecycle_authority"
+        && !crate::storage::session_repo::session_archive_search_lifecycle_fixture_passes()
+    {
+        diagnostics.push(
+            "session archive/search lifecycle can still behave as destructive history loss or default search/list leakage instead of Codex-style non-destructive thread metadata".to_string(),
+        );
+    }
     if gate.gate_id == "preflight.protocol.persistence_unit_of_work_authority"
         && !crate::protocol::protocol_store_latest_turn_position_resists_timestamp_drift_fixture_passes(
         )
@@ -1892,6 +1906,13 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
     {
         diagnostics.push(
             "provider replay can still drop rejected final-assistant-message lifecycle evidence instead of projecting it as typed no-progress context before the next dispatch".to_string(),
+        );
+    }
+    if gate.gate_id == "preflight.prompt_replay.tool_pair_symmetry"
+        && !crate::agent::loop_impl::rejected_final_message_event_persists_for_provider_replay_fixture_passes()
+    {
+        diagnostics.push(
+            "open-obligation final assistant rejection can still remain a transient RunEvent without a canonical RejectedToolProposal history item for the next provider replay".to_string(),
         );
     }
 
@@ -4110,6 +4131,7 @@ fn protocol_persistence_unit_of_work_fixture_passes() -> bool {
                     cwd: workspace_root.to_path_buf(),
                     model: PREFLIGHT_FIXTURE_MODEL.to_string(),
                     base_url: PREFLIGHT_FIXTURE_BASE_URL.to_string(),
+                    access_mode: crate::config::AccessMode::Default,
                 })
                 .await
                 .map_err(|error| RuntimeError::Message(error.to_string()))?;
@@ -4647,6 +4669,7 @@ fn prompt_replay_internal_control_items_are_not_provider_visible() -> bool {
         cwd: camino::Utf8PathBuf::from("C:/workspace"),
         model: PREFLIGHT_FIXTURE_MODEL.to_string(),
         base_url: PREFLIGHT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -4727,6 +4750,7 @@ fn provider_replay_call_output_symmetry_fixture_passes() -> bool {
         cwd: camino::Utf8PathBuf::from("C:/workspace"),
         model: PREFLIGHT_FIXTURE_MODEL.to_string(),
         base_url: PREFLIGHT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -6250,7 +6274,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
         PreflightFixture {
             fixture_id: "fixture.protocol.history_item_lifecycle_authority".to_string(),
             family: PreflightGateFamily::ProtocolItemLifecycle,
-            authority_source: "runtime_event_stream explicit_turn_started turn_context_authority turn_item_stream terminal_turn_event canonical_history_item_stream HistoryItemAuthorityRole typed_tool_arguments protocol_tool_call_typed_arguments_authority legacy_display_arguments_not_canonical typed_file_change_evidence call_id_scoped_file_change_evidence typed_tool_output_success tool_output_blocked_action_projection protocol_pending_tool_lifecycle_blocked_action_absent app_resume_latest_user_sequence_primary_order protocol_mod_projection_fixture_current_provider_profile projection_items_not_provider_replay projection_items_not_state_reducer_authority".to_string(),
+            authority_source: "runtime_event_stream explicit_turn_started turn_context_authority turn_item_stream terminal_turn_event canonical_history_item_stream HistoryItemAuthorityRole typed_tool_arguments protocol_tool_call_typed_arguments_authority active_turn_steer_mailbox_contract legacy_display_arguments_not_canonical typed_file_change_evidence call_id_scoped_file_change_evidence typed_tool_output_success tool_output_blocked_action_projection protocol_pending_tool_lifecycle_blocked_action_absent app_resume_latest_user_sequence_primary_order protocol_mod_projection_fixture_current_provider_profile projection_items_not_provider_replay projection_items_not_state_reducer_authority".to_string(),
             required_refs: vec![
                 "runtime_event_stream".to_string(),
                 "explicit_turn_started".to_string(),
@@ -6261,6 +6285,7 @@ pub fn default_preflight_fixtures() -> Vec<PreflightFixture> {
                 "turn_item_stream".to_string(),
                 "typed_tool_arguments".to_string(),
                 "protocol_tool_call_typed_arguments_authority".to_string(),
+                "active_turn_steer_mailbox_contract".to_string(),
                 "legacy_display_arguments_not_canonical".to_string(),
                 "typed_file_change_evidence".to_string(),
                 "call_id_scoped_file_change_evidence".to_string(),

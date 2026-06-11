@@ -57,6 +57,7 @@ pub fn history_items_to_markdown(
     for item in ordered {
         match &item.payload {
             HistoryItemPayload::UserTurn { .. }
+            | HistoryItemPayload::SteerTurn { .. }
             | HistoryItemPayload::Message {
                 role: MessageRole::User,
                 ..
@@ -114,6 +115,7 @@ pub(crate) fn filechange_display_export_preserves_call_id_fixture_passes() -> bo
         cwd: camino::Utf8PathBuf::from("C:/workspace"),
         model: "fixture-model".to_string(),
         base_url: "http://fixture".to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: Some(3),
@@ -175,6 +177,7 @@ pub(crate) fn tooloutput_markdown_export_preserves_blocked_action_fixture_passes
         cwd: camino::Utf8PathBuf::from("C:/workspace"),
         model: "fixture-model".to_string(),
         base_url: "http://fixture".to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: Some(3),
@@ -218,6 +221,7 @@ pub(crate) fn session_markdown_legacy_toolcall_arguments_do_not_render_typed_pro
         cwd: camino::Utf8PathBuf::from("C:/workspace"),
         model: "fixture-model".to_string(),
         base_url: "http://fixture".to_string(),
+        access_mode: crate::config::AccessMode::Default,
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: Some(3),
@@ -686,7 +690,7 @@ fn push_message(output: &mut String, message: &TranscriptMessage) {
 
 fn push_history_item(output: &mut String, item: &HistoryItem) {
     let role = match &item.payload {
-        HistoryItemPayload::UserTurn { .. } => Some("User"),
+        HistoryItemPayload::UserTurn { .. } | HistoryItemPayload::SteerTurn { .. } => Some("User"),
         HistoryItemPayload::Message { role, .. } => Some(match role {
             MessageRole::User => "User",
             MessageRole::Assistant => "Assistant",
@@ -729,13 +733,16 @@ fn history_item_detail_title(item: &HistoryItem) -> &'static str {
         HistoryItemPayload::ControlEnvelope { .. } => "Control Envelope",
         HistoryItemPayload::Compaction { .. } => "Compaction",
         HistoryItemPayload::Error { .. } => "Error",
-        HistoryItemPayload::UserTurn { .. } | HistoryItemPayload::Message { .. } => "Message",
+        HistoryItemPayload::UserTurn { .. }
+        | HistoryItemPayload::SteerTurn { .. }
+        | HistoryItemPayload::Message { .. } => "Message",
     }
 }
 
 fn push_history_user_quote_body(output: &mut String, item: &HistoryItem) {
     match &item.payload {
         HistoryItemPayload::UserTurn { content, .. }
+        | HistoryItemPayload::SteerTurn { content, .. }
         | HistoryItemPayload::Message {
             role: MessageRole::User,
             content,
@@ -900,6 +907,26 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
                     output,
                     "json",
                     &serde_json::to_string_pretty(turn_context).unwrap_or_default(),
+                );
+            }
+        }
+        HistoryItemPayload::SteerTurn {
+            content,
+            additional_context,
+            client_user_message_id,
+            ..
+        } => {
+            push_content_parts(output, content);
+            if !additional_context.is_empty() || client_user_message_id.is_some() {
+                output.push_str("### Active-Turn Steer Context\n\n");
+                let context = serde_json::json!({
+                    "client_user_message_id": client_user_message_id,
+                    "additional_context": additional_context,
+                });
+                push_fenced(
+                    output,
+                    "json",
+                    &serde_json::to_string_pretty(&context).unwrap_or_default(),
                 );
             }
         }
