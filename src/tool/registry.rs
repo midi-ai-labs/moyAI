@@ -65,6 +65,10 @@ impl ToolRegistry {
             "apply_patch".to_string(),
             Arc::new(crate::tool::apply_patch::ApplyPatchTool),
         );
+        tools.insert(
+            "todowrite".to_string(),
+            Arc::new(crate::tool::todo_write::TodoWriteTool),
+        );
         tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
         tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
         Self { tools }
@@ -124,6 +128,7 @@ mod tests {
                 "list",
                 "read",
                 "shell",
+                "todowrite",
                 "write"
             ]
         );
@@ -142,6 +147,15 @@ mod tests {
             super::ToolRegistry::core_agent()
                 .available_tool_names()
                 .contains(&"apply_patch".to_string())
+        );
+    }
+
+    #[test]
+    fn core_agent_registry_includes_todowrite_surface() {
+        assert!(
+            super::ToolRegistry::core_agent()
+                .available_tool_names()
+                .contains(&"todowrite".to_string())
         );
     }
 }
