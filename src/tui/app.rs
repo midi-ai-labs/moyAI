@@ -21,6 +21,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionSteerRequest};
 use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode, TuiArgs};
 use crate::config::merge::apply_patch as apply_config_patch;
+use crate::config::model::full_effective_override;
 use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 use crate::runtime::{SystemClock, build_cancel_token};
@@ -455,7 +456,7 @@ impl TuiController {
             self.effective_config.permissions.access_mode.next();
         self.config_editor = ConfigEditorState::from_config(&self.effective_config);
         self.state.status_message = Some(format!(
-            "session access mode set to {}",
+            "UI session access mode set to {}",
             self.effective_config.permissions.access_mode.label()
         ));
     }
@@ -1927,77 +1928,6 @@ fn build_composer() -> TextArea<'static> {
 
 fn textarea_value(textarea: &TextArea<'_>) -> String {
     textarea.lines().join("\n")
-}
-
-fn full_effective_override(config: &ResolvedConfig) -> crate::config::model::PartialResolvedConfig {
-    crate::config::model::PartialResolvedConfig {
-        model: Some(crate::config::model::PartialModelConfig {
-            base_url: Some(config.model.base_url.clone()),
-            model: Some(config.model.model.clone()),
-            prompt_profile: Some(config.model.prompt_profile),
-            provider_metadata_mode: Some(config.model.provider_metadata_mode),
-            api_key_env: None,
-            extra_headers: Some(config.model.extra_headers.clone()),
-            request_timeout_ms: Some(config.model.request_timeout_ms),
-            stream_idle_timeout_ms: Some(config.model.stream_idle_timeout_ms),
-            connect_timeout_ms: Some(config.model.connect_timeout_ms),
-            max_retries: Some(config.model.max_retries),
-            stream_max_retries: Some(config.model.stream_max_retries),
-            context_window: Some(config.model.context_window),
-            max_output_tokens: Some(config.model.max_output_tokens),
-            temperature: config.model.temperature,
-            top_p: config.model.top_p,
-            top_k: config.model.top_k,
-            presence_penalty: config.model.presence_penalty,
-            frequency_penalty: config.model.frequency_penalty,
-            seed: config.model.seed,
-            stop_sequences: Some(config.model.stop_sequences.clone()),
-            supports_tools: Some(config.model.supports_tools),
-            supports_reasoning: Some(config.model.supports_reasoning),
-            supports_images: Some(config.model.supports_images),
-            parallel_tool_calls: Some(config.model.parallel_tool_calls),
-            max_parallel_predictions: Some(config.model.max_parallel_predictions),
-            extra_body_json: config.model.extra_body_json.clone(),
-        }),
-        session: Some(crate::config::model::PartialSessionConfig {
-            default_title_max_len: None,
-            transcript_limit_messages: None,
-            auto_resume_last: None,
-            max_steps_per_turn: Some(config.session.max_steps_per_turn),
-            overflow_margin_tokens: None,
-        }),
-        inspection: Some(crate::config::model::PartialInspectionConfig {
-            default_max_depth: Some(config.inspection.default_max_depth),
-            default_max_entries_per_dir: Some(config.inspection.default_max_entries_per_dir),
-            max_extensions_reported: Some(config.inspection.max_extensions_reported),
-            include_hidden_by_default: Some(config.inspection.include_hidden_by_default),
-        }),
-        file_guard: Some(crate::config::model::PartialFileGuardConfig {
-            max_inline_read_bytes: Some(config.file_guard.max_inline_read_bytes),
-            large_file_warning_bytes: Some(config.file_guard.large_file_warning_bytes),
-            blocked_read_extensions: Some(config.file_guard.blocked_read_extensions.clone()),
-            structured_document_extensions: Some(
-                config.file_guard.structured_document_extensions.clone(),
-            ),
-        }),
-        docling: Some(crate::config::model::PartialDoclingConfig {
-            enabled: Some(config.docling.enabled),
-            base_url: Some(config.docling.base_url.clone()),
-            timeout_ms: Some(config.docling.timeout_ms),
-            api_key_env: Some(config.docling.api_key_env.clone()),
-            headers: Some(config.docling.headers.clone()),
-        }),
-        mcp: Some(crate::config::model::PartialMcpConfig {
-            enabled: Some(config.mcp.enabled),
-            servers: Some(config.mcp.servers.clone()),
-        }),
-        permissions: Some(crate::config::model::PartialPermissionsConfig {
-            access_mode: Some(config.permissions.access_mode),
-            additional_read_roots: Some(config.permissions.additional_read_roots.clone()),
-            additional_write_roots: Some(config.permissions.additional_write_roots.clone()),
-        }),
-        ..Default::default()
-    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

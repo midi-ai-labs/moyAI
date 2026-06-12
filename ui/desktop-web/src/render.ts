@@ -658,7 +658,7 @@ function renderProviderOverlay(state: DesktopWebState): string {
         </div>
         <div class="split-actions">
           <button data-action="load-provider-models" ${state.provider_loading ? "disabled" : ""}>${state.provider_loading ? "読込中" : "モデル読込"}</button>
-          <button data-action="apply-provider-session" ${state.provider_apply_enabled ? "" : "disabled"}>セッションに適用</button>
+          <button data-action="apply-provider-session" ${state.provider_apply_enabled ? "" : "disabled"}>UIセッションに適用</button>
           <button data-action="save-provider-global" ${state.provider_apply_enabled ? "" : "disabled"}>設定ファイルに保存</button>
         </div>
         <div class="select-list">
@@ -713,7 +713,7 @@ function renderConfigOverlay(state: DesktopWebState): string {
             )}</div>
             <pre class="feedback">${escapeHtml(state.config_feedback_text)}</pre>
             <div class="split-actions config-actions">
-              <button data-action="apply-session-config">このセッションに適用</button>
+              <button data-action="apply-session-config">このUIセッションに適用</button>
               <button data-action="save-global-config">設定ファイルに保存</button>
               <button data-action="open-global-config-folder">設定フォルダーを開く</button>
               <button data-action="close-overlay">閉じる</button>

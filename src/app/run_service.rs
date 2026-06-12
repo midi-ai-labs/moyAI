@@ -15,7 +15,8 @@ use crate::app::{
     SessionTitleUpdateRequest, SessionTurnsRequest,
 };
 use crate::cli::{ConfirmationPrompt, EventRenderer};
-use crate::config::{ModelConfig, merge::apply_patch as apply_config_patch};
+use crate::config::model::PartialResolvedConfig;
+use crate::config::{ModelConfig, ResolvedConfig, merge::apply_patch as apply_config_patch};
 use crate::error::{AppRunError, RuntimeError};
 use crate::harness::{HarnessRecordingSink, NativeHarnessRecorder};
 use crate::llm::{
@@ -153,16 +154,6 @@ impl RunService {
         renderer: &mut dyn EventRenderer,
         prompt: &mut dyn ConfirmationPrompt,
     ) -> Result<RunSummary, AppRunError> {
-        let mut effective_config = match request.config_override.clone() {
-            Some(patch) => apply_config_patch(self.config.clone(), patch),
-            None => self.config.clone(),
-        };
-        if !request.base_url.trim().is_empty() {
-            effective_config.model.base_url = request.base_url.clone();
-        }
-        if !request.model.trim().is_empty() {
-            effective_config.model.model = request.model.clone();
-        }
         let selector = match (request.session_id, request.continue_last) {
             (Some(id), false) => SessionSelector::ById(id),
             (None, true) => SessionSelector::Latest,
@@ -173,15 +164,14 @@ impl RunService {
                 ));
             }
         };
-        if let Some(session_settings) = self.session_settings_for_selector(&selector).await? {
-            effective_config.model.model = session_settings.model.clone();
-            effective_config.model.base_url = session_settings.base_url.clone();
-            apply_session_model_parameters(
-                &mut effective_config.model,
-                &session_settings.model_parameters,
-            );
-            effective_config.permissions.access_mode = session_settings.access_mode;
-        }
+        let session_settings = self.session_settings_for_selector(&selector).await?;
+        let mut effective_config = compose_run_effective_config(
+            self.config.clone(),
+            session_settings.as_ref(),
+            request.config_override.clone(),
+            &request.model,
+            &request.base_url,
+        );
         let should_generate_session_title = matches!(&selector, SessionSelector::New)
             && request
                 .title
@@ -982,6 +972,35 @@ fn apply_session_model_parameters(model: &mut ModelConfig, parameters: &SessionM
     }
 }
 
+fn compose_run_effective_config(
+    base_config: ResolvedConfig,
+    session_settings: Option<&SessionRecord>,
+    config_override: Option<PartialResolvedConfig>,
+    request_model: &str,
+    request_base_url: &str,
+) -> ResolvedConfig {
+    let mut effective_config = base_config;
+    if let Some(session_settings) = session_settings {
+        effective_config.model.model = session_settings.model.clone();
+        effective_config.model.base_url = session_settings.base_url.clone();
+        apply_session_model_parameters(
+            &mut effective_config.model,
+            &session_settings.model_parameters,
+        );
+        effective_config.permissions.access_mode = session_settings.access_mode;
+    }
+    if let Some(patch) = config_override {
+        effective_config = apply_config_patch(effective_config, patch);
+    }
+    if !request_base_url.trim().is_empty() {
+        effective_config.model.base_url = request_base_url.to_string();
+    }
+    if !request_model.trim().is_empty() {
+        effective_config.model.model = request_model.to_string();
+    }
+    effective_config
+}
+
 #[cfg(test)]
 fn app_session_model_parameters_override_runtime_config_fixture_passes() -> bool {
     let mut model = ModelConfig {
@@ -1004,6 +1023,104 @@ fn app_session_model_parameters_override_runtime_config_fixture_passes() -> bool
         && model.top_p == Some(0.8)
         && model.top_k == Some(40)
         && model.max_output_tokens == 4096
+}
+
+#[cfg(test)]
+fn app_config_override_wins_over_session_settings_fixture_passes() -> bool {
+    let mut base = ResolvedConfig::default();
+    base.model.model = "base-model".to_string();
+    base.model.base_url = "http://base:1234".to_string();
+    base.model.max_output_tokens = 1024;
+    base.permissions.access_mode = crate::config::AccessMode::Default;
+
+    let session = SessionRecord {
+        id: crate::session::SessionId::new(),
+        project_id: crate::session::ProjectId::new(),
+        title: "Session".to_string(),
+        status: SessionStatus::Completed,
+        cwd: Utf8PathBuf::from("C:/workspace"),
+        model: "session-model".to_string(),
+        base_url: "http://session:1234".to_string(),
+        access_mode: crate::config::AccessMode::FullAccess,
+        model_parameters: SessionModelParameters {
+            temperature: Some(0.2),
+            top_p: Some(0.8),
+            top_k: Some(40),
+            max_output_tokens: Some(2048),
+        },
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: Some(1),
+    };
+    let override_config = PartialResolvedConfig {
+        model: Some(crate::config::model::PartialModelConfig {
+            model: Some("override-model".to_string()),
+            base_url: Some("http://override:1234".to_string()),
+            temperature: Some(0.7),
+            max_output_tokens: Some(4096),
+            ..crate::config::model::PartialModelConfig::default()
+        }),
+        permissions: Some(crate::config::model::PartialPermissionsConfig {
+            access_mode: Some(crate::config::AccessMode::AutoReview),
+            ..crate::config::model::PartialPermissionsConfig::default()
+        }),
+        ..PartialResolvedConfig::default()
+    };
+
+    let effective =
+        compose_run_effective_config(base, Some(&session), Some(override_config), "", "");
+    effective.model.model == "override-model"
+        && effective.model.base_url == "http://override:1234"
+        && effective.model.temperature == Some(0.7)
+        && effective.model.max_output_tokens == 4096
+        && effective.permissions.access_mode == crate::config::AccessMode::AutoReview
+}
+
+#[cfg(test)]
+fn app_session_settings_remain_when_request_override_is_empty_fixture_passes() -> bool {
+    let mut base = ResolvedConfig::default();
+    base.model.model = "base-model".to_string();
+    base.model.base_url = "http://base:1234".to_string();
+
+    let session = SessionRecord {
+        id: crate::session::SessionId::new(),
+        project_id: crate::session::ProjectId::new(),
+        title: "Session".to_string(),
+        status: SessionStatus::Completed,
+        cwd: Utf8PathBuf::from("C:/workspace"),
+        model: "session-model".to_string(),
+        base_url: "http://session:1234".to_string(),
+        access_mode: crate::config::AccessMode::FullAccess,
+        model_parameters: SessionModelParameters::default(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: Some(1),
+    };
+
+    let effective = compose_run_effective_config(base, Some(&session), None, "", "");
+    effective.model.model == "session-model"
+        && effective.model.base_url == "http://session:1234"
+        && effective.permissions.access_mode == crate::config::AccessMode::FullAccess
+}
+
+#[cfg(test)]
+fn app_per_run_model_and_base_url_win_over_config_override_fixture_passes() -> bool {
+    let override_config = PartialResolvedConfig {
+        model: Some(crate::config::model::PartialModelConfig {
+            model: Some("override-model".to_string()),
+            base_url: Some("http://override:1234".to_string()),
+            ..crate::config::model::PartialModelConfig::default()
+        }),
+        ..PartialResolvedConfig::default()
+    };
+    let effective = compose_run_effective_config(
+        ResolvedConfig::default(),
+        None,
+        Some(override_config),
+        "request-model",
+        "http://request:1234",
+    );
+    effective.model.model == "request-model" && effective.model.base_url == "http://request:1234"
 }
 
 fn build_user_thread_op(
@@ -1358,5 +1475,20 @@ mod tests {
     #[test]
     fn session_model_parameters_override_runtime_config() {
         assert!(super::app_session_model_parameters_override_runtime_config_fixture_passes());
+    }
+
+    #[test]
+    fn config_override_wins_over_session_settings() {
+        assert!(super::app_config_override_wins_over_session_settings_fixture_passes());
+    }
+
+    #[test]
+    fn session_settings_remain_when_request_override_is_empty() {
+        assert!(super::app_session_settings_remain_when_request_override_is_empty_fixture_passes());
+    }
+
+    #[test]
+    fn per_run_model_and_base_url_win_over_config_override() {
+        assert!(super::app_per_run_model_and_base_url_win_over_config_override_fixture_passes());
     }
 }

@@ -271,14 +271,8 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             continue_last: args.continue_last,
             title: args.title.clone(),
             cwd: app.workspace.cwd.clone(),
-            model: args
-                .model_override
-                .clone()
-                .unwrap_or_else(|| app.config.model.model.clone()),
-            base_url: args
-                .base_url_override
-                .clone()
-                .unwrap_or_else(|| app.config.model.base_url.clone()),
+            model: args.model_override.clone().unwrap_or_default(),
+            base_url: args.base_url_override.clone().unwrap_or_default(),
             config_override: None,
             output_mode: args.output_mode,
             show_reasoning: args.show_reasoning,

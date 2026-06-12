@@ -51,7 +51,7 @@ const eventContext = {
 
 void refresh();
 window.setInterval(() => {
-  if (currentState?.async_polling_required) {
+  if (currentState?.async_polling_required && !shouldDeferAutoRefresh()) {
     void refresh();
   }
 }, 600);
@@ -243,6 +243,15 @@ function restoreThreadPosition(thread: HTMLElement, scrollTop: number): void {
     thread.scrollTop = Math.min(scrollTop, Math.max(0, thread.scrollHeight - thread.clientHeight));
   };
   requestAnimationFrame(scroll);
+}
+
+function shouldDeferAutoRefresh(): boolean {
+  const active = document.activeElement;
+  const editingText =
+    active instanceof HTMLInputElement ||
+    active instanceof HTMLTextAreaElement ||
+    active instanceof HTMLSelectElement;
+  return editingText || currentState?.overlay === "provider" || currentState?.overlay === "config";
 }
 
 function renderError(message: string): void {

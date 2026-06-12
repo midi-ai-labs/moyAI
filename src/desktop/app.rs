@@ -9,7 +9,7 @@ use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest, Sessi
 use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode};
 use crate::config::loader::global_config_path;
 use crate::config::merge::apply_patch as apply_config_patch;
-use crate::config::model::{PartialModelConfig, PartialPermissionsConfig, PartialResolvedConfig};
+use crate::config::model::{PartialModelConfig, PartialResolvedConfig, full_effective_override};
 use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::docling::{normalize_docling_base_url, probe_docling_readiness};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
@@ -1385,7 +1385,11 @@ impl DesktopController {
         }
         self.state.begin_provider_model_load(normalized.clone());
         let runtime_tx = self.runtime_tx.clone();
-        let config = self.state.provider_config.effective_config.clone();
+        let config = provider_catalog_probe_config(
+            self.state.provider_config.effective_config.clone(),
+            normalized.clone(),
+            self.state.provider_config.provider_metadata_mode_input,
+        );
         std::thread::spawn(move || {
             let request_base_url = normalized.clone();
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1450,7 +1454,7 @@ impl DesktopController {
         };
         self.state.reset_effective_config(config);
         self.state
-            .set_status_message("applied provider selection to this session");
+            .set_status_message("applied provider selection to this UI session");
         self.state.hide_overlay();
     }
 
@@ -1484,7 +1488,8 @@ impl DesktopController {
                 let config = apply_config_patch(self.app.config.clone(), patch.clone());
                 self.state.reset_effective_config(config);
                 self.check_startup_docling();
-                self.state.set_status_message("applied session override");
+                self.state
+                    .set_status_message("applied override to this UI session");
             }
             Err(error) => self
                 .state
@@ -1504,7 +1509,7 @@ impl DesktopController {
         let access_mode = config.permissions.access_mode;
         self.state.reset_effective_config(config);
         self.state.set_status_message(format!(
-            "session access mode set to {}",
+            "UI session access mode set to {}",
             access_mode.label()
         ));
     }
@@ -3338,16 +3343,26 @@ unsafe fn shell_execute_hidden(file: &str, parameters: &str) -> bool {
     result > 32
 }
 
+fn provider_catalog_probe_config(
+    mut config: ResolvedConfig,
+    base_url: String,
+    provider_metadata_mode: crate::config::ProviderMetadataMode,
+) -> ResolvedConfig {
+    config.model.base_url = base_url;
+    config.model.provider_metadata_mode = provider_metadata_mode;
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DesktopProviderModelLoad, RuntimeMessage, RuntimeMessageAsyncContract,
         fallback_workspace_after_project_delete, first_restorable_project_root,
         notification_session_title, open_transcript_rows_to_markdown,
-        run_completion_notification_body, run_terminal_event_notification_body,
-        transcript_markdown_file_name,
+        provider_catalog_probe_config, run_completion_notification_body,
+        run_terminal_event_notification_body, transcript_markdown_file_name,
     };
-    use crate::config::ProviderMetadataMode;
+    use crate::config::{ProviderMetadataMode, ResolvedConfig};
     use crate::desktop::models::DesktopTranscriptRowKind;
     use crate::desktop::models::{DesktopFileChangeRow, DesktopTranscriptRow};
     use crate::llm::{ModelAvailabilityReport, ModelAvailabilityStatus};
@@ -3433,6 +3448,25 @@ mod tests {
         assert_eq!(
             RuntimeMessage::Finished(Err("failed".to_string())).async_contract(),
             RuntimeMessageAsyncContract::TerminalRun
+        );
+    }
+
+    #[test]
+    fn provider_catalog_probe_uses_current_provider_mode_input() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = "http://old-provider:1234".to_string();
+        config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+
+        let probe_config = provider_catalog_probe_config(
+            config,
+            "http://127.0.0.1:8110".to_string(),
+            ProviderMetadataMode::LmStudioNativeRequired,
+        );
+
+        assert_eq!(probe_config.model.base_url, "http://127.0.0.1:8110");
+        assert_eq!(
+            probe_config.model.provider_metadata_mode,
+            ProviderMetadataMode::LmStudioNativeRequired
         );
     }
 
@@ -4244,81 +4278,4 @@ pub fn desktop_app_current_provider_profile_fixture_passes() -> bool {
         && report.max_output_tokens == Some(8192)
         && markdown.contains("http://127.0.0.1:1234")
         && markdown.contains("qwen/qwen3.6-35b-a3b")
-}
-
-fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig {
-    PartialResolvedConfig {
-        model: Some(PartialModelConfig {
-            base_url: Some(config.model.base_url.clone()),
-            model: Some(config.model.model.clone()),
-            prompt_profile: Some(config.model.prompt_profile),
-            provider_metadata_mode: Some(config.model.provider_metadata_mode),
-            api_key_env: None,
-            extra_headers: Some(config.model.extra_headers.clone()),
-            request_timeout_ms: Some(config.model.request_timeout_ms),
-            stream_idle_timeout_ms: Some(config.model.stream_idle_timeout_ms),
-            connect_timeout_ms: Some(config.model.connect_timeout_ms),
-            max_retries: Some(config.model.max_retries),
-            stream_max_retries: Some(config.model.stream_max_retries),
-            context_window: Some(config.model.context_window),
-            max_output_tokens: Some(config.model.max_output_tokens),
-            temperature: config.model.temperature,
-            top_p: config.model.top_p,
-            top_k: config.model.top_k,
-            presence_penalty: config.model.presence_penalty,
-            frequency_penalty: config.model.frequency_penalty,
-            seed: config.model.seed,
-            stop_sequences: Some(config.model.stop_sequences.clone()),
-            supports_tools: Some(config.model.supports_tools),
-            supports_reasoning: Some(config.model.supports_reasoning),
-            supports_images: Some(config.model.supports_images),
-            parallel_tool_calls: Some(config.model.parallel_tool_calls),
-            max_parallel_predictions: Some(config.model.max_parallel_predictions),
-            extra_body_json: config.model.extra_body_json.clone(),
-        }),
-        session: Some(crate::config::model::PartialSessionConfig {
-            default_title_max_len: None,
-            transcript_limit_messages: None,
-            auto_resume_last: None,
-            max_steps_per_turn: Some(config.session.max_steps_per_turn),
-            overflow_margin_tokens: None,
-        }),
-        inspection: Some(crate::config::model::PartialInspectionConfig {
-            default_max_depth: Some(config.inspection.default_max_depth),
-            default_max_entries_per_dir: Some(config.inspection.default_max_entries_per_dir),
-            max_extensions_reported: Some(config.inspection.max_extensions_reported),
-            include_hidden_by_default: Some(config.inspection.include_hidden_by_default),
-        }),
-        file_guard: Some(crate::config::model::PartialFileGuardConfig {
-            max_inline_read_bytes: Some(config.file_guard.max_inline_read_bytes),
-            large_file_warning_bytes: Some(config.file_guard.large_file_warning_bytes),
-            blocked_read_extensions: Some(config.file_guard.blocked_read_extensions.clone()),
-            structured_document_extensions: Some(
-                config.file_guard.structured_document_extensions.clone(),
-            ),
-        }),
-        docling: Some(crate::config::model::PartialDoclingConfig {
-            enabled: Some(config.docling.enabled),
-            base_url: Some(config.docling.base_url.clone()),
-            timeout_ms: Some(config.docling.timeout_ms),
-            api_key_env: Some(config.docling.api_key_env.clone()),
-            headers: Some(config.docling.headers.clone()),
-        }),
-        mcp: Some(crate::config::model::PartialMcpConfig {
-            enabled: Some(config.mcp.enabled),
-            servers: Some(config.mcp.servers.clone()),
-        }),
-        permissions: Some(PartialPermissionsConfig {
-            access_mode: Some(config.permissions.access_mode),
-            additional_read_roots: Some(config.permissions.additional_read_roots.clone()),
-            additional_write_roots: Some(config.permissions.additional_write_roots.clone()),
-        }),
-        agent: None,
-        shell: None,
-        format: None,
-        instructions: None,
-        workspace: None,
-        tool_output: None,
-        logging: None,
-    }
 }

@@ -21,8 +21,18 @@ interface EventContext {
 let pendingOpacityPreviewPercent: number | null = null;
 let opacityPreviewFrame: number | null = null;
 let opacityPreviewInFlight = false;
+const TEXT_MUTATION_DEBOUNCE_MS = 180;
 const MIN_WINDOW_OPACITY_PERCENT = 50;
 const MAX_WINDOW_OPACITY_PERCENT = 100;
+
+interface PendingTextMutation {
+  name: string;
+  args: Record<string, unknown> | null;
+  timer: number | null;
+  inFlight: Promise<void> | null;
+}
+
+const pendingTextMutations = new Map<string, PendingTextMutation>();
 
 export function installGlobalKeyboardShortcuts(context: EventContext): void {
   document.addEventListener("keydown", (event) => {
@@ -89,33 +99,30 @@ export function wireEvents(state: DesktopWebState, context: EventContext): void 
       .catch((error) => context.renderError(String(error)));
   });
   document.querySelector<HTMLInputElement>("#provider-url")?.addEventListener("input", (event) => {
-    void command<DesktopWebState>("set_provider_base_url", {
-      text: (event.currentTarget as HTMLInputElement).value,
-    })
-      .then(context.setCurrentState)
-      .catch((error) => context.renderError(String(error)));
+    const text = (event.currentTarget as HTMLInputElement).value;
+    const currentState = context.getCurrentState();
+    if (currentState) currentState.provider_base_url = text;
+    scheduleTextMutation("provider-url", "set_provider_base_url", { text }, context);
   });
   document.querySelector<HTMLInputElement>("#provider-context-window")?.addEventListener("input", (event) => {
-    void command<DesktopWebState>("set_provider_context_window", {
-      text: (event.currentTarget as HTMLInputElement).value,
-    })
-      .then(context.setCurrentState)
-      .catch((error) => context.renderError(String(error)));
+    const text = (event.currentTarget as HTMLInputElement).value;
+    const currentState = context.getCurrentState();
+    if (currentState) currentState.provider_context_window = text;
+    scheduleTextMutation("provider-context-window", "set_provider_context_window", { text }, context);
   });
   document.querySelector<HTMLInputElement>("#provider-max-output-tokens")?.addEventListener("input", (event) => {
-    void command<DesktopWebState>("set_provider_max_output_tokens", {
-      text: (event.currentTarget as HTMLInputElement).value,
-    })
-      .then(context.setCurrentState)
-      .catch((error) => context.renderError(String(error)));
+    const text = (event.currentTarget as HTMLInputElement).value;
+    const currentState = context.getCurrentState();
+    if (currentState) currentState.provider_max_output_tokens = text;
+    scheduleTextMutation("provider-max-output-tokens", "set_provider_max_output_tokens", { text }, context);
   });
   document.querySelector<HTMLTextAreaElement>("#config-value")?.addEventListener("input", (event) => {
     const text = (event.currentTarget as HTMLTextAreaElement).value;
+    const currentState = context.getCurrentState();
+    if (currentState) currentState.config_value_text = text;
     context.uiState.configDirty = true;
     updateConfigValidation(state.config_field_title, text, context.uiState);
-    void command<DesktopWebState>("set_config_value", { text })
-      .then(context.setCurrentState)
-      .catch((error) => context.renderError(String(error)));
+    scheduleTextMutation("config-value", "set_config_value", { text }, context);
   });
   document.querySelector<HTMLInputElement>("#config-filter")?.addEventListener("input", (event) => {
     context.uiState.configFilterText = (event.currentTarget as HTMLInputElement).value;
@@ -161,7 +168,7 @@ export function wireEvents(state: DesktopWebState, context: EventContext): void 
       const action = node.dataset.action ?? "";
       const index = Number(node.dataset.index ?? "-1");
       const value = node.dataset.mode ?? "";
-      dispatchAction(action, index, value, state, context);
+      void dispatchAction(action, index, value, state, context);
     });
   });
   document.querySelectorAll<HTMLElement>("[data-drag-region], [data-tauri-drag-region]").forEach((node) => {
@@ -171,6 +178,63 @@ export function wireEvents(state: DesktopWebState, context: EventContext): void 
     });
   });
   focusOverlayPrimary(state, context.uiState);
+}
+
+function scheduleTextMutation(key: string, name: string, args: Record<string, unknown>, context: EventContext): void {
+  const existing = pendingTextMutations.get(key);
+  const entry = existing ?? { name, args: null, timer: null, inFlight: null };
+  entry.name = name;
+  entry.args = args;
+  if (entry.timer !== null) window.clearTimeout(entry.timer);
+  entry.timer = window.setTimeout(() => {
+    entry.timer = null;
+    void flushTextMutation(key, context);
+  }, TEXT_MUTATION_DEBOUNCE_MS);
+  pendingTextMutations.set(key, entry);
+}
+
+async function flushTextMutation(key: string, context: EventContext): Promise<void> {
+  const entry = pendingTextMutations.get(key);
+  if (!entry) return;
+  if (entry.timer !== null) {
+    window.clearTimeout(entry.timer);
+    entry.timer = null;
+  }
+  if (entry.inFlight) {
+    await entry.inFlight;
+  }
+  if (!entry.args) {
+    return;
+  }
+  const name = entry.name;
+  const args = entry.args;
+  entry.args = null;
+  entry.inFlight = command<DesktopWebState>(name, args)
+    .then((state) => {
+      if (entry.args === null) context.setCurrentState(state);
+    })
+    .catch((error) => context.renderError(String(error)))
+    .finally(() => {
+      entry.inFlight = null;
+    });
+  await entry.inFlight;
+  if (entry.args !== null) {
+    await flushTextMutation(key, context);
+  } else {
+    pendingTextMutations.delete(key);
+  }
+}
+
+async function flushProviderInputMutations(context: EventContext): Promise<void> {
+  await Promise.all([
+    flushTextMutation("provider-url", context),
+    flushTextMutation("provider-context-window", context),
+    flushTextMutation("provider-max-output-tokens", context),
+  ]);
+}
+
+async function flushConfigInputMutations(context: EventContext): Promise<void> {
+  await flushTextMutation("config-value", context);
 }
 
 function scheduleOpacityPreview(percent: number, context: EventContext): void {
@@ -205,7 +269,7 @@ async function flushOpacityPreview(context: EventContext): Promise<void> {
   }
 }
 
-function dispatchAction(action: string, index: number, value: string, state: DesktopWebState, context: EventContext): void {
+async function dispatchAction(action: string, index: number, value: string, state: DesktopWebState, context: EventContext): Promise<void> {
   if (action === "minimize-window") void context.desktopWindow.minimize();
   if (action === "toggle-maximize-window") void context.desktopWindow.toggleMaximize();
   if (action === "close-window") void command("hide_to_tray").catch(() => context.desktopWindow.hide());
@@ -274,19 +338,34 @@ function dispatchAction(action: string, index: number, value: string, state: Des
   if (action === "open-global-config-folder") void context.mutate("open_global_config_folder");
   if (action === "open-typed-path") void context.mutate("open_typed_path");
   if (action === "open-artifact-folder") void context.mutate("open_artifact_folder");
-  if (action === "load-provider-models") void context.mutate("load_provider_models");
+  if (action === "load-provider-models") {
+    await flushProviderInputMutations(context);
+    void context.mutate("load_provider_models");
+  }
   if (action === "set-provider-mode") {
     void context.mutate("set_provider_metadata_mode", { mode: value });
   }
   if (action === "select-provider-model") void context.mutate("select_provider_model", { index });
-  if (action === "apply-provider-session") void context.mutate("apply_provider_session");
-  if (action === "save-provider-global") void context.mutate("save_provider_global");
+  if (action === "apply-provider-session") {
+    await flushProviderInputMutations(context);
+    void context.mutate("apply_provider_session");
+  }
+  if (action === "save-provider-global") {
+    await flushProviderInputMutations(context);
+    void context.mutate("save_provider_global");
+  }
   if (action === "select-config") {
     context.uiState.configDirty = false;
     void context.mutate("set_config_selection", { index });
   }
-  if (action === "apply-session-config") submitConfigAction("apply_session_config", state, context);
-  if (action === "save-global-config") submitConfigAction("save_global_config", state, context);
+  if (action === "apply-session-config") {
+    await flushConfigInputMutations(context);
+    submitConfigAction("apply_session_config", state, context);
+  }
+  if (action === "save-global-config") {
+    await flushConfigInputMutations(context);
+    submitConfigAction("save_global_config", state, context);
+  }
   if (action === "toggle-access") void context.mutate("toggle_access_mode");
   if (action === "insert-command") void context.mutate("insert_command", { index });
   if (action === "allow") void context.mutate("answer_permission", { allow: true });

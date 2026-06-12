@@ -146,33 +146,49 @@ pub async fn fetch_provider_model_infos(
     let client = build_probe_client(config)?;
     let headers = build_probe_headers(config)?;
 
-    let openai_models = fetch_openai_model_infos(&client, &base_url, headers.clone()).await?;
-    if openai_models.is_empty() {
-        return Err(LlmError::Message(
-            "provider returned an empty model list".to_string(),
-        ));
+    let mut models = std::collections::BTreeMap::new();
+    let mut first_error = None;
+    match fetch_openai_model_infos(&client, &base_url, headers.clone()).await {
+        Ok(openai_models) => {
+            for model in openai_models {
+                models.insert(model.id.clone(), model);
+            }
+        }
+        Err(error) => first_error = Some(error),
     }
-    let mut models = openai_models
-        .into_iter()
-        .map(|model| (model.id.clone(), model))
-        .collect::<std::collections::BTreeMap<_, _>>();
 
-    if let Ok(native_models) = fetch_lmstudio_model_infos(&client, &base_url, headers.clone()).await
-    {
-        for model in native_models {
-            models
-                .entry(model.id.clone())
-                .and_modify(|existing| existing.enrich_from(&model))
-                .or_insert(model);
+    match fetch_lmstudio_model_infos(&client, &base_url, headers.clone()).await {
+        Ok(native_models) => {
+            for model in native_models {
+                models
+                    .entry(model.id.clone())
+                    .and_modify(|existing| existing.enrich_from(&model))
+                    .or_insert(model);
+            }
         }
+        Err(error) if first_error.is_none() => first_error = Some(error),
+        Err(_) => {}
     }
-    if let Ok(vllm_mlx_models) = fetch_vllm_mlx_model_infos(&client, &base_url, headers).await {
-        for model in vllm_mlx_models {
-            models
-                .entry(model.id.clone())
-                .and_modify(|existing| existing.enrich_from(&model))
-                .or_insert(model);
+    match fetch_vllm_mlx_model_infos(&client, &base_url, headers).await {
+        Ok(vllm_mlx_models) => {
+            for model in vllm_mlx_models {
+                models
+                    .entry(model.id.clone())
+                    .and_modify(|existing| existing.enrich_from(&model))
+                    .or_insert(model);
+            }
         }
+        Err(error) if first_error.is_none() => first_error = Some(error),
+        Err(_) => {}
+    }
+
+    if models.is_empty() {
+        return match first_error {
+            Some(error) => Err(error),
+            None => Err(LlmError::Message(
+                "provider returned an empty model list".to_string(),
+            )),
+        };
     }
 
     let mut models = models.into_values().collect::<Vec<_>>();
@@ -1555,6 +1571,61 @@ mod tests {
         assert_eq!(models[0].context_window, Some(131_072));
         assert_eq!(models[0].max_output_tokens, Some(8_192));
         assert!(models[0].loaded);
+    }
+
+    #[tokio::test]
+    async fn provider_model_infos_can_load_from_lmstudio_native_when_v1_models_is_missing() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut handled = 0;
+            while handled < 4 && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                handled += 1;
+                let mut buf = [0_u8; 2048];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]);
+                let (status, body) = if request.starts_with("GET /api/v1/models ") {
+                    (
+                        "200 OK",
+                        r#"{"models":[{"key":"native-model","type":"llm","display_name":"Native Model","context_length":32768,"max_prediction_tokens":4096,"capabilities":{"trained_for_tool_use":true,"reasoning":true}}]}"#,
+                    )
+                } else {
+                    ("404 Not Found", r#"{"error":"not found"}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut config = ResolvedConfig::default();
+        config.model.provider_metadata_mode = ProviderMetadataMode::LmStudioNativeRequired;
+
+        let models = fetch_provider_model_infos(&config, &format!("http://{addr}"))
+            .await
+            .expect("models from native endpoint");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "native-model");
+        assert_eq!(models[0].source, "lmstudio_api");
+        assert_eq!(models[0].context_window, Some(32_768));
+        assert_eq!(models[0].max_output_tokens, Some(4096));
+        assert_eq!(models[0].supports_tools, Some(true));
+        assert_eq!(models[0].supports_reasoning, Some(true));
+
+        server.join().expect("server");
     }
 
     #[test]
