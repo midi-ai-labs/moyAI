@@ -1,22 +1,8 @@
 import { command } from "./api";
-import type { DesktopWebState, ProjectRow, SessionRow } from "./types";
-import { setArtifactPaneCollapsed, type UiLocalState } from "./ui_state";
+import { dispatchRegisteredAction, type ActionContext } from "./actions";
+import type { DesktopWebState } from "./types";
+import type { UiLocalState } from "./ui_state";
 import { validateConfigInput } from "./utils";
-
-interface EventContext {
-  desktopWindow: {
-    hide: () => Promise<void>;
-    minimize: () => Promise<void>;
-    toggleMaximize: () => Promise<void>;
-    startDragging: () => Promise<void>;
-  };
-  uiState: UiLocalState;
-  getCurrentState: () => DesktopWebState | null;
-  setCurrentState: (state: DesktopWebState) => void;
-  render: (state: DesktopWebState) => void;
-  mutate: (name: string, args?: Record<string, unknown>) => Promise<void>;
-  renderError: (message: string) => void;
-}
 
 let pendingOpacityPreviewPercent: number | null = null;
 let opacityPreviewFrame: number | null = null;
@@ -34,20 +20,28 @@ interface PendingTextMutation {
 
 const pendingTextMutations = new Map<string, PendingTextMutation>();
 
-export function installGlobalKeyboardShortcuts(context: EventContext): void {
+export function installGlobalKeyboardShortcuts(context: ActionContext): void {
   document.addEventListener("keydown", (event) => {
     const currentState = context.getCurrentState();
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
       event.preventDefault();
-      void context.mutate("show_command_palette");
+      if (currentState) void dispatchRegisteredAction("show-command-palette", currentState, context, { index: -1, value: "" });
     }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
       event.preventDefault();
-      void context.mutate("new_chat");
+      if (currentState) void dispatchRegisteredAction("new-chat", currentState, context, { index: -1, value: "" });
     }
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && currentState?.can_submit) {
       event.preventDefault();
-      void context.mutate("submit_prompt");
+      void dispatchRegisteredAction("send", currentState, context, { index: -1, value: "" });
+    }
+    if (event.key === "F8" && currentState && !currentState.busy) {
+      event.preventDefault();
+      void dispatchRegisteredAction("toggle-access", currentState, context, { index: -1, value: "" });
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "i" && currentState) {
+      event.preventDefault();
+      void dispatchRegisteredAction("toggle-session-archived-search", currentState, context, { index: -1, value: "" });
     }
     if (event.key === "Escape" && currentState?.overlay !== "none") {
       event.preventDefault();
@@ -56,7 +50,7 @@ export function installGlobalKeyboardShortcuts(context: EventContext): void {
   });
 }
 
-export function wireEvents(state: DesktopWebState, context: EventContext): void {
+export function wireEvents(state: DesktopWebState, context: ActionContext): void {
   document.querySelectorAll<HTMLElement>('[data-action="close-window"]').forEach((node) => {
     node.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
@@ -180,7 +174,7 @@ export function wireEvents(state: DesktopWebState, context: EventContext): void 
   focusOverlayPrimary(state, context.uiState);
 }
 
-function scheduleTextMutation(key: string, name: string, args: Record<string, unknown>, context: EventContext): void {
+function scheduleTextMutation(key: string, name: string, args: Record<string, unknown>, context: ActionContext): void {
   const existing = pendingTextMutations.get(key);
   const entry = existing ?? { name, args: null, timer: null, inFlight: null };
   entry.name = name;
@@ -193,7 +187,7 @@ function scheduleTextMutation(key: string, name: string, args: Record<string, un
   pendingTextMutations.set(key, entry);
 }
 
-async function flushTextMutation(key: string, context: EventContext): Promise<void> {
+async function flushTextMutation(key: string, context: ActionContext): Promise<void> {
   const entry = pendingTextMutations.get(key);
   if (!entry) return;
   if (entry.timer !== null) {
@@ -225,7 +219,7 @@ async function flushTextMutation(key: string, context: EventContext): Promise<vo
   }
 }
 
-async function flushProviderInputMutations(context: EventContext): Promise<void> {
+export async function flushProviderInputMutations(context: ActionContext): Promise<void> {
   await Promise.all([
     flushTextMutation("provider-url", context),
     flushTextMutation("provider-context-window", context),
@@ -233,11 +227,11 @@ async function flushProviderInputMutations(context: EventContext): Promise<void>
   ]);
 }
 
-async function flushConfigInputMutations(context: EventContext): Promise<void> {
+export async function flushConfigInputMutations(context: ActionContext): Promise<void> {
   await flushTextMutation("config-value", context);
 }
 
-function scheduleOpacityPreview(percent: number, context: EventContext): void {
+function scheduleOpacityPreview(percent: number, context: ActionContext): void {
   percent = clampOpacityPercent(percent);
   pendingOpacityPreviewPercent = percent;
   const currentState = context.getCurrentState();
@@ -254,7 +248,7 @@ function clampOpacityPercent(percent: number): number {
   return Math.min(MAX_WINDOW_OPACITY_PERCENT, Math.max(MIN_WINDOW_OPACITY_PERCENT, Math.round(percent)));
 }
 
-async function flushOpacityPreview(context: EventContext): Promise<void> {
+async function flushOpacityPreview(context: ActionContext): Promise<void> {
   if (opacityPreviewInFlight || pendingOpacityPreviewPercent === null) return;
   const percent = pendingOpacityPreviewPercent;
   pendingOpacityPreviewPercent = null;
@@ -269,7 +263,8 @@ async function flushOpacityPreview(context: EventContext): Promise<void> {
   }
 }
 
-async function dispatchAction(action: string, index: number, value: string, state: DesktopWebState, context: EventContext): Promise<void> {
+async function dispatchAction(action: string, index: number, value: string, state: DesktopWebState, context: ActionContext): Promise<void> {
+  if (await dispatchRegisteredAction(action, state, context, { index, value })) return;
   if (action === "minimize-window") void context.desktopWindow.minimize();
   if (action === "toggle-maximize-window") void context.desktopWindow.toggleMaximize();
   if (action === "close-window") void command("hide_to_tray").catch(() => context.desktopWindow.hide());
@@ -278,10 +273,7 @@ async function dispatchAction(action: string, index: number, value: string, stat
     context.uiState.attachmentTrayOpen = !context.uiState.attachmentTrayOpen;
     return context.render(state);
   }
-  if (action === "toggle-artifact-pane") {
-    setArtifactPaneCollapsed(context.uiState, !context.uiState.artifactPaneCollapsed);
-    return context.render(state);
-  }
+  if (action === "toggle-artifact-pane") return;
   if (action === "cancel-run" && (state.busy || state.confirmation_visible)) void context.mutate("cancel_run");
   if (action === "refresh") void context.mutate("refresh_desktop");
   if (action === "load-previous-turn-page") void context.mutate("load_previous_turn_page");
@@ -295,12 +287,6 @@ async function dispatchAction(action: string, index: number, value: string, stat
   if (action === "toggle-session-archived-search") {
     void context.mutate("set_session_search_include_archived", { includeArchived: !state.session_search_include_archived });
   }
-  if (action === "archive-session") return requestLocalArchiveState("archive_session", index, state, context);
-  if (action === "unarchive-session") return requestLocalArchiveState("unarchive_session", index, state, context);
-  if (action === "rollback-session") return requestLocalRollback(index, state, context);
-  if (action === "delete-project") return requestLocalDelete("project", index, state, context);
-  if (action === "delete-session") return requestLocalDelete("session", index, state, context);
-  if (action === "delete-chat-session") return requestLocalDelete("chat_session", index, state, context);
   if (action === "cancel-local-confirm") {
     context.uiState.pendingLocalConfirmation = null;
     return context.render(state);
@@ -372,69 +358,7 @@ async function dispatchAction(action: string, index: number, value: string, stat
   if (action === "deny") void context.mutate("answer_permission", { allow: false });
 }
 
-function requestLocalArchiveState(
-  kind: "archive_session" | "unarchive_session",
-  index: number,
-  state: DesktopWebState,
-  context: EventContext
-): void {
-  if (state.busy) {
-    return;
-  }
-  const row = state.session_rows[index];
-  if (!row) {
-    return;
-  }
-  context.uiState.pendingLocalConfirmation = {
-    kind,
-    index,
-    title: row.label,
-    detail: row.session_id,
-  };
-  context.render(state);
-}
-
-function requestLocalDelete(
-  kind: "project" | "session" | "chat_session",
-  index: number,
-  state: DesktopWebState,
-  context: EventContext
-): void {
-  if (state.busy) {
-    return;
-  }
-  const row =
-    kind === "project" ? state.project_rows[index] : kind === "chat_session" ? state.chat_session_rows[index] : state.session_rows[index];
-  if (!row) {
-    return;
-  }
-  context.uiState.pendingLocalConfirmation = {
-    kind,
-    index,
-    title: row.label,
-    detail: kind === "project" ? (row as ProjectRow).path : (row as SessionRow).session_id,
-  };
-  context.render(state);
-}
-
-function requestLocalRollback(index: number, state: DesktopWebState, context: EventContext): void {
-  if (state.busy) {
-    return;
-  }
-  const row = state.session_rows[index];
-  if (!row || row.loaded_status === "active") {
-    return;
-  }
-  context.uiState.pendingLocalConfirmation = {
-    kind: "rollback_session",
-    index,
-    title: row.label,
-    detail: row.session_id,
-  };
-  context.render(state);
-}
-
-function confirmLocalDelete(context: EventContext): void {
+function confirmLocalDelete(context: ActionContext): void {
   const pending = context.uiState.pendingLocalConfirmation;
   if (!pending) {
     return;
@@ -449,7 +373,7 @@ function confirmLocalDelete(context: EventContext): void {
   }
 }
 
-function confirmLocalArchiveState(context: EventContext): void {
+function confirmLocalArchiveState(context: ActionContext): void {
   const pending = context.uiState.pendingLocalConfirmation;
   if (!pending || (pending.kind !== "archive_session" && pending.kind !== "unarchive_session")) {
     return;
@@ -458,7 +382,7 @@ function confirmLocalArchiveState(context: EventContext): void {
   void context.mutate(pending.kind === "archive_session" ? "archive_session" : "unarchive_session", { index: pending.index });
 }
 
-function confirmLocalRollback(context: EventContext): void {
+function confirmLocalRollback(context: ActionContext): void {
   const pending = context.uiState.pendingLocalConfirmation;
   if (!pending || pending.kind !== "rollback_session") {
     return;
@@ -467,7 +391,7 @@ function confirmLocalRollback(context: EventContext): void {
   void context.mutate("rollback_session", { index: pending.index });
 }
 
-function submitConfigAction(commandName: string, state: DesktopWebState, context: EventContext): void {
+function submitConfigAction(commandName: string, state: DesktopWebState, context: ActionContext): void {
   const value = document.querySelector<HTMLTextAreaElement>("#config-value")?.value ?? state.config_value_text;
   const result = validateConfigInput(state.config_field_title, value);
   if (!result.ok) {

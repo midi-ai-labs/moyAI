@@ -1,4 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { actionById, menuActions, paletteActions, shortcutActions, type ActionDefinition, type ActionMenu } from "./actions";
 import { icon } from "./icons";
 import { renderMarkdown } from "./markdown";
 import type { DesktopWebState, FileChangeRow, ProjectRow, SessionRow, TranscriptRow } from "./types";
@@ -598,19 +599,12 @@ export function renderOverlay(state: DesktopWebState): string {
   if (state.overlay === "command_palette") return renderCommandPalette(state);
   if (state.overlay === "shortcuts") return renderShortcuts();
   if (state.overlay === "project_menu") return "";
-  if (state.overlay === "file_menu") return renderMenuPopover("file", [
-    ["new-chat", "新しいチャット", "Ctrl+N"],
-    ["create-project-from-picker", "プロジェクトを追加...", ""],
-    ["open-workspace-folder", "現在のフォルダーを開く", ""],
-  ]);
-  if (state.overlay === "edit_menu") return renderMenuPopover("edit", [
-    ["show-command-palette", "検索 / コマンド", "Ctrl+K"],
-    ["enhance-prompt", "Enhance", ""],
-  ]);
+  if (state.overlay === "file_menu") return renderMenuPopover("file", menuActions("file", state));
+  if (state.overlay === "edit_menu") return renderMenuPopover("edit", menuActions("edit", state));
   if (state.overlay === "view_menu") {
     return renderMenuPopover(
       "view",
-      [["refresh", "更新", ""], ["show-provider", "LLM URL", ""], ["show-config", "設定", ""]],
+      menuActions("view", state),
       `
         <div class="menu-slider" data-modal>
           <label class="field-label">ウィンドウ透過率</label>
@@ -619,7 +613,7 @@ export function renderOverlay(state: DesktopWebState): string {
       `
     );
   }
-  if (state.overlay === "help_menu") return renderMenuPopover("help", [["show-shortcuts", "ショートカット", ""]]);
+  if (state.overlay === "help_menu") return renderMenuPopover("help", menuActions("help", state));
   return "";
 }
 
@@ -816,13 +810,26 @@ function renderPromptReviewOverlay(state: DesktopWebState): string {
 }
 
 function renderCommandPalette(state: DesktopWebState): string {
+  const actions = paletteActions(state);
   return `
     <div class="modal-backdrop" data-action="close-overlay">
       <section class="modal command" data-modal>
-        <h2>検索 / コマンド</h2>
-        <input id="local-search" value="${escapeHtml(state.local_search_text)}" placeholder="ローカル状態を検索" />
+        <h2>コマンドパレット</h2>
+        <input id="local-search" value="${escapeHtml(state.local_search_text)}" placeholder="アクション、セッション、/コマンドを検索" />
         <pre class="feedback">${escapeHtml(state.local_search_results_text)}</pre>
         <div class="select-list compact">
+          ${
+            actions.length === 0
+              ? '<div class="empty">実行できるアクションはありません</div>'
+              : actions
+                  .map(
+                    (action) => `
+                      <button data-action="${escapeHtml(action.id)}">
+                        <span>${escapeHtml(action.label)}</span>${action.shortcut ? `<small>${escapeHtml(action.shortcut)}</small>` : ""}
+                      </button>`
+                  )
+                  .join("")
+          }
           ${state.command_rows
             .map(
               (row, index) => `
@@ -838,28 +845,21 @@ function renderCommandPalette(state: DesktopWebState): string {
 }
 
 function renderShortcuts(): string {
-  return renderMenuOverlay("ショートカット", [
-    ["close-overlay", "Esc  閉じる"],
-    ["show-command-palette", "Ctrl+K  検索 / コマンド"],
-    ["new-chat", "Ctrl+N  新しいチャット"],
-    ["send", "Ctrl+Enter  送信"],
-  ]);
+  const rows: Array<[string, string]> = [["close-overlay", "Esc  閉じる"]];
+  rows.push(...shortcutActions().map((action) => [action.id, `${action.shortcut ?? ""}  ${action.label}`] as [string, string]));
+  return renderMenuOverlay("ショートカット", rows);
 }
 
-function renderMenuPopover(
-  menu: "file" | "edit" | "view" | "help",
-  items: Array<[string, string, string]>,
-  extra = ""
-): string {
+function renderMenuPopover(menu: ActionMenu, items: ActionDefinition[], extra = ""): string {
   return `
     <div class="menu-scrim" data-action="close-overlay">
       <section class="titlebar-popover ${menu}" data-modal role="menu">
         ${items
           .map(
-            ([action, label, shortcut]) => `
-              <button data-action="${action}" role="menuitem">
-                <span>${escapeHtml(label)}</span>
-                ${shortcut ? `<small>${escapeHtml(shortcut)}</small>` : ""}
+            (action) => `
+              <button data-action="${escapeHtml(action.id)}" role="menuitem">
+                <span>${escapeHtml(action.label)}</span>
+                ${action.shortcut ? `<small>${escapeHtml(action.shortcut)}</small>` : ""}
               </button>`
           )
           .join("")}
@@ -895,6 +895,10 @@ function renderNavRow(
   running = false
 ): string {
   const actionClass = `${rejoinAction ? "has-rejoin" : ""} ${archiveAction ? "has-archive" : ""} ${rollbackAction ? "has-rollback" : ""}`.trim();
+  const rejoinLabel = actionLabel(rejoinAction, "実行中セッションに再参加");
+  const archiveLabel = actionLabel(archiveAction, archiveAction === "unarchive-session" ? "復元" : "アーカイブ");
+  const rollbackLabel = actionLabel(rollbackAction, "最新turnを戻す");
+  const deleteLabel = actionLabel(deleteAction, "削除");
   return `
     <div class="nav-row-wrap ${actionClass} ${selected ? "selected" : ""}">
       <button class="nav-row" data-action="${kind}" data-index="${index}">
@@ -903,22 +907,26 @@ function renderNavRow(
       </button>
       ${
         rejoinAction
-          ? `<button class="row-action row-rejoin" data-action="${rejoinAction}" data-index="${index}" title="実行中セッションに再参加" aria-label="実行中セッションに再参加">${icon("refresh")}</button>`
+          ? `<button class="row-action row-rejoin" data-action="${rejoinAction}" data-index="${index}" title="${escapeHtml(rejoinLabel)}" aria-label="${escapeHtml(rejoinLabel)}">${icon("refresh")}</button>`
           : ""
       }
       ${
         archiveAction
-          ? `<button class="row-action row-archive" data-action="${archiveAction}" data-index="${index}" title="${archiveAction === "unarchive-session" ? "復元" : "アーカイブ"}" aria-label="${archiveAction === "unarchive-session" ? "復元" : "アーカイブ"}">${icon("archive")}</button>`
+          ? `<button class="row-action row-archive" data-action="${archiveAction}" data-index="${index}" title="${escapeHtml(archiveLabel)}" aria-label="${escapeHtml(archiveLabel)}">${icon("archive")}</button>`
           : ""
       }
       ${
         rollbackAction
-          ? `<button class="row-action row-rollback" data-action="${rollbackAction}" data-index="${index}" title="最新turnを戻す" aria-label="最新turnを戻す">${icon("undo")}</button>`
+          ? `<button class="row-action row-rollback" data-action="${rollbackAction}" data-index="${index}" title="${escapeHtml(rollbackLabel)}" aria-label="${escapeHtml(rollbackLabel)}">${icon("undo")}</button>`
           : ""
       }
-      <button class="row-delete" data-action="${deleteAction}" data-index="${index}" title="削除" aria-label="削除">${icon("x")}</button>
+      <button class="row-delete" data-action="${deleteAction}" data-index="${index}" title="${escapeHtml(deleteLabel)}" aria-label="${escapeHtml(deleteLabel)}">${icon("x")}</button>
     </div>
   `;
+}
+
+function actionLabel(actionId: string, fallback: string): string {
+  return actionId ? (actionById(actionId)?.label ?? fallback) : fallback;
 }
 
 

@@ -1,6 +1,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { command } from "./api";
-import { installGlobalKeyboardShortcuts, wireEvents } from "./events";
+import type { ActionContext } from "./actions";
+import { flushConfigInputMutations, flushProviderInputMutations, installGlobalKeyboardShortcuts, wireEvents } from "./events";
 import {
   renderArtifactPane,
   renderComposer,
@@ -37,7 +38,7 @@ if (!app) {
   throw new Error("app root missing");
 }
 const appRoot = app;
-const eventContext = {
+const eventContext: ActionContext = {
   desktopWindow,
   uiState,
   getCurrentState: () => currentState,
@@ -47,6 +48,8 @@ const eventContext = {
   render,
   mutate,
   renderError,
+  flushProviderInputMutations: async () => flushProviderInputMutations(eventContext),
+  flushConfigInputMutations: async () => flushConfigInputMutations(eventContext),
 };
 
 void refresh();
