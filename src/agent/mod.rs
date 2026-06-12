@@ -161,26 +161,21 @@ impl AgentLoop {
                 }
 
                 let chat_request = self.chat_request(&request, &messages, &tool_schemas)?;
-                let mut collector = ResponseCollector::default();
+                let mut collector = StreamingResponseCollector::new(assistant.id, sink);
                 let response = self
                     .llm
                     .stream_chat(chat_request, request.cancel.clone(), &mut collector)
                     .await?;
+                let collector = collector.into_inner();
                 latest_usage = response.usage.clone();
 
-                for reasoning in collector.reasoning {
-                    sink.emit(RunEvent::ReasoningDelta {
-                        message_id: assistant.id,
-                        delta: reasoning,
-                    })?;
-                }
                 if !collector.text.is_empty() {
-                    persist_text_delta(
+                    persist_text_part(
                         &repo,
                         request.session.session.id,
                         assistant.id,
                         request.protocol_turn_id,
-                        sink,
+                        sink.reserve_protocol_sequence_no(),
                         collector.text.clone(),
                     )
                     .await?;
@@ -568,7 +563,6 @@ struct ToolOutputForModel {
 #[derive(Default)]
 struct ResponseCollector {
     text: String,
-    reasoning: Vec<String>,
     tool_calls: Vec<ModelToolCall>,
     tool_call_order: Vec<String>,
     tool_call_args: HashMap<String, String>,
@@ -579,7 +573,7 @@ impl LlmEventSink for ResponseCollector {
     fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
         match event {
             LlmEvent::TextDelta(delta) => self.text.push_str(&delta),
-            LlmEvent::ReasoningDelta(delta) => self.reasoning.push(delta),
+            LlmEvent::ReasoningDelta(_) => {}
             LlmEvent::ToolCallStart { call_id, tool_name } => {
                 if !self.tool_call_order.iter().any(|seen| seen == &call_id) {
                     self.tool_call_order.push(call_id.clone());
@@ -597,6 +591,49 @@ impl LlmEventSink for ResponseCollector {
         }
         self.rebuild_tool_calls();
         Ok(())
+    }
+}
+
+struct StreamingResponseCollector<'a> {
+    inner: ResponseCollector,
+    message_id: MessageId,
+    sink: &'a mut dyn RunEventSink,
+}
+
+impl<'a> StreamingResponseCollector<'a> {
+    fn new(message_id: MessageId, sink: &'a mut dyn RunEventSink) -> Self {
+        Self {
+            inner: ResponseCollector::default(),
+            message_id,
+            sink,
+        }
+    }
+
+    fn into_inner(self) -> ResponseCollector {
+        self.inner
+    }
+}
+
+impl LlmEventSink for StreamingResponseCollector<'_> {
+    fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
+        match &event {
+            LlmEvent::TextDelta(delta) => self
+                .sink
+                .emit_pre_recorded(RunEvent::TextDelta {
+                    message_id: self.message_id,
+                    delta: delta.clone(),
+                })
+                .map_err(|error| crate::error::LlmError::Message(error.to_string()))?,
+            LlmEvent::ReasoningDelta(delta) => self
+                .sink
+                .emit_pre_recorded(RunEvent::ReasoningDelta {
+                    message_id: self.message_id,
+                    delta: delta.clone(),
+                })
+                .map_err(|error| crate::error::LlmError::Message(error.to_string()))?,
+            _ => {}
+        }
+        self.inner.push(event)
     }
 }
 
@@ -668,12 +705,12 @@ impl LoopGuard {
     }
 }
 
-async fn persist_text_delta(
+async fn persist_text_part(
     repo: &crate::storage::SqliteSessionRepository,
     session_id: crate::session::SessionId,
     message_id: MessageId,
     turn_id: TurnId,
-    sink: &mut dyn RunEventSink,
+    protocol_sequence_no: Option<i64>,
     text: String,
 ) -> Result<(), AgentError> {
     let event = RunEvent::TextDelta {
@@ -689,10 +726,9 @@ async fn persist_text_delta(
         },
         &event,
         turn_id,
-        sink.reserve_protocol_sequence_no(),
+        protocol_sequence_no,
     )
     .await?;
-    sink.emit_pre_recorded(event)?;
     Ok(())
 }
 
@@ -1179,6 +1215,62 @@ mod tests {
             .await
             .expect("session");
         assert_eq!(session.status, SessionStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn text_and_reasoning_deltas_stream_before_single_text_persist() {
+        let config = ResolvedConfig::default();
+        let run = run_scripted(
+            config,
+            vec![ScriptedResponse {
+                events: vec![
+                    LlmEvent::ReasoningDelta("thinking".to_string()),
+                    LlmEvent::TextDelta("hello".to_string()),
+                    LlmEvent::TextDelta(" world".to_string()),
+                ],
+                finish_reason: FinishReason::Stop,
+            }],
+        )
+        .await
+        .expect("run");
+        run.summary.expect("summary");
+
+        let text_deltas = run
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let reasoning_deltas = run
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::ReasoningDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(reasoning_deltas, vec!["thinking"]);
+        assert_eq!(text_deltas, vec!["hello", " world"]);
+
+        let persisted_assistant_text = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("history")
+            .into_iter()
+            .filter_map(|item| match item.payload {
+                HistoryItemPayload::Message {
+                    role: MessageRole::Assistant,
+                    content,
+                    ..
+                } => Some(content_text(&content)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_assistant_text, vec!["hello world"]);
     }
 
     #[test]

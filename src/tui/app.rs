@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{self, Stdout};
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
@@ -23,6 +24,7 @@ use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 use crate::runtime::{SystemClock, build_cancel_token};
+use crate::session::markdown::{history_items_to_markdown, history_markdown_file_name};
 use crate::session::{
     EditorContext, LoadedSessionStatus, LoadedSessionSummary, PromptDispatchPart, RunEvent,
     RunSummary, SessionId, SessionRecord, SessionStateSnapshot, TodoItem, TodoStatus,
@@ -204,6 +206,12 @@ impl TuiController {
                     && self.state.run_status != RunStatus::Confirming =>
             {
                 self.toggle_access_mode();
+            }
+            KeyCode::F(9)
+                if self.state.run_status != RunStatus::Running
+                    && self.state.run_status != RunStatus::Confirming =>
+            {
+                self.export_history_markdown().await?;
             }
             KeyCode::Up => {
                 if self.state.route == Route::History && !self.state.sessions.is_empty() {
@@ -874,6 +882,46 @@ impl TuiController {
         Ok(())
     }
 
+    async fn export_history_markdown(&mut self) -> Result<(), AppRunError> {
+        let session_id = if self.state.route == Route::History {
+            self.state.selected_session().map(|session| session.id)
+        } else {
+            self.state.current_session_id
+        };
+        let Some(session_id) = session_id else {
+            self.state.status_message = Some("select or open a session first".to_string());
+            return Ok(());
+        };
+        let session = self.app.session_service.get_session(session_id).await?;
+        let history_items = self
+            .app
+            .session_service
+            .canonical_history_items(session_id)
+            .await?;
+        if history_items.is_empty() {
+            self.state.status_message = Some("session has no history to export".to_string());
+            return Ok(());
+        }
+
+        let file_name = history_markdown_file_name(&session.title, session_id);
+        let export_path = self
+            .app
+            .workspace
+            .root
+            .join(".moyai")
+            .join("history-exports")
+            .join(file_name);
+        if let Some(parent) = export_path.parent() {
+            fs::create_dir_all(parent.as_std_path())
+                .map_err(|error| AppRunError::Message(error.to_string()))?;
+        }
+        let markdown = history_items_to_markdown(&session, &history_items);
+        fs::write(export_path.as_std_path(), markdown)
+            .map_err(|error| AppRunError::Message(error.to_string()))?;
+        self.state.status_message = Some(format!("exported history markdown to {export_path}"));
+        Ok(())
+    }
+
     async fn archive_selected_session(&mut self, archived: bool) -> Result<(), AppRunError> {
         let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
             self.state.status_message = Some("select a session first".to_string());
@@ -1218,9 +1266,9 @@ impl TuiController {
             return;
         }
         let help = if self.state.route == Route::Home {
-            "Ctrl+Enter=send/open  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
+            "Ctrl+Enter=send/open  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  F9=export_md  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
         } else {
-            "Ctrl+Enter=send  F1=home  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
+            "Ctrl+Enter=send  F1=home  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  F9=export_md  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
         };
         frame.render_widget(Clear, area);
         let block = Block::default().borders(Borders::ALL).title(help);
