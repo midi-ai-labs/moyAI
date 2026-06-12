@@ -58,6 +58,8 @@ impl ToolRegistry {
     pub fn core_agent() -> Self {
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         tools.insert("list".to_string(), Arc::new(crate::tool::search::ListTool));
+        tools.insert("glob".to_string(), Arc::new(crate::tool::search::GlobTool));
+        tools.insert("grep".to_string(), Arc::new(crate::tool::search::GrepTool));
         tools.insert("read".to_string(), Arc::new(crate::tool::read::ReadTool));
         tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
         tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
@@ -111,7 +113,14 @@ mod tests {
     fn core_agent_registry_exposes_only_minimal_live_smoke_tools() {
         assert_eq!(
             super::ToolRegistry::core_agent().available_tool_names(),
-            vec!["list", "read", "shell", "write"]
+            vec!["glob", "grep", "list", "read", "shell", "write"]
         );
+    }
+
+    #[test]
+    fn core_agent_registry_includes_search_surface() {
+        let names = super::ToolRegistry::core_agent().available_tool_names();
+        assert!(names.contains(&"glob".to_string()));
+        assert!(names.contains(&"grep".to_string()));
     }
 }
