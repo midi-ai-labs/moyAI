@@ -151,6 +151,9 @@ impl AgentLoop {
                             &request,
                             assistant.id,
                             latest_usage.clone(),
+                            tool_call_count,
+                            failed_tool_count,
+                            change_count,
                             "run cancelled by user",
                             sink,
                         )
@@ -189,6 +192,9 @@ impl AgentLoop {
                             &request,
                             assistant.id,
                             latest_usage.clone(),
+                            tool_call_count,
+                            failed_tool_count,
+                            change_count,
                             "run cancelled by user",
                             sink,
                         )
@@ -469,6 +475,9 @@ impl AgentLoop {
         request: &AgentRunRequest,
         assistant_message_id: MessageId,
         usage: Option<TokenUsage>,
+        tool_call_count: usize,
+        failed_tool_count: usize,
+        change_count: usize,
         reason: &str,
         sink: &mut dyn RunEventSink,
     ) -> Result<RunSummary, AgentError> {
@@ -495,9 +504,9 @@ impl AgentLoop {
             assistant_message_id: Some(assistant_message_id),
             status: SessionStatus::Cancelled,
             finish_reason: Some(FinishReason::Cancelled),
-            tool_call_count: 0,
-            failed_tool_count: 0,
-            change_count: 0,
+            tool_call_count,
+            failed_tool_count,
+            change_count,
         })
     }
 
@@ -555,6 +564,7 @@ struct ResponseCollector {
     text: String,
     reasoning: Vec<String>,
     tool_calls: Vec<ModelToolCall>,
+    tool_call_order: Vec<String>,
     tool_call_args: HashMap<String, String>,
     tool_call_names: HashMap<String, String>,
 }
@@ -565,6 +575,9 @@ impl LlmEventSink for ResponseCollector {
             LlmEvent::TextDelta(delta) => self.text.push_str(&delta),
             LlmEvent::ReasoningDelta(delta) => self.reasoning.push(delta),
             LlmEvent::ToolCallStart { call_id, tool_name } => {
+                if !self.tool_call_order.iter().any(|seen| seen == &call_id) {
+                    self.tool_call_order.push(call_id.clone());
+                }
                 self.tool_call_names.insert(call_id.clone(), tool_name);
                 self.tool_call_args.entry(call_id).or_default();
             }
@@ -583,20 +596,22 @@ impl LlmEventSink for ResponseCollector {
 
 impl ResponseCollector {
     fn rebuild_tool_calls(&mut self) {
-        let mut calls = self
-            .tool_call_names
+        let calls = self
+            .tool_call_order
             .iter()
-            .map(|(call_id, tool_name)| ModelToolCall {
-                call_id: call_id.clone(),
-                tool_name: tool_name.clone(),
-                arguments_json: self
-                    .tool_call_args
-                    .get(call_id)
-                    .cloned()
-                    .unwrap_or_else(|| "{}".to_string()),
+            .filter_map(|call_id| {
+                let tool_name = self.tool_call_names.get(call_id)?;
+                Some(ModelToolCall {
+                    call_id: call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    arguments_json: self
+                        .tool_call_args
+                        .get(call_id)
+                        .cloned()
+                        .unwrap_or_else(|| "{}".to_string()),
+                })
             })
             .collect::<Vec<_>>();
-        calls.sort_by(|left, right| left.call_id.cmp(&right.call_id));
         self.tool_calls = calls;
     }
 }
@@ -604,7 +619,8 @@ impl ResponseCollector {
 struct LoopGuard {
     max_steps: usize,
     steps: usize,
-    repeats: HashMap<String, usize>,
+    last_tool_signature: Option<String>,
+    consecutive_repeat_count: usize,
 }
 
 impl LoopGuard {
@@ -612,7 +628,8 @@ impl LoopGuard {
         Self {
             max_steps: max_steps.max(1),
             steps: 0,
-            repeats: HashMap::new(),
+            last_tool_signature: None,
+            consecutive_repeat_count: 0,
         }
     }
 
@@ -629,11 +646,16 @@ impl LoopGuard {
 
     fn record_tool_call(&mut self, call: &ModelToolCall) -> Result<(), AgentError> {
         let signature = format!("{}:{}", call.tool_name, call.arguments_json);
-        let count = self.repeats.entry(signature.clone()).or_insert(0);
-        *count += 1;
-        if *count >= 3 {
+        if self.last_tool_signature.as_deref() == Some(signature.as_str()) {
+            self.consecutive_repeat_count += 1;
+        } else {
+            self.last_tool_signature = Some(signature.clone());
+            self.consecutive_repeat_count = 1;
+        }
+        if self.consecutive_repeat_count >= 3 {
             return Err(AgentError::Message(format!(
-                "repeated identical tool call stopped after {count} attempts: {signature}"
+                "repeated identical consecutive tool call stopped after {} attempts: {signature}",
+                self.consecutive_repeat_count
             )));
         }
         Ok(())
@@ -1257,6 +1279,73 @@ mod tests {
         assert!(missing.to_string().contains("$.count is required"));
         assert!(missing.to_string().contains("$.path expected type"));
         assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn response_collector_preserves_tool_call_start_order() {
+        let mut collector = ResponseCollector::default();
+        collector
+            .push(LlmEvent::ToolCallStart {
+                call_id: "z_call".to_string(),
+                tool_name: "write".to_string(),
+            })
+            .expect("start z");
+        collector
+            .push(LlmEvent::ToolCallStart {
+                call_id: "a_call".to_string(),
+                tool_name: "read".to_string(),
+            })
+            .expect("start a");
+        collector
+            .push(LlmEvent::ToolCallArgsDelta {
+                call_id: "z_call".to_string(),
+                delta: r#"{"path":"one"}"#.to_string(),
+            })
+            .expect("args z");
+        collector
+            .push(LlmEvent::ToolCallArgsDelta {
+                call_id: "a_call".to_string(),
+                delta: r#"{"path":"two"}"#.to_string(),
+            })
+            .expect("args a");
+
+        assert_eq!(collector.tool_calls[0].call_id, "z_call");
+        assert_eq!(collector.tool_calls[1].call_id, "a_call");
+    }
+
+    #[test]
+    fn repeat_guard_counts_only_consecutive_identical_calls() {
+        let mut guard = LoopGuard::new(128);
+        let unittest = ModelToolCall {
+            call_id: "call_1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_json: r#"{"command":"python -m unittest -v"}"#.to_string(),
+        };
+        let read = ModelToolCall {
+            call_id: "call_2".to_string(),
+            tool_name: "read".to_string(),
+            arguments_json: r#"{"path":"calculator.py"}"#.to_string(),
+        };
+
+        guard.record_tool_call(&unittest).expect("first unittest");
+        guard
+            .record_tool_call(&read)
+            .expect("different call resets");
+        guard
+            .record_tool_call(&unittest)
+            .expect("non-consecutive repeat is allowed");
+        guard
+            .record_tool_call(&unittest)
+            .expect("second consecutive repeat is allowed");
+        let blocked = guard
+            .record_tool_call(&unittest)
+            .expect_err("third consecutive repeat is blocked");
+
+        assert!(
+            blocked
+                .to_string()
+                .contains("repeated identical consecutive tool call")
+        );
     }
 
     struct ScriptedRun {
