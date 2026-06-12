@@ -352,6 +352,18 @@ impl DesktopState {
             .finish_one_kind(DesktopAsyncOperationKind::SessionRollback);
     }
 
+    pub fn begin_session_maintenance_mutation(&mut self) {
+        self.view
+            .async_operations
+            .begin(DesktopAsyncOperationKind::SessionMaintenance);
+    }
+
+    pub fn finish_session_maintenance_mutation(&mut self) {
+        self.view
+            .async_operations
+            .finish_one_kind(DesktopAsyncOperationKind::SessionMaintenance);
+    }
+
     pub fn begin_session_search(&mut self) {
         self.view
             .async_operations
@@ -392,6 +404,10 @@ impl DesktopState {
                 .view
                 .async_operations
                 .is_pending(DesktopAsyncOperationKind::SessionRollback)
+            || self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::SessionMaintenance)
     }
 
     pub fn begin_history_export(&mut self) {

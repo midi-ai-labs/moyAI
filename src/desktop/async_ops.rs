@@ -12,6 +12,7 @@ pub enum DesktopAsyncOperationKind {
     SessionDelete,
     SessionArchive,
     SessionRollback,
+    SessionMaintenance,
     SessionSearch,
     PromptEnhance,
 }
@@ -31,6 +32,7 @@ impl DesktopAsyncOperationKind {
             Self::SessionDelete => "session_delete",
             Self::SessionArchive => "session_archive",
             Self::SessionRollback => "session_rollback",
+            Self::SessionMaintenance => "session_maintenance",
             Self::SessionSearch => "session_search",
             Self::PromptEnhance => "prompt_enhance",
         }

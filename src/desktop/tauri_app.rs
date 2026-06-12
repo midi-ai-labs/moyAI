@@ -80,6 +80,11 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             archive_session,
             unarchive_session,
             rollback_session,
+            fork_session,
+            compact_session,
+            interrupt_session,
+            enable_session_memory,
+            disable_session_memory,
             delete_project,
             delete_session,
             delete_chat_session,
@@ -446,6 +451,66 @@ async fn rollback_session(
     mutate_controller(controller, |controller| {
         controller.state.select_session(index);
         controller.rollback_selected_session();
+    })
+    .await
+}
+
+#[tauri::command]
+async fn fork_session(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.select_session(index);
+        controller.fork_selected_session();
+    })
+    .await
+}
+
+#[tauri::command]
+async fn compact_session(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.select_session(index);
+        controller.compact_selected_session();
+    })
+    .await
+}
+
+#[tauri::command]
+async fn interrupt_session(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.select_session(index);
+        controller.interrupt_selected_session();
+    })
+    .await
+}
+
+#[tauri::command]
+async fn enable_session_memory(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.select_session(index);
+        controller.set_selected_session_memory_mode(crate::session::SessionMemoryMode::Enabled);
+    })
+    .await
+}
+
+#[tauri::command]
+async fn disable_session_memory(
+    controller: State<'_, SharedController>,
+    index: usize,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.select_session(index);
+        controller.set_selected_session_memory_mode(crate::session::SessionMemoryMode::Disabled);
     })
     .await
 }

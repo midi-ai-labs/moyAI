@@ -284,7 +284,9 @@ export function renderTopbar(state: DesktopWebState): string {
         </div>
         <div class="chips">
           <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${escapeHtml(workspaceLabel)}</button>
-          <button data-action="show-provider" title="${escapeHtml(state.provider_label)}">${escapeHtml(state.model_label)}</button>
+          <button data-action="show-provider" title="${escapeHtml(state.provider_label)}">
+            <span>${escapeHtml(state.model_label)}</span><small>${escapeHtml(state.provider_label)}</small>
+          </button>
           <button data-action="toggle-access" title="アクセス権限">${escapeHtml(displayAccessLabel(state.access_label))}</button>
           ${
             turnPageVisible

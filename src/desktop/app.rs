@@ -25,7 +25,8 @@ use crate::session::markdown::{
 };
 use crate::session::{
     EditorContext, LoadedSessionStatus, ProjectId, ProjectRecord, RunEvent, RunSummary, SessionId,
-    SessionRecord, SessionStatus, TodoItem, history_items_to_markdown, history_markdown_file_name,
+    SessionMemoryMode, SessionRecord, SessionStatus, TodoItem, history_items_to_markdown,
+    history_markdown_file_name,
 };
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
@@ -69,6 +70,10 @@ enum RuntimeMessage {
     SessionRolledBack {
         session_id: SessionId,
         result: Result<DesktopRollbackLoaded, String>,
+    },
+    SessionOperationApplied {
+        session_id: SessionId,
+        result: Result<DesktopSessionOperationLoaded, String>,
     },
     TurnPageLoaded {
         session_id: SessionId,
@@ -147,6 +152,9 @@ impl RuntimeMessage {
             RuntimeMessage::SessionRolledBack { .. } => {
                 RuntimeMessageAsyncContract::BackgroundOperation
             }
+            RuntimeMessage::SessionOperationApplied { .. } => {
+                RuntimeMessageAsyncContract::BackgroundOperation
+            }
             RuntimeMessage::TurnPageLoaded { .. } => {
                 RuntimeMessageAsyncContract::NavigationOperation
             }
@@ -205,6 +213,12 @@ struct DesktopRollbackLoaded {
     snapshot: super::models::DesktopSnapshot,
     loaded: LoadedSession,
     dropped_turn_count: usize,
+}
+
+struct DesktopSessionOperationLoaded {
+    snapshot: super::models::DesktopSnapshot,
+    loaded: LoadedSession,
+    message: String,
 }
 
 pub(crate) struct DesktopController {
@@ -540,6 +554,76 @@ impl DesktopController {
             self.state.view.session_search_text.clone(),
             self.state.view.session_search_include_archived,
         );
+    }
+
+    pub(crate) fn fork_selected_session(&mut self) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("chat fork cannot run while a local run is active");
+            return;
+        }
+        let Some(session_id) = self.state.selected_session_id() else {
+            self.state.set_status_message("select a chat before forking");
+            return;
+        };
+        let title = format!("{} fork", self.state.selected_session_title());
+        self.state
+            .set_status_message(format!("forking chat {}...", session_id));
+        self.state.begin_session_maintenance_mutation();
+        self.spawn_session_fork(session_id, Some(title));
+    }
+
+    pub(crate) fn compact_selected_session(&mut self) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("chat compact cannot run while a local run is active");
+            return;
+        }
+        let Some(session_id) = self.state.selected_session_id() else {
+            self.state
+                .set_status_message("select a chat before compacting history");
+            return;
+        };
+        self.state
+            .set_status_message(format!("compacting chat {}...", session_id));
+        self.state.begin_session_maintenance_mutation();
+        self.spawn_session_compact(session_id, 20);
+    }
+
+    pub(crate) fn interrupt_selected_session(&mut self) {
+        let Some(session_id) = self.state.selected_session_id() else {
+            self.state
+                .set_status_message("select a running chat before interrupting");
+            return;
+        };
+        if self.state.app_state.current_session_id == Some(session_id) && self.state.is_busy() {
+            self.cancel_active_run();
+            return;
+        }
+        self.state
+            .set_status_message(format!("interrupting running chat {}...", session_id));
+        self.state.begin_session_maintenance_mutation();
+        self.spawn_session_interrupt(session_id);
+    }
+
+    pub(crate) fn set_selected_session_memory_mode(&mut self, mode: SessionMemoryMode) {
+        if self.state.is_busy() {
+            self.state
+                .set_status_message("chat memory mode cannot change while a local run is active");
+            return;
+        }
+        let Some(session_id) = self.state.selected_session_id() else {
+            self.state
+                .set_status_message("select a chat before changing memory mode");
+            return;
+        };
+        self.state.set_status_message(format!(
+            "setting chat {} memory mode to {}...",
+            session_id,
+            mode.key()
+        ));
+        self.state.begin_session_maintenance_mutation();
+        self.spawn_session_memory_mode(session_id, mode);
     }
 
     pub(crate) fn set_session_search(&mut self, text: String) {
@@ -1069,6 +1153,137 @@ impl DesktopController {
                 })
             });
             let _ = runtime_tx.send(RuntimeMessage::SessionRolledBack { session_id, result });
+        });
+    }
+
+    fn spawn_session_fork(&self, source_session_id: SessionId, title: Option<String>) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop session-fork runtime");
+            let result = runtime.block_on(async move {
+                let fork = app
+                    .session_service
+                    .fork_session(source_session_id, title)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let session_id = fork.forked_session.id;
+                load_session_operation_projection(
+                    &app,
+                    session_id,
+                    format!(
+                        "forked chat {} to {} ({} history item(s), {} turn item(s))",
+                        source_session_id,
+                        session_id,
+                        fork.copied_history_items,
+                        fork.copied_turn_items
+                    ),
+                )
+                .await
+            });
+            let session_id = result
+                .as_ref()
+                .map(|loaded| loaded.loaded.session.id)
+                .unwrap_or(source_session_id);
+            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied {
+                session_id,
+                result,
+            });
+        });
+    }
+
+    fn spawn_session_compact(&self, session_id: SessionId, keep_recent: usize) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop session-compact runtime");
+            let result = runtime.block_on(async move {
+                let compact = app
+                    .session_service
+                    .compact_session(session_id, keep_recent)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                load_session_operation_projection(
+                    &app,
+                    session_id,
+                    format!(
+                        "compacted chat {}: summarized {} item(s), retained {} item(s)",
+                        session_id,
+                        compact.summarized_history_items,
+                        compact.retained_history_items
+                    ),
+                )
+                .await
+            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied {
+                session_id,
+                result,
+            });
+        });
+    }
+
+    fn spawn_session_interrupt(&self, session_id: SessionId) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop session-interrupt runtime");
+            let result = runtime.block_on(async move {
+                app.session_service
+                    .interrupt_running_session(session_id, "Desktop interrupt requested".to_string())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                load_session_operation_projection(
+                    &app,
+                    session_id,
+                    format!("interrupted running chat {}", session_id),
+                )
+                .await
+            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied {
+                session_id,
+                result,
+            });
+        });
+    }
+
+    fn spawn_session_memory_mode(&self, session_id: SessionId, mode: SessionMemoryMode) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop session-memory runtime");
+            let result = runtime.block_on(async move {
+                let update = app
+                    .session_service
+                    .update_session_memory_mode(session_id, mode)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                load_session_operation_projection(
+                    &app,
+                    session_id,
+                    format!(
+                        "set chat {} memory mode to {}",
+                        session_id,
+                        update.mode.key()
+                    ),
+                )
+                .await
+            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied {
+                session_id,
+                result,
+            });
         });
     }
 
@@ -2482,6 +2697,34 @@ impl DesktopController {
                             .set_status_message(format!("chat rollback failed: {error}")),
                     }
                 }
+                RuntimeMessage::SessionOperationApplied { session_id, result } => {
+                    self.state.finish_session_maintenance_mutation();
+                    match result {
+                        Ok(applied) => {
+                            self.state.replace_snapshot(applied.snapshot);
+                            if self.state.selected_session_id() == Some(session_id)
+                                && !self.session_load_is_blocked_by_active_run()
+                            {
+                                let loaded = applied.loaded;
+                                self.state.load_open_session(
+                                    &loaded.session,
+                                    &loaded.transcript,
+                                    &loaded.turn_items,
+                                    loaded.state,
+                                    loaded.todos,
+                                    loaded.turn_page_offset,
+                                    loaded.turn_page_limit,
+                                    loaded.turn_page_total,
+                                    loaded.turn_page_has_more,
+                                );
+                            }
+                            self.state.set_status_message(applied.message);
+                        }
+                        Err(error) => self
+                            .state
+                            .set_status_message(format!("session operation failed: {error}")),
+                    }
+                }
                 RuntimeMessage::SessionSearchLoaded(result) => {
                     self.state.finish_session_search();
                     match result {
@@ -2689,6 +2932,44 @@ impl DesktopController {
         }
         changed
     }
+}
+
+async fn load_session_operation_projection(
+    app: &App,
+    session_id: SessionId,
+    message: String,
+) -> Result<DesktopSessionOperationLoaded, String> {
+    let snapshot = load_snapshot_for_selection(app, Some(session_id))
+        .await
+        .map_err(|error| error.to_string())?;
+    let (
+        session,
+        transcript,
+        turn_items,
+        state,
+        todos,
+        turn_page_offset,
+        turn_page_limit,
+        turn_page_total,
+        turn_page_has_more,
+    ) = load_session_detail(app, session_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(DesktopSessionOperationLoaded {
+        snapshot,
+        loaded: LoadedSession {
+            session,
+            transcript,
+            turn_items,
+            state,
+            todos,
+            turn_page_offset,
+            turn_page_limit,
+            turn_page_total,
+            turn_page_has_more,
+        },
+        message,
+    })
 }
 
 fn live_event_requires_canonical_refresh(event: &RunEvent) -> bool {
