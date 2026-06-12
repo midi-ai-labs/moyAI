@@ -57,24 +57,25 @@ impl ToolRegistry {
 
     pub fn core_agent() -> Self {
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
-        tools.insert("list".to_string(), Arc::new(crate::tool::search::ListTool));
-        tools.insert("glob".to_string(), Arc::new(crate::tool::search::GlobTool));
-        tools.insert("grep".to_string(), Arc::new(crate::tool::search::GrepTool));
-        tools.insert("read".to_string(), Arc::new(crate::tool::read::ReadTool));
-        tools.insert(
-            "inspect_directory".to_string(),
-            Arc::new(crate::tool::inspect_directory::InspectDirectoryTool),
-        );
-        tools.insert(
-            "apply_patch".to_string(),
-            Arc::new(crate::tool::apply_patch::ApplyPatchTool),
-        );
-        tools.insert(
-            "todowrite".to_string(),
-            Arc::new(crate::tool::todo_write::TodoWriteTool),
-        );
-        tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
-        tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
+        insert_core_agent_tools(&mut tools);
+        Self { tools }
+    }
+
+    pub fn core_agent_for_config(config: &crate::config::ResolvedConfig) -> Self {
+        let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
+        insert_core_agent_tools(&mut tools);
+        if config.docling.enabled {
+            tools.insert(
+                "docling_convert".to_string(),
+                Arc::new(crate::tool::docling_convert::DoclingConvertTool),
+            );
+        }
+        if config.mcp.enabled {
+            tools.insert(
+                "mcp_call".to_string(),
+                Arc::new(crate::tool::mcp_call::McpCallTool),
+            );
+        }
         Self { tools }
     }
 
@@ -117,6 +118,27 @@ impl ToolRegistry {
             .ok_or_else(|| self.unknown_tool_error(name))?;
         tool.execute(raw_arguments, ctx).await
     }
+}
+
+fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
+    tools.insert("list".to_string(), Arc::new(crate::tool::search::ListTool));
+    tools.insert("glob".to_string(), Arc::new(crate::tool::search::GlobTool));
+    tools.insert("grep".to_string(), Arc::new(crate::tool::search::GrepTool));
+    tools.insert("read".to_string(), Arc::new(crate::tool::read::ReadTool));
+    tools.insert(
+        "inspect_directory".to_string(),
+        Arc::new(crate::tool::inspect_directory::InspectDirectoryTool),
+    );
+    tools.insert(
+        "apply_patch".to_string(),
+        Arc::new(crate::tool::apply_patch::ApplyPatchTool),
+    );
+    tools.insert(
+        "todowrite".to_string(),
+        Arc::new(crate::tool::todo_write::TodoWriteTool),
+    );
+    tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
+    tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
 }
 
 #[cfg(test)]
@@ -171,5 +193,29 @@ mod tests {
                 .available_tool_names()
                 .contains(&"inspect_directory".to_string())
         );
+    }
+
+    #[test]
+    fn core_agent_for_config_omits_external_tools_when_disabled() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.docling.enabled = false;
+        config.mcp.enabled = false;
+
+        let names = super::ToolRegistry::core_agent_for_config(&config).available_tool_names();
+
+        assert!(!names.contains(&"docling_convert".to_string()));
+        assert!(!names.contains(&"mcp_call".to_string()));
+    }
+
+    #[test]
+    fn core_agent_for_config_includes_external_tools_when_enabled() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.docling.enabled = true;
+        config.mcp.enabled = true;
+
+        let names = super::ToolRegistry::core_agent_for_config(&config).available_tool_names();
+
+        assert!(names.contains(&"docling_convert".to_string()));
+        assert!(names.contains(&"mcp_call".to_string()));
     }
 }

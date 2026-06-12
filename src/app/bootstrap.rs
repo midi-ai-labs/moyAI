@@ -96,7 +96,7 @@ impl AppBootstrap {
             truncator: ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
         };
-        let registry = ToolRegistry::core_agent();
+        let registry = ToolRegistry::core_agent_for_config(&config);
         let api_key = config
             .model
             .api_key_env
