@@ -563,7 +563,8 @@ impl DesktopController {
             return;
         }
         let Some(session_id) = self.state.selected_session_id() else {
-            self.state.set_status_message("select a chat before forking");
+            self.state
+                .set_status_message("select a chat before forking");
             return;
         };
         let title = format!("{} fork", self.state.selected_session_title());
@@ -1188,10 +1189,7 @@ impl DesktopController {
                 .as_ref()
                 .map(|loaded| loaded.loaded.session.id)
                 .unwrap_or(source_session_id);
-            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied {
-                session_id,
-                result,
-            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied { session_id, result });
         });
     }
 
@@ -1221,10 +1219,7 @@ impl DesktopController {
                 )
                 .await
             });
-            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied {
-                session_id,
-                result,
-            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied { session_id, result });
         });
     }
 
@@ -1238,7 +1233,10 @@ impl DesktopController {
                 .expect("failed to build desktop session-interrupt runtime");
             let result = runtime.block_on(async move {
                 app.session_service
-                    .interrupt_running_session(session_id, "Desktop interrupt requested".to_string())
+                    .interrupt_running_session(
+                        session_id,
+                        "Desktop interrupt requested".to_string(),
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
                 load_session_operation_projection(
@@ -1248,10 +1246,7 @@ impl DesktopController {
                 )
                 .await
             });
-            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied {
-                session_id,
-                result,
-            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied { session_id, result });
         });
     }
 
@@ -1280,10 +1275,7 @@ impl DesktopController {
                 )
                 .await
             });
-            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied {
-                session_id,
-                result,
-            });
+            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied { session_id, result });
         });
     }
 
