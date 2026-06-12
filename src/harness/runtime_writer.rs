@@ -214,28 +214,6 @@ impl<S: RunEventSink + ?Sized> RunEventSink for HarnessRecordingSink<'_, S> {
     }
 }
 
-pub(crate) fn native_harness_recorder_is_harness_only_fixture_passes() -> bool {
-    let runtime_writer = include_str!("runtime_writer.rs");
-    let run_service = include_str!("../app/run_service.rs");
-    let stale_protocol_store_type = ["Sqlite", "Protocol", "EventStore"].concat();
-    let stale_protocol_store_field = ["protocol", "_event", "_store"].concat();
-    let stale_projection_method = ["record", "_protocol", "_projection"].concat();
-    let start_block = runtime_writer
-        .split("pub fn start(")
-        .nth(1)
-        .and_then(|tail| tail.split("pub fn start_harness_only(").next())
-        .unwrap_or_default();
-
-    !runtime_writer.contains(&stale_protocol_store_type)
-        && !runtime_writer.contains(&stale_protocol_store_field)
-        && !runtime_writer.contains(&stale_projection_method)
-        && start_block.contains("Self::start_harness_only")
-        && run_service.contains("NativeHarnessRecorder::start_harness_only")
-        && run_service.contains("let mut harness_sink = HarnessRecordingSink::new")
-        && run_service.contains("let mut sink = ProtocolRecordingSink::new")
-        && run_service.contains("&mut harness_sink")
-}
-
 fn harness_kind_for_run_event(event: &RunEvent) -> HarnessEventKind {
     match event {
         RunEvent::SessionStarted { .. } => HarnessEventKind::RunStarted,
@@ -505,24 +483,6 @@ fn no_progress_signature_projection(
         "allowed_surface_snapshot": map.get("allowed_surface_snapshot").cloned().unwrap_or_else(|| json!([])),
         "repeat_count": 1
     })
-}
-
-pub(crate) fn no_progress_signature_projection_matches_schema_fixture_passes() -> bool {
-    let mut map = serde_json::Map::new();
-    map.insert("tool".to_string(), json!("shell"));
-    map.insert("progress_effect".to_string(), json!("no_progress"));
-    map.insert("blocked_action".to_string(), json!("invalid_command"));
-    map.insert("allowed_surface_snapshot".to_string(), json!(["shell"]));
-    let signature = no_progress_signature_projection(&map, "a".repeat(64));
-    signature.get("result_hash").and_then(Value::as_str) == Some(&"a".repeat(64))
-        && signature.get("tool").and_then(Value::as_str) == Some("shell")
-        && signature.get("progress_effect").and_then(Value::as_str) == Some("no_progress")
-        && signature.get("blocked_action").and_then(Value::as_str) == Some("invalid_command")
-        && signature
-            .get("allowed_surface_snapshot")
-            .and_then(Value::as_array)
-            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("shell")))
-        && signature.get("repeat_count").and_then(Value::as_i64) == Some(1)
 }
 
 fn stored_text_projection_seen(metadata: &Value) -> bool {

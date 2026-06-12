@@ -252,22 +252,6 @@ pub fn tool_surface_scoped_parallel_tool_calls_projection(
     (tool_surface_len > 0).then_some(effective_parallel_tool_calls)
 }
 
-pub(crate) fn effective_parallel_tool_calls_requires_tool_surface_and_prediction_capacity_fixture_passes()
--> bool {
-    !effective_parallel_tool_calls(0, true, 4)
-        && !effective_parallel_tool_calls(1, true, 1)
-        && !effective_parallel_tool_calls(1, false, 4)
-        && effective_parallel_tool_calls(1, true, 2)
-}
-
-pub(crate) fn control_plane_parallel_tool_calls_matches_effective_projection_fixture_passes() -> bool
-{
-    !control_plane_parallel_tool_calls_projection(0, true, 4)
-        && !control_plane_parallel_tool_calls_projection(1, true, 1)
-        && !control_plane_parallel_tool_calls_projection(1, false, 4)
-        && control_plane_parallel_tool_calls_projection(1, true, 2)
-}
-
 pub fn system_prompt_with_provider_policy(
     system_prompt: &str,
     provider_metadata_mode: ProviderMetadataMode,

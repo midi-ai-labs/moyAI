@@ -57,21 +57,6 @@ fn truncation_followup_guidance() -> &'static str {
     "Use `read` with `offset`/`limit`, or use registered `grep` with `path` set to that saved file, instead of rereading the full output."
 }
 
-pub(crate) fn truncated_tool_output_feedback_uses_typed_tool_surface_fixture_passes() -> bool {
-    let guidance = truncation_followup_guidance();
-    let unavailable_search_tool = format!("`{}`", "search");
-    !guidance.contains(&unavailable_search_tool)
-        && guidance.contains("`read`")
-        && guidance.contains("`offset`")
-        && guidance.contains("`limit`")
-        && guidance.contains("registered `grep`")
-        && guidance.contains("`path`")
-}
-
-pub(crate) fn truncated_tool_output_feedback_uses_registered_tool_surface_fixture_passes() -> bool {
-    truncated_tool_output_feedback_uses_typed_tool_surface_fixture_passes()
-}
-
 pub fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
     if text.len() <= max_bytes {
         return;

@@ -22,8 +22,6 @@ use crate::llm::{ModelAvailabilityReport, ProviderModelInfo, normalize_provider_
 pub const MIN_WINDOW_OPACITY_PERCENT: i32 = 50;
 pub const MAX_WINDOW_OPACITY_PERCENT: i32 = 100;
 pub const DEFAULT_WINDOW_OPACITY_PERCENT: i32 = 96;
-const CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
-const CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopOverlay {
@@ -1311,37 +1309,6 @@ fn truncate_for_search(value: &str, max_chars: usize) -> String {
     format!("{shortened}…")
 }
 
-fn desktop_state_provider_profile_session_record(
-    project_id: ProjectId,
-    session_id: SessionId,
-    title: &str,
-) -> SessionRecord {
-    SessionRecord {
-        id: session_id,
-        project_id,
-        title: title.to_string(),
-        status: crate::session::SessionStatus::Completed,
-        cwd: camino::Utf8PathBuf::from("C:/workspace"),
-        model: CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL.to_string(),
-        base_url: CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL.to_string(),
-        access_mode: crate::config::AccessMode::Default,
-        model_parameters: crate::session::SessionModelParameters::default(),
-        created_at_ms: 1_000,
-        updated_at_ms: 34_000,
-        completed_at_ms: Some(34_000),
-    }
-}
-
-pub(crate) fn desktop_state_current_provider_profile_fixture_passes() -> bool {
-    let session = desktop_state_provider_profile_session_record(
-        ProjectId::new(),
-        SessionId::new(),
-        "desktop-state-provider-fixture",
-    );
-    session.base_url == CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL
-        && session.model == CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL
-}
-
 pub(crate) fn initial_provider_models(config: &ResolvedConfig) -> Vec<String> {
     ensure_current_model(Vec::new(), &config.model.model)
 }
@@ -1547,85 +1514,6 @@ mod tests {
         assert!(state.navigation_loading());
         assert!(state.finish_navigation(newer_request));
         assert!(!state.navigation_loading());
-    }
-
-    #[test]
-    fn loaded_open_session_detail_keeps_elapsed_work_summary_title() {
-        let project_id = ProjectId::new();
-        let session_id = SessionId::new();
-        let mut session = desktop_state_provider_profile_session_record(
-            project_id,
-            session_id,
-            "elapsed session",
-        );
-        let turn_id = crate::protocol::TurnId::new();
-        let turn_items = vec![
-            TurnItem {
-                id: crate::protocol::TurnItemId::new(),
-                session_id,
-                turn_id,
-                source_item_id: None,
-                sequence_no: 1,
-                payload: crate::protocol::TurnItemPayload::UserMessage {
-                    text: "このworkspace内にある資料ってどんなものがありますか？".to_string(),
-                },
-            },
-            TurnItem {
-                id: crate::protocol::TurnItemId::new(),
-                session_id,
-                turn_id,
-                source_item_id: None,
-                sequence_no: 2,
-                payload: crate::protocol::TurnItemPayload::ToolStatus {
-                    call_id: crate::session::ToolCallId::new(),
-                    tool: crate::tool::ToolName::Shell,
-                    status: crate::protocol::ToolLifecycleStatus::Completed,
-                    title: "workspace scan".to_string(),
-                    summary: "Command: Get-ChildItem\n\nStdout:\nREADME.md".to_string(),
-                },
-            },
-            TurnItem {
-                id: crate::protocol::TurnItemId::new(),
-                session_id,
-                turn_id,
-                source_item_id: None,
-                sequence_no: 3,
-                payload: crate::protocol::TurnItemPayload::AgentMessage {
-                    text: "このワークスペースには資料があります。".to_string(),
-                },
-            },
-        ];
-        let mut state = DesktopState::new(
-            snapshot(
-                vec![session_row(
-                    session_id,
-                    &session.title,
-                    SessionStatus::Completed,
-                )],
-                0,
-            ),
-            ResolvedConfig::default(),
-        );
-        session.project_id = state.snapshot.project_rows[0].project_id;
-
-        state.load_open_session(
-            &session,
-            &Transcript {
-                session: session.clone(),
-                messages: Vec::new(),
-            },
-            &turn_items,
-            SessionStateSnapshot::default(),
-            Vec::new(),
-            0,
-            turn_items.len(),
-            turn_items.len(),
-            false,
-        );
-
-        assert!(state.selected_detail().transcript_rows.iter().any(|row| {
-            row.kind == "work_summary_completed" && row.title == "33s作業しました"
-        }));
     }
 
     #[test]

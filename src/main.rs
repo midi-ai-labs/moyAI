@@ -68,12 +68,9 @@ fn run() -> Result<(), (u8, String)> {
         | CliCommand::SessionSteer(_)
         | CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
-        | CliCommand::PreflightRun(_)
-        | CliCommand::PreflightArtifact(_)
         | CliCommand::ModelAvailability(_)
         | CliCommand::SchemaExport(_)
-        | CliCommand::ContractSnapshot(_)
-        | CliCommand::ManualStRoute(_) => run_with_large_stack(command),
+        | CliCommand::ContractSnapshot(_) => run_with_large_stack(command),
         CliCommand::Desktop(_) => run_desktop_command(command),
         CliCommand::Tui(_) => run_on_current_thread(command),
     }
@@ -154,47 +151,6 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
     }
     if let CliCommand::ModelAvailability(args) = command.clone() {
         return run_model_availability_command(args).await;
-    }
-    if let CliCommand::ManualStRoute(args) = command.clone() {
-        let route = args
-            .route
-            .parse::<moyai::harness::manual_st::ManualStRouteKind>()
-            .map_err(|error| (2, error))?;
-        let result = moyai::harness::manual_st::run_manual_st_route(
-            moyai::harness::manual_st::ManualStRouteRunConfig {
-                route,
-                output_root: args.output_root,
-                preflight_report: args.preflight_report,
-                model_override: args.model_override,
-                base_url_override: args.base_url_override,
-                provider_metadata_mode_override: args
-                    .openai_compatible_only
-                    .then_some(moyai::config::ProviderMetadataMode::OpenAiCompatibleOnly),
-                context_window_override: args.context_window,
-                max_output_tokens_override: args.max_output_tokens,
-                max_turn_seconds: args.max_turn_seconds,
-                dry_run: args.dry_run,
-            },
-        )
-        .await
-        .map_err(|error| (4, error))?;
-        println!(
-            "{}",
-            serde_json::to_string(&result).map_err(|error| (4, error.to_string()))?
-        );
-        if !matches!(
-            result.route_level_verdict,
-            moyai::harness::manual_st::RouteVerdict::Pass
-                | moyai::harness::manual_st::RouteVerdict::NotRun
-        ) {
-            return Err((
-                4,
-                result
-                    .stop_reason
-                    .unwrap_or_else(|| "manual ST route did not pass".to_string()),
-            ));
-        }
-        return Ok(());
     }
     let desktop_global_config_existed_at_launch = if matches!(command, CliCommand::Desktop(_)) {
         moyai::config::loader::global_config_path()
@@ -464,12 +420,9 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
         }),
         CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
-        | CliCommand::PreflightRun(_)
-        | CliCommand::PreflightArtifact(_)
         | CliCommand::ModelAvailability(_)
         | CliCommand::SchemaExport(_)
-        | CliCommand::ContractSnapshot(_)
-        | CliCommand::ManualStRoute(_) => {
+        | CliCommand::ContractSnapshot(_) => {
             unreachable!("harness command is handled before renderer dispatch")
         }
         CliCommand::Tui(_) | CliCommand::Desktop(_) => {
@@ -501,12 +454,9 @@ fn command_output_mode(command: &CliCommand) -> OutputMode {
         CliCommand::SessionSteer(args) => args.output_mode,
         CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
-        | CliCommand::PreflightRun(_)
-        | CliCommand::PreflightArtifact(_)
         | CliCommand::ModelAvailability(_)
         | CliCommand::SchemaExport(_)
-        | CliCommand::ContractSnapshot(_)
-        | CliCommand::ManualStRoute(_) => OutputMode::Json,
+        | CliCommand::ContractSnapshot(_) => OutputMode::Json,
         CliCommand::Tui(_) | CliCommand::Desktop(_) => OutputMode::Human,
     }
 }
@@ -628,46 +578,6 @@ fn run_harness_command(command: &CliCommand) -> Result<bool, String> {
                 "{}",
                 serde_json::to_string(&report).map_err(|error| error.to_string())?
             );
-            Ok(true)
-        }
-        CliCommand::PreflightRun(args) => {
-            let report = moyai::harness::preflight::run_default_active_preflight();
-            if let Some(output) = args.output.as_ref() {
-                moyai::harness::preflight::write_preflight_report(&report, output)
-                    .map_err(|error| error.to_string())?;
-            }
-            println!(
-                "{}",
-                serde_json::to_string(&report).map_err(|error| error.to_string())?
-            );
-            if !matches!(
-                report.status,
-                moyai::harness::preflight::PreflightResultStatus::Pass
-            ) {
-                return Err("preflight did not pass".to_string());
-            }
-            Ok(true)
-        }
-        CliCommand::PreflightArtifact(args) => {
-            let report = moyai::harness::preflight::run_artifact_replay_preflight(
-                &args.artifact_root,
-                args.failure_ids.clone(),
-            )
-            .map_err(|error| error.to_string())?;
-            if let Some(output) = args.output.as_ref() {
-                moyai::harness::preflight::write_preflight_report(&report, output)
-                    .map_err(|error| error.to_string())?;
-            }
-            println!(
-                "{}",
-                serde_json::to_string(&report).map_err(|error| error.to_string())?
-            );
-            if !matches!(
-                report.status,
-                moyai::harness::preflight::PreflightResultStatus::Pass
-            ) {
-                return Err("artifact preflight did not pass".to_string());
-            }
             Ok(true)
         }
         CliCommand::ContractSnapshot(args) => {

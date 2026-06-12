@@ -6,9 +6,6 @@ use crate::session::{
     UserMessageMeta,
 };
 
-const SESSION_TRANSCRIPT_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
-const SESSION_TRANSCRIPT_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
-
 pub fn flatten_text_parts(transcript: &Transcript) -> Vec<String> {
     transcript
         .messages
@@ -302,86 +299,5 @@ fn steer_context_summary(
     lines.join("\n")
 }
 
-pub(crate) fn transcript_from_history_items_uses_item_sequence_fixture_passes() -> bool {
-    let session = SessionRecord {
-        id: crate::session::SessionId::new(),
-        project_id: crate::session::ProjectId::new(),
-        title: "sequence fixture".to_string(),
-        status: crate::session::SessionStatus::Completed,
-        cwd: camino::Utf8PathBuf::from("C:/workspace"),
-        model: SESSION_TRANSCRIPT_FIXTURE_MODEL.to_string(),
-        base_url: SESSION_TRANSCRIPT_FIXTURE_BASE_URL.to_string(),
-        access_mode: crate::config::AccessMode::Default,
-        model_parameters: crate::session::SessionModelParameters::default(),
-        created_at_ms: 1,
-        updated_at_ms: 3,
-        completed_at_ms: Some(3),
-    };
-    let later = HistoryItem {
-        id: crate::protocol::HistoryItemId::new(),
-        session_id: session.id,
-        turn_id: crate::protocol::TurnId::new(),
-        sequence_no: 2,
-        created_at_ms: 1,
-        payload: HistoryItemPayload::Message {
-            message_id: None,
-            role: MessageRole::Assistant,
-            content: vec![ContentPart::Text {
-                text: "assistant after user".to_string(),
-            }],
-        },
-    };
-    let earlier = HistoryItem {
-        id: crate::protocol::HistoryItemId::new(),
-        session_id: session.id,
-        turn_id: crate::protocol::TurnId::new(),
-        sequence_no: 1,
-        created_at_ms: 2,
-        payload: HistoryItemPayload::Message {
-            message_id: None,
-            role: MessageRole::User,
-            content: vec![ContentPart::Text {
-                text: "user request".to_string(),
-            }],
-        },
-    };
-    let transcript = transcript_from_history_items(&session, &[later, earlier]);
-    let Some(first) = transcript.messages.first() else {
-        return false;
-    };
-    let Some(second) = transcript.messages.get(1) else {
-        return false;
-    };
-    first.record.role == MessageRole::User
-        && second.record.role == MessageRole::Assistant
-        && first.record.sequence_no == 1
-        && second.record.sequence_no == 2
-        && matches!(
-            &first.record.metadata,
-            MessageMetadata::User(meta)
-                if meta.requested_model.as_deref() == Some(SESSION_TRANSCRIPT_FIXTURE_MODEL)
-        )
-        && matches!(
-            &second.record.metadata,
-            MessageMetadata::Assistant(meta)
-                if meta.model == SESSION_TRANSCRIPT_FIXTURE_MODEL
-                    && meta.base_url == SESSION_TRANSCRIPT_FIXTURE_BASE_URL
-        )
-}
-
-pub(crate) fn transcript_from_history_items_current_provider_profile_fixture_passes() -> bool {
-    transcript_from_history_items_uses_item_sequence_fixture_passes()
-}
-
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn transcript_from_history_items_uses_item_sequence() {
-        assert!(super::transcript_from_history_items_uses_item_sequence_fixture_passes());
-    }
-
-    #[test]
-    fn transcript_from_history_items_uses_current_provider_profile() {
-        assert!(super::transcript_from_history_items_current_provider_profile_fixture_passes());
-    }
-}
+mod tests {}

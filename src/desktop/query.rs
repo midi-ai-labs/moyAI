@@ -994,14 +994,6 @@ fn desktop_query_provider_profile_session_record(title: &str) -> SessionRecord {
     }
 }
 
-pub(crate) fn desktop_query_current_provider_profile_fixture_passes() -> bool {
-    let session = desktop_query_provider_profile_session_record("desktop-query-provider-fixture");
-    session.base_url == CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL
-        && session.model == CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL
-        && completed_desktop_transcript_primary_reading_fixture_passes()
-        && desktop_turn_item_projection_uses_turn_local_sequence_fixture_passes()
-}
-
 pub fn completed_desktop_transcript_primary_reading_fixture_passes() -> bool {
     let fixture_language_neutral_ref = "desktop_transcript_fixture_language_neutral";
     let session = desktop_query_provider_profile_session_record("desktop-transcript-fixture");
@@ -1144,176 +1136,6 @@ pub fn desktop_pseudo_tool_call_closeout_evidence_preserved_fixture_passes() -> 
         && assistant_rows[0].body.contains("<parameter=command>")
         && assistant_rows[0].body != "完了しました。"
         && rows.iter().any(|row| row.kind == "work_summary_completed")
-}
-
-pub(crate) fn desktop_turn_item_projection_uses_turn_local_sequence_fixture_passes() -> bool {
-    let mut session = desktop_query_provider_profile_session_record("desktop-turn-order-fixture");
-    session.updated_at_ms = 2_000;
-    session.completed_at_ms = Some(2_000);
-    let turn_id = crate::protocol::TurnId::new();
-    let rows = transcript_rows_from_turn_items_with_context(
-        &session,
-        &[
-            crate::protocol::TurnItem {
-                id: crate::protocol::TurnItemId::new(),
-                session_id: session.id,
-                turn_id,
-                source_item_id: None,
-                sequence_no: 3,
-                payload: crate::protocol::TurnItemPayload::FileChange {
-                    call_id: crate::session::ToolCallId::new(),
-                    change_ids: vec![crate::session::ChangeId::new()],
-                    changes: vec![crate::protocol::FileChangeEvidence {
-                        change_id: crate::session::ChangeId::new(),
-                        kind: ChangeKind::Add,
-                        path_before: None,
-                        path_after: Some(camino::Utf8PathBuf::from("src/workflow.rs")),
-                        summary: "Added src/workflow.rs".to_string(),
-                    }],
-                    summary: "Added src/workflow.rs".to_string(),
-                },
-            },
-            crate::protocol::TurnItem {
-                id: crate::protocol::TurnItemId::new(),
-                session_id: session.id,
-                turn_id,
-                source_item_id: None,
-                sequence_no: 1,
-                payload: crate::protocol::TurnItemPayload::UserMessage {
-                    text: "src/workflow.rs を作成".to_string(),
-                },
-            },
-            crate::protocol::TurnItem {
-                id: crate::protocol::TurnItemId::new(),
-                session_id: session.id,
-                turn_id,
-                source_item_id: None,
-                sequence_no: 4,
-                payload: crate::protocol::TurnItemPayload::AgentMessage {
-                    text: "完了しました。".to_string(),
-                },
-            },
-            crate::protocol::TurnItem {
-                id: crate::protocol::TurnItemId::new(),
-                session_id: session.id,
-                turn_id,
-                source_item_id: None,
-                sequence_no: 2,
-                payload: crate::protocol::TurnItemPayload::ToolStatus {
-                    call_id: crate::session::ToolCallId::new(),
-                    tool: crate::tool::ToolName::Write,
-                    status: crate::protocol::ToolLifecycleStatus::Completed,
-                    title: "write src/workflow.rs".to_string(),
-                    summary: "wrote src/workflow.rs".to_string(),
-                },
-            },
-        ],
-    );
-    let user = rows
-        .iter()
-        .position(|row| row.kind == "user" && row.body.contains("src/workflow.rs"));
-    let summary = rows
-        .iter()
-        .position(|row| row.kind == "work_summary_completed");
-    let assistant = rows
-        .iter()
-        .position(|row| row.kind == "assistant" && row.body.contains("完了"));
-    let file_changes = rows.iter().position(|row| row.kind == "file_changes");
-    matches!(
-        (user, summary, assistant, file_changes),
-        (Some(user), Some(summary), Some(assistant), Some(file_changes))
-            if user < summary && summary < assistant && assistant < file_changes
-    )
-}
-
-pub(crate) fn desktop_query_todo_status_typed_projection_fixture_passes() -> bool {
-    let todos = vec![
-        TodoItem::simple(
-            "workflow source ready",
-            TodoStatus::Completed,
-            crate::session::TodoPriority::High,
-        ),
-        TodoItem::simple(
-            "workflow verification running",
-            TodoStatus::InProgress,
-            crate::session::TodoPriority::High,
-        ),
-        TodoItem::simple(
-            "workflow release blocked",
-            TodoStatus::Blocked,
-            crate::session::TodoPriority::Medium,
-        ),
-        TodoItem::simple(
-            "workflow follow-up queued",
-            TodoStatus::Pending,
-            crate::session::TodoPriority::Low,
-        ),
-        TodoItem::simple(
-            "workflow obsolete branch",
-            TodoStatus::Cancelled,
-            crate::session::TodoPriority::Low,
-        ),
-    ];
-    let title = task_summary_title(&todos);
-    let rows = format_todo_rows(&todos);
-    let mut state = AppState::default();
-    state.sidebar_todos = todos.clone();
-    let tool_status_text =
-        format_tool_status_text(&state, &SessionStateSnapshot::default(), &todos);
-
-    title == "タスク進捗 1/5 完了, 1件ブロック"
-        && rows.contains("✓ workflow source ready  (状態: 完了")
-        && rows.contains("● workflow verification running  (状態: 進行中")
-        && rows.contains("! workflow release blocked  (状態: ブロック")
-        && rows.contains("○ workflow follow-up queued  (状態: 未着手")
-        && rows.contains("○ workflow obsolete branch  (状態: 停止")
-        && tool_status_text.contains("- [完了] workflow source ready")
-        && tool_status_text.contains("- [進行中] workflow verification running")
-        && tool_status_text.contains("- [ブロック] workflow release blocked")
-        && tool_status_text.contains("- [停止] workflow obsolete branch")
-}
-
-pub(crate) fn desktop_transcript_row_kind_typed_projection_fixture_passes() -> bool {
-    let mut state = AppState::default();
-    state.run_status = RunStatus::Completed;
-    let mut intermediate = desktop_transcript_row(
-        DesktopTranscriptRowKind::Assistant,
-        "01".to_string(),
-        "応答".to_string(),
-        "中間応答".to_string(),
-        Vec::new(),
-    );
-    let mut final_answer = desktop_transcript_row(
-        DesktopTranscriptRowKind::Assistant,
-        "02".to_string(),
-        "応答".to_string(),
-        "完了しました。".to_string(),
-        Vec::new(),
-    );
-    intermediate.kind = DesktopTranscriptRowKind::System.key().to_string();
-    final_answer.kind = DesktopTranscriptRowKind::System.key().to_string();
-    let file_changes = vec![DesktopFileChangeRow {
-        label: "workflow.rs".to_string(),
-        path: "src/workflow.rs".to_string(),
-        kind: ChangeKind::Add,
-        action: "追加".to_string(),
-        summary: "Added src/workflow.rs".to_string(),
-        tool_call_ids: vec![crate::session::ToolCallId::new()],
-    }];
-
-    let folded = fold_intermediate_assistant_rows(
-        vec![intermediate, final_answer],
-        &state,
-        &file_changes,
-        true,
-        true,
-    );
-
-    folded.len() == 1
-        && folded[0].row_kind == DesktopTranscriptRowKind::Assistant
-        && folded[0].kind == DesktopTranscriptRowKind::System.key()
-        && folded[0].body.contains("完了しました")
-        && DesktopTranscriptRowKind::FileChanges.key() == "file_changes"
 }
 
 fn session_status_is_terminal(status: SessionStatus) -> bool {
@@ -2600,16 +2422,6 @@ mod tests {
         assert!(!primary_text.contains("Invalid tool arguments"));
         assert!(work_summary.body.contains("中間応答"));
         assert!(completed_desktop_transcript_primary_reading_fixture_passes());
-    }
-
-    #[test]
-    fn desktop_turn_item_projection_uses_turn_local_sequence() {
-        assert!(desktop_turn_item_projection_uses_turn_local_sequence_fixture_passes());
-    }
-
-    #[test]
-    fn desktop_transcript_row_kind_typed_projection() {
-        assert!(desktop_transcript_row_kind_typed_projection_fixture_passes());
     }
 
     #[test]

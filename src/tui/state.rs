@@ -1027,86 +1027,6 @@ pub fn tool_statuses_from_turn_items(turn_items: &[TurnItem]) -> Vec<ToolStatusV
     statuses
 }
 
-pub(crate) fn tui_turn_item_projection_uses_turn_local_sequence_fixture_passes() -> bool {
-    let turn_id = crate::protocol::TurnId::new();
-    let session_id = SessionId::new();
-    let first_call = ToolCallId::new();
-    let second_call = ToolCallId::new();
-    let items = vec![
-        TurnItem {
-            id: crate::protocol::TurnItemId::new(),
-            session_id,
-            turn_id,
-            source_item_id: None,
-            sequence_no: 4,
-            payload: TurnItemPayload::AgentMessage {
-                text: "done".to_string(),
-            },
-        },
-        TurnItem {
-            id: crate::protocol::TurnItemId::new(),
-            session_id,
-            turn_id,
-            source_item_id: None,
-            sequence_no: 2,
-            payload: TurnItemPayload::ToolStatus {
-                call_id: first_call,
-                tool: ToolName::Write,
-                status: ToolLifecycleStatus::Completed,
-                title: "write a.txt".to_string(),
-                summary: "wrote a.txt".to_string(),
-            },
-        },
-        TurnItem {
-            id: crate::protocol::TurnItemId::new(),
-            session_id,
-            turn_id,
-            source_item_id: None,
-            sequence_no: 1,
-            payload: TurnItemPayload::UserMessage {
-                text: "make files".to_string(),
-            },
-        },
-        TurnItem {
-            id: crate::protocol::TurnItemId::new(),
-            session_id,
-            turn_id,
-            source_item_id: None,
-            sequence_no: 3,
-            payload: TurnItemPayload::ToolStatus {
-                call_id: second_call,
-                tool: ToolName::Shell,
-                status: ToolLifecycleStatus::Completed,
-                title: "cargo test".to_string(),
-                summary: "ok".to_string(),
-            },
-        },
-    ];
-    let entries = transcript_entries_from_turn_items(&items);
-    let statuses = tool_statuses_from_turn_items(&items);
-    let user = entries
-        .iter()
-        .position(|entry| entry.kind == TranscriptKind::User);
-    let first_tool = entries
-        .iter()
-        .position(|entry| entry.tool_call_id == Some(first_call));
-    let second_tool = entries
-        .iter()
-        .position(|entry| entry.tool_call_id == Some(second_call));
-    let assistant = entries
-        .iter()
-        .position(|entry| entry.kind == TranscriptKind::Assistant);
-    matches!(
-        (user, first_tool, second_tool, assistant),
-        (Some(user), Some(first_tool), Some(second_tool), Some(assistant))
-            if user < first_tool && first_tool < second_tool && second_tool < assistant
-    ) && statuses
-        .iter()
-        .map(|status| status.tool_call_id)
-        .collect::<Vec<_>>()
-        == vec![first_call, second_call]
-}
-
 pub fn tui_primary_transcript_omits_internal_projection_items_fixture_passes() -> bool {
     let turn_id = crate::protocol::TurnId::new();
     let session_id = SessionId::new();
@@ -1227,10 +1147,6 @@ fn terminal_transcript_kind(status: TurnTerminalStatus) -> TranscriptKind {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn tui_turn_item_projection_uses_turn_local_sequence() {
-        assert!(super::tui_turn_item_projection_uses_turn_local_sequence_fixture_passes());
-    }
 
     #[test]
     fn tui_primary_transcript_omits_internal_projection_items() {

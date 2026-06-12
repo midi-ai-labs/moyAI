@@ -77,18 +77,6 @@ pub(crate) fn workspace_relative_key_for_match(path: &str, workspace_root: &str)
         .filter(|relative| !relative.is_empty())
 }
 
-pub(crate) fn target_keys_for_workspace_match(
-    path: &str,
-    workspace_root: &Utf8Path,
-) -> Vec<String> {
-    let normalized = path_key_for_workspace_match(path);
-    if let Some(relative) = workspace_relative_key_for_match(path, workspace_root.as_str()) {
-        vec![normalized, relative]
-    } else {
-        vec![normalized]
-    }
-}
-
 fn collapse_repeated_path_separators(path: &str) -> String {
     let mut collapsed = String::with_capacity(path.len());
     let mut previous_was_separator = false;
@@ -106,29 +94,4 @@ fn collapse_repeated_path_separators(path: &str) -> String {
         }
     }
     collapsed
-}
-
-pub(crate) fn path_separator_normalization_fixture_passes() -> bool {
-    normalize_path_separators(r"C:\\workspace\\route\\docs\\design.md")
-        == "C:/workspace/route/docs/design.md"
-        && normalize_path_separators(r"\\server\\share\\workspace") == "//server/share/workspace"
-        && path_key_for_workspace_match(r"`.\docs\\design.md`") == "docs/design.md"
-        && workspace_relative_key_for_match(
-            r"C:\\workspace\\route\\docs\\design.md",
-            "C:/workspace/route",
-        )
-        .as_deref()
-            == Some("docs/design.md")
-        && workspace_relative_key_for_match(
-            r"C:\\workspace\\route2\\docs\\design.md",
-            "C:/workspace/route",
-        )
-        .is_none()
-        && target_keys_for_workspace_match(
-            r"C:\\workspace\\route\\docs\\design.md",
-            Utf8Path::new("C:/workspace/route"),
-        ) == vec![
-            "c:/workspace/route/docs/design.md".to_string(),
-            "docs/design.md".to_string(),
-        ]
 }

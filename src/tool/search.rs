@@ -258,26 +258,6 @@ fn glob_output_label(path: &str, workspace_root: &Utf8Path) -> String {
         .to_string()
 }
 
-pub(crate) fn glob_workspace_relative_pattern_fixture_passes() -> bool {
-    let mut builder = GlobSetBuilder::new();
-    let invariant = "workflow.glob.contract model_visible_relative_output";
-    let Ok(glob) = Glob::new("src/workflow.rs") else {
-        return false;
-    };
-    builder.add(glob);
-    let Ok(matcher) = builder.build() else {
-        return false;
-    };
-    let workspace_root = Utf8Path::new("C:/workspace/project");
-    let search_root = workspace_root;
-    let file_path = Utf8Path::new("C:/workspace/project/src/workflow.rs");
-
-    glob_matches_path(&matcher, file_path, search_root, workspace_root)
-        && glob_output_label(file_path.as_str(), workspace_root) == "src/workflow.rs"
-        && invariant.contains("workflow.glob.contract")
-        && invariant.contains("model_visible_relative_output")
-}
-
 #[async_trait(?Send)]
 impl Tool for GrepTool {
     fn spec(&self) -> ToolSpec {

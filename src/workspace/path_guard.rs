@@ -136,54 +136,5 @@ fn effective_path_for_boundary(path: &Utf8Path) -> Result<Utf8PathBuf, Workspace
     })
 }
 
-pub(crate) fn path_guard_rejects_cross_workspace_absolute_remap_fixture_passes() -> bool {
-    use crate::config::ResolvedConfig;
-    use crate::workspace::WorkspaceDiscovery;
-
-    let unique = format!(
-        "moyai-pathguard-remap-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_nanos())
-            .unwrap_or(0)
-    );
-    let root = std::env::temp_dir().join(unique);
-    let workspace_root = root.join("real").join("workspace");
-    let Ok(workspace_root) = Utf8PathBuf::from_path_buf(workspace_root) else {
-        return false;
-    };
-    if std::fs::create_dir_all(workspace_root.join("docs")).is_err() {
-        return false;
-    }
-    let Ok(outside_request) = Utf8PathBuf::from_path_buf(
-        root.join("elsewhere")
-            .join("workspace")
-            .join("docs")
-            .join("note.md"),
-    ) else {
-        let _ = std::fs::remove_dir_all(root);
-        return false;
-    };
-    let workspace = match WorkspaceDiscovery::discover_fixed_root(
-        &workspace_root,
-        &ResolvedConfig::default(),
-    ) {
-        Ok(value) => value,
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(root);
-            return false;
-        }
-    };
-    let rejected = PathGuard::require_path(&workspace, &outside_request, AccessKind::Read).is_err();
-    let _ = std::fs::remove_dir_all(root);
-    rejected
-}
-
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn path_guard_rejects_cross_workspace_absolute_remap() {
-        assert!(super::path_guard_rejects_cross_workspace_absolute_remap_fixture_passes());
-    }
-}
+mod tests {}

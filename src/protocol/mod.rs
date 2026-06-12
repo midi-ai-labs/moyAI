@@ -66,19 +66,12 @@ pub use projection::{
     tool_output_projection_preserves_blocked_action_fixture_passes,
 };
 pub use recording::ProtocolRecordingSink;
-pub(crate) use recording::pre_recorded_protocol_sequence_reservation_fixture_passes;
 pub use runtime::{
     CompiledTurn, ObligationCompiler, TurnEngine, TurnEngineInput, WorkOrder, WorkOrderState,
     repair_target_identity_aliases_compile_exact_write_action_fixture_passes,
 };
+pub(crate) use store::insert_event_bundle_in_transaction;
 pub use store::{ProtocolEventStore, SqliteProtocolEventStore};
-pub(crate) use store::{
-    insert_event_bundle_in_transaction,
-    protocol_store_latest_turn_position_resists_timestamp_drift_fixture_passes,
-    protocol_store_latest_turn_position_uses_unified_item_stream_fixture_passes,
-    protocol_store_rejects_incoherent_event_bundles_fixture_passes,
-    protocol_store_single_item_append_order_atomic_commit_fixture_passes,
-};
 
 macro_rules! protocol_id {
     ($name:ident) => {

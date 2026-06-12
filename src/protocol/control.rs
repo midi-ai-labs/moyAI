@@ -7,9 +7,6 @@ use super::{
     ModelCapabilities, OperationIntent, ProjectionId, ToolChoice, TurnContext,
     TurnControlEnvelopeId, TurnId,
 };
-use crate::agent::language_evidence::{
-    ArtifactRole, LanguageFamily, classify_artifact_target as classify_language_artifact_target,
-};
 use crate::session::SessionId;
 use crate::tool::{ToolName, shell::command_text_encoding_suggested_command};
 
@@ -1042,41 +1039,9 @@ fn content_shape_projection_contract(required_action: &RequiredAction) -> Option
         "`content` must be"
     };
     let operation_template = edit_operation_template_projection(required_action, target);
-    let target_spec = classify_language_artifact_target(target);
-    let shape = match (target_spec.language, target_spec.role) {
-        (_, ArtifactRole::Document) => {
-            "effective Markdown/text with real newline-separated document structure. Do not send a quote-wrapped whole-document string, JSON-escaped serialized Markdown/text, or content dominated by literal `\\n` escape sequences instead of real newlines."
-        }
-        (LanguageFamily::Python, ArtifactRole::Test) => {
-            "executable Python test module text with real newlines, imports, test classes/functions, and assertions. Do not send production implementation code or quote-wrapped serialized source."
-        }
-        (_, ArtifactRole::Test) => {
-            "executable test artifact text with real newlines, imports or framework setup appropriate for the language, test functions/cases, and assertions. Do not send production implementation code or quote-wrapped serialized source."
-        }
-        (LanguageFamily::Python, ArtifactRole::Source) => {
-            "effective Python module text with real newline-separated source structure. Do not send quote-wrapped serialized source or literal `\\n` dominated content."
-        }
-        (_, ArtifactRole::Source) => {
-            "effective source artifact text with real newline-separated code structure appropriate for the language. Do not send quote-wrapped serialized source or literal `\\n` dominated content."
-        }
-        _ => {
-            "effective workspace artifact text with real newline-separated structure appropriate for the target. Do not send quote-wrapped serialized content or literal `\\n` dominated content."
-        }
-    };
-    let scaffold = if required_action.tool == ToolName::ApplyPatch
-        && target_spec.language == LanguageFamily::Python
-        && target_spec.role == ArtifactRole::Test
-    {
-        crate::agent::content_shape_contract::artifact_content_shape_apply_patch_recovery_scaffold(
-            target,
-        )
-        .map(|value| format!(" {value}"))
-        .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let shape = "effective workspace artifact text with real newline-separated structure appropriate for the target. Do not send quote-wrapped serialized content or literal `\\n` dominated content.";
     Some(format!(
-        "{operation_template}Required positive artifact shape for `{target}`: {content_subject} {shape}{scaffold}"
+        "{operation_template}Required positive artifact shape for `{target}`: {content_subject} {shape}"
     ))
 }
 

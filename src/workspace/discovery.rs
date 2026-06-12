@@ -85,20 +85,6 @@ fn workspace_from_cwd_and_root(
     }
 }
 
-pub(crate) fn workspace_discovery_absolute_root_authority_fixture_passes() -> bool {
-    let config = ResolvedConfig::default();
-    let Ok(workspace) =
-        WorkspaceDiscovery::discover_fixed_root(Utf8Path::new("project_sandbox"), &config)
-    else {
-        return false;
-    };
-    workspace.cwd.is_absolute()
-        && workspace.root.is_absolute()
-        && !workspace.root.as_str().is_empty()
-        && workspace.cwd == workspace.root
-        && workspace.path_policy.workspace_root == workspace.root
-}
-
 fn default_protected_paths() -> Vec<Utf8PathBuf> {
     let mut paths = Vec::new();
 

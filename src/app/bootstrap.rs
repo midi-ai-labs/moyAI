@@ -166,12 +166,9 @@ fn command_directory(command: &CliCommand) -> Result<camino::Utf8PathBuf, AppBoo
         | CliCommand::SessionTurns(_) => current,
         CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
-        | CliCommand::PreflightRun(_)
-        | CliCommand::PreflightArtifact(_)
         | CliCommand::ModelAvailability(_)
         | CliCommand::SchemaExport(_)
-        | CliCommand::ContractSnapshot(_)
-        | CliCommand::ManualStRoute(_) => current,
+        | CliCommand::ContractSnapshot(_) => current,
     })
 }
 
@@ -184,14 +181,4 @@ fn default_desktop_workspace_directory() -> Result<Option<Utf8PathBuf>, AppBoots
     };
     std::fs::create_dir_all(path.as_std_path())?;
     Ok(Some(path))
-}
-
-pub(crate) fn app_default_desktop_workspace_creation_fixture_passes() -> bool {
-    let Ok(temp_dir) = tempfile::TempDir::new() else {
-        return false;
-    };
-    let Ok(root) = Utf8PathBuf::from_path_buf(temp_dir.path().join("quick-chat-workspace")) else {
-        return false;
-    };
-    std::fs::create_dir_all(root.as_std_path()).is_ok() && root.exists()
 }

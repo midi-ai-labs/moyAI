@@ -3,7 +3,6 @@ use std::collections::BTreeSet;
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::json;
 
-use crate::agent::language_evidence::language_verification_artifact_role_stem;
 use crate::error::RuntimeError;
 use crate::harness::artifact::{ArtifactKind, ArtifactManifest, ArtifactTag, hash_file};
 use crate::harness::contract::{ContractKind, ContractRecord};
@@ -188,6 +187,15 @@ fn classify_artifact(path: &str, tags: &mut BTreeSet<ArtifactTag>) -> ArtifactKi
     }
 }
 
+const VERIFICATION_ROLE_STEM_TOKENS: &[&str] = &[
+    "jest",
+    "pytest",
+    "unittest",
+    "verification",
+    "verify",
+    "vitest",
+];
+
 fn artifact_name_has_verification_role(file_name: &str) -> bool {
     let stem = file_name
         .strip_suffix(".json")
@@ -195,7 +203,8 @@ fn artifact_name_has_verification_role(file_name: &str) -> bool {
         .or_else(|| file_name.strip_suffix(".txt"))
         .or_else(|| file_name.strip_suffix(".log"))
         .unwrap_or(file_name);
-    language_verification_artifact_role_stem(stem)
+    stem.split(['.', '-', '_'])
+        .any(|part| VERIFICATION_ROLE_STEM_TOKENS.contains(&part))
 }
 
 fn is_request_diagnostics_artifact(path: &str, file_name: &str) -> bool {

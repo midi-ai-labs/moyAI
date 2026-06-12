@@ -7,8 +7,6 @@ pub mod event_store;
 pub mod gate;
 pub mod gate_store;
 pub mod ids;
-pub mod manual_st;
-pub mod preflight;
 pub mod replay;
 pub mod report;
 pub mod report_store;

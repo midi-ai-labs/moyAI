@@ -4113,10 +4113,6 @@ fn write_markdown_export_atomic(path: &Utf8Path, markdown: &str) -> Result<(), S
         .map_err(|error| error.error.to_string())
 }
 
-pub(crate) fn desktop_image_dispatch_delegates_capability_to_runtime_fixture_passes() -> bool {
-    true
-}
-
 pub fn desktop_open_transcript_markdown_preserves_visible_evidence_fixture_passes() -> bool {
     let session_id = SessionId::new();
     let rows = vec![

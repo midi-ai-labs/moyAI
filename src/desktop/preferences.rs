@@ -81,33 +81,6 @@ fn persist_desktop_preferences_tempfile(path: &Utf8Path, text: &str) -> Result<(
         .map_err(|error| error.error.to_string())
 }
 
-pub(crate) fn desktop_preferences_save_atomic_commit_fixture_passes() -> bool {
-    let Ok(temp_dir) = tempfile::tempdir() else {
-        return false;
-    };
-    let Ok(path) = Utf8PathBuf::from_path_buf(temp_dir.path().join("desktop.toml")) else {
-        return false;
-    };
-    if fs::write(&path, "last_workspace = \"C:/old\"\n").is_err() {
-        return false;
-    }
-    let root = Utf8PathBuf::from("C:/workspace/deleted");
-    let preferences = DesktopPreferences {
-        last_workspace: None,
-        window_opacity_percent: Some(91),
-        deleted_project_roots: vec![root.clone()],
-    };
-    if preferences.save_to_path(&path).is_err() {
-        return false;
-    }
-    let Ok(saved) = fs::read_to_string(&path) else {
-        return false;
-    };
-    saved.contains("window_opacity_percent = 91")
-        && saved.contains("deleted_project_roots")
-        && saved.contains(root.as_str())
-}
-
 fn preferences_path() -> Result<Utf8PathBuf, String> {
     if let Ok(value) = std::env::var(DESKTOP_PREFS_ENV) {
         return Ok(Utf8PathBuf::from(value));

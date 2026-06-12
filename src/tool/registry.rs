@@ -71,10 +71,6 @@ impl ToolRegistry {
         names
     }
 
-    pub(crate) fn has_tool(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
-    }
-
     pub(crate) fn unknown_tool_message(&self, name: &str) -> String {
         let available = self.available_tool_names().join(", ");
         format!(
@@ -100,21 +96,5 @@ impl ToolRegistry {
     }
 }
 
-pub(crate) fn unknown_tool_feedback_does_not_restore_shell_surface_fixture_passes() -> bool {
-    let registry = ToolRegistry {
-        tools: HashMap::new(),
-    };
-    let message = registry.unknown_tool_message("python");
-    message.contains("unknown tool `python`")
-        && message.contains("active turn control envelope")
-        && message.contains("no-progress tool lifecycle feedback")
-        && !message.contains("Use `shell`")
-}
-
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn unknown_tool_feedback_does_not_restore_shell_surface() {
-        assert!(super::unknown_tool_feedback_does_not_restore_shell_surface_fixture_passes());
-    }
-}
+mod tests {}

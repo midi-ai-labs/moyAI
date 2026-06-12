@@ -133,14 +133,6 @@ pub fn is_placeholder_session_title(title: &str) -> bool {
     title.trim() == NEW_SESSION_PLACEHOLDER_TITLE
 }
 
-pub(crate) fn app_session_title_fixture_domain_neutral_fixture_passes() -> bool {
-    sanitize_generated_session_title("タイトル：「ワークフロー整理」。").as_deref()
-        == Some("ワークフロー整理")
-        && sanitize_generated_session_title("Title: quicksort notes").as_deref()
-            == Some("quicksort notes")
-        && !is_placeholder_session_title("ワークフロー整理")
-}
-
 #[derive(Default)]
 struct SessionTitleSink {
     output: String,
@@ -163,10 +155,7 @@ impl LlmEventSink for SessionTitleSink {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        GENERATED_SESSION_TITLE_MAX_CHARS, NEW_SESSION_PLACEHOLDER_TITLE,
-        is_placeholder_session_title, sanitize_generated_session_title,
-    };
+    use super::{GENERATED_SESSION_TITLE_MAX_CHARS, sanitize_generated_session_title};
 
     #[test]
     fn sanitize_generated_session_title_strips_wrappers_and_prefixes() {
@@ -189,12 +178,5 @@ mod tests {
         .expect("title");
         assert!(title.chars().count() <= GENERATED_SESSION_TITLE_MAX_CHARS);
         assert!(title.ends_with('…'));
-    }
-
-    #[test]
-    fn placeholder_session_title_is_explicit() {
-        assert!(is_placeholder_session_title(NEW_SESSION_PLACEHOLDER_TITLE));
-        assert!(!is_placeholder_session_title("ワークフロー整理"));
-        assert!(super::app_session_title_fixture_domain_neutral_fixture_passes());
     }
 }

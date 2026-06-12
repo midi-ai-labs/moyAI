@@ -220,18 +220,6 @@ pub struct ReplayReportArgs {
 }
 
 #[derive(Debug, Clone)]
-pub struct PreflightRunArgs {
-    pub output: Option<Utf8PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PreflightArtifactArgs {
-    pub artifact_root: Utf8PathBuf,
-    pub failure_ids: Vec<String>,
-    pub output: Option<Utf8PathBuf>,
-}
-
-#[derive(Debug, Clone)]
 pub struct ModelAvailabilityArgs {
     pub directory: Option<Utf8PathBuf>,
     pub model_override: Option<String>,
@@ -251,20 +239,6 @@ pub struct ContractSnapshotArgs {
     pub scenario_id: String,
     pub source: Utf8PathBuf,
     pub output: Utf8PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub struct ManualStRouteArgs {
-    pub route: String,
-    pub output_root: Option<Utf8PathBuf>,
-    pub preflight_report: Utf8PathBuf,
-    pub model_override: Option<String>,
-    pub base_url_override: Option<String>,
-    pub openai_compatible_only: bool,
-    pub context_window: Option<u32>,
-    pub max_output_tokens: Option<u32>,
-    pub max_turn_seconds: u64,
-    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -292,12 +266,9 @@ pub enum CliCommand {
     Desktop(DesktopArgs),
     ReplayRun(ReplayRunArgs),
     ReplayReport(ReplayReportArgs),
-    PreflightRun(PreflightRunArgs),
-    PreflightArtifact(PreflightArtifactArgs),
     ModelAvailability(ModelAvailabilityArgs),
     SchemaExport(SchemaExportArgs),
     ContractSnapshot(ContractSnapshotArgs),
-    ManualStRoute(ManualStRouteArgs),
 }
 
 pub fn parse() -> Result<CliCommand, CliUsageError> {
@@ -651,18 +622,6 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                 data_dir: args.data_dir,
             })),
         },
-        RootCommand::Preflight { command } => match command {
-            PreflightCommand::Run(args) => Ok(CliCommand::PreflightRun(PreflightRunArgs {
-                output: args.output,
-            })),
-            PreflightCommand::Artifact(args) => {
-                Ok(CliCommand::PreflightArtifact(PreflightArtifactArgs {
-                    artifact_root: args.artifact_root,
-                    failure_ids: args.failure_ids,
-                    output: args.output,
-                }))
-            }
-        },
         RootCommand::Model { command } => match command {
             ModelCommand::Availability(args) => {
                 Ok(CliCommand::ModelAvailability(ModelAvailabilityArgs {
@@ -688,20 +647,6 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                     output: args.output,
                 }))
             }
-        },
-        RootCommand::ManualSt { command } => match command {
-            ManualStCommand::Route(args) => Ok(CliCommand::ManualStRoute(ManualStRouteArgs {
-                route: args.route,
-                output_root: args.output_root,
-                preflight_report: args.preflight_report,
-                model_override: args.model_override,
-                base_url_override: args.base_url_override,
-                openai_compatible_only: args.openai_compatible_only,
-                context_window: args.context_window,
-                max_output_tokens: args.max_output_tokens,
-                max_turn_seconds: args.max_turn_seconds,
-                dry_run: args.dry_run,
-            })),
         },
     }
 }
@@ -765,10 +710,6 @@ enum RootCommand {
         #[command(subcommand)]
         command: ReplayCommand,
     },
-    Preflight {
-        #[command(subcommand)]
-        command: PreflightCommand,
-    },
     Model {
         #[command(subcommand)]
         command: ModelCommand,
@@ -780,10 +721,6 @@ enum RootCommand {
     Contract {
         #[command(subcommand)]
         command: ContractCommand,
-    },
-    ManualSt {
-        #[command(subcommand)]
-        command: ManualStCommand,
     },
 }
 
@@ -875,12 +812,6 @@ enum ReplayCommand {
 }
 
 #[derive(Subcommand)]
-enum PreflightCommand {
-    Run(PreflightRunCommand),
-    Artifact(PreflightArtifactCommand),
-}
-
-#[derive(Subcommand)]
 enum ModelCommand {
     Availability(ModelAvailabilityCommand),
 }
@@ -893,11 +824,6 @@ enum SchemaCommand {
 #[derive(Subcommand)]
 enum ContractCommand {
     Snapshot(ContractSnapshotCommand),
-}
-
-#[derive(Subcommand)]
-enum ManualStCommand {
-    Route(ManualStRouteCommand),
 }
 
 #[derive(Args)]
@@ -1132,22 +1058,6 @@ struct ReplayReportCommand {
 }
 
 #[derive(Args)]
-struct PreflightRunCommand {
-    #[arg(long = "output")]
-    output: Option<Utf8PathBuf>,
-}
-
-#[derive(Args)]
-struct PreflightArtifactCommand {
-    #[arg(long = "artifact-root")]
-    artifact_root: Utf8PathBuf,
-    #[arg(long = "failure-id")]
-    failure_ids: Vec<String>,
-    #[arg(long = "output")]
-    output: Option<Utf8PathBuf>,
-}
-
-#[derive(Args)]
 struct ModelAvailabilityCommand {
     #[arg(long = "dir")]
     directory: Option<Utf8PathBuf>,
@@ -1177,30 +1087,6 @@ struct ContractSnapshotCommand {
     source: Utf8PathBuf,
     #[arg(long = "output")]
     output: Utf8PathBuf,
-}
-
-#[derive(Args)]
-struct ManualStRouteCommand {
-    #[arg(long = "route")]
-    route: String,
-    #[arg(long = "output-root")]
-    output_root: Option<Utf8PathBuf>,
-    #[arg(long = "preflight-report")]
-    preflight_report: Utf8PathBuf,
-    #[arg(long = "model")]
-    model_override: Option<String>,
-    #[arg(long = "base-url")]
-    base_url_override: Option<String>,
-    #[arg(long = "openai-compatible-only")]
-    openai_compatible_only: bool,
-    #[arg(long = "context-window")]
-    context_window: Option<u32>,
-    #[arg(long = "max-output-tokens")]
-    max_output_tokens: Option<u32>,
-    #[arg(long = "max-turn-seconds", default_value_t = 7200)]
-    max_turn_seconds: u64,
-    #[arg(long = "dry-run")]
-    dry_run: bool,
 }
 
 impl clap::ValueEnum for OutputMode {

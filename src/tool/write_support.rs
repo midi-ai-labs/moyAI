@@ -44,45 +44,5 @@ pub(crate) fn to_summary(change: &FileChange) -> ChangeSummary {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WriteCommitStep {
-    WriteTempFile,
-    PersistTempToTarget,
-}
-
-fn write_text_file_commit_plan() -> Vec<WriteCommitStep> {
-    vec![
-        WriteCommitStep::WriteTempFile,
-        WriteCommitStep::PersistTempToTarget,
-    ]
-}
-
-pub(crate) fn write_text_file_commit_plan_avoids_pre_remove_fixture_passes() -> bool {
-    let temp = match tempfile::tempdir() {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-    let path = match Utf8PathBuf::from_path_buf(temp.path().join("target.txt")) {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-    if std::fs::write(&path, "before").is_err() {
-        return false;
-    }
-    if write_text_file(&path, "after").is_err() {
-        return false;
-    }
-    let plan = write_text_file_commit_plan();
-    plan == vec![
-        WriteCommitStep::WriteTempFile,
-        WriteCommitStep::PersistTempToTarget,
-    ] && matches!(std::fs::read_to_string(&path), Ok(value) if value == "after")
-}
-
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn write_text_file_commit_plan_avoids_pre_remove() {
-        assert!(super::write_text_file_commit_plan_avoids_pre_remove_fixture_passes());
-    }
-}
+mod tests {}

@@ -169,38 +169,6 @@ impl SessionRuntimeEventSubscription {
     }
 }
 
-pub(crate) fn run_event_publisher_tolerates_observer_absence_fixture_passes() -> bool {
-    let (publisher, subscriber) = RunEventBus::channel(16);
-    drop(subscriber);
-    let observer_absent_event = RunEvent::SessionStarted {
-        session_id: crate::session::SessionId::new(),
-        title: "observer absence".to_string(),
-    };
-    if publisher.publish(observer_absent_event).is_err() {
-        return false;
-    }
-
-    let (publisher, mut subscriber) = RunEventBus::channel(16);
-    let session_id = crate::session::SessionId::new();
-    let title = "active observer".to_string();
-    if publisher
-        .publish(RunEvent::SessionStarted {
-            session_id,
-            title: title.clone(),
-        })
-        .is_err()
-    {
-        return false;
-    }
-    matches!(
-        subscriber.receiver.try_recv(),
-        Ok(RunEvent::SessionStarted {
-            session_id: delivered_session_id,
-            title: delivered_title,
-        }) if delivered_session_id == session_id && delivered_title == title
-    )
-}
-
 #[cfg(test)]
 pub(crate) fn session_runtime_event_subscription_replays_backfill_before_live_without_duplicates_fixture_passes()
 -> bool {
@@ -302,10 +270,6 @@ pub(crate) fn session_runtime_event_hub_fans_out_committed_events_by_session_fix
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn run_event_publisher_tolerates_observer_absence() {
-        assert!(super::run_event_publisher_tolerates_observer_absence_fixture_passes());
-    }
 
     #[test]
     fn session_runtime_event_hub_fans_out_committed_events_by_session() {

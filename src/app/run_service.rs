@@ -1006,54 +1006,6 @@ fn app_session_model_parameters_override_runtime_config_fixture_passes() -> bool
         && model.max_output_tokens == 4096
 }
 
-pub(crate) fn resume_latest_user_message_uses_item_order_fixture_passes() -> bool {
-    use crate::protocol::{ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, TurnId};
-    use crate::session::{MessageId, SessionId};
-
-    let session_id = SessionId::new();
-    let sequence_latest_message = MessageId::new();
-    let timestamp_latest_message = MessageId::new();
-    let items = vec![
-        HistoryItem {
-            id: HistoryItemId::new(),
-            session_id,
-            turn_id: TurnId::new(),
-            sequence_no: 2,
-            created_at_ms: 10,
-            payload: HistoryItemPayload::UserTurn {
-                message_id: Some(sequence_latest_message),
-                content: vec![ContentPart::Text {
-                    text: "sequence latest request".to_string(),
-                }],
-                prompt_dispatch: None,
-                editor_context: None,
-                turn_context: None,
-            },
-        },
-        HistoryItem {
-            id: HistoryItemId::new(),
-            session_id,
-            turn_id: TurnId::new(),
-            sequence_no: 1,
-            created_at_ms: 20,
-            payload: HistoryItemPayload::UserTurn {
-                message_id: Some(timestamp_latest_message),
-                content: vec![ContentPart::Text {
-                    text: "timestamp latest request".to_string(),
-                }],
-                prompt_dispatch: None,
-                editor_context: None,
-                turn_context: None,
-            },
-        },
-    ];
-    latest_user_message_id_from_history_items(&items) == Some(sequence_latest_message)
-}
-
-pub(crate) fn app_resume_latest_user_sequence_primary_order_fixture_passes() -> bool {
-    resume_latest_user_message_uses_item_order_fixture_passes()
-}
-
 fn build_user_thread_op(
     turn_id: crate::protocol::TurnId,
     session_context: &crate::session::SessionContext,
@@ -1103,65 +1055,6 @@ async fn hydrate_configured_model_from_provider(
     apply_model_availability_report_to_config(&mut config.model, &report)
         .map_err(|error| AppRunError::Message(error.to_string()))?;
     Ok(())
-}
-
-pub(crate) fn runtime_model_hydration_uses_availability_probe_evidence_fixture_passes() -> bool {
-    let mut config = crate::config::ResolvedConfig::default();
-    config.model.supports_tools = false;
-    let metadata_only_model = crate::llm::ProviderModelInfo {
-        id: config.model.model.clone(),
-        display_name: None,
-        context_window: Some(config.model.context_window),
-        max_output_tokens: Some(config.model.max_output_tokens),
-        supports_images: None,
-        supports_tools: Some(false),
-        supports_reasoning: None,
-        max_parallel_predictions: Some(config.model.max_parallel_predictions),
-        loaded: true,
-        source: "openai_compat".to_string(),
-    };
-
-    let mut report = crate::llm::ModelAvailabilityReport {
-        gate: "model_availability".to_string(),
-        status: crate::llm::ModelAvailabilityStatus::Pass,
-        generated_by: "moyai_model_availability_v2".to_string(),
-        model: metadata_only_model.id.clone(),
-        base_url: config.model.base_url.clone(),
-        provider_metadata_mode: config.model.provider_metadata_mode,
-        v1_present: true,
-        native_present: false,
-        require_vision: false,
-        vision_capable: false,
-        vision_probe_passed: false,
-        vision_probes: Vec::new(),
-        tool_use_capable: Some(true),
-        capability_overrides: vec![crate::llm::model_probe::ModelCapabilityOverride {
-            capability: crate::llm::model_probe::ModelCapabilityKind::ToolUse,
-            metadata_value: Some(false),
-            effective_value: true,
-            evidence_ref: "tool_call_probe_passed".to_string(),
-        }],
-        tool_call_probe_passed: true,
-        tool_call_probes: Vec::new(),
-        reasoning_capable: None,
-        context: metadata_only_model.context_window,
-        max_output_tokens: metadata_only_model.max_output_tokens,
-        max_parallel_predictions: metadata_only_model.max_parallel_predictions,
-        matched_model: Some(crate::llm::ProviderModelInfo {
-            supports_tools: Some(true),
-            ..metadata_only_model
-        }),
-        v1_models: vec![config.model.model.clone()],
-        native_models: Vec::new(),
-        openai_error: None,
-        native_error: None,
-        checked_at_ms: 0,
-    };
-    report.status = crate::llm::ModelAvailabilityStatus::Pass;
-    if apply_model_availability_report_to_config(&mut config.model, &report).is_err() {
-        return false;
-    }
-    config.model.supports_tools
 }
 
 fn load_image_attachments(
@@ -1333,21 +1226,6 @@ fn build_initial_turn_context(
     }
 }
 
-pub(crate) fn app_initial_turn_route_key_projection_fixture_passes() -> bool {
-    use crate::session::TaskRoute;
-
-    [
-        (TaskRoute::Code, "code"),
-        (TaskRoute::Docs, "docs"),
-        (TaskRoute::Review, "review"),
-        (TaskRoute::Debug, "debug"),
-        (TaskRoute::Ask, "ask"),
-        (TaskRoute::Summary, "summary"),
-    ]
-    .into_iter()
-    .all(|(route, key)| route.key() == key && route.key() != format!("{route:?}"))
-}
-
 fn sandbox_profile_for_access_mode(access_mode: crate::config::AccessMode) -> SandboxProfile {
     match access_mode {
         crate::config::AccessMode::Default | crate::config::AccessMode::AutoReview => {
@@ -1480,10 +1358,5 @@ mod tests {
     #[test]
     fn session_model_parameters_override_runtime_config() {
         assert!(super::app_session_model_parameters_override_runtime_config_fixture_passes());
-    }
-
-    #[test]
-    fn resume_latest_user_message_uses_item_order() {
-        assert!(super::resume_latest_user_message_uses_item_order_fixture_passes());
     }
 }

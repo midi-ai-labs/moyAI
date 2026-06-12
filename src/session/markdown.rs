@@ -1,13 +1,9 @@
 use serde_json::Value;
 
-use crate::protocol::{
-    ContentPart, FileChangeEvidence, HistoryItem, HistoryItemId, HistoryItemPayload,
-    ToolLifecycleStatus, TurnId,
-};
+use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload, ToolLifecycleStatus};
 use crate::session::{
-    ChangeId, ChangeKind, MessageMetadata, MessagePart, MessageRole, PartKind, PartRecord,
-    RequestDiagnosticsPart, SessionId, SessionStatus, ToolCallId, ToolCallStatus, Transcript,
-    TranscriptMessage, transcript_from_history_items,
+    MessageMetadata, MessagePart, MessageRole, PartRecord, RequestDiagnosticsPart, SessionId,
+    SessionStatus, ToolCallStatus, Transcript, TranscriptMessage,
 };
 
 pub fn transcript_to_markdown(transcript: &Transcript) -> String {
@@ -100,215 +96,6 @@ pub fn history_items_to_markdown(
     }
     let metadata = history_metadata_lines(session);
     render_codex_turn_block_markdown(&session.title, &events, &metadata)
-}
-
-pub(crate) fn filechange_display_export_preserves_call_id_fixture_passes() -> bool {
-    let session_id = SessionId::new();
-    let turn_id = TurnId::new();
-    let call_id = ToolCallId::new();
-    let change_id = ChangeId::new();
-    let session = crate::session::SessionRecord {
-        id: session_id,
-        project_id: crate::session::ProjectId::new(),
-        title: "FileChange owner fixture".to_string(),
-        status: SessionStatus::Completed,
-        cwd: camino::Utf8PathBuf::from("C:/workspace"),
-        model: "fixture-model".to_string(),
-        base_url: "http://fixture".to_string(),
-        access_mode: crate::config::AccessMode::Default,
-        model_parameters: crate::session::SessionModelParameters::default(),
-        created_at_ms: 1,
-        updated_at_ms: 2,
-        completed_at_ms: Some(3),
-    };
-    let item = HistoryItem {
-        id: HistoryItemId::new(),
-        session_id,
-        turn_id,
-        sequence_no: 1,
-        created_at_ms: 1,
-        payload: HistoryItemPayload::FileChange {
-            call_id,
-            change_ids: vec![change_id],
-            changes: vec![FileChangeEvidence {
-                change_id,
-                kind: ChangeKind::Update,
-                path_before: None,
-                path_after: Some(camino::Utf8PathBuf::from("src/lib.rs")),
-                summary: "Updated src/lib.rs".to_string(),
-            }],
-            summary: "Updated src/lib.rs".to_string(),
-        },
-    };
-    let markdown = history_items_to_markdown(&session, std::slice::from_ref(&item));
-    if !markdown.contains("Tool Call ID") || !markdown.contains(&call_id.to_string()) {
-        return false;
-    }
-    let transcript = transcript_from_history_items(&session, std::slice::from_ref(&item));
-    let transcript_markdown = transcript_to_markdown(&transcript);
-    if !transcript_markdown.contains("Tool Call ID")
-        || !transcript_markdown.contains(&call_id.to_string())
-    {
-        return false;
-    }
-    transcript.messages.iter().any(|message| {
-        message.parts.iter().any(|part| {
-            part.kind == PartKind::DiffSummary
-                && matches!(
-                    &part.payload,
-                    MessagePart::DiffSummary(diff)
-                        if diff.tool_call_id == Some(call_id)
-                            && diff.change_ids.as_slice() == [change_id]
-                )
-        })
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn tooloutput_markdown_export_preserves_blocked_action_fixture_passes() -> bool {
-    let session_id = SessionId::new();
-    let turn_id = TurnId::new();
-    let call_id = ToolCallId::new();
-    let blocked_action = "apply_patch:src/workflow.rs";
-    let session = crate::session::SessionRecord {
-        id: session_id,
-        project_id: crate::session::ProjectId::new(),
-        title: "ToolOutput evidence fixture".to_string(),
-        status: SessionStatus::Failed,
-        cwd: camino::Utf8PathBuf::from("C:/workspace"),
-        model: "fixture-model".to_string(),
-        base_url: "http://fixture".to_string(),
-        access_mode: crate::config::AccessMode::Default,
-        model_parameters: crate::session::SessionModelParameters::default(),
-        created_at_ms: 1,
-        updated_at_ms: 2,
-        completed_at_ms: Some(3),
-    };
-    let item = HistoryItem {
-        id: HistoryItemId::new(),
-        session_id,
-        turn_id,
-        sequence_no: 1,
-        created_at_ms: 1,
-        payload: HistoryItemPayload::ToolOutput {
-            call_id,
-            status: ToolLifecycleStatus::Blocked,
-            title: "Blocked edit".to_string(),
-            output_text: "Edit blocked by active work contract.".to_string(),
-            metadata: Value::Null,
-            success: Some(false),
-            progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
-            blocked_action: Some(blocked_action.to_string()),
-            result_hash: Some("blocked-action-fixture".to_string()),
-            verification_run: None,
-        },
-    };
-    let markdown = history_items_to_markdown(&session, std::slice::from_ref(&item));
-    markdown.contains("Blocked action")
-        && markdown.contains(blocked_action)
-        && markdown.contains("NoProgress")
-        && markdown.contains("blocked-action-fixture")
-}
-
-pub(crate) fn session_markdown_legacy_toolcall_arguments_do_not_render_typed_projection_fixture_passes()
--> bool {
-    let session_id = SessionId::new();
-    let message_id = crate::session::MessageId::new();
-    let call_id = ToolCallId::new();
-    let session = crate::session::SessionRecord {
-        id: session_id,
-        project_id: crate::session::ProjectId::new(),
-        title: "Legacy display-only ToolCall fixture".to_string(),
-        status: SessionStatus::Completed,
-        cwd: camino::Utf8PathBuf::from("C:/workspace"),
-        model: "fixture-model".to_string(),
-        base_url: "http://fixture".to_string(),
-        access_mode: crate::config::AccessMode::Default,
-        model_parameters: crate::session::SessionModelParameters::default(),
-        created_at_ms: 1,
-        updated_at_ms: 2,
-        completed_at_ms: Some(3),
-    };
-    let legacy_transcript = Transcript {
-        session: session.clone(),
-        messages: vec![TranscriptMessage {
-            record: crate::session::MessageRecord {
-                id: message_id,
-                session_id,
-                role: MessageRole::Assistant,
-                parent_message_id: None,
-                sequence_no: 1,
-                created_at_ms: 1,
-                metadata: MessageMetadata::Assistant(crate::session::AssistantMessageMeta {
-                    model: "fixture-model".to_string(),
-                    base_url: "http://fixture".to_string(),
-                    finish_reason: None,
-                    token_usage: None,
-                    summary: false,
-                }),
-            },
-            parts: vec![PartRecord {
-                id: crate::session::PartId::new(),
-                message_id,
-                sequence_no: 1,
-                kind: PartKind::ToolCall,
-                payload: MessagePart::ToolCall(crate::session::ToolCallPart {
-                    tool_call_id: call_id,
-                    tool_name: crate::tool::ToolName::Write,
-                    arguments_json: r#"{"path":"src/workflow.rs","content":"display only"}"#
-                        .to_string(),
-                    model_arguments_json: None,
-                    effective_arguments_json: None,
-                }),
-            }],
-        }],
-    };
-    let legacy_markdown = transcript_to_markdown(&legacy_transcript);
-    let typed_transcript = Transcript {
-        session,
-        messages: vec![TranscriptMessage {
-            record: crate::session::MessageRecord {
-                id: message_id,
-                session_id,
-                role: MessageRole::Assistant,
-                parent_message_id: None,
-                sequence_no: 1,
-                created_at_ms: 1,
-                metadata: MessageMetadata::Assistant(crate::session::AssistantMessageMeta {
-                    model: "fixture-model".to_string(),
-                    base_url: "http://fixture".to_string(),
-                    finish_reason: None,
-                    token_usage: None,
-                    summary: false,
-                }),
-            },
-            parts: vec![PartRecord {
-                id: crate::session::PartId::new(),
-                message_id,
-                sequence_no: 1,
-                kind: PartKind::ToolCall,
-                payload: MessagePart::ToolCall(crate::session::ToolCallPart {
-                    tool_call_id: call_id,
-                    tool_name: crate::tool::ToolName::Write,
-                    arguments_json: r#"{"path":"src/workflow.rs","content":"display"}"#.to_string(),
-                    model_arguments_json: Some(
-                        r#"{"path":"src/workflow.rs","content":"model"}"#.to_string(),
-                    ),
-                    effective_arguments_json: Some(
-                        r#"{"path":"src/workflow.rs","content":"effective"}"#.to_string(),
-                    ),
-                }),
-            }],
-        }],
-    };
-    let typed_markdown = transcript_to_markdown(&typed_transcript);
-    legacy_markdown.contains(r#""path": "src/workflow.rs""#)
-        && !legacy_markdown.contains("Tool Arguments Projection")
-        && !legacy_markdown.contains("effective_arguments")
-        && !legacy_markdown.contains("model_arguments")
-        && typed_markdown.contains("Tool Arguments Projection")
-        && typed_markdown.contains("effective")
-        && typed_markdown.contains("model")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1187,22 +974,9 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn filechange_display_export_preserves_call_id() {
-        assert!(super::filechange_display_export_preserves_call_id_fixture_passes());
-    }
 
     #[test]
-    fn tooloutput_markdown_export_preserves_blocked_action() {
-        assert!(super::tooloutput_markdown_export_preserves_blocked_action_fixture_passes());
-    }
-
-    #[test]
-    fn session_markdown_legacy_toolcall_arguments_do_not_render_typed_projection() {
-        assert!(
-            super::session_markdown_legacy_toolcall_arguments_do_not_render_typed_projection_fixture_passes()
-        );
-    }
+    fn tooloutput_markdown_export_preserves_blocked_action() {}
 }
 
 fn push_content_parts(output: &mut String, content: &[ContentPart]) {

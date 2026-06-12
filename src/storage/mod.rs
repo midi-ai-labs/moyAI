@@ -14,9 +14,6 @@ pub use project_repo::SqliteProjectRepository;
 pub use session_repo::SqliteSessionRepository;
 pub use sqlite::SqliteStore;
 
-pub(crate) const STORAGE_REPOSITORY_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
-pub(crate) const STORAGE_REPOSITORY_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoragePaths {
     pub data_dir: Utf8PathBuf,

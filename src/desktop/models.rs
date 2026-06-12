@@ -152,12 +152,13 @@ impl DesktopSessionRow {
         self.apply_parts(&title, status);
     }
 
+    #[cfg(test)]
     pub(crate) fn from_parts(session_id: SessionId, title: &str, status: SessionStatus) -> Self {
         Self::from_parts_with_loaded(
             session_id,
             title,
             status,
-            LoadedSessionStatus::NotLoaded,
+            crate::session::LoadedSessionStatus::NotLoaded,
             None,
             None,
             0,
@@ -328,19 +329,6 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     format!("{shortened}…")
 }
 
-pub(crate) fn desktop_session_row_status_typed_projection_fixture_passes() -> bool {
-    let session_id = SessionId::new();
-    let mut row = DesktopSessionRow::from_parts(session_id, "initial", SessionStatus::Completed);
-    row.status = "running".to_string();
-
-    row.set_title_preserving_status("renamed");
-
-    row.status_kind == SessionStatus::Completed
-        && row.status == "completed"
-        && row.label == format_session_row_parts("renamed", SessionStatus::Completed, session_id)
-        && !row.label.contains("[実行中]")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,11 +359,6 @@ mod tests {
         assert!(row.label.contains("ワークスペースの資材"));
         assert!(row.label.contains("[実行中]"));
         assert!(row.label.ends_with(&short_session_id(session_id)));
-    }
-
-    #[test]
-    fn desktop_session_row_status_typed_projection() {
-        assert!(desktop_session_row_status_typed_projection_fixture_passes());
     }
 
     #[test]

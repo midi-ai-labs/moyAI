@@ -770,35 +770,3 @@ fn tool_no_progress_signature_schema() -> Value {
         }),
     )
 }
-
-pub(crate) fn tool_no_progress_signature_schema_matches_runtime_projection_fixture_passes() -> bool
-{
-    let schema = tool_no_progress_signature_schema();
-    let required = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let properties = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let required_fields = [
-        "result_hash",
-        "tool",
-        "progress_effect",
-        "allowed_surface_snapshot",
-        "repeat_count",
-    ];
-    required_fields.iter().all(|field| {
-        required.iter().any(|value| value.as_str() == Some(*field))
-            && properties.contains_key(*field)
-    }) && properties.contains_key("blocked_action")
-        && schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
-        && properties
-            .get("progress_effect")
-            .and_then(|value| value.get("const"))
-            .and_then(Value::as_str)
-            == Some("no_progress")
-}
