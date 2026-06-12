@@ -62,6 +62,10 @@ impl ToolRegistry {
         tools.insert("grep".to_string(), Arc::new(crate::tool::search::GrepTool));
         tools.insert("read".to_string(), Arc::new(crate::tool::read::ReadTool));
         tools.insert(
+            "inspect_directory".to_string(),
+            Arc::new(crate::tool::inspect_directory::InspectDirectoryTool),
+        );
+        tools.insert(
             "apply_patch".to_string(),
             Arc::new(crate::tool::apply_patch::ApplyPatchTool),
         );
@@ -125,6 +129,7 @@ mod tests {
                 "apply_patch",
                 "glob",
                 "grep",
+                "inspect_directory",
                 "list",
                 "read",
                 "shell",
@@ -156,6 +161,15 @@ mod tests {
             super::ToolRegistry::core_agent()
                 .available_tool_names()
                 .contains(&"todowrite".to_string())
+        );
+    }
+
+    #[test]
+    fn core_agent_registry_includes_directory_inspection_surface() {
+        assert!(
+            super::ToolRegistry::core_agent()
+                .available_tool_names()
+                .contains(&"inspect_directory".to_string())
         );
     }
 }
