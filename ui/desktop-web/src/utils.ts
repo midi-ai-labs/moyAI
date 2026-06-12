@@ -69,6 +69,43 @@ export function displayAccessLabel(label: string): string {
   return label;
 }
 
+export interface HumanError {
+  title: string;
+  hint: string;
+  details: string;
+}
+
+export function humanizeError(message: string): HumanError {
+  const text = message.trim();
+  const lower = text.toLowerCase();
+  if (lower.includes("error sending request") || lower.includes("connection refused") || lower.includes("failed to connect")) {
+    return {
+      title: "LLM provider に接続できません",
+      hint: "LM Studio が起動しているか、Base URL が http://127.0.0.1:1234 のように到達可能なURLになっているか確認してください。",
+      details: text,
+    };
+  }
+  if (lower.includes("model") && (lower.includes("not found") || lower.includes("404"))) {
+    return {
+      title: "指定したモデルが見つかりません",
+      hint: "Provider設定でモデル一覧を読み込み、現在ロード済みのモデルを選択してください。",
+      details: text,
+    };
+  }
+  if (lower.includes("permission") || lower.includes("denied") || lower.includes("access")) {
+    return {
+      title: "操作が許可されませんでした",
+      hint: "アクセスモードと対象ファイルの場所を確認してください。必要なら確認ダイアログで許可してください。",
+      details: text,
+    };
+  }
+  return {
+    title: "処理に失敗しました",
+    hint: "設定と対象ワークスペースを確認してください。原因の切り分けには技術詳細を参照してください。",
+    details: text,
+  };
+}
+
 export function escapeHtml(value: string): string {
   return value
     .replaceAll("&", "&amp;")

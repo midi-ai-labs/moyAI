@@ -3,7 +3,7 @@ import { actionById, menuActions, paletteActions, shortcutActions, type ActionDe
 import { icon } from "./icons";
 import { renderMarkdown } from "./markdown";
 import type { DesktopWebState, FileChangeRow, ProjectRow, SessionRow, TranscriptRow } from "./types";
-import { displayAccessLabel, escapeHtml, fileName, shortenPath, validateConfigInput } from "./utils";
+import { displayAccessLabel, escapeHtml, fileName, humanizeError, shortenPath, validateConfigInput } from "./utils";
 
 export type { LocalConfirmation } from "./render_overlays";
 export { renderConfirmation, renderLocalConfirmation } from "./render_overlays";
@@ -621,6 +621,7 @@ export function renderOverlay(state: DesktopWebState): string {
 
 function renderProviderOverlay(state: DesktopWebState): string {
   const selectedSummary = state.provider_selected_model_summary.length > 0 ? state.provider_selected_model_summary : ["モデル metadata は未取得です。"];
+  const providerStatus = providerStatusView(state.provider_status_text);
   const providerModeOptions = [
     ["lm_studio_native_required", "LM Studio native"],
     ["openai_compatible_only", "OpenAI互換のみ"],
@@ -667,18 +668,60 @@ function renderProviderOverlay(state: DesktopWebState): string {
             )
             .join("")}
         </div>
-        <div class="provider-summary">
-          ${selectedSummary
-            .map((line) => {
-              const [label, ...rest] = line.split(": ");
-              return `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(rest.join(": ") || line)}</strong></div>`;
-            })
-            .join("")}
+        <details class="provider-details">
+          <summary>モデル詳細</summary>
+          <div class="provider-summary">
+            ${selectedSummary
+              .map((line) => {
+                const [label, ...rest] = line.split(": ");
+                return `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(rest.join(": ") || line)}</strong></div>`;
+              })
+              .join("")}
+          </div>
+        </details>
+        <div class="provider-status ${providerStatus.kind}">
+          <strong>${escapeHtml(providerStatus.title)}</strong>
+          <p>${escapeHtml(providerStatus.hint)}</p>
+          ${
+            providerStatus.details.trim().length > 0
+              ? `<details><summary>技術詳細</summary><pre>${escapeHtml(providerStatus.details)}</pre></details>`
+              : ""
+          }
         </div>
-        <pre class="feedback">${escapeHtml(state.provider_status_text)}</pre>
       </section>
     </div>
   `;
+}
+
+function providerStatusView(message: string): { kind: string; title: string; hint: string; details: string } {
+  const text = message.trim();
+  if (text.length === 0) {
+    return {
+      kind: "idle",
+      title: "Provider 設定を確認できます",
+      hint: "Base URL、mode、model を選択してセッションへ適用できます。",
+      details: "",
+    };
+  }
+  const lower = text.toLowerCase();
+  if (lower.includes("error") || lower.includes("failed")) {
+    const error = humanizeError(text);
+    return { kind: "error", title: error.title, hint: error.hint, details: error.details };
+  }
+  if (lower.includes("selected") || lower.includes("loaded") || lower.includes("managed request")) {
+    return {
+      kind: "ok",
+      title: "Provider 設定を読み込みました",
+      hint: "選択したモデルとBase URLをセッションまたは設定ファイルへ適用できます。",
+      details: text,
+    };
+  }
+  return {
+    kind: "idle",
+    title: "Provider 状態",
+    hint: "詳細は必要な場合だけ展開してください。",
+    details: text,
+  };
 }
 
 function renderConfigOverlay(state: DesktopWebState): string {

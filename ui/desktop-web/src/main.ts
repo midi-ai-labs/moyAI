@@ -18,7 +18,7 @@ import {
 } from "./render";
 import type { DesktopWebState } from "./types";
 import { createUiLocalState } from "./ui_state";
-import { escapeHtml } from "./utils";
+import { escapeHtml, humanizeError } from "./utils";
 import "./styles.css";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -258,5 +258,15 @@ function shouldDeferAutoRefresh(): boolean {
 }
 
 function renderError(message: string): void {
-  appRoot.innerHTML = `<div class="fatal"><h1>moyAI Desktop</h1><pre>${escapeHtml(message)}</pre></div>`;
+  const error = humanizeError(message);
+  appRoot.innerHTML = `
+    <div class="fatal">
+      <h1>moyAI Desktop</h1>
+      <h2>${escapeHtml(error.title)}</h2>
+      <p>${escapeHtml(error.hint)}</p>
+      <details>
+        <summary>技術詳細</summary>
+        <pre>${escapeHtml(error.details)}</pre>
+      </details>
+    </div>`;
 }

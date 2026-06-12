@@ -1623,6 +1623,55 @@ pre {
   font-weight: 650;
 }
 
+.provider-details {
+  margin: 12px 0;
+}
+
+.provider-details summary,
+.provider-status summary,
+.fatal summary {
+  cursor: pointer;
+  color: #c8c3b8;
+  font-size: 12px;
+}
+
+.provider-status {
+  margin-top: 12px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #181815;
+}
+
+.provider-status.ok {
+  border-color: rgba(96, 180, 136, 0.45);
+  background: #152019;
+}
+
+.provider-status.error {
+  border-color: rgba(255, 116, 132, 0.5);
+  background: #241518;
+}
+
+.provider-status strong {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.provider-status p {
+  margin: 5px 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.provider-status pre,
+.fatal pre {
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
 .split-actions button,
 .select-list button {
   min-height: 34px;
@@ -1828,6 +1877,17 @@ pre {
 
 .fatal {
   padding: 32px;
+  color: var(--text);
+}
+
+.fatal h2 {
+  margin: 16px 0 8px;
+  font-size: 18px;
+}
+
+.fatal p {
+  max-width: 760px;
+  color: var(--muted);
 }
 
 @keyframes moyai-busy-spin {

@@ -51,6 +51,9 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
     let controller = DesktopController::new(app, args).await?;
     let shared: SharedController = Arc::new(Mutex::new(controller));
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            restore_main_window(app);
+        }))
         .manage(shared)
         .setup(|app| {
             install_tray(app.handle())?;
