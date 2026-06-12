@@ -14,11 +14,12 @@ use crate::runtime::{Clock, SystemClock};
 use crate::session::{
     CompletionState, DiffSummaryPart, FailureKind, FailureState, MessageId, MessageMetadata,
     MessagePart, MessageRecord, MessageRole, NewMessage, NewPart, NewSession, PartKind, PartRecord,
-    ProcessPhase, ProjectId, ProjectRepository, RunEvent, SessionId, SessionRecord,
-    SessionRepository, SessionSettingsPatch, SessionSettingsUpdate, SessionStateSnapshot,
-    SessionStatus, TaskRoute, TextPart, TodoItem, TodoKind, TodoPriority, TodoStatus, ToolCallId,
-    ToolCallPart, ToolCallRecord, ToolCallStatus, ToolResultPart, Transcript, TranscriptMessage,
-    VerificationState,
+    ProcessPhase, ProjectId, ProjectRepository, RunEvent, SessionId, SessionMemoryMode,
+    SessionMemoryModeUpdate, SessionModelParameters, SessionRecord, SessionRepository,
+    SessionSettingsPatch, SessionSettingsUpdate, SessionStateSnapshot, SessionStatus,
+    SessionTitleUpdate, TaskRoute, TextPart, TodoItem, TodoKind, TodoPriority, TodoStatus,
+    ToolCallId, ToolCallPart, ToolCallRecord, ToolCallStatus, ToolResultPart, Transcript,
+    TranscriptMessage, VerificationState,
 };
 
 const STORAGE_REPOSITORY_FIXTURE_MODEL: &str = crate::storage::STORAGE_REPOSITORY_FIXTURE_MODEL;
@@ -239,6 +240,19 @@ impl SqliteSessionRepository {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub async fn get_session_memory_mode(
+        &self,
+        id: SessionId,
+    ) -> Result<SessionMemoryMode, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let value: String = connection.query_row(
+            "SELECT memory_mode FROM sessions WHERE id = ?1",
+            params![id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(parse_memory_mode(&value))
     }
 
     pub async fn append_user_message_with_protocol_bundle(
@@ -1022,8 +1036,8 @@ impl SessionRepository for SqliteSessionRepository {
         let now = SystemClock.now_ms();
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection.execute(
-            "INSERT INTO sessions (id, project_id, title, status, cwd_path, model_name, base_url, access_mode, created_at_ms, updated_at_ms, completed_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+            "INSERT INTO sessions (id, project_id, title, status, cwd_path, model_name, base_url, access_mode, memory_mode, model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'enabled', '{}', ?9, ?10, NULL)",
             params![
                 id.to_string(),
                 draft.project_id.to_string(),
@@ -1045,7 +1059,7 @@ impl SessionRepository for SqliteSessionRepository {
     async fn get_session(&self, id: SessionId) -> Result<SessionRecord, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection.query_row(
-            "SELECT project_id, title, status, cwd_path, model_name, base_url, access_mode, created_at_ms, updated_at_ms, completed_at_ms
+            "SELECT project_id, title, status, cwd_path, model_name, base_url, access_mode, model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms
              FROM sessions WHERE id = ?1",
             params![id.to_string()],
             |row| {
@@ -1061,9 +1075,10 @@ impl SessionRepository for SqliteSessionRepository {
                     model: row.get(4)?,
                     base_url: row.get(5)?,
                     access_mode: parse_access_mode(&row.get::<_, String>(6)?),
-                    created_at_ms: row.get(7)?,
-                    updated_at_ms: row.get(8)?,
-                    completed_at_ms: row.get(9)?,
+                    model_parameters: parse_session_model_parameters(&row.get::<_, String>(7)?, 7)?,
+                    created_at_ms: row.get(8)?,
+                    updated_at_ms: row.get(9)?,
+                    completed_at_ms: row.get(10)?,
                 })
             },
         ).map_err(StorageError::from)
@@ -1253,10 +1268,12 @@ impl SessionRepository for SqliteSessionRepository {
             .clone()
             .unwrap_or_else(|| current.base_url.clone());
         let next_access_mode = patch.access_mode.unwrap_or(current.access_mode);
+        let next_model_parameters = patch.apply_to_model_parameters(&current.model_parameters);
         let changed = next_cwd != current.cwd
             || next_model != current.model
             || next_base_url != current.base_url
-            || next_access_mode != current.access_mode;
+            || next_access_mode != current.access_mode
+            || next_model_parameters != current.model_parameters;
         if !changed {
             return Ok(SessionSettingsUpdate {
                 session: current,
@@ -1267,7 +1284,7 @@ impl SessionRepository for SqliteSessionRepository {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection.execute(
             "UPDATE sessions
-             SET cwd_path = ?2, model_name = ?3, base_url = ?4, access_mode = ?5, updated_at_ms = ?6
+             SET cwd_path = ?2, model_name = ?3, base_url = ?4, access_mode = ?5, model_parameters_json = ?6, updated_at_ms = ?7
              WHERE id = ?1",
             params![
                 id.to_string(),
@@ -1275,12 +1292,66 @@ impl SessionRepository for SqliteSessionRepository {
                 next_model,
                 next_base_url,
                 next_access_mode.as_str(),
+                serde_json::to_string(&next_model_parameters)?,
                 now
             ],
         )?;
         drop(connection);
         Ok(SessionSettingsUpdate {
             session: self.get_session(id).await?,
+            changed: true,
+        })
+    }
+
+    async fn update_session_title(
+        &self,
+        id: SessionId,
+        title: &str,
+    ) -> Result<SessionTitleUpdate, StorageError> {
+        let current = self.get_session(id).await?;
+        if current.title == title {
+            return Ok(SessionTitleUpdate {
+                session: current,
+                changed: false,
+            });
+        }
+        let now = SystemClock::now_ms();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE sessions SET title = ?2, updated_at_ms = ?3 WHERE id = ?1",
+            params![id.to_string(), title, now],
+        )?;
+        drop(connection);
+        Ok(SessionTitleUpdate {
+            session: self.get_session(id).await?,
+            changed: true,
+        })
+    }
+
+    async fn update_session_memory_mode(
+        &self,
+        id: SessionId,
+        mode: SessionMemoryMode,
+    ) -> Result<SessionMemoryModeUpdate, StorageError> {
+        let current = self.get_session(id).await?;
+        let current_mode = self.get_session_memory_mode(id).await?;
+        if current_mode == mode {
+            return Ok(SessionMemoryModeUpdate {
+                session: current,
+                mode,
+                changed: false,
+            });
+        }
+        let now = SystemClock::now_ms();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE sessions SET memory_mode = ?2, updated_at_ms = ?3 WHERE id = ?1",
+            params![id.to_string(), mode.key(), now],
+        )?;
+        drop(connection);
+        Ok(SessionMemoryModeUpdate {
+            session: self.get_session(id).await?,
+            mode,
             changed: true,
         })
     }
@@ -1670,6 +1741,23 @@ fn parse_status(value: &str) -> SessionStatus {
 
 fn parse_access_mode(value: &str) -> AccessMode {
     AccessMode::parse(value).unwrap_or(AccessMode::Default)
+}
+
+fn parse_memory_mode(value: &str) -> SessionMemoryMode {
+    SessionMemoryMode::parse(value).unwrap_or(SessionMemoryMode::Enabled)
+}
+
+fn parse_session_model_parameters(
+    value: &str,
+    column: usize,
+) -> Result<SessionModelParameters, rusqlite::Error> {
+    serde_json::from_str(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
 }
 
 fn parse_part_kind(value: &str) -> PartKind {

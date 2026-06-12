@@ -468,6 +468,7 @@ fn prepare_prompt_tools(
         &mut tools, state,
     );
     apply_active_content_shape_to_write_schema(&mut tools, state);
+    apply_active_target_to_apply_patch_schema(&mut tools, state);
     let tool_names = tools
         .iter()
         .map(|tool| tool.name.clone())
@@ -478,6 +479,58 @@ fn prepare_prompt_tools(
         String::new()
     };
     (tools, tool_names, available_skills_text)
+}
+
+fn apply_active_target_to_apply_patch_schema(
+    tools: &mut [ToolSchema],
+    state: &SessionStateSnapshot,
+) {
+    let Some(target) = active_authoring_schema_target(state) else {
+        return;
+    };
+    let Some(tool) = tools.iter_mut().find(|tool| tool.name == "apply_patch") else {
+        return;
+    };
+    let Some(patch_text) = tool.input_schema.pointer_mut("/properties/patch_text") else {
+        return;
+    };
+    let Some(schema) = patch_text.as_object_mut() else {
+        return;
+    };
+    let base = schema
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let shape =
+        crate::agent::content_shape_contract::artifact_content_shape_tool_schema_description(
+            &target,
+        )
+        .unwrap_or_else(|| {
+            "Required positive artifact shape: complete target file content with real newlines."
+                .to_string()
+        });
+    schema.insert(
+        "description".to_string(),
+        Value::String(format!(
+            "{base} Current active target-only patch skeleton: `*** Begin Patch\n*** Add File: {target}\n+<complete content for {target}>\n*** End Patch`; if `{target}` already exists, use one `*** Update File: {target}` operation instead. The patch_text must contain exactly one file operation for `{target}`, exactly one final `*** End Patch`, and no inactive target hunks. {shape}"
+        )),
+    );
+}
+
+fn active_authoring_schema_target(state: &SessionStateSnapshot) -> Option<String> {
+    if let Some(target) = exact_active_authoring_write_required(state) {
+        return Some(target);
+    }
+    if !matches!(
+        state.process_phase,
+        ProcessPhase::Author | ProcessPhase::Repair
+    ) || state.completion.open_work_count == 0
+        || state.active_targets.len() != 1
+    {
+        return None;
+    }
+    let target = state.active_targets.first()?.as_str().trim();
+    (!target.is_empty()).then(|| target.to_string())
 }
 
 fn repair_lane_projection_for_prompt(
@@ -1367,24 +1420,41 @@ fn build_provider_replay_projection_from_history_items(
             replay_context,
             &tool_output_index,
         );
+    let target_exclusive_contract_violation_calls =
+        target_exclusive_apply_patch_contract_violation_calls_after(
+            history_items,
+            replay_start,
+            replay_context,
+            &tool_output_index,
+        );
     let suppressed_tool_call_ids = replay_prelude_suppressed_tool_call_ids(
         &stale_inactive_authoring_calls,
         &historical_progress_projection_calls,
         &consumed_supporting_context_calls,
+        &target_exclusive_contract_violation_calls,
     );
     let suppressed_prelude_indices = stale_history_tool_call_prelude_indices(
         history_items,
         replay_start,
         &suppressed_tool_call_ids,
     );
-    for (target, note) in
-        inactive_filechange_reference_notes_after(history_items, replay_start, replay_context)
-    {
-        replay_policies.push(inactive_filechange_reference_snapshot_policy(
-            &target,
-            &replay_context.active_authoring_targets,
-        ));
-        result.push(ModelMessage::System { content: note });
+    let suppress_inactive_filechange_references =
+        inactive_content_shape_recovery_requires_target_exclusive_replay_after(
+            history_items,
+            replay_start,
+            replay_context,
+            &tool_output_index,
+        );
+    if !suppress_inactive_filechange_references {
+        for (target, note) in
+            inactive_filechange_reference_notes_after(history_items, replay_start, replay_context)
+        {
+            replay_policies.push(inactive_filechange_reference_snapshot_policy(
+                &target,
+                &replay_context.active_authoring_targets,
+            ));
+            result.push(ModelMessage::System { content: note });
+        }
     }
     let mut emitted_outputs = BTreeSet::new();
     let mut emitted_tool_calls = BTreeSet::new();
@@ -1467,6 +1537,12 @@ fn build_provider_replay_projection_from_history_items(
                         &call_id_text,
                         &replay_context.active_authoring_targets,
                     );
+                let target_exclusive_contract_violation =
+                    tool_call_has_target_exclusive_apply_patch_contract_violation_output(
+                        history_items,
+                        &tool_output_index,
+                        &call_id_text,
+                    );
                 let arguments_json = if let Some(stale_targets) =
                     inactive_content_shape_targets.as_ref()
                 {
@@ -1480,6 +1556,23 @@ fn build_provider_replay_projection_from_history_items(
                         content: inactive_target_content_shape_pair_replay_note(
                             &call_id_text,
                             tool,
+                            &replay_context.active_authoring_targets,
+                        ),
+                    });
+                    continue;
+                } else if let Some(violation_targets) = target_exclusive_contract_violation.as_ref()
+                {
+                    replay_policies.push(target_exclusive_contract_violation_replay_policy(
+                        &call_id_text,
+                        tool,
+                        violation_targets,
+                        &replay_context.active_authoring_targets,
+                    ));
+                    result.push(ModelMessage::System {
+                        content: target_exclusive_contract_violation_pair_replay_note(
+                            &call_id_text,
+                            tool,
+                            violation_targets,
                             &replay_context.active_authoring_targets,
                         ),
                     });
@@ -1792,6 +1885,7 @@ pub(crate) fn provider_replay_includes_active_turn_steer_fixture_passes() -> boo
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 3,
         completed_at_ms: None,
@@ -1989,11 +2083,13 @@ fn replay_prelude_suppressed_tool_call_ids(
     stale_inactive_authoring_calls: &BTreeMap<String, Vec<String>>,
     historical_progress_projection_calls: &BTreeMap<String, Vec<String>>,
     consumed_supporting_context_calls: &BTreeMap<String, String>,
+    target_exclusive_contract_violation_calls: &BTreeMap<String, Vec<String>>,
 ) -> BTreeSet<String> {
     stale_inactive_authoring_calls
         .keys()
         .chain(historical_progress_projection_calls.keys())
         .chain(consumed_supporting_context_calls.keys())
+        .chain(target_exclusive_contract_violation_calls.keys())
         .cloned()
         .collect()
 }
@@ -2126,6 +2222,49 @@ fn metadata_operation_progress_class_is_content_shape_mismatch(metadata: &Value)
         })
 }
 
+fn tool_call_has_target_exclusive_apply_patch_contract_violation_output(
+    history_items: &[HistoryItem],
+    output_index: &BTreeMap<String, usize>,
+    call_id: &str,
+) -> Option<Vec<String>> {
+    let index = output_index.get(call_id)?;
+    let item = history_items.get(*index)?;
+    let HistoryItemPayload::ToolOutput { metadata, .. } = &item.payload else {
+        return None;
+    };
+    if !tool_output_payload_is_target_exclusive_apply_patch_contract_violation(metadata) {
+        return None;
+    }
+    let mut targets = metadata_replay_string_array(metadata, "inactive_submitted_targets");
+    if targets.is_empty() {
+        targets = metadata_replay_string_array(metadata, "submitted_targets");
+    }
+    Some(targets)
+}
+
+fn tool_output_payload_is_target_exclusive_apply_patch_contract_violation(
+    metadata: &Value,
+) -> bool {
+    metadata_operation_progress_class_is_target_exclusive_apply_patch_contract_violation(metadata)
+        || metadata.get("tool_feedback_envelope").is_some_and(
+            metadata_operation_progress_class_is_target_exclusive_apply_patch_contract_violation,
+        )
+        || metadata
+            .get("tool_feedback_envelope")
+            .and_then(|feedback| feedback.get("kind"))
+            .and_then(Value::as_str)
+            == Some("target_exclusive_apply_patch_contract_violation")
+}
+
+fn metadata_operation_progress_class_is_target_exclusive_apply_patch_contract_violation(
+    metadata: &Value,
+) -> bool {
+    metadata
+        .get("operation_progress_class")
+        .and_then(Value::as_str)
+        == Some("target_exclusive_apply_patch_contract_violation")
+}
+
 fn tool_call_has_invalid_edit_arguments_output(
     history_items: &[HistoryItem],
     output_index: &BTreeMap<String, usize>,
@@ -2226,6 +2365,58 @@ fn tool_call_has_inactive_target_content_shape_mismatch_output(
         return None;
     }
     Some(submitted_targets)
+}
+
+fn inactive_content_shape_recovery_requires_target_exclusive_replay_after(
+    history_items: &[HistoryItem],
+    start: usize,
+    replay_context: &ProviderReplayContext,
+    output_index: &BTreeMap<String, usize>,
+) -> bool {
+    if replay_context.active_authoring_targets.is_empty() {
+        return false;
+    }
+    history_items.iter().skip(start).any(|item| {
+        let HistoryItemPayload::ToolCall { call_id, .. } = &item.payload else {
+            return false;
+        };
+        tool_call_has_inactive_target_content_shape_mismatch_output(
+            history_items,
+            output_index,
+            &call_id.to_string(),
+            &replay_context.active_authoring_targets,
+        )
+        .is_some()
+    })
+}
+
+fn target_exclusive_apply_patch_contract_violation_calls_after(
+    history_items: &[HistoryItem],
+    start: usize,
+    replay_context: &ProviderReplayContext,
+    output_index: &BTreeMap<String, usize>,
+) -> BTreeMap<String, Vec<String>> {
+    if replay_context.active_authoring_targets.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut calls = BTreeMap::new();
+    for item in history_items.iter().skip(start) {
+        let HistoryItemPayload::ToolCall { call_id, tool, .. } = &item.payload else {
+            continue;
+        };
+        if tool != &ToolName::ApplyPatch {
+            continue;
+        }
+        let call_id_text = call_id.to_string();
+        if let Some(targets) = tool_call_has_target_exclusive_apply_patch_contract_violation_output(
+            history_items,
+            output_index,
+            &call_id_text,
+        ) {
+            calls.insert(call_id_text, targets);
+        }
+    }
+    calls
 }
 
 fn tool_call_has_wrong_authoring_target_output(
@@ -3124,9 +3315,14 @@ fn mixed_target_invalid_edit_pair_replay_note(
         .map(|target| format!("`{target}`"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
+    let mut note = format!(
         "Prior mixed-target invalid edit tool call/output `{call_id}` for `{tool}` is omitted from executable provider tool-call history. Runtime rejected it before side effects because it combined the current active submitted target(s) {submitted_active} with additional inactive hunks. Treat this as non-executable failure evidence; do not replay, repair, or continue the omitted call. The current target-exclusive requested-work set is {active}; submit a fresh target-only edit using the current TurnControlEnvelope and stable tool schema."
-    )
+    );
+    if let Some(skeleton) = target_only_apply_patch_recovery_skeleton(tool, active_targets) {
+        note.push('\n');
+        note.push_str(&skeleton);
+    }
+    note
 }
 
 fn inactive_target_content_shape_pair_replay_note(
@@ -3139,9 +3335,77 @@ fn inactive_target_content_shape_pair_replay_note(
         .map(|target| format!("`{target}`"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
+    let mut note = format!(
         "Prior content-shape rejected tool call/output `{call_id}` for `{tool}` is omitted from executable provider tool-call history because it targeted an inactive artifact while the current target-exclusive requested-work set is {active}. Treat this as non-executable failure evidence; do not replay, repair, or continue the omitted call. Submit a fresh edit for the active target using the current TurnControlEnvelope and generated artifact shape."
-    )
+    );
+    if let Some(skeleton) = target_only_apply_patch_recovery_skeleton(tool, active_targets) {
+        note.push('\n');
+        note.push_str(&skeleton);
+    }
+    note
+}
+
+fn target_exclusive_contract_violation_replay_policy(
+    call_id: &str,
+    tool: &ToolName,
+    omitted_targets: &[String],
+    active_targets: &[String],
+) -> RequestReplayPolicyDiagnostic {
+    RequestReplayPolicyDiagnostic {
+        policy: "target_exclusive_apply_patch_contract_violation_pair_omitted".to_string(),
+        call_id: Some(call_id.to_string()),
+        tool_name: Some(tool.to_string()),
+        omitted_targets: omitted_targets.to_vec(),
+        active_targets: active_targets.to_vec(),
+        reason: "canonical target-exclusive apply_patch violation ToolCall/ToolOutput items are preserved, but the malformed or inactive-target patch payload is omitted from executable provider replay while exact active-target recovery remains open".to_string(),
+    }
+}
+
+fn target_exclusive_contract_violation_pair_replay_note(
+    call_id: &str,
+    tool: &ToolName,
+    omitted_targets: &[String],
+    active_targets: &[String],
+) -> String {
+    let omitted = omitted_targets
+        .iter()
+        .map(|target| format!("`{target}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let active = active_targets
+        .iter()
+        .map(|target| format!("`{target}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let omitted_clause = if omitted.is_empty() {
+        "with malformed target-exclusive patch shape".to_string()
+    } else {
+        format!("with inactive or non-admitted target evidence {omitted}")
+    };
+    let mut note = format!(
+        "Prior target-exclusive apply_patch contract violation `{call_id}` for `{tool}` is omitted from executable provider tool-call history {omitted_clause}. Treat this as non-executable failed edit evidence; do not replay, repair, or continue the omitted patch body. The current target-exclusive requested-work set is {active}; submit a fresh single-operation edit for the active target using the current TurnControlEnvelope and stable tool schema."
+    );
+    if let Some(skeleton) = target_only_apply_patch_recovery_skeleton(tool, active_targets) {
+        note.push('\n');
+        note.push_str(&skeleton);
+    }
+    note
+}
+
+fn target_only_apply_patch_recovery_skeleton(
+    tool: &ToolName,
+    active_targets: &[String],
+) -> Option<String> {
+    if tool != &ToolName::ApplyPatch || active_targets.len() != 1 {
+        return None;
+    }
+    let target = active_targets.first()?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "single-operation active-target patch skeleton:\n*** Begin Patch\n*** Add File: {target}\n+<complete content for {target}>\n*** End Patch\nIf `{target}` already exists, use one `*** Update File: {target}` operation instead. The fresh patch must contain exactly one file operation, exactly one final `*** End Patch`, and no inactive target hunks."
+    ))
 }
 
 fn consumed_supporting_context_replay_policy(
@@ -3255,6 +3519,7 @@ pub fn vision_input_provider_projection_fixture_passes() -> bool {
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -3329,6 +3594,7 @@ pub(crate) fn provider_replay_uses_protocol_visibility_roles_fixture_passes() ->
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -3433,6 +3699,7 @@ pub(crate) fn provider_replay_sanitizes_content_shape_mismatch_from_typed_metada
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -3560,10 +3827,253 @@ pub(crate) fn provider_replay_sanitizes_content_shape_mismatch_from_typed_metada
         && session.base_url == PROMPT_FIXTURE_BASE_URL
 }
 
+pub(crate) fn provider_replay_suppresses_inactive_filechange_during_target_exclusive_content_shape_recovery_fixture_passes()
+-> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let accepted_call_id = crate::session::ToolCallId::new();
+    let rejected_call_id = crate::session::ToolCallId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "target-exclusive content shape replay fixture".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: PROMPT_FIXTURE_MODEL.to_string(),
+        base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
+        created_at_ms: 1,
+        updated_at_ms: 6,
+        completed_at_ms: None,
+    };
+    let history_items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create calculator.py and test_calculator.py".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::FileChange {
+                call_id: accepted_call_id,
+                change_ids: vec![crate::session::ChangeId::new()],
+                changes: vec![crate::protocol::FileChangeEvidence {
+                    change_id: crate::session::ChangeId::new(),
+                    kind: crate::session::ChangeKind::Add,
+                    path_before: None,
+                    path_after: Some(Utf8PathBuf::from("calculator.py")),
+                    summary: "Added production source containing def calculate".to_string(),
+                }],
+                summary: "accepted calculator.py source".to_string(),
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolCall {
+                call_id: rejected_call_id,
+                tool: ToolName::ApplyPatch,
+                arguments: json!({
+                    "patch_text": "*** Begin Patch\n*** Add File: calculator.py\n+def calculate(a, op, b):\n+    return a\n*** End Patch"
+                }),
+                model_arguments: Value::Null,
+                effective_arguments: Value::Null,
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![ToolName::ApplyPatch],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: rejected_call_id,
+                status: ToolLifecycleStatus::Completed,
+                title: "Required write content shape mismatch".to_string(),
+                output_text: "retry only test_calculator.py with positive test-module shape"
+                    .to_string(),
+                metadata: json!({
+                    "operation_progress_class": "required_write_content_shape_mismatch",
+                    "submitted_targets": ["calculator.py"],
+                    "tool_feedback_envelope": {
+                        "kind": "required_write_content_shape_mismatch",
+                        "operation_progress_class": "required_write_content_shape_mismatch",
+                        "active_targets": ["test_calculator.py"],
+                        "submitted_targets": ["calculator.py"]
+                    }
+                }),
+                success: Some(false),
+                progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
+                blocked_action: None,
+                result_hash: Some("fixture-target-exclusive-content-shape".to_string()),
+                verification_run: None,
+            },
+        },
+    ];
+    let replay_context = ProviderReplayContext {
+        active_authoring_targets: vec!["test_calculator.py".to_string()],
+        workspace_root: Some(Utf8PathBuf::from("C:/workspace/project")),
+    };
+    let projection = build_provider_replay_projection_from_history_items(
+        &session,
+        &history_items,
+        20,
+        &replay_context,
+    );
+    let rendered = serde_json::to_string(&projection.messages).unwrap_or_default();
+    let policy_rendered = serde_json::to_string(&projection.replay_policies).unwrap_or_default();
+
+    rendered.contains("test_calculator.py")
+        && rendered.contains("target-exclusive requested-work set")
+        && !rendered.contains("Reference-only accepted artifact snapshot for inactive target")
+        && !rendered.contains("def calculate")
+        && !policy_rendered.contains("inactive_filechange_reference_snapshot_projected")
+        && policy_rendered.contains("inactive_target_content_shape_executable_pair_omitted")
+}
+
+pub(crate) fn provider_replay_omits_target_exclusive_apply_patch_contract_violation_fixture_passes()
+-> bool {
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let call_id = crate::session::ToolCallId::new();
+    let session = SessionRecord {
+        id: session_id,
+        project_id: crate::session::ProjectId::new(),
+        title: "target-exclusive patch violation replay fixture".to_string(),
+        status: crate::session::SessionStatus::Running,
+        cwd: Utf8PathBuf::from("C:/workspace/project"),
+        model: PROMPT_FIXTURE_MODEL.to_string(),
+        base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
+        access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
+        created_at_ms: 1,
+        updated_at_ms: 4,
+        completed_at_ms: None,
+    };
+    let history_items = vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::UserTurn {
+                message_id: None,
+                content: vec![ContentPart::Text {
+                    text: "Create source module and active verification artifact".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+                turn_context: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolCall {
+                call_id,
+                tool: ToolName::ApplyPatch,
+                arguments: json!({
+                    "patch_text": "*** Begin Patch\n*** Add File: src/workflow.rs\n+pub fn stale_production_source() {}\n*** End Patch\n*** Begin Patch\n*** Add File: tests/workflow.spec.ts\n+import { strict as assert } from 'assert';\n*** End Patch\n*** End Patch"
+                }),
+                model_arguments: Value::Null,
+                effective_arguments: Value::Null,
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![ToolName::ApplyPatch],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id,
+                status: ToolLifecycleStatus::Completed,
+                title: "Target-exclusive apply_patch contract violation".to_string(),
+                output_text: "Submit one active-target operation for tests/workflow.spec.ts"
+                    .to_string(),
+                metadata: json!({
+                    "operation_progress_class": "target_exclusive_apply_patch_contract_violation",
+                    "inactive_submitted_targets": ["src/workflow.rs"],
+                    "submitted_targets": ["src/workflow.rs", "tests/workflow.spec.ts"],
+                    "tool_feedback_envelope": {
+                        "kind": "target_exclusive_apply_patch_contract_violation",
+                        "operation_progress_class": "target_exclusive_apply_patch_contract_violation",
+                        "active_targets": ["tests/workflow.spec.ts"],
+                        "inactive_submitted_targets": ["src/workflow.rs"],
+                        "submitted_targets": ["src/workflow.rs", "tests/workflow.spec.ts"]
+                    }
+                }),
+                success: Some(false),
+                progress_effect: crate::protocol::ToolProgressEffect::NoProgress,
+                blocked_action: None,
+                result_hash: Some("target-exclusive-violation-fixture".to_string()),
+                verification_run: None,
+            },
+        },
+    ];
+    let replay_context = ProviderReplayContext {
+        active_authoring_targets: vec!["tests/workflow.spec.ts".to_string()],
+        workspace_root: Some(Utf8PathBuf::from("C:/workspace/project")),
+    };
+    let projection = build_provider_replay_projection_from_history_items(
+        &session,
+        &history_items,
+        20,
+        &replay_context,
+    );
+    let rendered = serde_json::to_string(&projection.messages).unwrap_or_default();
+    let policy_rendered = serde_json::to_string(&projection.replay_policies).unwrap_or_default();
+
+    rendered.contains("tests/workflow.spec.ts")
+        && rendered.contains("target-exclusive apply_patch contract violation")
+        && rendered.contains("single-operation active-target patch skeleton")
+        && !rendered.contains("stale_production_source")
+        && !rendered.contains("AssistantToolCalls")
+        && policy_rendered.contains("target_exclusive_apply_patch_contract_violation_pair_omitted")
+        && policy_rendered.contains("src/workflow.rs")
+}
+
 pub fn prompt_provider_replay_fixtures_use_current_provider_profile_fixture_passes() -> bool {
     let prompt_provider_replay_fixture_current_provider_profile =
         "prompt_provider_replay_fixture_current_provider_profile";
     provider_replay_sanitizes_content_shape_mismatch_from_typed_metadata_fixture_passes()
+        && provider_replay_suppresses_inactive_filechange_during_target_exclusive_content_shape_recovery_fixture_passes()
+        && provider_replay_omits_target_exclusive_apply_patch_contract_violation_fixture_passes()
         && provider_replay_compaction_boundary_uses_canonical_history_order_fixture_passes()
         && stale_inactive_authoring_replay_omits_fake_executable_arguments()
         && provider_replay_preserves_failed_inactive_authoring_feedback()
@@ -3581,6 +4091,7 @@ pub(crate) fn prompt_projection_uses_typed_tool_output_feedback_fixture_passes()
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -3731,6 +4242,7 @@ pub(crate) fn message_only_history_does_not_recreate_tool_lifecycle_prompt_state
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -3861,6 +4373,7 @@ pub(crate) fn verification_repair_read_budget_exhaustion_uses_typed_history_item
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4064,6 +4577,7 @@ pub(crate) fn verification_repair_target_rotation_uses_typed_history_item_author
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4303,6 +4817,7 @@ pub(crate) fn verification_evidence_uses_typed_history_item_authority_fixture_pa
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4489,6 +5004,7 @@ pub(crate) fn staged_task_closeout_repair_targets_use_typed_history_authority_fi
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -4792,6 +5308,7 @@ pub(crate) fn staged_task_output_lifecycle_uses_typed_history_authority_fixture_
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5106,6 +5623,7 @@ pub(crate) fn documentation_prompt_lifecycle_uses_typed_history_authority_fixtur
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5356,6 +5874,7 @@ pub(crate) fn follow_up_focus_uses_typed_history_authority_fixture_passes() -> b
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5609,6 +6128,7 @@ pub(crate) fn staged_task_recovery_stall_uses_typed_history_authority_fixture_pa
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5783,6 +6303,7 @@ pub(crate) fn prompt_projection_uses_typed_verification_run_cycle_fixture_passes
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -5976,6 +6497,7 @@ pub(crate) fn prompt_projection_uses_rejected_tool_proposal_fixture_passes() -> 
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6042,6 +6564,7 @@ pub(crate) fn prompt_projection_uses_typed_pseudo_tool_rejection_fixture_passes(
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6116,6 +6639,7 @@ pub(crate) fn code_block_stall_uses_typed_history_authority_fixture_passes() -> 
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6262,6 +6786,7 @@ pub(crate) fn superseded_tool_denial_uses_typed_history_authority_fixture_passes
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6459,6 +6984,7 @@ pub(crate) fn prompt_projection_uses_typed_docs_audit_metadata_fixture_passes() 
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -6577,6 +7103,7 @@ pub(crate) fn prompt_projection_uses_state_patch_recovery_fixture_passes() -> bo
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -7711,6 +8238,7 @@ pub(crate) fn provider_replay_compaction_boundary_uses_canonical_history_order_f
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 5,
         completed_at_ms: None,
@@ -11485,6 +12013,7 @@ pub(crate) fn stale_inactive_authoring_replay_uses_live_builder() -> bool {
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -11638,6 +12167,7 @@ pub(crate) fn provider_replay_omits_stale_inactive_authoring_prelude_text() -> b
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -11756,6 +12286,7 @@ pub(crate) fn stale_inactive_apply_patch_filechange_replay_uses_reference_snapsh
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -11929,6 +12460,7 @@ pub(crate) fn metadata_only_tool_output_does_not_create_filechange_reference_sna
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12035,6 +12567,7 @@ pub(crate) fn stale_inactive_filechange_without_replayable_tool_call_uses_refere
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12106,6 +12639,7 @@ pub(crate) fn failed_inactive_authoring_replay_uses_call_scoped_summary() -> boo
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12274,6 +12808,7 @@ pub(crate) fn failed_inactive_apply_patch_replay_uses_call_scoped_summary() -> b
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12430,6 +12965,7 @@ pub(crate) fn mixed_target_invalid_edit_replay_is_target_exclusive_fixture_passe
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12534,6 +13070,10 @@ pub(crate) fn mixed_target_invalid_edit_replay_is_target_exclusive_fixture_passe
                     && content.contains(&call_id_text)
                     && content.contains("tests/workflow.behavior.md")
                     && content.contains("target-exclusive requested-work")
+                    && content.contains("single-operation active-target patch skeleton")
+                    && content.contains("*** Add File: tests/workflow.behavior.md")
+                    && content.contains("+<complete content for tests/workflow.behavior.md>")
+                    && content.contains("exactly one file operation")
                     && !content.contains("src/inactive-workflow.rs")
                     && !content.contains("WORKFLOW_STATE")
         )
@@ -12566,6 +13106,7 @@ pub(crate) fn inactive_target_content_shape_replay_is_target_exclusive_fixture_p
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -12672,6 +13213,10 @@ pub(crate) fn inactive_target_content_shape_replay_is_target_exclusive_fixture_p
                     && content.contains(&call_id_text)
                     && content.contains("tests/workflow.behavior.md")
                     && content.contains("target-exclusive requested-work")
+                    && content.contains("single-operation active-target patch skeleton")
+                    && content.contains("*** Add File: tests/workflow.behavior.md")
+                    && content.contains("+<complete content for tests/workflow.behavior.md>")
+                    && content.contains("exactly one file operation")
                     && !content.contains("src/inactive-workflow.rs")
                     && !content.contains("workflow_compute")
                     && !content.contains("def main")
@@ -12705,6 +13250,7 @@ pub(crate) fn failed_inactive_authoring_feedback_requires_typed_metadata() -> bo
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -12804,6 +13350,7 @@ pub(crate) fn invalid_edit_arguments_replay_requires_typed_metadata() -> bool {
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -12906,6 +13453,7 @@ pub(crate) fn stale_progress_projection_replay_uses_live_builder() -> bool {
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -13062,6 +13610,7 @@ pub(crate) fn current_progress_projection_feedback_replay_preserves_call_output(
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -13275,6 +13824,7 @@ pub(crate) fn current_progress_projection_feedback_requires_typed_metadata() -> 
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -13404,6 +13954,7 @@ pub(crate) fn content_shape_mismatch_replay_preserves_tool_lifecycle_without_pay
             model: PROMPT_FIXTURE_MODEL.to_string(),
             base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
 access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: None,
@@ -13625,6 +14176,7 @@ pub(crate) fn content_shape_mismatch_replay_requires_typed_metadata() -> bool {
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -13721,6 +14273,7 @@ pub(crate) fn exact_write_repair_omits_consumed_supporting_context_replay() -> b
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -13985,6 +14538,7 @@ pub(crate) fn exact_write_repair_does_not_consume_untyped_read_as_supporting_con
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -14153,6 +14707,7 @@ pub fn provider_replay_preserves_current_invalid_edit_argument_feedback() -> boo
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -14318,6 +14873,7 @@ pub(crate) fn stale_write_prelude_replay_omits_text(
             model: PROMPT_FIXTURE_MODEL.to_string(),
             base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
             access_mode: crate::config::AccessMode::Default,
+            model_parameters: crate::session::SessionModelParameters::default(),
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: None,
@@ -14410,6 +14966,7 @@ pub(crate) fn stale_todo_progress_replay_omits_prior_plan(
             model: PROMPT_FIXTURE_MODEL.to_string(),
             base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
             access_mode: crate::config::AccessMode::Default,
+            model_parameters: crate::session::SessionModelParameters::default(),
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: None,
@@ -14568,6 +15125,7 @@ pub(crate) fn text_artifact_content_shape_repair_projection_carries_positive_con
             model: PROMPT_FIXTURE_MODEL.to_string(),
             base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
 access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: None,
@@ -14798,18 +15356,55 @@ access_mode: crate::config::AccessMode::Default,
 }
 
 pub(crate) fn prompt_fixtures_are_workflow_neutral_fixture_passes() -> bool {
+    prompt_fixtures_workflow_neutral_failures().is_empty()
+}
+
+pub(crate) fn prompt_fixtures_workflow_neutral_failures() -> Vec<&'static str> {
     let prompt_fixture_workflow_neutral = "prompt_fixture_workflow_neutral";
-    content_shape_mismatch_replay_preserves_tool_lifecycle_without_payload()
-        && content_shape_mismatch_replay_requires_typed_metadata()
-        && exact_write_repair_omits_consumed_supporting_context_replay()
-        && exact_write_repair_does_not_consume_untyped_read_as_supporting_context_replay()
-        && provider_replay_preserves_current_invalid_edit_argument_feedback()
-        && stale_todo_progress_replay_omits_prior_plan(
-            "tests/workflow.spec.ts",
-            "Plan: write src/workflow.rs, then write tests/workflow.spec.ts",
-        )
-        && text_artifact_content_shape_repair_projection_carries_positive_contract()
-        && prompt_fixture_workflow_neutral == "prompt_fixture_workflow_neutral"
+    [
+        (
+            "content_shape_mismatch_replay_preserves_tool_lifecycle_without_payload",
+            content_shape_mismatch_replay_preserves_tool_lifecycle_without_payload(),
+        ),
+        (
+            "content_shape_mismatch_replay_requires_typed_metadata",
+            content_shape_mismatch_replay_requires_typed_metadata(),
+        ),
+        (
+            "exact_write_repair_omits_consumed_supporting_context_replay",
+            exact_write_repair_omits_consumed_supporting_context_replay(),
+        ),
+        (
+            "exact_write_repair_does_not_consume_untyped_read_as_supporting_context_replay",
+            exact_write_repair_does_not_consume_untyped_read_as_supporting_context_replay(),
+        ),
+        (
+            "provider_replay_preserves_current_invalid_edit_argument_feedback",
+            provider_replay_preserves_current_invalid_edit_argument_feedback(),
+        ),
+        (
+            "stale_todo_progress_replay_omits_prior_plan",
+            stale_todo_progress_replay_omits_prior_plan(
+                "tests/workflow.spec.ts",
+                "Plan: write src/workflow.rs, then write tests/workflow.spec.ts",
+            ),
+        ),
+        (
+            "text_artifact_content_shape_repair_projection_carries_positive_contract",
+            text_artifact_content_shape_repair_projection_carries_positive_contract(),
+        ),
+        (
+            "active_target_apply_patch_schema_projects_single_operation_skeleton",
+            active_target_apply_patch_schema_projects_single_operation_skeleton(),
+        ),
+        (
+            "prompt_fixture_workflow_neutral_marker",
+            prompt_fixture_workflow_neutral == "prompt_fixture_workflow_neutral",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, passed)| (!passed).then_some(name))
+    .collect()
 }
 
 pub(crate) fn prompt_content_shape_projection_uses_adapter_contract_fixture_passes() -> bool {
@@ -14875,6 +15470,44 @@ pub(crate) fn prompt_content_shape_projection_uses_adapter_contract_fixture_pass
         && !expected_js.contains("unittest")
 }
 
+pub(crate) fn active_target_apply_patch_schema_projects_single_operation_skeleton() -> bool {
+    let mut state = SessionStateSnapshot {
+        route: TaskRoute::Code,
+        process_phase: ProcessPhase::Author,
+        active_targets: vec![Utf8PathBuf::from("tests/test_output.py")],
+        ..SessionStateSnapshot::default()
+    };
+    state.completion.open_work_count = 1;
+    let mut tools = vec![ToolSchema {
+        name: "apply_patch".to_string(),
+        description: "apply patch".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["patch_text"],
+            "properties": {
+                "patch_text": {
+                    "type": "string",
+                    "description": "Entire patch text."
+                }
+            }
+        }),
+        strict: false,
+    }];
+    apply_active_target_to_apply_patch_schema(&mut tools, &state);
+    let description = tools[0]
+        .input_schema
+        .pointer("/properties/patch_text/description")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    description.contains("Current active target-only patch skeleton")
+        && description.contains("*** Add File: tests/test_output.py")
+        && description.contains("+<complete content for tests/test_output.py>")
+        && description.contains("exactly one file operation")
+        && description.contains("no inactive target hunks")
+        && description.contains("Required positive")
+        && !description.contains("*** Add File: src/output.py")
+}
+
 pub(crate) fn python_source_content_shape_repair_projection_carries_positive_contract() -> bool {
     let target = "src/workflow.py";
     let session_id = crate::session::SessionId::new();
@@ -14891,6 +15524,7 @@ pub(crate) fn python_source_content_shape_repair_projection_carries_positive_con
             model: PROMPT_FIXTURE_MODEL.to_string(),
             base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
             access_mode: crate::config::AccessMode::Default,
+            model_parameters: crate::session::SessionModelParameters::default(),
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: None,
@@ -15093,6 +15727,7 @@ pub fn provider_replay_preserves_latest_user_across_trailing_compaction() -> boo
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -15232,6 +15867,7 @@ pub(crate) fn compaction_provider_context_projects_typed_contract_before_summary
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -15304,6 +15940,7 @@ pub(crate) fn compaction_replay_uses_typed_history_authority_fixture_passes() ->
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 3,
         completed_at_ms: None,
@@ -15495,6 +16132,7 @@ pub(crate) fn prompt_projection_workspace_root_uses_typed_runtime_input_fixture_
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -15560,6 +16198,7 @@ pub fn provider_replay_after_compaction_repairs_orphan_assistant_before_user() -
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -15666,6 +16305,7 @@ pub fn provider_replay_preserves_tool_pair_symmetry_with_model_arguments() -> bo
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -15807,6 +16447,7 @@ pub fn provider_replay_projects_rejected_final_message_evidence() -> bool {
         model: PROMPT_FIXTURE_MODEL.to_string(),
         base_url: PROMPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 1,
         completed_at_ms: None,
@@ -17226,6 +17867,13 @@ mod tests {
     #[test]
     fn exact_write_repair_omits_consumed_supporting_context_fixture_passes() {
         assert!(super::exact_write_repair_omits_consumed_supporting_context_replay());
+    }
+
+    #[test]
+    fn target_exclusive_apply_patch_contract_violation_replay_fixture_passes() {
+        assert!(
+            super::provider_replay_omits_target_exclusive_apply_patch_contract_violation_fixture_passes()
+        );
     }
 }
 

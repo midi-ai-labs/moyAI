@@ -5,12 +5,16 @@ use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::{
+    DEFAULT_MODEL_BASE_URL, DEFAULT_MODEL_CONTEXT_WINDOW, DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
+    DEFAULT_MODEL_NAME,
+};
 use crate::error::RuntimeError;
 
-const PREFLIGHT_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
-const PREFLIGHT_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
-const PREFLIGHT_FIXTURE_CONTEXT_WINDOW: u32 = 131_072;
-const PREFLIGHT_FIXTURE_MAX_OUTPUT_TOKENS: u32 = 8_192;
+const PREFLIGHT_FIXTURE_MODEL: &str = DEFAULT_MODEL_NAME;
+const PREFLIGHT_FIXTURE_BASE_URL: &str = DEFAULT_MODEL_BASE_URL;
+const PREFLIGHT_FIXTURE_CONTEXT_WINDOW: u32 = DEFAULT_MODEL_CONTEXT_WINDOW;
+const PREFLIGHT_FIXTURE_MAX_OUTPUT_TOKENS: u32 = DEFAULT_MODEL_MAX_OUTPUT_TOKENS;
 const BANNED_SCOPE_SHRINK_TERMS: &[&str] = &[
     "MVP",
     "最小構成",
@@ -213,6 +217,20 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
     {
         diagnostics.push(
             "control envelope gate must fail closed when typed projection is missing".to_string(),
+        );
+    }
+    if matches!(gate.family, PreflightGateFamily::ControlEnvelopeProjection)
+        && !crate::agent::lifecycle_kernel::open_obligation_final_message_rejection_is_kernel_owned_fixture_passes()
+    {
+        diagnostics.push(
+            "open-obligation final assistant message rejection can still be classified by runtime-loop semantic string branching instead of lifecycle-kernel adjudication".to_string(),
+        );
+    }
+    if matches!(gate.family, PreflightGateFamily::ControlEnvelopeProjection)
+        && !crate::agent::loop_impl::rejected_model_action_no_progress_effects_are_guard_owned_fixture_passes()
+    {
+        diagnostics.push(
+            "rejected model-action no-progress effects can still be assembled from ToolResult metadata in the runtime loop instead of LifecycleGuardState".to_string(),
         );
     }
 
@@ -729,16 +747,16 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             "provider stream retry exhaustion can still be classified without first-class provider-boundary owner/evidence refs in timeout_classification.json".to_string(),
         );
     }
-    if gate.gate_id == "preflight.route_evidence.schema" {
+    if gate.gate_id == "preflight.route_evidence.schema"
+        && !crate::harness::manual_st::manual_st_closeout_and_route_fixtures_are_workflow_neutral_and_current_profile_fixture_passes()
+    {
         let failures =
             crate::harness::manual_st::manual_st_closeout_and_route_fixture_workflow_neutral_failures(
             );
-        if !failures.is_empty() {
-            diagnostics.push(format!(
-                "manual ST closeout and route-progress fixtures can still use legacy case/language/provider authority instead of workflow-neutral current-profile evidence: {}",
-                failures.join(", ")
-            ));
-        }
+        diagnostics.push(format!(
+            "manual ST closeout and route-progress fixtures can still use legacy case/language/provider authority instead of workflow-neutral current-profile evidence: {}",
+            failures.join(", ")
+        ));
     }
     if gate.gate_id == "preflight.route_evidence.schema"
         && !manual_st_reference_exports_scope_hygiene_fixture_passes()
@@ -805,6 +823,43 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
     {
         diagnostics.push(
             "active apply_patch target projection still lacks a concrete current-item patch operation template".to_string(),
+        );
+    }
+    if gate.gate_id == "preflight.control_envelope.dispatch_projection_authority"
+        && !crate::protocol::generated_test_scaffold_projects_to_all_control_surfaces_fixture_passes(
+        )
+    {
+        diagnostics.push(
+            "generated-test recovery projection can still lack a positive active-target test-module patch scaffold derived from the content-shape contract".to_string(),
+        );
+    }
+    if gate.gate_id == "preflight.control_envelope.dispatch_projection_authority"
+        && !crate::agent::lifecycle_kernel::turn_lifecycle_recovery_context_is_kernel_owned_fixture_passes()
+    {
+        diagnostics.push(
+            "turn recovery context can still be assembled as loose TurnRuntime boolean state instead of a TurnLifecycleKernel-owned typed recovery projection".to_string(),
+        );
+    }
+    if gate.gate_id == "preflight.control_envelope.dispatch_projection_authority"
+        && !crate::agent::lifecycle_kernel::turn_lifecycle_early_surface_sequence_is_kernel_owned_fixture_passes()
+    {
+        diagnostics.push(
+            "early pre-context recovery surface sequencing can still be assembled as loose TurnRuntime branch order instead of a TurnLifecycleKernel-owned typed lifecycle plan".to_string(),
+        );
+    }
+    if gate.gate_id == "preflight.control_envelope.dispatch_projection_authority"
+        && !crate::agent::lifecycle_kernel::turn_lifecycle_late_surface_sequence_is_kernel_owned_fixture_passes()
+    {
+        diagnostics.push(
+            "late pre-context recovery surface sequencing can still be assembled as loose TurnRuntime branch order instead of a TurnLifecycleKernel-owned typed lifecycle plan".to_string(),
+        );
+    }
+    if gate.gate_id == "preflight.control_envelope.dispatch_projection_authority"
+        && !crate::agent::tool_orchestrator::generated_test_source_reauthoring_recovery_choice_guard_fixture_passes(
+        )
+    {
+        diagnostics.push(
+            "local-LLM recovery choice guard can still treat generated-test production-source reauthoring as ordinary content-shape feedback instead of typed terminal blocked evidence".to_string(),
         );
     }
     if gate.gate_id == "preflight.control_envelope.dispatch_projection_authority"
@@ -951,6 +1006,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::app::run_service::resume_latest_user_message_uses_item_order_fixture_passes(
             )
             || !crate::agent::loop_impl::terminal_token_accounting_sequence_fixture_passes()
+            || !crate::agent::loop_impl::terminal_turn_projection_fixture_passes()
             || !crate::protocol::pre_recorded_protocol_sequence_reservation_fixture_passes()
             || !crate::protocol::protocol_store_rejects_incoherent_event_bundles_fixture_passes()
             || !crate::session::service::stale_running_cleanup_records_protocol_terminal_fixture_passes())
@@ -1531,9 +1587,15 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
     if gate.gate_id == "preflight.prompt_replay.stale_write_arguments_summary_projection"
         && !crate::agent::prompt::prompt_fixtures_are_workflow_neutral_fixture_passes()
     {
+        let failed_prompt_fixtures =
+            crate::agent::prompt::prompt_fixtures_workflow_neutral_failures();
         diagnostics.push(
             "Prompt replay fixtures can still use component/test_component/component-design domain surfaces instead of workflow-neutral source/test/docs provider replay authority".to_string(),
         );
+        diagnostics.push(format!(
+            "failed prompt workflow-neutral fixtures: {}",
+            failed_prompt_fixtures.join(", ")
+        ));
     }
     if gate.gate_id == "preflight.prompt_replay.stale_write_arguments_summary_projection"
         && !crate::agent::prompt::prompt_residual_fixtures_are_workflow_neutral_fixture_passes()
@@ -3409,6 +3471,7 @@ fn evaluate_fixture(gate: &PreflightGate, fixture: &PreflightFixture) -> Preflig
             || !crate::harness::manual_st::route_inflight_case_progress_artifact_fixture_passes()
             || !crate::harness::manual_st::route_case_progress_phase_boundaries_fixture_passes()
             || !crate::harness::manual_st::route_authoring_content_paths_use_language_adapter_fixture_passes()
+            || !crate::harness::manual_st::manual_st_default_output_root_uses_workspace_sandbox_fixture_passes()
             || !crate::harness::manual_st::manual_st_route_omits_provider_defaults_without_explicit_override_fixture_passes()
             || !crate::harness::manual_st::stage_scoped_verification_commands_are_spec_owned_fixture_passes()
             || !crate::harness::manual_st::manual_st_visible_scenario_contract_prompt_fixture_passes())
@@ -4670,6 +4733,7 @@ fn prompt_replay_internal_control_items_are_not_provider_visible() -> bool {
         model: PREFLIGHT_FIXTURE_MODEL.to_string(),
         base_url: PREFLIGHT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -4751,6 +4815,7 @@ fn provider_replay_call_output_symmetry_fixture_passes() -> bool {
         model: PREFLIGHT_FIXTURE_MODEL.to_string(),
         base_url: PREFLIGHT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 2,
         completed_at_ms: None,
@@ -4889,7 +4954,7 @@ fn provider_replay_call_output_symmetry_fixture_passes() -> bool {
 }
 
 fn write_schema_stays_provider_owned() -> bool {
-    let mut tools = vec![crate::llm::ToolSchema {
+    let tools = [crate::llm::ToolSchema {
         name: "write".to_string(),
         description: "write a file".to_string(),
         input_schema: serde_json::json!({
@@ -4902,7 +4967,6 @@ fn write_schema_stays_provider_owned() -> bool {
         }),
         strict: false,
     }];
-    crate::agent::loop_impl::preserve_provider_tool_surface_for_dispatch(&mut tools);
     let Some(tool) = tools.first() else {
         return false;
     };

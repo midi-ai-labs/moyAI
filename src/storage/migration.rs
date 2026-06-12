@@ -35,6 +35,10 @@ const V20_PROTOCOL_ITEM_APPEND_ORDER: &str =
 const V21_SESSIONS_ARCHIVE: &str = include_str!("../../migrations/V21__sessions_archive.sql");
 const V22_SESSIONS_ACCESS_MODE: &str =
     include_str!("../../migrations/V22__sessions_access_mode.sql");
+const V23_SESSIONS_MEMORY_MODE: &str =
+    include_str!("../../migrations/V23__sessions_memory_mode.sql");
+const V24_SESSIONS_MODEL_PARAMETERS: &str =
+    include_str!("../../migrations/V24__sessions_model_parameters.sql");
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
     connection.execute_batch(V1_INIT)?;
@@ -86,6 +90,12 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     }
     if needs_sessions_access_mode_migration(connection)? {
         connection.execute_batch(V22_SESSIONS_ACCESS_MODE)?;
+    }
+    if needs_sessions_memory_mode_migration(connection)? {
+        connection.execute_batch(V23_SESSIONS_MEMORY_MODE)?;
+    }
+    if needs_sessions_model_parameters_migration(connection)? {
+        connection.execute_batch(V24_SESSIONS_MODEL_PARAMETERS)?;
     }
     Ok(())
 }
@@ -255,4 +265,24 @@ fn needs_sessions_access_mode_migration(connection: &Connection) -> Result<bool,
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(!columns.iter().any(|column| column == "access_mode"))
+}
+
+fn needs_sessions_memory_mode_migration(connection: &Connection) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(!columns.iter().any(|column| column == "memory_mode"))
+}
+
+fn needs_sessions_model_parameters_migration(
+    connection: &Connection,
+) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(!columns
+        .iter()
+        .any(|column| column == "model_parameters_json"))
 }

@@ -1,9 +1,10 @@
 use crate::error::CliRenderError;
 use crate::protocol::{HistoryItem, HistoryItemPayload};
 use crate::session::{
-    CanonicalHistoryPage, CanonicalSessionRead, CanonicalTurnPage, LoadedSessionList, MessagePart,
-    PartKind, RunEvent, RunSummary, RunningSessionRejoin, SessionRecord, SessionStateSnapshot,
-    Transcript, transcript_from_history_items,
+    CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionRead, CanonicalTurnPage,
+    IdleTurnAdmission, LoadedSessionList, MessagePart, PartKind, RunEvent, RunSummary,
+    RunningSessionRejoin, SessionCompactResult, SessionMemoryModeUpdate, SessionRecord,
+    SessionStateSnapshot, Transcript, transcript_from_history_items,
 };
 
 const CURRENT_PROVIDER_MODEL: &str = "qwen/qwen3.6-35b-a3b";
@@ -31,6 +32,24 @@ pub trait EventRenderer {
         rejoin: &RunningSessionRejoin,
     ) -> Result<(), CliRenderError>;
     fn render_session_turn_page(&mut self, page: &CanonicalTurnPage) -> Result<(), CliRenderError>;
+    fn render_session_runtime_event_page(
+        &mut self,
+        page: &CanonicalRuntimeEventPage,
+    ) -> Result<(), CliRenderError>;
+    fn render_session_compact_result(
+        &mut self,
+        result: &SessionCompactResult,
+    ) -> Result<(), CliRenderError>;
+    fn render_session_memory_mode_update(
+        &mut self,
+        update: &SessionMemoryModeUpdate,
+    ) -> Result<(), CliRenderError>;
+    fn render_session_idle_turn_admission(
+        &mut self,
+        _admission: &IdleTurnAdmission,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
 }
 
 pub struct HumanRenderer;
@@ -330,6 +349,81 @@ impl EventRenderer for HumanRenderer {
         }
         Ok(())
     }
+
+    fn render_session_runtime_event_page(
+        &mut self,
+        page: &CanonicalRuntimeEventPage,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "session {} events offset={} limit={} total={} has_more={}",
+            page.session.id, page.offset, page.limit, page.total, page.has_more
+        )?;
+        for event in &page.items {
+            writeln!(
+                stdout,
+                "{}\t{}\t{}\t{}",
+                event.sequence_no,
+                event.turn_id,
+                event.id,
+                payload_kind(&event.msg)?
+            )?;
+        }
+        Ok(())
+    }
+
+    fn render_session_compact_result(
+        &mut self,
+        result: &SessionCompactResult,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "session {} compacted item={} summarized={} retained={}",
+            result.session.id,
+            result.compaction_item_id,
+            result.summarized_history_items,
+            result.retained_history_items
+        )?;
+        Ok(())
+    }
+
+    fn render_session_memory_mode_update(
+        &mut self,
+        update: &SessionMemoryModeUpdate,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "session {} memory={} changed={}",
+            update.session.id,
+            update.mode.key(),
+            update.changed
+        )?;
+        Ok(())
+    }
+
+    fn render_session_idle_turn_admission(
+        &mut self,
+        admission: &IdleTurnAdmission,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        let reason = admission
+            .rejection_reason
+            .map(|reason| reason.key())
+            .unwrap_or("none");
+        writeln!(
+            stdout,
+            "session {} idle_admitted={} reason={}",
+            admission.session.id, admission.admitted, reason
+        )?;
+        Ok(())
+    }
 }
 
 pub struct JsonRenderer;
@@ -430,6 +524,46 @@ impl EventRenderer for JsonRenderer {
         writeln!(stdout, "{}", serde_json::to_string(page)?)?;
         Ok(())
     }
+
+    fn render_session_runtime_event_page(
+        &mut self,
+        page: &CanonicalRuntimeEventPage,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(page)?)?;
+        Ok(())
+    }
+
+    fn render_session_compact_result(
+        &mut self,
+        result: &SessionCompactResult,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(result)?)?;
+        Ok(())
+    }
+
+    fn render_session_memory_mode_update(
+        &mut self,
+        update: &SessionMemoryModeUpdate,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(update)?)?;
+        Ok(())
+    }
+
+    fn render_session_idle_turn_admission(
+        &mut self,
+        admission: &IdleTurnAdmission,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(admission)?)?;
+        Ok(())
+    }
 }
 
 fn payload_kind<T: serde::Serialize>(payload: &T) -> Result<String, CliRenderError> {
@@ -487,14 +621,36 @@ fn human_run_summary_line(summary: &RunSummary) -> String {
 }
 
 fn human_session_record_line(session: &SessionRecord) -> String {
+    let model_parameters = human_model_parameters(&session.model_parameters);
     format!(
-        "{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}",
         session.id,
         session.status.key(),
         session.access_mode.as_str(),
+        model_parameters,
         session.updated_at_ms,
         session.title
     )
+}
+
+fn human_model_parameters(parameters: &crate::session::SessionModelParameters) -> String {
+    if parameters.is_empty() {
+        return "model_params=-".to_string();
+    }
+    let mut parts = Vec::new();
+    if let Some(value) = parameters.temperature {
+        parts.push(format!("temperature={value}"));
+    }
+    if let Some(value) = parameters.top_p {
+        parts.push(format!("top_p={value}"));
+    }
+    if let Some(value) = parameters.top_k {
+        parts.push(format!("top_k={value}"));
+    }
+    if let Some(value) = parameters.max_output_tokens {
+        parts.push(format!("max_output_tokens={value}"));
+    }
+    format!("model_params={}", parts.join(","))
 }
 
 fn human_loaded_session_summary_line(summary: &crate::session::LoadedSessionSummary) -> String {
@@ -536,6 +692,7 @@ fn renderer_fixture_session_record(title: &str) -> SessionRecord {
         updated_at_ms: 3,
         completed_at_ms: Some(3),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
     }
 }
 

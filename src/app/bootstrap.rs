@@ -9,6 +9,7 @@ use crate::config::ConfigLoader;
 use crate::edit::{ChangeTracker, EditSafety, Formatter};
 use crate::error::AppBootstrapError;
 use crate::llm::OpenAiCompatClient;
+use crate::runtime::SessionRuntimeEventHub;
 use crate::session::ProjectRepository;
 use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 use crate::tool::context::ToolServices;
@@ -108,12 +109,14 @@ impl AppBootstrap {
             api_key,
         )?);
         let agent_loop = AgentLoop::new(llm, registry, store.clone(), PromptBuilder, tool_services);
+        let session_event_hub = SessionRuntimeEventHub::new(1024);
         let run_service = RunService::new(
             store.clone(),
             config.clone(),
             workspace.clone(),
             session_service.clone(),
             agent_loop,
+            session_event_hub.clone(),
         );
 
         Ok(App {
@@ -122,6 +125,7 @@ impl AppBootstrap {
             store,
             session_service,
             run_service,
+            session_event_hub,
         })
     }
 }
@@ -148,12 +152,17 @@ fn command_directory(command: &CliCommand) -> Result<camino::Utf8PathBuf, AppBoo
         }
         CliCommand::SessionArchive(_)
         | CliCommand::SessionSettings(_)
+        | CliCommand::SessionTitle(_)
+        | CliCommand::SessionInterrupt(_)
+        | CliCommand::SessionCompact(_)
+        | CliCommand::SessionMemory(_)
         | CliCommand::SessionShow(_)
         | CliCommand::SessionHistory(_)
         | CliCommand::SessionRead(_)
         | CliCommand::SessionRejoin(_)
         | CliCommand::SessionRollback(_)
         | CliCommand::SessionFork(_)
+        | CliCommand::SessionEvents(_)
         | CliCommand::SessionTurns(_) => current,
         CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)

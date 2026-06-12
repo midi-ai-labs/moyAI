@@ -3,7 +3,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::OutputMode;
 use crate::config::AccessMode;
-use crate::session::{EditorContext, PromptDispatchPart, SessionId};
+use crate::error::StorageError;
+use crate::protocol::ProtocolEventStore;
+use crate::runtime::{SessionRuntimeEventHub, SessionRuntimeEventSubscription};
+use crate::session::{EditorContext, PromptDispatchPart, SessionId, SessionMemoryMode};
 
 #[derive(Debug, Clone)]
 pub enum ReviewRequest {
@@ -18,6 +21,28 @@ pub struct App {
     pub store: crate::storage::StoreBundle,
     pub session_service: crate::session::SessionService,
     pub run_service: crate::app::RunService,
+    pub session_event_hub: SessionRuntimeEventHub,
+}
+
+impl App {
+    pub fn subscribe_session_runtime_events(
+        &self,
+        session_id: SessionId,
+    ) -> SessionRuntimeEventSubscription {
+        self.session_event_hub.subscribe(session_id)
+    }
+
+    pub fn subscribe_session_runtime_events_with_backfill(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionRuntimeEventSubscription, StorageError> {
+        let subscriber = self.session_event_hub.subscribe(session_id);
+        let backfill = self
+            .store
+            .protocol_event_store()
+            .list_runtime_events_for_session(session_id)?;
+        Ok(subscriber.with_backfill(backfill))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +98,42 @@ pub struct SessionSettingsUpdateRequest {
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub access_mode: Option<AccessMode>,
+    pub reset_model_parameters: bool,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionTitleUpdateRequest {
+    pub session_id: SessionId,
+    pub title: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionInterruptRequest {
+    pub session_id: SessionId,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionCompactRequest {
+    pub session_id: SessionId,
+    pub keep_recent: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionMemoryRequest {
+    pub session_id: SessionId,
+    pub mode: SessionMemoryMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionIdleAdmissionRequest {
+    pub session_id: SessionId,
+    pub pending_trigger_turn: bool,
+    pub plan_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +195,13 @@ pub struct SessionTurnsRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct SessionEventsRequest {
+    pub session_id: SessionId,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionSteerRequest {
     pub session_id: SessionId,
     pub prompt: String,
@@ -151,11 +219,17 @@ pub enum AppCommand {
     SessionSearch(SessionSearchRequest),
     SessionShow(SessionShowRequest),
     SessionSettingsUpdate(SessionSettingsUpdateRequest),
+    SessionTitleUpdate(SessionTitleUpdateRequest),
+    SessionInterrupt(SessionInterruptRequest),
+    SessionCompact(SessionCompactRequest),
+    SessionMemory(SessionMemoryRequest),
+    SessionIdleAdmission(SessionIdleAdmissionRequest),
     SessionHistory(SessionHistoryRequest),
     SessionRead(SessionReadRequest),
     SessionRejoin(SessionRejoinRequest),
     SessionRollback(SessionRollbackRequest),
     SessionFork(SessionForkRequest),
     SessionTurns(SessionTurnsRequest),
+    SessionEvents(SessionEventsRequest),
     SessionSteer(SessionSteerRequest),
 }

@@ -46,6 +46,7 @@ pub use control::{
     content_changing_projection_text_separates_availability_from_satisfying_progress_fixture_passes,
     continuation_contract_matches_control_envelope_fixture_passes,
     edit_only_authoring_grounding_recovery_narrows_action_surface_fixture_passes,
+    generated_test_scaffold_projects_to_all_control_surfaces_fixture_passes,
     named_tool_choice_matches_required_action_fixture_passes,
     non_python_edit_projection_uses_language_adapter_fixture_passes,
     output_contract_final_answer_matches_open_obligations_fixture_passes,

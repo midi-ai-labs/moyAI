@@ -1,20 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::agent::language_evidence::{
     ArtifactRole, LanguageFamily, classify_artifact_target as classify_language_artifact_target,
 };
-use crate::agent::lifecycle_kernel::provider_replay_metadata_is_supporting_context;
+use crate::agent::lifecycle_kernel::{
+    TurnLifecycleKernel, TurnLifecycleRecoveryContext, compile_turn_lifecycle_tool_choice,
+    provider_replay_metadata_is_supporting_context,
+};
 use crate::agent::tool_orchestrator::{AuthoringGroundingRecoveryEnvelope, ToolLifecycleRuntime};
 use crate::protocol::{
     HistoryItem, HistoryItemPayload, OperationIntent, ToolLifecycleStatus,
     canonical_tool_call_arguments,
 };
 use crate::session::{
-    ContractStatus, DocsArea, DocsDeliverableCoverage, DocsGroundingRequirement,
-    SessionStateSnapshot,
+    ContractStatus, DocsArea, DocsDeliverableCoverage, DocsDeliverableKind, DocsGroundingCoverage,
+    DocsGroundingRequirement, DocsRouteState, SessionStateSnapshot, TaskRoute,
 };
 use crate::tool::ToolName;
 
@@ -22,6 +26,14 @@ use crate::tool::ToolName;
 enum DocsContentGroundingClass {
     Repository,
     Tests,
+}
+
+pub(crate) struct AuthoringGroundingDispatchProjection {
+    pub(crate) missing_targets: BTreeSet<String>,
+    pub(crate) active_targets_need_grounding: bool,
+    pub(crate) recovery_envelope: AuthoringGroundingRecoveryEnvelope,
+    pub(crate) has_unread_source_change_for_generated_test: bool,
+    pub(crate) has_current_source_reference_read_for_generated_test: bool,
 }
 
 pub(crate) fn docs_route_has_required_content_grounding_evidence(
@@ -339,6 +351,35 @@ pub(crate) fn authoring_grounding_recovery_envelope(
     }
 }
 
+pub(crate) fn authoring_grounding_dispatch_projection(
+    history_items: &[HistoryItem],
+    state: &SessionStateSnapshot,
+    workspace_root: &Utf8Path,
+    turn_grounded_targets: &BTreeSet<String>,
+) -> AuthoringGroundingDispatchProjection {
+    let missing_targets = authoring_missing_grounding_targets(
+        history_items,
+        state,
+        workspace_root,
+        turn_grounded_targets,
+    );
+    let recovery_envelope = authoring_grounding_recovery_envelope(
+        history_items,
+        state,
+        workspace_root,
+        turn_grounded_targets,
+    );
+    AuthoringGroundingDispatchProjection {
+        active_targets_need_grounding: !missing_targets.is_empty(),
+        missing_targets,
+        recovery_envelope,
+        has_unread_source_change_for_generated_test:
+            history_has_unread_source_change_for_generated_test(history_items),
+        has_current_source_reference_read_for_generated_test:
+            history_has_current_source_reference_read_for_generated_test(history_items),
+    }
+}
+
 pub(crate) fn authoring_grounding_recovery_obligation(
     envelope: &AuthoringGroundingRecoveryEnvelope,
 ) -> crate::protocol::TurnObligation {
@@ -506,6 +547,186 @@ pub(crate) fn matching_active_target_key(
             None
         }
     })
+}
+
+pub(crate) fn multi_target_authoring_consumed_grounding_narrows_edit_recovery_fixture_passes()
+-> bool {
+    let Ok(temp) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(workspace_root) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
+        return false;
+    };
+    if fs::create_dir_all(workspace_root.join("src").as_std_path()).is_err()
+        || fs::create_dir_all(workspace_root.join("tests").as_std_path()).is_err()
+        || fs::write(
+            workspace_root.join("src/workflow.rs").as_std_path(),
+            "pub fn add(left: i32, right: i32) -> i32 { left + right }\n",
+        )
+        .is_err()
+        || fs::write(
+            workspace_root
+                .join("tests/workflow.behavior.md")
+                .as_std_path(),
+            "workflow behavior contract: add returns the sum of two integers\n",
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let mut state = SessionStateSnapshot {
+        route: TaskRoute::Code,
+        process_phase: crate::session::ProcessPhase::Author,
+        ..SessionStateSnapshot::default()
+    };
+    state.completion.open_work_count = 1;
+    state.completion.closeout_ready = false;
+    state.active_targets = vec![
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
+    ];
+    state
+        .verification
+        .required_commands
+        .push("verify-contract --behavior".to_string());
+    let exhausted = BTreeSet::from(["supporting-context-budget".to_string()]);
+    let allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "glob".to_string(),
+        "read".to_string(),
+        "shell".to_string(),
+        "todowrite".to_string(),
+        "write".to_string(),
+    ]);
+    let partial_grounded = BTreeSet::from(["src/workflow.rs".to_string()]);
+    let all_grounded = BTreeSet::from([
+        "src/workflow.rs".to_string(),
+        "tests/workflow.behavior.md".to_string(),
+    ]);
+    let partial_missing =
+        authoring_missing_grounding_targets(&[], &state, &workspace_root, &partial_grounded);
+    let all_missing =
+        authoring_missing_grounding_targets(&[], &state, &workspace_root, &all_grounded);
+    let partial_envelope =
+        authoring_grounding_recovery_envelope(&[], &state, &workspace_root, &partial_grounded);
+    let mut partial_visible = allowed.clone();
+    if TurnLifecycleKernel::authoring_supporting_context_budget_recovery_surface_active(
+        &state, &exhausted,
+    ) {
+        partial_visible.retain(|tool| {
+            TurnLifecycleKernel::authoring_supporting_context_budget_recovery_tool_visible(
+                tool,
+                !partial_missing.is_empty(),
+            )
+        });
+    }
+    let mut edit_visible = allowed.clone();
+    if TurnLifecycleKernel::authoring_supporting_context_budget_recovery_surface_active(
+        &state, &exhausted,
+    ) {
+        edit_visible.retain(|tool| {
+            TurnLifecycleKernel::authoring_supporting_context_budget_recovery_tool_visible(
+                tool,
+                !all_missing.is_empty(),
+            )
+        });
+    }
+    let consumed_read_disallowed =
+        ToolLifecycleRuntime::authoring_supporting_context_budget_recovery_read_disallowed(
+            "read",
+            &json!({"path": "src/workflow.rs"}),
+            &state,
+            &[],
+            &workspace_root,
+            &partial_grounded,
+        );
+    let remaining_read_allowed =
+        !ToolLifecycleRuntime::authoring_supporting_context_budget_recovery_read_disallowed(
+            "read",
+            &json!({"path": "tests/workflow.behavior.md"}),
+            &state,
+            &[],
+            &workspace_root,
+            &partial_grounded,
+        );
+    let consumed_result = ToolLifecycleRuntime::authoring_target_grounding_required_result(
+        "read",
+        &json!({"path": "src/workflow.rs"}),
+        &state,
+        &partial_envelope,
+    );
+    let consumed_output = consumed_result.output_text.clone();
+    let mut schema_tools = vec![crate::llm::ToolSchema {
+        name: "read".to_string(),
+        description: "Read a file".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"}
+            },
+            "required": ["path"]
+        }),
+        strict: false,
+    }];
+    ToolLifecycleRuntime::constrain_read_schema_to_missing_authoring_targets(
+        &mut schema_tools,
+        &partial_envelope,
+    );
+    let schema_path_enum = schema_tools
+        .first()
+        .and_then(|tool| tool.input_schema.pointer("/properties/path/enum"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let recovery_obligation = authoring_grounding_recovery_obligation(&partial_envelope);
+    let final_grounding_active =
+        TurnLifecycleKernel::authoring_target_grounding_final_message_recovery_active(
+            &state,
+            active_authoring_targets_need_grounding(&[], &state, &workspace_root, &all_grounded),
+        );
+    let final_choice = compile_turn_lifecycle_tool_choice(
+        &crate::agent::prompt::PromptPolicy::default(),
+        &state,
+        &edit_visible,
+        TurnLifecycleRecoveryContext {
+            open_obligation_final_message_recovery_active: true,
+            open_obligation_final_message_count: 1,
+            ..TurnLifecycleRecoveryContext::default()
+        },
+    );
+
+    partial_missing == BTreeSet::from(["tests/workflow.behavior.md".to_string()])
+        && all_missing.is_empty()
+        && partial_visible == BTreeSet::from(["apply_patch".to_string(), "read".to_string()])
+        && edit_visible == BTreeSet::from(["apply_patch".to_string()])
+        && consumed_read_disallowed
+        && remaining_read_allowed
+        && partial_envelope.consumed_targets == vec!["src/workflow.rs".to_string()]
+        && partial_envelope.missing_grounding_targets
+            == vec!["tests/workflow.behavior.md".to_string()]
+        && consumed_output.contains("already grounded")
+        && consumed_output.contains("tests/workflow.behavior.md")
+        && consumed_result
+            .metadata
+            .pointer("/missing_grounding_targets/0")
+            .and_then(Value::as_str)
+            == Some("tests/workflow.behavior.md")
+        && consumed_result
+            .metadata
+            .pointer("/consumed_targets/0")
+            .and_then(Value::as_str)
+            == Some("src/workflow.rs")
+        && schema_path_enum == json!(["tests/workflow.behavior.md"])
+        && recovery_obligation
+            .evidence_refs
+            .first()
+            .is_some_and(|reference| {
+                reference
+                    .reference
+                    .contains("missing=tests/workflow.behavior.md")
+                    && reference.reference.contains("consumed=src/workflow.rs")
+            })
+        && !final_grounding_active
+        && matches!(final_choice, crate::protocol::ToolChoice::Required)
 }
 
 pub(crate) fn history_has_unread_source_change_for_generated_test(
@@ -738,6 +959,164 @@ pub(crate) fn docs_route_grep_line_path_generic_path_line_fixture_passes() -> bo
         && docs_route_grep_line_path("src/workflow.rs: no line number").is_some()
 }
 
+pub(crate) fn docs_route_content_grounding_requires_typed_supporting_context_fixture_passes() -> bool
+{
+    let session_id = crate::session::SessionId::new();
+    let turn_id = crate::protocol::TurnId::new();
+    let mut state = SessionStateSnapshot {
+        route: crate::session::TaskRoute::Docs,
+        process_phase: crate::session::ProcessPhase::Author,
+        docs_route: Some(DocsRouteState {
+            active_deliverable: Some(Utf8PathBuf::from("docs/workflow-design.md")),
+            deliverables: vec![DocsDeliverableCoverage {
+                target: Utf8PathBuf::from("docs/workflow-design.md"),
+                kind: DocsDeliverableKind::DetailDesign,
+                required_areas: vec![DocsArea::Tests],
+                required_topics: vec!["tests".to_string()],
+                grounding: vec![DocsGroundingCoverage {
+                    requirement: DocsGroundingRequirement::Tests,
+                    status: ContractStatus::Satisfied,
+                    representative_path: Some(Utf8PathBuf::from("tests/workflow.contract")),
+                    evidence_summary: Some("tests contract was inspected".to_string()),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let repository_only = docs_route_history_fixture(
+        session_id,
+        turn_id,
+        "repo-context",
+        ToolName::Read,
+        serde_json::json!({ "path": "src/workflow.rs" }),
+        "repository workflow contract",
+        serde_json::json!({ "operation_progress_class": "supporting_context" }),
+    );
+    let test_context = docs_route_history_fixture(
+        session_id,
+        turn_id,
+        "test-context",
+        ToolName::Read,
+        serde_json::json!({ "path": "tests/workflow.contract" }),
+        "test workflow contract",
+        serde_json::json!({ "operation_progress_class": "supporting_context" }),
+    );
+    let corrective_context = docs_route_history_fixture(
+        session_id,
+        turn_id,
+        "corrective-context",
+        ToolName::Read,
+        serde_json::json!({ "path": "tests/workflow.contract" }),
+        "corrective feedback must not count as grounding",
+        serde_json::json!({
+            "operation_progress_class": "supporting_context",
+            "corrective_result": true
+        }),
+    );
+
+    let tests_are_required = !docs_route_has_required_content_grounding_evidence(
+        &state,
+        &[repository_only.clone(), corrective_context].concat(),
+    ) && docs_route_has_required_content_grounding_evidence(
+        &state,
+        &[repository_only, test_context].concat(),
+    );
+
+    if let Some(docs) = state.docs_route.as_mut()
+        && let Some(deliverable) = docs.deliverables.first_mut()
+    {
+        deliverable.required_areas.clear();
+        deliverable.required_topics.clear();
+        deliverable.grounding.clear();
+    }
+    let repository_satisfies_default = docs_route_has_required_content_grounding_evidence(
+        &state,
+        &docs_route_history_fixture(
+            session_id,
+            turn_id,
+            "repo-default",
+            ToolName::Read,
+            serde_json::json!({ "path": "src/workflow.rs" }),
+            "repository workflow contract",
+            serde_json::json!({ "operation_progress_class": "supporting_context" }),
+        ),
+    );
+
+    repository_satisfies_default
+        && tests_are_required
+        && !docs_route_has_required_content_grounding_evidence(
+            &state,
+            &docs_route_history_fixture(
+                session_id,
+                turn_id,
+                "corrective-default",
+                ToolName::Read,
+                serde_json::json!({ "path": "src/workflow.rs" }),
+                "corrective feedback must not count as default grounding",
+                serde_json::json!({
+                    "operation_progress_class": "supporting_context",
+                    "corrective_result": true
+                }),
+            ),
+        )
+}
+
+fn docs_route_history_fixture(
+    session_id: crate::session::SessionId,
+    turn_id: crate::protocol::TurnId,
+    call_label: &str,
+    tool: ToolName,
+    arguments: serde_json::Value,
+    output_text: &str,
+    metadata: serde_json::Value,
+) -> Vec<HistoryItem> {
+    let call_id = crate::session::ToolCallId::new();
+    vec![
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 0,
+            created_at_ms: 0,
+            payload: HistoryItemPayload::ToolCall {
+                call_id,
+                tool,
+                arguments: serde_json::json!({ "display": call_label }),
+                model_arguments: arguments,
+                effective_arguments: serde_json::Value::Null,
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: vec![tool],
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        },
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id,
+                status: ToolLifecycleStatus::Completed,
+                title: "supporting context".to_string(),
+                output_text: output_text.to_string(),
+                metadata,
+                success: Some(true),
+                progress_effect: Default::default(),
+                blocked_action: None,
+                result_hash: None,
+                verification_run: None,
+            },
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,5 +1134,10 @@ mod tests {
     #[test]
     fn docs_route_grep_line_path_parses_non_python_windows_absolute_test_path() {
         assert!(docs_route_grep_line_path_generic_path_line_fixture_passes());
+    }
+
+    #[test]
+    fn docs_route_content_grounding_requires_typed_supporting_context() {
+        assert!(docs_route_content_grounding_requires_typed_supporting_context_fixture_passes());
     }
 }

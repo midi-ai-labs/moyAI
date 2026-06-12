@@ -1683,6 +1683,8 @@ fn classify_route_stage_terminal_cluster_from_reason(
         (format!("tool_no_progress:{tool}"), false, true)
     } else if lower.contains("same verification failure evidence repeated") {
         ("verification_non_convergence".to_string(), false, false)
+    } else if terminal_reason_is_local_llm_recovery_choice_guard(reason) {
+        ("local_llm_recovery_choice_guard".to_string(), true, false)
     } else if terminal_reason_is_authoring_grounding_budget_exhausted(reason) {
         (
             "authoring_grounding_budget_exhausted".to_string(),
@@ -1792,6 +1794,18 @@ fn typed_terminal_cluster_from_tool_output(
 
     if operation_intent == Some("content_changing_authoring_required")
         && progress_effect == ToolProgressEffect::NoProgress
+        && operation_progress_class == Some("wrong_generated_test_recovery_choice")
+    {
+        return Some(ManualStTerminalClusterEvidence {
+            failure_family: "local_llm_recovery_choice_guard".to_string(),
+            fail_stop: true,
+            workspace_progress_can_reset: false,
+            source: "tool_output.tool_feedback_envelope".to_string(),
+        });
+    }
+
+    if operation_intent == Some("content_changing_authoring_required")
+        && progress_effect == ToolProgressEffect::NoProgress
         && matches!(
             operation_progress_class,
             Some("no_progress" | "idempotent_file_write_no_progress")
@@ -1852,9 +1866,17 @@ fn terminal_reason_is_content_changing_authoring_no_progress(reason: &str) -> bo
             .contains("runtime stopped before treating non-content tool calls as artifact progress")
 }
 
+fn terminal_reason_is_local_llm_recovery_choice_guard(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("local-llm recovery choice guard stopped repeated production-source reauthoring")
+        && lower.contains("active generated-test target")
+        && lower.contains("unsupported recovery choice")
+}
+
 fn terminal_reason_requires_route_fail_stop(reason: &str) -> bool {
     terminal_reason_is_authoring_grounding_budget_exhausted(reason)
         || terminal_reason_is_content_changing_authoring_no_progress(reason)
+        || terminal_reason_is_local_llm_recovery_choice_guard(reason)
 }
 
 fn terminal_reason_word_after(reason: &str, marker: &str) -> Option<String> {
@@ -3759,6 +3781,8 @@ fn timeout_classification_value(
         reason.is_some_and(is_provider_transport_stream_error_reason);
     let semantic_no_progress_terminal =
         reason.is_some_and(is_semantic_no_progress_terminal_guard_reason);
+    let provider_profile_unsupported =
+        reason.is_some_and(terminal_reason_is_local_llm_recovery_choice_guard);
     let evidence_refs = reason
         .filter(|_| {
             provider_stream_stall
@@ -3789,6 +3813,17 @@ fn timeout_classification_value(
             && reason.is_some_and(is_verification_non_convergence_reason),
         "repeated_no_progress_repair": semantic_no_progress_terminal,
         "semantic_no_progress_terminal_guard": semantic_no_progress_terminal,
+        "provider_boundary_unsupported": provider_profile_unsupported,
+        "provider_capability_failure_class": if provider_profile_unsupported {
+            Value::String("generated_test_authoring_contract_not_followed".to_string())
+        } else {
+            Value::Null
+        },
+        "unsupported_backend_classification": if provider_profile_unsupported {
+            Value::String("local_llm_repeated_wrong_artifact_role_after_coherent_scaffold_projection".to_string())
+        } else {
+            Value::Null
+        },
         "tool_or_environment_stall": false,
         "outer_timeout": outer_timeout,
         "classified_terminal_before_timeout": classified_terminal_before_timeout,
@@ -3905,6 +3940,9 @@ fn is_semantic_no_progress_terminal_guard_reason(reason: &str) -> bool {
     (lower.contains("supporting-context budget")
         || lower.contains("supporting_context output")
         || lower.contains("same verification failure evidence repeated")
+        || lower.contains(
+            "local-llm recovery choice guard stopped repeated production-source reauthoring",
+        )
         || lower.contains("representative survey budget is exhausted")
         || lower.contains("content-changing authoring is required")
         || lower.contains("runtime stopped before allowing more broad docs-route discovery"))
@@ -3912,7 +3950,8 @@ fn is_semantic_no_progress_terminal_guard_reason(reason: &str) -> bool {
             || lower.contains("docs authoring")
             || lower.contains("file-change evidence")
             || lower.contains("artifact progress")
-            || lower.contains("repair/rerun loop"))
+            || lower.contains("repair/rerun loop")
+            || lower.contains("unsupported recovery choice"))
 }
 
 fn is_verification_non_convergence_reason(reason: &str) -> bool {
@@ -6183,6 +6222,99 @@ pub fn route_terminal_cluster_uses_typed_tool_output_fixture_passes() -> bool {
         && cluster.source == "tool_output.tool_feedback_envelope"
 }
 
+pub fn local_llm_recovery_choice_terminal_classifies_route_evidence_fixture_passes() -> bool {
+    let evidence = classify_manual_st_closeout_from_evidence(
+        false,
+        Some("caseX stage1 ended with session status Failed: Local-LLM recovery choice guard stopped repeated production-source reauthoring 2 time(s) for generated-test authoring. Submitted source target(s): src/workflow.rs. Active generated-test target(s): tests/workflow.contract. Runtime stopped before another provider continuation could grow history with the same unsupported recovery choice.".to_string()),
+        Some(&ActiveWorkContract::RequestedWorkAuthoring {
+            pending_targets: vec![Utf8PathBuf::from("tests/workflow.contract")],
+            verification_commands: vec!["verify-generated-test --contract".to_string()],
+        }),
+        &[
+            "src/workflow.rs".to_string(),
+            "tests/workflow.contract".to_string(),
+        ],
+        &["src/workflow.rs".to_string()],
+        &[],
+    );
+    let reason = "caseX stage1 ended with session status Failed: Local-LLM recovery choice guard stopped repeated production-source reauthoring 2 time(s) for generated-test authoring. Submitted source target(s): src/workflow.rs. Active generated-test target(s): tests/workflow.contract. Runtime stopped before another provider continuation could grow history with the same unsupported recovery choice.";
+    let mut budget = CloseoutContinuationBudget::default();
+    let mut ledger = RouteStageTerminalContinuationLedger::default();
+    let attempt = next_stage_closeout_continuation_attempt(
+        &mut budget,
+        &mut ledger,
+        &evidence,
+        "workspace-with-source-only",
+        Some(reason),
+    );
+    let cluster = route_stage_terminal_continuation_cluster(&evidence, reason).unwrap_or_default();
+    let timeout = timeout_classification_value(false, true, Some(reason));
+
+    let session_id = SessionId::new();
+    let turn_id = TurnId::new();
+    let call_id = ToolCallId::new();
+    let history = vec![HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no: 1,
+        created_at_ms: 1,
+        payload: HistoryItemPayload::ToolOutput {
+            call_id,
+            status: ToolLifecycleStatus::Completed,
+            title: "Wrong generated-test recovery choice".to_string(),
+            output_text: "source reauthoring rejected".to_string(),
+            metadata: json!({
+                "tool_feedback_envelope": {
+                    "operation_intent": "content_changing_authoring_required",
+                    "operation_progress_class": "wrong_generated_test_recovery_choice",
+                    "progress_effect": "no_progress",
+                    "side_effects_applied": false,
+                    "active_targets": ["tests/workflow.contract"],
+                    "source_target": "src/workflow.rs"
+                }
+            }),
+            success: Some(false),
+            progress_effect: ToolProgressEffect::NoProgress,
+            blocked_action: Some(
+                "production_source_reauthoring_for_generated_test_turn".to_string(),
+            ),
+            result_hash: Some("wrong-generated-test-recovery-choice".to_string()),
+            verification_run: None,
+        },
+    }];
+    let Some(typed_cluster) = latest_route_stage_terminal_cluster_evidence(&history) else {
+        return false;
+    };
+
+    attempt.is_none()
+        && terminal_reason_requires_route_fail_stop(reason)
+        && cluster.starts_with("local_llm_recovery_choice_guard|open_obligation")
+        && cluster.contains("tests/workflow.contract")
+        && timeout
+            .get("semantic_no_progress_terminal_guard")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && timeout.get("primary_timeout_owner").and_then(Value::as_str)
+            == Some("semantic_no_progress_terminal_guard")
+        && timeout
+            .get("repeated_no_progress_repair")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && timeout
+            .get("provider_boundary_unsupported")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && timeout
+            .get("provider_capability_failure_class")
+            .and_then(Value::as_str)
+            == Some("generated_test_authoring_contract_not_followed")
+        && typed_cluster.failure_family == "local_llm_recovery_choice_guard"
+        && typed_cluster.fail_stop
+        && !typed_cluster.workspace_progress_can_reset
+        && typed_cluster.source == "tool_output.tool_feedback_envelope"
+}
+
 pub fn authoring_grounding_terminal_fail_stops_route_fixture_passes() -> bool {
     let evidence = classify_manual_st_closeout_from_evidence(
         false,
@@ -6584,6 +6716,10 @@ pub(crate) fn manual_st_closeout_and_route_fixture_workflow_neutral_failures() -
             content_changing_authoring_no_progress_terminal_fail_stops_route_fixture_passes(),
         ),
         (
+            "local_llm_recovery_choice_terminal_classifies_route_evidence",
+            local_llm_recovery_choice_terminal_classifies_route_evidence_fixture_passes(),
+        ),
+        (
             "verification_repair_terminal_ledger_blocks_non_obligation_workspace_progress",
             verification_repair_terminal_ledger_blocks_non_obligation_workspace_progress_fixture_passes(),
         ),
@@ -6763,6 +6899,27 @@ impl EventRenderer for RecordingRenderer {
     fn render_session_turn_page(
         &mut self,
         _page: &crate::session::CanonicalTurnPage,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_runtime_event_page(
+        &mut self,
+        _page: &crate::session::CanonicalRuntimeEventPage,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_compact_result(
+        &mut self,
+        _result: &crate::session::SessionCompactResult,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_memory_mode_update(
+        &mut self,
+        _update: &crate::session::SessionMemoryModeUpdate,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }

@@ -987,6 +987,7 @@ fn desktop_query_provider_profile_session_record(title: &str) -> SessionRecord {
         model: CURRENT_PROVIDER_PROFILE_FIXTURE_MODEL.to_string(),
         base_url: CURRENT_PROVIDER_PROFILE_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1_000,
         updated_at_ms: 6_000,
         completed_at_ms: Some(6_000),

@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand, error::ErrorKind};
 
 use crate::config::AccessMode;
 use crate::error::CliUsageError;
-use crate::session::SessionId;
+use crate::session::{SessionId, SessionMemoryMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +69,39 @@ pub struct SessionSettingsArgs {
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub access_mode: Option<AccessMode>,
+    pub reset_model_parameters: bool,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionTitleArgs {
+    pub session_id: SessionId,
+    pub title: String,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionInterruptArgs {
+    pub session_id: SessionId,
+    pub reason: String,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionCompactArgs {
+    pub session_id: SessionId,
+    pub keep_recent: usize,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionMemoryArgs {
+    pub session_id: SessionId,
+    pub mode: SessionMemoryMode,
     pub output_mode: OutputMode,
 }
 
@@ -131,6 +164,14 @@ pub struct SessionForkArgs {
 
 #[derive(Debug, Clone)]
 pub struct SessionTurnsArgs {
+    pub session_id: SessionId,
+    pub offset: usize,
+    pub limit: usize,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionEventsArgs {
     pub session_id: SessionId,
     pub offset: usize,
     pub limit: usize,
@@ -234,6 +275,10 @@ pub enum CliCommand {
     SessionLoaded(SessionLoadedArgs),
     SessionSearch(SessionSearchArgs),
     SessionSettings(SessionSettingsArgs),
+    SessionTitle(SessionTitleArgs),
+    SessionInterrupt(SessionInterruptArgs),
+    SessionCompact(SessionCompactArgs),
+    SessionMemory(SessionMemoryArgs),
     SessionShow(SessionShowArgs),
     SessionHistory(SessionHistoryArgs),
     SessionRead(SessionReadArgs),
@@ -241,6 +286,7 @@ pub enum CliCommand {
     SessionRollback(SessionRollbackArgs),
     SessionFork(SessionForkArgs),
     SessionTurns(SessionTurnsArgs),
+    SessionEvents(SessionEventsArgs),
     SessionSteer(SessionSteerArgs),
     Tui(TuiArgs),
     Desktop(DesktopArgs),
@@ -387,9 +433,31 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                     && args.model.is_none()
                     && args.base_url.is_none()
                     && args.access_mode.is_none()
+                    && !args.reset_model_parameters
+                    && args.temperature.is_none()
+                    && args.top_p.is_none()
+                    && args.top_k.is_none()
+                    && args.max_output_tokens.is_none()
                 {
                     return Err(CliUsageError::Message(
-                        "session settings requires at least one of --cwd, --model, --base-url, or --access-mode".to_string(),
+                        "session settings requires at least one setting flag".to_string(),
+                    ));
+                }
+                if let Some(value) = args.temperature {
+                    validate_cli_finite_non_negative("session settings --temperature", value)?;
+                }
+                if let Some(value) = args.top_p {
+                    validate_cli_finite_range("session settings --top-p", value, 0.0, 1.0)?;
+                }
+                if args.top_k == Some(0) {
+                    return Err(CliUsageError::Message(
+                        "session settings --top-k must be greater than zero".to_string(),
+                    ));
+                }
+                if args.max_output_tokens == Some(0) {
+                    return Err(CliUsageError::Message(
+                        "session settings --max-output-tokens must be greater than zero"
+                            .to_string(),
                     ));
                 }
                 Ok(CliCommand::SessionSettings(SessionSettingsArgs {
@@ -404,6 +472,68 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                         .as_deref()
                         .map(parse_cli_access_mode)
                         .transpose()?,
+                    reset_model_parameters: args.reset_model_parameters,
+                    temperature: args.temperature,
+                    top_p: args.top_p,
+                    top_k: args.top_k,
+                    max_output_tokens: args.max_output_tokens,
+                    output_mode: args.output_mode,
+                }))
+            }
+            SessionCommand::Title(args) => {
+                let title = args.title.join(" ");
+                if title.trim().is_empty() {
+                    return Err(CliUsageError::Message(
+                        "session title must not be empty".to_string(),
+                    ));
+                }
+                Ok(CliCommand::SessionTitle(SessionTitleArgs {
+                    session_id: args.session_id.parse().map_err(|error| {
+                        CliUsageError::Message(format!("invalid session id: {error}"))
+                    })?,
+                    title,
+                    output_mode: args.output_mode,
+                }))
+            }
+            SessionCommand::Interrupt(args) => {
+                Ok(CliCommand::SessionInterrupt(SessionInterruptArgs {
+                    session_id: args.session_id.parse().map_err(|error| {
+                        CliUsageError::Message(format!("invalid session id: {error}"))
+                    })?,
+                    reason: args.reason.join(" "),
+                    output_mode: args.output_mode,
+                }))
+            }
+            SessionCommand::Compact(args) => {
+                if args.keep_recent == 0 {
+                    return Err(CliUsageError::Message(
+                        "session compact --keep-recent must be greater than zero".to_string(),
+                    ));
+                }
+                Ok(CliCommand::SessionCompact(SessionCompactArgs {
+                    session_id: args.session_id.parse().map_err(|error| {
+                        CliUsageError::Message(format!("invalid session id: {error}"))
+                    })?,
+                    keep_recent: args.keep_recent,
+                    output_mode: args.output_mode,
+                }))
+            }
+            SessionCommand::Memory(args) => {
+                let requested_mode = args
+                    .mode
+                    .as_deref()
+                    .map(parse_cli_memory_mode)
+                    .transpose()?;
+                if requested_mode.is_some() == args.reset {
+                    return Err(CliUsageError::Message(
+                        "session memory requires exactly one of --mode or --reset".to_string(),
+                    ));
+                }
+                Ok(CliCommand::SessionMemory(SessionMemoryArgs {
+                    session_id: args.session_id.parse().map_err(|error| {
+                        CliUsageError::Message(format!("invalid session id: {error}"))
+                    })?,
+                    mode: requested_mode.unwrap_or(SessionMemoryMode::Enabled),
                     output_mode: args.output_mode,
                 }))
             }
@@ -472,6 +602,14 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                 output_mode: args.output_mode,
             })),
             SessionCommand::Turns(args) => Ok(CliCommand::SessionTurns(SessionTurnsArgs {
+                session_id: args.session_id.parse().map_err(|error| {
+                    CliUsageError::Message(format!("invalid session id: {error}"))
+                })?,
+                offset: args.offset,
+                limit: args.limit,
+                output_mode: args.output_mode,
+            })),
+            SessionCommand::Events(args) => Ok(CliCommand::SessionEvents(SessionEventsArgs {
                 session_id: args.session_id.parse().map_err(|error| {
                     CliUsageError::Message(format!("invalid session id: {error}"))
                 })?,
@@ -574,6 +712,37 @@ fn parse_cli_access_mode(value: &str) -> Result<AccessMode, CliUsageError> {
             "invalid access mode `{value}`; expected default, auto_review, or full_access"
         ))
     })
+}
+
+fn parse_cli_memory_mode(value: &str) -> Result<SessionMemoryMode, CliUsageError> {
+    SessionMemoryMode::parse(value).ok_or_else(|| {
+        CliUsageError::Message(format!(
+            "invalid memory mode `{value}`; expected enabled or disabled"
+        ))
+    })
+}
+
+fn validate_cli_finite_non_negative(label: &str, value: f64) -> Result<(), CliUsageError> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(CliUsageError::Message(format!(
+            "{label} must be finite and non-negative"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cli_finite_range(
+    label: &str,
+    value: f64,
+    min: f64,
+    max: f64,
+) -> Result<(), CliUsageError> {
+    if !value.is_finite() || value < min || value > max {
+        return Err(CliUsageError::Message(format!(
+            "{label} must be finite and between {min} and {max}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -683,6 +852,10 @@ enum SessionCommand {
     Loaded(SessionLoadedCommand),
     Search(SessionSearchCommand),
     Settings(SessionSettingsCommand),
+    Title(SessionTitleCommand),
+    Interrupt(SessionInterruptCommand),
+    Compact(SessionCompactCommand),
+    Memory(SessionMemoryCommand),
     Show(SessionShowCommand),
     Unarchive(SessionArchiveCommand),
     History(SessionItemsCommand),
@@ -691,6 +864,7 @@ enum SessionCommand {
     Rollback(SessionRollbackCommand),
     Fork(SessionForkCommand),
     Turns(SessionItemsCommand),
+    Events(SessionItemsCommand),
     Steer(SessionSteerCommand),
 }
 
@@ -785,6 +959,58 @@ struct SessionSettingsCommand {
         value_parser = ["default", "auto_review", "full_access"]
     )]
     access_mode: Option<String>,
+    #[arg(long = "reset-model-parameters")]
+    reset_model_parameters: bool,
+    #[arg(long = "temperature")]
+    temperature: Option<f64>,
+    #[arg(long = "top-p")]
+    top_p: Option<f64>,
+    #[arg(long = "top-k")]
+    top_k: Option<u32>,
+    #[arg(long = "max-output-tokens")]
+    max_output_tokens: Option<u32>,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionTitleCommand {
+    #[arg()]
+    session_id: String,
+    #[arg()]
+    title: Vec<String>,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionInterruptCommand {
+    #[arg()]
+    session_id: String,
+    #[arg()]
+    reason: Vec<String>,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionCompactCommand {
+    #[arg()]
+    session_id: String,
+    #[arg(long = "keep-recent", default_value_t = 20)]
+    keep_recent: usize,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionMemoryCommand {
+    #[arg()]
+    session_id: String,
+    #[arg(long = "mode", value_parser = ["enabled", "disabled"])]
+    mode: Option<String>,
+    #[arg(long = "reset", conflicts_with = "mode")]
+    reset: bool,
     #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
     output_mode: OutputMode,
 }

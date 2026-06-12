@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
 
@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 use crate::agent::grounding_evidence::{
     metadata_path_matches_active_target, normalize_path_for_target_match,
 };
-use crate::agent::lifecycle_kernel::TurnLifecycleKernel;
+use crate::agent::lifecycle_kernel::{
+    TurnLifecycleKernel, TurnLifecycleRecoveryContext, compile_turn_lifecycle_tool_choice,
+    request_content_markers,
+};
 use crate::edit::ChangeSummary;
 use crate::protocol::{
     CandidateRepairEdit, CandidateRepairId, CandidateRepairValidity, OperationIntent, ToolChoice,
@@ -18,6 +21,11 @@ use crate::session::{ProcessPhase, SessionStateSnapshot, TaskRoute};
 use crate::tool::{ToolName, ToolResult};
 
 const INVALID_EDIT_ARGUMENTS_TERMINAL_THRESHOLD: usize = 3;
+
+pub(crate) fn invalid_edit_arguments_terminal_threshold() -> usize {
+    INVALID_EDIT_ARGUMENTS_TERMINAL_THRESHOLD
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InvalidEditRecoveryEnvelope {
     pub(crate) failure_kind: String,
@@ -219,16 +227,26 @@ pub(crate) fn failed_edit_control_recovery_envelope(
     } else {
         allowed_tools.iter().cloned().collect::<Vec<_>>().join(", ")
     };
-    let grammar_line = if tool_name == "apply_patch" || allowed_tools.contains("apply_patch") {
+    let target_exclusive_apply_patch = (tool_name == "apply_patch"
+        || allowed_tools.contains("apply_patch"))
+        && active_targets.len() == 1
+        && (!inactive_submitted_targets.is_empty()
+            || failure_kind == "required_write_content_shape_mismatch");
+    let grammar_line = if target_exclusive_apply_patch {
+        format!(
+            "Use the exact apply_patch grammar for one active target only. The patch must start with `*** Begin Patch`, contain exactly one `*** Add File: {target}` or `*** Update File: {target}` operation, prefix every Add File content line with `+`, and end with one final `*** End Patch`. Do not include inactive target hunks or production-source patch bodies.",
+            target = active_targets[0]
+        )
+    } else if tool_name == "apply_patch" || allowed_tools.contains("apply_patch") {
         if tool_name == "apply_patch"
             && parser_error_family.as_deref() == Some("apply_patch_malformed_patch")
         {
-            "Use the exact apply_patch grammar. Add File body lines must start with `+`, including blank lines and every content line. Update File hunks must use `@@` and every hunk line must start with ` `, `+`, or `-`; a single patch may contain multiple `*** Add File` or `*** Update File` sections. If the OpenAI-compatible function-tool payload keeps corrupting `patch_text` line prefixes, use `write` with complete content for the current open target when the recovery surface provides `write`."
+            "Use the exact apply_patch grammar. Add File body lines must start with `+`, including blank lines and every content line. Update File hunks must use `@@` and every hunk line must start with ` `, `+`, or `-`; a single patch may contain multiple `*** Add File` or `*** Update File` sections. If the OpenAI-compatible function-tool payload keeps corrupting `patch_text` line prefixes, use `write` with complete content for the current open target when the recovery surface provides `write`.".to_string()
         } else {
-            "Use the exact apply_patch grammar. Add File body lines must start with `+`, including blank lines and every content line. Update File hunks must use `@@` and every hunk line must start with ` `, `+`, or `-`; a single patch may contain multiple `*** Add File` or `*** Update File` sections."
+            "Use the exact apply_patch grammar. Add File body lines must start with `+`, including blank lines and every content line. Update File hunks must use `@@` and every hunk line must start with ` `, `+`, or `-`; a single patch may contain multiple `*** Add File` or `*** Update File` sections.".to_string()
         }
     } else {
-        "Use a schema-valid edit call for the active target. Do not treat malformed edit output, planning, or text-only responses as progress."
+        "Use a schema-valid edit call for the active target. Do not treat malformed edit output, planning, or text-only responses as progress.".to_string()
     };
     let content_shape_contract = if failure_kind == "required_write_content_shape_mismatch" {
         metadata
@@ -251,7 +269,24 @@ pub(crate) fn failed_edit_control_recovery_envelope(
             (failure_kind == "required_write_content_shape_mismatch")
                 .then(|| "rewrite_content_for_required_shape".to_string())
         });
-    let active_shape_contract = if active_targets.len() == 1 {
+    let active_shape_contract = if target_exclusive_apply_patch {
+        let recovery_scaffold =
+            crate::agent::content_shape_contract::artifact_content_shape_apply_patch_recovery_scaffold(
+                &active_targets[0],
+            )
+            .map(|scaffold| format!("\n{scaffold}"))
+            .unwrap_or_default();
+        crate::agent::content_shape_contract::artifact_content_shape_tool_schema_description(
+            &active_targets[0],
+        )
+        .map(|contract| {
+            format!(
+                "\nActive apply_patch target contract:\n`patch_text` must add or update `{}` with {contract}{recovery_scaffold}",
+                active_targets[0]
+            )
+        })
+        .unwrap_or_default()
+    } else if active_targets.len() == 1 {
         crate::agent::content_shape_contract::artifact_content_shape_prompt_contract(
             &active_targets[0],
         )
@@ -1242,6 +1277,794 @@ pub(crate) fn normalized_escaped_source_write_candidate(
     })
 }
 
+pub(crate) fn source_content_shape_normalizes_escaped_repair_candidate_fixture_passes() -> bool {
+    let arguments = json!({
+        "path": "src/workflow.rs",
+        "content": "\"pub struct WorkflowState {\\n    pub ready: bool,\\n}\\n\\npub fn add(a: i32, b: i32) -> i32 {\\n    a + b\\n}\\n\\npub fn workflow_state() -> WorkflowState {\\n    WorkflowState { ready: add(2, 3) == 5 }\\n}\\n\""
+    })
+    .to_string();
+    let Some(candidate) = normalized_escaped_source_write_candidate(
+        "write",
+        &arguments,
+        &[Utf8PathBuf::from("src/workflow.rs")],
+    ) else {
+        return false;
+    };
+    let Ok(effective) = serde_json::from_str::<Value>(&candidate.effective_arguments_json) else {
+        return false;
+    };
+    let Some(content) = effective.get("content").and_then(Value::as_str) else {
+        return false;
+    };
+    let repair = candidate.into_candidate_repair_edit(crate::session::ToolCallId::new());
+    let js_arguments = json!({
+        "path": "src/tool.js",
+        "content": "\"export function add(a, b) {\\n  return a + b;\\n}\\n\""
+    })
+    .to_string();
+    let Some(js_candidate) = normalized_escaped_source_write_candidate(
+        "write",
+        &js_arguments,
+        &[Utf8PathBuf::from("src/tool.js")],
+    ) else {
+        return false;
+    };
+    let Ok(js_effective) = serde_json::from_str::<Value>(&js_candidate.effective_arguments_json)
+    else {
+        return false;
+    };
+    let Some(js_content) = js_effective.get("content").and_then(Value::as_str) else {
+        return false;
+    };
+
+    effective.get("path").and_then(Value::as_str) == Some("src/workflow.rs")
+        && content.contains("pub fn add")
+        && content.contains("workflow_state")
+        && !content.contains("\\npub fn")
+        && !content.trim_end().ends_with('"')
+        && crate::agent::content_shape_contract::write_content_matches_required_target(
+            "src/workflow.rs",
+            content,
+        )
+        && repair.target_path.as_ref().map(|path| path.as_str()) == Some("src/workflow.rs")
+        && repair.semantic_class == "escaped_source_write_candidate_normalized"
+        && repair
+            .normalized_edit_intent
+            .contains("source/code candidate")
+        && repair
+            .aligned_failure_refs
+            .iter()
+            .any(|item| item == "artifact_executable_content_shape")
+        && matches!(repair.validity, CandidateRepairValidity::Admitted)
+        && repair
+            .evidence_refs
+            .iter()
+            .any(|item| item == "escaped_source_write_normalized")
+        && js_effective.get("path").and_then(Value::as_str) == Some("src/tool.js")
+        && js_content.contains("export function add")
+        && !js_content.contains("\\n")
+        && crate::agent::content_shape_contract::write_content_matches_required_target(
+            "src/tool.js",
+            js_content,
+        )
+}
+
+pub(crate) fn invalid_edit_arguments_project_no_progress_recovery_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = ProcessPhase::Author;
+    state.completion.open_work_count = 1;
+    state.completion.blocked_reason = Some(
+        "Requested deliverables still require authoring in the workspace: `tests/workflow.spec.ts`."
+            .to_string(),
+    );
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    let allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "read".to_string(),
+        "todowrite".to_string(),
+        "write".to_string(),
+    ]);
+    let result = invalid_tool_arguments_result(
+        "apply_patch",
+        r#"{"patch_text":"*** Begin Patch\n*** Update File: tests/workflow.spec.ts\n@@\n old\n+new\n*** End Patch"}"#,
+        "tool edit error: context mismatch: expected `old`, got `old`",
+        &state,
+        Some(&allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let feedback = result
+        .metadata
+        .get("tool_feedback_envelope")
+        .and_then(Value::as_object);
+    let expected_lines_result = invalid_tool_arguments_result(
+        "apply_patch",
+        r#"{"patch_text":"*** Begin Patch\n*** Update File: tests/workflow.spec.ts\n@@\nimport old\n+import new\n*** End Patch"}"#,
+        "tool edit error: failed to find expected lines `import old`",
+        &state,
+        Some(&allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let malformed_write_result = invalid_tool_arguments_result(
+        "write",
+        "{\"path\":\"tests/workflow.spec.ts\",\"content\":\"workflow behavior contract\\nexpected result ok\\n}",
+        "EOF while parsing a string at line 1 column 58",
+        &state,
+        Some(&allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let malformed_write_feedback = malformed_write_result
+        .metadata
+        .get("tool_feedback_envelope")
+        .and_then(Value::as_object);
+    let expected_lines_feedback = expected_lines_result
+        .metadata
+        .get("tool_feedback_envelope")
+        .and_then(Value::as_object);
+    let no_write_allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "shell".to_string(),
+        "todowrite".to_string(),
+    ]);
+    let no_write_context_result = invalid_tool_arguments_result(
+        "apply_patch",
+        r#"{"patch_text":"*** Begin Patch\n*** Update File: tests/workflow.spec.ts\n@@\nmissing\n+new\n*** End Patch"}"#,
+        "tool edit error: failed to find expected lines `missing`",
+        &state,
+        Some(&no_write_allowed),
+        Some(&ToolChoice::Required),
+    );
+    let no_write_context_feedback = no_write_context_result
+        .metadata
+        .get("tool_feedback_envelope")
+        .and_then(Value::as_object);
+
+    result.recorded_changes.is_empty()
+        && result.change_summaries.is_empty()
+        && result
+            .output_text
+            .contains("operation_progress_class: invalid_edit_arguments")
+        && result.output_text.contains("progress_effect: no_progress")
+        && result.output_text.contains("tests/workflow.spec.ts")
+        && result.output_text.contains("Use `write`")
+        && feedback.is_some_and(|feedback| {
+            feedback
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "invalid_edit_arguments")
+                && feedback
+                    .get("progress_effect")
+                    .and_then(Value::as_str)
+                    .is_some_and(|effect| effect == "no_progress")
+                && feedback
+                    .get("side_effects_applied")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|applied| !applied)
+                && feedback
+                    .get("allowed_surface_snapshot")
+                    .and_then(|snapshot| snapshot.get("allowed_tools"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| tools.iter().any(|tool| tool.as_str() == Some("write")))
+                && feedback
+                    .get("parser_error_family")
+                    .and_then(Value::as_str)
+                    .is_some_and(|family| family == "apply_patch_context_mismatch")
+        })
+        && expected_lines_result
+            .output_text
+            .contains("complete replacement content")
+        && no_write_context_result
+            .output_text
+            .contains("inspect only the exact active target `tests/workflow.spec.ts` with `shell`")
+        && !no_write_context_result.output_text.contains("Use `write`")
+        && no_write_context_feedback.is_some_and(|feedback| {
+            feedback.get("recovery_action").and_then(Value::as_str)
+                == Some("target_scoped_inspection_then_repatch_after_patch_context_mismatch")
+        })
+        && expected_lines_feedback.is_some_and(|feedback| {
+            feedback
+                .get("recovery_action")
+                .and_then(Value::as_str)
+                .is_some_and(|action| {
+                    action == "write_full_replacement_or_repatch_after_patch_context_mismatch"
+                })
+        })
+        && malformed_write_result
+            .output_text
+            .contains("parser_error_family: eof_while_parsing_string")
+        && malformed_write_result
+            .output_text
+            .contains("raw_argument_shape_hash:")
+        && malformed_write_result
+            .output_text
+            .contains("candidate_target_from_arguments: tests/workflow.spec.ts")
+        && malformed_write_feedback.is_some_and(|feedback| {
+            feedback
+                .get("submitted_tool")
+                .and_then(Value::as_str)
+                .is_some_and(|tool| tool == "write")
+                && feedback
+                    .get("parser_error_family")
+                    .and_then(Value::as_str)
+                    .is_some_and(|family| family == "eof_while_parsing_string")
+                && feedback
+                    .get("raw_argument_shape_hash")
+                    .and_then(Value::as_str)
+                    .is_some_and(|hash| hash.len() == 64)
+                && feedback
+                    .get("candidate_target_from_arguments")
+                    .and_then(Value::as_str)
+                    .is_some_and(|target| target == "tests/workflow.spec.ts")
+        })
+}
+
+pub(crate) fn invalid_edit_arguments_terminal_guard_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = ProcessPhase::Author;
+    state.completion.open_work_count = 1;
+    state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    let allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "todowrite".to_string(),
+        "write".to_string(),
+    ]);
+    let result = invalid_tool_arguments_result(
+        "write",
+        r#"{"content":"workflow behavior contract\n"}"#,
+        "missing field `path`",
+        &state,
+        Some(&allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let repeat_key = invalid_edit_arguments_no_progress_key(
+        "write",
+        &result.metadata,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let repeat_key_again = invalid_edit_arguments_no_progress_key(
+        "write",
+        &result.metadata,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let mut other_state = state.clone();
+    other_state.active_targets = vec![Utf8PathBuf::from("tests/other-workflow.spec.ts")];
+    let other_result = invalid_tool_arguments_result(
+        "write",
+        r#"{"content":"workflow behavior contract\n"}"#,
+        "missing field `path`",
+        &other_state,
+        Some(&allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let other_key = invalid_edit_arguments_no_progress_key(
+        "write",
+        &other_result.metadata,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let malformed_a = invalid_tool_arguments_result(
+        "write",
+        r#"{"path":"tests/workflow.spec.ts","content":"workflow behavior contract\nworkflow scenario"#,
+        "EOF while parsing a string at line 1 column 62",
+        &state,
+        Some(&allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let malformed_b = invalid_tool_arguments_result(
+        "write",
+        r#"{"path":"tests/workflow.spec.ts","content":"workflow behavior contract\nworkflow scenario\nworkflow expected outcome"#,
+        "EOF while parsing a string at line 1 column 109",
+        &state,
+        Some(&allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let malformed_key_a = invalid_edit_arguments_no_progress_key(
+        "write",
+        &malformed_a.metadata,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let malformed_key_b = invalid_edit_arguments_no_progress_key(
+        "write",
+        &malformed_b.metadata,
+        &allowed,
+        &ToolChoice::Auto,
+    );
+    let patch_allowed = BTreeSet::from([
+        "apply_patch".to_string(),
+        "shell".to_string(),
+        "todowrite".to_string(),
+    ]);
+    let patch_a = invalid_tool_arguments_result(
+        "apply_patch",
+        r#"{"patch_text":"*** Begin Patch\n*** Add File: tests/workflow.spec.ts\n+workflow behavior contract\nworkflow scenario\n+expected result\n*** End Patch"}"#,
+        "tool patch error: add file body line `workflow scenario` must start with `+`; every added content line, including blank lines, must be prefixed with `+`.",
+        &state,
+        Some(&patch_allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let patch_b = invalid_tool_arguments_result(
+        "apply_patch",
+        r#"{"patch_text":"*** Begin Patch\n*** Add File: tests/workflow.spec.ts\n+workflow behavior contract\n+workflow scenario\nworkflow expectation\n+expected result\n*** End Patch"}"#,
+        "tool patch error: add file body line `workflow expectation` must start with `+`; every added content line, including blank lines, must be prefixed with `+`.",
+        &state,
+        Some(&patch_allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let patch_key_a = invalid_edit_arguments_no_progress_key(
+        "apply_patch",
+        &patch_a.metadata,
+        &patch_allowed,
+        &ToolChoice::Auto,
+    );
+    let patch_key_b = invalid_edit_arguments_no_progress_key(
+        "apply_patch",
+        &patch_b.metadata,
+        &patch_allowed,
+        &ToolChoice::Auto,
+    );
+    let terminal_message = invalid_edit_arguments_terminal_message(
+        "write",
+        invalid_edit_arguments_terminal_threshold(),
+        &result.metadata,
+    );
+    let mut counts = BTreeMap::<String, usize>::new();
+    for key in [repeat_key.clone(), repeat_key_again.clone()]
+        .into_iter()
+        .flatten()
+    {
+        counts
+            .entry(key)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+
+    repeat_key.is_some()
+        && repeat_key == repeat_key_again
+        && repeat_key != other_key
+        && malformed_key_a.is_some()
+        && malformed_key_a == malformed_key_b
+        && patch_key_a.is_some()
+        && patch_key_a == patch_key_b
+        && counts.values().any(|count| *count == 2)
+        && patch_a
+            .metadata
+            .get("tool_feedback_envelope")
+            .and_then(|feedback| feedback.get("raw_argument_shape_hash"))
+            != patch_b
+                .metadata
+                .get("tool_feedback_envelope")
+                .and_then(|feedback| feedback.get("raw_argument_shape_hash"))
+        && malformed_a.output_text.contains("smaller valid JSON")
+        && should_terminalize_invalid_edit_arguments_no_progress(
+            invalid_edit_arguments_terminal_threshold(),
+        )
+        && !should_terminalize_invalid_edit_arguments_no_progress(
+            invalid_edit_arguments_terminal_threshold() - 1,
+        )
+        && terminal_message.contains("invalid edit arguments")
+        && terminal_message.contains("tests/workflow.spec.ts")
+        && terminal_message.contains("outer timeout")
+}
+
+pub(crate) fn malformed_apply_patch_write_recovery_surface_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = ProcessPhase::Author;
+    state.completion.open_work_count = 1;
+    state.active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
+    let normal_code_surface = BTreeSet::from([
+        "apply_patch".to_string(),
+        "shell".to_string(),
+        "todowrite".to_string(),
+    ]);
+    let stable_tools = ["apply_patch", "shell", "todowrite", "write"]
+        .into_iter()
+        .map(|name| crate::llm::ToolSchema {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        })
+        .collect::<Vec<_>>();
+    let malformed_patch = invalid_tool_arguments_result(
+        "apply_patch",
+        r#"{"patch_text":"*** Begin Patch\n*** Add File: src/workflow.rs\npub fn workflow_add(left: i32, right: i32) -> i32 {\n+    left + right\n+}\n*** End Patch"}"#,
+        "tool patch error: Add File body line must start with `+`: pub fn workflow_add(left: i32, right: i32) -> i32 {",
+        &state,
+        Some(&normal_code_surface),
+        Some(&ToolChoice::Auto),
+    );
+    let recovery_needed = invalid_apply_patch_arguments_need_write_recovery(
+        "apply_patch",
+        &malformed_patch.metadata,
+        &state,
+        &normal_code_surface,
+        &ToolChoice::Auto,
+    );
+    let mut recovery_tools = normal_code_surface
+        .iter()
+        .map(|name| crate::llm::ToolSchema {
+            name: name.clone(),
+            description: format!("{name} tool"),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        })
+        .collect::<Vec<_>>();
+    TurnLifecycleKernel::apply_codex_style_provider_edit_surface(&mut recovery_tools, &state);
+    if recovery_needed {
+        TurnLifecycleKernel::augment_tools_from_stable_surface(
+            &mut recovery_tools,
+            &stable_tools,
+            |name| name == "apply_patch",
+        );
+        recovery_tools.retain(|tool| tool.name == "apply_patch");
+    }
+    let recovery_tool_names = recovery_tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
+    let recovery_choice = compile_turn_lifecycle_tool_choice(
+        &crate::agent::prompt::PromptPolicy::default(),
+        &state,
+        &recovery_tool_names,
+        TurnLifecycleRecoveryContext {
+            malformed_apply_patch_write_recovery_active: recovery_needed,
+            ..TurnLifecycleRecoveryContext::default()
+        },
+    );
+    let envelope = invalid_edit_arguments_control_recovery_envelope(
+        "apply_patch",
+        &malformed_patch.metadata,
+        &state,
+        &normal_code_surface,
+        &ToolChoice::Auto,
+    );
+    let policy = TurnLifecycleKernel::malformed_apply_patch_write_recovery_policy(&state);
+    let mut docs_state = SessionStateSnapshot::default();
+    docs_state.route = TaskRoute::Docs;
+    docs_state.process_phase = ProcessPhase::Author;
+    docs_state.completion.open_work_count = 1;
+    docs_state.completion.route_contract_pending = true;
+    docs_state.active_targets = vec![Utf8PathBuf::from("docs/workflow-design.md")];
+    let docs_apply_patch_only_surface = BTreeSet::from(["apply_patch".to_string()]);
+    let docs_malformed_patch = invalid_tool_arguments_result(
+        "apply_patch",
+        r#"{"patch_text":"*** Begin Patch\n*** Add File: docs/workflow-design.md\n+# Workflow design\n\n## API\n\nDetails\n*** End Patch"}"#,
+        "tool patch error: add file body line `` must start with `+`; every added content line, including blank lines, must be prefixed with `+`.",
+        &docs_state,
+        Some(&docs_apply_patch_only_surface),
+        Some(&ToolChoice::Required),
+    );
+    let docs_recovery_needed = invalid_apply_patch_arguments_need_write_recovery(
+        "apply_patch",
+        &docs_malformed_patch.metadata,
+        &docs_state,
+        &docs_apply_patch_only_surface,
+        &ToolChoice::Required,
+    );
+    let mut docs_recovery_tools = docs_apply_patch_only_surface
+        .iter()
+        .map(|name| crate::llm::ToolSchema {
+            name: name.clone(),
+            description: format!("{name} tool"),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        })
+        .collect::<Vec<_>>();
+    TurnLifecycleKernel::apply_codex_style_provider_edit_surface(
+        &mut docs_recovery_tools,
+        &docs_state,
+    );
+    if docs_recovery_needed {
+        TurnLifecycleKernel::augment_tools_from_stable_surface(
+            &mut docs_recovery_tools,
+            &stable_tools,
+            |name| name == "apply_patch",
+        );
+        docs_recovery_tools.retain(|tool| tool.name == "apply_patch");
+    }
+    let docs_recovery_tool_names = docs_recovery_tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
+    let docs_recovery_choice = compile_turn_lifecycle_tool_choice(
+        &crate::agent::prompt::PromptPolicy::default(),
+        &docs_state,
+        &docs_recovery_tool_names,
+        TurnLifecycleRecoveryContext {
+            malformed_apply_patch_write_recovery_active: docs_recovery_needed,
+            ..TurnLifecycleRecoveryContext::default()
+        },
+    );
+    let mut generated_test_active_state = SessionStateSnapshot::default();
+    generated_test_active_state.route = TaskRoute::Code;
+    generated_test_active_state.process_phase = ProcessPhase::Author;
+    generated_test_active_state.completion.open_work_count = 1;
+    generated_test_active_state.active_targets =
+        vec![Utf8PathBuf::from("tests/workflow.behavior.md")];
+    let generated_test_active_patch = invalid_tool_arguments_result(
+        "apply_patch",
+        r#"{"patch_text":"*** Add File: tests/workflow.behavior.md\nworkflow behavior contract\n\nworkflow_render returns ok\n*** End Patch"}"#,
+        "tool patch error: patch must start with `*** Begin Patch`.",
+        &generated_test_active_state,
+        Some(&normal_code_surface),
+        Some(&ToolChoice::Auto),
+    );
+    let generated_test_active_recovery_needed = invalid_apply_patch_arguments_need_write_recovery(
+        "apply_patch",
+        &generated_test_active_patch.metadata,
+        &generated_test_active_state,
+        &normal_code_surface,
+        &ToolChoice::Auto,
+    );
+    let mut generated_test_active_recovery_tools = normal_code_surface
+        .iter()
+        .map(|name| crate::llm::ToolSchema {
+            name: name.clone(),
+            description: format!("{name} tool"),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        })
+        .collect::<Vec<_>>();
+    TurnLifecycleKernel::apply_codex_style_provider_edit_surface(
+        &mut generated_test_active_recovery_tools,
+        &generated_test_active_state,
+    );
+    if generated_test_active_recovery_needed {
+        TurnLifecycleKernel::augment_tools_from_stable_surface(
+            &mut generated_test_active_recovery_tools,
+            &stable_tools,
+            |name| name == "apply_patch",
+        );
+        generated_test_active_recovery_tools.retain(|tool| tool.name == "apply_patch");
+    }
+    let generated_test_active_recovery_tool_names = generated_test_active_recovery_tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
+    let generated_test_active_recovery_choice = compile_turn_lifecycle_tool_choice(
+        &crate::agent::prompt::PromptPolicy::default(),
+        &generated_test_active_state,
+        &generated_test_active_recovery_tool_names,
+        TurnLifecycleRecoveryContext {
+            malformed_apply_patch_write_recovery_active: generated_test_active_recovery_needed,
+            ..TurnLifecycleRecoveryContext::default()
+        },
+    );
+    let stale_candidate_state = generated_test_active_state.clone();
+    let stale_candidate_patch = invalid_tool_arguments_result(
+        "apply_patch",
+        r#"{"patch_text":"*** Begin Patch\n*** Update File: src/workflow.rs\n@@\nworkflow stale source draft\n+workflow behavior update\n*** End Patch"}"#,
+        "tool patch error: unexpected patch hunk line `workflow stale source draft`.",
+        &stale_candidate_state,
+        Some(&normal_code_surface),
+        Some(&ToolChoice::Auto),
+    );
+    let stale_candidate_recovery_needed = invalid_apply_patch_arguments_need_write_recovery(
+        "apply_patch",
+        &stale_candidate_patch.metadata,
+        &stale_candidate_state,
+        &normal_code_surface,
+        &ToolChoice::Auto,
+    );
+    let stale_candidate_envelope = invalid_edit_arguments_control_recovery_envelope(
+        "apply_patch",
+        &stale_candidate_patch.metadata,
+        &stale_candidate_state,
+        &normal_code_surface,
+        &ToolChoice::Auto,
+    );
+
+    !normal_code_surface.contains("write")
+        && recovery_needed
+        && recovery_tool_names == BTreeSet::from(["apply_patch".to_string()])
+        && recovery_choice == ToolChoice::Required
+        && docs_recovery_needed
+        && docs_recovery_tool_names == BTreeSet::from(["apply_patch".to_string()])
+        && docs_recovery_choice == ToolChoice::Required
+        && generated_test_active_recovery_needed
+        && generated_test_active_recovery_tool_names == BTreeSet::from(["apply_patch".to_string()])
+        && generated_test_active_recovery_choice == ToolChoice::Required
+        && malformed_patch
+            .output_text
+            .contains("If the next recovery surface includes `write`")
+        && envelope.is_some_and(|value| {
+            value
+                .prompt
+                .contains("when the recovery surface provides `write`")
+                && value.candidate_target.as_deref() == Some("src/workflow.rs")
+        })
+        && !stale_candidate_recovery_needed
+        && stale_candidate_envelope.is_some_and(|value| {
+            value.candidate_target.as_deref() == Some("src/workflow.rs")
+                && value.active_targets == vec!["tests/workflow.behavior.md".to_string()]
+                && value.prompt.contains(
+                    "It is not currently an open target, so choose one of the open targets",
+                )
+        })
+        && policy.policy == "malformed_apply_patch_write_recovery_surface"
+        && policy.active_targets == vec!["src/workflow.rs".to_string()]
+}
+
+pub(crate) fn malformed_write_patch_capable_recovery_surface_fixture_passes() -> bool {
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = ProcessPhase::Repair;
+    state.completion.open_work_count = 1;
+    state.active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
+    let allowed = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+    let previous_tool_choice = ToolChoice::Named(ToolName::Write);
+    let result = invalid_tool_arguments_result(
+        "write",
+        r#"{"path":"src/workflow.rs","content":"pub fn workflow_render() -> &'static str {\n    \"ok"#,
+        "EOF while parsing a string at line 1 column 63",
+        &state,
+        Some(&allowed),
+        Some(&previous_tool_choice),
+    );
+    let recovery_needed = invalid_write_arguments_need_patch_capable_recovery(
+        "write",
+        &result.metadata,
+        &allowed,
+        &previous_tool_choice,
+    );
+    let recovery_active = recovery_needed
+        && TurnLifecycleKernel::open_executable_work_requires_tool_call(&state)
+        && allowed.contains("write")
+        && allowed.contains("apply_patch");
+    let dispatch_tool_choice = if recovery_active {
+        ToolChoice::Required
+    } else {
+        previous_tool_choice.clone()
+    };
+    let policy = TurnLifecycleKernel::malformed_write_patch_capable_recovery_policy(&state);
+    let repeat_key = invalid_edit_arguments_no_progress_key(
+        "write",
+        &result.metadata,
+        &allowed,
+        &dispatch_tool_choice,
+    );
+    let mut generated_test_state = SessionStateSnapshot::default();
+    generated_test_state.route = TaskRoute::Code;
+    generated_test_state.process_phase = ProcessPhase::Author;
+    generated_test_state.completion.open_work_count = 1;
+    generated_test_state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    let full_surface = BTreeSet::from([
+        "apply_patch".to_string(),
+        "read".to_string(),
+        "shell".to_string(),
+        "todowrite".to_string(),
+        "write".to_string(),
+    ]);
+    let full_surface_tools = ["apply_patch", "read", "shell", "todowrite", "write"]
+        .into_iter()
+        .map(|name| crate::llm::ToolSchema {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            input_schema: json!({"type": "object"}),
+            strict: false,
+        })
+        .collect::<Vec<_>>();
+    let generated_test_invalid = invalid_tool_arguments_result(
+        "write",
+        r#"{"content":"workflow behavior contract\nworkflow_render returns ok\nworkflow scenario"#,
+        "EOF while parsing a string at line 1 column 153",
+        &generated_test_state,
+        Some(&full_surface),
+        Some(&ToolChoice::Auto),
+    );
+    let generated_test_recovery_needed = invalid_write_arguments_need_patch_capable_recovery(
+        "write",
+        &generated_test_invalid.metadata,
+        &full_surface,
+        &ToolChoice::Auto,
+    );
+    let mut generated_test_recovery_tools = full_surface_tools.clone();
+    TurnLifecycleKernel::apply_codex_style_provider_edit_surface(
+        &mut generated_test_recovery_tools,
+        &generated_test_state,
+    );
+    if generated_test_recovery_needed {
+        TurnLifecycleKernel::augment_tools_from_stable_surface(
+            &mut generated_test_recovery_tools,
+            &full_surface_tools,
+            |name| matches!(name, "apply_patch" | "write"),
+        );
+        generated_test_recovery_tools
+            .retain(|tool| matches!(tool.name.as_str(), "apply_patch" | "write"));
+    } else {
+        TurnLifecycleKernel::apply_generated_test_source_reference_grounding_surface(
+            &mut generated_test_recovery_tools,
+            &full_surface_tools,
+            true,
+        );
+    }
+    let generated_test_recovery_tool_names = generated_test_recovery_tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
+    let generated_test_recovery_choice = compile_turn_lifecycle_tool_choice(
+        &crate::agent::prompt::PromptPolicy::default(),
+        &generated_test_state,
+        &generated_test_recovery_tool_names,
+        TurnLifecycleRecoveryContext {
+            generated_test_source_reference_grounding_active: true,
+            malformed_write_patch_recovery_active: generated_test_recovery_needed,
+            ..TurnLifecycleRecoveryContext::default()
+        },
+    );
+
+    recovery_needed
+        && recovery_active
+        && dispatch_tool_choice == ToolChoice::Required
+        && !matches!(dispatch_tool_choice, ToolChoice::Named(ToolName::Write))
+        && generated_test_recovery_needed
+        && generated_test_recovery_tool_names
+            == BTreeSet::from(["apply_patch".to_string(), "write".to_string()])
+        && generated_test_recovery_choice == ToolChoice::Required
+        && result
+            .output_text
+            .contains("or use `apply_patch` with a concise add/update patch")
+        && policy.policy == "malformed_write_patch_capable_recovery_surface"
+        && policy.active_targets == vec!["src/workflow.rs".to_string()]
+        && repeat_key.is_some_and(|key| {
+            key.contains("tool=write")
+                && key.contains("allowed=apply_patch,write")
+                && key.contains("choice=required")
+        })
+}
+
+pub(crate) fn singleton_active_target_write_arguments_repair_fixture_passes() -> bool {
+    let active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    let content_only = r#"{"content":"workflow behavior contract\n"}"#;
+    let inferred =
+        repair_write_arguments_from_active_target("write", content_only, &active_targets);
+    let malformed_content_only = "{\"content\":\"workflow behavior contract\\n";
+    let inferred_from_malformed =
+        repair_write_arguments_from_active_target("write", malformed_content_only, &active_targets);
+    let multiple_targets = vec![
+        Utf8PathBuf::from("tests/workflow.spec.ts"),
+        Utf8PathBuf::from("tests/other-workflow.spec.ts"),
+    ];
+    let ambiguous =
+        repair_write_arguments_from_active_target("write", content_only, &multiple_targets);
+    let absolute_target = vec![Utf8PathBuf::from("C:/workspace/tests/workflow.spec.ts")];
+    let absolute =
+        repair_write_arguments_from_active_target("write", content_only, &absolute_target);
+    let embedded_path_payload =
+        r#"{"content":"workflow behavior contract\n\",\"path\":\"tests/other-workflow.spec.ts\""}"#;
+    let embedded_path_repair =
+        repair_write_arguments_from_active_target("write", embedded_path_payload, &active_targets);
+
+    inferred
+        .as_ref()
+        .and_then(|json| serde_json::from_str::<Value>(json).ok())
+        .is_some_and(|value| {
+            value.get("path").and_then(Value::as_str) == Some("tests/workflow.spec.ts")
+                && value
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains("workflow behavior contract"))
+        })
+        && inferred_from_malformed
+            .as_ref()
+            .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            .is_some_and(|value| {
+                value.get("path").and_then(Value::as_str) == Some("tests/workflow.spec.ts")
+                    && value
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.contains("workflow behavior contract"))
+            })
+        && ambiguous.is_none()
+        && absolute.is_none()
+        && embedded_path_repair.is_none()
+}
+
 fn normalize_escaped_whole_file_source_candidate(target: &str, content: &str) -> Option<String> {
     let normalized = content
         .replace("\\r\\n", "\n")
@@ -1575,9 +2398,9 @@ pub(crate) fn invalid_edit_recovery_uses_open_target_when_candidate_is_inactive_
             .prompt
             .contains("Required recovery operation: submit a corrected `apply_patch` content-changing edit for `tests/workflow.spec.ts`")
         && !envelope.prompt.contains("latest attempted open target")
-        && envelope
-            .prompt
-            .contains("Active content-shape target contract")
+        && envelope.prompt.contains("Active apply_patch target contract")
+        && !envelope.prompt.contains("a single patch may contain multiple")
+        && !envelope.prompt.contains("Use the `write` tool with `path` set")
         && envelope.prompt.contains("tests/workflow.spec.ts")
 }
 
@@ -1670,8 +2493,185 @@ pub(crate) fn edit_recovery_targets_and_fixtures_are_workflow_neutral_fixture_pa
         && apply_patch_context_mismatch_enters_invalid_edit_lifecycle_fixture_passes()
         && invalid_edit_recovery_uses_open_target_when_candidate_is_inactive_fixture_passes()
         && mixed_target_apply_patch_preserves_active_hunk_evidence_fixture_passes()
+        && target_exclusive_content_shape_recovery_uses_single_apply_patch_contract_fixture_passes()
         && invalid_apply_patch_write_recovery_normalizes_active_targets_fixture_passes()
         && invalid_edit_recovery_candidate_target_normalized_fixture_passes()
+        && invalid_edit_recovery_projects_candidate_target_operation_fixture_passes()
+        && invalid_edit_arguments_recovery_persists_across_final_message_fixture_passes()
+        && malformed_write_arguments_terminal_quote_repair_fixture_passes()
+}
+
+pub(crate) fn invalid_edit_recovery_projects_candidate_target_operation_fixture_passes() -> bool {
+    let tool_names = BTreeSet::from([
+        "apply_patch".to_string(),
+        "shell".to_string(),
+        "todowrite".to_string(),
+    ]);
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = ProcessPhase::Author;
+    state.active_targets = vec![
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
+    ];
+    state.completion.open_work_count = 2;
+    let result = invalid_tool_arguments_result(
+        "apply_patch",
+        r#"{"patch_text":"*** Begin Patch\n*** Add File: src/workflow.rs\n+workflow-invalid-edit-contract\nworkflow_compute(value)\n+workflow_state_ready\n*** End Patch"}"#,
+        "tool patch error: add file body line `workflow_compute(value)` must start with `+`",
+        &state,
+        Some(&tool_names),
+        Some(&ToolChoice::Auto),
+    );
+    let Some(recovery) = invalid_edit_arguments_control_recovery_envelope(
+        "apply_patch",
+        &result.metadata,
+        &state,
+        &tool_names,
+        &ToolChoice::Auto,
+    ) else {
+        return false;
+    };
+    recovery.candidate_target.as_deref() == Some("src/workflow.rs")
+        && recovery.parser_error_family.as_deref() == Some("apply_patch_malformed_patch")
+        && recovery
+            .prompt
+            .contains("Latest attempted edit target: `src/workflow.rs`")
+        && recovery
+            .prompt
+            .contains("retry the same bounded edit operation for `src/workflow.rs`")
+        && recovery
+            .prompt
+            .contains("before any verification, progress-only todo update, or final answer")
+        && !recovery
+            .prompt
+            .contains("retry the same bounded edit operation for `tests/workflow.behavior.md`")
+        && !recovery
+            .prompt
+            .contains("Required recovery operation: submit a corrected `apply_patch` content-changing edit for `tests/workflow.behavior.md`")
+}
+
+pub(crate) fn invalid_edit_arguments_recovery_persists_across_final_message_fixture_passes() -> bool
+{
+    let tool_names = BTreeSet::from([
+        "apply_patch".to_string(),
+        "shell".to_string(),
+        "todowrite".to_string(),
+    ]);
+    let mut state = SessionStateSnapshot::default();
+    state.route = TaskRoute::Code;
+    state.process_phase = ProcessPhase::Author;
+    state.active_targets = vec![
+        Utf8PathBuf::from("src/workflow.rs"),
+        Utf8PathBuf::from("tests/workflow.behavior.md"),
+    ];
+    state.completion.open_work_count = 2;
+    let result = invalid_tool_arguments_result(
+        "apply_patch",
+        r#"{"patch_text":"*** Begin Patch\n*** Add File: src/workflow.rs\n+ok\n*** End"}"#,
+        "tool patch error: patch must end with `*** End Patch`",
+        &state,
+        Some(&tool_names),
+        Some(&ToolChoice::Auto),
+    );
+    let Some(envelope) = invalid_edit_arguments_control_recovery_envelope(
+        "apply_patch",
+        &result.metadata,
+        &state,
+        &tool_names,
+        &ToolChoice::Auto,
+    ) else {
+        return false;
+    };
+    let final_recovery = TurnLifecycleKernel::open_obligation_final_message_recovery_envelope(
+        &state,
+        2,
+        None,
+        &tool_names,
+        false,
+    )
+    .prompt;
+    let base_messages = vec![crate::llm::ModelMessage::User {
+        content: "create src/workflow.rs and tests/workflow.behavior.md".to_string(),
+    }];
+    let (messages, _) = TurnLifecycleKernel::provider_messages_for_dispatch_control(
+        &base_messages,
+        "Turn control projection surface: prompt".to_string(),
+        Some(final_recovery),
+        Some(envelope.prompt.clone()),
+        &tool_names,
+        true,
+    );
+    let Some(control) = messages.iter().find_map(|message| match message {
+        crate::llm::ModelMessage::System { content } => Some(content.as_str()),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let markers = request_content_markers(control);
+    envelope.tool_name == "apply_patch"
+        && envelope.active_targets
+            == vec![
+                "src/workflow.rs".to_string(),
+                "tests/workflow.behavior.md".to_string(),
+            ]
+        && envelope.result_hash.is_some()
+        && control.contains("Invalid edit recovery:")
+        && control.contains("Open-obligation final-message recovery:")
+        && markers.contains(&"invalid_edit_arguments_recovery".to_string())
+        && markers.contains(&"open_obligation_final_message_recovery".to_string())
+        && markers.contains(&"open_targets_projection".to_string())
+        && markers.contains(&"strict_apply_patch_grammar".to_string())
+}
+
+pub(crate) fn target_exclusive_content_shape_recovery_uses_single_apply_patch_contract_fixture_passes()
+-> bool {
+    let mut state = SessionStateSnapshot {
+        route: TaskRoute::Code,
+        process_phase: ProcessPhase::Author,
+        active_targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
+        ..SessionStateSnapshot::default()
+    };
+    state.completion.open_work_count = 1;
+    let allowed = BTreeSet::from(["apply_patch".to_string(), "read".to_string()]);
+    let metadata = json!({
+        "tool_feedback_envelope": {
+            "kind": "required_write_content_shape_mismatch",
+            "progress_effect": "no_progress",
+            "side_effects_applied": false,
+            "target": "tests/workflow.spec.ts",
+            "required_target": "tests/workflow.spec.ts",
+            "submitted_targets": ["src/workflow.ts"],
+            "inactive_submitted_targets": ["src/workflow.ts"],
+            "parser_error_family": "code_test_module_content_shape",
+            "content_shape_contract": {
+                "kind": "code_test_module_content_shape",
+                "target": "tests/workflow.spec.ts"
+            },
+            "observed_forbidden_markers": ["export function runWorkflow"],
+            "result_hash": "target-exclusive-content-shape-recovery"
+        }
+    });
+    let Some(envelope) = failed_edit_control_recovery_envelope(
+        "apply_patch",
+        &metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Required,
+    ) else {
+        return false;
+    };
+    envelope.failure_kind == "required_write_content_shape_mismatch"
+        && envelope.active_targets == vec!["tests/workflow.spec.ts"]
+        && envelope
+            .inactive_submitted_targets
+            .contains(&"src/workflow.ts".to_string())
+        && envelope.prompt.contains("exactly one `*** Add File: tests/workflow.spec.ts` or `*** Update File: tests/workflow.spec.ts` operation")
+        && envelope.prompt.contains("Do not include inactive target hunks or production-source patch bodies")
+        && envelope.prompt.contains("Active apply_patch target contract")
+        && envelope.prompt.contains("`patch_text` must add or update `tests/workflow.spec.ts`")
+        && !envelope.prompt.contains("a single patch may contain multiple")
+        && !envelope.prompt.contains("Use the `write` tool with `path` set")
 }
 
 pub(crate) fn invalid_edit_recovery_candidate_target_normalized_fixture_passes() -> bool {
@@ -1754,6 +2754,86 @@ pub(crate) fn invalid_apply_patch_write_recovery_normalizes_active_targets_fixtu
     )
 }
 
+pub(crate) fn malformed_write_arguments_terminal_quote_repair_fixture_passes() -> bool {
+    let active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+    let repaired_from_active = repair_write_arguments_from_active_target(
+        "write",
+        "{\"content\":\"workflow behavior contract\\n",
+        &active_targets,
+    );
+    let repaired_with_path = repair_unambiguous_malformed_edit_arguments_json(
+        "write",
+        "{\"path\":\"tests/workflow.spec.ts\",\"content\":\"workflow behavior contract\\n",
+    );
+    let embedded_path_rejected = repair_write_arguments_from_active_target(
+        "write",
+        "{\"content\":\"workflow behavior contract\\n\\\",\\\"path\\\":\\\"src/workflow.rs\\\"",
+        &active_targets,
+    )
+    .is_none();
+
+    let mut state = SessionStateSnapshot {
+        route: TaskRoute::Code,
+        process_phase: ProcessPhase::Author,
+        active_targets,
+        ..SessionStateSnapshot::default()
+    };
+    state.completion.open_work_count = 1;
+    let allowed = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+    let invalid = invalid_tool_arguments_result(
+        "write",
+        "{\"content\":\"workflow behavior contract\\n",
+        "EOF while parsing a string at line 1 column 38",
+        &state,
+        Some(&allowed),
+        Some(&ToolChoice::Auto),
+    );
+    let Some(envelope) = invalid_edit_arguments_control_recovery_envelope(
+        "write",
+        &invalid.metadata,
+        &state,
+        &allowed,
+        &ToolChoice::Auto,
+    ) else {
+        return false;
+    };
+    let repaired_active_value = repaired_from_active
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Value>(json).ok());
+    let repaired_path_value = repaired_with_path
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Value>(json).ok());
+
+    repaired_active_value.as_ref().is_some_and(|value| {
+        value.get("path").and_then(Value::as_str) == Some("tests/workflow.spec.ts")
+            && value
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content == "workflow behavior contract\n")
+    }) && repaired_path_value.as_ref().is_some_and(|value| {
+        value.get("path").and_then(Value::as_str) == Some("tests/workflow.spec.ts")
+            && value
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content == "workflow behavior contract\n")
+    }) && embedded_path_rejected
+        && invalid
+            .output_text
+            .contains("Continue with a smaller valid JSON `write` call")
+        && invalid
+            .metadata
+            .pointer("/tool_feedback_envelope/parser_error_family")
+            .and_then(Value::as_str)
+            == Some("eof_while_parsing_string")
+        && envelope.recovery_target.as_deref() == Some("tests/workflow.spec.ts")
+        && envelope
+            .prompt
+            .contains("Latest parser/content-shape error")
+        && envelope
+            .prompt
+            .contains("submit a corrected `write` content-changing edit")
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1779,5 +2859,29 @@ mod tests {
     #[test]
     fn invalid_edit_recovery_candidate_target_normalized() {
         assert!(super::invalid_edit_recovery_candidate_target_normalized_fixture_passes());
+    }
+
+    #[test]
+    fn target_exclusive_content_shape_recovery_uses_single_apply_patch_contract() {
+        assert!(
+            super::target_exclusive_content_shape_recovery_uses_single_apply_patch_contract_fixture_passes()
+        );
+    }
+
+    #[test]
+    fn invalid_edit_recovery_projects_candidate_target_operation() {
+        assert!(super::invalid_edit_recovery_projects_candidate_target_operation_fixture_passes());
+    }
+
+    #[test]
+    fn invalid_edit_arguments_recovery_persists_across_final_message() {
+        assert!(
+            super::invalid_edit_arguments_recovery_persists_across_final_message_fixture_passes()
+        );
+    }
+
+    #[test]
+    fn malformed_write_arguments_terminal_quote_repair() {
+        assert!(super::malformed_write_arguments_terminal_quote_repair_fixture_passes());
     }
 }

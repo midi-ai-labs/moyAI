@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
+use crate::edit::ChangeSummary;
 use crate::error::ToolError;
 use crate::session::{
     SessionId, SessionRepository, TodoId, TodoItem, TodoKind, TodoPriority, TodoStatus,
@@ -232,6 +233,92 @@ pub(crate) fn progress_projection_payload_drops_authority_fields() -> bool {
         && todos[0].targets.is_empty()
         && todos[0].depends_on.is_empty()
         && todos[0].success_criteria.is_empty()
+}
+
+pub(crate) async fn align_progress_projection_after_changes(
+    session_repo: &dyn SessionRepository,
+    session_id: SessionId,
+    workspace_root: &Utf8Path,
+    todos: &[TodoItem],
+    changes: &[ChangeSummary],
+) -> Result<(), crate::error::StorageError> {
+    let changed_keys = changes
+        .iter()
+        .flat_map(|change| {
+            change
+                .path_after
+                .as_ref()
+                .or(change.path_before.as_ref())
+                .into_iter()
+                .flat_map(|path| {
+                    crate::workspace::project::target_keys_for_workspace_match(
+                        path.as_str(),
+                        workspace_root,
+                    )
+                })
+        })
+        .collect::<HashSet<_>>();
+    if changed_keys.is_empty() {
+        return Ok(());
+    }
+
+    let Some(updated) = aligned_todos_after_changed_keys(todos, &changed_keys, workspace_root)
+    else {
+        return Ok(());
+    };
+
+    session_repo.update_todos(session_id, &updated).await
+}
+
+pub(crate) fn aligned_todos_after_changed_keys(
+    todos: &[TodoItem],
+    changed_keys: &HashSet<String>,
+    workspace_root: &Utf8Path,
+) -> Option<Vec<TodoItem>> {
+    let mut updated = todos.to_vec();
+    let mut changed = false;
+    for todo in &mut updated {
+        if !matches!(todo.kind, TodoKind::Work | TodoKind::Repair)
+            || !matches!(todo.status, TodoStatus::Pending | TodoStatus::InProgress)
+        {
+            continue;
+        }
+        let todo_keys = todo
+            .targets
+            .iter()
+            .flat_map(|target| {
+                crate::workspace::project::target_keys_for_workspace_match(
+                    target.as_str(),
+                    workspace_root,
+                )
+            })
+            .collect::<HashSet<_>>();
+        if !todo_keys.is_empty() && !todo_keys.is_disjoint(changed_keys) {
+            todo.status = TodoStatus::Completed;
+            changed = true;
+        }
+    }
+
+    let open_non_completion = updated.iter().any(|todo| {
+        !matches!(todo.kind, TodoKind::Completion)
+            && matches!(
+                todo.status,
+                TodoStatus::Pending | TodoStatus::InProgress | TodoStatus::Blocked
+            )
+    });
+    if !open_non_completion {
+        for todo in &mut updated {
+            if matches!(todo.kind, TodoKind::Completion)
+                && matches!(todo.status, TodoStatus::Pending | TodoStatus::Blocked)
+            {
+                todo.status = TodoStatus::InProgress;
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    changed.then_some(updated)
 }
 
 pub(crate) fn normalize_todo_write_arguments(raw_arguments: Value) -> Result<Value, ToolError> {

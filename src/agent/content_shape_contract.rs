@@ -1,4 +1,4 @@
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::{Value, json};
 
 use crate::agent::language_evidence::{
@@ -358,6 +358,10 @@ pub(crate) fn artifact_content_shape_tool_schema_description(target: &str) -> Op
         return Some(code_artifact_tool_schema_description(target));
     }
     source_artifact_shape_contract(target).map(|contract| contract.tool_schema_description())
+}
+
+pub(crate) fn artifact_content_shape_apply_patch_recovery_scaffold(target: &str) -> Option<String> {
+    test_artifact_shape_contract(target).map(|contract| contract.apply_patch_recovery_scaffold())
 }
 
 pub(crate) fn source_artifact_target_requires_executable_shape(target: &str) -> bool {
@@ -740,6 +744,28 @@ def main():
             .contains("Runtime rejected this tool call before applying filesystem side effects")
 }
 
+#[cfg(test)]
+pub(crate) fn generated_test_recovery_scaffold_fixture_passes() -> bool {
+    let target = "test_workflow.py";
+    let Some(schema) = artifact_content_shape_tool_schema_description(target) else {
+        return false;
+    };
+    let Some(scaffold) = artifact_content_shape_apply_patch_recovery_scaffold(target) else {
+        return false;
+    };
+    schema.contains("Generated-test recovery scaffold")
+        && schema.contains("*** Add File: test_workflow.py")
+        && schema.contains("import `workflow`")
+        && schema.contains("class TestWorkflow(unittest.TestCase)")
+        && scaffold.contains("Positive generated-test apply_patch scaffold")
+        && scaffold.contains("`*** Add File: test_workflow.py`")
+        && scaffold.contains("import `workflow`")
+        && scaffold.contains("`+class TestWorkflow(unittest.TestCase):`")
+        && scaffold.contains("`+    def test_<requested_behavior>(self):`")
+        && scaffold.contains("do not paste implementation code from `workflow.py`")
+        && !scaffold.contains("calculator")
+}
+
 pub(crate) fn text_artifact_readable_shape_rejects_serialized_markdown_fixture_passes() -> bool {
     let good =
         "# Workflow Design\n\n## Tests\n\n- `tests/workflow.spec.ts` covers public behavior.\n";
@@ -765,6 +791,123 @@ pub(crate) fn text_artifact_readable_shape_rejects_short_serialized_markdown_fix
         && artifact_content_shape_violation_result("write", &write_arguments, None).is_some()
 }
 
+pub(crate) fn text_artifact_content_shape_rejects_serialized_markdown_fixture_passes() -> bool {
+    let bad_arguments = json!({
+        "path": "docs/workflow-design.md",
+        "content": "\"# Workflow Design\\n\\n## Tests\\n\\n- `tests/workflow.behavior.md` covers public behavior.\\n\\n```\\nverify-contract --behavior\\n```\\n\""
+    });
+    let good_arguments = json!({
+        "path": "docs/workflow-design.md",
+        "content": "# Workflow Design\n\n## Tests\n\n- `tests/workflow.behavior.md` covers public behavior.\n\n```bash\nverify-contract --behavior\n```\n"
+    });
+    let root_path = std::env::temp_dir().join(format!(
+        "moyai-text-shape-patch-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    ));
+    let Ok(root) = Utf8PathBuf::from_path_buf(root_path) else {
+        return false;
+    };
+    if std::fs::create_dir_all(root.as_std_path()).is_err() {
+        return false;
+    }
+    let patch_arguments = json!({
+        "patch_text": "*** Begin Patch\n*** Add File: docs/workflow-design.md\n+\"# Workflow Design\\n\\n## Tests\\n\\n- `tests/workflow.behavior.md` covers public behavior.\\n\\n```\\nverify-contract --behavior\\n```\\n\"\n*** End Patch"
+    });
+    let Some(bad_result) = artifact_content_shape_violation_result("write", &bad_arguments, None)
+    else {
+        let _ = std::fs::remove_dir_all(root.as_std_path());
+        return false;
+    };
+    let patch_rejected = artifact_content_shape_violation_result(
+        "apply_patch",
+        &patch_arguments,
+        Some(root.as_path()),
+    )
+    .is_some_and(|result| {
+        result
+            .metadata
+            .pointer("/content_shape_contract/kind")
+            .and_then(Value::as_str)
+            == Some("text_artifact_readable_content_shape")
+    });
+    let patch_left_workspace_clean = !root.join("docs/workflow-design.md").exists();
+    let _ = std::fs::remove_dir_all(root.as_std_path());
+    artifact_content_shape_violation_result("write", &good_arguments, None).is_none()
+        && bad_result
+            .metadata
+            .pointer("/tool_feedback_envelope/side_effects_applied")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && bad_result
+            .metadata
+            .pointer("/content_shape_contract/kind")
+            .and_then(Value::as_str)
+            == Some("text_artifact_readable_content_shape")
+        && bad_result
+            .output_text
+            .contains("Required positive text artifact shape")
+        && patch_rejected
+        && patch_left_workspace_clean
+        && text_artifact_readable_shape_rejects_serialized_markdown_fixture_passes()
+}
+
+pub(crate) fn content_shape_mismatch_canonicalizes_workspace_absolute_target_fixture_passes() -> bool
+{
+    let root = Utf8PathBuf::from("C:/workspace");
+    let bad_content = "\"# Workflow Design\\n\\n## Tests\\n\\n- `tests/workflow.behavior.md` covers public behavior.\\n\"";
+    let absolute_arguments = json!({
+        "path": r"C:\\workspace\\docs\\workflow-design.md",
+        "content": bad_content
+    });
+    let relative_arguments = json!({
+        "path": "docs/workflow-design.md",
+        "content": bad_content
+    });
+    let Some(absolute_result) =
+        artifact_content_shape_violation_result("write", &absolute_arguments, Some(root.as_path()))
+    else {
+        return false;
+    };
+    let Some(relative_result) =
+        artifact_content_shape_violation_result("write", &relative_arguments, Some(root.as_path()))
+    else {
+        return false;
+    };
+    let metadata_target = absolute_result
+        .metadata
+        .pointer("/content_shape_contract/target")
+        .and_then(Value::as_str);
+    let feedback_target = absolute_result
+        .metadata
+        .pointer("/tool_feedback_envelope/target")
+        .and_then(Value::as_str);
+    let active_target = absolute_result
+        .metadata
+        .pointer("/active_targets/0")
+        .and_then(Value::as_str);
+    let absolute_hash = absolute_result
+        .metadata
+        .pointer("/result_hash")
+        .and_then(Value::as_str);
+    let relative_hash = relative_result
+        .metadata
+        .pointer("/result_hash")
+        .and_then(Value::as_str);
+    metadata_target == Some("docs/workflow-design.md")
+        && feedback_target == Some("docs/workflow-design.md")
+        && active_target == Some("docs/workflow-design.md")
+        && absolute_hash.is_some()
+        && absolute_hash == relative_hash
+        && absolute_result
+            .output_text
+            .contains("`docs/workflow-design.md`")
+        && !absolute_result.output_text.contains("C:/workspace")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,6 +915,11 @@ mod tests {
     #[test]
     fn text_artifact_readable_shape_rejects_short_serialized_markdown() {
         assert!(text_artifact_readable_shape_rejects_short_serialized_markdown_fixture_passes());
+    }
+
+    #[test]
+    fn generated_test_recovery_scaffold_is_positive_and_workflow_neutral() {
+        assert!(generated_test_recovery_scaffold_fixture_passes());
     }
 }
 

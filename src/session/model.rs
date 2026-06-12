@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{AccessMode, ShellFamily};
 use crate::error::ErrorCategory;
-use crate::protocol::{FileChangeEvidence, HistoryItem, ToolProgressEffect, TurnId, TurnItem};
+use crate::protocol::{
+    FileChangeEvidence, HistoryItem, HistoryItemId, ToolProgressEffect, TurnId, TurnItem,
+};
 use crate::tool::ToolName;
 
 use super::{
@@ -31,6 +33,30 @@ impl SessionStatus {
             Self::AwaitingUser => "awaiting_user",
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMemoryMode {
+    Enabled,
+    Disabled,
+}
+
+impl SessionMemoryMode {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "enabled" => Some(Self::Enabled),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
         }
     }
 }
@@ -134,12 +160,35 @@ pub struct SessionRecord {
     pub model: String,
     pub base_url: String,
     pub access_mode: AccessMode,
+    #[serde(default)]
+    pub model_parameters: SessionModelParameters,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub completed_at_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionModelParameters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+}
+
+impl SessionModelParameters {
+    pub fn is_empty(&self) -> bool {
+        self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.top_k.is_none()
+            && self.max_output_tokens.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<Utf8PathBuf>,
@@ -149,6 +198,16 @@ pub struct SessionSettingsPatch {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_mode: Option<AccessMode>,
+    #[serde(default)]
+    pub reset_model_parameters: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 impl SessionSettingsPatch {
@@ -157,6 +216,35 @@ impl SessionSettingsPatch {
             && self.model.is_none()
             && self.base_url.is_none()
             && self.access_mode.is_none()
+            && !self.reset_model_parameters
+            && self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.top_k.is_none()
+            && self.max_output_tokens.is_none()
+    }
+
+    pub fn apply_to_model_parameters(
+        &self,
+        current: &SessionModelParameters,
+    ) -> SessionModelParameters {
+        let mut next = if self.reset_model_parameters {
+            SessionModelParameters::default()
+        } else {
+            current.clone()
+        };
+        if let Some(value) = self.temperature {
+            next.temperature = Some(value);
+        }
+        if let Some(value) = self.top_p {
+            next.top_p = Some(value);
+        }
+        if let Some(value) = self.top_k {
+            next.top_k = Some(value);
+        }
+        if let Some(value) = self.max_output_tokens {
+            next.max_output_tokens = Some(value);
+        }
+        next
     }
 }
 
@@ -164,6 +252,45 @@ impl SessionSettingsPatch {
 pub struct SessionSettingsUpdate {
     pub session: SessionRecord,
     pub changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTitleUpdate {
+    pub session: SessionRecord,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMemoryModeUpdate {
+    pub session: SessionRecord,
+    pub mode: SessionMemoryMode,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleTurnRejectionReason {
+    PendingTriggerTurn,
+    PlanMode,
+    Busy,
+}
+
+impl IdleTurnRejectionReason {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::PendingTriggerTurn => "pending_trigger_turn",
+            Self::PlanMode => "plan_mode",
+            Self::Busy => "busy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdleTurnAdmission {
+    pub session: SessionRecord,
+    pub admitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<IdleTurnRejectionReason>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +306,15 @@ pub struct SessionForkResult {
     pub forked_session: SessionRecord,
     pub copied_history_items: usize,
     pub copied_turn_items: usize,
+    pub interrupted_live_snapshot: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCompactResult {
+    pub session: SessionRecord,
+    pub compaction_item_id: HistoryItemId,
+    pub summarized_history_items: usize,
+    pub retained_history_items: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

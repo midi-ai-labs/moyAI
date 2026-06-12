@@ -7,13 +7,15 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::agent::{AgentLoop, AgentRunRequest, RuntimeInputView};
 use crate::app::session_title::{generate_session_title, is_placeholder_session_title};
 use crate::app::{
-    AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionForkRequest,
-    SessionHistoryRequest, SessionListRequest, SessionLoadedRequest, SessionReadRequest,
-    SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
-    SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest, SessionTurnsRequest,
+    AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionCompactRequest,
+    SessionEventsRequest, SessionForkRequest, SessionHistoryRequest, SessionIdleAdmissionRequest,
+    SessionInterruptRequest, SessionListRequest, SessionLoadedRequest, SessionMemoryRequest,
+    SessionReadRequest, SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
+    SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,
+    SessionTitleUpdateRequest, SessionTurnsRequest,
 };
 use crate::cli::{ConfirmationPrompt, EventRenderer};
-use crate::config::merge::apply_patch as apply_config_patch;
+use crate::config::{ModelConfig, merge::apply_patch as apply_config_patch};
 use crate::error::{AppRunError, RuntimeError};
 use crate::harness::{HarnessRecordingSink, NativeHarnessRecorder};
 use crate::llm::{
@@ -26,10 +28,10 @@ use crate::protocol::{
     ProtocolEventStore, ProtocolRecordingSink, SandboxProfile, SteerTurn, ThreadOp, ToolChoice,
     TurnContext, UserInputItem, UserTurn,
 };
-use crate::runtime::RunEventSink;
+use crate::runtime::{RunEventSink, SessionRuntimeEventHub};
 use crate::session::{
-    DispatchTransformKind, ImagePart, PromptDispatchPart, RunSummary, SessionRecord,
-    SessionRepository, SessionSelector, SessionSettingsPatch, SessionStartRequest,
+    DispatchTransformKind, ImagePart, PromptDispatchPart, RunSummary, SessionModelParameters,
+    SessionRecord, SessionRepository, SessionSelector, SessionSettingsPatch, SessionStartRequest,
     SessionStateSnapshot, SessionStatus, TaskRoute,
 };
 use crate::storage::StoreBundle;
@@ -45,6 +47,7 @@ pub struct RunService {
     workspace: crate::workspace::Workspace,
     session_service: crate::session::SessionService,
     agent_loop: AgentLoop,
+    session_event_hub: SessionRuntimeEventHub,
 }
 
 impl RunService {
@@ -54,6 +57,7 @@ impl RunService {
         workspace: crate::workspace::Workspace,
         session_service: crate::session::SessionService,
         agent_loop: AgentLoop,
+        session_event_hub: SessionRuntimeEventHub,
     ) -> Self {
         Self {
             store,
@@ -61,6 +65,7 @@ impl RunService {
             workspace,
             session_service,
             agent_loop,
+            session_event_hub,
         }
     }
 
@@ -86,6 +91,21 @@ impl RunService {
                 self.execute_session_settings_update(request, renderer)
                     .await
             }
+            AppCommand::SessionTitleUpdate(request) => {
+                self.execute_session_title_update(request, renderer).await
+            }
+            AppCommand::SessionInterrupt(request) => {
+                self.execute_session_interrupt(request, renderer).await
+            }
+            AppCommand::SessionCompact(request) => {
+                self.execute_session_compact(request, renderer).await
+            }
+            AppCommand::SessionMemory(request) => {
+                self.execute_session_memory(request, renderer).await
+            }
+            AppCommand::SessionIdleAdmission(request) => {
+                self.execute_session_idle_admission(request, renderer).await
+            }
             AppCommand::SessionShow(request) => self.execute_session_show(request, renderer).await,
             AppCommand::SessionHistory(request) => {
                 self.execute_session_history(request, renderer).await
@@ -100,6 +120,9 @@ impl RunService {
             AppCommand::SessionFork(request) => self.execute_session_fork(request, renderer).await,
             AppCommand::SessionTurns(request) => {
                 self.execute_session_turns(request, renderer).await
+            }
+            AppCommand::SessionEvents(request) => {
+                self.execute_session_events(request, renderer).await
             }
             AppCommand::SessionSteer(request) => {
                 self.execute_session_steer(request, renderer).await
@@ -153,6 +176,10 @@ impl RunService {
         if let Some(session_settings) = self.session_settings_for_selector(&selector).await? {
             effective_config.model.model = session_settings.model.clone();
             effective_config.model.base_url = session_settings.base_url.clone();
+            apply_session_model_parameters(
+                &mut effective_config.model,
+                &session_settings.model_parameters,
+            );
             effective_config.permissions.access_mode = session_settings.access_mode;
         }
         let should_generate_session_title = matches!(&selector, SessionSelector::New)
@@ -226,7 +253,8 @@ impl RunService {
             Some(session_context.session.id),
             protocol_turn_id,
             &mut harness_sink,
-        );
+        )
+        .with_runtime_event_publisher(self.session_event_hub.publisher());
         sink.emit(crate::session::RunEvent::SessionStarted {
             session_id: session_context.session.id,
             title: session_context.session.title.clone(),
@@ -492,6 +520,94 @@ impl RunService {
         })
     }
 
+    async fn execute_session_interrupt(
+        &self,
+        request: SessionInterruptRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let session = self
+            .session_service
+            .interrupt_running_session(request.session_id, request.reason)
+            .await?;
+        renderer.render_session_list(std::slice::from_ref(&session))?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_compact(
+        &self,
+        request: SessionCompactRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let result = self
+            .session_service
+            .compact_session(request.session_id, request.keep_recent)
+            .await?;
+        renderer.render_session_compact_result(&result)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_memory(
+        &self,
+        request: SessionMemoryRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let update = self
+            .session_service
+            .update_session_memory_mode(request.session_id, request.mode)
+            .await?;
+        renderer.render_session_memory_mode_update(&update)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_idle_admission(
+        &self,
+        request: SessionIdleAdmissionRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let admission = self
+            .session_service
+            .evaluate_idle_turn_admission(
+                request.session_id,
+                request.pending_trigger_turn,
+                request.plan_mode,
+            )
+            .await?;
+        renderer.render_session_idle_turn_admission(&admission)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
     async fn execute_session_settings_update(
         &self,
         request: SessionSettingsUpdateRequest,
@@ -506,8 +622,34 @@ impl RunService {
                     model: request.model,
                     base_url: request.base_url,
                     access_mode: request.access_mode,
+                    reset_model_parameters: request.reset_model_parameters,
+                    temperature: request.temperature,
+                    top_p: request.top_p,
+                    top_k: request.top_k,
+                    max_output_tokens: request.max_output_tokens,
                 },
             )
+            .await?;
+        renderer.render_session_list(std::slice::from_ref(&update.session))?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_title_update(
+        &self,
+        request: SessionTitleUpdateRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let update = self
+            .session_service
+            .update_session_title(request.session_id, request.title)
             .await?;
         renderer.render_session_list(std::slice::from_ref(&update.session))?;
         Ok(RunSummary {
@@ -583,6 +725,27 @@ impl RunService {
             .canonical_turn_page(request.session_id, request.offset, request.limit)
             .await?;
         renderer.render_session_turn_page(&page)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+        })
+    }
+
+    async fn execute_session_events(
+        &self,
+        request: SessionEventsRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        let page = self
+            .session_service
+            .canonical_runtime_event_page(request.session_id, request.offset, request.limit)
+            .await?;
+        renderer.render_session_runtime_event_page(&page)?;
         Ok(RunSummary {
             session_id: request.session_id,
             assistant_message_id: None,
@@ -802,6 +965,45 @@ fn latest_user_message_id_from_history_items(
         } => Some(*message_id),
         _ => None,
     })
+}
+
+fn apply_session_model_parameters(model: &mut ModelConfig, parameters: &SessionModelParameters) {
+    if let Some(value) = parameters.temperature {
+        model.temperature = Some(value);
+    }
+    if let Some(value) = parameters.top_p {
+        model.top_p = Some(value);
+    }
+    if let Some(value) = parameters.top_k {
+        model.top_k = Some(value);
+    }
+    if let Some(value) = parameters.max_output_tokens {
+        model.max_output_tokens = value;
+    }
+}
+
+#[cfg(test)]
+fn app_session_model_parameters_override_runtime_config_fixture_passes() -> bool {
+    let mut model = ModelConfig {
+        temperature: Some(1.0),
+        top_p: Some(1.0),
+        top_k: Some(8),
+        max_output_tokens: 1024,
+        ..crate::config::ResolvedConfig::default().model
+    };
+    apply_session_model_parameters(
+        &mut model,
+        &SessionModelParameters {
+            temperature: Some(0.2),
+            top_p: Some(0.8),
+            top_k: Some(40),
+            max_output_tokens: Some(4096),
+        },
+    );
+    model.temperature == Some(0.2)
+        && model.top_p == Some(0.8)
+        && model.top_k == Some(40)
+        && model.max_output_tokens == 4096
 }
 
 pub(crate) fn resume_latest_user_message_uses_item_order_fixture_passes() -> bool {
@@ -1275,6 +1477,11 @@ impl<'a> RunEventSink for RendererSink<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_model_parameters_override_runtime_config() {
+        assert!(super::app_session_model_parameters_override_runtime_config_fixture_passes());
+    }
+
     #[test]
     fn resume_latest_user_message_uses_item_order() {
         assert!(super::resume_latest_user_message_uses_item_order_fixture_passes());

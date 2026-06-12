@@ -3,10 +3,12 @@ use std::process::ExitCode;
 
 use camino::Utf8PathBuf;
 use moyai::app::{
-    AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionForkRequest,
-    SessionHistoryRequest, SessionListRequest, SessionLoadedRequest, SessionReadRequest,
-    SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
-    SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest, SessionTurnsRequest,
+    AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest,
+    SessionCompactRequest, SessionEventsRequest, SessionForkRequest, SessionHistoryRequest,
+    SessionInterruptRequest, SessionListRequest, SessionLoadedRequest, SessionMemoryRequest,
+    SessionReadRequest, SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
+    SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,
+    SessionTitleUpdateRequest, SessionTurnsRequest,
 };
 use moyai::cli::parse::parse as parse_cli;
 use moyai::cli::{
@@ -51,6 +53,10 @@ fn run() -> Result<(), (u8, String)> {
         | CliCommand::SessionLoaded(_)
         | CliCommand::SessionSearch(_)
         | CliCommand::SessionSettings(_)
+        | CliCommand::SessionTitle(_)
+        | CliCommand::SessionInterrupt(_)
+        | CliCommand::SessionCompact(_)
+        | CliCommand::SessionMemory(_)
         | CliCommand::SessionShow(_)
         | CliCommand::SessionHistory(_)
         | CliCommand::SessionRead(_)
@@ -58,6 +64,7 @@ fn run() -> Result<(), (u8, String)> {
         | CliCommand::SessionRollback(_)
         | CliCommand::SessionFork(_)
         | CliCommand::SessionTurns(_)
+        | CliCommand::SessionEvents(_)
         | CliCommand::SessionSteer(_)
         | CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
@@ -369,8 +376,33 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
                 model: args.model.clone(),
                 base_url: args.base_url.clone(),
                 access_mode: args.access_mode,
+                reset_model_parameters: args.reset_model_parameters,
+                temperature: args.temperature,
+                top_p: args.top_p,
+                top_k: args.top_k,
+                max_output_tokens: args.max_output_tokens,
             })
         }
+        CliCommand::SessionTitle(args) => {
+            AppCommand::SessionTitleUpdate(SessionTitleUpdateRequest {
+                session_id: args.session_id,
+                title: args.title.clone(),
+            })
+        }
+        CliCommand::SessionInterrupt(args) => {
+            AppCommand::SessionInterrupt(SessionInterruptRequest {
+                session_id: args.session_id,
+                reason: args.reason.clone(),
+            })
+        }
+        CliCommand::SessionCompact(args) => AppCommand::SessionCompact(SessionCompactRequest {
+            session_id: args.session_id,
+            keep_recent: args.keep_recent,
+        }),
+        CliCommand::SessionMemory(args) => AppCommand::SessionMemory(SessionMemoryRequest {
+            session_id: args.session_id,
+            mode: args.mode,
+        }),
         CliCommand::SessionShow(args) => AppCommand::SessionShow(SessionShowRequest {
             session_id: args.session_id,
             show_reasoning: args.show_reasoning,
@@ -415,6 +447,11 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             offset: args.offset,
             limit: args.limit,
         }),
+        CliCommand::SessionEvents(args) => AppCommand::SessionEvents(SessionEventsRequest {
+            session_id: args.session_id,
+            offset: args.offset,
+            limit: args.limit,
+        }),
         CliCommand::SessionSteer(args) => AppCommand::SessionSteer(SessionSteerRequest {
             session_id: args.session_id,
             prompt: args.prompt.clone(),
@@ -449,6 +486,10 @@ fn command_output_mode(command: &CliCommand) -> OutputMode {
         CliCommand::SessionLoaded(args) => args.output_mode,
         CliCommand::SessionSearch(args) => args.output_mode,
         CliCommand::SessionSettings(args) => args.output_mode,
+        CliCommand::SessionTitle(args) => args.output_mode,
+        CliCommand::SessionInterrupt(args) => args.output_mode,
+        CliCommand::SessionCompact(args) => args.output_mode,
+        CliCommand::SessionMemory(args) => args.output_mode,
         CliCommand::SessionShow(args) => args.output_mode,
         CliCommand::SessionHistory(args) => args.output_mode,
         CliCommand::SessionRead(args) => args.output_mode,
@@ -456,6 +497,7 @@ fn command_output_mode(command: &CliCommand) -> OutputMode {
         CliCommand::SessionRollback(args) => args.output_mode,
         CliCommand::SessionFork(args) => args.output_mode,
         CliCommand::SessionTurns(args) => args.output_mode,
+        CliCommand::SessionEvents(args) => args.output_mode,
         CliCommand::SessionSteer(args) => args.output_mode,
         CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)

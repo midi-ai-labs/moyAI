@@ -3,9 +3,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::{Map, Value, json};
 
+use crate::agent::edit_recovery::{
+    EscapedSourceWriteCandidate, InvalidEditRecoveryEnvelope,
+    invalid_apply_patch_arguments_need_write_recovery,
+    invalid_edit_arguments_control_recovery_envelope, invalid_edit_arguments_no_progress_key,
+    invalid_edit_arguments_terminal_message, invalid_tool_arguments_no_progress_key,
+    invalid_tool_arguments_result, invalid_tool_arguments_terminal_message,
+    invalid_write_arguments_need_patch_capable_recovery, is_invalid_tool_arguments_error,
+    normalized_escaped_source_write_candidate, record_patch_context_mismatch_grounding_targets,
+    should_terminalize_invalid_edit_arguments_no_progress,
+};
+use crate::agent::grounding_evidence::{
+    active_authoring_target_keys, active_authoring_targets_need_grounding,
+    authoring_grounding_recovery_envelope, authoring_missing_grounding_targets,
+    generated_test_reference_consumed_read_requires_active_target,
+    history_has_current_source_reference_read_for_generated_test,
+    history_has_unread_source_change_for_generated_test, matching_active_target_key,
+};
 use crate::agent::language_evidence::{
     ArtifactRole, classify_artifact_target as classify_language_artifact_target,
     language_failure_label_from_output_line, language_verification_command_evidence,
+};
+use crate::agent::lifecycle_kernel::{
+    PrepareToolRouteArgumentsInput, RuntimeOwnedVerificationRedirectSnapshot, TurnLifecycleKernel,
+    TurnLifecyclePreNormalizationSurfaceInput, TurnLifecycleRecoveryContext,
+    TurnLifecycleRecoverySurfaceInput, compile_turn_lifecycle_tool_choice,
 };
 use crate::agent::state::ActiveWorkContract;
 use crate::agent::verification::{
@@ -13,23 +35,31 @@ use crate::agent::verification::{
     verification_command_satisfaction_keys,
 };
 use crate::cli::ConfirmationPrompt;
-use crate::config::ResolvedConfig;
+use crate::config::{ResolvedConfig, ShellFamily};
+use crate::edit::ChangeSummary;
 use crate::error::{AgentError, CliPromptError, ToolError};
 use crate::protocol::{
-    CandidateRepairEdit, HistoryItem, OperationIntent, RejectedToolProposal, RequiredAction,
-    ToolChoice, ToolProgressEffect, VerificationRunResult, VerificationRunStatus,
+    CandidateRepairEdit, FileChangeEvidence, HistoryItem, HistoryItemPayload, OperationIntent,
+    ProjectionSurface, ProtocolEventStore, RejectedToolProposal, RequiredAction, SandboxProfile,
+    ToolChoice, ToolLifecycleStatus, ToolProgressEffect, TurnId, VerificationRunResult,
+    VerificationRunStatus,
 };
 use crate::runtime::RunEventSink;
 use crate::session::{
-    DiffSummaryPart, FailureKind, MessageId, SessionContext, SessionId, SessionStateSnapshot,
-    TaskRoute, ToolCallId, ToolCallRecord, VerificationFailureCluster,
+    ChangeId, ChangeKind, DiffSummaryPart, FailureKind, MessageId, ProcessPhase, SessionContext,
+    SessionId, SessionStateSnapshot, TaskRoute, ToolCallId, ToolCallRecord,
+    VerificationFailureCluster,
 };
-use crate::storage::SqliteSessionRepository;
+use crate::storage::{SqliteSessionRepository, StoreBundle};
 use crate::tool::context::{ToolContext, ToolServices};
 use crate::tool::registry::ToolRegistry;
 use crate::tool::{ToolName, ToolResult};
 use crate::workspace::Workspace;
+use crate::workspace::project::{path_key_for_workspace_match, target_keys_for_workspace_match};
 use tokio_util::sync::CancellationToken;
+
+const INVALID_TOOL_ARGUMENTS_TERMINAL_THRESHOLD: usize = 3;
+const PROGRESS_PROJECTION_NO_PROGRESS_TERMINAL_THRESHOLD: usize = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ToolRouteRequest<'a> {
@@ -46,6 +76,50 @@ pub(crate) struct ToolRouteRequest<'a> {
     pub tool_choice: Option<&'a str>,
     pub control_projection: Option<Value>,
     pub sandbox_decision: Value,
+}
+
+pub(crate) struct RejectedModelActionRouteRequest<'a> {
+    pub requested_tool: String,
+    pub effective_tool: String,
+    pub arguments_json: String,
+    pub allowed_tool_names: &'a BTreeSet<String>,
+    pub tool_exists: bool,
+    pub tool_allowed: bool,
+    pub tool_choice: Option<&'a str>,
+    pub control_projection: Option<Value>,
+    pub sandbox_decision: Value,
+}
+
+pub(crate) struct AcceptedToolRouteRequest<'a> {
+    pub requested_tool: String,
+    pub effective_tool: String,
+    pub original_arguments_json: String,
+    pub effective_arguments_json: String,
+    pub allowed_tool_names: &'a BTreeSet<String>,
+    pub tool_exists: bool,
+    pub tool_allowed: bool,
+    pub redirected_from_arguments_json: Option<String>,
+    pub redirect_reason: Option<&'a str>,
+    pub tool_choice: Option<&'a str>,
+    pub control_projection: Option<Value>,
+    pub sandbox_decision: Value,
+}
+
+pub(crate) struct AcceptedToolRoutePreparationInput<'a> {
+    pub requested_tool_name: &'a str,
+    pub original_arguments_json: &'a str,
+    pub runtime_owned_verification_redirect: Option<&'a RuntimeOwnedVerificationRedirectSnapshot>,
+    pub active_work: Option<&'a ActiveWorkContract>,
+    pub state: &'a SessionStateSnapshot,
+    pub shell_family: ShellFamily,
+}
+
+pub(crate) struct PreparedAcceptedToolRouteArguments {
+    pub effective_tool_name: String,
+    pub effective_arguments_json: String,
+    pub redirected_from_arguments_json: Option<String>,
+    pub redirect_reason: Option<&'static str>,
+    pub escaped_source_write_candidate: Option<EscapedSourceWriteCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +143,10 @@ pub(crate) struct ToolExecutionRequest<'a> {
     pub cancel: CancellationToken,
     pub prompt: &'a mut dyn ConfirmationPrompt,
     pub services: &'a ToolServices,
+}
+
+pub(crate) struct RouteArgumentParseError {
+    pub message: String,
 }
 
 pub(crate) struct PreExecutionCorrectiveInput<'a> {
@@ -107,8 +185,99 @@ pub(crate) struct PreExecutionCorrectiveNoProgressInput<'a> {
     pub wrong_verification_command_counts: &'a mut BTreeMap<String, usize>,
 }
 
+pub(crate) struct InvalidArgumentsLifecycleEffectsInput<'a> {
+    pub effective_tool_name: &'a str,
+    pub result_metadata: &'a Value,
+    pub state: &'a SessionStateSnapshot,
+    pub allowed_tools: &'a BTreeSet<String>,
+    pub tool_choice: &'a ToolChoice,
+    pub patch_context_mismatch_grounding_targets: &'a mut BTreeSet<String>,
+    pub invalid_edit_argument_counts: &'a mut BTreeMap<String, usize>,
+    pub invalid_edit_arguments_recovery: &'a mut Option<InvalidEditRecoveryEnvelope>,
+    pub malformed_write_patch_recovery_pending: &'a mut bool,
+    pub malformed_apply_patch_write_recovery_pending: &'a mut bool,
+}
+
+pub(crate) struct SupportingContextCorrectiveInput<'a> {
+    pub effective_tool_name: &'a str,
+    pub parsed_arguments: &'a Value,
+    pub state: &'a SessionStateSnapshot,
+    pub docs_budget_key: Option<String>,
+    pub docs_budget_exhausted: bool,
+    pub authoring_grounding_recovery: Option<&'a AuthoringGroundingRecoveryEnvelope>,
+    pub authoring_grounding_required: bool,
+    pub generated_test_grounding_required: bool,
+}
+
+pub(crate) struct SupportingContextCorrectivePreparationInput<'a> {
+    pub effective_tool_name: &'a str,
+    pub parsed_arguments: &'a Value,
+    pub state: &'a SessionStateSnapshot,
+    pub history_items: &'a [HistoryItem],
+    pub workspace_root: &'a Utf8Path,
+    pub allowed_tools: &'a BTreeSet<String>,
+    pub tool_choice: &'a ToolChoice,
+    pub docs_supporting_context_budget_exhausted: &'a BTreeSet<String>,
+    pub authoring_supporting_context_budget_exhausted: &'a BTreeSet<String>,
+    pub authoring_grounded_active_targets: &'a BTreeSet<String>,
+    pub existing_target_grounding_recovery_active: bool,
+    pub generated_test_reference_consumed_target_grounding_active: bool,
+}
+
+pub(crate) struct PreparedSupportingContextCorrectiveInput {
+    docs_budget_key: Option<String>,
+    docs_budget_exhausted: bool,
+    authoring_grounding_recovery: Option<AuthoringGroundingRecoveryEnvelope>,
+    authoring_grounding_required: bool,
+    generated_test_grounding_required: bool,
+}
+
+impl PreparedSupportingContextCorrectiveInput {
+    pub(crate) fn as_input<'a>(
+        &'a self,
+        effective_tool_name: &'a str,
+        parsed_arguments: &'a Value,
+        state: &'a SessionStateSnapshot,
+    ) -> SupportingContextCorrectiveInput<'a> {
+        SupportingContextCorrectiveInput {
+            effective_tool_name,
+            parsed_arguments,
+            state,
+            docs_budget_key: self.docs_budget_key.clone(),
+            docs_budget_exhausted: self.docs_budget_exhausted,
+            authoring_grounding_recovery: self.authoring_grounding_recovery.as_ref(),
+            authoring_grounding_required: self.authoring_grounding_required,
+            generated_test_grounding_required: self.generated_test_grounding_required,
+        }
+    }
+}
+
+pub(crate) struct ToolExecutionInvalidArgumentsInput<'a> {
+    pub effective_tool_name: &'a str,
+    pub effective_arguments_json: &'a str,
+    pub error_text: &'a str,
+    pub state: &'a SessionStateSnapshot,
+    pub allowed_tools: &'a BTreeSet<String>,
+    pub tool_choice: &'a ToolChoice,
+}
+
+pub(crate) struct SupportingContextCorrectiveDecision {
+    pub kind: SupportingContextCorrectiveKind,
+    pub budget_key: Option<String>,
+    pub result: ToolResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SupportingContextCorrectiveKind {
+    DocsBudgetExhausted,
+    AuthoringTargetGroundingRequired,
+    GeneratedTestTargetGroundingRequired,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreExecutionCorrectiveKind {
+    TargetExclusiveApplyPatchContractViolation,
+    GeneratedTestSourceReauthoringRecoveryChoice,
     ArtifactContentShapeViolation,
     RepairTargetAuthorityViolation,
     RepairActiveShellProbeTarget,
@@ -121,6 +290,104 @@ pub(crate) enum PreExecutionCorrectiveKind {
 pub(crate) struct ToolLifecycleRuntime;
 
 impl ToolLifecycleRuntime {
+    pub(crate) fn operation_non_content_no_progress_terminal_threshold() -> usize {
+        OPERATION_NON_CONTENT_NO_PROGRESS_TERMINAL_THRESHOLD
+    }
+
+    pub(crate) fn docs_route_operation_non_content_no_progress_terminal_threshold() -> usize {
+        DOCS_ROUTE_OPERATION_NON_CONTENT_NO_PROGRESS_TERMINAL_THRESHOLD
+    }
+
+    pub(crate) fn verification_supporting_context_no_progress_terminal_threshold() -> usize {
+        VERIFICATION_SUPPORTING_CONTEXT_NO_PROGRESS_TERMINAL_THRESHOLD
+    }
+
+    pub(crate) fn same_verification_failure_terminal_threshold() -> usize {
+        SAME_VERIFICATION_FAILURE_TERMINAL_THRESHOLD
+    }
+
+    pub(crate) fn route_accepted_tool_call(
+        request: AcceptedToolRouteRequest<'_>,
+    ) -> ToolRouteDecision {
+        Self::route_adjudicated_call(ToolRouteRequest {
+            requested_tool: request.requested_tool.clone(),
+            effective_tool: request.effective_tool.clone(),
+            record_tool: request.effective_tool,
+            original_arguments_json: request.original_arguments_json,
+            effective_arguments_json: request.effective_arguments_json,
+            allowed_tool_names: request.allowed_tool_names,
+            tool_exists: request.tool_exists,
+            tool_allowed: request.tool_allowed,
+            redirected_from_arguments_json: request.redirected_from_arguments_json,
+            redirect_reason: request.redirect_reason,
+            tool_choice: request.tool_choice,
+            control_projection: request.control_projection,
+            sandbox_decision: request.sandbox_decision,
+        })
+    }
+
+    pub(crate) fn prepare_accepted_tool_route_arguments(
+        input: AcceptedToolRoutePreparationInput<'_>,
+    ) -> PreparedAcceptedToolRouteArguments {
+        let active_targets_for_argument_repair =
+            Self::operation_feedback_targets_for_turn(input.state, input.active_work);
+        let escaped_source_write_candidate = normalized_escaped_source_write_candidate(
+            input.requested_tool_name,
+            input.original_arguments_json,
+            &active_targets_for_argument_repair,
+        );
+        let shell_repaired_arguments_json =
+            TurnLifecycleKernel::repair_shell_arguments_from_singleton_verification_command(
+                input
+                    .runtime_owned_verification_redirect
+                    .as_ref()
+                    .map(|redirect| redirect.effective_tool_name.as_str())
+                    .unwrap_or(input.requested_tool_name),
+                input.original_arguments_json,
+                input.active_work,
+                input.shell_family,
+            );
+        let prepared_route_arguments = TurnLifecycleKernel::prepare_tool_route_arguments(
+            PrepareToolRouteArgumentsInput {
+                requested_tool_name: input.requested_tool_name,
+                original_arguments_json: input.original_arguments_json,
+                runtime_owned_verification_redirect: input.runtime_owned_verification_redirect,
+                active_targets_for_argument_repair: &active_targets_for_argument_repair,
+                shell_repaired_arguments_json: shell_repaired_arguments_json.as_deref(),
+            },
+            escaped_source_write_candidate
+                .as_ref()
+                .map(|candidate| candidate.effective_arguments_json.as_str()),
+        );
+        PreparedAcceptedToolRouteArguments {
+            effective_tool_name: prepared_route_arguments.effective_tool_name,
+            effective_arguments_json: prepared_route_arguments.effective_arguments_json,
+            redirected_from_arguments_json: prepared_route_arguments.redirected_from_arguments_json,
+            redirect_reason: prepared_route_arguments.redirect_reason,
+            escaped_source_write_candidate,
+        }
+    }
+
+    pub(crate) fn route_rejected_model_action(
+        request: RejectedModelActionRouteRequest<'_>,
+    ) -> ToolRouteDecision {
+        Self::route_adjudicated_call(ToolRouteRequest {
+            requested_tool: request.requested_tool.clone(),
+            effective_tool: request.effective_tool.clone(),
+            record_tool: request.effective_tool,
+            original_arguments_json: request.arguments_json.clone(),
+            effective_arguments_json: request.arguments_json,
+            allowed_tool_names: request.allowed_tool_names,
+            tool_exists: request.tool_exists,
+            tool_allowed: request.tool_allowed,
+            redirected_from_arguments_json: None,
+            redirect_reason: None,
+            tool_choice: request.tool_choice,
+            control_projection: request.control_projection,
+            sandbox_decision: request.sandbox_decision,
+        })
+    }
+
     pub(crate) fn route_adjudicated_call(request: ToolRouteRequest<'_>) -> ToolRouteDecision {
         let allowed_tools = request
             .allowed_tool_names
@@ -211,6 +478,383 @@ impl ToolLifecycleRuntime {
         }
     }
 
+    pub(crate) fn control_projection_metadata(surface: &ProjectionSurface) -> Value {
+        json!({
+            "projection_id": surface.projection_id.to_string(),
+            "surface": surface.surface.as_str(),
+            "required_action": surface.required_action,
+            "allowed_tools": surface.allowed_tools.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "forbidden_tools": surface.forbidden_tools.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "operation_intents": surface.operation_intents.iter().map(|intent| intent.as_str()).collect::<Vec<_>>(),
+            "obligation_ids": surface.obligation_ids.clone(),
+            "contract_refs": surface.contract_refs.clone(),
+            "evidence_refs": surface.evidence_refs.iter().map(|evidence| {
+                json!({
+                    "source": evidence.source,
+                    "reference": evidence.reference,
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+
+    pub(crate) fn sandbox_decision_metadata(profile: &SandboxProfile) -> Value {
+        let profile = match profile {
+            SandboxProfile::ReadOnly => "read_only",
+            SandboxProfile::WorkspaceWrite => "workspace_write",
+            SandboxProfile::FullAccess => "full_access",
+        };
+        json!({
+            "profile": profile,
+            "network_allowed": false,
+            "escalated": false,
+        })
+    }
+
+    pub(crate) fn tool_result_is_progress_projection_no_content(result: &ToolResult) -> bool {
+        result
+            .metadata
+            .get("progress_projection")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && result.recorded_changes.is_empty()
+            && result.change_summaries.is_empty()
+    }
+
+    pub(crate) fn tool_output_is_content_changing_progress(metadata: &Value) -> bool {
+        Self::operation_progress_class_from_metadata(metadata) == Some("content_changing_progress")
+            && metadata
+                .get("tool_feedback_envelope")
+                .and_then(|feedback| feedback.get("progress_effect"))
+                .or_else(|| metadata.get("progress_effect"))
+                .and_then(Value::as_str)
+                == Some("made_progress")
+    }
+
+    pub(crate) fn progress_projection_no_progress_key(
+        effective_tool_name: &str,
+        state: &SessionStateSnapshot,
+        allowed_tools: &BTreeSet<String>,
+        tool_choice: &ToolChoice,
+        result_hash: Option<&str>,
+    ) -> String {
+        let active_targets = state
+            .active_targets
+            .iter()
+            .map(|target| target.as_str().to_ascii_lowercase())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(",");
+        let required_commands = state
+            .verification
+            .required_commands
+            .iter()
+            .map(|command| command.trim().to_ascii_lowercase())
+            .filter(|command| !command.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{}|result_hash={}|route={:?}|phase={:?}|open={}|verification_pending={}|route_contract_pending={}|targets={}|commands={}|allowed={}|choice={}",
+            effective_tool_name,
+            result_hash.unwrap_or(""),
+            state.route,
+            state.process_phase,
+            state.completion.open_work_count,
+            state.completion.verification_pending,
+            state.completion.route_contract_pending,
+            active_targets,
+            required_commands,
+            allowed_tools.iter().cloned().collect::<Vec<_>>().join(","),
+            tool_choice_label(tool_choice),
+        )
+    }
+
+    pub(crate) fn tool_result_result_hash(metadata: &Value) -> Option<String> {
+        tool_result_result_hash(metadata)
+    }
+
+    pub(crate) fn should_terminalize_progress_projection_no_progress(
+        progress_count: usize,
+    ) -> bool {
+        progress_count >= PROGRESS_PROJECTION_NO_PROGRESS_TERMINAL_THRESHOLD
+    }
+
+    pub(crate) fn progress_projection_no_progress_terminal_message(
+        tool_name: &str,
+        progress_count: usize,
+        state: &SessionStateSnapshot,
+    ) -> String {
+        let targets = state
+            .active_targets
+            .iter()
+            .map(|target| target.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "Tool `{tool_name}` returned progress projection without artifact or workspace progress {progress_count} time(s) while executable work remains open. Runtime stopped before repeating plan-only outputs until the turn step budget. Open targets: {targets}."
+        )
+    }
+
+    pub(crate) fn docs_route_supporting_context_budget_applies(
+        tool_name: &str,
+        state: &SessionStateSnapshot,
+    ) -> bool {
+        state.route == TaskRoute::Docs
+            && state.completion.route_contract_pending
+            && matches!(
+                tool_name,
+                "read"
+                    | "list"
+                    | "glob"
+                    | "grep"
+                    | "inspect_directory"
+                    | "skill"
+                    | "docling_convert"
+                    | "mcp_call"
+            )
+    }
+
+    pub(crate) fn constrain_read_schema_to_missing_authoring_targets(
+        tools: &mut [crate::llm::ToolSchema],
+        envelope: &AuthoringGroundingRecoveryEnvelope,
+    ) {
+        if envelope.missing_grounding_targets.is_empty() {
+            return;
+        }
+        let missing = envelope.missing_grounding_targets.clone();
+        let description = format!(
+            "Target file path. In the current authoring grounding recovery, `read` is only admissible for remaining ungrounded active target(s): {}. Already grounded target(s) {} must be edited with `write` / `apply_patch` instead of read again.",
+            envelope.missing_text(),
+            envelope.consumed_text()
+        );
+        for tool in tools.iter_mut().filter(|tool| tool.name == "read") {
+            if let Some(path_schema) = tool
+                .input_schema
+                .pointer_mut("/properties/path")
+                .and_then(Value::as_object_mut)
+            {
+                path_schema.insert("description".to_string(), json!(description));
+                path_schema.insert("enum".to_string(), json!(missing));
+            }
+        }
+    }
+
+    pub(crate) fn authoring_supporting_context_budget_recovery_read_disallowed(
+        effective_tool_name: &str,
+        arguments: &Value,
+        state: &SessionStateSnapshot,
+        history_items: &[HistoryItem],
+        workspace_root: &Utf8Path,
+        turn_grounded_targets: &BTreeSet<String>,
+    ) -> bool {
+        if effective_tool_name != "read" {
+            return false;
+        }
+        let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+            return true;
+        };
+        let active_targets = active_authoring_target_keys(state);
+        let Some(target) =
+            matching_active_target_key(&normalize_path_for_target_match(path), &active_targets)
+        else {
+            return true;
+        };
+        !authoring_missing_grounding_targets(
+            history_items,
+            state,
+            workspace_root,
+            turn_grounded_targets,
+        )
+        .contains(&target)
+    }
+
+    pub(crate) fn docs_existing_target_update_keeps_exact_read_grounding_fixture_passes() -> bool {
+        let Ok(temp) = tempfile::tempdir() else {
+            return false;
+        };
+        let Ok(workspace_root) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
+            return false;
+        };
+        if std::fs::create_dir_all(workspace_root.join("docs").as_std_path()).is_err()
+            || std::fs::write(
+                workspace_root.join("docs/workflow-design.md").as_std_path(),
+                "# Existing design\n\nCurrent content.\n",
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let mut state = SessionStateSnapshot::default();
+        state.route = TaskRoute::Docs;
+        state.process_phase = ProcessPhase::Author;
+        state.completion.open_work_count = 1;
+        state.active_targets = vec![Utf8PathBuf::from("docs/workflow-design.md")];
+
+        let active = TurnLifecycleKernel::existing_target_grounding_recovery_active(
+            &state,
+            active_authoring_targets_need_grounding(&[], &state, &workspace_root, &BTreeSet::new()),
+        );
+        let stable_tools = ["apply_patch", "grep", "read", "shell", "todowrite", "write"]
+            .into_iter()
+            .map(|name| crate::llm::ToolSchema {
+                name: name.to_string(),
+                description: format!("{name} tool"),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}}
+                }),
+                strict: false,
+            })
+            .collect::<Vec<_>>();
+        let mut visible = stable_tools.clone();
+        let recovery = TurnLifecycleRecoveryContext {
+            existing_target_grounding_recovery_active: active,
+            open_obligation_final_message_recovery_active: true,
+            open_obligation_final_message_count: 1,
+            ..TurnLifecycleRecoveryContext::default()
+        };
+        TurnLifecycleKernel::apply_pre_normalization_recovery_surface(
+            &mut visible,
+            &stable_tools,
+            TurnLifecyclePreNormalizationSurfaceInput {
+                state: &state,
+                recovery,
+                code_authoring_final_message_hard_edit_recovery_active: false,
+                code_authoring_final_message_recovery_stable_surface_active: false,
+                code_repair_final_message_recovery_stable_surface_active: false,
+            },
+        );
+        TurnLifecycleKernel::apply_post_normalization_recovery_surface(
+            &mut visible,
+            &stable_tools,
+            TurnLifecycleRecoverySurfaceInput {
+                state: &state,
+                recovery,
+                code_authoring_final_message_hard_edit_recovery_active: false,
+                generated_test_orientation_allowed: true,
+            },
+        );
+        let envelope =
+            authoring_grounding_recovery_envelope(&[], &state, &workspace_root, &BTreeSet::new());
+        Self::constrain_read_schema_to_missing_authoring_targets(&mut visible, &envelope);
+        let visible_names = visible
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<BTreeSet<_>>();
+        let choice = compile_turn_lifecycle_tool_choice(
+            &crate::agent::prompt::PromptPolicy::default(),
+            &state,
+            &visible_names,
+            recovery,
+        );
+        let read_schema_constrained = visible
+            .iter()
+            .find(|tool| tool.name == "read")
+            .and_then(|tool| tool.input_schema.pointer("/properties/path/enum"))
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|value| value.as_str() == Some("docs/workflow-design.md"))
+            });
+        let correct_read_allowed =
+            !Self::authoring_supporting_context_budget_recovery_read_disallowed(
+                "read",
+                &json!({"path": "docs/workflow-design.md"}),
+                &state,
+                &[],
+                &workspace_root,
+                &BTreeSet::new(),
+            );
+        let wrong_read_rejected =
+            Self::authoring_supporting_context_budget_recovery_read_disallowed(
+                "read",
+                &json!({"path": "docs/other-workflow.md"}),
+                &state,
+                &[],
+                &workspace_root,
+                &BTreeSet::new(),
+            );
+
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let read_call_id = ToolCallId::new();
+        let grounded_history = vec![
+            HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: HistoryItemPayload::ToolCall {
+                    call_id: read_call_id,
+                    tool: ToolName::Read,
+                    arguments: Value::Null,
+                    model_arguments: json!({"path": "docs/workflow-design.md"}),
+                    effective_arguments: json!({"path": "docs/workflow-design.md"}),
+                    adjusted_arguments: None,
+                    permission_decision: None,
+                    sandbox_decision: None,
+                    allowed_surface: Vec::new(),
+                    retry_policy: None,
+                    terminal_guard_policy: None,
+                },
+            },
+            HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 2,
+                created_at_ms: 2,
+                payload: HistoryItemPayload::ToolOutput {
+                    call_id: read_call_id,
+                    status: ToolLifecycleStatus::Completed,
+                    title: "Read docs/workflow-design.md".to_string(),
+                    output_text: "# Existing design".to_string(),
+                    metadata: json!({"operation_progress_class": "supporting_context"}),
+                    success: Some(true),
+                    progress_effect: ToolProgressEffect::NoProgress,
+                    blocked_action: None,
+                    result_hash: Some("read-docs-workflow-design".to_string()),
+                    verification_run: None,
+                },
+            },
+        ];
+        let grounded_active = TurnLifecycleKernel::existing_target_grounding_recovery_active(
+            &state,
+            active_authoring_targets_need_grounding(
+                &grounded_history,
+                &state,
+                &workspace_root,
+                &BTreeSet::new(),
+            ),
+        );
+
+        envelope.missing_grounding_targets == vec!["docs/workflow-design.md"]
+            && active
+            && !grounded_active
+            && visible_names
+                == BTreeSet::from([
+                    "apply_patch".to_string(),
+                    "read".to_string(),
+                    "write".to_string(),
+                ])
+            && choice == ToolChoice::Auto
+            && read_schema_constrained
+            && correct_read_allowed
+            && wrong_read_rejected
+    }
+
+    pub(crate) fn docs_existing_target_grounding_fixture_domain_neutral_fixture_passes() -> bool {
+        Self::docs_existing_target_update_keeps_exact_read_grounding_fixture_passes()
+    }
+
+    pub(crate) fn generated_test_source_reference_fixture_domain_neutral_fixture_passes() -> bool {
+        Self::generated_test_consumed_source_reference_requires_active_target_fixture_passes()
+    }
+
     pub(crate) async fn record_pending_call(
         session_repo: &SqliteSessionRepository,
         session_id: SessionId,
@@ -241,6 +885,838 @@ impl ToolLifecycleRuntime {
     ) -> Result<(), AgentError> {
         session_repo.mark_tool_call_running(tool_call_id).await?;
         Ok(())
+    }
+
+    pub(crate) fn emit_candidate_repair_edit_recorded(
+        sink: &mut dyn RunEventSink,
+        tool_call_id: ToolCallId,
+        candidate: CandidateRepairEdit,
+    ) -> Result<(), AgentError> {
+        sink.emit(crate::session::RunEvent::CandidateRepairEditRecorded {
+            tool_call_id,
+            candidate,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn emit_tool_proposal_rejected(
+        sink: &mut dyn RunEventSink,
+        tool_call_id: ToolCallId,
+        proposal: RejectedToolProposal,
+    ) -> Result<(), AgentError> {
+        sink.emit(crate::session::RunEvent::ToolProposalRejected {
+            tool_call_id,
+            proposal,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn record_tool_proposal_rejected_event(
+        store: &StoreBundle,
+        session_id: SessionId,
+        protocol_turn_id: TurnId,
+        tool_call_id: ToolCallId,
+        proposal: RejectedToolProposal,
+        sink: &mut dyn RunEventSink,
+    ) -> Result<(), AgentError> {
+        let event = crate::session::RunEvent::ToolProposalRejected {
+            tool_call_id,
+            proposal,
+        };
+        let Some(sequence_no) = sink.reserve_protocol_sequence_no() else {
+            sink.emit(event)?;
+            return Ok(());
+        };
+        if let Some(projection) = crate::protocol::project_protocol_run_event(
+            &event,
+            Some(session_id),
+            protocol_turn_id,
+            sequence_no,
+        ) {
+            store.protocol_event_store().append_event_bundle(
+                &projection.runtime_event,
+                projection.history_item.as_ref(),
+                projection.turn_item.as_ref(),
+            )?;
+        }
+        sink.emit_pre_recorded(event)?;
+        Ok(())
+    }
+
+    pub(crate) fn rejected_final_message_event_persists_for_provider_replay_fixture_passes(
+        fixture_model: &str,
+        fixture_base_url: &str,
+    ) -> bool {
+        struct CountingSink {
+            next_sequence_no: i64,
+            emitted: Vec<crate::session::RunEvent>,
+        }
+
+        impl RunEventSink for CountingSink {
+            fn emit(
+                &mut self,
+                event: crate::session::RunEvent,
+            ) -> Result<(), crate::error::RuntimeError> {
+                self.next_sequence_no += 1;
+                self.emitted.push(event);
+                Ok(())
+            }
+
+            fn reserve_protocol_sequence_no(&mut self) -> Option<i64> {
+                let sequence_no = self.next_sequence_no;
+                self.next_sequence_no += 1;
+                Some(sequence_no)
+            }
+
+            fn emit_pre_recorded(
+                &mut self,
+                event: crate::session::RunEvent,
+            ) -> Result<(), crate::error::RuntimeError> {
+                self.emitted.push(event);
+                Ok(())
+            }
+        }
+
+        let unique = format!(
+            "moyai-rejected-final-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        );
+        let root_path = std::env::temp_dir().join(unique);
+        let Ok(data_dir) = Utf8PathBuf::from_path_buf(root_path) else {
+            return false;
+        };
+        let paths = crate::storage::StoragePaths {
+            data_dir: data_dir.clone(),
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+        };
+        let Ok(sqlite) = crate::storage::SqliteStore::open(&paths) else {
+            return false;
+        };
+        if sqlite.migrate().is_err() {
+            let _ = std::fs::remove_dir_all(data_dir.as_std_path());
+            return false;
+        }
+        let store = StoreBundle::new(sqlite);
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let projection_id = crate::protocol::ProjectionId::new();
+        let event = crate::session::RunEvent::ToolProposalRejected {
+            tool_call_id: ToolCallId::new(),
+            proposal: RejectedToolProposal {
+                proposal_id: crate::protocol::ToolProposalId::new(),
+                source_call_id: ToolCallId::new(),
+                requested_tool: "final_assistant_message".to_string(),
+                effective_tool: "final_assistant_message".to_string(),
+                resolved_tool: ToolName::Invalid,
+                original_arguments: json!({
+                    "projection_id": projection_id.to_string(),
+                    "text": ""
+                }),
+                adjusted_arguments: None,
+                allowed_surface: vec![ToolName::ApplyPatch],
+                blocked_reason:
+                    "The provider emitted a final message while obligations remain open."
+                        .to_string(),
+                projection_id,
+                semantic_class: "text_final_while_obligations_open".to_string(),
+                candidate_repair_id: None,
+                payload_hash: "open-obligation-final-hash".to_string(),
+                contract_refs: vec!["failed_edit_control_recovery_projection".to_string()],
+                evidence_refs: vec![
+                    "required_write_content_shape_mismatch:active-target".to_string(),
+                ],
+            },
+        };
+        let mut sink = CountingSink {
+            next_sequence_no: 1,
+            emitted: Vec::new(),
+        };
+        let recorded = match event {
+            crate::session::RunEvent::ToolProposalRejected {
+                tool_call_id,
+                proposal,
+            } => Self::record_tool_proposal_rejected_event(
+                &store,
+                session_id,
+                turn_id,
+                tool_call_id,
+                proposal,
+                &mut sink,
+            )
+            .is_ok(),
+            _ => false,
+        };
+        let history_items = store
+            .protocol_event_store()
+            .list_history_items_for_session(session_id)
+            .unwrap_or_default();
+        let session = crate::session::SessionRecord {
+            id: session_id,
+            project_id: crate::session::ProjectId::new(),
+            title: "rejected final replay persistence fixture".to_string(),
+            status: crate::session::SessionStatus::Running,
+            cwd: Utf8PathBuf::from("C:/workspace/project"),
+            model: fixture_model.to_string(),
+            base_url: fixture_base_url.to_string(),
+            access_mode: crate::config::AccessMode::Default,
+            model_parameters: crate::session::SessionModelParameters::default(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: None,
+        };
+        let replay = crate::agent::prompt::build_provider_replay_messages_from_history_items(
+            &session,
+            &history_items,
+            32,
+        );
+        let replay_text = serde_json::to_string(&replay).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(data_dir.as_std_path());
+        recorded
+            && sink.emitted.len() == 1
+            && history_items.iter().any(|item| {
+                matches!(
+                    &item.payload,
+                    HistoryItemPayload::RejectedToolProposal { proposal }
+                        if proposal.semantic_class == "text_final_while_obligations_open"
+                            && proposal.effective_tool == "final_assistant_message"
+                            && proposal.allowed_surface == vec![ToolName::ApplyPatch]
+                )
+            })
+            && replay_text.contains("Rejected model action evidence")
+            && replay_text.contains("text_final_while_obligations_open")
+            && replay_text.contains("Allowed tool surface: [apply_patch]")
+            && replay_text.contains("current TurnControlEnvelope")
+    }
+
+    pub(crate) fn operation_feedback_targets_for_turn(
+        state: &SessionStateSnapshot,
+        active_work: Option<&ActiveWorkContract>,
+    ) -> Vec<Utf8PathBuf> {
+        active_work
+            .map(ActiveWorkContract::targets)
+            .filter(|targets| !targets.is_empty())
+            .unwrap_or_else(|| state.active_targets.clone())
+    }
+
+    pub(crate) fn operation_feedback_uses_active_work_targets_fixture_passes() -> bool {
+        let mut state = SessionStateSnapshot::default();
+        state.active_targets = vec![
+            Utf8PathBuf::from("tests/workflow.behavior.md"),
+            Utf8PathBuf::from("src/workflow.rs"),
+        ];
+        let active_work = ActiveWorkContract::Verification {
+            commands: vec!["verify-contract --behavior".to_string()],
+            failing_labels: vec!["workflow-verification-contract".to_string()],
+            repair_required: true,
+            targets: vec![Utf8PathBuf::from("src/workflow.rs")],
+        };
+
+        Self::operation_feedback_targets_for_turn(&state, Some(&active_work))
+            == vec![Utf8PathBuf::from("src/workflow.rs")]
+            && Self::operation_feedback_targets_for_turn(&state, None) == state.active_targets
+    }
+
+    pub(crate) fn executed_tool_failure_terminal_guard_fixture_passes() -> bool {
+        let allowed = BTreeSet::from(["read".to_string()]);
+        let first = executed_tool_failure_no_progress_key(
+            "read",
+            r#"{"path":"docs/missing-workflow.md"}"#,
+            &allowed,
+            "The system cannot find the path specified. (os error 3)",
+        );
+        let second = executed_tool_failure_no_progress_key(
+            "read",
+            r#"{"path":"docs/missing-workflow.md"}"#,
+            &allowed,
+            "指定されたパスが見つかりません。 (os error 3)",
+        );
+        first == second
+            && executed_tool_failure_terminal_message(
+                "read",
+                3,
+                "指定されたパスが見つかりません。 (os error 3)",
+            )
+            .contains("Runtime stopped")
+    }
+
+    pub(crate) fn progress_projection_terminal_guard_fixture_passes() -> bool {
+        let mut state = SessionStateSnapshot {
+            route: TaskRoute::Code,
+            process_phase: crate::session::ProcessPhase::Author,
+            ..SessionStateSnapshot::default()
+        };
+        state.active_targets = vec![
+            Utf8PathBuf::from("README.md"),
+            Utf8PathBuf::from("tests/workflow.behavior.md"),
+        ];
+        state.completion.open_work_count = 2;
+        state
+            .verification
+            .required_commands
+            .push("verify-contract --behavior".to_string());
+        let allowed = BTreeSet::from([
+            "read".to_string(),
+            "shell".to_string(),
+            "todowrite".to_string(),
+            "write".to_string(),
+        ]);
+        let first = progress_projection_no_progress_key(
+            "todowrite",
+            &state,
+            &allowed,
+            &ToolChoice::Required,
+            Some("same-result"),
+        );
+        let second = progress_projection_no_progress_key(
+            "todowrite",
+            &state,
+            &allowed,
+            &ToolChoice::Required,
+            Some("same-result"),
+        );
+        let different_result = progress_projection_no_progress_key(
+            "todowrite",
+            &state,
+            &allowed,
+            &ToolChoice::Required,
+            Some("different-result"),
+        );
+        let mut progressed_state = state.clone();
+        progressed_state
+            .active_targets
+            .retain(|target| target.as_str() != "tests/workflow.behavior.md");
+        let progressed = progress_projection_no_progress_key(
+            "todowrite",
+            &progressed_state,
+            &allowed,
+            &ToolChoice::Required,
+            Some("same-result"),
+        );
+        let result = ToolResult {
+            title: "Plan updated".to_string(),
+            output_text: "Plan updated".to_string(),
+            metadata: json!({"progress_projection": true, "todo_count": 3}),
+            truncated_output_path: None,
+            recorded_changes: Vec::new(),
+            change_summaries: Vec::new(),
+        };
+        let completion_metadata = json!({
+            "progress_projection": true,
+            "result_hash": "completed-result",
+            "tool_feedback_envelope": {
+                "result_hash": "completed-result"
+            }
+        });
+        let different_completion_metadata = json!({
+            "progress_projection": true,
+            "result_hash": "completed-different-result",
+            "tool_feedback_envelope": {
+                "result_hash": "completed-different-result"
+            }
+        });
+        let raw_missing_hash_key = progress_projection_no_progress_key(
+            "todowrite",
+            &state,
+            &allowed,
+            &ToolChoice::Required,
+            tool_result_result_hash(&result.metadata).as_deref(),
+        );
+        let completed_metadata_key = progress_projection_no_progress_key(
+            "todowrite",
+            &state,
+            &allowed,
+            &ToolChoice::Required,
+            tool_result_result_hash(&completion_metadata).as_deref(),
+        );
+        let different_completed_metadata_key = progress_projection_no_progress_key(
+            "todowrite",
+            &state,
+            &allowed,
+            &ToolChoice::Required,
+            tool_result_result_hash(&different_completion_metadata).as_deref(),
+        );
+        first == second
+            && first != different_result
+            && first != progressed
+            && raw_missing_hash_key != completed_metadata_key
+            && completed_metadata_key != different_completed_metadata_key
+            && Self::tool_result_is_progress_projection_no_content(&result)
+            && Self::should_terminalize_progress_projection_no_progress(3)
+            && Self::progress_projection_no_progress_terminal_message("todowrite", 3, &state)
+                .contains("progress projection")
+    }
+
+    pub(crate) fn open_authoring_operation_intent_classifies_non_content_tools_fixture_passes()
+    -> bool {
+        let active_work = ActiveWorkContract::RequestedWorkAuthoring {
+            pending_targets: vec![
+                Utf8PathBuf::from("README.md"),
+                Utf8PathBuf::from("src/workflow.rs"),
+                Utf8PathBuf::from("tests/workflow.behavior.md"),
+            ],
+            verification_commands: vec!["verify-contract --behavior".to_string()],
+        };
+        let operation_intents =
+            TurnLifecycleKernel::operation_intents_for_active_work(Some(&active_work));
+        let mut state = SessionStateSnapshot::default();
+        state.route = TaskRoute::Code;
+        state.process_phase = crate::session::ProcessPhase::Author;
+        state.active_targets = vec![
+            Utf8PathBuf::from("README.md"),
+            Utf8PathBuf::from("src/workflow.rs"),
+            Utf8PathBuf::from("tests/workflow.behavior.md"),
+        ];
+        state.completion.open_work_count = 3;
+        state.completion.closeout_ready = false;
+        let allowed = BTreeSet::from([
+            "read".to_string(),
+            "todowrite".to_string(),
+            "write".to_string(),
+        ]);
+        let supporting_context_metadata = json!({
+            "operation_intent": "content_changing_authoring_required",
+            "operation_progress_class": "supporting_context",
+            "progress_effect": "no_progress"
+        });
+        let progress_projection_metadata = json!({
+            "operation_intent": "content_changing_authoring_required",
+            "operation_progress_class": "progress_projection",
+            "progress_effect": "no_progress"
+        });
+
+        operation_intents == vec![OperationIntent::ContentChangingAuthoringRequired]
+            && open_authoring_operation_intent_classification_fixture_passes()
+            && Self::operation_non_content_no_progress_under_open_authoring(
+                &supporting_context_metadata,
+                &state,
+            )
+            && !Self::operation_non_content_no_progress_under_open_authoring(
+                &progress_projection_metadata,
+                &state,
+            )
+            && Self::operation_non_content_no_progress_key(
+                "read",
+                &supporting_context_metadata,
+                &state,
+                &allowed,
+                &ToolChoice::Required,
+            )
+            .contains("content_changing_authoring_required")
+            && Self::should_terminalize_operation_non_content_no_progress(
+                Self::operation_non_content_no_progress_terminal_threshold(),
+            )
+    }
+
+    pub(crate) fn open_authoring_operation_intent_preserves_tool_surface_fixture_passes() -> bool {
+        let docs_work = ActiveWorkContract::DocsRepair {
+            deliverable: Some(Utf8PathBuf::from("README.md")),
+            pending_deliverables: vec![crate::session::DocsPendingDeliverable {
+                target: Utf8PathBuf::from("README.md"),
+                summary: "topics=overview".to_string(),
+            }],
+            pending_summary: "docs route contract pending".to_string(),
+            route_contract_satisfied: false,
+        };
+        let mut state = SessionStateSnapshot::default();
+        state.route = TaskRoute::Code;
+        state.process_phase = crate::session::ProcessPhase::Author;
+        state.active_targets = vec![Utf8PathBuf::from("src/workflow.rs")];
+        state.completion.open_work_count = 1;
+        state.completion.closeout_ready = false;
+        let available = BTreeSet::from([
+            "inspect_directory".to_string(),
+            "read".to_string(),
+            "todowrite".to_string(),
+            "write".to_string(),
+            "apply_patch".to_string(),
+        ]);
+        let effective = available.clone();
+        let expected = available.clone();
+
+        effective == expected
+            && TurnLifecycleKernel::operation_intents_for_active_work(Some(&docs_work))
+                == vec![OperationIntent::ContentChangingAuthoringRequired]
+            && effective.contains("write")
+            && effective.contains("apply_patch")
+            && effective.contains("read")
+            && effective.contains("todowrite")
+            && Self::operation_non_content_no_progress_under_open_authoring(
+                &json!({
+                    "operation_intent": "content_changing_authoring_required",
+                    "operation_progress_class": "supporting_context",
+                    "progress_effect": "no_progress"
+                }),
+                &state,
+            )
+            && {
+                let read_metadata = json!({
+                    "operation_intent": "content_changing_authoring_required",
+                    "operation_progress_class": "supporting_context",
+                    "progress_effect": "no_progress",
+                    "result_hash": "read-hash"
+                });
+                let inspect_metadata = json!({
+                    "operation_intent": "content_changing_authoring_required",
+                    "operation_progress_class": "supporting_context",
+                    "progress_effect": "no_progress",
+                    "result_hash": "inspect-hash"
+                });
+                let first_key = Self::operation_non_content_no_progress_key(
+                    "read",
+                    &read_metadata,
+                    &state,
+                    &effective,
+                    &ToolChoice::Required,
+                );
+                let repeated_key = Self::operation_non_content_no_progress_key(
+                    "read",
+                    &read_metadata,
+                    &state,
+                    &effective,
+                    &ToolChoice::Required,
+                );
+                let different_key = Self::operation_non_content_no_progress_key(
+                    "inspect_directory",
+                    &inspect_metadata,
+                    &state,
+                    &effective,
+                    &ToolChoice::Required,
+                );
+                first_key == repeated_key
+                    && first_key != different_key
+                    && first_key.contains("content_changing_authoring_required")
+            }
+            && Self::should_terminalize_operation_non_content_no_progress(
+                Self::operation_non_content_no_progress_terminal_threshold(),
+            )
+    }
+
+    pub(crate) fn docs_route_semantic_no_progress_guard_fixture_passes() -> bool {
+        let mut docs_state = SessionStateSnapshot::default();
+        docs_state.route = TaskRoute::Docs;
+        docs_state.process_phase = crate::session::ProcessPhase::Author;
+        docs_state.completion.route_contract_pending = true;
+        docs_state.completion.open_work_count = 3;
+        docs_state.active_targets = vec![
+            Utf8PathBuf::from("README.md"),
+            Utf8PathBuf::from("docs/workflow-design.md"),
+            Utf8PathBuf::from("docs/workflow-contract.md"),
+        ];
+        let allowed = BTreeSet::from([
+            "list".to_string(),
+            "read".to_string(),
+            "write".to_string(),
+            "apply_patch".to_string(),
+        ]);
+        let read_metadata = json!({
+            "operation_intent": "content_changing_authoring_required",
+            "operation_progress_class": "supporting_context",
+            "progress_effect": "no_progress",
+            "result_hash": "read-a"
+        });
+        let other_read_metadata = json!({
+            "operation_intent": "content_changing_authoring_required",
+            "operation_progress_class": "supporting_context",
+            "progress_effect": "no_progress",
+            "result_hash": "read-b"
+        });
+        let list_metadata = json!({
+            "operation_intent": "content_changing_authoring_required",
+            "operation_progress_class": "supporting_context",
+            "progress_effect": "no_progress",
+            "result_hash": "list-c"
+        });
+        let first_key = Self::operation_non_content_no_progress_key(
+            "read",
+            &read_metadata,
+            &docs_state,
+            &allowed,
+            &ToolChoice::Auto,
+        );
+        let second_key = Self::operation_non_content_no_progress_key(
+            "read",
+            &other_read_metadata,
+            &docs_state,
+            &allowed,
+            &ToolChoice::Auto,
+        );
+        let list_key = Self::operation_non_content_no_progress_key(
+            "list",
+            &list_metadata,
+            &docs_state,
+            &allowed,
+            &ToolChoice::Auto,
+        );
+        let mut code_state = docs_state.clone();
+        code_state.route = TaskRoute::Code;
+        code_state.completion.route_contract_pending = false;
+        let code_first = Self::operation_non_content_no_progress_key(
+            "read",
+            &read_metadata,
+            &code_state,
+            &allowed,
+            &ToolChoice::Auto,
+        );
+        let code_second = Self::operation_non_content_no_progress_key(
+            "read",
+            &other_read_metadata,
+            &code_state,
+            &allowed,
+            &ToolChoice::Auto,
+        );
+
+        first_key == second_key
+            && second_key == list_key
+            && !first_key.contains("read-a")
+            && !first_key.contains("read-b")
+            && code_first != code_second
+            && !Self::should_terminalize_operation_non_content_no_progress_for_state(3, &docs_state)
+            && Self::should_terminalize_operation_non_content_no_progress_for_state(
+                Self::docs_route_operation_non_content_no_progress_terminal_threshold(),
+                &docs_state,
+            )
+    }
+
+    pub(crate) fn docs_route_idempotent_write_no_progress_terminal_guard_fixture_passes() -> bool {
+        let mut docs_state = SessionStateSnapshot::default();
+        docs_state.route = TaskRoute::Docs;
+        docs_state.process_phase = crate::session::ProcessPhase::Author;
+        docs_state.completion.route_contract_pending = true;
+        docs_state.completion.open_work_count = 1;
+        docs_state.active_targets = vec![Utf8PathBuf::from("README.md")];
+        let allowed = BTreeSet::from([
+            "apply_patch".to_string(),
+            "read".to_string(),
+            "write".to_string(),
+        ]);
+        let idempotent_metadata = json!({
+            "operation_intent": "content_changing_authoring_required",
+            "operation_progress_class": "idempotent_file_write_no_progress",
+            "progress_effect": "no_progress",
+            "result_hash": "same-readme-content",
+            "tool_feedback_envelope": {
+                "operation_intent": "content_changing_authoring_required",
+                "operation_progress_class": "idempotent_file_write_no_progress",
+                "progress_effect": "no_progress",
+                "result_hash": "same-readme-content",
+                "target": "README.md",
+                "no_content_change": true
+            }
+        });
+        let supporting_context_metadata = json!({
+            "operation_intent": "content_changing_authoring_required",
+            "operation_progress_class": "supporting_context",
+            "progress_effect": "no_progress",
+            "result_hash": "readme-supporting-context"
+        });
+        let mut counts = BTreeMap::new();
+        let first = Self::record_operation_non_content_no_progress(
+            &mut counts,
+            "write",
+            &idempotent_metadata,
+            &docs_state,
+            &allowed,
+            &ToolChoice::Auto,
+            true,
+        );
+        let second = Self::record_operation_non_content_no_progress(
+            &mut counts,
+            "write",
+            &idempotent_metadata,
+            &docs_state,
+            &allowed,
+            &ToolChoice::Auto,
+            true,
+        );
+        let third = Self::record_operation_non_content_no_progress(
+            &mut counts,
+            "write",
+            &idempotent_metadata,
+            &docs_state,
+            &allowed,
+            &ToolChoice::Auto,
+            true,
+        );
+
+        Self::operation_non_content_no_progress_under_open_authoring(
+            &idempotent_metadata,
+            &docs_state,
+        ) && Self::operation_non_content_no_progress_key(
+            "write",
+            &idempotent_metadata,
+            &docs_state,
+            &allowed,
+            &ToolChoice::Auto,
+        )
+        .contains("idempotent_file_write_no_progress")
+            && !Self::should_terminalize_operation_non_content_no_progress_for_state(
+                Self::operation_non_content_no_progress_terminal_threshold(),
+                &docs_state,
+            )
+            && Self::operation_non_content_no_progress_under_open_authoring(
+                &supporting_context_metadata,
+                &docs_state,
+            )
+            && first
+                .as_ref()
+                .is_some_and(|decision| decision.count == 1 && decision.terminal_message.is_none())
+            && second
+                .as_ref()
+                .is_some_and(|decision| decision.count == 2 && decision.terminal_message.is_none())
+            && third.as_ref().is_some_and(|decision| {
+                decision.count == Self::operation_non_content_no_progress_terminal_threshold()
+                    && decision.budget_exhaustion.is_none()
+                    && decision.terminal_message.as_deref().is_some_and(|message| {
+                        message.contains("idempotent file write") && message.contains("README.md")
+                    })
+            })
+    }
+
+    pub(crate) fn non_edit_invalid_tool_arguments_terminal_guard_fixture_passes() -> bool {
+        let mut state = SessionStateSnapshot::default();
+        state.route = TaskRoute::Code;
+        state.process_phase = crate::session::ProcessPhase::Author;
+        state.completion.open_work_count = 1;
+        state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+        let allowed = BTreeSet::from([
+            "apply_patch".to_string(),
+            "read".to_string(),
+            "shell".to_string(),
+            "todowrite".to_string(),
+        ]);
+        let result = invalid_tool_arguments_result(
+            "read",
+            r#"{"limit":"120","offset":"0","path":"src/workflow.rs"}"#,
+            "tool json error: invalid type: string \"120\", expected usize",
+            &state,
+            Some(&allowed),
+            Some(&ToolChoice::Auto),
+        );
+        let same_shape = invalid_tool_arguments_result(
+            "read",
+            r#"{"limit":"999","offset":"30","path":"tests/other-workflow.spec.ts"}"#,
+            "tool json error: invalid type: string \"999\", expected usize",
+            &state,
+            Some(&allowed),
+            Some(&ToolChoice::Auto),
+        );
+        let generic_key = invalid_tool_arguments_no_progress_key(
+            "read",
+            &result.metadata,
+            &state,
+            &allowed,
+            &ToolChoice::Auto,
+        );
+        let same_shape_key = invalid_tool_arguments_no_progress_key(
+            "read",
+            &same_shape.metadata,
+            &state,
+            &allowed,
+            &ToolChoice::Auto,
+        );
+        let edit_key = invalid_edit_arguments_no_progress_key(
+            "read",
+            &result.metadata,
+            &allowed,
+            &ToolChoice::Auto,
+        );
+        let mut counts = BTreeMap::<String, usize>::new();
+        let mut patch_context_targets = BTreeSet::<String>::new();
+        let mut invalid_edit_recovery = None;
+        let mut malformed_write_pending = false;
+        let mut malformed_apply_patch_pending = false;
+        let first = Self::record_invalid_arguments_lifecycle_effects(
+            InvalidArgumentsLifecycleEffectsInput {
+                effective_tool_name: "read",
+                result_metadata: &result.metadata,
+                state: &state,
+                allowed_tools: &allowed,
+                tool_choice: &ToolChoice::Auto,
+                patch_context_mismatch_grounding_targets: &mut patch_context_targets,
+                invalid_edit_argument_counts: &mut counts,
+                invalid_edit_arguments_recovery: &mut invalid_edit_recovery,
+                malformed_write_patch_recovery_pending: &mut malformed_write_pending,
+                malformed_apply_patch_write_recovery_pending: &mut malformed_apply_patch_pending,
+            },
+        );
+        let second = Self::record_invalid_arguments_lifecycle_effects(
+            InvalidArgumentsLifecycleEffectsInput {
+                effective_tool_name: "read",
+                result_metadata: &same_shape.metadata,
+                state: &state,
+                allowed_tools: &allowed,
+                tool_choice: &ToolChoice::Auto,
+                patch_context_mismatch_grounding_targets: &mut patch_context_targets,
+                invalid_edit_argument_counts: &mut counts,
+                invalid_edit_arguments_recovery: &mut invalid_edit_recovery,
+                malformed_write_patch_recovery_pending: &mut malformed_write_pending,
+                malformed_apply_patch_write_recovery_pending: &mut malformed_apply_patch_pending,
+            },
+        );
+        let third = Self::record_invalid_arguments_lifecycle_effects(
+            InvalidArgumentsLifecycleEffectsInput {
+                effective_tool_name: "read",
+                result_metadata: &result.metadata,
+                state: &state,
+                allowed_tools: &allowed,
+                tool_choice: &ToolChoice::Auto,
+                patch_context_mismatch_grounding_targets: &mut patch_context_targets,
+                invalid_edit_argument_counts: &mut counts,
+                invalid_edit_arguments_recovery: &mut invalid_edit_recovery,
+                malformed_write_patch_recovery_pending: &mut malformed_write_pending,
+                malformed_apply_patch_write_recovery_pending: &mut malformed_apply_patch_pending,
+            },
+        );
+        edit_key.is_none()
+            && generic_key.is_some()
+            && generic_key == same_shape_key
+            && first.is_none()
+            && second.is_none()
+            && third.is_some_and(|message| {
+                message.contains("Provider repeated invalid arguments for `read`")
+                    && message.contains("tests/workflow.spec.ts")
+                    && message.contains("malformed supporting tool call")
+            })
+    }
+
+    pub(crate) fn parse_route_arguments(
+        route: &ToolRouteDecision,
+    ) -> Result<Value, RouteArgumentParseError> {
+        serde_json::from_str::<Value>(&route.effective_arguments_json).map_err(|error| {
+            RouteArgumentParseError {
+                message: error.to_string(),
+            }
+        })
+    }
+
+    pub(crate) fn tool_execution_invalid_arguments_result(
+        input: ToolExecutionInvalidArgumentsInput<'_>,
+    ) -> ToolResult {
+        invalid_tool_arguments_result(
+            input.effective_tool_name,
+            input.effective_arguments_json,
+            input.error_text,
+            input.state,
+            Some(input.allowed_tools),
+            Some(input.tool_choice),
+        )
+    }
+
+    pub(crate) fn tool_execution_cancelled_error_message() -> &'static str {
+        "tool execution cancelled by user"
+    }
+
+    pub(crate) fn tool_execution_error_text(error: &ToolError) -> String {
+        error.to_string()
+    }
+
+    pub(crate) fn tool_execution_error_is_invalid_arguments(error_text: &str) -> bool {
+        is_invalid_tool_arguments_error(error_text)
     }
 
     pub(crate) async fn execute_registered_call(
@@ -339,16 +1815,10 @@ impl ToolLifecycleRuntime {
             )
             .await?;
         if let Some(proposal) = rejected_tool_proposal_from_metadata(&metadata) {
-            sink.emit(crate::session::RunEvent::ToolProposalRejected {
-                tool_call_id,
-                proposal,
-            })?;
+            Self::emit_tool_proposal_rejected(sink, tool_call_id, proposal)?;
         }
         if let Some(candidate) = candidate_repair_edit_from_metadata(&metadata) {
-            sink.emit(crate::session::RunEvent::CandidateRepairEditRecorded {
-                tool_call_id,
-                candidate,
-            })?;
+            Self::emit_candidate_repair_edit_recorded(sink, tool_call_id, candidate)?;
         }
         sink.emit_pre_recorded(event)?;
         Ok(metadata)
@@ -364,23 +1834,18 @@ impl ToolLifecycleRuntime {
         result: &ToolResult,
         route: &ToolRouteDecision,
         workspace_root: &Utf8Path,
-        active_targets: &[Utf8PathBuf],
+        state: &SessionStateSnapshot,
+        active_work: Option<&ActiveWorkContract>,
         sink: &mut dyn RunEventSink,
     ) -> Result<Value, AgentError> {
-        let result_metadata = classify_executed_result_for_operation_intent(
+        let operation_feedback_targets =
+            Self::operation_feedback_targets_for_turn(state, active_work);
+        let metadata = executed_completion_metadata(
             tool_name,
             result,
             route,
-            Some(workspace_root),
-        );
-        let metadata = with_active_targets_for_operation_feedback(
-            with_verification_run_result(
-                tool_name,
-                &result.output_text,
-                route.completion_metadata(result_metadata),
-                result.truncated_output_path.as_deref(),
-            ),
-            active_targets,
+            workspace_root,
+            &operation_feedback_targets,
         );
         let provider_output_text =
             render_provider_visible_operation_progress_feedback(&result.output_text, &metadata);
@@ -406,15 +1871,11 @@ impl ToolLifecycleRuntime {
                 .await?;
             sink.emit_pre_recorded(event)?;
         } else {
-            let summary = content_satisfying_changes
-                .iter()
-                .map(|change| change.summary_line(Some(workspace_root)))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let content_satisfying_change_ids = content_satisfying_changes
-                .iter()
-                .map(|change| change.change_id)
-                .collect::<Vec<_>>();
+            let diff_summary = content_satisfying_diff_summary_part(
+                tool_call_id,
+                &content_satisfying_changes,
+                workspace_root,
+            );
             let (tool_output_event, file_changes_event) = session_repo
                 .complete_tool_call_with_file_changes_protocol_bundle(
                     session_id,
@@ -425,21 +1886,7 @@ impl ToolLifecycleRuntime {
                     metadata.clone(),
                     &provider_output_text,
                     result.truncated_output_path.as_deref(),
-                    DiffSummaryPart {
-                        tool_call_id: Some(tool_call_id),
-                        change_ids: content_satisfying_change_ids,
-                        changes: content_satisfying_changes
-                            .iter()
-                            .map(|change| crate::protocol::FileChangeEvidence {
-                                change_id: change.change_id,
-                                kind: change.kind,
-                                path_before: change.path_before.clone(),
-                                path_after: change.path_after.clone(),
-                                summary: change.summary_line(Some(workspace_root)),
-                            })
-                            .collect(),
-                        summary,
-                    },
+                    diff_summary,
                     content_satisfying_changes.clone(),
                     protocol_turn_id,
                     sink.reserve_protocol_sequence_no(),
@@ -516,9 +1963,206 @@ impl ToolLifecycleRuntime {
         }
     }
 
+    pub(crate) fn record_rejected_model_action_no_progress(
+        input: RejectedModelActionNoProgressInput<'_>,
+    ) -> RejectedModelActionNoProgressDecision {
+        let provider_noncompliance = input
+            .result_metadata
+            .get("provider_noncompliance")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !provider_noncompliance && input.tool_allowed {
+            return RejectedModelActionNoProgressDecision::Continue;
+        }
+        let semantic_class = input
+            .result_metadata
+            .get("model_action_adjudication")
+            .and_then(|value| value.get("semantic_class"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool_outside_allowed_surface");
+        let result_hash = input
+            .result_metadata
+            .get("model_action_adjudication")
+            .and_then(|value| value.get("result_hash"))
+            .and_then(Value::as_str);
+        let guard_request = RejectedToolNoProgressGuardRequest {
+            effective_tool_name: input.effective_tool_name,
+            effective_arguments_json: input.effective_arguments_json,
+            allowed_tools: input.allowed_tools,
+            tool_choice: input.tool_choice,
+            required_action: input.required_action,
+            provider_noncompliance,
+            semantic_class,
+            result_hash,
+            recovery_no_progress_key: input.recovery_no_progress_key,
+        };
+        let rejected_tool_key = Self::rejected_tool_no_progress_guard_key(&guard_request);
+        let terminal_guard_feedback_was_visible = input
+            .rejected_tool_proposals
+            .contains_key(&rejected_tool_key);
+        let terminal_message =
+            Self::record_rejected_tool_no_progress(input.rejected_tool_proposals, guard_request)
+                .terminal_message;
+        if terminal_guard_feedback_was_visible {
+            if let Some(message) = terminal_message {
+                return RejectedModelActionNoProgressDecision::Fail(message);
+            }
+        } else if terminal_message.is_some() {
+            return RejectedModelActionNoProgressDecision::SuppressUntilFeedbackVisible;
+        }
+        RejectedModelActionNoProgressDecision::Continue
+    }
+
+    pub(crate) fn rejected_model_action_no_progress_effects_are_guard_owned_fixture_passes() -> bool
+    {
+        let mut counts = BTreeMap::new();
+        let allowed = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+        let mut record = || {
+            Self::record_rejected_tool_no_progress(
+                &mut counts,
+                RejectedToolNoProgressGuardRequest {
+                    effective_tool_name: "shell",
+                    effective_arguments_json: r#"{"command":"verify-contract --behavior"}"#,
+                    allowed_tools: &allowed,
+                    tool_choice: &ToolChoice::Required,
+                    required_action: None,
+                    provider_noncompliance: true,
+                    semantic_class: "provider_ignored_edit_only_surface",
+                    result_hash: Some("rejected-provider-shell"),
+                    recovery_no_progress_key: None,
+                },
+            )
+        };
+        let first = record();
+        let second = record();
+        let third = record();
+
+        first.terminal_message.is_none()
+            && second.terminal_message.is_none()
+            && third.terminal_message.as_deref().is_some_and(|message| {
+                message.contains("Provider repeated a rejected model action")
+                    && message.contains("provider_ignored_edit_only_surface")
+            })
+            && first.count == 1
+            && second.count == 2
+            && third.count == 3
+            && counts.len() == 1
+    }
+
+    pub(crate) fn rejected_tool_batch_terminal_guard_waits_for_followup_fixture_passes() -> bool {
+        let allowed = BTreeSet::from([
+            "apply_patch".to_string(),
+            "docling_convert".to_string(),
+            "grep".to_string(),
+            "mcp_call".to_string(),
+            "read".to_string(),
+            "shell".to_string(),
+            "todowrite".to_string(),
+            "write".to_string(),
+        ]);
+        let required_patch = RequiredAction::edit(
+            ToolName::ApplyPatch,
+            Utf8PathBuf::from("docs/workflow-design.md"),
+        );
+        let mut counts = BTreeMap::<String, usize>::new();
+        let before_first_model_response = counts.clone();
+        let first_request = RejectedToolNoProgressGuardRequest {
+            effective_tool_name: "",
+            effective_arguments_json: r#"{"path":"src/workflow.rs"}"#,
+            allowed_tools: &allowed,
+            tool_choice: &ToolChoice::Auto,
+            required_action: Some(&required_patch),
+            provider_noncompliance: false,
+            semantic_class: "invalid_tool_call",
+            result_hash: Some("empty-tool-name-path-proposal"),
+            recovery_no_progress_key: None,
+        };
+        let first_key = Self::rejected_tool_no_progress_guard_key(&first_request);
+        let first_decision = Self::record_rejected_tool_no_progress(&mut counts, first_request);
+        let second_decision = Self::record_rejected_tool_no_progress(
+            &mut counts,
+            RejectedToolNoProgressGuardRequest {
+                effective_tool_name: "",
+                effective_arguments_json: r#"{"path":"src/workflow.rs"}"#,
+                allowed_tools: &allowed,
+                tool_choice: &ToolChoice::Auto,
+                required_action: Some(&required_patch),
+                provider_noncompliance: false,
+                semantic_class: "invalid_tool_call",
+                result_hash: Some("empty-tool-name-path-proposal"),
+                recovery_no_progress_key: None,
+            },
+        );
+        let third_decision = Self::record_rejected_tool_no_progress(
+            &mut counts,
+            RejectedToolNoProgressGuardRequest {
+                effective_tool_name: "",
+                effective_arguments_json: r#"{"path":"src/workflow.rs"}"#,
+                allowed_tools: &allowed,
+                tool_choice: &ToolChoice::Auto,
+                required_action: Some(&required_patch),
+                provider_noncompliance: false,
+                semantic_class: "invalid_tool_call",
+                result_hash: Some("empty-tool-name-path-proposal"),
+                recovery_no_progress_key: None,
+            },
+        );
+        let first_batch_terminal_is_suppressed = third_decision.terminal_message.is_some()
+            && !before_first_model_response.contains_key(&first_key);
+        let before_followup_response = counts.clone();
+        let followup_request = RejectedToolNoProgressGuardRequest {
+            effective_tool_name: "",
+            effective_arguments_json: r#"{"path":"src/workflow.rs"}"#,
+            allowed_tools: &allowed,
+            tool_choice: &ToolChoice::Auto,
+            required_action: Some(&required_patch),
+            provider_noncompliance: false,
+            semantic_class: "invalid_tool_call",
+            result_hash: Some("empty-tool-name-path-proposal"),
+            recovery_no_progress_key: None,
+        };
+        let followup_key = Self::rejected_tool_no_progress_guard_key(&followup_request);
+        let followup_decision =
+            Self::record_rejected_tool_no_progress(&mut counts, followup_request);
+
+        first_decision.count == 1
+            && first_decision.terminal_message.is_none()
+            && second_decision.count == 2
+            && second_decision.terminal_message.is_none()
+            && third_decision.count == 3
+            && first_batch_terminal_is_suppressed
+            && before_followup_response.contains_key(&followup_key)
+            && followup_decision.terminal_message.is_some()
+    }
+
     pub(crate) fn classify_pre_execution_corrective_result(
         input: PreExecutionCorrectiveInput<'_>,
     ) -> Option<PreExecutionCorrectiveDecision> {
+        if let Some(result) = Self::target_exclusive_apply_patch_contract_violation_result(
+            input.effective_tool_name,
+            input.parsed_arguments,
+            input.active_work,
+            input.state,
+            input.workspace_root,
+            input.allowed_tools,
+        ) {
+            return Some(PreExecutionCorrectiveDecision {
+                kind: PreExecutionCorrectiveKind::TargetExclusiveApplyPatchContractViolation,
+                result,
+            });
+        }
+        if let Some(result) = Self::generated_test_source_reauthoring_recovery_choice_result(
+            input.effective_tool_name,
+            input.parsed_arguments,
+            input.active_work,
+            input.workspace_root,
+            input.allowed_tools,
+        ) {
+            return Some(PreExecutionCorrectiveDecision {
+                kind: PreExecutionCorrectiveKind::GeneratedTestSourceReauthoringRecoveryChoice,
+                result,
+            });
+        }
         if let Some(result) = Self::exact_required_target_content_shape_result(
             input.effective_tool_name,
             input.parsed_arguments,
@@ -624,6 +2268,283 @@ impl ToolLifecycleRuntime {
         None
     }
 
+    fn target_exclusive_apply_patch_contract_violation_result(
+        effective_tool_name: &str,
+        parsed_arguments: &Value,
+        active_work: Option<&ActiveWorkContract>,
+        state: &SessionStateSnapshot,
+        workspace_root: &Utf8Path,
+        allowed_tools: &BTreeSet<String>,
+    ) -> Option<ToolResult> {
+        if effective_tool_name != "apply_patch" || !allowed_tools.contains("apply_patch") {
+            return None;
+        }
+        let mut active_targets = active_requested_work_targets(active_work)
+            .map(|targets| {
+                targets
+                    .iter()
+                    .map(|target| target.as_str().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if active_targets.is_empty() {
+            active_targets = state
+                .active_targets
+                .iter()
+                .map(|target| target.as_str().to_string())
+                .collect();
+        }
+        if active_targets.len() != 1 {
+            return None;
+        }
+        let active_target = active_targets.first()?.trim();
+        if active_target.is_empty() {
+            return None;
+        }
+        let patch_text = parsed_arguments.get("patch_text").and_then(Value::as_str)?;
+        let shape = target_exclusive_patch_shape(patch_text);
+        if shape.operation_targets.is_empty() && shape.end_patch_count <= 1 {
+            return None;
+        }
+        let active_keys = target_keys_for_workspace_match(active_target, workspace_root);
+        let active_operation_count = shape
+            .operation_targets
+            .iter()
+            .filter(|target| {
+                target.trim() == active_target
+                    || target_keys_for_workspace_match(target, workspace_root)
+                        .iter()
+                        .any(|key| active_keys.contains(key))
+            })
+            .count();
+        let inactive_targets = shape
+            .operation_targets
+            .iter()
+            .filter(|target| {
+                target.trim() != active_target
+                    && !target_keys_for_workspace_match(target, workspace_root)
+                        .iter()
+                        .any(|key| active_keys.contains(key))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let violates = shape.operation_targets.len() > 1
+            || (shape.operation_targets.len() == 1 && active_operation_count > 1)
+            || shape.end_patch_count > 1
+            || shape.has_payload_after_final_end_patch;
+        if !violates {
+            return None;
+        }
+        let required_action_projection = format!("apply_patch:{active_target}");
+        let current_operation_template =
+            current_operation_template_feedback(&required_action_projection).unwrap_or_default();
+        let result_hash = crate::harness::artifact::hash_bytes(
+            format!("target_exclusive_apply_patch_contract:{active_target}").as_bytes(),
+        );
+        let content_shape_contract =
+            crate::agent::content_shape_contract::artifact_content_shape_metadata_for_feedback(
+                active_target,
+            );
+        let submitted_targets = shape.operation_targets.clone();
+        let output_text = format!(
+            "The submitted apply_patch payload violates the current target-exclusive edit contract for `{active_target}`. Runtime rejected this tool call before filesystem side effects. The patch must contain exactly one operation for `{active_target}`, exactly one final `*** End Patch`, no inactive target operation headers, and no payload after the final `*** End Patch`. Current operation: {current_operation_template}."
+        );
+        Some(ToolResult {
+            title: "Target-exclusive apply_patch contract violation".to_string(),
+            output_text,
+            metadata: json!({
+                "success": false,
+                "corrective_result": true,
+                "target_exclusive_apply_patch_contract_violation": true,
+                "operation_intent": OperationIntent::ContentChangingAuthoringRequired.as_str(),
+                "operation_progress_class": "target_exclusive_apply_patch_contract_violation",
+                "progress_effect": "no_progress",
+                "active_targets": [active_target],
+                "required_target": active_target,
+                "required_action_projection": required_action_projection,
+                "current_operation_template": current_operation_template,
+                "submitted_targets": submitted_targets,
+                "inactive_submitted_targets": inactive_targets,
+                "operation_count": shape.operation_targets.len(),
+                "end_patch_count": shape.end_patch_count,
+                "has_payload_after_final_end_patch": shape.has_payload_after_final_end_patch,
+                "content_shape_contract": content_shape_contract,
+                "result_hash": result_hash,
+                "tool_feedback_envelope": {
+                    "kind": "target_exclusive_apply_patch_contract_violation",
+                    "success": false,
+                    "side_effects_applied": false,
+                    "operation_intent": OperationIntent::ContentChangingAuthoringRequired.as_str(),
+                    "operation_progress_class": "target_exclusive_apply_patch_contract_violation",
+                    "progress_effect": "no_progress",
+                    "active_targets": [active_target],
+                    "required_target": active_target,
+                    "required_action_projection": required_action_projection,
+                    "current_operation_template": current_operation_template,
+                    "submitted_targets": shape.operation_targets,
+                    "inactive_submitted_targets": inactive_targets,
+                    "operation_count": shape.operation_targets.len(),
+                    "end_patch_count": shape.end_patch_count,
+                    "has_payload_after_final_end_patch": shape.has_payload_after_final_end_patch,
+                    "content_shape_contract": content_shape_contract,
+                    "result_hash": result_hash
+                },
+                "terminal_guard_policy": {
+                    "owner": "tool_lifecycle_runtime",
+                    "no_progress_guard": true,
+                    "side_effects_applied": false,
+                    "terminal_after_repeated_corrections": OPERATION_NON_CONTENT_NO_PROGRESS_TERMINAL_THRESHOLD
+                }
+            }),
+            truncated_output_path: None,
+            recorded_changes: Vec::new(),
+            change_summaries: Vec::new(),
+        })
+    }
+
+    fn generated_test_source_reauthoring_recovery_choice_result(
+        effective_tool_name: &str,
+        parsed_arguments: &Value,
+        active_work: Option<&ActiveWorkContract>,
+        workspace_root: &Utf8Path,
+        allowed_tools: &BTreeSet<String>,
+    ) -> Option<ToolResult> {
+        if !operation_content_changing_tool_name(effective_tool_name) {
+            return None;
+        }
+        if effective_tool_name == "write"
+            && (!allowed_tools.contains("write") || allowed_tools.contains("apply_patch"))
+        {
+            return None;
+        }
+        if effective_tool_name == "apply_patch" && !allowed_tools.contains("apply_patch") {
+            return None;
+        }
+        let active_targets = active_requested_work_targets(active_work)?;
+        if active_targets.len() != 1 {
+            return None;
+        }
+        let active_target = active_targets.first()?.as_str();
+        let active_spec = classify_language_artifact_target(active_target);
+        if active_spec.role != ArtifactRole::Test {
+            return None;
+        }
+        let source_path = active_spec.source_path.as_deref()?;
+        let source_keys = target_keys_for_workspace_match(source_path, workspace_root)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if source_keys.is_empty() {
+            return None;
+        }
+        let submitted_targets = submitted_authoring_targets(effective_tool_name, parsed_arguments);
+        if submitted_targets.is_empty() {
+            return None;
+        }
+        let active_keys = target_keys_for_workspace_match(active_target, workspace_root);
+        if submitted_targets.iter().any(|target| {
+            target_keys_for_workspace_match(target, workspace_root)
+                .iter()
+                .any(|key| active_keys.contains(key))
+        }) {
+            return None;
+        }
+        let submitted_source_targets = submitted_targets
+            .iter()
+            .filter(|target| {
+                target_keys_for_workspace_match(target, workspace_root)
+                    .iter()
+                    .any(|key| source_keys.contains(key))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if submitted_source_targets.is_empty() {
+            return None;
+        }
+
+        let required_action_projection = current_authoring_required_action_projection(
+            &[active_target.to_string()],
+            allowed_tools,
+        )
+        .unwrap_or_else(|| format!("{effective_tool_name}:{active_target}"));
+        let current_operation_template =
+            current_operation_template_feedback(&required_action_projection).unwrap_or_default();
+        let content_shape_contract =
+            crate::agent::content_shape_contract::artifact_content_shape_metadata_for_feedback(
+                active_target,
+            );
+        let recovery_scaffold =
+            crate::agent::content_shape_contract::artifact_content_shape_apply_patch_recovery_scaffold(
+                active_target,
+            )
+            .unwrap_or_default();
+        let result_hash = crate::harness::artifact::hash_bytes(
+            format!(
+                "wrong_generated_test_recovery_choice|active={active_target}|source={source_path}|submitted={}",
+                submitted_source_targets.join("|")
+            )
+            .as_bytes(),
+        );
+        let submitted_line = submitted_targets
+            .iter()
+            .map(|target| format!("`{target}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(ToolResult {
+            title: "Wrong generated-test recovery choice".to_string(),
+            output_text: format!(
+                "The active generated-test authoring target is `{active_target}`, but the submitted content-changing `{effective_tool_name}` call reauthors the production source under test ({submitted_line}). Runtime rejected this call before filesystem side effects. `{source_path}` is reference evidence for the test target, not an admissible content-changing target for this turn. Use the current generated-test scaffold for `{active_target}` instead."
+            ),
+            metadata: json!({
+                "corrective_result": true,
+                "success": false,
+                "local_llm_recovery_choice_guard": true,
+                "operation_intent": OperationIntent::ContentChangingAuthoringRequired.as_str(),
+                "operation_progress_class": "wrong_generated_test_recovery_choice",
+                "progress_effect": "no_progress",
+                "active_targets": [active_target],
+                "required_target": active_target,
+                "source_target": source_path,
+                "submitted_targets": submitted_targets,
+                "submitted_source_targets": submitted_source_targets,
+                "required_action_projection": required_action_projection,
+                "current_operation_template": current_operation_template,
+                "content_shape_contract": content_shape_contract,
+                "generated_test_recovery_scaffold": recovery_scaffold,
+                "blocked_action": "production_source_reauthoring_for_generated_test_turn",
+                "result_hash": result_hash,
+                "tool_feedback_envelope": {
+                    "kind": "wrong_generated_test_recovery_choice",
+                    "success": false,
+                    "local_llm_recovery_choice_guard": true,
+                    "operation_intent": OperationIntent::ContentChangingAuthoringRequired.as_str(),
+                    "operation_progress_class": "wrong_generated_test_recovery_choice",
+                    "progress_effect": "no_progress",
+                    "side_effects_applied": false,
+                    "active_targets": [active_target],
+                    "required_target": active_target,
+                    "source_target": source_path,
+                    "submitted_targets": submitted_targets,
+                    "submitted_source_targets": submitted_source_targets,
+                    "required_action_projection": required_action_projection,
+                    "current_operation_template": current_operation_template,
+                    "content_shape_contract": content_shape_contract,
+                    "generated_test_recovery_scaffold": recovery_scaffold,
+                    "blocked_action": "production_source_reauthoring_for_generated_test_turn",
+                    "result_hash": result_hash
+                },
+                "terminal_guard_policy": {
+                    "owner": "tool_lifecycle_runtime",
+                    "no_progress_guard": true,
+                    "side_effects_applied": false,
+                    "terminal_after_repeated_corrections": LOCAL_LLM_RECOVERY_CHOICE_TERMINAL_THRESHOLD
+                }
+            }),
+            truncated_output_path: None,
+            recorded_changes: Vec::new(),
+            change_summaries: Vec::new(),
+        })
+    }
+
     fn exact_required_target_content_shape_result(
         effective_tool_name: &str,
         parsed_arguments: &Value,
@@ -652,12 +2573,12 @@ impl ToolLifecycleRuntime {
         if submitted_targets.is_empty() {
             return None;
         }
-        let active_keys = normalized_target_keys(active_target, workspace_root);
+        let active_keys = target_keys_for_workspace_match(active_target, workspace_root);
         if submitted_targets.iter().any(|submitted_target| {
             submitted_target.trim().is_empty()
                 || submitted_target == active_target
                 || (!active_keys.is_empty()
-                    && normalized_target_keys(submitted_target, workspace_root)
+                    && target_keys_for_workspace_match(submitted_target, workspace_root)
                         .iter()
                         .any(|submitted_key| active_keys.contains(submitted_key)))
         }) {
@@ -767,6 +2688,29 @@ impl ToolLifecycleRuntime {
         input: PreExecutionCorrectiveNoProgressInput<'_>,
     ) -> ToolTerminalGuardDecision {
         match input.kind {
+            PreExecutionCorrectiveKind::TargetExclusiveApplyPatchContractViolation => {
+                Self::record_corrective_content_shape_no_progress(
+                    input.operation_non_content_no_progress_counts,
+                    input.effective_tool_name,
+                    &input.result.metadata,
+                    input.state,
+                    input.allowed_tools,
+                    input.tool_choice,
+                    input.open_executable_work,
+                )
+                .unwrap_or(ToolTerminalGuardDecision {
+                    count: 0,
+                    terminal_message: None,
+                })
+            }
+            PreExecutionCorrectiveKind::GeneratedTestSourceReauthoringRecoveryChoice => {
+                Self::record_generated_test_source_reauthoring_recovery_choice_no_progress(
+                    input.wrong_authoring_target_counts,
+                    input.allowed_tools,
+                    input.tool_choice,
+                    input.result,
+                )
+            }
             PreExecutionCorrectiveKind::ArtifactContentShapeViolation => {
                 Self::record_corrective_content_shape_no_progress(
                     input.operation_non_content_no_progress_counts,
@@ -825,6 +2769,95 @@ impl ToolLifecycleRuntime {
                     input.result,
                 )
             }
+        }
+    }
+
+    pub(crate) fn record_invalid_arguments_lifecycle_effects(
+        input: InvalidArgumentsLifecycleEffectsInput<'_>,
+    ) -> Option<String> {
+        record_patch_context_mismatch_grounding_targets(
+            input.patch_context_mismatch_grounding_targets,
+            input.result_metadata,
+            input.state,
+        );
+        if let Some(envelope) = invalid_edit_arguments_control_recovery_envelope(
+            input.effective_tool_name,
+            input.result_metadata,
+            input.state,
+            input.allowed_tools,
+            input.tool_choice,
+        ) {
+            *input.invalid_edit_arguments_recovery = Some(envelope);
+        }
+        if invalid_write_arguments_need_patch_capable_recovery(
+            input.effective_tool_name,
+            input.result_metadata,
+            input.allowed_tools,
+            input.tool_choice,
+        ) {
+            *input.malformed_write_patch_recovery_pending = true;
+        }
+        if invalid_apply_patch_arguments_need_write_recovery(
+            input.effective_tool_name,
+            input.result_metadata,
+            input.state,
+            input.allowed_tools,
+            input.tool_choice,
+        ) {
+            *input.malformed_apply_patch_write_recovery_pending = true;
+        }
+        Self::record_invalid_arguments_no_progress_message(
+            input.invalid_edit_argument_counts,
+            input.effective_tool_name,
+            input.result_metadata,
+            input.state,
+            input.allowed_tools,
+            input.tool_choice,
+        )
+    }
+
+    fn record_invalid_arguments_no_progress_message(
+        counts: &mut BTreeMap<String, usize>,
+        effective_tool_name: &str,
+        metadata: &Value,
+        state: &SessionStateSnapshot,
+        allowed_tools: &BTreeSet<String>,
+        tool_choice: &ToolChoice,
+    ) -> Option<String> {
+        let (key, edit_arguments) = invalid_edit_arguments_no_progress_key(
+            effective_tool_name,
+            metadata,
+            allowed_tools,
+            tool_choice,
+        )
+        .map(|key| (key, true))
+        .or_else(|| {
+            invalid_tool_arguments_no_progress_key(
+                effective_tool_name,
+                metadata,
+                state,
+                allowed_tools,
+                tool_choice,
+            )
+            .map(|key| (key, false))
+        })?;
+        let count = counts
+            .entry(key)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        if edit_arguments {
+            should_terminalize_invalid_edit_arguments_no_progress(*count).then(|| {
+                invalid_edit_arguments_terminal_message(effective_tool_name, *count, metadata)
+            })
+        } else {
+            (*count >= INVALID_TOOL_ARGUMENTS_TERMINAL_THRESHOLD).then(|| {
+                invalid_tool_arguments_terminal_message(
+                    effective_tool_name,
+                    *count,
+                    metadata,
+                    state,
+                )
+            })
         }
     }
 
@@ -986,12 +3019,12 @@ impl ToolLifecycleRuntime {
         if exact_target.is_empty() {
             return None;
         }
-        let exact_keys = normalized_target_keys(exact_target, workspace_root)
+        let exact_keys = target_keys_for_workspace_match(exact_target, workspace_root)
             .into_iter()
             .collect::<BTreeSet<_>>();
         let submitted_keys = submitted_targets
             .iter()
-            .flat_map(|target| normalized_target_keys(target, workspace_root))
+            .flat_map(|target| target_keys_for_workspace_match(target, workspace_root))
             .collect::<BTreeSet<_>>();
         if !exact_keys.is_empty() && !submitted_keys.is_disjoint(&exact_keys) {
             return None;
@@ -1129,12 +3162,12 @@ impl ToolLifecycleRuntime {
         else {
             return false;
         };
-        let exact_keys = normalized_target_keys(exact_target, workspace_root)
+        let exact_keys = target_keys_for_workspace_match(exact_target, workspace_root)
             .into_iter()
             .collect::<BTreeSet<_>>();
         let submitted_keys = submitted_targets
             .iter()
-            .flat_map(|target| normalized_target_keys(target, workspace_root))
+            .flat_map(|target| target_keys_for_workspace_match(target, workspace_root))
             .collect::<BTreeSet<_>>();
         !exact_keys.is_empty() && !submitted_keys.is_disjoint(&exact_keys)
     }
@@ -1182,11 +3215,11 @@ impl ToolLifecycleRuntime {
         }
         let active_keys = active_targets
             .iter()
-            .flat_map(|target| normalized_target_keys(target.as_str(), workspace_root))
+            .flat_map(|target| target_keys_for_workspace_match(target.as_str(), workspace_root))
             .collect::<BTreeSet<_>>();
         let submitted_keys = submitted_targets
             .iter()
-            .flat_map(|target| normalized_target_keys(target, workspace_root))
+            .flat_map(|target| target_keys_for_workspace_match(target, workspace_root))
             .collect::<BTreeSet<_>>();
         if !active_keys.is_empty() && !submitted_keys.is_disjoint(&active_keys) {
             return None;
@@ -1288,12 +3321,12 @@ impl ToolLifecycleRuntime {
         if exact_target.is_empty() {
             return None;
         }
-        let exact_keys = normalized_target_keys(exact_target, workspace_root)
+        let exact_keys = target_keys_for_workspace_match(exact_target, workspace_root)
             .into_iter()
             .collect::<BTreeSet<_>>();
         let submitted_keys = submitted_targets
             .iter()
-            .flat_map(|target| normalized_target_keys(target, workspace_root))
+            .flat_map(|target| target_keys_for_workspace_match(target, workspace_root))
             .collect::<BTreeSet<_>>();
         if !exact_keys.is_empty() && !submitted_keys.is_disjoint(&exact_keys) {
             return None;
@@ -1453,6 +3486,31 @@ impl ToolLifecycleRuntime {
             .or_insert(1);
         let terminal_message = (*count >= WRONG_AUTHORING_TARGET_TERMINAL_THRESHOLD)
             .then(|| wrong_authoring_target_terminal_message(result, *count));
+        ToolTerminalGuardDecision {
+            count: *count,
+            terminal_message,
+        }
+    }
+
+    pub(crate) fn record_generated_test_source_reauthoring_recovery_choice_no_progress(
+        counts: &mut BTreeMap<String, usize>,
+        allowed_tools: &BTreeSet<String>,
+        tool_choice: &ToolChoice,
+        result: &ToolResult,
+    ) -> ToolTerminalGuardDecision {
+        let key = generated_test_source_reauthoring_recovery_choice_key(
+            result,
+            allowed_tools,
+            tool_choice,
+        );
+        let count = counts
+            .entry(key)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        let terminal_message =
+            (*count >= LOCAL_LLM_RECOVERY_CHOICE_TERMINAL_THRESHOLD).then(|| {
+                generated_test_source_reauthoring_recovery_choice_terminal_message(result, *count)
+            });
         ToolTerminalGuardDecision {
             count: *count,
             terminal_message,
@@ -1704,6 +3762,305 @@ impl ToolLifecycleRuntime {
         }
     }
 
+    pub(crate) fn generated_test_consumed_source_reference_requires_active_target_fixture_passes()
+    -> bool {
+        let Ok(temp) = tempfile::tempdir() else {
+            return false;
+        };
+        let Ok(workspace_root) = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()) else {
+            return false;
+        };
+        if std::fs::create_dir_all(workspace_root.join("src").as_std_path()).is_err()
+            || std::fs::create_dir_all(workspace_root.join("tests").as_std_path()).is_err()
+            || std::fs::write(
+                workspace_root.join("src/workflow.rs").as_std_path(),
+                "pub fn workflow_process(input: &str) -> String { format!(\"processed {input}\") }\n",
+            )
+            .is_err()
+            || std::fs::write(
+                workspace_root.join("tests/workflow.spec.ts").as_std_path(),
+                "workflow generated test contract: workflow source reference validates workflow_process draft handling\n",
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        let mut state = SessionStateSnapshot::default();
+        state.route = TaskRoute::Code;
+        state.process_phase = ProcessPhase::Author;
+        state.completion.open_work_count = 1;
+        state.completion.closeout_ready = false;
+        state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+        state
+            .verification
+            .required_commands
+            .push("verify-contract --behavior".to_string());
+
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let source_change = ChangeId::new();
+        let source_read_call_id = ToolCallId::new();
+        let test_read_call_id = ToolCallId::new();
+        let history = vec![
+            HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: HistoryItemPayload::FileChange {
+                    call_id: ToolCallId::new(),
+                    change_ids: vec![source_change],
+                    changes: vec![FileChangeEvidence {
+                        change_id: source_change,
+                        kind: ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        path_after: Some(Utf8PathBuf::from("src/workflow.rs")),
+                        summary: "Updated src/workflow.rs".to_string(),
+                    }],
+                    summary: "Updated src/workflow.rs".to_string(),
+                },
+            },
+            HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 2,
+                created_at_ms: 2,
+                payload: HistoryItemPayload::ToolCall {
+                    call_id: source_read_call_id,
+                    tool: ToolName::Read,
+                    arguments: Value::Null,
+                    model_arguments: json!({"path": "src/workflow.rs"}),
+                    effective_arguments: json!({"path": "src/workflow.rs"}),
+                    adjusted_arguments: None,
+                    permission_decision: None,
+                    sandbox_decision: None,
+                    allowed_surface: Vec::new(),
+                    retry_policy: None,
+                    terminal_guard_policy: None,
+                },
+            },
+            HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 3,
+                created_at_ms: 3,
+                payload: HistoryItemPayload::ToolOutput {
+                    call_id: source_read_call_id,
+                    status: ToolLifecycleStatus::Completed,
+                    title: "Read src/workflow.rs".to_string(),
+                    output_text: "pub fn workflow_process(input: &str) -> String { format!(\"processed {input}\") }"
+                        .to_string(),
+                    metadata: json!({"operation_progress_class": "supporting_context"}),
+                    success: Some(true),
+                    progress_effect: ToolProgressEffect::NoProgress,
+                    blocked_action: None,
+                    result_hash: Some("read-workflow".to_string()),
+                    verification_run: None,
+                },
+            },
+        ];
+        let mut grounded_test_history = history.clone();
+        grounded_test_history.push(HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::ToolCall {
+                call_id: test_read_call_id,
+                tool: ToolName::Read,
+                arguments: Value::Null,
+                model_arguments: json!({"path": "tests/workflow.spec.ts"}),
+                effective_arguments: json!({"path": "tests/workflow.spec.ts"}),
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: Vec::new(),
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        });
+        grounded_test_history.push(HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 5,
+            created_at_ms: 5,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: test_read_call_id,
+                status: ToolLifecycleStatus::Completed,
+                title: "Read tests/workflow.spec.ts".to_string(),
+                output_text: "workflow generated test contract".to_string(),
+                metadata: json!({"operation_progress_class": "supporting_context"}),
+                success: Some(true),
+                progress_effect: ToolProgressEffect::NoProgress,
+                blocked_action: None,
+                result_hash: Some("read-test-workflow".to_string()),
+                verification_run: None,
+            },
+        });
+
+        let ts_source_change = ChangeId::new();
+        let ts_source_read_call_id = ToolCallId::new();
+        let ts_unread_history = vec![HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 10,
+            created_at_ms: 10,
+            payload: HistoryItemPayload::FileChange {
+                call_id: ToolCallId::new(),
+                change_ids: vec![ts_source_change],
+                changes: vec![FileChangeEvidence {
+                    change_id: ts_source_change,
+                    kind: ChangeKind::Update,
+                    path_before: Some(Utf8PathBuf::from("src/workflow.ts")),
+                    path_after: Some(Utf8PathBuf::from("src/workflow.ts")),
+                    summary: "Updated src/workflow.ts".to_string(),
+                }],
+                summary: "Updated src/workflow.ts".to_string(),
+            },
+        }];
+        let mut ts_grounded_history = ts_unread_history.clone();
+        ts_grounded_history.push(HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 11,
+            created_at_ms: 11,
+            payload: HistoryItemPayload::ToolCall {
+                call_id: ts_source_read_call_id,
+                tool: ToolName::Read,
+                arguments: Value::Null,
+                model_arguments: json!({"path": "src/workflow.ts"}),
+                effective_arguments: json!({"path": "src/workflow.ts"}),
+                adjusted_arguments: None,
+                permission_decision: None,
+                sandbox_decision: None,
+                allowed_surface: Vec::new(),
+                retry_policy: None,
+                terminal_guard_policy: None,
+            },
+        });
+        ts_grounded_history.push(HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 12,
+            created_at_ms: 12,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id: ts_source_read_call_id,
+                status: ToolLifecycleStatus::Completed,
+                title: "Read src/workflow.ts".to_string(),
+                output_text:
+                    "export const workflow_process = (input: string): string => input.trim();"
+                        .to_string(),
+                metadata: json!({"operation_progress_class": "supporting_context"}),
+                success: Some(true),
+                progress_effect: ToolProgressEffect::NoProgress,
+                blocked_action: None,
+                result_hash: Some("read-src-workflow-ts".to_string()),
+                verification_run: None,
+            },
+        });
+
+        let source_grounding_consumed =
+            !TurnLifecycleKernel::generated_test_source_reference_grounding_active(
+                &state,
+                history_has_unread_source_change_for_generated_test(&history),
+            ) && history_has_current_source_reference_read_for_generated_test(&history);
+        let generic_code_source_grounding_consumed =
+            history_has_unread_source_change_for_generated_test(&ts_unread_history)
+                && !history_has_unread_source_change_for_generated_test(&ts_grounded_history)
+                && history_has_current_source_reference_read_for_generated_test(
+                    &ts_grounded_history,
+                );
+        let target_grounding_active =
+            TurnLifecycleKernel::generated_test_reference_consumed_target_grounding_active(
+                &state,
+                history_has_current_source_reference_read_for_generated_test(&history),
+                history_has_unread_source_change_for_generated_test(&history),
+                active_authoring_targets_need_grounding(
+                    &history,
+                    &state,
+                    &workspace_root,
+                    &BTreeSet::new(),
+                ),
+            );
+        let target_grounding_consumed =
+            !TurnLifecycleKernel::generated_test_reference_consumed_target_grounding_active(
+                &state,
+                history_has_current_source_reference_read_for_generated_test(
+                    &grounded_test_history,
+                ),
+                history_has_unread_source_change_for_generated_test(&grounded_test_history),
+                active_authoring_targets_need_grounding(
+                    &grounded_test_history,
+                    &state,
+                    &workspace_root,
+                    &BTreeSet::new(),
+                ),
+            );
+
+        let mut visible = BTreeSet::from([
+            "apply_patch".to_string(),
+            "read".to_string(),
+            "shell".to_string(),
+            "write".to_string(),
+        ]);
+        if target_grounding_active {
+            visible.retain(|tool| {
+                TurnLifecycleKernel::authoring_target_grounding_recovery_tool_visible(tool)
+            });
+        }
+        let non_active_read = json!({"path": "src/workflow.rs"});
+        let active_read = json!({"path": "tests/workflow.spec.ts"});
+        let non_active_rejected = generated_test_reference_consumed_read_requires_active_target(
+            "read",
+            &non_active_read,
+            &state,
+        );
+        let active_read_allowed = !generated_test_reference_consumed_read_requires_active_target(
+            "read",
+            &active_read,
+            &state,
+        );
+        let rejection =
+            Self::generated_test_target_grounding_required_result("read", &non_active_read, &state);
+
+        source_grounding_consumed
+            && generic_code_source_grounding_consumed
+            && target_grounding_active
+            && target_grounding_consumed
+            && matches!(
+                compile_turn_lifecycle_tool_choice(
+                    &crate::agent::prompt::PromptPolicy::default(),
+                    &state,
+                    &visible,
+                    TurnLifecycleRecoveryContext {
+                        generated_test_reference_consumed_target_grounding_active: true,
+                        ..TurnLifecycleRecoveryContext::default()
+                    },
+                ),
+                ToolChoice::Auto
+            )
+            && visible == BTreeSet::from(["apply_patch".to_string(), "read".to_string()])
+            && non_active_rejected
+            && active_read_allowed
+            && rejection
+                .metadata
+                .pointer("/tool_feedback_envelope/kind")
+                .and_then(Value::as_str)
+                == Some("generated_test_target_grounding_required")
+            && rejection
+                .output_text
+                .contains("production source reference input is already current")
+    }
+
     pub(crate) fn record_authoring_target_grounding_required_no_progress(
         counts: &mut BTreeMap<String, usize>,
         result: &ToolResult,
@@ -1736,6 +4093,105 @@ impl ToolLifecycleRuntime {
         ToolTerminalGuardDecision {
             count: *count,
             terminal_message,
+        }
+    }
+
+    pub(crate) fn classify_supporting_context_corrective_result(
+        input: SupportingContextCorrectiveInput<'_>,
+    ) -> Option<SupportingContextCorrectiveDecision> {
+        if input.docs_budget_exhausted {
+            let budget_key = input.docs_budget_key?;
+            return Some(SupportingContextCorrectiveDecision {
+                kind: SupportingContextCorrectiveKind::DocsBudgetExhausted,
+                budget_key: Some(budget_key),
+                result: Self::docs_supporting_context_budget_exhausted_result(
+                    input.effective_tool_name,
+                    input.parsed_arguments,
+                    input.state,
+                ),
+            });
+        }
+        if input.authoring_grounding_required {
+            let envelope = input.authoring_grounding_recovery?;
+            return Some(SupportingContextCorrectiveDecision {
+                kind: SupportingContextCorrectiveKind::AuthoringTargetGroundingRequired,
+                budget_key: None,
+                result: Self::authoring_target_grounding_required_result(
+                    input.effective_tool_name,
+                    input.parsed_arguments,
+                    input.state,
+                    envelope,
+                ),
+            });
+        }
+        if input.generated_test_grounding_required {
+            return Some(SupportingContextCorrectiveDecision {
+                kind: SupportingContextCorrectiveKind::GeneratedTestTargetGroundingRequired,
+                budget_key: None,
+                result: Self::generated_test_target_grounding_required_result(
+                    input.effective_tool_name,
+                    input.parsed_arguments,
+                    input.state,
+                ),
+            });
+        }
+        None
+    }
+
+    pub(crate) fn prepare_supporting_context_corrective_input(
+        input: SupportingContextCorrectivePreparationInput<'_>,
+    ) -> PreparedSupportingContextCorrectiveInput {
+        let docs_budget_key = Self::docs_route_supporting_context_budget_applies(
+            input.effective_tool_name,
+            input.state,
+        )
+        .then(|| {
+            Self::docs_route_supporting_context_budget_key(
+                input.state,
+                input.allowed_tools,
+                input.tool_choice,
+            )
+        });
+        let docs_budget_exhausted = docs_budget_key.as_ref().is_some_and(|budget_key| {
+            input
+                .docs_supporting_context_budget_exhausted
+                .contains(budget_key)
+        });
+        let authoring_grounding_recovery_read_disallowed =
+            Self::authoring_supporting_context_budget_recovery_read_disallowed(
+                input.effective_tool_name,
+                input.parsed_arguments,
+                input.state,
+                input.history_items,
+                input.workspace_root,
+                input.authoring_grounded_active_targets,
+            );
+        let authoring_grounding_required = authoring_grounding_recovery_read_disallowed
+            && (TurnLifecycleKernel::authoring_supporting_context_budget_recovery_surface_active(
+                input.state,
+                input.authoring_supporting_context_budget_exhausted,
+            ) || input.existing_target_grounding_recovery_active);
+        let authoring_grounding_recovery = authoring_grounding_required.then(|| {
+            authoring_grounding_recovery_envelope(
+                input.history_items,
+                input.state,
+                input.workspace_root,
+                input.authoring_grounded_active_targets,
+            )
+        });
+        let generated_test_grounding_required = input
+            .generated_test_reference_consumed_target_grounding_active
+            && generated_test_reference_consumed_read_requires_active_target(
+                input.effective_tool_name,
+                input.parsed_arguments,
+                input.state,
+            );
+        PreparedSupportingContextCorrectiveInput {
+            docs_budget_key,
+            docs_budget_exhausted,
+            authoring_grounding_recovery,
+            authoring_grounding_required,
+            generated_test_grounding_required,
         }
     }
 
@@ -1828,6 +4284,1097 @@ impl ToolLifecycleRuntime {
             count: *count,
             terminal_message,
         }
+    }
+
+    pub(crate) fn docs_route_supporting_context_budget_exhaustion_is_recoverable_fixture_passes()
+    -> bool {
+        let mut docs_state = SessionStateSnapshot::default();
+        docs_state.route = TaskRoute::Docs;
+        docs_state.process_phase = crate::session::ProcessPhase::Author;
+        docs_state.completion.route_contract_pending = true;
+        docs_state.completion.open_work_count = 3;
+        docs_state.active_targets = vec![
+            Utf8PathBuf::from("docs/workflow-overview.md"),
+            Utf8PathBuf::from("docs/workflow-design.md"),
+            Utf8PathBuf::from("docs/workflow-contract.md"),
+        ];
+        let allowed = BTreeSet::from([
+            "list".to_string(),
+            "read".to_string(),
+            "write".to_string(),
+            "apply_patch".to_string(),
+        ]);
+        let metadata = json!({
+            "operation_intent": "content_changing_authoring_required",
+            "operation_progress_class": "supporting_context",
+            "progress_effect": "no_progress",
+            "result_hash": "omitted-for-docs"
+        });
+        let operation_key = Self::operation_non_content_no_progress_key(
+            "read",
+            &metadata,
+            &docs_state,
+            &allowed,
+            &ToolChoice::Auto,
+        );
+        let budget_key = Self::docs_route_supporting_context_budget_key(
+            &docs_state,
+            &allowed,
+            &ToolChoice::Auto,
+        );
+        let result = Self::docs_supporting_context_budget_exhausted_result(
+            "read",
+            &json!({"path": "docs/workflow-reference.md"}),
+            &docs_state,
+        );
+        let mut counts = BTreeMap::new();
+        let _ = Self::record_docs_supporting_context_budget_exhausted_no_progress(
+            &mut counts,
+            budget_key.clone(),
+            &docs_state,
+        );
+        let _ = Self::record_docs_supporting_context_budget_exhausted_no_progress(
+            &mut counts,
+            budget_key.clone(),
+            &docs_state,
+        );
+        let terminal = Self::record_docs_supporting_context_budget_exhausted_no_progress(
+            &mut counts,
+            budget_key.clone(),
+            &docs_state,
+        )
+        .terminal_message
+        .unwrap_or_default();
+        operation_key == budget_key
+            && Self::docs_route_supporting_context_budget_applies("read", &docs_state)
+            && !Self::docs_route_supporting_context_budget_applies("write", &docs_state)
+            && result.recorded_changes.is_empty()
+            && result.change_summaries.is_empty()
+            && result.output_text.contains("write")
+            && result.output_text.contains("apply_patch")
+            && result.output_text.contains("不明")
+            && result
+                .metadata
+                .pointer("/tool_feedback_envelope/operation_progress_class")
+                .and_then(Value::as_str)
+                == Some("docs_supporting_context_budget_exhausted")
+            && result
+                .metadata
+                .pointer("/terminal_guard_policy/terminal_after_repeated_corrections")
+                .and_then(Value::as_u64)
+                == Some(3)
+            && terminal.contains("budget was exhausted")
+    }
+
+    pub(crate) fn docs_route_budget_exhaustion_narrows_recovery_surface_fixture_passes() -> bool {
+        let mut docs_state = SessionStateSnapshot::default();
+        docs_state.route = TaskRoute::Docs;
+        docs_state.process_phase = crate::session::ProcessPhase::Author;
+        docs_state.completion.route_contract_pending = true;
+        docs_state.completion.open_work_count = 3;
+        docs_state.active_targets = vec![
+            Utf8PathBuf::from("docs/workflow-overview.md"),
+            Utf8PathBuf::from("docs/workflow-design.md"),
+            Utf8PathBuf::from("docs/workflow-contract.md"),
+        ];
+        let allowed = BTreeSet::from([
+            "apply_patch".to_string(),
+            "glob".to_string(),
+            "grep".to_string(),
+            "list".to_string(),
+            "read".to_string(),
+            "todowrite".to_string(),
+            "write".to_string(),
+        ]);
+        let exhausted = BTreeSet::from([Self::docs_route_supporting_context_budget_key(
+            &docs_state,
+            &allowed,
+            &ToolChoice::Auto,
+        )]);
+        let mut visible = allowed.clone();
+        if TurnLifecycleKernel::docs_route_supporting_context_budget_recovery_surface_active(
+            &docs_state,
+            &exhausted,
+        ) {
+            visible.retain(|tool| {
+                TurnLifecycleKernel::docs_route_supporting_context_budget_recovery_tool_visible(
+                    tool,
+                )
+            });
+        }
+        let mut inactive_state = docs_state.clone();
+        inactive_state.route = TaskRoute::Code;
+
+        visible
+            == BTreeSet::from([
+                "apply_patch".to_string(),
+                "todowrite".to_string(),
+                "write".to_string(),
+            ])
+            && !visible.contains("read")
+            && !visible.contains("list")
+            && !visible.contains("grep")
+            && TurnLifecycleKernel::docs_route_supporting_context_budget_recovery_surface_active(
+                &docs_state,
+                &exhausted,
+            )
+            && !TurnLifecycleKernel::docs_route_supporting_context_budget_recovery_surface_active(
+                &inactive_state,
+                &exhausted,
+            )
+    }
+
+    pub(crate) fn docs_route_budget_exhaustion_survives_partial_write_fixture_passes() -> bool {
+        let mut docs_state = SessionStateSnapshot::default();
+        docs_state.route = TaskRoute::Docs;
+        docs_state.process_phase = crate::session::ProcessPhase::Author;
+        docs_state.completion.route_contract_pending = true;
+        docs_state.completion.open_work_count = 2;
+        docs_state.active_targets = vec![
+            Utf8PathBuf::from("docs/workflow-design.md"),
+            Utf8PathBuf::from("docs/workflow-contract.md"),
+        ];
+        let exhausted = BTreeSet::from(["docs-budget".to_string()]);
+        let mut retained = exhausted.clone();
+        if !TurnLifecycleKernel::docs_route_contract_pending_after_file_change(&docs_state) {
+            retained.clear();
+        }
+        let mut visible = BTreeSet::from([
+            "apply_patch".to_string(),
+            "list".to_string(),
+            "read".to_string(),
+            "todowrite".to_string(),
+            "write".to_string(),
+        ]);
+        if TurnLifecycleKernel::docs_route_supporting_context_budget_recovery_surface_active(
+            &docs_state,
+            &retained,
+        ) {
+            visible.retain(|tool| {
+                TurnLifecycleKernel::docs_route_supporting_context_budget_recovery_tool_visible(
+                    tool,
+                )
+            });
+        }
+        docs_state.completion.route_contract_pending = false;
+        let mut cleared = exhausted.clone();
+        if !TurnLifecycleKernel::docs_route_contract_pending_after_file_change(&docs_state) {
+            cleared.clear();
+        }
+
+        retained == exhausted
+            && visible
+                == BTreeSet::from([
+                    "apply_patch".to_string(),
+                    "todowrite".to_string(),
+                    "write".to_string(),
+                ])
+            && cleared.is_empty()
+    }
+
+    pub(crate) fn docs_route_supporting_context_budget_fixture_workflow_neutral_fixture_passes()
+    -> bool {
+        let source = include_str!("tool_orchestrator.rs");
+        let fixture_block = source
+            .split(
+                "pub(crate) fn docs_route_supporting_context_budget_exhaustion_is_recoverable_fixture_passes",
+            )
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub(crate) fn record_operation_non_content_no_progress")
+                    .next()
+            })
+            .unwrap_or_default();
+
+        !fixture_block.contains("README.md")
+            && !fixture_block.contains("basic_design.md")
+            && !fixture_block.contains("detail_design.md")
+            && fixture_block.contains("docs/workflow-overview.md")
+            && fixture_block.contains("docs/workflow-design.md")
+            && fixture_block.contains("docs/workflow-contract.md")
+    }
+
+    pub(crate) fn docs_route_budget_edit_surface_fixture_passes() -> bool {
+        Self::docs_route_supporting_context_budget_exhaustion_is_recoverable_fixture_passes()
+            && Self::docs_route_supporting_context_budget_fixture_workflow_neutral_fixture_passes()
+            && Self::docs_route_budget_exhaustion_narrows_recovery_surface_fixture_passes()
+            && Self::docs_route_budget_exhaustion_survives_partial_write_fixture_passes()
+    }
+
+    pub(crate) fn edit_surface_registry_symmetry_fixture_passes() -> bool {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let call_id = ToolCallId::new();
+        let _active_work = ActiveWorkContract::RequestedWorkAuthoring {
+            pending_targets: vec![
+                Utf8PathBuf::from("src/workflow.rs"),
+                Utf8PathBuf::from("tests/workflow.behavior.md"),
+            ],
+            verification_commands: vec!["verify-contract --behavior".to_string()],
+        };
+        let mut state = SessionStateSnapshot::default();
+        state.route = TaskRoute::Code;
+        state.process_phase = ProcessPhase::Author;
+        state.active_targets = vec![
+            Utf8PathBuf::from("src/workflow.rs"),
+            Utf8PathBuf::from("tests/workflow.behavior.md"),
+        ];
+        state.completion.open_work_count = 2;
+        state.completion.closeout_ready = false;
+        let history_items = vec![
+            HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: HistoryItemPayload::ToolCall {
+                    call_id,
+                    tool: ToolName::Write,
+                    arguments: json!({"path": "docs/other-workflow.md", "content": "stale workflow draft"}),
+                    model_arguments: Value::Null,
+                    effective_arguments: json!({"path": "docs/other-workflow.md", "content": "stale workflow draft"}),
+                    adjusted_arguments: None,
+                    permission_decision: None,
+                    sandbox_decision: None,
+                    allowed_surface: vec![ToolName::Write, ToolName::ApplyPatch],
+                    retry_policy: None,
+                    terminal_guard_policy: None,
+                },
+            },
+            HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 2,
+                created_at_ms: 2,
+                payload: HistoryItemPayload::ToolOutput {
+                    call_id,
+                    status: ToolLifecycleStatus::Completed,
+                    title: "Wrong authoring target".to_string(),
+                    output_text: "The submitted write call targeted docs/other-workflow.md, but active targets are src/workflow.rs and tests/workflow.behavior.md.".to_string(),
+                    metadata: json!({
+                        "operation_intent": OperationIntent::ContentChangingAuthoringRequired.as_str(),
+                        "operation_progress_class": "wrong_authoring_target",
+                        "progress_effect": "no_progress",
+                        "submitted_targets": ["docs/other-workflow.md"],
+                        "active_authoring_targets": ["src/workflow.rs", "tests/workflow.behavior.md"]
+                    }),
+                    success: Some(false),
+                    progress_effect: ToolProgressEffect::NoProgress,
+                    blocked_action: None,
+                    result_hash: Some("wrong-target-workflow-doc".to_string()),
+                    verification_run: None,
+                },
+            },
+        ];
+        let available = BTreeSet::from([
+            "read".to_string(),
+            "write".to_string(),
+            "apply_patch".to_string(),
+        ]);
+        let effective = available.clone();
+        let _ = history_items;
+        effective.contains("write")
+            && effective.contains("apply_patch")
+            && effective.contains("read")
+            && crate::agent::prompt::provider_replay_preserves_failed_inactive_authoring_feedback()
+    }
+
+    pub(crate) fn fixture_executable_verification_command(command: &str) -> String {
+        crate::tool::shell::command_text_encoding_suggested_command(
+            command,
+            crate::config::ShellFamily::PowerShell,
+        )
+        .unwrap_or_else(|| command.to_string())
+    }
+
+    pub(crate) fn verification_active_work_preserves_tool_surface_and_rejects_wrong_command_fixture_passes()
+    -> bool {
+        Self::verification_active_work_preserves_tool_surface_and_rejects_wrong_command_failed_checks(
+        )
+        .is_empty()
+    }
+
+    pub(crate) fn repair_active_shell_probe_uses_repair_target_authority_fixture_passes() -> bool {
+        let mut state = SessionStateSnapshot::default();
+        state.process_phase = crate::session::ProcessPhase::Repair;
+        state.active_targets = vec![Utf8PathBuf::from("tests/workflow.spec.ts")];
+        state.failure = Some(crate::session::FailureState {
+            kind: crate::session::FailureKind::VerificationFailed,
+            summary: "verification failed: generated test expected extra output formatting"
+                .to_string(),
+            tool_name: Some(ToolName::Shell),
+            targets: state.active_targets.clone(),
+        });
+        state.completion.verification_pending = true;
+        state.verification.required_commands = vec!["verify-contract --behavior".to_string()];
+        state.verification.failure_cluster = Some(VerificationFailureCluster {
+            cluster_id: "fixture-repair-active-shell-probe-target-authority".to_string(),
+            failing_labels: vec!["workflow_public_output_contract".to_string()],
+            primary_failure: Some("stdout assertion overreach".to_string()),
+            evidence: vec![crate::session::VerificationFailureEvidence {
+                evidence_kind: "verification_failure".to_string(),
+                subtype: Some("public_output_stream_assertion_mismatch".to_string()),
+                label: Some("workflow_public_output_contract".to_string()),
+                target: Some("tests/workflow.spec.ts".to_string()),
+                symbol: None,
+                call_site: Some(
+                    "workflow_public_output_contract.requires_decorative_marker(proc.stdout)"
+                        .to_string(),
+                ),
+                exception: None,
+                expected: Some("decorative".to_string()),
+                observed: Some("stdout `7`".to_string()),
+                public_state_assertions: vec!["proc.returncode".to_string()],
+                public_missing_attributes: Vec::new(),
+                evidence_markers: vec![
+                    "generated_test_contract_overreach".to_string(),
+                    "public_output_stream_assertion_mismatch".to_string(),
+                    "workflow-public-output-contract".to_string(),
+                    "generated-test public output formatting assertion overreach".to_string(),
+                ],
+                sibling_obligations: vec!["proc.returncode".to_string()],
+                requirement_refs: Vec::new(),
+                source_refs: Vec::new(),
+                test_refs: vec!["tests/workflow.spec.ts".to_string()],
+            }],
+            sibling_obligations: vec!["proc.returncode".to_string()],
+            source_refs: Vec::new(),
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
+        });
+        let repair_active = ActiveWorkContract::Verification {
+            commands: vec!["verify-contract --behavior".to_string()],
+            failing_labels: vec!["workflow_public_output_contract".to_string()],
+            repair_required: true,
+            targets: vec![Utf8PathBuf::from("tests/workflow.spec.ts")],
+        };
+        let allowed_tools = BTreeSet::from([
+            "apply_patch".to_string(),
+            "shell".to_string(),
+            "todowrite".to_string(),
+        ]);
+        let workspace_root = Utf8Path::new("C:/workspace/repair-shell");
+
+        let exact_probe_args =
+            json!({"command": "Get-Content -Encoding UTF8 tests/workflow.spec.ts"});
+        let exact_target_probe_matches = Self::repair_active_shell_probe_matches_exact_target(
+            "shell",
+            &exact_probe_args,
+            Some(&repair_active),
+            &state,
+            workspace_root,
+            &allowed_tools,
+        );
+        let exact_target_probe_wrong_verification = if exact_target_probe_matches {
+            None
+        } else {
+            Self::wrong_verification_shell_command_result(
+                "shell",
+                &exact_probe_args,
+                Some(&repair_active),
+                crate::config::ShellFamily::PowerShell,
+            )
+        };
+        let wrong_target_probe = Self::repair_active_shell_probe_target_result(
+            "shell",
+            &json!({"command": "Get-Content -Encoding UTF8 src/workflow.ts"}),
+            Some(&repair_active),
+            &state,
+            workspace_root,
+            &allowed_tools,
+        );
+        let wrong_target_result = wrong_target_probe
+            .as_ref()
+            .expect("wrong target shell probe should be repair no-progress");
+
+        exact_target_probe_matches
+            && exact_target_probe_wrong_verification.is_none()
+            && wrong_target_probe.as_ref().is_some_and(|result| {
+                result
+                    .metadata
+                    .pointer("/tool_feedback_envelope/kind")
+                    .and_then(Value::as_str)
+                    == Some("repair_shell_probe_target_mismatch")
+                    && result
+                        .metadata
+                        .pointer("/tool_feedback_envelope/required_target")
+                        .and_then(Value::as_str)
+                        == Some("tests/workflow.spec.ts")
+                    && result
+                        .metadata
+                        .pointer("/tool_feedback_envelope/submitted_targets/0")
+                        .and_then(Value::as_str)
+                        == Some("src/workflow.ts")
+            })
+            && Self::record_repair_target_authority_violation_no_progress(
+                &mut BTreeMap::new(),
+                &allowed_tools,
+                &ToolChoice::Required,
+                wrong_target_result,
+            )
+            .count
+                == 1
+    }
+
+    pub(crate) fn active_authoring_rejects_wrong_target_fixture_passes() -> bool {
+        let active = ActiveWorkContract::RequestedWorkAuthoring {
+            pending_targets: vec![
+                Utf8PathBuf::from("docs/workflow-contract.md"),
+                Utf8PathBuf::from("tests/workflow.behavior.md"),
+            ],
+            verification_commands: vec!["verify-contract --behavior".to_string()],
+        };
+        let workspace_root = Utf8Path::new("C:/workspace/route");
+        let allowed = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+        let wrong_write = Self::wrong_authoring_target_result(
+            "write",
+            &json!({"path": "src/workflow.rs", "content": "source"}),
+            Some(&active),
+            workspace_root,
+            &allowed,
+        );
+        let right_write = Self::wrong_authoring_target_result(
+            "write",
+            &json!({"path": "tests/workflow.behavior.md", "content": "tests"}),
+            Some(&active),
+            workspace_root,
+            &allowed,
+        );
+        let wrong_patch = Self::wrong_authoring_target_result(
+            "apply_patch",
+            &json!({"patch_text": "*** Begin Patch\n*** Update File: src/workflow.rs\n@@\n-pass\n+pass\n*** End Patch"}),
+            Some(&active),
+            workspace_root,
+            &allowed,
+        );
+        let right_patch = Self::wrong_authoring_target_result(
+            "apply_patch",
+            &json!({"patch_text": "*** Begin Patch\n*** Add File: docs/workflow-contract.md\n+Workflow contract overview\n*** End Patch"}),
+            Some(&active),
+            workspace_root,
+            &allowed,
+        );
+        let workspace_absolute_escaped_write = Self::wrong_authoring_target_result(
+            "write",
+            &json!({
+                "path": "C:\\\\workspace\\\\route\\\\tests/workflow.behavior.md",
+                "content": "tests"
+            }),
+            Some(&active),
+            workspace_root,
+            &allowed,
+        );
+        let outside_workspace_absolute_write = Self::wrong_authoring_target_result(
+            "write",
+            &json!({
+                "path": "C:\\\\workspace\\\\other\\\\tests/workflow.behavior.md",
+                "content": "tests"
+            }),
+            Some(&active),
+            workspace_root,
+            &allowed,
+        );
+        let mut wrong_authoring_counts = BTreeMap::new();
+        let first_wrong_args = json!({"path": "src/workflow.rs", "content": "source"});
+        let second_wrong_args = json!({"path": "src/workflow.rs", "content": "different source"});
+        let wrong_write_result = wrong_write
+            .as_ref()
+            .expect("wrong write should be rejected");
+        let first_decision = Self::record_wrong_authoring_target_no_progress(
+            &mut wrong_authoring_counts,
+            "write",
+            &first_wrong_args,
+            Some(&active),
+            workspace_root,
+            &allowed,
+            &ToolChoice::Required,
+            wrong_write_result,
+        );
+        let second_decision = Self::record_wrong_authoring_target_no_progress(
+            &mut wrong_authoring_counts,
+            "write",
+            &second_wrong_args,
+            Some(&active),
+            workspace_root,
+            &allowed,
+            &ToolChoice::Required,
+            wrong_write_result,
+        );
+        let wrong_patch_args = json!({"patch_text": "*** Begin Patch\n*** Update File: src/workflow.rs\n@@\n-pass\n+different pass\n*** End Patch"});
+        let wrong_patch_result = wrong_patch
+            .as_ref()
+            .expect("wrong patch should be rejected");
+        let cross_tool_decision = Self::record_wrong_authoring_target_no_progress(
+            &mut wrong_authoring_counts,
+            "apply_patch",
+            &wrong_patch_args,
+            Some(&active),
+            workspace_root,
+            &allowed,
+            &ToolChoice::Auto,
+            wrong_patch_result,
+        );
+        let progressed_active = ActiveWorkContract::RequestedWorkAuthoring {
+            pending_targets: vec![Utf8PathBuf::from("src/workflow.rs")],
+            verification_commands: vec!["verify-contract --behavior".to_string()],
+        };
+        let progressed_decision = Self::record_wrong_authoring_target_no_progress(
+            &mut wrong_authoring_counts,
+            "write",
+            &first_wrong_args,
+            Some(&progressed_active),
+            workspace_root,
+            &allowed,
+            &ToolChoice::Required,
+            wrong_write_result,
+        );
+
+        wrong_write.as_ref().is_some_and(|result| {
+            result.recorded_changes.is_empty()
+                && result.change_summaries.is_empty()
+                && result
+                    .metadata
+                    .get("operation_progress_class")
+                    .and_then(Value::as_str)
+                    == Some("wrong_authoring_target")
+                && result
+                    .metadata
+                    .get("tool_feedback_envelope")
+                    .and_then(|value| value.get("side_effects_applied"))
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && result.output_text.contains("docs/workflow-contract.md")
+                && result.output_text.contains("tests/workflow.behavior.md")
+        }) && right_write.is_none()
+            && wrong_patch.is_some()
+            && right_patch.is_none()
+            && workspace_absolute_escaped_write.is_none()
+            && outside_workspace_absolute_write.is_some()
+            && first_decision.count == 1
+            && second_decision.count == 2
+            && cross_tool_decision.count == 3
+            && cross_tool_decision
+                .terminal_message
+                .as_deref()
+                .is_some_and(|message| message.contains("active requested-work deliverable set"))
+            && progressed_decision.count == 1
+            && Self::docs_route_rejects_completed_deliverable_regression_fixture_passes()
+            && wrong_authoring_counts.len() == 2
+    }
+
+    pub(crate) fn docs_route_rejects_completed_deliverable_regression_fixture_passes() -> bool {
+        let docs_active = ActiveWorkContract::DocsRepair {
+            deliverable: Some(Utf8PathBuf::from("docs/workflow-design.md")),
+            pending_deliverables: vec![
+                crate::session::DocsPendingDeliverable {
+                    target: Utf8PathBuf::from("docs/workflow-design.md"),
+                    summary:
+                        "docs/workflow-design.md (topics=workflow responsibilities, data flow)"
+                            .to_string(),
+                },
+                crate::session::DocsPendingDeliverable {
+                    target: Utf8PathBuf::from("docs/workflow-contract.md"),
+                    summary: "docs/workflow-contract.md (topics=module input output, route flow)"
+                        .to_string(),
+                },
+            ],
+            pending_summary: "docs route contract is pending".to_string(),
+            route_contract_satisfied: false,
+        };
+        let workspace_root = Utf8Path::new("C:/workspace/route");
+        let allowed = BTreeSet::from(["apply_patch".to_string(), "write".to_string()]);
+        let completed_workflow_write = Self::wrong_authoring_target_result(
+            "write",
+            &json!({"path": "docs/completed-workflow.md", "content": "# stale completed deliverable"}),
+            Some(&docs_active),
+            workspace_root,
+            &allowed,
+        );
+        let active_workflow_write = Self::wrong_authoring_target_result(
+            "write",
+            &json!({"path": "docs/workflow-design.md", "content": "# Workflow design"}),
+            Some(&docs_active),
+            workspace_root,
+            &allowed,
+        );
+        let completed_workflow_patch = Self::wrong_authoring_target_result(
+            "apply_patch",
+            &json!({"patch_text": "*** Begin Patch\n*** Update File: docs/completed-workflow.md\n@@\n-old\n+new\n*** End Patch"}),
+            Some(&docs_active),
+            workspace_root,
+            &allowed,
+        );
+
+        completed_workflow_write.as_ref().is_some_and(|result| {
+            result.recorded_changes.is_empty()
+                && result.change_summaries.is_empty()
+                && result
+                    .metadata
+                    .pointer("/tool_feedback_envelope/operation_progress_class")
+                    .and_then(Value::as_str)
+                    == Some("wrong_authoring_target")
+                && result
+                    .metadata
+                    .pointer("/tool_feedback_envelope/side_effects_applied")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && result.output_text.contains("docs/workflow-design.md")
+                && !result.output_text.contains("docs/workflow-contract.md")
+        }) && active_workflow_write.is_none()
+            && completed_workflow_patch.is_some()
+    }
+
+    pub(crate) fn active_authoring_docs_regression_fixture_domain_neutral_fixture_passes() -> bool {
+        Self::active_authoring_rejects_wrong_target_fixture_passes()
+            && Self::docs_route_rejects_completed_deliverable_regression_fixture_passes()
+    }
+
+    pub(crate) fn verification_repair_rejects_non_exact_write_target_fixture_passes() -> bool {
+        let mut state = SessionStateSnapshot::default();
+        state.process_phase = crate::session::ProcessPhase::Repair;
+        state.active_targets = vec![
+            Utf8PathBuf::from("src/workflow.ts"),
+            Utf8PathBuf::from("tests/workflow.spec.ts"),
+        ];
+        state.failure = Some(crate::session::FailureState {
+            kind: crate::session::FailureKind::VerificationFailed,
+            summary: "verification failed: workflow process operation is missing".to_string(),
+            tool_name: Some(ToolName::Shell),
+            targets: state.active_targets.clone(),
+        });
+        state.completion.verification_pending = true;
+        state.verification.required_commands = vec!["verify-contract --behavior".to_string()];
+        state.verification.failure_cluster = Some(VerificationFailureCluster {
+            cluster_id: "fixture-source-owned-repair-write-admission".to_string(),
+            failing_labels: vec!["workflow_source_operation_contract".to_string()],
+            primary_failure: Some(
+                "workflow source contract missing workflow_process operation".to_string(),
+            ),
+            evidence: vec![crate::session::VerificationFailureEvidence {
+                evidence_kind: "verification_failure".to_string(),
+                subtype: Some("public_surface_operation_missing".to_string()),
+                label: Some("workflow_source_operation_contract".to_string()),
+                target: Some(" 0".to_string()),
+                symbol: Some("workflow_process".to_string()),
+                call_site: Some("workflow_process(\"draft\")".to_string()),
+                exception: None,
+                expected: Some("processed draft".to_string()),
+                observed: Some("workflow_process operation is missing".to_string()),
+                public_state_assertions: vec!["workflow_process(\"draft\")".to_string()],
+                public_missing_attributes: vec!["workflow_process".to_string()],
+                evidence_markers: vec![
+                    "workflow-source-contract".to_string(),
+                    "public_surface_operation_missing".to_string(),
+                    "public missing operation `workflow_process`".to_string(),
+                ],
+                sibling_obligations: vec!["`workflow_process` is missing".to_string()],
+                requirement_refs: Vec::new(),
+                source_refs: vec![
+                    "workflow_process(\"draft\")".to_string(),
+                    "draft workflow input".to_string(),
+                ],
+                test_refs: vec!["tests/workflow.spec.ts".to_string()],
+            }],
+            sibling_obligations: vec!["`workflow_process` is missing".to_string()],
+            source_refs: vec![
+                "workflow_process(\"draft\")".to_string(),
+                "draft workflow input".to_string(),
+            ],
+            test_refs: vec!["tests/workflow.spec.ts".to_string()],
+        });
+        let active_work = ActiveWorkContract::Verification {
+            commands: state.verification.required_commands.clone(),
+            failing_labels: state.verification.failing_labels.clone(),
+            repair_required: true,
+            targets: state.active_targets.clone(),
+        };
+        let allowed_tools = BTreeSet::from([
+            "apply_patch".to_string(),
+            "read".to_string(),
+            "todowrite".to_string(),
+            "write".to_string(),
+        ]);
+        let workspace_root = Utf8Path::new("C:/workspace/source-owned-repair");
+        let wrong_test_write = Self::repair_target_authority_violation_result(
+            "write",
+            &json!({"path": "tests/workflow.spec.ts", "content": "workflow contract test expects workflow_process\n"}),
+            Some(&active_work),
+            &state,
+            workspace_root,
+            &allowed_tools,
+        );
+        let right_source_write = Self::repair_target_authority_violation_result(
+            "write",
+            &json!({"path": "src/workflow.ts", "content": "export function workflow_process(input: string): string {\n    return input;\n}\n"}),
+            Some(&active_work),
+            &state,
+            workspace_root,
+            &allowed_tools,
+        );
+        let wrong_repair_result = wrong_test_write
+            .as_ref()
+            .expect("wrong repair target should be rejected");
+        let mut wrong_repair_target_counts = BTreeMap::new();
+        let first_wrong_repair_decision =
+            Self::record_repair_target_authority_violation_no_progress(
+                &mut wrong_repair_target_counts,
+                &allowed_tools,
+                &ToolChoice::Required,
+                wrong_repair_result,
+            );
+        let second_wrong_repair_decision =
+            Self::record_repair_target_authority_violation_no_progress(
+                &mut wrong_repair_target_counts,
+                &allowed_tools,
+                &ToolChoice::Required,
+                wrong_repair_result,
+            );
+        let third_wrong_repair_decision =
+            Self::record_repair_target_authority_violation_no_progress(
+                &mut wrong_repair_target_counts,
+                &allowed_tools,
+                &ToolChoice::Required,
+                wrong_repair_result,
+            );
+
+        wrong_test_write.as_ref().is_some_and(|result| {
+            result.recorded_changes.is_empty()
+                && result.change_summaries.is_empty()
+                && result
+                    .metadata
+                    .pointer("/tool_feedback_envelope/side_effects_applied")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && result
+                    .metadata
+                    .pointer("/repair_target_authority/exact_target")
+                    .and_then(Value::as_str)
+                    == Some("src/workflow.ts")
+                && result
+                    .metadata
+                    .pointer("/tool_feedback_envelope/operation_progress_class")
+                    .and_then(Value::as_str)
+                    == Some("wrong_repair_target")
+                && result
+                    .metadata
+                    .get("result_hash")
+                    .and_then(Value::as_str)
+                    .is_some_and(|hash| !hash.trim().is_empty())
+                && result
+                    .metadata
+                    .pointer("/tool_feedback_envelope/result_hash")
+                    .and_then(Value::as_str)
+                    .is_some_and(|hash| !hash.trim().is_empty())
+                && result
+                    .metadata
+                    .pointer("/terminal_guard_policy/terminal_after_repeated_corrections")
+                    .and_then(Value::as_u64)
+                    == Some(3)
+                && result
+                    .metadata
+                    .pointer("/repair_target_authority/forbidden_actions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().filter_map(Value::as_str).any(|item| {
+                            item == "generated_test_rewrite_for_source_owned_contract_violation"
+                        })
+                    })
+        }) && right_source_write.is_none()
+            && first_wrong_repair_decision.count == 1
+            && second_wrong_repair_decision.count == 2
+            && third_wrong_repair_decision.count == 3
+            && third_wrong_repair_decision
+                .terminal_message
+                .as_deref()
+                .is_some_and(|message| message.contains("exact repair target"))
+    }
+
+    pub(crate) fn verification_active_work_preserves_tool_surface_and_rejects_wrong_command_failed_checks()
+    -> Vec<&'static str> {
+        let executable_behavior_command =
+            Self::fixture_executable_verification_command("verify-contract --behavior");
+        let executable_schema_command = Self::fixture_executable_verification_command(
+            "verify-contract --schema src/workflow.rs",
+        );
+        let available = BTreeSet::from([
+            "read".to_string(),
+            "shell".to_string(),
+            "todowrite".to_string(),
+            "write".to_string(),
+        ]);
+        let mut state = SessionStateSnapshot::default();
+        state.process_phase = crate::session::ProcessPhase::Verify;
+        state.completion.verification_pending = true;
+        state
+            .verification
+            .required_commands
+            .push("verify-contract --behavior".to_string());
+        let active = ActiveWorkContract::Verification {
+            commands: state.verification.required_commands.clone(),
+            failing_labels: Vec::new(),
+            repair_required: false,
+            targets: Vec::new(),
+        };
+        let public_active = ActiveWorkContract::Verification {
+            commands: vec![
+                "workflow-tool combine draft + review".to_string(),
+                "workflow-tool inspect draft + review".to_string(),
+                "workflow-tool combine draft + review".to_string(),
+                "workflow-tool inspect draft + review".to_string(),
+            ],
+            failing_labels: Vec::new(),
+            repair_required: false,
+            targets: Vec::new(),
+        };
+        let public_active_deduped = ActiveWorkContract::Verification {
+            commands: vec![
+                "workflow-tool combine draft + review".to_string(),
+                "workflow-tool inspect draft + review".to_string(),
+            ],
+            failing_labels: Vec::new(),
+            repair_required: false,
+            targets: Vec::new(),
+        };
+        let schema_active = ActiveWorkContract::Verification {
+            commands: vec!["verify-contract --schema src/workflow.rs".to_string()],
+            failing_labels: Vec::new(),
+            repair_required: false,
+            targets: Vec::new(),
+        };
+        let effective = available.clone();
+        let wrong = Self::wrong_verification_shell_command_result(
+            "shell",
+            &json!({"command": "verify-contract --schema src/other.rs"}),
+            Some(&active),
+            crate::config::ShellFamily::PowerShell,
+        );
+        let non_required_probe = Self::wrong_verification_shell_command_result(
+            "shell",
+            &json!({"command": "workflow-cli src/workflow.ts --probe"}),
+            Some(&active),
+            crate::config::ShellFamily::PowerShell,
+        );
+        let right = Self::wrong_verification_shell_command_result(
+            "shell",
+            &json!({"command": "verify-contract --behavior"}),
+            Some(&active),
+            crate::config::ShellFamily::PowerShell,
+        );
+        let executable_right = Self::wrong_verification_shell_command_result(
+            "shell",
+            &json!({"command": executable_behavior_command.clone()}),
+            Some(&active),
+            crate::config::ShellFamily::PowerShell,
+        );
+        let public_exact = Self::wrong_verification_shell_command_result(
+            "shell",
+            &json!({"command": "workflow-tool combine draft + review"}),
+            Some(&public_active),
+            crate::config::ShellFamily::PowerShell,
+        );
+        let public_wrong = Self::wrong_verification_shell_command_result(
+            "shell",
+            &json!({"command": "workflow-tool combine draft + archived"}),
+            Some(&public_active),
+            crate::config::ShellFamily::PowerShell,
+        );
+        let schema_exact = Self::wrong_verification_shell_command_result(
+            "shell",
+            &json!({"command": "verify-contract --schema src/workflow.rs"}),
+            Some(&schema_active),
+            crate::config::ShellFamily::PowerShell,
+        );
+        let schema_executable_exact = Self::wrong_verification_shell_command_result(
+            "shell",
+            &json!({"command": executable_schema_command.clone()}),
+            Some(&schema_active),
+            crate::config::ShellFamily::PowerShell,
+        );
+        let schema_wrong_target = Self::wrong_verification_shell_command_result(
+            "shell",
+            &json!({"command": "verify-contract --schema src/other.rs"}),
+            Some(&schema_active),
+            crate::config::ShellFamily::PowerShell,
+        );
+        let mut public_wrong_counts = BTreeMap::new();
+        let public_wrong_args = json!({"command": "workflow-tool combine draft + archived"});
+        let public_wrong_result = public_wrong
+            .as_ref()
+            .expect("public wrong verification command should be corrective");
+        let public_wrong_deduped_decision = Self::record_wrong_verification_command_no_progress(
+            &mut public_wrong_counts,
+            &public_wrong_args,
+            Some(&public_active_deduped),
+            &effective,
+            &ToolChoice::Auto,
+            public_wrong_result,
+        );
+        let public_wrong_duplicated_decision = Self::record_wrong_verification_command_no_progress(
+            &mut public_wrong_counts,
+            &public_wrong_args,
+            Some(&public_active),
+            &effective,
+            &ToolChoice::Auto,
+            public_wrong_result,
+        );
+        let read_result = ToolResult {
+            title: "Read src/workflow.rs".to_string(),
+            output_text: "1: pub fn workflow_process(input: &str) -> String { input.to_string() }"
+                .to_string(),
+            metadata: Value::Null,
+            truncated_output_path: None,
+            recorded_changes: Vec::new(),
+            change_summaries: Vec::new(),
+        };
+        let checks = [
+            ("effective_surface", effective == available),
+            (
+                "wrong_command_projects_executable_required_command",
+                wrong.as_ref().is_some_and(|result| {
+                    result.output_text.contains("verify-contract --behavior")
+                        && result.output_text.contains(&executable_behavior_command)
+                        && result
+                            .metadata
+                            .get("operation_progress_class")
+                            .and_then(Value::as_str)
+                            == Some("wrong_verification_command")
+                        && result
+                            .metadata
+                            .get("executable_verification_commands")
+                            .and_then(Value::as_array)
+                            .is_some_and(|commands| {
+                                commands.iter().any(|command| {
+                                    command.as_str() == Some(executable_behavior_command.as_str())
+                                })
+                            })
+                }),
+            ),
+            (
+                "non_required_probe_rejected",
+                non_required_probe.as_ref().is_some_and(|result| {
+                    result.output_text.contains("verify-contract --behavior")
+                        && result
+                            .output_text
+                            .contains("Do not run public command probes")
+                        && result
+                            .metadata
+                            .get("operation_progress_class")
+                            .and_then(Value::as_str)
+                            == Some("wrong_verification_command")
+                }),
+            ),
+            ("public_exact_accepted", public_exact.is_none()),
+            (
+                "public_wrong_projects_deduped_required_commands",
+                public_wrong.as_ref().is_some_and(|result| {
+                    result
+                        .metadata
+                        .get("required_verification_commands")
+                        .and_then(Value::as_array)
+                        .is_some_and(|commands| {
+                            commands.len() == 2
+                                && commands.iter().any(|command| {
+                                    command.as_str() == Some("workflow-tool combine draft + review")
+                                })
+                                && commands.iter().any(|command| {
+                                    command.as_str() == Some("workflow-tool inspect draft + review")
+                                })
+                        })
+                        && result
+                            .metadata
+                            .get("executable_verification_commands")
+                            .and_then(Value::as_array)
+                            .is_some_and(|commands| {
+                                commands.iter().any(|command| {
+                                    command.as_str() == Some("workflow-tool combine draft + review")
+                                })
+                            })
+                }),
+            ),
+            (
+                "public_wrong_deduped_count",
+                public_wrong_deduped_decision.count == 1,
+            ),
+            (
+                "public_wrong_duplicated_count",
+                public_wrong_duplicated_decision.count == 2,
+            ),
+            (
+                "raw_required_command_gets_executable_correction",
+                right.as_ref().is_some_and(|result| {
+                    result.output_text.contains(&executable_behavior_command)
+                        && result
+                            .metadata
+                            .get("operation_progress_class")
+                            .and_then(Value::as_str)
+                            == Some("wrong_verification_command")
+                }),
+            ),
+            (
+                "executable_required_command_accepted",
+                executable_right.is_none(),
+            ),
+            (
+                "raw_schema_command_gets_executable_correction",
+                schema_exact.as_ref().is_some_and(|result| {
+                    result.output_text.contains(&executable_schema_command)
+                        && result
+                            .metadata
+                            .get("operation_progress_class")
+                            .and_then(Value::as_str)
+                            == Some("wrong_verification_command")
+                }),
+            ),
+            (
+                "executable_schema_command_accepted",
+                schema_executable_exact.is_none(),
+            ),
+            (
+                "schema_wrong_target_projects_executable_schema_command",
+                schema_wrong_target.as_ref().is_some_and(|result| {
+                    result
+                        .metadata
+                        .get("executable_verification_commands")
+                        .and_then(Value::as_array)
+                        .is_some_and(|commands| {
+                            commands.iter().any(|command| {
+                                command.as_str() == Some(executable_schema_command.as_str())
+                            })
+                        })
+                }),
+            ),
+            (
+                "verification_supporting_context_is_no_progress",
+                Self::verification_supporting_context_no_progress_under_active_verification(
+                    "read",
+                    r#"{"path":"src/workflow.rs"}"#,
+                    &read_result,
+                    &state,
+                ),
+            ),
+            (
+                "verification_supporting_context_key",
+                Self::verification_supporting_context_no_progress_key(
+                    "read",
+                    r#"{"path":"src/workflow.rs"}"#,
+                    &state,
+                    &effective,
+                    &ToolChoice::Required,
+                )
+                .contains("verification_supporting_context"),
+            ),
+            (
+                "verification_supporting_context_terminal_guard",
+                Self::should_terminalize_verification_supporting_context_no_progress(
+                    Self::verification_supporting_context_no_progress_terminal_threshold(),
+                ),
+            ),
+        ];
+        checks
+            .into_iter()
+            .filter_map(|(name, passed)| (!passed).then_some(name))
+            .collect()
     }
 
     pub(crate) fn record_operation_non_content_no_progress(
@@ -1930,6 +5477,7 @@ impl ToolLifecycleRuntime {
                     "required_write_content_shape_mismatch"
                         | "artifact_content_shape_violation"
                         | "artifact_content_shape_no_progress"
+                        | "target_exclusive_apply_patch_contract_violation"
                 )
             )
         {
@@ -2131,9 +5679,116 @@ impl ToolLifecycleRuntime {
         same_verification_failure_terminal_message(failure_count)
     }
 
+    pub(crate) fn same_verification_failure_terminal_guard_fixture_passes() -> bool {
+        let failed = json!({
+            "result_hash": "same-test-output",
+            "verification_run_result": {
+                "command": "verify-contract --behavior --utf8",
+                "status": "failed",
+                "exit_code": 1,
+                "timed_out": false,
+                "output_summary": "Passed: 9/10\nFailed: 1/10",
+                "failure_cluster": {
+                    "cluster_id": "raw-output-derived-a",
+                    "failing_labels": ["workflow_cli_contract"],
+                    "primary_failure": "Command: verify-contract --behavior --utf8",
+                    "evidence": [{
+                        "evidence_kind": "verification_failure",
+                        "subtype": "generic_verification_failure",
+                        "evidence_markers": ["generic_verification_failure"],
+                        "source_refs": ["usage text"],
+                        "test_refs": ["tests/workflow.spec.ts"]
+                    }],
+                    "source_refs": ["usage text"],
+                    "test_refs": ["tests/workflow.spec.ts"]
+                }
+            }
+        });
+        let failed_equivalent = json!({
+            "tool_feedback_envelope": {
+                "result_hash": "different-raw-output-hash"
+            },
+            "verification_run_result": {
+                "command": "verify-contract --behavior --utf8",
+                "status": "failed",
+                "exit_code": 1,
+                "timed_out": false,
+                "output_summary": "Ran 10 tests with one failure; progress dots and traceback formatting changed",
+                "failure_cluster": {
+                    "cluster_id": "raw-output-derived-b",
+                    "failing_labels": ["workflow_cli_contract"],
+                    "primary_failure": "Command: verify-contract --behavior --utf8",
+                    "evidence": [{
+                        "evidence_kind": "verification_failure",
+                        "subtype": "generic_verification_failure",
+                        "evidence_markers": ["generic_verification_failure"],
+                        "source_refs": ["usage text"],
+                        "test_refs": ["tests/workflow.spec.ts"]
+                    }],
+                    "source_refs": ["usage text"],
+                    "test_refs": ["tests/workflow.spec.ts"]
+                }
+            }
+        });
+        let different_failure = json!({
+            "result_hash": "different-test-output",
+            "verification_run_result": {
+                "command": "verify-contract --behavior --utf8",
+                "status": "failed",
+                "exit_code": 1,
+                "timed_out": false,
+                "output_summary": "Passed: 8/10\nFailed: 2/10",
+                "failure_cluster": {
+                    "cluster_id": "raw-output-derived-c",
+                    "failing_labels": ["workflow_file_output_contract"],
+                    "primary_failure": "Command: verify-contract --behavior --utf8",
+                    "evidence": [{
+                        "evidence_kind": "verification_failure",
+                        "subtype": "generic_verification_failure",
+                        "evidence_markers": ["generic_verification_failure"],
+                        "source_refs": ["file output"],
+                        "test_refs": ["tests/workflow.spec.ts"]
+                    }],
+                    "source_refs": ["file output"],
+                    "test_refs": ["tests/workflow.spec.ts"]
+                }
+            }
+        });
+        let passed = json!({
+            "verification_run_result": {
+                "command": "verify-contract --behavior --utf8",
+                "status": "passed",
+                "exit_code": 0,
+                "timed_out": false,
+                "output_summary": "Passed: 10/10\nFailed: 0/10"
+            }
+        });
+        let first = Self::same_verification_failure_no_progress_key(&failed);
+        let second = Self::same_verification_failure_no_progress_key(&failed_equivalent);
+        let different = Self::same_verification_failure_no_progress_key(&different_failure);
+        first.is_some()
+            && first == second
+            && first != different
+            && Self::verification_run_passed(&passed)
+            && Self::should_terminalize_same_verification_failure(
+                Self::same_verification_failure_terminal_threshold(),
+            )
+            && Self::same_verification_failure_terminal_message(
+                Self::same_verification_failure_terminal_threshold(),
+            )
+            .contains("same verification failure evidence repeated")
+    }
+
     pub(crate) fn verification_run_passed(metadata: &Value) -> bool {
         verification_run_passed(metadata)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetExclusivePatchShape {
+    operation_targets: Vec<String>,
+    end_patch_count: usize,
+    has_payload_after_final_end_patch: bool,
 }
 
 pub(crate) struct RejectedToolNoProgressGuardRequest<'a> {
@@ -2146,6 +5801,24 @@ pub(crate) struct RejectedToolNoProgressGuardRequest<'a> {
     pub semantic_class: &'a str,
     pub result_hash: Option<&'a str>,
     pub recovery_no_progress_key: Option<&'a str>,
+}
+
+pub(crate) struct RejectedModelActionNoProgressInput<'a> {
+    pub rejected_tool_proposals: &'a mut BTreeMap<String, usize>,
+    pub effective_tool_name: &'a str,
+    pub effective_arguments_json: &'a str,
+    pub result_metadata: &'a Value,
+    pub allowed_tools: &'a BTreeSet<String>,
+    pub tool_choice: &'a ToolChoice,
+    pub required_action: Option<&'a RequiredAction>,
+    pub tool_allowed: bool,
+    pub recovery_no_progress_key: Option<&'a str>,
+}
+
+pub(crate) enum RejectedModelActionNoProgressDecision {
+    Continue,
+    SuppressUntilFeedbackVisible,
+    Fail(String),
 }
 
 pub(crate) struct ToolTerminalGuardDecision {
@@ -2206,6 +5879,40 @@ impl AuthoringGroundingRecoveryEnvelope {
             self.consumed_text(),
             self.missing_text()
         )
+    }
+}
+
+fn target_exclusive_patch_shape(patch_text: &str) -> TargetExclusivePatchShape {
+    let normalized = patch_text.replace("\r\n", "\n").replace('\r', "\n");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    let mut operation_targets = Vec::new();
+    let mut end_patch_indexes = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(path) = trimmed
+            .strip_prefix("*** Add File: ")
+            .or_else(|| trimmed.strip_prefix("*** Update File: "))
+            .or_else(|| trimmed.strip_prefix("*** Delete File: "))
+        {
+            let target = path.trim();
+            if !target.is_empty() {
+                operation_targets.push(target.replace('\\', "/"));
+            }
+        }
+        if trimmed == "*** End Patch" {
+            end_patch_indexes.push(index);
+        }
+    }
+    let has_payload_after_final_end_patch = end_patch_indexes.last().is_some_and(|last| {
+        lines
+            .iter()
+            .skip(last + 1)
+            .any(|line| !line.trim().is_empty())
+    });
+    TargetExclusivePatchShape {
+        operation_targets,
+        end_patch_count: end_patch_indexes.len(),
+        has_payload_after_final_end_patch,
     }
 }
 
@@ -2370,6 +6077,30 @@ fn classify_executed_result_for_operation_intent(
     Value::Object(object)
 }
 
+fn executed_completion_metadata(
+    tool_name: ToolName,
+    result: &ToolResult,
+    route: &ToolRouteDecision,
+    workspace_root: &Utf8Path,
+    active_targets: &[Utf8PathBuf],
+) -> Value {
+    let result_metadata = classify_executed_result_for_operation_intent(
+        tool_name,
+        result,
+        route,
+        Some(workspace_root),
+    );
+    with_active_targets_for_operation_feedback(
+        with_verification_run_result(
+            tool_name,
+            &result.output_text,
+            route.completion_metadata(result_metadata),
+            result.truncated_output_path.as_deref(),
+        ),
+        active_targets,
+    )
+}
+
 fn with_active_targets_for_operation_feedback(
     metadata: Value,
     active_targets: &[Utf8PathBuf],
@@ -2424,6 +6155,32 @@ fn with_active_targets_for_operation_feedback(
     );
 
     Value::Object(object)
+}
+
+fn content_satisfying_diff_summary_part(
+    tool_call_id: ToolCallId,
+    changes: &[ChangeSummary],
+    workspace_root: &Utf8Path,
+) -> DiffSummaryPart {
+    DiffSummaryPart {
+        tool_call_id: Some(tool_call_id),
+        change_ids: changes.iter().map(|change| change.change_id).collect(),
+        changes: changes
+            .iter()
+            .map(|change| crate::protocol::FileChangeEvidence {
+                change_id: change.change_id,
+                kind: change.kind,
+                path_before: change.path_before.clone(),
+                path_after: change.path_after.clone(),
+                summary: change.summary_line(Some(workspace_root)),
+            })
+            .collect(),
+        summary: changes
+            .iter()
+            .map(|change| change.summary_line(Some(workspace_root)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
 }
 
 fn route_has_operation_intent(route: &ToolRouteDecision, intent: OperationIntent) -> bool {
@@ -2613,42 +6370,85 @@ fn render_provider_visible_operation_progress_feedback(
     } else {
         format!("\nsubmitted_targets: {}", submitted_targets.join(", "))
     };
-    if progress_class == "wrong_authoring_target" {
-        return format!(
-            "[tool feedback]\noperation_intent: content_changing_authoring_required\noperation_progress_class: wrong_authoring_target\nprogress_effect: no_progress{active_target_line}{required_action_line}{obligation_line}{template_line}{submitted_line}\nThe submitted content-changing call was rejected before filesystem side effects. The submitted target is historical failed-call evidence only; satisfy the current active target and required action before verification or final answer.\n\n{output_text}"
-        );
+    if let Some(special_feedback) = render_special_operation_feedback(
+        output_text,
+        metadata,
+        progress_class,
+        &active_target_line,
+        &required_action_line,
+        &obligation_line,
+        &template_line,
+        &submitted_line,
+    ) {
+        return special_feedback;
     }
 
-    let note = match progress_class {
-        "progress_projection" => {
-            "This plan update is recorded, but it did not create or modify any required workspace artifact."
-        }
-        "supporting_context" => {
-            "This context output is recorded, but it did not create or modify any required workspace artifact."
-        }
-        "no_progress" => {
-            "This tool output is recorded, but it did not create or modify any required workspace artifact."
-        }
-        "idempotent_file_write_no_progress" => {
-            "This file-changing tool output is recorded as idempotent no-progress because it produced no content change and no file-change evidence."
-        }
-        "empty_artifact_no_progress" => {
-            "This tool changed filesystem state, but the changed artifact has no content-bearing after-state and does not satisfy requested authoring work."
-        }
-        "required_write_content_shape_mismatch" => {
-            "This content-changing tool call was rejected before filesystem side effects because the submitted content violates the current required target's content-shape contract."
-        }
-        "artifact_content_shape_violation" => {
-            "This content-changing tool output is rejected because the artifact content violates its typed content-shape contract and does not satisfy requested authoring work."
-        }
-        "artifact_content_shape_no_progress" => {
-            "This tool changed filesystem state, but the changed artifact after-state violates its content-shape contract and does not satisfy requested authoring work."
-        }
-        _ => return output_text.to_string(),
+    let Some(note) = operation_feedback_note(progress_class) else {
+        return output_text.to_string();
     };
     format!(
         "{output_text}\n\n[tool feedback]\noperation_intent: content_changing_authoring_required\noperation_progress_class: {progress_class}\nprogress_effect: no_progress{active_target_line}{required_action_line}{obligation_line}{template_line}{submitted_line}\n{note}\n{continuation}"
     )
+}
+
+fn render_special_operation_feedback(
+    output_text: &str,
+    metadata: &Value,
+    progress_class: &str,
+    active_target_line: &str,
+    required_action_line: &str,
+    obligation_line: &str,
+    template_line: &str,
+    submitted_line: &str,
+) -> Option<String> {
+    match progress_class {
+        "wrong_generated_test_recovery_choice" => {
+            let scaffold_line = metadata
+                .get("tool_feedback_envelope")
+                .and_then(|feedback| feedback.get("generated_test_recovery_scaffold"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!("\ngenerated_test_recovery_scaffold: {value}"))
+                .unwrap_or_default();
+            Some(format!(
+                "[tool feedback]\noperation_intent: content_changing_authoring_required\noperation_progress_class: wrong_generated_test_recovery_choice\nprogress_effect: no_progress{active_target_line}{required_action_line}{obligation_line}{template_line}{submitted_line}{scaffold_line}\nThe submitted production-source edit was rejected before filesystem side effects. The production source is reference evidence only for this generated-test turn; satisfy the active generated-test target before verification or final answer.\n\n{output_text}"
+            ))
+        }
+        "wrong_authoring_target" => Some(format!(
+            "[tool feedback]\noperation_intent: content_changing_authoring_required\noperation_progress_class: wrong_authoring_target\nprogress_effect: no_progress{active_target_line}{required_action_line}{obligation_line}{template_line}{submitted_line}\nThe submitted content-changing call was rejected before filesystem side effects. The submitted target is historical failed-call evidence only; satisfy the current active target and required action before verification or final answer.\n\n{output_text}"
+        )),
+        _ => None,
+    }
+}
+
+fn operation_feedback_note(progress_class: &str) -> Option<&'static str> {
+    match progress_class {
+        "progress_projection" => Some(
+            "This plan update is recorded, but it did not create or modify any required workspace artifact.",
+        ),
+        "supporting_context" => Some(
+            "This context output is recorded, but it did not create or modify any required workspace artifact.",
+        ),
+        "no_progress" => Some(
+            "This tool output is recorded, but it did not create or modify any required workspace artifact.",
+        ),
+        "idempotent_file_write_no_progress" => Some(
+            "This file-changing tool output is recorded as idempotent no-progress because it produced no content change and no file-change evidence.",
+        ),
+        "empty_artifact_no_progress" => Some(
+            "This tool changed filesystem state, but the changed artifact has no content-bearing after-state and does not satisfy requested authoring work.",
+        ),
+        "required_write_content_shape_mismatch" => Some(
+            "This content-changing tool call was rejected before filesystem side effects because the submitted content violates the current required target's content-shape contract.",
+        ),
+        "artifact_content_shape_violation" => Some(
+            "This content-changing tool output is rejected because the artifact content violates its typed content-shape contract and does not satisfy requested authoring work.",
+        ),
+        "artifact_content_shape_no_progress" => Some(
+            "This tool changed filesystem state, but the changed artifact after-state violates its content-shape contract and does not satisfy requested authoring work.",
+        ),
+        _ => None,
+    }
 }
 
 fn operation_feedback_active_targets(metadata: &Value) -> Vec<String> {
@@ -3132,6 +6932,7 @@ const EXECUTED_TOOL_FAILURE_TERMINAL_THRESHOLD: usize = 3;
 const WRONG_VERIFICATION_COMMAND_TERMINAL_THRESHOLD: usize = 3;
 const WRONG_AUTHORING_TARGET_TERMINAL_THRESHOLD: usize = 3;
 const WRONG_REPAIR_TARGET_TERMINAL_THRESHOLD: usize = 3;
+const LOCAL_LLM_RECOVERY_CHOICE_TERMINAL_THRESHOLD: usize = 2;
 const PUBLIC_COMMAND_CONTRACT_TERMINAL_THRESHOLD: usize = 3;
 const AUTHORING_TARGET_GROUNDING_CORRECTION_TERMINAL_THRESHOLD: usize = 3;
 const DOCS_ROUTE_BUDGET_EXHAUSTED_CORRECTION_TERMINAL_THRESHOLD: usize = 3;
@@ -3566,7 +7367,7 @@ fn wrong_authoring_target_key(
 ) -> String {
     let submitted = submitted_authoring_targets(effective_tool_name, parsed_arguments)
         .into_iter()
-        .flat_map(|target| normalized_target_keys(&target, workspace_root))
+        .flat_map(|target| target_keys_for_workspace_match(&target, workspace_root))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>()
@@ -3575,7 +7376,7 @@ fn wrong_authoring_target_key(
         .map(|targets| {
             targets
                 .iter()
-                .flat_map(|target| normalized_target_keys(target.as_str(), workspace_root))
+                .flat_map(|target| target_keys_for_workspace_match(target.as_str(), workspace_root))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>()
@@ -3591,6 +7392,38 @@ fn wrong_authoring_target_terminal_message(result: &ToolResult, count: usize) ->
     format!(
         "Submitted content-changing calls missed the active requested-work deliverable set {count} time(s): {}",
         result.output_text
+    )
+}
+
+fn generated_test_source_reauthoring_recovery_choice_key(
+    result: &ToolResult,
+    allowed_tools: &BTreeSet<String>,
+    tool_choice: &ToolChoice,
+) -> String {
+    let result_hash = tool_result_result_hash(&result.metadata)
+        .unwrap_or_else(|| crate::harness::artifact::hash_bytes(result.output_text.as_bytes()));
+    let submitted = metadata_string_array(&result.metadata, "submitted_source_targets").join(",");
+    let active = metadata_string_array(&result.metadata, "active_targets").join(",");
+    let source = result
+        .metadata
+        .get("source_target")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    format!(
+        "wrong_generated_test_recovery_choice|hash={result_hash}|source={source}|submitted={submitted}|active={active}|allowed={}|choice={}",
+        allowed_tools.iter().cloned().collect::<Vec<_>>().join(","),
+        tool_choice_label(tool_choice),
+    )
+}
+
+fn generated_test_source_reauthoring_recovery_choice_terminal_message(
+    result: &ToolResult,
+    count: usize,
+) -> String {
+    let active = metadata_string_array(&result.metadata, "active_targets").join(", ");
+    let submitted = metadata_string_array(&result.metadata, "submitted_source_targets").join(", ");
+    format!(
+        "Local-LLM recovery choice guard stopped repeated production-source reauthoring {count} time(s) for generated-test authoring. Submitted source target(s): {submitted}. Active generated-test target(s): {active}. Runtime stopped before another provider continuation could grow history with the same unsupported recovery choice."
     )
 }
 
@@ -3676,7 +7509,7 @@ fn authoring_target_grounding_required_terminal_message(
         .get("submitted_path")
         .and_then(Value::as_str)
         .unwrap_or("<unknown>");
-    let submitted_normalized = normalize_target_key(submitted);
+    let submitted_normalized = path_key_for_workspace_match(submitted);
     let submitted_consumed = consumed_targets
         .iter()
         .any(|target| target_key_family_matches_exactly(&submitted_normalized, target));
@@ -4245,21 +8078,6 @@ fn tool_result_result_hash(metadata: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn normalized_target_keys(target: &str, workspace_root: &Utf8Path) -> Vec<String> {
-    let normalized = normalize_target_key(target);
-    if let Some(relative) =
-        crate::workspace::project::workspace_relative_key_for_match(target, workspace_root.as_str())
-    {
-        vec![normalized, relative]
-    } else {
-        vec![normalized]
-    }
-}
-
-fn normalize_target_key(target: &str) -> String {
-    crate::workspace::project::path_key_for_workspace_match(target)
-}
-
 pub(crate) fn tool_orchestrator_target_matching_exact_path_authority_fixture_passes() -> bool {
     target_key_family_matches_exactly("src/workflow.rs", "src/workflow.rs")
         && target_key_family_matches_exactly("./src/workflow.rs", "src/workflow.rs")
@@ -4706,6 +8524,118 @@ pub(crate) fn exact_apply_patch_wrong_path_content_shape_uses_active_target_fixt
             .pointer("/tool_feedback_envelope/submitted_targets/0")
             .and_then(Value::as_str)
             == Some("src/workflow.rs")
+}
+
+pub(crate) fn generated_test_source_reauthoring_recovery_choice_guard_fixture_passes() -> bool {
+    let active = ActiveWorkContract::RequestedWorkAuthoring {
+        pending_targets: vec![Utf8PathBuf::from("test_workflow.py")],
+        verification_commands: vec!["verify-generated-test --contract".to_string()],
+    };
+    let allowed = BTreeSet::from(["apply_patch".to_string(), "read".to_string()]);
+    let patch_text = "*** Begin Patch\n*** Add File: workflow.py\n+def transform_record(value):\n+    return value.strip() or 'empty'\n*** End Patch";
+    let Some(decision) = ToolLifecycleRuntime::classify_pre_execution_corrective_result(
+        PreExecutionCorrectiveInput {
+            effective_tool_name: "apply_patch",
+            parsed_arguments: &json!({ "patch_text": patch_text }),
+            active_work: Some(&active),
+            state: &SessionStateSnapshot {
+                route: TaskRoute::Code,
+                process_phase: crate::session::ProcessPhase::Author,
+                active_targets: vec![Utf8PathBuf::from("test_workflow.py")],
+                ..SessionStateSnapshot::default()
+            },
+            workspace_root: Utf8Path::new("C:/workspace"),
+            workspace_cwd: None,
+            allowed_tools: &allowed,
+            history_items: &[],
+            shell_family: crate::config::ShellFamily::PowerShell,
+        },
+    ) else {
+        return false;
+    };
+    let route = ToolLifecycleRuntime::route_adjudicated_call(ToolRouteRequest {
+        requested_tool: "apply_patch".to_string(),
+        effective_tool: "apply_patch".to_string(),
+        record_tool: "apply_patch".to_string(),
+        original_arguments_json: serde_json::to_string(&json!({ "patch_text": patch_text }))
+            .unwrap_or_default(),
+        effective_arguments_json: serde_json::to_string(&json!({ "patch_text": patch_text }))
+            .unwrap_or_default(),
+        allowed_tool_names: &allowed,
+        tool_exists: true,
+        tool_allowed: true,
+        redirected_from_arguments_json: None,
+        redirect_reason: None,
+        tool_choice: Some("required"),
+        control_projection: Some(json!({
+            "allowed_tools": ["apply_patch", "read"],
+            "operation_intents": ["content_changing_authoring_required"],
+            "required_action": {
+                "kind": "edit_target",
+                "tool": "apply_patch",
+                "target": "test_workflow.py"
+            }
+        })),
+        sandbox_decision: json!({
+            "profile": "workspace_write",
+            "network_allowed": false,
+            "escalated": false
+        }),
+    });
+    let metadata = route.completion_metadata(decision.result.metadata.clone());
+    let provider_output = render_provider_visible_operation_progress_feedback(
+        &decision.result.output_text,
+        &metadata,
+    );
+    let mut counts = BTreeMap::new();
+    let first =
+        ToolLifecycleRuntime::record_generated_test_source_reauthoring_recovery_choice_no_progress(
+            &mut counts,
+            &allowed,
+            &ToolChoice::Required,
+            &decision.result,
+        );
+    let second =
+        ToolLifecycleRuntime::record_generated_test_source_reauthoring_recovery_choice_no_progress(
+            &mut counts,
+            &allowed,
+            &ToolChoice::Required,
+            &decision.result,
+        );
+
+    decision.kind == PreExecutionCorrectiveKind::GeneratedTestSourceReauthoringRecoveryChoice
+        && decision.result.title == "Wrong generated-test recovery choice"
+        && decision
+            .result
+            .metadata
+            .pointer("/tool_feedback_envelope/local_llm_recovery_choice_guard")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && decision
+            .result
+            .metadata
+            .pointer("/tool_feedback_envelope/source_target")
+            .and_then(Value::as_str)
+            == Some("workflow.py")
+        && decision
+            .result
+            .metadata
+            .pointer("/tool_feedback_envelope/required_action_projection")
+            .and_then(Value::as_str)
+            == Some("apply_patch:test_workflow.py")
+        && provider_output.contains("wrong_generated_test_recovery_choice")
+        && provider_output.contains("active_targets: test_workflow.py")
+        && provider_output.contains("submitted_targets: workflow.py")
+        && provider_output.contains("Positive generated-test apply_patch scaffold")
+        && provider_output.contains("production source is reference evidence only")
+        && first.count == 1
+        && first.terminal_message.is_none()
+        && second.count == LOCAL_LLM_RECOVERY_CHOICE_TERMINAL_THRESHOLD
+        && second.terminal_message.as_deref().is_some_and(|message| {
+            message.contains("Local-LLM recovery choice guard stopped")
+                && message.contains("test_workflow.py")
+                && message.contains("workflow.py")
+        })
 }
 
 pub(crate) fn content_shape_mismatch_feedback_projects_current_action_fixture_passes() -> bool {
@@ -6025,6 +9955,19 @@ pub(crate) fn pre_execution_corrective_order_authority_fixture_passes() -> bool 
             shell_family: crate::config::ShellFamily::PowerShell,
         },
     );
+    let mixed_target_patch = ToolLifecycleRuntime::classify_pre_execution_corrective_result(
+        PreExecutionCorrectiveInput {
+            effective_tool_name: "apply_patch",
+            parsed_arguments: &json!({"patch_text": "*** Begin Patch\n*** Add File: src/workflow.rs\n+pub fn workflow_source_contract() -> bool { true }\n*** End Patch\n*** Add File: tests/workflow.spec.ts\n+import unittest\n*** End Patch"}),
+            active_work: Some(&authoring_active),
+            state: &authoring_state,
+            workspace_root,
+            workspace_cwd: Some(workspace_cwd),
+            allowed_tools: &allowed_tools,
+            history_items: &history_items,
+            shell_family: crate::config::ShellFamily::PowerShell,
+        },
+    );
 
     exact_repair_probe.is_none()
         && wrong_repair_probe.as_ref().is_some_and(|decision| {
@@ -6053,6 +9996,31 @@ pub(crate) fn pre_execution_corrective_order_authority_fixture_passes() -> bool 
                     .pointer("/tool_feedback_envelope/kind")
                     .and_then(Value::as_str)
                     == Some("wrong_authoring_target")
+        })
+        && mixed_target_patch.as_ref().is_some_and(|decision| {
+            decision.kind == PreExecutionCorrectiveKind::TargetExclusiveApplyPatchContractViolation
+                && decision
+                    .result
+                    .metadata
+                    .pointer("/tool_feedback_envelope/kind")
+                    .and_then(Value::as_str)
+                    == Some("target_exclusive_apply_patch_contract_violation")
+                && decision
+                    .result
+                    .metadata
+                    .pointer("/tool_feedback_envelope/required_action_projection")
+                    .and_then(Value::as_str)
+                    == Some("apply_patch:tests/workflow.spec.ts")
+                && decision
+                    .result
+                    .metadata
+                    .pointer("/tool_feedback_envelope/inactive_submitted_targets")
+                    .and_then(Value::as_array)
+                    .is_some_and(|targets| {
+                        targets
+                            .iter()
+                            .any(|target| target.as_str() == Some("src/workflow.rs"))
+                    })
         })
 }
 

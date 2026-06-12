@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use crate::error::StorageError;
 
 use super::{
-    ChangeId, NewSession, ProjectId, ProjectRecord, SessionId, SessionRecord, SessionSettingsPatch,
-    SessionSettingsUpdate, SessionStateSnapshot, TodoItem,
+    ChangeId, NewSession, ProjectId, ProjectRecord, SessionId, SessionMemoryMode,
+    SessionMemoryModeUpdate, SessionRecord, SessionSettingsPatch, SessionSettingsUpdate,
+    SessionStateSnapshot, SessionTitleUpdate, TodoItem,
 };
 
 #[async_trait(?Send)]
@@ -44,6 +45,16 @@ pub trait SessionRepository: Send + Sync {
         id: SessionId,
         patch: &SessionSettingsPatch,
     ) -> Result<SessionSettingsUpdate, StorageError>;
+    async fn update_session_title(
+        &self,
+        id: SessionId,
+        title: &str,
+    ) -> Result<SessionTitleUpdate, StorageError>;
+    async fn update_session_memory_mode(
+        &self,
+        id: SessionId,
+        mode: SessionMemoryMode,
+    ) -> Result<SessionMemoryModeUpdate, StorageError>;
     async fn delete_session(&self, id: SessionId) -> Result<(), StorageError>;
     async fn get_state(&self, session_id: SessionId) -> Result<SessionStateSnapshot, StorageError>;
     async fn update_todos(

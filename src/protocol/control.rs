@@ -1063,8 +1063,20 @@ fn content_shape_projection_contract(required_action: &RequiredAction) -> Option
             "effective workspace artifact text with real newline-separated structure appropriate for the target. Do not send quote-wrapped serialized content or literal `\\n` dominated content."
         }
     };
+    let scaffold = if required_action.tool == ToolName::ApplyPatch
+        && target_spec.language == LanguageFamily::Python
+        && target_spec.role == ArtifactRole::Test
+    {
+        crate::agent::content_shape_contract::artifact_content_shape_apply_patch_recovery_scaffold(
+            target,
+        )
+        .map(|value| format!(" {value}"))
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
     Some(format!(
-        "{operation_template}Required positive artifact shape for `{target}`: {content_subject} {shape}"
+        "{operation_template}Required positive artifact shape for `{target}`: {content_subject} {shape}{scaffold}"
     ))
 }
 
@@ -1237,6 +1249,40 @@ pub fn active_apply_patch_target_projection_renders_operation_template_fixture_p
         && text.contains("*** Update File: tests/workflow.behavior.md")
         && text.contains("must touch only the active target")
         && !text.contains("*** Add File: src/workflow.rs")
+}
+
+pub fn generated_test_scaffold_projects_to_all_control_surfaces_fixture_passes() -> bool {
+    let projection_id = ProjectionId::new();
+    let required_action =
+        RequiredAction::edit(ToolName::ApplyPatch, Utf8PathBuf::from("test_workflow.py"));
+    let surfaces = [
+        ProjectionSurfaceKind::Prompt,
+        ProjectionSurfaceKind::ToolResultFeedback,
+        ProjectionSurfaceKind::RequestDiagnostics,
+        ProjectionSurfaceKind::Handoff,
+        ProjectionSurfaceKind::Preflight,
+    ];
+    surfaces.iter().all(|surface_kind| {
+        let surface = ProjectionSurface {
+            surface: *surface_kind,
+            projection_id,
+            required_action: Some(required_action.clone()),
+            allowed_tools: vec![ToolName::ApplyPatch, ToolName::Read],
+            forbidden_tools: Vec::new(),
+            operation_intents: vec![OperationIntent::ContentChangingAuthoringRequired],
+            obligation_ids: vec!["active_work".to_string()],
+            contract_refs: vec!["required_write_content_shape_recovery_projection".to_string()],
+            evidence_refs: Vec::new(),
+        };
+        let text = surface.render_control_projection().text;
+        text.contains("Positive generated-test apply_patch scaffold")
+            && text.contains("`*** Add File: test_workflow.py`")
+            && text.contains("import `workflow`")
+            && text.contains("`+class TestWorkflow(unittest.TestCase):`")
+            && text.contains("`+    def test_<requested_behavior>(self):`")
+            && text.contains("do not paste implementation code from `workflow.py`")
+            && !text.contains("calculator")
+    })
 }
 
 pub fn projection_bundle_lifecycle_fields_match_authority_fixture_passes() -> bool {

@@ -1,6 +1,6 @@
 use crate::error::RuntimeError;
 use crate::protocol::{ProtocolEventStore, TurnId, project_protocol_run_event};
-use crate::runtime::RunEventSink;
+use crate::runtime::{RunEventSink, SessionRuntimeEventPublisher};
 use crate::session::{RunEvent, SessionId};
 
 pub struct ProtocolRecordingSink<'a, S: RunEventSink + ?Sized> {
@@ -8,6 +8,7 @@ pub struct ProtocolRecordingSink<'a, S: RunEventSink + ?Sized> {
     fallback_session_id: Option<SessionId>,
     turn_id: TurnId,
     next_sequence_no: i64,
+    runtime_event_publisher: Option<SessionRuntimeEventPublisher>,
     inner: &'a mut S,
 }
 
@@ -23,8 +24,14 @@ impl<'a, S: RunEventSink + ?Sized> ProtocolRecordingSink<'a, S> {
             fallback_session_id,
             turn_id,
             next_sequence_no: 0,
+            runtime_event_publisher: None,
             inner,
         }
+    }
+
+    pub fn with_runtime_event_publisher(mut self, publisher: SessionRuntimeEventPublisher) -> Self {
+        self.runtime_event_publisher = Some(publisher);
+        self
     }
 
     pub fn reserve_sequence_no(&mut self) -> i64 {
@@ -57,6 +64,9 @@ impl<S: RunEventSink + ?Sized> RunEventSink for ProtocolRecordingSink<'_, S> {
                     projection.turn_item.as_ref(),
                 )
                 .map_err(runtime_error)?;
+            if let Some(publisher) = &self.runtime_event_publisher {
+                publisher.publish(projection.runtime_event.clone())?;
+            }
             self.next_sequence_no += 1;
         }
         self.inner.emit(event)

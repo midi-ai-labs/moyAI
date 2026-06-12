@@ -3,6 +3,11 @@ use std::collections::BTreeMap;
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_MODEL_BASE_URL: &str = "http://127.0.0.1:1234";
+pub const DEFAULT_MODEL_NAME: &str = "qwen/qwen3.6-35b-a3b";
+pub const DEFAULT_MODEL_CONTEXT_WINDOW: u32 = 131_072;
+pub const DEFAULT_MODEL_MAX_OUTPUT_TOKENS: u32 = 8_192;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessMode {
@@ -325,8 +330,8 @@ impl Default for ResolvedConfig {
 
         Self {
             model: ModelConfig {
-                base_url: "http://127.0.0.1:1234".to_string(),
-                model: "qwen/qwen3.6-35b-a3b".to_string(),
+                base_url: DEFAULT_MODEL_BASE_URL.to_string(),
+                model: DEFAULT_MODEL_NAME.to_string(),
                 prompt_profile: PromptProfile::Auto,
                 provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
@@ -336,8 +341,8 @@ impl Default for ResolvedConfig {
                 connect_timeout_ms: 10_000,
                 max_retries: 2,
                 stream_max_retries: 2,
-                context_window: 131_072,
-                max_output_tokens: 8_192,
+                context_window: DEFAULT_MODEL_CONTEXT_WINDOW,
+                max_output_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
                 temperature: None,
                 top_p: None,
                 top_k: None,
@@ -350,7 +355,9 @@ impl Default for ResolvedConfig {
                 supports_images: true,
                 parallel_tool_calls: true,
                 max_parallel_predictions: 1,
-                extra_body_json: Some(serde_json::json!({ "num_ctx": 131072 })),
+                extra_body_json: Some(
+                    serde_json::json!({ "num_ctx": DEFAULT_MODEL_CONTEXT_WINDOW }),
+                ),
             },
             session: SessionConfig {
                 default_title_max_len: 80,

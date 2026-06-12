@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::error::LlmError;
-use crate::llm::{LlmEvent, LlmEventSink};
+use crate::llm::{ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct CompletedToolCall {
@@ -91,6 +94,32 @@ impl LlmEventSink for StreamAccumulator {
         }
         Ok(())
     }
+}
+
+pub(crate) async fn stream_chat_with_optional_terminal_timeout(
+    llm: &Arc<dyn LlmClient>,
+    request: ChatRequest,
+    cancel: CancellationToken,
+    sink: &mut dyn LlmEventSink,
+    terminal_response_timeout_ms: Option<u64>,
+) -> Result<LlmResponseSummary, LlmError> {
+    let request_future = llm.stream_chat(request, cancel, sink);
+    let Some(timeout_ms) = terminal_response_timeout_ms else {
+        return request_future.await;
+    };
+    if timeout_ms == 0 {
+        return request_future.await;
+    }
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), request_future).await {
+        Ok(result) => result,
+        Err(_) => Err(LlmError::Message(provider_request_timeout_error_message(
+            timeout_ms,
+        ))),
+    }
+}
+
+pub(crate) fn provider_request_timeout_error_message(timeout_ms: u64) -> String {
+    format!("provider request timeout after {timeout_ms}ms before a terminal model response")
 }
 
 pub(crate) fn stream_accumulator_complete_tool_call_lifecycle_fixture_passes() -> bool {

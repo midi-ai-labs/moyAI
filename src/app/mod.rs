@@ -5,9 +5,11 @@ pub mod session_title;
 
 pub use bootstrap::AppBootstrap;
 pub use command::{
-    App, AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionForkRequest,
-    SessionHistoryRequest, SessionListRequest, SessionLoadedRequest, SessionReadRequest,
-    SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
-    SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest, SessionTurnsRequest,
+    App, AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionCompactRequest,
+    SessionEventsRequest, SessionForkRequest, SessionHistoryRequest, SessionIdleAdmissionRequest,
+    SessionInterruptRequest, SessionListRequest, SessionLoadedRequest, SessionMemoryRequest,
+    SessionReadRequest, SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
+    SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,
+    SessionTitleUpdateRequest, SessionTurnsRequest,
 };
 pub use run_service::RunService;

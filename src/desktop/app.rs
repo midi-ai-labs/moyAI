@@ -3783,6 +3783,27 @@ impl EventRenderer for DesktopRenderer {
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
+
+    fn render_session_runtime_event_page(
+        &mut self,
+        _page: &crate::session::CanonicalRuntimeEventPage,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_compact_result(
+        &mut self,
+        _result: &crate::session::SessionCompactResult,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_memory_mode_update(
+        &mut self,
+        _update: &crate::session::SessionMemoryModeUpdate,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
 }
 
 struct DesktopSteerRenderer;
@@ -3847,6 +3868,27 @@ impl EventRenderer for DesktopSteerRenderer {
     fn render_session_turn_page(
         &mut self,
         _page: &crate::session::CanonicalTurnPage,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_runtime_event_page(
+        &mut self,
+        _page: &crate::session::CanonicalRuntimeEventPage,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_compact_result(
+        &mut self,
+        _result: &crate::session::SessionCompactResult,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+
+    fn render_session_memory_mode_update(
+        &mut self,
+        _update: &crate::session::SessionMemoryModeUpdate,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }

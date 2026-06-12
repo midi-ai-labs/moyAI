@@ -23,6 +23,26 @@ pub enum ToolName {
     Invalid,
 }
 
+impl ToolName {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "list" => Some(Self::List),
+            "glob" => Some(Self::Glob),
+            "grep" => Some(Self::Grep),
+            "read" => Some(Self::Read),
+            "inspect_directory" => Some(Self::InspectDirectory),
+            "apply_patch" => Some(Self::ApplyPatch),
+            "write" => Some(Self::Write),
+            "shell" => Some(Self::Shell),
+            "skill" => Some(Self::Skill),
+            "docling_convert" => Some(Self::DoclingConvert),
+            "mcp_call" => Some(Self::McpCall),
+            "todowrite" => Some(Self::TodoWrite),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for ToolName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {

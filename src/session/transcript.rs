@@ -312,6 +312,7 @@ pub(crate) fn transcript_from_history_items_uses_item_sequence_fixture_passes() 
         model: SESSION_TRANSCRIPT_FIXTURE_MODEL.to_string(),
         base_url: SESSION_TRANSCRIPT_FIXTURE_BASE_URL.to_string(),
         access_mode: crate::config::AccessMode::Default,
+        model_parameters: crate::session::SessionModelParameters::default(),
         created_at_ms: 1,
         updated_at_ms: 3,
         completed_at_ms: Some(3),
