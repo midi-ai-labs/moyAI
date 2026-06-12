@@ -202,6 +202,12 @@ impl AgentLoop {
                 }
 
                 if collector.tool_calls.is_empty() {
+                    if collector.text.trim().is_empty() {
+                        return Err(AgentError::Message(format!(
+                            "provider returned an empty final response with finish_reason={:?}",
+                            response.finish_reason
+                        )));
+                    }
                     let event = RunEvent::SessionCompleted {
                         session_id: request.session.session.id,
                         finish_reason: Some(response.finish_reason),
@@ -705,11 +711,9 @@ fn assistant_metadata(
 }
 
 fn messages_from_history(history_items: &[HistoryItem]) -> Vec<ModelMessage> {
-    let mut ordered = history_items.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|item| (item.sequence_no, item.created_at_ms));
     let mut messages = Vec::new();
     let mut tool_names_by_call = HashMap::new();
-    for item in ordered {
+    for item in history_items {
         match &item.payload {
             HistoryItemPayload::UserTurn { content, .. }
             | HistoryItemPayload::SteerTurn { content, .. } => {
@@ -1153,6 +1157,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn empty_final_response_fails_closed() {
+        let config = ResolvedConfig::default();
+        let run = run_scripted(
+            config,
+            vec![ScriptedResponse {
+                events: Vec::new(),
+                finish_reason: FinishReason::Stop,
+            }],
+        )
+        .await
+        .expect("run setup");
+
+        let error = run.summary.expect_err("empty final must fail");
+        assert!(error.to_string().contains("empty final response"));
+        let session = run
+            .store
+            .session_repo()
+            .get_session(run.session_id)
+            .await
+            .expect("session");
+        assert_eq!(session.status, SessionStatus::Failed);
+    }
+
     #[test]
     fn prompt_asset_stays_small() {
         assert!(include_str!("../../assets/prompts/system.md").len() < 8 * 1024);
@@ -1246,6 +1274,56 @@ mod tests {
         let messages = messages_from_history(&items);
 
         assert!(matches!(messages[0], ModelMessage::Assistant { .. }));
+    }
+
+    #[test]
+    fn history_projection_preserves_store_order_across_turns() {
+        let session_id = crate::session::SessionId::new();
+        let first_turn = TurnId::new();
+        let second_turn = TurnId::new();
+        let items = vec![
+            HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id,
+                turn_id: first_turn,
+                sequence_no: 10,
+                created_at_ms: 100,
+                payload: HistoryItemPayload::Message {
+                    message_id: Some(MessageId::new()),
+                    role: MessageRole::Assistant,
+                    content: vec![ContentPart::Text {
+                        text: "first turn assistant".to_string(),
+                    }],
+                },
+            },
+            HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id,
+                turn_id: second_turn,
+                sequence_no: 1,
+                created_at_ms: 200,
+                payload: HistoryItemPayload::UserTurn {
+                    message_id: Some(MessageId::new()),
+                    content: vec![ContentPart::Text {
+                        text: "second turn user".to_string(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                    turn_context: None,
+                },
+            },
+        ];
+
+        let messages = messages_from_history(&items);
+
+        assert!(matches!(
+            &messages[0],
+            ModelMessage::Assistant { content } if content == "first turn assistant"
+        ));
+        assert!(matches!(
+            &messages[1],
+            ModelMessage::User { content } if content == "second turn user"
+        ));
     }
 
     #[test]

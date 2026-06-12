@@ -55,6 +55,15 @@ impl ToolRegistry {
         Self { tools }
     }
 
+    pub fn core_agent() -> Self {
+        let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
+        tools.insert("list".to_string(), Arc::new(crate::tool::search::ListTool));
+        tools.insert("read".to_string(), Arc::new(crate::tool::read::ReadTool));
+        tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
+        tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
+        Self { tools }
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = self
             .tools
@@ -97,4 +106,12 @@ impl ToolRegistry {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    #[test]
+    fn core_agent_registry_exposes_only_minimal_live_smoke_tools() {
+        assert_eq!(
+            super::ToolRegistry::core_agent().available_tool_names(),
+            vec!["list", "read", "shell", "write"]
+        );
+    }
+}

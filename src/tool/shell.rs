@@ -1561,4 +1561,17 @@ mod tests {
     fn shell_output_projection_includes_stdout_stderr_and_recovery() {
         assert!(super::shell_output_projection_fixture_passes());
     }
+
+    #[test]
+    fn shell_timeout_termination_starts_with_process_tree_kill() {
+        let plan = super::shell_timeout_termination_plan();
+        assert_eq!(
+            plan,
+            vec![
+                super::ShellTerminationStep::ProcessTreeKill,
+                super::ShellTerminationStep::ParentStartKill,
+                super::ShellTerminationStep::WaitForParent,
+            ]
+        );
+    }
 }

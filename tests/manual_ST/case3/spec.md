@@ -36,6 +36,7 @@ Route role: Required Core Route A の後段 case。`case1` pass 後に同じ rou
 四則演算に加えて `sin`、`cos`、`sqrt`、`pow` を扱える仕様にし、CLI の引数形式、エラー処理、テスト観点も文書へ反映してください。
 既存の二項演算 CLI は `python calculator.py 2 + 3` の `<left> <operator> <right>` を維持し、単項関数 CLI は `python calculator.py sin 0`、`python calculator.py cos 0`、`python calculator.py sqrt 16` の `<function> <value>` 形式にしてください。`pow` は二項演算として `python calculator.py 2 pow 3` の形式にしてください。
 単項関数 CLI として扱う 2 引数形式は、先頭 token が `sin` / `cos` / `sqrt` の場合だけです。`python calculator.py 8 +` のような二項演算の不完全な入力は usage error として exit code 1 を返す仕様にしてください。
+usage error のメッセージは stderr へ出力してください。
 `python calculator.py log 10` のような未知の 2 token 入力は、CLI が未定義関数を受け付ける仕様を明示しない限り usage error として扱い、unsupported function exit code 2 を期待する生成 test は作らないでください。
 Python API は既存の `calculate(left, operator, right)` の引数意味を維持してください。単項関数の direct API を文書化する場合は `calculate_unary(function, value)` など一貫した helper にし、`calculate("sin", "sin", 0)` のように function token を重複させる call-site を仕様や test にしないでください。
 既存 CLI の出力整形も維持してください。整数値の結果は `13` のように trailing `.0` を付けず、設計書の例も `sin 0 -> 0` / `cos 0 -> 1` / `sqrt 16 -> 4` とし、生成 test もその既存仕様か数値比較に合わせてください。
@@ -48,6 +49,7 @@ Python API は既存の `calculate(left, operator, right)` の引数意味を維
 更新後の設計書に合わせて、`calculator.py` と `test_calculator.py` を変更してください。
 四則演算に加えて `sin`、`cos`、`sqrt`、`pow` を扱えるようにしてください。CLI は二項演算を `python calculator.py 2 + 3` / `python calculator.py 2 pow 3`、単項関数を `python calculator.py sin 0` / `python calculator.py cos 0` / `python calculator.py sqrt 16` として扱ってください。
 単項関数 CLI として扱う 2 引数形式は、先頭 token が `sin` / `cos` / `sqrt` の場合だけです。`python calculator.py 8 +` のような二項演算の不完全な入力は usage error として exit code 1 を返してください。
+usage error のメッセージは stderr へ出力してください。
 `python calculator.py log 10` のような未知の 2 token 入力は、CLI が未定義関数を受け付ける仕様を明示しない限り usage error として扱い、unsupported function exit code 2 を期待する生成 test は作らないでください。
 Python API は既存の `calculate(left, operator, right)` の引数意味を壊さず、単項関数の direct API は `calculate_unary(function, value)` など一貫した helper で扱ってください。`calculate("sin", "sin", 0)` のような function token 重複 call-site は生成 test に入れないでください。
 既存 CLI の出力整形を維持し、整数値の結果は `13` / `0` / `1` / `4` のように trailing `.0` を付けずに出力してください。生成 test は `.0` 固定ではなく、この既存仕様または数値比較で検証してください。
