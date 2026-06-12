@@ -61,6 +61,10 @@ impl ToolRegistry {
         tools.insert("glob".to_string(), Arc::new(crate::tool::search::GlobTool));
         tools.insert("grep".to_string(), Arc::new(crate::tool::search::GrepTool));
         tools.insert("read".to_string(), Arc::new(crate::tool::read::ReadTool));
+        tools.insert(
+            "apply_patch".to_string(),
+            Arc::new(crate::tool::apply_patch::ApplyPatchTool),
+        );
         tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
         tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
         Self { tools }
@@ -113,7 +117,15 @@ mod tests {
     fn core_agent_registry_exposes_only_minimal_live_smoke_tools() {
         assert_eq!(
             super::ToolRegistry::core_agent().available_tool_names(),
-            vec!["glob", "grep", "list", "read", "shell", "write"]
+            vec![
+                "apply_patch",
+                "glob",
+                "grep",
+                "list",
+                "read",
+                "shell",
+                "write"
+            ]
         );
     }
 
@@ -122,5 +134,14 @@ mod tests {
         let names = super::ToolRegistry::core_agent().available_tool_names();
         assert!(names.contains(&"glob".to_string()));
         assert!(names.contains(&"grep".to_string()));
+    }
+
+    #[test]
+    fn core_agent_registry_includes_apply_patch_surface() {
+        assert!(
+            super::ToolRegistry::core_agent()
+                .available_tool_names()
+                .contains(&"apply_patch".to_string())
+        );
     }
 }

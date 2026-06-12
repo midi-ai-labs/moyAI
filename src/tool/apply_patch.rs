@@ -48,7 +48,7 @@ impl Tool for ApplyPatchTool {
         mut ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<ApplyPatchInput>(raw_arguments)?;
-        let operations = PatchParser::parse(&input.patch_text).map_err(guided_patch_error)?;
+        let operations = PatchParser::parse(&input.patch_text).map_err(ToolError::Patch)?;
         validate_apply_patch_participant_ownership(&ctx, operations.as_slice())?;
         let permission_admission = build_patch_permission_admission(&ctx, operations.as_slice())?;
         confirm_patch_permission_admission(&mut ctx, &permission_admission)?;
@@ -103,12 +103,6 @@ async fn execute_admitted_patch_operations(
         recorded_changes: change_ids,
         change_summaries: commit.summaries.clone(),
     })
-}
-
-fn guided_patch_error(error: crate::error::PatchError) -> ToolError {
-    ToolError::Patch(crate::error::PatchError::Message(format!(
-        "{error}. Use the exact apply_patch grammar. Add File body lines must start with `+`, including blank lines and top-level code or declaration lines. Update File hunks must use `@@` and every hunk line must start with ` `, `+`, or `-`; to replace an entire existing file, send a single Update File hunk whose new file lines all start with `+`.\nExample:\n*** Begin Patch\n*** Add File: notes.txt\n+workflow note\n+\n+declare workflow_record\n+status: ready\n*** End Patch\nIf the target file already exists, switch to `*** Update File: path` with valid hunk lines instead of `*** Add File`."
-    )))
 }
 
 fn stage_admitted_patch_commit(
