@@ -485,13 +485,6 @@ fn command_text_encoding_review(command: &str, family: ShellFamily) -> CommandTe
     }
 }
 
-pub(crate) fn command_text_encoding_suggested_command(
-    command: &str,
-    family: ShellFamily,
-) -> Option<String> {
-    command_text_encoding_review(command, family).suggested_command
-}
-
 // Local language-command token classification for UTF-8 encoding corrections on
 // Windows / closed-network hosts. Inlined from the removed agent::language_evidence
 // module; shell encoding review is the only remaining consumer.

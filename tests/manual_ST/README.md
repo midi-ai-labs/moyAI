@@ -51,4 +51,4 @@ Desktop GUI e2e route taxonomy:
 - residual fix は `Codex` の Thread / Turn / Item protocol、tool lifecycle、control-plane、harness engineering を第一比較基準にし、local LLM 起因に切り分けた場合のみ `Roo Code` を補助比較、`opencode` を第三比較基準にする
 - prompt も製品機能として扱い、仮 wording のまま放置しない
 - 各 case の合格条件は scenario / user-visible contract と harness evidence の gate として扱う。failure handling や detailed regression signal は、そのまま e2e assertion に昇格させず、Failure Registry 登録後に下位 deterministic test へ分解してから固定する
-- 現在の user override では、新規 representative manual ST failure / route NG / preflight NG は `FR22-YYYY-MM-DD-NNN` prefix で登録する。既存 `FR-...` / `FR2-...` / `FR03-...` / `FR10-...` / `FR20-...` / `FR21-...` は historical evidence として保持する
+- 新規 representative manual ST failure は `docs/logs/worklog.md` に直接原因・対応・次アクションを数行で記録する。旧 Failure Registry は historical evidence として保持するが更新しない

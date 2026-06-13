@@ -16,10 +16,9 @@ use crate::session::{
 };
 use crate::tool::ToolName;
 
-mod control;
+mod legacy_control;
 mod projection;
 mod recording;
-mod runtime;
 mod store;
 
 const CURRENT_PROTOCOL_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
@@ -31,33 +30,12 @@ const PROTOCOL_MOD_PROJECTION_PROVIDER_PROFILE_MARKER: &str =
 const PROTOCOL_TOOL_CALL_TYPED_ARGUMENT_AUTHORITY_MARKER: &str =
     "protocol_tool_call_typed_arguments_authority";
 
-pub(crate) use control::canonicalize_workspace_targets;
-pub use control::{
+pub use legacy_control::{
     ActionAuthority, ControlEnvelopeIssue, ControlEnvelopeIssueCode, ControlEnvelopeIssueSeverity,
     ControlEnvelopeValidation, DispatchPolicy, EvidenceRef, ObligationKind, ObligationSet,
     ObligationStatus, ProjectionBundle, ProjectionSurface, ProjectionSurfaceKind,
     RenderedProjectionSurface, RequiredAction, RequiredActionConflict, RequiredActionKind,
-    TurnControlEnvelope, TurnObligation, action_authority_matches_open_obligations_fixture_passes,
-    active_apply_patch_target_projection_renders_operation_template_fixture_passes,
-    active_work_contract_matches_open_obligation_targets_fixture_passes,
-    active_work_contract_route_phase_matches_turn_context_fixture_passes,
-    allowed_forbidden_tool_surfaces_are_disjoint_fixture_passes,
-    conflicting_required_actions_fail_closed_fixture_passes,
-    content_changing_projection_text_separates_availability_from_satisfying_progress_fixture_passes,
-    continuation_contract_matches_control_envelope_fixture_passes,
-    edit_only_authoring_grounding_recovery_narrows_action_surface_fixture_passes,
-    generated_test_scaffold_projects_to_all_control_surfaces_fixture_passes,
-    named_tool_choice_matches_required_action_fixture_passes,
-    non_python_edit_projection_uses_language_adapter_fixture_passes,
-    output_contract_final_answer_matches_open_obligations_fixture_passes,
-    projection_bundle_lifecycle_fields_match_authority_fixture_passes,
-    required_action_projection_label_is_typed_rendering_fixture_passes,
-    singleton_missing_target_stable_surface_projects_apply_patch_action_fixture_passes,
-    turn_decision_projection_matches_control_envelope_fixture_passes,
-    turn_obligation_required_actions_are_typed_fixture_passes,
-    unavailable_explicit_required_action_fails_closed_fixture_passes,
-    verification_active_work_matches_open_obligation_targets_fixture_passes,
-    verification_only_authority_narrows_to_exact_shell_fixture_passes,
+    TurnControlEnvelope, TurnObligation,
 };
 pub use projection::{
     ProtocolRunEventProjection, filechange_item_projection_preserves_call_id_fixture_passes,
@@ -66,10 +44,6 @@ pub use projection::{
     tool_output_projection_preserves_blocked_action_fixture_passes,
 };
 pub use recording::ProtocolRecordingSink;
-pub use runtime::{
-    CompiledTurn, ObligationCompiler, TurnEngine, TurnEngineInput, WorkOrder, WorkOrderState,
-    repair_target_identity_aliases_compile_exact_write_action_fixture_passes,
-};
 pub(crate) use store::insert_event_bundle_in_transaction;
 pub use store::{ProtocolEventStore, SqliteProtocolEventStore};
 
