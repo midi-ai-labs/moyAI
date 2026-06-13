@@ -1106,6 +1106,7 @@ pub fn desktop_pseudo_tool_call_closeout_evidence_preserved_fixture_passes() -> 
         tool_call_count: 1,
         failed_tool_count: 0,
         change_count: 1,
+        metrics: Default::default(),
     });
     state.transcript_entries = vec![
         crate::tui::state::TranscriptEntry {
@@ -2201,6 +2202,7 @@ mod tests {
             tool_call_count: 1,
             failed_tool_count: 0,
             change_count: 1,
+            metrics: Default::default(),
         });
 
         let rows = transcript_rows(&state);
@@ -2436,6 +2438,7 @@ mod tests {
             tool_call_count: 2,
             failed_tool_count: 0,
             change_count: 1,
+            metrics: Default::default(),
         });
         state.transcript_entries = vec![
             crate::tui::state::TranscriptEntry {
@@ -2506,6 +2509,7 @@ mod tests {
             tool_call_count: 2,
             failed_tool_count: 0,
             change_count: 1,
+            metrics: Default::default(),
         });
         state.transcript_entries = vec![
             crate::tui::state::TranscriptEntry {
@@ -2557,6 +2561,7 @@ mod tests {
             tool_call_count: 3,
             failed_tool_count: 0,
             change_count: 2,
+            metrics: Default::default(),
         });
         state.transcript_entries = vec![
             crate::tui::state::TranscriptEntry {
@@ -2619,6 +2624,7 @@ mod tests {
             tool_call_count: 3,
             failed_tool_count: 0,
             change_count: 2,
+            metrics: Default::default(),
         });
         state.transcript_entries = vec![
             crate::tui::state::TranscriptEntry {
@@ -2671,6 +2677,7 @@ mod tests {
             tool_call_count: 3,
             failed_tool_count: 0,
             change_count: 2,
+            metrics: Default::default(),
         });
         state.transcript_entries = vec![
             crate::tui::state::TranscriptEntry {
@@ -2725,6 +2732,7 @@ mod tests {
             tool_call_count: 3,
             failed_tool_count: 0,
             change_count: 2,
+            metrics: Default::default(),
         });
         state.transcript_entries = vec![
             crate::tui::state::TranscriptEntry {
@@ -2777,6 +2785,7 @@ mod tests {
             tool_call_count: 3,
             failed_tool_count: 0,
             change_count: 2,
+            metrics: Default::default(),
         });
         state.transcript_entries = vec![
             crate::tui::state::TranscriptEntry {

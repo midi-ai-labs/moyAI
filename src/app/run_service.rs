@@ -439,6 +439,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -460,6 +461,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -486,6 +488,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -507,6 +510,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -528,6 +532,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -549,6 +554,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -570,6 +576,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -595,6 +602,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -629,6 +637,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -650,6 +659,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -681,6 +691,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -702,6 +713,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -723,6 +735,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -744,6 +757,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -771,6 +785,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -798,6 +813,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -828,6 +844,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -859,6 +876,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 
@@ -939,6 +957,7 @@ impl RunService {
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
+            metrics: Default::default(),
         })
     }
 }

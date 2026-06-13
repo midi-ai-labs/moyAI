@@ -1,7 +1,8 @@
 //! Phase14 core rebuild: thin agent loop boundary.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -17,8 +18,8 @@ use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload, TurnId};
 use crate::runtime::RunEventSink;
 use crate::session::{
     AssistantMessageMeta, FinishReason, MessageId, MessageMetadata, MessagePart, MessageRole,
-    NewMessage, NewPart, PartKind, RunEvent, RunSummary, SessionContext, SessionStateSnapshot,
-    SessionStatus, TextPart, TokenUsage,
+    NewMessage, NewPart, PartKind, RunConfigSnapshot, RunEvent, RunMetrics, RunSummary,
+    SessionContext, SessionStateSnapshot, SessionStatus, TextPart, TokenUsage,
 };
 use crate::storage::StoreBundle;
 use crate::tool::ToolResult;
@@ -134,12 +135,16 @@ impl AgentLoop {
             .await?;
         sink.emit_pre_recorded(started)?;
 
+        let started_at = Instant::now();
         let tool_schemas = self.tool_schemas();
         let mut messages = messages_from_history(&request.runtime_input.history_items);
         let mut guard = LoopGuard::new(request.config.session.max_steps_per_turn);
         let mut tool_call_count = 0usize;
         let mut failed_tool_count = 0usize;
         let mut change_count = 0usize;
+        let mut model_request_count = 0usize;
+        let mut tool_calls_by_name = BTreeMap::<String, usize>::new();
+        let mut failed_tool_calls_by_name = BTreeMap::<String, usize>::new();
         let mut latest_usage: Option<TokenUsage> = None;
 
         let outcome: Result<RunSummary, AgentError> = async {
@@ -154,6 +159,10 @@ impl AgentLoop {
                             tool_call_count,
                             failed_tool_count,
                             change_count,
+                            model_request_count,
+                            tool_calls_by_name.clone(),
+                            failed_tool_calls_by_name.clone(),
+                            started_at,
                             "run cancelled by user",
                             sink,
                         )
@@ -161,6 +170,7 @@ impl AgentLoop {
                 }
 
                 let chat_request = self.chat_request(&request, &messages, &tool_schemas)?;
+                model_request_count += 1;
                 let mut collector = StreamingResponseCollector::new(assistant.id, sink);
                 let response = self
                     .llm
@@ -190,6 +200,10 @@ impl AgentLoop {
                             tool_call_count,
                             failed_tool_count,
                             change_count,
+                            model_request_count,
+                            tool_calls_by_name.clone(),
+                            failed_tool_calls_by_name.clone(),
+                            started_at,
                             "run cancelled by user",
                             sink,
                         )
@@ -228,6 +242,14 @@ impl AgentLoop {
                         tool_call_count,
                         failed_tool_count,
                         change_count,
+                        metrics: run_metrics(
+                            &request,
+                            started_at,
+                            model_request_count,
+                            latest_usage.clone(),
+                            &tool_calls_by_name,
+                            &failed_tool_calls_by_name,
+                        ),
                     });
                 }
 
@@ -239,6 +261,9 @@ impl AgentLoop {
                 for call in collector.tool_calls {
                     guard.record_tool_call(&call)?;
                     tool_call_count += 1;
+                    *tool_calls_by_name
+                        .entry(call.tool_name.to_string())
+                        .or_default() += 1;
                     let tool_output = self
                         .handle_tool_call(
                             &request,
@@ -251,6 +276,9 @@ impl AgentLoop {
                         .await?;
                     if tool_output.failed {
                         failed_tool_count += 1;
+                        *failed_tool_calls_by_name
+                            .entry(call.tool_name.to_string())
+                            .or_default() += 1;
                     }
                     change_count += tool_output.change_count;
                     messages.push(ModelMessage::Tool {
@@ -479,6 +507,10 @@ impl AgentLoop {
         tool_call_count: usize,
         failed_tool_count: usize,
         change_count: usize,
+        model_request_count: usize,
+        tool_calls_by_name: BTreeMap<String, usize>,
+        failed_tool_calls_by_name: BTreeMap<String, usize>,
+        started_at: Instant,
         reason: &str,
         sink: &mut dyn RunEventSink,
     ) -> Result<RunSummary, AgentError> {
@@ -486,7 +518,7 @@ impl AgentLoop {
             session_id: request.session.session.id,
             reason: reason.to_string(),
         };
-        let metadata = assistant_metadata(request, Some(FinishReason::Cancelled), usage);
+        let metadata = assistant_metadata(request, Some(FinishReason::Cancelled), usage.clone());
         self.store
             .session_repo()
             .update_message_metadata_and_status_with_protocol_event(
@@ -508,6 +540,14 @@ impl AgentLoop {
             tool_call_count,
             failed_tool_count,
             change_count,
+            metrics: run_metrics(
+                request,
+                started_at,
+                model_request_count,
+                usage,
+                &tool_calls_by_name,
+                &failed_tool_calls_by_name,
+            ),
         })
     }
 
@@ -744,6 +784,28 @@ fn assistant_metadata(
         token_usage,
         summary: false,
     })
+}
+
+fn run_metrics(
+    request: &AgentRunRequest,
+    started_at: Instant,
+    model_request_count: usize,
+    token_usage: Option<TokenUsage>,
+    tool_calls_by_name: &BTreeMap<String, usize>,
+    failed_tool_calls_by_name: &BTreeMap<String, usize>,
+) -> RunMetrics {
+    RunMetrics {
+        model_request_count,
+        elapsed_ms: Some(started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+        token_usage,
+        tool_calls_by_name: tool_calls_by_name.clone(),
+        failed_tool_calls_by_name: failed_tool_calls_by_name.clone(),
+        config: Some(RunConfigSnapshot {
+            model: request.model.name.clone(),
+            base_url: request.config.model.base_url.clone(),
+            access_mode: request.session.session.access_mode.as_str().to_string(),
+        }),
+    }
 }
 
 fn messages_from_history(history_items: &[HistoryItem]) -> Vec<ModelMessage> {
@@ -1099,6 +1161,30 @@ mod tests {
         assert_eq!(summary.status, SessionStatus::Completed);
         assert_eq!(summary.tool_call_count, 1);
         assert_eq!(summary.failed_tool_count, 0);
+        assert_eq!(summary.metrics.model_request_count, 2);
+        assert_eq!(
+            summary
+                .metrics
+                .token_usage
+                .as_ref()
+                .map(|usage| usage.total_tokens),
+            Some(15)
+        );
+        assert_eq!(summary.metrics.tool_calls_by_name.get("write"), Some(&1));
+        assert_eq!(summary.metrics.failed_tool_calls_by_name.get("write"), None);
+        assert!(summary.metrics.elapsed_ms.is_some());
+        assert_eq!(
+            summary
+                .metrics
+                .config
+                .as_ref()
+                .map(|config| config.access_mode.as_str()),
+            Some("full_access")
+        );
+        let summary_json = serde_json::to_value(&summary).expect("summary json");
+        assert_eq!(summary_json["metrics"]["model_request_count"], 2);
+        assert_eq!(summary_json["metrics"]["token_usage"]["total_tokens"], 15);
+        assert_eq!(summary_json["metrics"]["tool_calls_by_name"]["write"], 1);
         assert_eq!(
             std::fs::read_to_string(run.root.join("hello.txt"))
                 .expect("written")

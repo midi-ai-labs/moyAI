@@ -21,14 +21,14 @@ pub use model::{
     RequestControlEnvelopeDiagnostic, RequestControlEnvelopeIssueDiagnostic,
     RequestControlObligationDiagnostic, RequestControlSurfaceDiagnostic, RequestDiagnosticsPart,
     RequestMessageDiagnostic, RequestReplayPolicyDiagnostic, RequestToolCallDiagnostic,
-    RequestToolSchemaDiagnostic, RunEvent, RunSummary, RunningSessionRejoin, SessionCompactResult,
-    SessionContext, SessionForkResult, SessionMemoryMode, SessionMemoryModeUpdate,
-    SessionModelParameters, SessionRecord, SessionRollbackResult, SessionSelector,
-    SessionSettingsPatch, SessionSettingsUpdate, SessionStartRequest, SessionStatus,
-    SessionTitleUpdate, TextPart, TokenUsage, ToolCallPart, ToolCallRecord, ToolCallStatus,
-    ToolNoProgressSignature, ToolResultPart, Transcript, TranscriptMessage, TurnDecisionDiagnostic,
-    TurnDecisionWarning, TurnDecisionWarningSeverity, UserMessageMeta, VerificationFailureCluster,
-    VerificationFailureEvidence,
+    RequestToolSchemaDiagnostic, RunConfigSnapshot, RunEvent, RunMetrics, RunSummary,
+    RunningSessionRejoin, SessionCompactResult, SessionContext, SessionForkResult,
+    SessionMemoryMode, SessionMemoryModeUpdate, SessionModelParameters, SessionRecord,
+    SessionRollbackResult, SessionSelector, SessionSettingsPatch, SessionSettingsUpdate,
+    SessionStartRequest, SessionStatus, SessionTitleUpdate, TextPart, TokenUsage, ToolCallPart,
+    ToolCallRecord, ToolCallStatus, ToolNoProgressSignature, ToolResultPart, Transcript,
+    TranscriptMessage, TurnDecisionDiagnostic, TurnDecisionWarning, TurnDecisionWarningSeverity,
+    UserMessageMeta, VerificationFailureCluster, VerificationFailureEvidence,
 };
 pub use repository::{ChangeRepository, ProjectRepository, SessionRepository};
 pub use service::SessionService;

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
@@ -1114,6 +1116,31 @@ pub struct RunSummary {
     pub tool_call_count: usize,
     pub failed_tool_count: usize,
     pub change_count: usize,
+    #[serde(default)]
+    pub metrics: RunMetrics,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunMetrics {
+    #[serde(default)]
+    pub model_request_count: usize,
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub token_usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_calls_by_name: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failed_tool_calls_by_name: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub config: Option<RunConfigSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunConfigSnapshot {
+    pub model: String,
+    pub base_url: String,
+    pub access_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

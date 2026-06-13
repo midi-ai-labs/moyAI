@@ -902,6 +902,7 @@ pub fn cli_human_renderer_typed_lifecycle_projection_fixture_passes() -> bool {
         tool_call_count: 2,
         failed_tool_count: 1,
         change_count: 3,
+        metrics: Default::default(),
     });
     let session = renderer_fixture_session_record("typed projection");
     let session_line = human_session_record_line(&session);

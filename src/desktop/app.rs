@@ -3965,6 +3965,7 @@ mod tests {
             tool_call_count: 3,
             failed_tool_count: 1,
             change_count: 2,
+            metrics: Default::default(),
         };
 
         let body = run_completion_notification_body("  vision GUI  ", &summary);
