@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::fs;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
@@ -11,6 +13,12 @@ use crate::storage::{
 pub struct SqliteStore {
     connection: Arc<Mutex<Connection>>,
     paths: StoragePaths,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageMaintenanceReport {
+    pub orphan_harness_dirs_removed: usize,
+    pub orphan_truncation_files_removed: usize,
 }
 
 impl SqliteStore {
@@ -70,7 +78,174 @@ impl SqliteStore {
         crate::protocol::SqliteProtocolEventStore::new(self.connection.clone())
     }
 
+    pub fn cleanup_orphan_internal_files(&self) -> Result<StorageMaintenanceReport, StorageError> {
+        let referenced_harness_runs = self.referenced_harness_run_ids()?;
+        let referenced_truncation_paths = self.referenced_truncation_paths()?;
+        let mut report = StorageMaintenanceReport::default();
+
+        let harness_root = self.paths.data_dir.join("harness");
+        if harness_root.exists() {
+            for entry in fs::read_dir(harness_root.as_std_path())? {
+                let entry = entry?;
+                let path = camino::Utf8PathBuf::from_path_buf(entry.path()).map_err(|_| {
+                    StorageError::Message("harness path is not valid UTF-8".to_string())
+                })?;
+                if !path.starts_with(&harness_root) || !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let Some(name) = path.file_name() else {
+                    continue;
+                };
+                if !referenced_harness_runs.contains(name) {
+                    fs::remove_dir_all(path.as_std_path())?;
+                    report.orphan_harness_dirs_removed += 1;
+                }
+            }
+        }
+
+        if self.paths.truncation_dir.exists() {
+            for entry in fs::read_dir(self.paths.truncation_dir.as_std_path())? {
+                let entry = entry?;
+                let path = camino::Utf8PathBuf::from_path_buf(entry.path()).map_err(|_| {
+                    StorageError::Message("truncation path is not valid UTF-8".to_string())
+                })?;
+                if !path.starts_with(&self.paths.truncation_dir) || !entry.file_type()?.is_file() {
+                    continue;
+                }
+                if !referenced_truncation_paths.contains(path.as_str()) {
+                    fs::remove_file(path.as_std_path())?;
+                    report.orphan_truncation_files_removed += 1;
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    pub fn checkpoint_and_vacuum(&self) -> Result<(), StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        Ok(())
+    }
+
     pub fn paths(&self) -> &StoragePaths {
         &self.paths
+    }
+
+    fn referenced_harness_run_ids(&self) -> Result<HashSet<String>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare("SELECT id FROM harness_runs")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            ids.insert(row?);
+        }
+        Ok(ids)
+    }
+
+    fn referenced_truncation_paths(&self) -> Result<HashSet<String>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT truncated_output_path FROM tool_calls WHERE truncated_output_path IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut paths = HashSet::new();
+        for row in rows {
+            paths.insert(row?);
+        }
+        Ok(paths)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::params;
+
+    use super::*;
+
+    #[test]
+    fn cleanup_orphan_internal_files_removes_only_unreferenced_appdata_artifacts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8");
+        let paths = StoragePaths {
+            data_dir: data_dir.clone(),
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+        };
+        let store = SqliteStore::open(&paths).expect("store");
+        store.migrate().expect("migrate");
+
+        let harness_root = data_dir.join("harness");
+        let referenced_harness = harness_root.join("referenced-run");
+        let orphan_harness = harness_root.join("orphan-run");
+        fs::create_dir_all(referenced_harness.as_std_path()).expect("referenced harness");
+        fs::create_dir_all(orphan_harness.as_std_path()).expect("orphan harness");
+        fs::write(referenced_harness.join("event.json").as_std_path(), "{}").expect("write ref");
+        fs::write(orphan_harness.join("event.json").as_std_path(), "{}").expect("write orphan");
+
+        fs::create_dir_all(paths.truncation_dir.as_std_path()).expect("truncation dir");
+        let referenced_truncation = paths.truncation_dir.join("referenced.txt");
+        let orphan_truncation = paths.truncation_dir.join("orphan.txt");
+        fs::write(referenced_truncation.as_std_path(), "referenced").expect("write trunc ref");
+        fs::write(orphan_truncation.as_std_path(), "orphan").expect("write trunc orphan");
+
+        {
+            let connection = store.connection.lock().expect("sqlite mutex poisoned");
+            connection
+                .execute(
+                    "INSERT INTO harness_runs
+                     (id, session_id, workspace_root, artifact_root, mode, started_at_ms, completed_at_ms, status)
+                     VALUES (?1, NULL, ?2, ?3, 'native_runtime', 1, NULL, 'started')",
+                    params![
+                        "referenced-run",
+                        "C:/workspace",
+                        referenced_harness.as_str()
+                    ],
+                )
+                .expect("insert harness run");
+            connection
+                .execute(
+                    "INSERT INTO projects
+                     (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                     VALUES ('project', 'C:/workspace', 'workspace', 'none', 1, 1)",
+                    [],
+                )
+                .expect("insert project");
+            connection
+                .execute(
+                    "INSERT INTO sessions
+                     (id, project_id, title, status, cwd_path, model_name, base_url, created_at_ms, updated_at_ms, completed_at_ms)
+                     VALUES ('session', 'project', 'session', 'completed', 'C:/workspace', 'model', 'http://localhost:1234', 1, 1, 1)",
+                    [],
+                )
+                .expect("insert session");
+            connection
+                .execute(
+                    "INSERT INTO messages
+                     (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
+                     VALUES ('message', 'session', NULL, 'assistant', 1, '{}', 1)",
+                    [],
+                )
+                .expect("insert message");
+            connection
+                .execute(
+                    "INSERT INTO tool_calls
+                     (id, session_id, message_id, tool_name, status, arguments_json, title, metadata_json, output_text, truncated_output_path, error_text, started_at_ms, finished_at_ms)
+                     VALUES ('tool', 'session', 'message', 'shell', 'completed', '{}', NULL, '{}', 'preview', ?1, NULL, 1, 1)",
+                    params![referenced_truncation.as_str()],
+                )
+                .expect("insert tool call");
+        }
+
+        let report = store
+            .cleanup_orphan_internal_files()
+            .expect("cleanup orphan files");
+
+        assert_eq!(report.orphan_harness_dirs_removed, 1);
+        assert_eq!(report.orphan_truncation_files_removed, 1);
+        assert!(referenced_harness.exists());
+        assert!(!orphan_harness.exists());
+        assert!(referenced_truncation.exists());
+        assert!(!orphan_truncation.exists());
     }
 }

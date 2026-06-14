@@ -1,0 +1,153 @@
+[model]
+base_url = "http://127.0.0.1:1234"
+model = "qwen/qwen3.6-35b-a3b"
+prompt_profile = "auto"
+provider_metadata_mode = "lm_studio_native_required"
+api_key_env = "OPENAI_API_KEY"
+request_timeout_ms = 600000
+stream_idle_timeout_ms = 300000
+connect_timeout_ms = 10000
+max_retries = 2
+stream_max_retries = 2
+context_window = 131072
+max_output_tokens = 8192
+stop_sequences = []
+supports_tools = true
+supports_reasoning = false
+supports_images = true
+parallel_tool_calls = true
+max_parallel_predictions = 1
+
+[model.extra_headers]
+
+[model.extra_body_json]
+num_ctx = 131072
+
+[session]
+default_title_max_len = 80
+transcript_limit_messages = 200
+auto_resume_last = false
+max_steps_per_turn = 128
+overflow_margin_tokens = 1024
+
+[agent]
+duplicate_success_abort_threshold = 6
+repetitive_text_line_threshold = 6
+readonly_stall_threshold_implementation = 3
+readonly_stall_threshold_general = 4
+verification_repair_grace_steps = 4
+verification_failure_attempt_limit = 4
+verification_failure_repair_read_budget = 2
+staged_task_documentation_finish_grace_steps = 128
+staged_task_discovery_redirect_repeat_threshold = 2
+staged_task_authoring_read_limit = 160
+staged_task_authoring_successful_read_budget_after_progress = 3
+staged_task_audit_repair_read_budget = 3
+staged_task_audit_repair_rewrite_escalation_threshold = 2
+staged_task_recovery_stall_threshold = 3
+
+[permissions]
+access_mode = "default"
+additional_read_roots = []
+additional_write_roots = []
+
+[shell]
+family = "power_shell"
+default_timeout_ms = 120000
+max_timeout_ms = 600000
+env_allowlist = [
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "ComSpec",
+    "USERPROFILE",
+    "USERNAME",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "TMP",
+    "TEMP",
+]
+
+[format]
+default_newline = "crlf"
+ensure_trailing_newline = true
+commands = []
+
+[instructions]
+additional_files = []
+
+[workspace]
+extra_ignore_globs = []
+protected_paths = []
+
+[inspection]
+default_max_depth = 4
+default_max_entries_per_dir = 64
+max_extensions_reported = 32
+include_hidden_by_default = false
+
+[file_guard]
+max_inline_read_bytes = 262144
+large_file_warning_bytes = 5242880
+blocked_read_extensions = [
+    "arrow",
+    "bin",
+    "ckpt",
+    "feather",
+    "joblib",
+    "npy",
+    "npz",
+    "onnx",
+    "parquet",
+    "pkl",
+    "pickle",
+    "pt",
+    "pth",
+    "safetensors",
+]
+structured_document_extensions = [
+    "docx",
+    "pdf",
+    "pptx",
+    "xlsx",
+]
+
+[docling]
+enabled = false
+base_url = "http://127.0.0.1:8123"
+timeout_ms = 120000
+api_key_env = "DOCLING_API_KEY"
+
+[docling.headers]
+
+[mcp]
+enabled = false
+
+[[mcp.servers]]
+id = "docling"
+enabled = false
+transport = "http"
+base_url = "http://127.0.0.1:8123/mcp"
+timeout_ms = 120000
+route_allowlist = [
+    "ask",
+    "docs",
+    "review",
+]
+tool_allowlist = []
+
+[mcp.servers.headers]
+
+[tool_output]
+max_lines = 2000
+max_bytes = 51200
+max_results = 100
+
+[logging]
+verbosity = "info"
+json_logs = false

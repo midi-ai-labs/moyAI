@@ -38,8 +38,9 @@ use super::models::DesktopTranscriptRow;
 use super::navigation::NavigationRequestId;
 use super::preferences::DesktopPreferences;
 use super::query::{
-    DESKTOP_TURN_PAGE_LIMIT, load_session_detail, load_snapshot, load_snapshot_continue_last,
-    load_snapshot_for_selection, load_snapshot_for_session_search,
+    DESKTOP_TURN_PAGE_LIMIT, LoadedSessionDetail, load_latest_session_detail, load_session_detail,
+    load_snapshot, load_snapshot_continue_last, load_snapshot_for_selection,
+    load_snapshot_for_session_search,
 };
 use super::state::DesktopState;
 
@@ -830,31 +831,13 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop session runtime");
             let result = runtime.block_on(async move {
-                load_session_detail(&app, session_id)
-                    .await
-                    .map(
-                        |(
-                            session,
-                            transcript,
-                            turn_items,
-                            state,
-                            todos,
-                            turn_page_offset,
-                            turn_page_limit,
-                            turn_page_total,
-                            turn_page_has_more,
-                        )| LoadedSession {
-                            session,
-                            transcript,
-                            turn_items,
-                            state,
-                            todos,
-                            turn_page_offset,
-                            turn_page_limit,
-                            turn_page_total,
-                            turn_page_has_more,
-                        },
-                    )
+                let load_result = if reason == SessionLoadReason::CurrentRefresh {
+                    load_latest_session_detail(&app, session_id).await
+                } else {
+                    load_session_detail(&app, session_id).await
+                };
+                load_result
+                    .map(loaded_session_from_detail)
                     .map_err(|error| error.to_string())
             });
             let _ = runtime_tx.send(RuntimeMessage::SessionLoaded {
@@ -951,6 +934,24 @@ impl DesktopController {
                     turn_page_total: page.total,
                     turn_page_has_more: page.has_more,
                 })
+            });
+            let _ = runtime_tx.send(RuntimeMessage::LiveSessionRefreshed { session_id, result });
+        });
+    }
+
+    fn spawn_latest_live_session_refresh(&self, session_id: SessionId) {
+        let app = self.app.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop latest-session-refresh runtime");
+            let result = runtime.block_on(async move {
+                load_latest_session_detail(&app, session_id)
+                    .await
+                    .map(loaded_session_from_detail)
+                    .map_err(|error| error.to_string())
             });
             let _ = runtime_tx.send(RuntimeMessage::LiveSessionRefreshed { session_id, result });
         });
@@ -1063,6 +1064,7 @@ impl DesktopController {
                     .delete_session(session_id)
                     .await
                     .map_err(|error| error.to_string())?;
+                run_storage_maintenance_after_delete(&app)?;
                 load_snapshot_for_selection(&app, None)
                     .await
                     .map_err(|error| error.to_string())
@@ -1322,6 +1324,7 @@ impl DesktopController {
                     .delete_project(project_id)
                     .await
                     .map_err(|error| error.to_string())?;
+                run_storage_maintenance_after_delete(&app)?;
                 let mut app = app;
                 if deleted_was_current {
                     let remaining = app
@@ -2502,17 +2505,21 @@ impl DesktopController {
                         && live_refresh_session_id == self.state.app_state.current_session_id
                     {
                         if let Some(session_id) = live_refresh_session_id {
-                            let detail = self.state.selected_detail();
-                            let limit = if detail.turn_page_limit == 0 {
-                                DESKTOP_TURN_PAGE_LIMIT
+                            if run_event_is_terminal(&event) {
+                                self.spawn_latest_live_session_refresh(session_id);
                             } else {
-                                detail.turn_page_limit
-                            };
-                            self.spawn_live_session_refresh(
-                                session_id,
-                                detail.turn_page_offset,
-                                limit,
-                            );
+                                let detail = self.state.selected_detail();
+                                let limit = if detail.turn_page_limit == 0 {
+                                    DESKTOP_TURN_PAGE_LIMIT
+                                } else {
+                                    detail.turn_page_limit
+                                };
+                                self.spawn_live_session_refresh(
+                                    session_id,
+                                    detail.turn_page_offset,
+                                    limit,
+                                );
+                            }
                         }
                     }
                     if run_event_is_terminal(&event) {
@@ -2759,6 +2766,12 @@ impl DesktopController {
                 RuntimeMessage::LiveSessionRefreshed { session_id, result } => match result {
                     Ok(loaded) => {
                         if self.state.app_state.current_session_id == Some(session_id) {
+                            if !self.session_load_is_blocked_by_active_run()
+                                && loaded.turn_page_has_more
+                            {
+                                self.spawn_latest_live_session_refresh(session_id);
+                                continue;
+                            }
                             self.state.refresh_open_session_projection(
                                 &loaded.session,
                                 &loaded.transcript,
@@ -2923,6 +2936,32 @@ impl DesktopController {
             }
         }
         changed
+    }
+}
+
+fn loaded_session_from_detail(
+    (
+        session,
+        transcript,
+        turn_items,
+        state,
+        todos,
+        turn_page_offset,
+        turn_page_limit,
+        turn_page_total,
+        turn_page_has_more,
+    ): LoadedSessionDetail,
+) -> LoadedSession {
+    LoadedSession {
+        session,
+        transcript,
+        turn_items,
+        state,
+        todos,
+        turn_page_offset,
+        turn_page_limit,
+        turn_page_total,
+        turn_page_has_more,
     }
 }
 
@@ -4256,14 +4295,29 @@ async fn purge_deleted_project_roots(
         .list_projects(200)
         .await
         .map_err(|error| error.to_string())?;
+    let mut deleted = false;
     for project in projects {
         if preferences.is_project_deleted(&project.root_path) {
             app.session_service
                 .delete_project(project.id)
                 .await
                 .map_err(|error| error.to_string())?;
+            deleted = true;
         }
     }
+    if deleted {
+        run_storage_maintenance_after_delete(app)?;
+    }
+    Ok(())
+}
+
+fn run_storage_maintenance_after_delete(app: &App) -> Result<(), String> {
+    app.store
+        .cleanup_orphan_internal_files()
+        .map_err(|error| error.to_string())?;
+    app.store
+        .checkpoint_and_vacuum()
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 

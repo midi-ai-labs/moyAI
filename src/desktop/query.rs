@@ -22,6 +22,18 @@ pub use super::artifact_projection::{file_change_rows_from_turn_items, format_ar
 
 pub const DESKTOP_TURN_PAGE_LIMIT: usize = 80;
 
+pub type LoadedSessionDetail = (
+    SessionRecord,
+    Transcript,
+    Vec<crate::protocol::TurnItem>,
+    SessionStateSnapshot,
+    Vec<TodoItem>,
+    usize,
+    usize,
+    usize,
+    bool,
+);
+
 pub async fn load_snapshot(app: &App, args: &DesktopArgs) -> Result<DesktopSnapshot, AppRunError> {
     load_snapshot_for_selection(app, args.session_id).await
 }
@@ -85,30 +97,37 @@ pub async fn load_snapshot_for_session_search(
 pub async fn load_session_detail(
     app: &App,
     session_id: SessionId,
-) -> Result<
-    (
-        SessionRecord,
-        Transcript,
-        Vec<crate::protocol::TurnItem>,
-        SessionStateSnapshot,
-        Vec<TodoItem>,
-        usize,
-        usize,
-        usize,
-        bool,
-    ),
-    AppRunError,
-> {
-    let session = app.session_service.get_session(session_id).await?;
+) -> Result<LoadedSessionDetail, AppRunError> {
+    load_session_detail_at(app, session_id, 0).await
+}
+
+pub async fn load_latest_session_detail(
+    app: &App,
+    session_id: SessionId,
+) -> Result<LoadedSessionDetail, AppRunError> {
+    let total = app
+        .session_service
+        .canonical_turn_items(session_id)
+        .await?
+        .len();
+    let offset = latest_turn_page_offset(total, DESKTOP_TURN_PAGE_LIMIT);
+    load_session_detail_at(app, session_id, offset).await
+}
+
+async fn load_session_detail_at(
+    app: &App,
+    session_id: SessionId,
+    turn_page_offset: usize,
+) -> Result<LoadedSessionDetail, AppRunError> {
     let page = app
         .session_service
-        .canonical_turn_page(session_id, 0, DESKTOP_TURN_PAGE_LIMIT)
+        .canonical_turn_page(session_id, turn_page_offset, DESKTOP_TURN_PAGE_LIMIT)
         .await?;
     let transcript = app.session_service.canonical_transcript(session_id).await?;
     let state = app.session_service.load_state(session_id).await?;
     let todos = app.session_service.list_todos(session_id).await?;
     Ok((
-        session,
+        page.session,
         transcript,
         page.items,
         state,
@@ -118,6 +137,14 @@ pub async fn load_session_detail(
         page.total,
         page.has_more,
     ))
+}
+
+fn latest_turn_page_offset(total: usize, limit: usize) -> usize {
+    if total == 0 || limit == 0 {
+        0
+    } else {
+        total.saturating_sub(1) / limit * limit
+    }
 }
 
 async fn build_snapshot(
@@ -1677,6 +1704,23 @@ mod tests {
         let selected = select_session_index(&sessions, None, Some(current_project), false).unwrap();
 
         assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn latest_turn_page_offset_returns_start_of_last_page() {
+        assert_eq!(latest_turn_page_offset(0, DESKTOP_TURN_PAGE_LIMIT), 0);
+        assert_eq!(latest_turn_page_offset(1, DESKTOP_TURN_PAGE_LIMIT), 0);
+        assert_eq!(
+            latest_turn_page_offset(DESKTOP_TURN_PAGE_LIMIT, DESKTOP_TURN_PAGE_LIMIT),
+            0
+        );
+        assert_eq!(
+            latest_turn_page_offset(DESKTOP_TURN_PAGE_LIMIT + 1, DESKTOP_TURN_PAGE_LIMIT),
+            DESKTOP_TURN_PAGE_LIMIT
+        );
+        assert_eq!(latest_turn_page_offset(151, DESKTOP_TURN_PAGE_LIMIT), 80);
+        assert_eq!(latest_turn_page_offset(160, DESKTOP_TURN_PAGE_LIMIT), 80);
+        assert_eq!(latest_turn_page_offset(161, DESKTOP_TURN_PAGE_LIMIT), 160);
     }
 
     #[test]

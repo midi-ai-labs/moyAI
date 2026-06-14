@@ -12,7 +12,7 @@ pub mod sqlite;
 pub use change_repo::SqliteChangeRepository;
 pub use project_repo::SqliteProjectRepository;
 pub use session_repo::SqliteSessionRepository;
-pub use sqlite::SqliteStore;
+pub use sqlite::{SqliteStore, StorageMaintenanceReport};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoragePaths {
@@ -95,6 +95,14 @@ impl StoreBundle {
 
     pub fn protocol_event_store(&self) -> crate::protocol::SqliteProtocolEventStore {
         self.store.protocol_event_store()
+    }
+
+    pub fn cleanup_orphan_internal_files(&self) -> Result<StorageMaintenanceReport, StorageError> {
+        self.store.cleanup_orphan_internal_files()
+    }
+
+    pub fn checkpoint_and_vacuum(&self) -> Result<(), StorageError> {
+        self.store.checkpoint_and_vacuum()
     }
 
     pub fn paths(&self) -> &StoragePaths {

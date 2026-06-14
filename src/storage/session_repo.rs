@@ -1395,6 +1395,10 @@ impl SessionRepository for SqliteSessionRepository {
             params![id.to_string()],
         )?;
         tx.execute(
+            "DELETE FROM protocol_item_append_order WHERE session_id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
             "DELETE FROM file_changes WHERE session_id = ?1",
             params![id.to_string()],
         )?;
