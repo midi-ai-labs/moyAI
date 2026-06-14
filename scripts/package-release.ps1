@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "0.1.0",
+  [string]$Version = "0.2.0",
   [string]$Target = "windows-x86_64",
   [string]$OutputRoot = "",
   [switch]$SkipBuild
@@ -120,6 +120,7 @@ try {
   Copy-RequiredFile (Join-Path $repoRoot "README.md") (Join-Path $releaseRoot "README.md")
   Copy-RequiredFile (Join-Path $repoRoot "README.ja.md") (Join-Path $releaseRoot "README.ja.md")
   Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $releaseRoot "LICENSE")
+  Copy-RequiredFile (Join-Path $repoRoot "docs\user\getting-started.md") (Join-Path $releaseRoot "docs\user\getting-started.md")
   $desktopDistDestination = Join-Path $releaseRoot "ui\desktop-web\dist"
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $desktopDistDestination) | Out-Null
   Copy-Item -LiteralPath $desktopDist -Destination $desktopDistDestination -Recurse -Force
@@ -146,7 +147,7 @@ timeout_ms = 30000
   $notesTemplate = @'
 # moyAI v{0}
 
-This release module contains the Windows CLI and Tauri Desktop binaries.
+This beta release module contains the Windows CLI and Tauri Desktop binaries.
 
 ## Files
 
@@ -155,6 +156,15 @@ This release module contains the Windows CLI and Tauri Desktop binaries.
 - `ui/desktop-web/dist/`: bundled Desktop web assets
 - `config.example.toml`: optional sample config
 - `README.md` / `README.ja.md`: usage notes
+- `docs/user/getting-started.md`: first-run setup and known limitations
+
+## Beta Highlights
+
+- Thin rebuilt agent core with short Markdown prompt, plain tool results, and minimal guard surface.
+- Desktop GUI, CLI, and TUI entrypoints over the same Rust core.
+- Local-first LM Studio / OpenAI-compatible endpoint configuration.
+- Workspace file editing, patching, search, directory inspection, shell execution, session history, and Markdown export.
+- Release candidate smoke coverage for CLI/TUI/Desktop, provider settings, streaming display, confirmation, cancellation, and export.
 
 ## Quick Start
 
@@ -163,6 +173,12 @@ This release module contains the Windows CLI and Tauri Desktop binaries.
 3. Open `LLM URL`, set base URL and model, then send a Quick Chat or select a Project workspace.
 
 The app stores user-wide config under the Windows user profile by default. No npm, Rust toolchain, internet access, or local dev server is required on the target machine.
+
+## Known Limitations
+
+- Long multi-file documentation tasks remain model-dependent and may need retries, timeout adjustment, or task splitting.
+- LM Studio streaming responses may not include token usage; metrics record `token_usage: null` when the provider omits it.
+- Malformed `apply_patch` input is returned to the model as a plain tool error. moyAI intentionally does not add a repair layer.
 '@
   $notes = $notesTemplate -f $Version
   Write-Utf8File (Join-Path $releaseRoot "RELEASE_NOTES.md") $notes

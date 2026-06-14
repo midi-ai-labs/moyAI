@@ -1,7 +1,7 @@
 {
   "name": "moyai-desktop-ui",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev:desktop-web": "vite --host 127.0.0.1 --port 1420",
