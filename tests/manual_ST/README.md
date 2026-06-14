@@ -7,7 +7,6 @@
 - current harness 実装とその境界は repository root の `docs/design/verification-harness.md` を参照する
 - この README と各 `spec.md` は `README.md` / `ProjectBrief.md` の Phase12 route taxonomy を具体化する scenario fixture input / acceptance evidence policy / rerun instruction であり、root authority を上書きしない
 - ここに置く `spec.md` は「別チャットから case 名で再実行できるようにするための実行仕様」であり、再現手順、入力、合格条件、失敗時ルールを固定する。ただし case 名や固有 artifact 名は preflight gate / runtime branch / fixture primary key の正本にしない
-- `manual_ST_exports_removed/` の Markdown export は Codex comparison evidence であり、完成品志向と衝突する縮小語を reference authority として保持しない
 
 収録ケース:
 
