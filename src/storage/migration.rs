@@ -39,6 +39,7 @@ const V23_SESSIONS_MEMORY_MODE: &str =
     include_str!("../../migrations/V23__sessions_memory_mode.sql");
 const V24_SESSIONS_MODEL_PARAMETERS: &str =
     include_str!("../../migrations/V24__sessions_model_parameters.sql");
+const V25_THREAD_GOALS: &str = include_str!("../../migrations/V25__thread_goals.sql");
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
     connection.execute_batch(V1_INIT)?;
@@ -97,6 +98,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     if needs_sessions_model_parameters_migration(connection)? {
         connection.execute_batch(V24_SESSIONS_MODEL_PARAMETERS)?;
     }
+    connection.execute_batch(V25_THREAD_GOALS)?;
     Ok(())
 }
 

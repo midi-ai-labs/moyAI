@@ -4,7 +4,8 @@ use crate::session::{
     CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionRead, CanonicalTurnPage,
     IdleTurnAdmission, LoadedSessionList, MessagePart, PartKind, RunEvent, RunSummary,
     RunningSessionRejoin, SessionCompactResult, SessionMemoryModeUpdate, SessionRecord,
-    SessionStateSnapshot, Transcript, transcript_from_history_items,
+    SessionStateSnapshot, ThreadGoal, ThreadGoalClearResult, ThreadGoalGetResult,
+    ThreadGoalSetResult, Transcript, transcript_from_history_items,
 };
 
 const CURRENT_PROVIDER_MODEL: &str = "qwen/qwen3.6-35b-a3b";
@@ -47,6 +48,24 @@ pub trait EventRenderer {
     fn render_session_idle_turn_admission(
         &mut self,
         _admission: &IdleTurnAdmission,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+    fn render_thread_goal_get(
+        &mut self,
+        _result: &ThreadGoalGetResult,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+    fn render_thread_goal_set(
+        &mut self,
+        _result: &ThreadGoalSetResult,
+    ) -> Result<(), CliRenderError> {
+        Ok(())
+    }
+    fn render_thread_goal_clear(
+        &mut self,
+        _result: &ThreadGoalClearResult,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
@@ -424,6 +443,43 @@ impl EventRenderer for HumanRenderer {
         )?;
         Ok(())
     }
+
+    fn render_thread_goal_get(
+        &mut self,
+        result: &ThreadGoalGetResult,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        match &result.goal {
+            Some(goal) => writeln!(stdout, "{}", human_thread_goal_line(goal))?,
+            None => writeln!(stdout, "goal none")?,
+        }
+        Ok(())
+    }
+
+    fn render_thread_goal_set(
+        &mut self,
+        result: &ThreadGoalSetResult,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", human_thread_goal_line(&result.goal))?;
+        Ok(())
+    }
+
+    fn render_thread_goal_clear(
+        &mut self,
+        result: &ThreadGoalClearResult,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "goal thread={} cleared={}",
+            result.thread_id, result.cleared
+        )?;
+        Ok(())
+    }
 }
 
 pub struct JsonRenderer;
@@ -564,6 +620,36 @@ impl EventRenderer for JsonRenderer {
         writeln!(stdout, "{}", serde_json::to_string(admission)?)?;
         Ok(())
     }
+
+    fn render_thread_goal_get(
+        &mut self,
+        result: &ThreadGoalGetResult,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(result)?)?;
+        Ok(())
+    }
+
+    fn render_thread_goal_set(
+        &mut self,
+        result: &ThreadGoalSetResult,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(result)?)?;
+        Ok(())
+    }
+
+    fn render_thread_goal_clear(
+        &mut self,
+        result: &ThreadGoalClearResult,
+    ) -> Result<(), CliRenderError> {
+        use std::io::{self, Write};
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(result)?)?;
+        Ok(())
+    }
 }
 
 fn payload_kind<T: serde::Serialize>(payload: &T) -> Result<String, CliRenderError> {
@@ -672,6 +758,27 @@ fn human_loaded_session_summary_line(summary: &crate::session::LoadedSessionSumm
         active_sequence,
         summary.pending_user_input_requests,
         summary.session.title
+    )
+}
+
+fn human_thread_goal_line(goal: &ThreadGoal) -> String {
+    let budget = goal
+        .token_budget
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let remaining = goal
+        .token_budget
+        .map(|budget| (budget - goal.tokens_used).max(0).to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "goal thread={} status={} tokens={}/{} remaining={} elapsed_seconds={} objective={}",
+        goal.thread_id,
+        goal.status.key(),
+        goal.tokens_used,
+        budget,
+        remaining,
+        goal.time_used_seconds,
+        goal.objective
     )
 }
 

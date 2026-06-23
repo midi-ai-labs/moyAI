@@ -337,13 +337,15 @@ textarea:focus-visible,
 }
 
 .sidebar {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto minmax(92px, 0.85fr) auto;
   gap: 8px;
   padding: 10px 8px;
   background: #181815;
   border-right: 1px solid #2b2a26;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .window-actions,
@@ -480,6 +482,29 @@ textarea:focus-visible,
   flex-direction: column;
   gap: 2px;
   min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: #4a505a transparent;
+}
+
+.row-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.row-list::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: #4a505a;
+}
+
+.row-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.project-list,
+.chat-list {
+  contain: layout paint;
 }
 
 .nav-row-wrap {
@@ -631,7 +656,7 @@ textarea:focus-visible,
 }
 
 .settings {
-  margin-top: auto;
+  margin-top: 0;
 }
 
 .conversation {
@@ -1194,6 +1219,15 @@ textarea:focus-visible,
   box-shadow: 0 18px 44px rgba(0, 0, 0, 0.36), 0 0 0 1px rgba(120, 150, 201, 0.35);
 }
 
+.composer.goal-command {
+  border-color: #8fb77d;
+}
+
+.composer.goal-command:focus-within {
+  border-color: #a9d58f;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.36), 0 0 0 1px rgba(169, 213, 143, 0.32);
+}
+
 .attachment-row {
   display: flex;
   flex-wrap: wrap;
@@ -1300,6 +1334,34 @@ textarea:focus-visible,
 #prompt::placeholder {
   color: #b7bfcb;
   opacity: 1;
+}
+
+.goal-command-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 0 16px 8px;
+  color: #ccd8c6;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.goal-command-hint[hidden] {
+  display: none;
+}
+
+.goal-command-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 2px 7px;
+  border: 1px solid rgba(169, 213, 143, 0.55);
+  border-radius: 6px;
+  background: rgba(169, 213, 143, 0.12);
+  color: #d8efca;
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .composer-actions {

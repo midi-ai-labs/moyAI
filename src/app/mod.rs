@@ -6,7 +6,8 @@ pub mod session_title;
 pub use bootstrap::AppBootstrap;
 pub use command::{
     App, AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionCompactRequest,
-    SessionEventsRequest, SessionForkRequest, SessionHistoryRequest, SessionIdleAdmissionRequest,
+    SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest, SessionGoalGetRequest,
+    SessionGoalSetRequest, SessionHistoryRequest, SessionIdleAdmissionRequest,
     SessionInterruptRequest, SessionListRequest, SessionLoadedRequest, SessionMemoryRequest,
     SessionReadRequest, SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
     SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,

@@ -295,6 +295,105 @@ pub struct IdleTurnAdmission {
     pub rejection_reason: Option<IdleTurnRejectionReason>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadGoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+}
+
+impl ThreadGoalStatus {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::UsageLimited => "usage_limited",
+            Self::BudgetLimited => "budget_limited",
+            Self::Complete => "complete",
+        }
+    }
+
+    pub fn parse_db(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "paused" => Some(Self::Paused),
+            "blocked" => Some(Self::Blocked),
+            "usage_limited" => Some(Self::UsageLimited),
+            "budget_limited" => Some(Self::BudgetLimited),
+            "complete" => Some(Self::Complete),
+            _ => None,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        self.as_db_str()
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::BudgetLimited | Self::Complete)
+    }
+
+    pub fn is_unfinished(self) -> bool {
+        !matches!(self, Self::Complete)
+    }
+}
+
+pub const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
+
+pub fn validate_thread_goal_objective(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("goal objective must not be empty".to_string());
+    }
+    if value.chars().count() > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+        return Err(format!(
+            "goal objective must be at most {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGoal {
+    pub thread_id: SessionId,
+    pub objective: String,
+    pub status: ThreadGoalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<i64>,
+    pub tokens_used: i64,
+    pub time_used_seconds: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGoalSetResult {
+    pub goal: ThreadGoal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGoalGetResult {
+    pub goal: Option<ThreadGoal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGoalClearResult {
+    pub thread_id: SessionId,
+    pub cleared: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRollbackResult {
     pub session: SessionRecord,

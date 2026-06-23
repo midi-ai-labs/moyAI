@@ -154,6 +154,7 @@ function render(state: DesktopWebState): void {
   previousSessionKey = nextSessionKey;
   lastRenderedState = state;
   wireEvents(state, eventContext);
+  focusPromptIfRequested(state);
 }
 
 function shouldShowSplash(state: DesktopWebState, elapsedMs: number): boolean {
@@ -182,6 +183,9 @@ function reconcileUiLocalState(previous: DesktopWebState | null, state: DesktopW
   if (sessionChanged || operationInvalidatesComposerTray(mutationName)) {
     uiState.attachmentTrayOpen = false;
   }
+  if (mutationName === "new_chat" || mutationName === "new_project_session") {
+    uiState.focusPromptAfterRender = true;
+  }
   if ((mutationName === "attach_image" || mutationName === "browse_image") && state.image_input.trim().length === 0) {
     uiState.attachmentTrayOpen = false;
   }
@@ -194,6 +198,26 @@ function reconcileUiLocalState(previous: DesktopWebState | null, state: DesktopW
   if (uiState.pendingLocalConfirmation && !localConfirmationStillTargetsRow(uiState.pendingLocalConfirmation, state)) {
     uiState.pendingLocalConfirmation = null;
   }
+}
+
+function focusPromptIfRequested(state: DesktopWebState): void {
+  const shouldFocusInitialPrompt =
+    !uiState.initialPromptFocusDone &&
+    state.selected_session_index < 0 &&
+    !state.busy &&
+    state.overlay === "none" &&
+    !state.confirmation_visible;
+  if (!uiState.focusPromptAfterRender && !shouldFocusInitialPrompt) {
+    return;
+  }
+  if (state.busy || state.overlay !== "none" || state.confirmation_visible) {
+    return;
+  }
+  uiState.initialPromptFocusDone = true;
+  uiState.focusPromptAfterRender = false;
+  requestAnimationFrame(() => {
+    document.querySelector<HTMLTextAreaElement>("#prompt")?.focus();
+  });
 }
 
 function operationInvalidatesComposerTray(name: string | null): boolean {

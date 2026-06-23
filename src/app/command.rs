@@ -6,7 +6,9 @@ use crate::config::AccessMode;
 use crate::error::StorageError;
 use crate::protocol::ProtocolEventStore;
 use crate::runtime::{SessionRuntimeEventHub, SessionRuntimeEventSubscription};
-use crate::session::{EditorContext, PromptDispatchPart, SessionId, SessionMemoryMode};
+use crate::session::{
+    EditorContext, PromptDispatchPart, SessionId, SessionMemoryMode, ThreadGoalStatus,
+};
 
 #[derive(Debug, Clone)]
 pub enum ReviewRequest {
@@ -130,6 +132,24 @@ pub struct SessionMemoryRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct SessionGoalGetRequest {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionGoalSetRequest {
+    pub session_id: SessionId,
+    pub objective: Option<String>,
+    pub status: Option<ThreadGoalStatus>,
+    pub token_budget: Option<Option<i64>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionGoalClearRequest {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionIdleAdmissionRequest {
     pub session_id: SessionId,
     pub pending_trigger_turn: bool,
@@ -223,6 +243,9 @@ pub enum AppCommand {
     SessionInterrupt(SessionInterruptRequest),
     SessionCompact(SessionCompactRequest),
     SessionMemory(SessionMemoryRequest),
+    SessionGoalGet(SessionGoalGetRequest),
+    SessionGoalSet(SessionGoalSetRequest),
+    SessionGoalClear(SessionGoalClearRequest),
     SessionIdleAdmission(SessionIdleAdmissionRequest),
     SessionHistory(SessionHistoryRequest),
     SessionRead(SessionReadRequest),

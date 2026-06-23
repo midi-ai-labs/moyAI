@@ -3,12 +3,14 @@ use std::fs;
 
 use base64::Engine as _;
 use camino::{Utf8Path, Utf8PathBuf};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentLoop, AgentRunRequest, RuntimeInputView};
 use crate::app::session_title::{generate_session_title, is_placeholder_session_title};
 use crate::app::{
     AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionCompactRequest,
-    SessionEventsRequest, SessionForkRequest, SessionHistoryRequest, SessionIdleAdmissionRequest,
+    SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest, SessionGoalGetRequest,
+    SessionGoalSetRequest, SessionHistoryRequest, SessionIdleAdmissionRequest,
     SessionInterruptRequest, SessionListRequest, SessionLoadedRequest, SessionMemoryRequest,
     SessionReadRequest, SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
     SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,
@@ -33,13 +35,15 @@ use crate::runtime::{RunEventSink, SessionRuntimeEventHub};
 use crate::session::{
     DispatchTransformKind, ImagePart, PromptDispatchPart, RunSummary, SessionModelParameters,
     SessionRecord, SessionRepository, SessionSelector, SessionSettingsPatch, SessionStartRequest,
-    SessionStateSnapshot, SessionStatus, TaskRoute,
+    SessionStateSnapshot, SessionStatus, TaskRoute, ThreadGoalClearResult, ThreadGoalGetResult,
+    ThreadGoalSetResult, ThreadGoalStatus, validate_thread_goal_objective,
 };
 use crate::storage::StoreBundle;
 use crate::workspace::{branch_review_scope, uncommitted_review_scope};
 
 const MAX_IMAGE_ATTACHMENTS_PER_TURN: usize = 8;
 const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_GOAL_IDLE_CONTINUATIONS_PER_RUN: usize = 3;
 
 #[derive(Clone)]
 pub struct RunService {
@@ -104,6 +108,15 @@ impl RunService {
             AppCommand::SessionMemory(request) => {
                 self.execute_session_memory(request, renderer).await
             }
+            AppCommand::SessionGoalGet(request) => {
+                self.execute_session_goal_get(request, renderer).await
+            }
+            AppCommand::SessionGoalSet(request) => {
+                self.execute_session_goal_set(request, renderer).await
+            }
+            AppCommand::SessionGoalClear(request) => {
+                self.execute_session_goal_clear(request, renderer).await
+            }
             AppCommand::SessionIdleAdmission(request) => {
                 self.execute_session_idle_admission(request, renderer).await
             }
@@ -154,6 +167,54 @@ impl RunService {
         renderer: &mut dyn EventRenderer,
         prompt: &mut dyn ConfirmationPrompt,
     ) -> Result<RunSummary, AppRunError> {
+        let allow_idle_goal_continuation =
+            allows_goal_idle_continuation_after_run(&request.prompt)?;
+        let mut summary = self
+            .execute_single_run(request.clone(), renderer, prompt)
+            .await?;
+        if !allow_idle_goal_continuation {
+            return Ok(summary);
+        }
+
+        for _ in 0..MAX_GOAL_IDLE_CONTINUATIONS_PER_RUN {
+            if !self
+                .should_start_idle_goal_continuation(summary.session_id, &request.cancel)
+                .await?
+            {
+                break;
+            }
+            let continuation_request = RunRequest {
+                prompt: String::new(),
+                session_id: Some(summary.session_id),
+                continue_last: false,
+                title: None,
+                cwd: request.cwd.clone(),
+                model: request.model.clone(),
+                base_url: request.base_url.clone(),
+                config_override: request.config_override.clone(),
+                output_mode: request.output_mode,
+                show_reasoning: request.show_reasoning,
+                prompt_dispatch: None,
+                editor_context: None,
+                review_request: None,
+                image_paths: Vec::new(),
+                cancel: request.cancel.clone(),
+            };
+            summary = self
+                .execute_single_run(continuation_request, renderer, prompt)
+                .await?;
+        }
+
+        Ok(summary)
+    }
+
+    async fn execute_single_run(
+        &self,
+        mut request: RunRequest,
+        renderer: &mut dyn EventRenderer,
+        prompt: &mut dyn ConfirmationPrompt,
+    ) -> Result<RunSummary, AppRunError> {
+        let slash_goal_command = parse_goal_slash_command(&request.prompt)?;
         let selector = match (request.session_id, request.continue_last) {
             (Some(id), false) => SessionSelector::ById(id),
             (None, true) => SessionSelector::Latest,
@@ -164,6 +225,30 @@ impl RunService {
                 ));
             }
         };
+        if let Some(command) = slash_goal_command.clone() {
+            match command {
+                GoalSlashCommand::SetObjective(objective) => {
+                    request.prompt = objective.clone();
+                    request.prompt_dispatch = Some(PromptDispatchPart::raw(&objective));
+                }
+                GoalSlashCommand::Get
+                | GoalSlashCommand::Clear
+                | GoalSlashCommand::SetStatus(_) => {
+                    let session_id = self
+                        .session_id_for_goal_slash_control(&selector)
+                        .await?
+                        .ok_or_else(|| {
+                            AppRunError::Message(
+                                "Usage: /goal [<objective>|clear|pause|resume]. The session must start before you can view or change a goal."
+                                    .to_string(),
+                            )
+                        })?;
+                    return self
+                        .execute_goal_slash_control(session_id, command, renderer)
+                        .await;
+                }
+            }
+        }
         let session_settings = self.session_settings_for_selector(&selector).await?;
         let mut effective_config = compose_run_effective_config(
             self.config.clone(),
@@ -227,6 +312,10 @@ impl RunService {
                 self.workspace.clone(),
             )
             .await?;
+        if let Some(GoalSlashCommand::SetObjective(objective)) = slash_goal_command {
+            self.set_goal_from_slash(session_context.session.id, &objective, renderer)
+                .await?;
+        }
         let mut renderer_sink = RendererSink {
             renderer,
             show_reasoning: request.show_reasoning,
@@ -403,6 +492,103 @@ impl RunService {
         Ok(summary)
     }
 
+    async fn should_start_idle_goal_continuation(
+        &self,
+        session_id: crate::session::SessionId,
+        cancel: &CancellationToken,
+    ) -> Result<bool, AppRunError> {
+        if cancel.is_cancelled() {
+            return Ok(false);
+        }
+        let admission = self
+            .session_service
+            .evaluate_idle_turn_admission(session_id, false, false)
+            .await?;
+        if !admission.admitted {
+            return Ok(false);
+        }
+        let goal = self
+            .store
+            .session_repo()
+            .get_thread_goal(session_id)
+            .await?;
+        Ok(goal.is_some_and(|goal| goal.status == ThreadGoalStatus::Active))
+    }
+
+    async fn session_id_for_goal_slash_control(
+        &self,
+        selector: &SessionSelector,
+    ) -> Result<Option<crate::session::SessionId>, AppRunError> {
+        match selector {
+            SessionSelector::ById(session_id) => Ok(Some(*session_id)),
+            SessionSelector::Latest => Ok(self
+                .store
+                .session_repo()
+                .latest_session(self.workspace.project_id)
+                .await?
+                .map(|session| session.id)),
+            SessionSelector::New => Ok(None),
+        }
+    }
+
+    async fn execute_goal_slash_control(
+        &self,
+        session_id: crate::session::SessionId,
+        command: GoalSlashCommand,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        match command {
+            GoalSlashCommand::Get => {
+                self.execute_session_goal_get(SessionGoalGetRequest { session_id }, renderer)
+                    .await
+            }
+            GoalSlashCommand::Clear => {
+                self.execute_session_goal_clear(SessionGoalClearRequest { session_id }, renderer)
+                    .await
+            }
+            GoalSlashCommand::SetStatus(status) => {
+                self.execute_session_goal_set(
+                    SessionGoalSetRequest {
+                        session_id,
+                        objective: None,
+                        status: Some(status),
+                        token_budget: None,
+                    },
+                    renderer,
+                )
+                .await
+            }
+            GoalSlashCommand::SetObjective(_) => unreachable!("objective goal slash starts a run"),
+        }
+    }
+
+    async fn set_goal_from_slash(
+        &self,
+        session_id: crate::session::SessionId,
+        objective: &str,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<(), AppRunError> {
+        let repo = self.store.session_repo();
+        let current = account_goal_before_external_mutation(&repo, session_id).await?;
+        let goal = if current.is_some() {
+            repo.update_thread_goal(
+                session_id,
+                Some(objective),
+                Some(ThreadGoalStatus::Active),
+                None,
+            )
+            .await?
+            .ok_or_else(|| {
+                AppRunError::Message("thread goal disappeared during /goal update".to_string())
+            })?
+        } else {
+            repo.replace_thread_goal(session_id, objective, ThreadGoalStatus::Active, None)
+                .await?
+        };
+        renderer.render_thread_goal_set(&ThreadGoalSetResult { goal })?;
+        Ok(())
+    }
+
     async fn session_settings_for_selector(
         &self,
         selector: &SessionSelector,
@@ -568,6 +754,139 @@ impl RunService {
             .update_session_memory_mode(request.session_id, request.mode)
             .await?;
         renderer.render_session_memory_mode_update(&update)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        })
+    }
+
+    async fn execute_session_goal_get(
+        &self,
+        request: SessionGoalGetRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        self.store
+            .session_repo()
+            .get_session(request.session_id)
+            .await?;
+        let result = ThreadGoalGetResult {
+            goal: self
+                .store
+                .session_repo()
+                .get_thread_goal(request.session_id)
+                .await?,
+        };
+        renderer.render_thread_goal_get(&result)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        })
+    }
+
+    async fn execute_session_goal_set(
+        &self,
+        request: SessionGoalSetRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        self.store
+            .session_repo()
+            .get_session(request.session_id)
+            .await?;
+        if request.objective.is_none() && request.status.is_none() && request.token_budget.is_none()
+        {
+            return Err(AppRunError::Message(
+                "session goal set requires objective, --status, --token-budget, or --clear-token-budget".to_string(),
+            ));
+        }
+        let repo = self.store.session_repo();
+        let current = account_goal_before_external_mutation(&repo, request.session_id).await?;
+        let goal = if let Some(objective) = request.objective.as_deref() {
+            let objective = objective.trim();
+            validate_thread_goal_objective(objective).map_err(AppRunError::Message)?;
+            match current {
+                Some(_) => repo
+                    .update_thread_goal(
+                        request.session_id,
+                        Some(objective),
+                        request.status,
+                        request.token_budget,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        AppRunError::Message("thread goal disappeared during update".to_string())
+                    })?,
+                None => {
+                    let token_budget = request.token_budget.unwrap_or(None);
+                    repo.replace_thread_goal(
+                        request.session_id,
+                        objective,
+                        request.status.unwrap_or(ThreadGoalStatus::Active),
+                        token_budget,
+                    )
+                    .await?
+                }
+            }
+        } else {
+            repo.update_thread_goal(
+                request.session_id,
+                None,
+                request.status,
+                request.token_budget,
+            )
+            .await?
+            .ok_or_else(|| {
+                AppRunError::Message(format!(
+                    "session {} has no goal to update",
+                    request.session_id
+                ))
+            })?
+        };
+        let result = ThreadGoalSetResult { goal };
+        renderer.render_thread_goal_set(&result)?;
+        Ok(RunSummary {
+            session_id: request.session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        })
+    }
+
+    async fn execute_session_goal_clear(
+        &self,
+        request: SessionGoalClearRequest,
+        renderer: &mut dyn EventRenderer,
+    ) -> Result<RunSummary, AppRunError> {
+        self.store
+            .session_repo()
+            .get_session(request.session_id)
+            .await?;
+        account_goal_before_external_mutation(&self.store.session_repo(), request.session_id)
+            .await?;
+        let result = ThreadGoalClearResult {
+            thread_id: request.session_id,
+            cleared: self
+                .store
+                .session_repo()
+                .delete_thread_goal(request.session_id)
+                .await?,
+        };
+        renderer.render_thread_goal_clear(&result)?;
         Ok(RunSummary {
             session_id: request.session_id,
             assistant_message_id: None,
@@ -962,6 +1281,27 @@ impl RunService {
     }
 }
 
+async fn account_goal_before_external_mutation(
+    repo: &crate::storage::SqliteSessionRepository,
+    session_id: crate::session::SessionId,
+) -> Result<Option<crate::session::ThreadGoal>, AppRunError> {
+    let current = repo.get_thread_goal_with_id(session_id).await?;
+    if current.as_ref().is_some_and(|(goal, _goal_id)| {
+        matches!(
+            goal.status,
+            crate::session::ThreadGoalStatus::Active
+                | crate::session::ThreadGoalStatus::BudgetLimited
+        )
+    }) {
+        let (_goal, goal_id) = current.expect("current goal checked above");
+        repo.account_thread_goal_usage_for_goal(session_id, 0, Some(goal_id.as_str()))
+            .await
+            .map_err(AppRunError::from)
+    } else {
+        Ok(current.map(|(goal, _goal_id)| goal))
+    }
+}
+
 fn latest_user_message_id_from_history_items(
     history_items: &[crate::protocol::HistoryItem],
 ) -> Option<crate::session::MessageId> {
@@ -1303,6 +1643,55 @@ fn prepare_run_turn(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GoalSlashCommand {
+    Get,
+    Clear,
+    SetStatus(ThreadGoalStatus),
+    SetObjective(String),
+}
+
+fn parse_goal_slash_command(prompt: &str) -> Result<Option<GoalSlashCommand>, AppRunError> {
+    let trimmed = prompt.trim();
+    let Some(rest) = trimmed.strip_prefix("/goal") else {
+        return Ok(None);
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return Ok(None);
+    }
+
+    let arg = rest.trim();
+    if arg.is_empty() {
+        return Ok(Some(GoalSlashCommand::Get));
+    }
+
+    match arg.to_ascii_lowercase().as_str() {
+        "clear" => Ok(Some(GoalSlashCommand::Clear)),
+        "pause" => Ok(Some(GoalSlashCommand::SetStatus(ThreadGoalStatus::Paused))),
+        "resume" => Ok(Some(GoalSlashCommand::SetStatus(ThreadGoalStatus::Active))),
+        "edit" => Err(AppRunError::Message(
+            "Usage: /goal [<objective>|clear|pause|resume]. /goal edit is not available in this surface; send /goal <new objective> to replace the goal."
+                .to_string(),
+        )),
+        _ => {
+            validate_thread_goal_objective(arg).map_err(AppRunError::Message)?;
+            Ok(Some(GoalSlashCommand::SetObjective(arg.to_string())))
+        }
+    }
+}
+
+fn allows_goal_idle_continuation_after_run(prompt: &str) -> Result<bool, AppRunError> {
+    Ok(match parse_goal_slash_command(prompt)? {
+        Some(GoalSlashCommand::Get)
+        | Some(GoalSlashCommand::Clear)
+        | Some(GoalSlashCommand::SetStatus(ThreadGoalStatus::Paused)) => false,
+        Some(GoalSlashCommand::SetStatus(ThreadGoalStatus::Active))
+        | Some(GoalSlashCommand::SetObjective(_))
+        | None => true,
+        Some(GoalSlashCommand::SetStatus(_)) => false,
+    })
+}
+
 fn build_initial_turn_context(
     session_context: &crate::session::SessionContext,
     config: &crate::config::ResolvedConfig,
@@ -1491,6 +1880,8 @@ impl<'a> RunEventSink for RendererSink<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::session::ThreadGoalStatus;
+
     #[test]
     fn session_model_parameters_override_runtime_config() {
         assert!(super::app_session_model_parameters_override_runtime_config_fixture_passes());
@@ -1509,5 +1900,61 @@ mod tests {
     #[test]
     fn per_run_model_and_base_url_win_over_config_override() {
         assert!(super::app_per_run_model_and_base_url_win_over_config_override_fixture_passes());
+    }
+
+    #[test]
+    fn parses_goal_slash_controls() {
+        assert_eq!(
+            super::parse_goal_slash_command("/goal").unwrap(),
+            Some(super::GoalSlashCommand::Get)
+        );
+        assert_eq!(
+            super::parse_goal_slash_command("  /goal clear  ").unwrap(),
+            Some(super::GoalSlashCommand::Clear)
+        );
+        assert_eq!(
+            super::parse_goal_slash_command("/goal pause").unwrap(),
+            Some(super::GoalSlashCommand::SetStatus(ThreadGoalStatus::Paused))
+        );
+        assert_eq!(
+            super::parse_goal_slash_command("/goal resume").unwrap(),
+            Some(super::GoalSlashCommand::SetStatus(ThreadGoalStatus::Active))
+        );
+    }
+
+    #[test]
+    fn parses_goal_slash_objective_without_matching_other_commands() {
+        assert_eq!(
+            super::parse_goal_slash_command("/goal finish the release checklist").unwrap(),
+            Some(super::GoalSlashCommand::SetObjective(
+                "finish the release checklist".to_string()
+            ))
+        );
+        assert_eq!(
+            super::parse_goal_slash_command("/goalkeeper").unwrap(),
+            None
+        );
+        assert_eq!(
+            super::parse_goal_slash_command("/other goal").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_goal_edit_without_surface_editor() {
+        assert!(super::parse_goal_slash_command("/goal edit").is_err());
+    }
+
+    #[test]
+    fn goal_idle_continuation_policy_matches_goal_commands() {
+        assert!(super::allows_goal_idle_continuation_after_run("build the feature").unwrap());
+        assert!(
+            super::allows_goal_idle_continuation_after_run("/goal finish the release checklist")
+                .unwrap()
+        );
+        assert!(super::allows_goal_idle_continuation_after_run("/goal resume").unwrap());
+        assert!(!super::allows_goal_idle_continuation_after_run("/goal").unwrap());
+        assert!(!super::allows_goal_idle_continuation_after_run("/goal clear").unwrap());
+        assert!(!super::allows_goal_idle_continuation_after_run("/goal pause").unwrap());
     }
 }

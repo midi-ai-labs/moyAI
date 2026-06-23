@@ -20,6 +20,9 @@ pub enum ToolName {
     DoclingConvert,
     McpCall,
     TodoWrite,
+    GetGoal,
+    CreateGoal,
+    UpdateGoal,
     Invalid,
 }
 
@@ -40,6 +43,9 @@ impl std::fmt::Display for ToolName {
             ToolName::DoclingConvert => "docling_convert",
             ToolName::McpCall => "mcp_call",
             ToolName::TodoWrite => "todowrite",
+            ToolName::GetGoal => "get_goal",
+            ToolName::CreateGoal => "create_goal",
+            ToolName::UpdateGoal => "update_goal",
             ToolName::Invalid => "invalid",
         };
         write!(f, "{value}")

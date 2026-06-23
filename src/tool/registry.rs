@@ -52,6 +52,7 @@ impl ToolRegistry {
             "todowrite".to_string(),
             Arc::new(crate::tool::todo_write::TodoWriteTool),
         );
+        insert_goal_tools(&mut tools);
         Self { tools }
     }
 
@@ -121,6 +122,7 @@ impl ToolRegistry {
 }
 
 fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
+    insert_goal_tools(tools);
     tools.insert("list".to_string(), Arc::new(crate::tool::search::ListTool));
     tools.insert("glob".to_string(), Arc::new(crate::tool::search::GlobTool));
     tools.insert("grep".to_string(), Arc::new(crate::tool::search::GrepTool));
@@ -141,6 +143,21 @@ fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
     tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
 }
 
+fn insert_goal_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
+    tools.insert(
+        "get_goal".to_string(),
+        Arc::new(crate::tool::goal::GetGoalTool),
+    );
+    tools.insert(
+        "create_goal".to_string(),
+        Arc::new(crate::tool::goal::CreateGoalTool),
+    );
+    tools.insert(
+        "update_goal".to_string(),
+        Arc::new(crate::tool::goal::UpdateGoalTool),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -149,6 +166,8 @@ mod tests {
             super::ToolRegistry::core_agent().available_tool_names(),
             vec![
                 "apply_patch",
+                "create_goal",
+                "get_goal",
                 "glob",
                 "grep",
                 "inspect_directory",
@@ -156,6 +175,7 @@ mod tests {
                 "read",
                 "shell",
                 "todowrite",
+                "update_goal",
                 "write"
             ]
         );

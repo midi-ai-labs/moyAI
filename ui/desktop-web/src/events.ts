@@ -2,7 +2,7 @@ import { command } from "./api";
 import { dispatchRegisteredAction, type ActionContext } from "./actions";
 import type { DesktopWebState } from "./types";
 import type { UiLocalState } from "./ui_state";
-import { validateConfigInput } from "./utils";
+import { goalSlashCommandHint, validateConfigInput } from "./utils";
 
 let pendingOpacityPreviewPercent: number | null = null;
 let opacityPreviewFrame: number | null = null;
@@ -66,6 +66,7 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
       currentState.draft_prompt = text;
       currentState.can_submit = text.trim().length > 0 && !currentState.busy;
       currentState.enhance_enabled = text.trim().length > 0 && !currentState.busy;
+      updateGoalCommandHint(text);
       const send = document.querySelector<HTMLButtonElement>('[data-action="send"]');
       if (send) send.disabled = !currentState.can_submit;
       const enhance = document.querySelector<HTMLButtonElement>('[data-action="enhance-prompt"]');
@@ -172,6 +173,16 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
     });
   });
   focusOverlayPrimary(state, context.uiState);
+}
+
+function updateGoalCommandHint(text: string): void {
+  const hint = goalSlashCommandHint(text);
+  document.querySelector<HTMLElement>(".composer")?.classList.toggle("goal-command", hint !== null);
+  const hintNode = document.querySelector<HTMLElement>("#goal-command-hint");
+  if (!hintNode) return;
+  hintNode.hidden = hint === null;
+  const helpNode = hintNode.querySelector<HTMLElement>("[data-goal-command-help]");
+  if (helpNode) helpNode.textContent = hint ?? "";
 }
 
 function scheduleTextMutation(key: string, name: string, args: Record<string, unknown>, context: ActionContext): void {

@@ -1,5 +1,7 @@
 //! Phase14 core rebuild: thin agent loop boundary.
 
+mod goal_steering;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,7 +21,8 @@ use crate::runtime::RunEventSink;
 use crate::session::{
     AssistantMessageMeta, FinishReason, MessageId, MessageMetadata, MessagePart, MessageRole,
     NewMessage, NewPart, PartKind, RunConfigSnapshot, RunEvent, RunMetrics, RunSummary,
-    SessionContext, SessionStateSnapshot, SessionStatus, TextPart, TokenUsage,
+    SessionContext, SessionStateSnapshot, SessionStatus, TextPart, ThreadGoal, ThreadGoalStatus,
+    TokenUsage,
 };
 use crate::storage::StoreBundle;
 use crate::tool::ToolResult;
@@ -146,6 +149,7 @@ impl AgentLoop {
         let mut tool_calls_by_name = BTreeMap::<String, usize>::new();
         let mut failed_tool_calls_by_name = BTreeMap::<String, usize>::new();
         let mut latest_usage: Option<TokenUsage> = None;
+        let mut active_goal_id_for_turn: Option<String> = None;
 
         let outcome: Result<RunSummary, AgentError> = async {
             loop {
@@ -169,7 +173,15 @@ impl AgentLoop {
                         .await;
                 }
 
-                let chat_request = self.chat_request(&request, &messages, &tool_schemas)?;
+                let goal_for_request = self.goal_for_request(request.session.session.id).await?;
+                if let Some(goal_for_request) = &goal_for_request {
+                    active_goal_id_for_turn = Some(goal_for_request.goal_id.clone());
+                }
+                let request_messages = messages_with_goal_steering(
+                    &messages,
+                    goal_for_request.as_ref().map(|goal| &goal.goal),
+                );
+                let chat_request = self.chat_request(&request, &request_messages, &tool_schemas)?;
                 model_request_count += 1;
                 let mut collector = StreamingResponseCollector::new(assistant.id, sink);
                 let response = self
@@ -178,6 +190,16 @@ impl AgentLoop {
                     .await?;
                 let collector = collector.into_inner();
                 latest_usage = response.usage.clone();
+                if let Some(goal_for_request) = &goal_for_request {
+                    self.store
+                        .session_repo()
+                        .account_thread_goal_usage_for_goal(
+                            request.session.session.id,
+                            goal_token_delta(response.usage.as_ref()),
+                            Some(goal_for_request.goal_id.as_str()),
+                        )
+                        .await?;
+                }
 
                 if !collector.text.is_empty() {
                     persist_text_part(
@@ -295,6 +317,12 @@ impl AgentLoop {
         match outcome {
             Ok(summary) => Ok(summary),
             Err(error) => {
+                let _ = self
+                    .block_active_goal_after_turn_error(
+                        request.session.session.id,
+                        active_goal_id_for_turn.as_deref(),
+                    )
+                    .await;
                 self.fail(
                     &request,
                     assistant.id,
@@ -592,6 +620,68 @@ impl AgentLoop {
             })
             .collect()
     }
+
+    async fn goal_for_request(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Result<Option<AgentGoalForRequest>, AgentError> {
+        let goal = self
+            .store
+            .session_repo()
+            .get_thread_goal_with_id(session_id)
+            .await?;
+        Ok(goal
+            .filter(|(goal, _goal_id)| {
+                matches!(
+                    goal.status,
+                    ThreadGoalStatus::Active | ThreadGoalStatus::BudgetLimited
+                )
+            })
+            .map(|(goal, goal_id)| AgentGoalForRequest { goal, goal_id }))
+    }
+
+    async fn block_active_goal_after_turn_error(
+        &self,
+        session_id: crate::session::SessionId,
+        expected_goal_id: Option<&str>,
+    ) -> Result<(), AgentError> {
+        let repo = self.store.session_repo();
+        let Some(goal) = repo.get_thread_goal(session_id).await? else {
+            return Ok(());
+        };
+        if goal.status != ThreadGoalStatus::Active {
+            return Ok(());
+        }
+        repo.update_thread_goal_for_goal(
+            session_id,
+            None,
+            Some(ThreadGoalStatus::Blocked),
+            None,
+            expected_goal_id,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+struct AgentGoalForRequest {
+    goal: ThreadGoal,
+    goal_id: String,
+}
+
+fn messages_with_goal_steering(
+    messages: &[ModelMessage],
+    goal: Option<&ThreadGoal>,
+) -> Vec<ModelMessage> {
+    let Some(goal) = goal else {
+        return messages.to_vec();
+    };
+    let Some(steering) = goal_steering::steering_message_for_goal(goal) else {
+        return messages.to_vec();
+    };
+    let mut request_messages = messages.to_vec();
+    request_messages.push(steering);
+    request_messages
 }
 
 struct ToolOutputForModel {
@@ -1042,12 +1132,18 @@ fn merge_tool_metadata(mut metadata: Value, result: &ToolResult) -> Value {
     metadata
 }
 
+fn goal_token_delta(usage: Option<&TokenUsage>) -> i64 {
+    usage
+        .map(|usage| i64::from(usage.total_tokens))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use crate::config::{AccessMode, ResolvedConfig};
     use crate::error::LlmError;
@@ -1068,6 +1164,7 @@ mod tests {
 
     struct ScriptedClient {
         responses: Mutex<Vec<ScriptedResponse>>,
+        requests: Arc<Mutex<Vec<ChatRequest>>>,
     }
 
     struct ScriptedResponse {
@@ -1079,10 +1176,11 @@ mod tests {
     impl LlmClient for ScriptedClient {
         async fn stream_chat(
             &self,
-            _request: ChatRequest,
+            request: ChatRequest,
             _cancel: CancellationToken,
             sink: &mut dyn LlmEventSink,
         ) -> Result<LlmResponseSummary, LlmError> {
+            self.requests.lock().expect("requests mutex").push(request);
             let response = self.responses.lock().expect("responses mutex").remove(0);
             for event in response.events {
                 sink.push(event)?;
@@ -1280,6 +1378,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_goal_is_blocked_after_turn_error() {
+        let mut config = ResolvedConfig::default();
+        config.session.max_steps_per_turn = 1;
+        let run = run_scripted_with_goal(
+            config,
+            vec![ScriptedResponse {
+                events: vec![LlmEvent::ToolCallStart {
+                    call_id: "call_1".to_string(),
+                    tool_name: "read".to_string(),
+                }],
+                finish_reason: FinishReason::Stop,
+            }],
+            Some(("finish the objective", ThreadGoalStatus::Active, Some(100))),
+        )
+        .await
+        .expect("run setup");
+
+        assert!(run.summary.is_err());
+        let goal = run
+            .store
+            .session_repo()
+            .get_thread_goal(run.session_id)
+            .await
+            .expect("goal")
+            .expect("stored goal");
+
+        assert_eq!(goal.status, ThreadGoalStatus::Blocked);
+        assert_eq!(goal.tokens_used, 15);
+    }
+
+    #[tokio::test]
     async fn empty_final_response_fails_closed() {
         let config = ResolvedConfig::default();
         let run = run_scripted(
@@ -1301,6 +1430,98 @@ mod tests {
             .await
             .expect("session");
         assert_eq!(session.status, SessionStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn active_goal_steering_is_request_local() {
+        let config = ResolvedConfig::default();
+        let run = run_scripted_with_goal(
+            config,
+            vec![ScriptedResponse {
+                events: vec![LlmEvent::TextDelta("made progress".to_string())],
+                finish_reason: FinishReason::Stop,
+            }],
+            Some((
+                "deliver <feature> & verify",
+                ThreadGoalStatus::Active,
+                Some(100),
+            )),
+        )
+        .await
+        .expect("run");
+        run.summary.expect("summary");
+
+        assert_eq!(run.requests.len(), 1);
+        let Some(ModelMessage::User { content }) = run.requests[0].messages.last() else {
+            panic!("goal steering should be appended as a user message");
+        };
+        assert!(content.contains("Continue working toward the active thread goal."));
+        assert!(content.contains("deliver &lt;feature&gt; &amp; verify"));
+        assert!(content.contains("- Tokens remaining: 100"));
+
+        let history = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("history");
+        let user_turns = history
+            .iter()
+            .filter(|item| matches!(item.payload, HistoryItemPayload::UserTurn { .. }))
+            .count();
+        assert_eq!(user_turns, 1);
+        assert!(
+            history
+                .iter()
+                .filter_map(|item| match &item.payload {
+                    HistoryItemPayload::UserTurn { content, .. }
+                    | HistoryItemPayload::Message { content, .. } => Some(content_text(content)),
+                    _ => None,
+                })
+                .all(|text| !text.contains("Continue working toward the active thread goal."))
+        );
+
+        let goal = run
+            .store
+            .session_repo()
+            .get_thread_goal(run.session_id)
+            .await
+            .expect("goal")
+            .expect("stored goal");
+        assert_eq!(goal.tokens_used, 15);
+    }
+
+    #[tokio::test]
+    async fn budget_limited_goal_steering_is_used_after_budget_is_reached() {
+        let config = ResolvedConfig::default();
+        let run = run_scripted_with_goal(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![LlmEvent::ToolCallStart {
+                        call_id: "call_1".to_string(),
+                        tool_name: "read".to_string(),
+                    }],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("wrapped up".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            Some(("finish within budget", ThreadGoalStatus::Active, Some(10))),
+        )
+        .await
+        .expect("run");
+        run.summary.expect("summary");
+
+        assert_eq!(run.requests.len(), 2);
+        let Some(ModelMessage::User { content }) = run.requests[1].messages.last() else {
+            panic!("budget limit steering should be appended as a user message");
+        };
+        assert!(content.contains("has reached its token budget"));
+        assert!(content.contains("do not start new substantive work"));
+        assert!(content.contains("- Tokens used: 15"));
+        assert!(!content.contains("{{"));
     }
 
     #[tokio::test]
@@ -1609,12 +1830,21 @@ mod tests {
         store: StoreBundle,
         session_id: crate::session::SessionId,
         events: Vec<RunEvent>,
+        requests: Vec<ChatRequest>,
         root: Utf8PathBuf,
     }
 
     async fn run_scripted(
         config: ResolvedConfig,
         responses: Vec<ScriptedResponse>,
+    ) -> Result<ScriptedRun, AgentError> {
+        run_scripted_with_goal(config, responses, None).await
+    }
+
+    async fn run_scripted_with_goal(
+        config: ResolvedConfig,
+        responses: Vec<ScriptedResponse>,
+        goal: Option<(&str, ThreadGoalStatus, Option<i64>)>,
     ) -> Result<ScriptedRun, AgentError> {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.keep()).expect("utf8 temp");
@@ -1648,6 +1878,13 @@ mod tests {
             .await
             .expect("session");
         let session_id = session.session.id;
+        if let Some((objective, status, token_budget)) = goal {
+            store
+                .session_repo()
+                .replace_thread_goal(session_id, objective, status, token_budget)
+                .await
+                .expect("store goal");
+        }
         let turn_id = TurnId::new();
         let user_turn = UserTurn {
             turn_id,
@@ -1680,8 +1917,10 @@ mod tests {
         );
         let tool_services = test_tool_services(&config, &store, storage_paths);
         let registry = ToolRegistry::builtin(tool_services.clone());
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let llm = Arc::new(ScriptedClient {
             responses: Mutex::new(responses),
+            requests: Arc::clone(&requests),
         });
         let agent = AgentLoop::new(llm, registry, store.clone(), PromptBuilder, tool_services);
         let mut sink = CapturingSink {
@@ -1711,6 +1950,7 @@ mod tests {
             store,
             session_id,
             events: sink.events,
+            requests: requests.lock().expect("requests mutex").clone(),
             root,
         })
     }

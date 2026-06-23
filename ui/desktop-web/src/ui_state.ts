@@ -5,6 +5,8 @@ export interface UiLocalState {
   configFilterText: string;
   configDirty: boolean;
   lastFocusedOverlay: string;
+  focusPromptAfterRender: boolean;
+  initialPromptFocusDone: boolean;
   artifactPaneCollapsed: boolean;
   attachmentTrayOpen: boolean;
 }
@@ -15,6 +17,8 @@ export function createUiLocalState(): UiLocalState {
     configFilterText: "",
     configDirty: false,
     lastFocusedOverlay: "none",
+    focusPromptAfterRender: false,
+    initialPromptFocusDone: false,
     artifactPaneCollapsed: window.localStorage.getItem("moyai.artifactPaneCollapsed") === "true",
     attachmentTrayOpen: false,
   };

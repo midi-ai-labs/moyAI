@@ -16,8 +16,9 @@ use crate::session::{
     ProcessPhase, ProjectId, RunEvent, SessionId, SessionMemoryMode, SessionMemoryModeUpdate,
     SessionModelParameters, SessionRecord, SessionRepository, SessionSettingsPatch,
     SessionSettingsUpdate, SessionStateSnapshot, SessionStatus, SessionTitleUpdate, TaskRoute,
-    TodoItem, TodoKind, TodoPriority, TodoStatus, ToolCallId, ToolCallPart, ToolCallRecord,
-    ToolCallStatus, ToolResultPart, Transcript, TranscriptMessage, VerificationState,
+    ThreadGoal, ThreadGoalStatus, TodoItem, TodoKind, TodoPriority, TodoStatus, ToolCallId,
+    ToolCallPart, ToolCallRecord, ToolCallStatus, ToolResultPart, Transcript, TranscriptMessage,
+    VerificationState, validate_thread_goal_objective,
 };
 
 #[derive(Clone)]
@@ -247,6 +248,278 @@ impl SqliteSessionRepository {
             |row| row.get(0),
         )?;
         Ok(parse_memory_mode(&value))
+    }
+
+    pub async fn get_thread_goal(
+        &self,
+        thread_id: SessionId,
+    ) -> Result<Option<ThreadGoal>, StorageError> {
+        Ok(self
+            .get_stored_thread_goal(thread_id)?
+            .map(|stored| stored.goal))
+    }
+
+    pub async fn get_thread_goal_with_id(
+        &self,
+        thread_id: SessionId,
+    ) -> Result<Option<(ThreadGoal, String)>, StorageError> {
+        Ok(self
+            .get_stored_thread_goal(thread_id)?
+            .map(|stored| (stored.goal, stored.goal_id)))
+    }
+
+    pub async fn replace_thread_goal(
+        &self,
+        thread_id: SessionId,
+        objective: &str,
+        status: ThreadGoalStatus,
+        token_budget: Option<i64>,
+    ) -> Result<ThreadGoal, StorageError> {
+        validate_goal_objective_and_budget(objective, token_budget)?;
+        let goal_id = ulid::Ulid::new().to_string();
+        let now = SystemClock.now_ms();
+        let status = status_after_budget_limit(status, 0, token_budget);
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO thread_goals (
+                 thread_id, goal_id, objective, status, token_budget, tokens_used,
+                 time_used_seconds, created_at_ms, updated_at_ms
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7)
+             ON CONFLICT(thread_id) DO UPDATE SET
+                 goal_id = excluded.goal_id,
+                 objective = excluded.objective,
+                 status = excluded.status,
+                 token_budget = excluded.token_budget,
+                 tokens_used = 0,
+                 time_used_seconds = 0,
+                 created_at_ms = excluded.created_at_ms,
+                 updated_at_ms = excluded.updated_at_ms",
+            params![
+                thread_id.to_string(),
+                goal_id,
+                objective,
+                status.as_db_str(),
+                token_budget,
+                now,
+                now
+            ],
+        )?;
+        drop(connection);
+        self.get_thread_goal(thread_id)
+            .await?
+            .ok_or_else(|| StorageError::Message("thread goal was not stored".to_string()))
+    }
+
+    pub async fn insert_thread_goal(
+        &self,
+        thread_id: SessionId,
+        objective: &str,
+        status: ThreadGoalStatus,
+        token_budget: Option<i64>,
+    ) -> Result<Option<ThreadGoal>, StorageError> {
+        validate_goal_objective_and_budget(objective, token_budget)?;
+        let goal_id = ulid::Ulid::new().to_string();
+        let now = SystemClock.now_ms();
+        let status = status_after_budget_limit(status, 0, token_budget);
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "INSERT INTO thread_goals (
+                 thread_id, goal_id, objective, status, token_budget, tokens_used,
+                 time_used_seconds, created_at_ms, updated_at_ms
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7)
+             ON CONFLICT(thread_id) DO UPDATE SET
+                 goal_id = excluded.goal_id,
+                 objective = excluded.objective,
+                 status = excluded.status,
+                 token_budget = excluded.token_budget,
+                 tokens_used = 0,
+                 time_used_seconds = 0,
+                 created_at_ms = excluded.created_at_ms,
+                 updated_at_ms = excluded.updated_at_ms
+             WHERE thread_goals.status = 'complete'",
+            params![
+                thread_id.to_string(),
+                goal_id,
+                objective,
+                status.as_db_str(),
+                token_budget,
+                now,
+                now
+            ],
+        )?;
+        drop(connection);
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get_thread_goal(thread_id).await
+    }
+
+    pub async fn update_thread_goal(
+        &self,
+        thread_id: SessionId,
+        objective: Option<&str>,
+        status: Option<ThreadGoalStatus>,
+        token_budget: Option<Option<i64>>,
+    ) -> Result<Option<ThreadGoal>, StorageError> {
+        self.update_thread_goal_for_goal(thread_id, objective, status, token_budget, None)
+            .await
+    }
+
+    pub async fn update_thread_goal_for_goal(
+        &self,
+        thread_id: SessionId,
+        objective: Option<&str>,
+        status: Option<ThreadGoalStatus>,
+        token_budget: Option<Option<i64>>,
+        expected_goal_id: Option<&str>,
+    ) -> Result<Option<ThreadGoal>, StorageError> {
+        let Some(stored) = self.get_stored_thread_goal(thread_id)? else {
+            return Ok(None);
+        };
+        if expected_goal_id.is_some_and(|expected| expected != stored.goal_id) {
+            return Ok(Some(stored.goal));
+        }
+        let next_objective = objective
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(stored.goal.objective.as_str())
+            .to_string();
+        let next_token_budget = token_budget.unwrap_or(stored.goal.token_budget);
+        validate_goal_objective_and_budget(&next_objective, next_token_budget)?;
+        let requested_status = status.unwrap_or(stored.goal.status);
+        let next_status = if stored.goal.status == ThreadGoalStatus::BudgetLimited
+            && matches!(
+                requested_status,
+                ThreadGoalStatus::Paused | ThreadGoalStatus::Blocked
+            ) {
+            ThreadGoalStatus::BudgetLimited
+        } else {
+            status_after_budget_limit(requested_status, stored.goal.tokens_used, next_token_budget)
+        };
+        let now = SystemClock.now_ms();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE thread_goals
+             SET objective = ?2,
+                 status = ?3,
+                 token_budget = ?4,
+                 updated_at_ms = ?5
+             WHERE thread_id = ?1
+               AND (?6 IS NULL OR goal_id = ?6)",
+            params![
+                thread_id.to_string(),
+                next_objective,
+                next_status.as_db_str(),
+                next_token_budget,
+                now,
+                expected_goal_id
+            ],
+        )?;
+        drop(connection);
+        self.get_thread_goal(thread_id).await
+    }
+
+    pub async fn delete_thread_goal(&self, thread_id: SessionId) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "DELETE FROM thread_goals WHERE thread_id = ?1",
+            params![thread_id.to_string()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub async fn account_thread_goal_usage(
+        &self,
+        thread_id: SessionId,
+        token_delta: i64,
+    ) -> Result<Option<ThreadGoal>, StorageError> {
+        self.account_thread_goal_usage_for_goal(thread_id, token_delta, None)
+            .await
+    }
+
+    pub async fn account_thread_goal_usage_for_goal(
+        &self,
+        thread_id: SessionId,
+        token_delta: i64,
+        expected_goal_id: Option<&str>,
+    ) -> Result<Option<ThreadGoal>, StorageError> {
+        let Some(stored) = self.get_stored_thread_goal(thread_id)? else {
+            return Ok(None);
+        };
+        if expected_goal_id.is_some_and(|expected| expected != stored.goal_id) {
+            return Ok(Some(stored.goal));
+        }
+        if !matches!(
+            stored.goal.status,
+            ThreadGoalStatus::Active | ThreadGoalStatus::BudgetLimited
+        ) {
+            return Ok(Some(stored.goal));
+        }
+        let now = SystemClock.now_ms();
+        let time_delta_seconds = ((now - stored.updated_at_ms).max(0)) / 1000;
+        let token_delta = token_delta.max(0);
+        if time_delta_seconds == 0 && token_delta == 0 {
+            return Ok(Some(stored.goal));
+        }
+        let tokens_used = stored.goal.tokens_used.saturating_add(token_delta);
+        let time_used_seconds = stored
+            .goal
+            .time_used_seconds
+            .saturating_add(time_delta_seconds);
+        let status =
+            status_after_budget_limit(stored.goal.status, tokens_used, stored.goal.token_budget);
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE thread_goals
+             SET status = ?2,
+                 tokens_used = ?3,
+                 time_used_seconds = ?4,
+                 updated_at_ms = ?5
+             WHERE thread_id = ?1
+               AND (?6 IS NULL OR goal_id = ?6)",
+            params![
+                thread_id.to_string(),
+                status.as_db_str(),
+                tokens_used,
+                time_used_seconds,
+                now,
+                expected_goal_id
+            ],
+        )?;
+        drop(connection);
+        self.get_thread_goal(thread_id).await
+    }
+
+    fn get_stored_thread_goal(
+        &self,
+        thread_id: SessionId,
+    ) -> Result<Option<StoredThreadGoal>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let row = connection
+            .query_row(
+                "SELECT thread_id, goal_id, objective, status, token_budget, tokens_used,
+                        time_used_seconds, created_at_ms, updated_at_ms
+                 FROM thread_goals
+                 WHERE thread_id = ?1",
+                params![thread_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(stored_thread_goal_from_row).transpose()
     }
 
     pub async fn append_user_message_with_protocol_bundle(
@@ -1737,6 +2010,83 @@ fn parse_status(value: &str) -> SessionStatus {
     }
 }
 
+struct StoredThreadGoal {
+    goal: ThreadGoal,
+    goal_id: String,
+    updated_at_ms: i64,
+}
+
+fn stored_thread_goal_from_row(
+    row: (
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+        i64,
+    ),
+) -> Result<StoredThreadGoal, StorageError> {
+    let (
+        thread_id,
+        goal_id,
+        objective,
+        status,
+        token_budget,
+        tokens_used,
+        time_used_seconds,
+        created_at_ms,
+        updated_at_ms,
+    ) = row;
+    let thread_id = thread_id
+        .parse::<SessionId>()
+        .map_err(|error| StorageError::Message(format!("invalid thread goal id: {error}")))?;
+    let status = ThreadGoalStatus::parse_db(&status).ok_or_else(|| {
+        StorageError::Message(format!("invalid thread goal status `{status}` in storage"))
+    })?;
+    Ok(StoredThreadGoal {
+        goal: ThreadGoal {
+            thread_id,
+            objective,
+            status,
+            token_budget,
+            tokens_used,
+            time_used_seconds,
+            created_at: created_at_ms / 1000,
+            updated_at: updated_at_ms / 1000,
+        },
+        goal_id,
+        updated_at_ms,
+    })
+}
+
+fn validate_goal_objective_and_budget(
+    objective: &str,
+    token_budget: Option<i64>,
+) -> Result<(), StorageError> {
+    validate_thread_goal_objective(objective).map_err(StorageError::Message)?;
+    if token_budget.is_some_and(|budget| budget <= 0) {
+        return Err(StorageError::Message(
+            "goal token budget must be positive".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn status_after_budget_limit(
+    status: ThreadGoalStatus,
+    tokens_used: i64,
+    token_budget: Option<i64>,
+) -> ThreadGoalStatus {
+    if token_budget.is_some_and(|budget| tokens_used >= budget) {
+        ThreadGoalStatus::BudgetLimited
+    } else {
+        status
+    }
+}
+
 fn parse_access_mode(value: &str) -> AccessMode {
     AccessMode::parse(value).unwrap_or(AccessMode::Default)
 }
@@ -2102,6 +2452,9 @@ fn parse_tool_name(value: &str) -> crate::tool::ToolName {
         "docling_convert" => crate::tool::ToolName::DoclingConvert,
         "mcp_call" => crate::tool::ToolName::McpCall,
         "todowrite" => crate::tool::ToolName::TodoWrite,
+        "get_goal" => crate::tool::ToolName::GetGoal,
+        "create_goal" => crate::tool::ToolName::CreateGoal,
+        "update_goal" => crate::tool::ToolName::UpdateGoal,
         "invalid" => crate::tool::ToolName::Invalid,
         _ => crate::tool::ToolName::Invalid,
     }
@@ -2121,6 +2474,9 @@ fn tool_name_text(value: crate::tool::ToolName) -> &'static str {
         crate::tool::ToolName::DoclingConvert => "docling_convert",
         crate::tool::ToolName::McpCall => "mcp_call",
         crate::tool::ToolName::TodoWrite => "todowrite",
+        crate::tool::ToolName::GetGoal => "get_goal",
+        crate::tool::ToolName::CreateGoal => "create_goal",
+        crate::tool::ToolName::UpdateGoal => "update_goal",
         crate::tool::ToolName::Invalid => "invalid",
     }
 }
@@ -2271,4 +2627,148 @@ fn todo_priority_text(value: TodoPriority) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use camino::Utf8PathBuf;
+
+    use super::*;
+    use crate::config::AccessMode;
+    use crate::session::{NewSession, ProjectId, ProjectRepository, SessionRepository};
+    use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+
+    async fn test_repo() -> (StoreBundle, SessionId) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir: data_dir.clone(),
+        };
+        let sqlite = SqliteStore::open(&paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "test", "none")
+            .await
+            .expect("project");
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "test".to_string(),
+                cwd: data_dir,
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("session");
+        (store, session.id)
+    }
+
+    #[tokio::test]
+    async fn thread_goal_insert_replaces_only_completed_goal() {
+        let (store, session_id) = test_repo().await;
+        let repo = store.session_repo();
+
+        let first = repo
+            .insert_thread_goal(
+                session_id,
+                "ship the goal",
+                ThreadGoalStatus::Active,
+                Some(100),
+            )
+            .await
+            .expect("insert first")
+            .expect("first goal");
+        assert_eq!(first.status, ThreadGoalStatus::Active);
+        assert_eq!(first.token_budget, Some(100));
+
+        let refused = repo
+            .insert_thread_goal(
+                session_id,
+                "replace too early",
+                ThreadGoalStatus::Active,
+                None,
+            )
+            .await
+            .expect("insert unfinished");
+        assert!(refused.is_none());
+
+        repo.update_thread_goal(session_id, None, Some(ThreadGoalStatus::Complete), None)
+            .await
+            .expect("complete")
+            .expect("completed goal");
+        let replaced = repo
+            .insert_thread_goal(session_id, "next goal", ThreadGoalStatus::Active, None)
+            .await
+            .expect("insert next")
+            .expect("next goal");
+        assert_eq!(replaced.objective, "next goal");
+        assert_eq!(replaced.tokens_used, 0);
+        assert_eq!(replaced.token_budget, None);
+    }
+
+    #[tokio::test]
+    async fn thread_goal_accounting_marks_budget_limited() {
+        let (store, session_id) = test_repo().await;
+        let repo = store.session_repo();
+        repo.replace_thread_goal(
+            session_id,
+            "stay within budget",
+            ThreadGoalStatus::Active,
+            Some(5),
+        )
+        .await
+        .expect("replace");
+
+        let updated = repo
+            .account_thread_goal_usage(session_id, 7)
+            .await
+            .expect("account")
+            .expect("goal");
+
+        assert_eq!(updated.tokens_used, 7);
+        assert_eq!(updated.status, ThreadGoalStatus::BudgetLimited);
+    }
+
+    #[tokio::test]
+    async fn thread_goal_expected_id_prevents_stale_accounting_and_update() {
+        let (store, session_id) = test_repo().await;
+        let repo = store.session_repo();
+        repo.replace_thread_goal(session_id, "first", ThreadGoalStatus::Active, Some(100))
+            .await
+            .expect("first");
+        let (_first_goal, first_goal_id) = repo
+            .get_thread_goal_with_id(session_id)
+            .await
+            .expect("first id")
+            .expect("first goal");
+
+        repo.replace_thread_goal(session_id, "second", ThreadGoalStatus::Active, Some(100))
+            .await
+            .expect("second");
+        repo.account_thread_goal_usage_for_goal(session_id, 10, Some(first_goal_id.as_str()))
+            .await
+            .expect("stale account");
+        repo.update_thread_goal_for_goal(
+            session_id,
+            None,
+            Some(ThreadGoalStatus::Blocked),
+            None,
+            Some(first_goal_id.as_str()),
+        )
+        .await
+        .expect("stale update");
+
+        let current = repo
+            .get_thread_goal(session_id)
+            .await
+            .expect("current")
+            .expect("goal");
+        assert_eq!(current.objective, "second");
+        assert_eq!(current.status, ThreadGoalStatus::Active);
+        assert_eq!(current.tokens_used, 0);
+    }
+}

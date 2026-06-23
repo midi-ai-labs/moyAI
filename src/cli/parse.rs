@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand, error::ErrorKind};
 
 use crate::config::AccessMode;
 use crate::error::CliUsageError;
-use crate::session::{SessionId, SessionMemoryMode};
+use crate::session::{SessionId, SessionMemoryMode, ThreadGoalStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +102,27 @@ pub struct SessionCompactArgs {
 pub struct SessionMemoryArgs {
     pub session_id: SessionId,
     pub mode: SessionMemoryMode,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionGoalGetArgs {
+    pub session_id: SessionId,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionGoalSetArgs {
+    pub session_id: SessionId,
+    pub objective: Option<String>,
+    pub status: Option<ThreadGoalStatus>,
+    pub token_budget: Option<Option<i64>>,
+    pub output_mode: OutputMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionGoalClearArgs {
+    pub session_id: SessionId,
     pub output_mode: OutputMode,
 }
 
@@ -253,6 +274,9 @@ pub enum CliCommand {
     SessionInterrupt(SessionInterruptArgs),
     SessionCompact(SessionCompactArgs),
     SessionMemory(SessionMemoryArgs),
+    SessionGoalGet(SessionGoalGetArgs),
+    SessionGoalSet(SessionGoalSetArgs),
+    SessionGoalClear(SessionGoalClearArgs),
     SessionShow(SessionShowArgs),
     SessionHistory(SessionHistoryArgs),
     SessionRead(SessionReadArgs),
@@ -508,6 +532,67 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                     output_mode: args.output_mode,
                 }))
             }
+            SessionCommand::Goal { command } => match command {
+                SessionGoalCommand::Get(args) => {
+                    Ok(CliCommand::SessionGoalGet(SessionGoalGetArgs {
+                        session_id: args.session_id.parse().map_err(|error| {
+                            CliUsageError::Message(format!("invalid session id: {error}"))
+                        })?,
+                        output_mode: args.output_mode,
+                    }))
+                }
+                SessionGoalCommand::Set(args) => {
+                    let objective = if args.objective.is_empty() {
+                        None
+                    } else {
+                        Some(args.objective.join(" "))
+                    };
+                    if objective.is_none()
+                        && args.status.is_none()
+                        && args.token_budget.is_none()
+                        && !args.clear_token_budget
+                    {
+                        return Err(CliUsageError::Message(
+                            "session goal set requires objective, --status, --token-budget, or --clear-token-budget".to_string(),
+                        ));
+                    }
+                    if args.token_budget.is_some() && args.clear_token_budget {
+                        return Err(CliUsageError::Message(
+                            "session goal set accepts only one of --token-budget or --clear-token-budget".to_string(),
+                        ));
+                    }
+                    if args.token_budget.is_some_and(|budget| budget <= 0) {
+                        return Err(CliUsageError::Message(
+                            "session goal set --token-budget must be positive".to_string(),
+                        ));
+                    }
+                    Ok(CliCommand::SessionGoalSet(SessionGoalSetArgs {
+                        session_id: args.session_id.parse().map_err(|error| {
+                            CliUsageError::Message(format!("invalid session id: {error}"))
+                        })?,
+                        objective,
+                        status: args
+                            .status
+                            .as_deref()
+                            .map(parse_cli_goal_status)
+                            .transpose()?,
+                        token_budget: if args.clear_token_budget {
+                            Some(None)
+                        } else {
+                            args.token_budget.map(Some)
+                        },
+                        output_mode: args.output_mode,
+                    }))
+                }
+                SessionGoalCommand::Clear(args) => {
+                    Ok(CliCommand::SessionGoalClear(SessionGoalClearArgs {
+                        session_id: args.session_id.parse().map_err(|error| {
+                            CliUsageError::Message(format!("invalid session id: {error}"))
+                        })?,
+                        output_mode: args.output_mode,
+                    }))
+                }
+            },
             SessionCommand::Show(args) => Ok(CliCommand::SessionShow(SessionShowArgs {
                 session_id: args.session_id.parse().map_err(|error| {
                     CliUsageError::Message(format!("invalid session id: {error}"))
@@ -667,6 +752,20 @@ fn parse_cli_memory_mode(value: &str) -> Result<SessionMemoryMode, CliUsageError
     })
 }
 
+fn parse_cli_goal_status(value: &str) -> Result<ThreadGoalStatus, CliUsageError> {
+    match value {
+        "active" => Ok(ThreadGoalStatus::Active),
+        "paused" => Ok(ThreadGoalStatus::Paused),
+        "blocked" => Ok(ThreadGoalStatus::Blocked),
+        "usageLimited" => Ok(ThreadGoalStatus::UsageLimited),
+        "budgetLimited" => Ok(ThreadGoalStatus::BudgetLimited),
+        "complete" => Ok(ThreadGoalStatus::Complete),
+        _ => Err(CliUsageError::Message(format!(
+            "invalid goal status `{value}`; expected active, paused, blocked, usageLimited, budgetLimited, or complete"
+        ))),
+    }
+}
+
 fn validate_cli_finite_non_negative(label: &str, value: f64) -> Result<(), CliUsageError> {
     if !value.is_finite() || value < 0.0 {
         return Err(CliUsageError::Message(format!(
@@ -793,6 +892,10 @@ enum SessionCommand {
     Interrupt(SessionInterruptCommand),
     Compact(SessionCompactCommand),
     Memory(SessionMemoryCommand),
+    Goal {
+        #[command(subcommand)]
+        command: SessionGoalCommand,
+    },
     Show(SessionShowCommand),
     Unarchive(SessionArchiveCommand),
     History(SessionItemsCommand),
@@ -809,6 +912,13 @@ enum SessionCommand {
 enum ReplayCommand {
     Run(ReplayRunCommand),
     Report(ReplayReportCommand),
+}
+
+#[derive(Subcommand)]
+enum SessionGoalCommand {
+    Get(SessionGoalGetCommand),
+    Set(SessionGoalSetCommand),
+    Clear(SessionGoalClearCommand),
 }
 
 #[derive(Subcommand)]
@@ -937,6 +1047,41 @@ struct SessionMemoryCommand {
     mode: Option<String>,
     #[arg(long = "reset", conflicts_with = "mode")]
     reset: bool,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionGoalGetCommand {
+    #[arg()]
+    session_id: String,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionGoalSetCommand {
+    #[arg()]
+    session_id: String,
+    #[arg()]
+    objective: Vec<String>,
+    #[arg(
+        long = "status",
+        value_parser = ["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]
+    )]
+    status: Option<String>,
+    #[arg(long = "token-budget")]
+    token_budget: Option<i64>,
+    #[arg(long = "clear-token-budget", conflicts_with = "token_budget")]
+    clear_token_budget: bool,
+    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
+    output_mode: OutputMode,
+}
+
+#[derive(Args)]
+struct SessionGoalClearCommand {
+    #[arg()]
+    session_id: String,
     #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
     output_mode: OutputMode,
 }

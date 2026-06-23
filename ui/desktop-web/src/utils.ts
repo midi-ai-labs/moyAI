@@ -69,6 +69,18 @@ export function displayAccessLabel(label: string): string {
   return label;
 }
 
+export function goalSlashCommandHint(prompt: string): string | null {
+  const match = prompt.match(/^\s*\/goal(?:\s|$)/);
+  if (!match) return null;
+  const arg = prompt.slice(match[0].length).trim();
+  const normalized = arg.toLowerCase();
+  if (arg.length === 0) return "現在のgoalを表示します。指定: objective | clear | pause | resume";
+  if (normalized === "clear") return "現在のgoalを削除します。";
+  if (normalized === "pause") return "現在のgoalを一時停止します。";
+  if (normalized === "resume") return "一時停止中のgoalを再開します。";
+  return "このobjectiveをgoalに設定して、そのまま実行します。";
+}
+
 export interface HumanError {
   title: string;
   hint: string;

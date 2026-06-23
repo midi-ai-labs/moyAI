@@ -180,7 +180,10 @@ impl SessionService {
             Some(IdleTurnRejectionReason::PendingTriggerTurn)
         } else if plan_mode {
             Some(IdleTurnRejectionReason::PlanMode)
-        } else if session.status != SessionStatus::Idle {
+        } else if !matches!(
+            session.status,
+            SessionStatus::Idle | SessionStatus::Completed
+        ) {
             Some(IdleTurnRejectionReason::Busy)
         } else {
             None

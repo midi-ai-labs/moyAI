@@ -3,7 +3,7 @@ import { actionById, menuActions, paletteActions, shortcutActions, type ActionDe
 import { icon } from "./icons";
 import { renderMarkdown } from "./markdown";
 import type { DesktopWebState, FileChangeRow, ProjectRow, SessionRow, TranscriptRow } from "./types";
-import { displayAccessLabel, escapeHtml, fileName, humanizeError, shortenPath, validateConfigInput } from "./utils";
+import { displayAccessLabel, escapeHtml, fileName, goalSlashCommandHint, humanizeError, shortenPath, validateConfigInput } from "./utils";
 
 export type { LocalConfirmation } from "./render_overlays";
 export { renderConfirmation, renderLocalConfirmation } from "./render_overlays";
@@ -240,7 +240,7 @@ export function renderSidebar(state: DesktopWebState): string {
         <span>プロジェクト</span>
         <button class="tiny-button icon-only" data-action="create-project-from-picker" title="プロジェクトを作成" aria-label="プロジェクトを作成">${icon("folder-plus")}</button>
       </div>
-      <div class="row-list">
+      <div class="row-list project-list">
         ${state.project_rows
           .map((row, index) => renderProjectRowWithSessions(state, row, index))
           .join("")}
@@ -249,7 +249,7 @@ export function renderSidebar(state: DesktopWebState): string {
         <span class="section-label">チャット${chatRunning ? '<span class="busy-spinner small" title="実行中"></span>' : ""}</span>
         <button class="tiny-button icon-only" data-action="new-chat" title="新しいチャット" aria-label="新しいチャット">${icon("edit")}</button>
       </div>
-      <div class="row-list">${renderChatRows(state)}</div>
+      <div class="row-list chat-list">${renderChatRows(state)}</div>
       <button class="settings" data-action="show-config" title="設定"><span class="rail-icon">${icon("settings")}</span><span>設定</span></button>
     </aside>
   `;
@@ -468,10 +468,15 @@ export function renderComposer(state: DesktopWebState): string {
   const enhanceTitle = state.busy ? "実行中はEnhanceできません" : state.draft_prompt.trim().length === 0 ? "依頼文を入力してください" : "Enhance";
   const controlsVisible = attachmentTrayOpen || state.image_input.trim().length > 0;
   const trayVisible = controlsVisible || state.attached_images.length > 0;
+  const goalHint = goalSlashCommandHint(state.draft_prompt);
   return `
-    <section class="composer">
+    <section class="composer ${goalHint ? "goal-command" : ""}">
       ${trayVisible ? renderAttachmentTray(state, controlsVisible) : ""}
-      <textarea id="prompt" placeholder="moyAI に依頼する">${escapeHtml(state.draft_prompt)}</textarea>
+      <textarea id="prompt" placeholder="moyAI に依頼する" aria-describedby="goal-command-hint">${escapeHtml(state.draft_prompt)}</textarea>
+      <div class="goal-command-hint" id="goal-command-hint" ${goalHint ? "" : "hidden"}>
+        <span class="goal-command-badge">/goal</span>
+        <span data-goal-command-help>${escapeHtml(goalHint ?? "")}</span>
+      </div>
       <div class="composer-actions">
         <button class="add-button icon-only" data-action="toggle-attachment-tray" title="画像添付" aria-label="画像添付" ${state.image_input_enabled ? "" : "disabled"}>${icon("plus")}</button>
         <button class="icon-only" data-action="show-command-palette" title="検索 / コマンド" aria-label="検索 / コマンド">${icon("more")}</button>

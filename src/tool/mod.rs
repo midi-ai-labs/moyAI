@@ -2,6 +2,7 @@ pub mod apply_patch;
 pub mod context;
 pub mod contract;
 pub mod docling_convert;
+pub mod goal;
 pub mod inspect_directory;
 pub mod mcp_call;
 pub mod read;

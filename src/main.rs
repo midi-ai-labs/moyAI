@@ -4,9 +4,10 @@ use std::process::ExitCode;
 use camino::Utf8PathBuf;
 use moyai::app::{
     AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest,
-    SessionCompactRequest, SessionEventsRequest, SessionForkRequest, SessionHistoryRequest,
-    SessionInterruptRequest, SessionListRequest, SessionLoadedRequest, SessionMemoryRequest,
-    SessionReadRequest, SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
+    SessionCompactRequest, SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest,
+    SessionGoalGetRequest, SessionGoalSetRequest, SessionHistoryRequest, SessionInterruptRequest,
+    SessionListRequest, SessionLoadedRequest, SessionMemoryRequest, SessionReadRequest,
+    SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
     SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,
     SessionTitleUpdateRequest, SessionTurnsRequest,
 };
@@ -57,6 +58,9 @@ fn run() -> Result<(), (u8, String)> {
         | CliCommand::SessionInterrupt(_)
         | CliCommand::SessionCompact(_)
         | CliCommand::SessionMemory(_)
+        | CliCommand::SessionGoalGet(_)
+        | CliCommand::SessionGoalSet(_)
+        | CliCommand::SessionGoalClear(_)
         | CliCommand::SessionShow(_)
         | CliCommand::SessionHistory(_)
         | CliCommand::SessionRead(_)
@@ -353,6 +357,20 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             session_id: args.session_id,
             mode: args.mode,
         }),
+        CliCommand::SessionGoalGet(args) => AppCommand::SessionGoalGet(SessionGoalGetRequest {
+            session_id: args.session_id,
+        }),
+        CliCommand::SessionGoalSet(args) => AppCommand::SessionGoalSet(SessionGoalSetRequest {
+            session_id: args.session_id,
+            objective: args.objective.clone(),
+            status: args.status,
+            token_budget: args.token_budget,
+        }),
+        CliCommand::SessionGoalClear(args) => {
+            AppCommand::SessionGoalClear(SessionGoalClearRequest {
+                session_id: args.session_id,
+            })
+        }
         CliCommand::SessionShow(args) => AppCommand::SessionShow(SessionShowRequest {
             session_id: args.session_id,
             show_reasoning: args.show_reasoning,
@@ -437,6 +455,9 @@ fn command_output_mode(command: &CliCommand) -> OutputMode {
         CliCommand::SessionInterrupt(args) => args.output_mode,
         CliCommand::SessionCompact(args) => args.output_mode,
         CliCommand::SessionMemory(args) => args.output_mode,
+        CliCommand::SessionGoalGet(args) => args.output_mode,
+        CliCommand::SessionGoalSet(args) => args.output_mode,
+        CliCommand::SessionGoalClear(args) => args.output_mode,
         CliCommand::SessionShow(args) => args.output_mode,
         CliCommand::SessionHistory(args) => args.output_mode,
         CliCommand::SessionRead(args) => args.output_mode,
