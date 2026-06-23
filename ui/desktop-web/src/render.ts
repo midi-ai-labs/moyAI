@@ -627,14 +627,19 @@ export function renderOverlay(state: DesktopWebState): string {
 function renderProviderOverlay(state: DesktopWebState): string {
   const selectedSummary = state.provider_selected_model_summary.length > 0 ? state.provider_selected_model_summary : ["モデル metadata は未取得です。"];
   const providerStatus = providerStatusView(state.provider_status_text);
+  const setupRequired = startupSetupRequired(state);
   const providerModeOptions = [
     ["lm_studio_native_required", "LM Studio native"],
     ["openai_compatible_only", "OpenAI互換のみ"],
   ] as const;
   return `
     <div class="modal-backdrop" data-action="close-overlay">
-      <section class="modal wide" data-modal>
-        <h2>LLM URL</h2>
+      <section class="modal wide ${setupRequired ? "setup-modal" : ""}" data-modal>
+        <div class="modal-header">
+          <h2>${setupRequired ? "初期設定" : "LLM URL"}</h2>
+          ${setupRequired ? "" : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
+        </div>
+        ${setupRequired ? `<p class="setup-message">${escapeHtml(state.startup.message)} ${escapeHtml(state.startup.detail)}</p>` : ""}
         <label class="field-label">ベースURL</label>
         <input id="provider-url" value="${escapeHtml(state.provider_base_url)}" />
         <label class="field-label">Provider mode</label>
@@ -662,6 +667,7 @@ function renderProviderOverlay(state: DesktopWebState): string {
           <button data-action="load-provider-models" ${state.provider_loading ? "disabled" : ""}>${state.provider_loading ? "読込中" : "モデル読込"}</button>
           <button data-action="apply-provider-session" ${state.provider_apply_enabled ? "" : "disabled"}>UIセッションに適用</button>
           <button data-action="save-provider-global" ${state.provider_apply_enabled ? "" : "disabled"}>設定ファイルに保存</button>
+          ${setupRequired ? `<button data-action="import-config-toml">config.tomlをImport</button>` : ""}
         </div>
         <div class="select-list">
           ${state.provider_models
@@ -732,13 +738,15 @@ function providerStatusView(message: string): { kind: string; title: string; hin
 function renderConfigOverlay(state: DesktopWebState): string {
   const normalizedFilter = configFilterText.trim().toLowerCase();
   const selectedValidation = validateConfigInput(state.config_field_title, state.config_value_text);
+  const setupRequired = startupSetupRequired(state);
   return `
     <div class="modal-backdrop" data-action="close-overlay">
-      <section class="modal wide" data-modal>
+      <section class="modal wide ${setupRequired ? "setup-modal" : ""}" data-modal>
         <div class="modal-header">
-          <h2>設定</h2>
-          <button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>
+          <h2>${setupRequired ? "初期設定" : "設定"}</h2>
+          ${setupRequired ? "" : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
         </div>
+        ${setupRequired ? `<p class="setup-message">${escapeHtml(state.startup.message)} ${escapeHtml(state.startup.detail)}</p>` : ""}
         <div class="config-grid">
           <div class="config-list-pane">
             <input id="config-filter" value="${escapeHtml(configFilterText)}" placeholder="設定項目を検索" aria-label="設定項目を検索" />
@@ -759,14 +767,22 @@ function renderConfigOverlay(state: DesktopWebState): string {
             <div class="split-actions config-actions">
               <button data-action="apply-session-config">このUIセッションに適用</button>
               <button data-action="save-global-config">設定ファイルに保存</button>
+              ${setupRequired ? `<button data-action="import-config-toml">config.tomlをImport</button>` : ""}
               <button data-action="open-global-config-folder">設定フォルダーを開く</button>
-              <button data-action="close-overlay">閉じる</button>
+              ${setupRequired ? "" : `<button data-action="close-overlay">閉じる</button>`}
             </div>
           </div>
         </div>
       </section>
     </div>
   `;
+}
+
+function startupSetupRequired(state: DesktopWebState): boolean {
+  return (
+    (state.startup.status === "requires_config" || state.startup.status === "requires_provider") &&
+    state.startup.action_overlay === state.overlay
+  );
 }
 
 function renderConfigItems(state: DesktopWebState, normalizedFilter: string): string {

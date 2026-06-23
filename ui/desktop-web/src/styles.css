@@ -1984,3 +1984,14 @@ pre {
     padding-inline: 28px;
   }
 }
+
+.setup-modal {
+  border-color: #7896c9;
+}
+
+.setup-message {
+  margin: 4px 0 14px;
+  color: var(--muted);
+  line-height: 1.5;
+  font-size: 13px;
+}

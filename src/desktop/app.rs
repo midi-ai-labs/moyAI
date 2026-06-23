@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Write;
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
@@ -1679,6 +1680,7 @@ impl DesktopController {
         ) {
             Ok(message) => {
                 self.reload_config();
+                self.state.mark_startup_config_reviewed();
                 self.state.set_status_message(message);
             }
             Err(error) => self
@@ -1731,11 +1733,31 @@ impl DesktopController {
         ) {
             Ok(message) => {
                 self.reload_config();
+                self.state.mark_startup_config_reviewed();
                 self.state.set_status_message(message);
             }
             Err(error) => self
                 .state
                 .set_status_message(format!("config save failed: {error}")),
+        }
+    }
+
+    pub(crate) fn import_global_config_toml_dialog(&mut self) {
+        match pick_config_toml_file() {
+            Ok(Some(path)) => match import_global_config_toml(&path) {
+                Ok(message) => {
+                    self.reload_config();
+                    self.state.mark_startup_config_reviewed();
+                    self.state.set_status_message(message);
+                }
+                Err(error) => self
+                    .state
+                    .set_status_message(format!("config import failed: {error}")),
+            },
+            Ok(None) => {}
+            Err(error) => self
+                .state
+                .set_status_message(format!("config import failed: {error}")),
         }
     }
 
@@ -4443,6 +4465,42 @@ fn pick_image_file(start_dir: Option<&Utf8Path>) -> Result<Option<Utf8PathBuf>, 
 #[cfg(not(feature = "tauri-desktop"))]
 fn pick_image_file(_start_dir: Option<&Utf8Path>) -> Result<Option<Utf8PathBuf>, String> {
     Err("desktop image picker requires the tauri-desktop feature".to_string())
+}
+
+#[cfg(feature = "tauri-desktop")]
+fn pick_config_toml_file() -> Result<Option<Utf8PathBuf>, String> {
+    match rfd::FileDialog::new()
+        .add_filter("moyAI config.toml", &["toml"])
+        .set_file_name("config.toml")
+        .pick_file()
+    {
+        Some(path) => Utf8PathBuf::from_path_buf(path)
+            .map(Some)
+            .map_err(|_| "selected config path is not valid UTF-8".to_string()),
+        None => Ok(None),
+    }
+}
+
+#[cfg(not(feature = "tauri-desktop"))]
+fn pick_config_toml_file() -> Result<Option<Utf8PathBuf>, String> {
+    Err("desktop config picker requires the tauri-desktop feature".to_string())
+}
+
+fn import_global_config_toml(source: &Utf8Path) -> Result<String, String> {
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| "selected file has no file name".to_string())?;
+    if !file_name.eq_ignore_ascii_case("config.toml") {
+        return Err("select a file named config.toml".to_string());
+    }
+    let text = fs::read_to_string(source.as_std_path()).map_err(|error| error.to_string())?;
+    toml::from_str::<PartialResolvedConfig>(&text).map_err(|error| error.to_string())?;
+    let target = global_config_path().map_err(|error| error.to_string())?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent.as_std_path()).map_err(|error| error.to_string())?;
+    }
+    fs::write(target.as_std_path(), text).map_err(|error| error.to_string())?;
+    Ok(format!("imported config.toml to {}", target))
 }
 
 fn normalize_markdown_export_path(path: Utf8PathBuf) -> Utf8PathBuf {

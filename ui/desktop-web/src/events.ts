@@ -43,8 +43,9 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
       event.preventDefault();
       void dispatchRegisteredAction("toggle-session-archived-search", currentState, context, { index: -1, value: "" });
     }
-    if (event.key === "Escape" && currentState?.overlay !== "none") {
+    if (event.key === "Escape" && currentState && currentState.overlay !== "none") {
       event.preventDefault();
+      if (startupSetupRequired(currentState)) return;
       void context.mutate("close_overlay");
     }
   });
@@ -326,6 +327,7 @@ async function dispatchAction(action: string, index: number, value: string, stat
   if (action === "show-command-palette") void context.mutate("show_command_palette");
   if (action === "show-shortcuts") void context.mutate("show_shortcuts");
   if (action === "close-overlay") {
+    if (startupSetupRequired(state)) return;
     context.uiState.configDirty = false;
     void context.mutate("close_overlay");
   }
@@ -333,6 +335,7 @@ async function dispatchAction(action: string, index: number, value: string, stat
   if (action === "browse-workspace") void context.mutate("browse_workspace");
   if (action === "open-workspace-folder") void context.mutate("open_workspace_folder");
   if (action === "open-global-config-folder") void context.mutate("open_global_config_folder");
+  if (action === "import-config-toml") void context.mutate("import_global_config_toml");
   if (action === "open-typed-path") void context.mutate("open_typed_path");
   if (action === "open-artifact-folder") void context.mutate("open_artifact_folder");
   if (action === "load-provider-models") {
@@ -367,6 +370,13 @@ async function dispatchAction(action: string, index: number, value: string, stat
   if (action === "insert-command") void context.mutate("insert_command", { index });
   if (action === "allow") void context.mutate("answer_permission", { allow: true });
   if (action === "deny") void context.mutate("answer_permission", { allow: false });
+}
+
+function startupSetupRequired(state: DesktopWebState): boolean {
+  return (
+    (state.startup.status === "requires_config" || state.startup.status === "requires_provider") &&
+    state.startup.action_overlay === state.overlay
+  );
 }
 
 function confirmLocalDelete(context: ActionContext): void {

@@ -1024,7 +1024,26 @@ impl DesktopState {
     }
 
     pub fn hide_overlay(&mut self) {
+        if self.startup_requires_overlay(self.view.overlay) {
+            self.set_status_message(
+                "初期設定が必要です。保存または config.toml Import で設定を完了してください。",
+            );
+            return;
+        }
         self.view.overlay = DesktopOverlay::None;
+    }
+
+    pub fn mark_startup_config_reviewed(&mut self) {
+        self.startup.mark_config_reviewed();
+        self.apply_startup_overlay();
+    }
+
+    fn startup_requires_overlay(&self, overlay: DesktopOverlay) -> bool {
+        matches!(
+            self.startup.status,
+            super::startup::DesktopStartupStatus::RequiresConfig
+                | super::startup::DesktopStartupStatus::RequiresProvider
+        ) && self.startup.action_overlay == Some(overlay)
     }
 
     pub fn set_config_selection(&mut self, index: usize) {

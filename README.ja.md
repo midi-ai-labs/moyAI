@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.3.0"><img alt="Release" src="https://img.shields.io/badge/release-v0.3.0-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.4.0"><img alt="Release" src="https://img.shields.io/badge/release-v0.4.0-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.md">English README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.3.0">release をダウンロード</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.4.0">release をダウンロード</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -74,7 +74,7 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 
 現在の beta release を公開しています。
 
-[**moyAI v0.3.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.3.0)
+[**moyAI v0.4.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.4.0)
 
 Windows 向け release zip には、次のものが含まれています。
 
@@ -119,7 +119,7 @@ cargo build --release --bin moyai --bin moyai-desktop
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.3.0
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.4.0
 ```
 
 既定では、release artifact は repository の外側にある `project_sandbox/releases/` に出力されます。

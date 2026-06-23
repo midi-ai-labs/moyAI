@@ -248,6 +248,11 @@ impl DesktopStartupState {
         self.recompute();
     }
 
+    pub fn mark_config_reviewed(&mut self) {
+        self.config_requires_attention = false;
+        self.recompute();
+    }
+
     fn set_provider_check(&mut self, check: DesktopStartupCheck) {
         self.set_check(check);
     }

@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "0.3.0",
+  [string]$Version = "0.4.0",
   [string]$Target = "windows-x86_64",
   [string]$OutputRoot = "",
   [switch]$SkipBuild
@@ -93,17 +93,21 @@ try {
 
   if (-not $SkipBuild) {
     npm run build:desktop-web
-    cargo build --release --bin moyai --bin moyai-desktop
+    cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
   }
 
   $cliExe = Join-Path $repoRoot "target\release\moyai.exe"
   $desktopExe = Join-Path $repoRoot "target\release\moyai-desktop.exe"
+  $cleanupExe = Join-Path $repoRoot "target\release\moyai-cleanup.exe"
   $desktopDist = Join-Path $repoRoot "ui\desktop-web\dist"
   if (-not (Test-Path -LiteralPath $cliExe -PathType Leaf)) {
     throw "release CLI binary not found: $cliExe"
   }
   if (-not (Test-Path -LiteralPath $desktopExe -PathType Leaf)) {
     throw "release Desktop binary not found: $desktopExe"
+  }
+  if (-not (Test-Path -LiteralPath $cleanupExe -PathType Leaf)) {
+    throw "release cleanup binary not found: $cleanupExe"
   }
   if (-not (Test-Path -LiteralPath $desktopDist -PathType Container)) {
     throw "Desktop web asset directory not found: $desktopDist"
@@ -117,6 +121,7 @@ try {
 
   Copy-RequiredFile $cliExe (Join-Path $releaseRoot "bin\moyai.exe")
   Copy-RequiredFile $desktopExe (Join-Path $releaseRoot "bin\moyai-desktop.exe")
+  Copy-RequiredFile $cleanupExe (Join-Path $releaseRoot "bin\moyai-cleanup.exe")
   Copy-RequiredFile (Join-Path $repoRoot "README.md") (Join-Path $releaseRoot "README.md")
   Copy-RequiredFile (Join-Path $repoRoot "README.ja.md") (Join-Path $releaseRoot "README.ja.md")
   Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $releaseRoot "LICENSE")
@@ -153,6 +158,7 @@ This release module contains the Windows CLI and Tauri Desktop binaries.
 
 - `bin/moyai.exe`: CLI / TUI entrypoint
 - `bin/moyai-desktop.exe`: Desktop App entrypoint
+- `bin/moyai-cleanup.exe`: reset user-wide moyAI AppData to first-run state
 - `ui/desktop-web/dist/`: bundled Desktop web assets
 - `config.example.toml`: optional sample config
 - `README.md` / `README.ja.md`: usage notes
@@ -174,6 +180,8 @@ This release module contains the Windows CLI and Tauri Desktop binaries.
 3. Open `LLM URL`, set base URL and model, then send a Quick Chat or select a Project workspace.
 
 The app stores user-wide config under the Windows user profile by default. No npm, Rust toolchain, internet access, or local dev server is required on the target machine.
+
+To reset moyAI to its first-run state, close all moyAI windows and run `bin/moyai-cleanup.exe`.
 
 ## Known Limitations
 
