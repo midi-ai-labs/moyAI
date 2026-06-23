@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "0.2.0",
+  [string]$Version = "0.3.0",
   [string]$Target = "windows-x86_64",
   [string]$OutputRoot = "",
   [switch]$SkipBuild
@@ -147,7 +147,7 @@ timeout_ms = 30000
   $notesTemplate = @'
 # moyAI v{0}
 
-This beta release module contains the Windows CLI and Tauri Desktop binaries.
+This release module contains the Windows CLI and Tauri Desktop binaries.
 
 ## Files
 
@@ -158,13 +158,14 @@ This beta release module contains the Windows CLI and Tauri Desktop binaries.
 - `README.md` / `README.ja.md`: usage notes
 - `docs/user/getting-started.md`: first-run setup and known limitations
 
-## Beta Highlights
+## Highlights
 
 - Thin rebuilt agent core with short Markdown prompt, plain tool results, and minimal guard surface.
 - Desktop GUI, CLI, and TUI entrypoints over the same Rust core.
 - Local-first LM Studio / OpenAI-compatible endpoint configuration.
 - Workspace file editing, patching, search, directory inspection, shell execution, session history, and Markdown export.
 - Release candidate smoke coverage for CLI/TUI/Desktop, provider settings, streaming display, confirmation, cancellation, and export.
+- Codex-compatible goal runtime with `/goal`, goal tools, request-local steering, status accounting, and bounded idle continuation.
 
 ## Quick Start
 
