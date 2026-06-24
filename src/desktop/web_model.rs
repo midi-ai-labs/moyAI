@@ -38,6 +38,13 @@ pub struct DesktopStartupProjection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopConfigFieldProjection {
+    pub key: String,
+    pub value: String,
+    pub env_override: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopWebState {
     pub workspace_path: String,
     pub provider_label: String,
@@ -101,6 +108,7 @@ pub struct DesktopWebState {
     pub provider_selected_model_summary: Vec<String>,
     pub provider_loading: bool,
     pub provider_apply_enabled: bool,
+    pub config_fields: Vec<DesktopConfigFieldProjection>,
     pub config_items: Vec<String>,
     pub selected_config_index: i32,
     pub config_field_title: String,
@@ -254,6 +262,17 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         provider_selected_model_summary: provider_selected_model_summary(state),
         provider_loading: state.provider_config.provider_loading,
         provider_apply_enabled: state.can_apply_provider_selection(),
+        config_fields: state
+            .provider_config
+            .config_editor
+            .fields
+            .iter()
+            .map(|field| DesktopConfigFieldProjection {
+                key: field.key.label().to_string(),
+                value: field.value.clone(),
+                env_override: field.key.env_override().map(ToString::to_string),
+            })
+            .collect(),
         config_items,
         selected_config_index: state.provider_config.config_editor.selected as i32,
         config_field_title: state

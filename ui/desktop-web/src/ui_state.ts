@@ -2,7 +2,6 @@ import type { LocalConfirmation } from "./render";
 
 export interface UiLocalState {
   pendingLocalConfirmation: LocalConfirmation | null;
-  configFilterText: string;
   configDirty: boolean;
   lastFocusedOverlay: string;
   focusPromptAfterRender: boolean;
@@ -14,7 +13,6 @@ export interface UiLocalState {
 export function createUiLocalState(): UiLocalState {
   return {
     pendingLocalConfirmation: null,
-    configFilterText: "",
     configDirty: false,
     lastFocusedOverlay: "none",
     focusPromptAfterRender: false,

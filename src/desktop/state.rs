@@ -1070,6 +1070,20 @@ impl DesktopState {
         }
     }
 
+    pub fn set_config_values(&mut self, values: Vec<(usize, String)>) {
+        for (index, value) in values {
+            if let Some(field) = self.provider_config.config_editor.fields.get_mut(index) {
+                field.value = value;
+            }
+        }
+        self.provider_config.config_value_text = self
+            .provider_config
+            .config_editor
+            .selected_field()
+            .value
+            .clone();
+    }
+
     pub fn begin_provider_model_load(&mut self, normalized_base_url: String) {
         self.provider_config.provider_base_url_input = normalized_base_url;
         self.provider_config.provider_loading = true;
@@ -1283,8 +1297,8 @@ impl DesktopState {
                 .provider_base_url_input
                 .trim()
                 .is_empty()
-            && self.provider_config.provider_loaded_base_url.as_deref() == Some(normalized.as_str())
             && self.selected_provider_model().is_some()
+            && !normalized.is_empty()
     }
 
     fn with_provider_fields(mut self) -> Self {

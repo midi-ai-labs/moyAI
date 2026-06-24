@@ -122,7 +122,6 @@ function render(state: DesktopWebState): void {
   setRenderContext({
     artifactPaneCollapsed: uiState.artifactPaneCollapsed,
     attachmentTrayOpen: uiState.attachmentTrayOpen,
-    configFilterText: uiState.configFilterText,
     configDirty: uiState.configDirty,
   });
   appRoot.innerHTML = `

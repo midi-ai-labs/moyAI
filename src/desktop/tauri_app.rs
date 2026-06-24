@@ -131,6 +131,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             save_provider_global,
             set_config_selection,
             set_config_value,
+            set_config_values,
             apply_session_config,
             save_global_config,
             toggle_access_mode,
@@ -934,6 +935,28 @@ async fn set_config_value(
 ) -> Result<DesktopWebState, String> {
     mutate_controller(controller, |controller| {
         controller.state.set_config_value(text);
+    })
+    .await
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DesktopConfigValueInput {
+    index: usize,
+    text: String,
+}
+
+#[tauri::command]
+async fn set_config_values(
+    controller: State<'_, SharedController>,
+    values: Vec<DesktopConfigValueInput>,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, |controller| {
+        controller.state.set_config_values(
+            values
+                .into_iter()
+                .map(|value| (value.index, value.text))
+                .collect(),
+        );
     })
     .await
 }

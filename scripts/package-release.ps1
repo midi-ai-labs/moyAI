@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "0.4.0",
+  [string]$Version = "0.5.0",
   [string]$Target = "windows-x86_64",
   [string]$OutputRoot = "",
   [switch]$SkipBuild
@@ -168,6 +168,7 @@ This release module contains the Windows CLI and Tauri Desktop binaries.
 
 - Thin rebuilt agent core with short Markdown prompt, plain tool results, and minimal guard surface.
 - Desktop GUI, CLI, and TUI entrypoints over the same Rust core.
+- Redesigned Desktop settings with stable typed controls, section navigation, and reliable apply/save behavior.
 - Local-first LM Studio / OpenAI-compatible endpoint configuration.
 - Workspace file editing, patching, search, directory inspection, shell execution, session history, and Markdown export.
 - Release candidate smoke coverage for CLI/TUI/Desktop, provider settings, streaming display, confirmation, cancellation, and export.

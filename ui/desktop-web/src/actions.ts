@@ -1,7 +1,6 @@
 import { command } from "./api";
 import type { DesktopWebState, ProjectRow, SessionRow } from "./types";
 import { setArtifactPaneCollapsed, type UiLocalState } from "./ui_state";
-import { validateConfigInput } from "./utils";
 
 export type ActionMenu = "file" | "edit" | "view" | "help";
 
@@ -24,7 +23,7 @@ export interface ActionContext {
   mutate: (name: string, args?: Record<string, unknown>) => Promise<void>;
   renderError: (message: string) => void;
   flushProviderInputMutations: () => Promise<void>;
-  flushConfigInputMutations: () => Promise<void>;
+  flushConfigInputMutations: () => Promise<boolean>;
 }
 
 export interface ActionDefinition {
@@ -350,10 +349,8 @@ export const ACTIONS: ActionDefinition[] = [
     label: "設定を UI セッションに適用",
     palette: true,
     enabled: always,
-    run: async (state, context) => {
-      await context.flushConfigInputMutations();
-      const result = validateConfigInput(state.config_field_title, state.config_value_text);
-      if (!result.ok) return;
+    run: async (_state, context) => {
+      if (!(await context.flushConfigInputMutations())) return;
       context.uiState.configDirty = false;
       await context.mutate("apply_session_config");
     },
@@ -363,10 +360,8 @@ export const ACTIONS: ActionDefinition[] = [
     label: "設定ファイルに保存",
     palette: true,
     enabled: always,
-    run: async (state, context) => {
-      await context.flushConfigInputMutations();
-      const result = validateConfigInput(state.config_field_title, state.config_value_text);
-      if (!result.ok) return;
+    run: async (_state, context) => {
+      if (!(await context.flushConfigInputMutations())) return;
       context.uiState.configDirty = false;
       await context.mutate("save_global_config");
     },

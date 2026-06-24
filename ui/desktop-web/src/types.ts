@@ -84,6 +84,12 @@ export interface StartupProjection {
   checks: StartupCheckProjection[];
 }
 
+export interface ConfigFieldProjection {
+  key: string;
+  value: string;
+  env_override: string | null;
+}
+
 export interface DesktopWebState {
   workspace_path: string;
   provider_label: string;
@@ -147,6 +153,7 @@ export interface DesktopWebState {
   provider_selected_model_summary: string[];
   provider_loading: boolean;
   provider_apply_enabled: boolean;
+  config_fields: ConfigFieldProjection[];
   config_items: string[];
   selected_config_index: number;
   config_field_title: string;

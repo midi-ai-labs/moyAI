@@ -2,8 +2,8 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { actionById, menuActions, paletteActions, shortcutActions, type ActionDefinition, type ActionMenu } from "./actions";
 import { icon } from "./icons";
 import { renderMarkdown } from "./markdown";
-import type { DesktopWebState, FileChangeRow, ProjectRow, SessionRow, TranscriptRow } from "./types";
-import { displayAccessLabel, escapeHtml, fileName, goalSlashCommandHint, humanizeError, shortenPath, validateConfigInput } from "./utils";
+import type { ConfigFieldProjection, DesktopWebState, FileChangeRow, ProjectRow, SessionRow, TranscriptRow } from "./types";
+import { displayAccessLabel, escapeHtml, fileName, goalSlashCommandHint, humanizeError, shortenPath } from "./utils";
 
 export type { LocalConfirmation } from "./render_overlays";
 export { renderConfirmation, renderLocalConfirmation } from "./render_overlays";
@@ -13,19 +13,46 @@ const splashLogoUrl = new URL("../../../logo/fabicon/android-chrome-512x512.png"
 interface RenderContext {
   artifactPaneCollapsed: boolean;
   attachmentTrayOpen: boolean;
-  configFilterText: string;
   configDirty: boolean;
 }
 
 let artifactPaneCollapsed = false;
 let attachmentTrayOpen = false;
-let configFilterText = "";
 let configDirty = false;
+
+const TYPED_CONFIG_KEYS = new Set([
+  "model.base_url",
+  "model.model",
+  "model.provider_metadata_mode",
+  "model.context_window",
+  "model.max_output_tokens",
+  "model.temperature",
+  "model.top_p",
+  "model.supports_tools",
+  "model.supports_reasoning",
+  "model.supports_images",
+  "model.parallel_tool_calls",
+  "permissions.access_mode",
+  "inspection.default_max_depth",
+  "inspection.default_max_entries_per_dir",
+  "inspection.max_extensions_reported",
+  "inspection.include_hidden_by_default",
+  "file_guard.max_inline_read_bytes",
+  "file_guard.large_file_warning_bytes",
+  "file_guard.blocked_read_extensions",
+  "file_guard.structured_document_extensions",
+  "docling.enabled",
+  "docling.base_url",
+  "docling.timeout_ms",
+  "docling.api_key_env",
+  "docling.headers_json",
+  "mcp.enabled",
+  "mcp.servers_json",
+]);
 
 export function setRenderContext(context: RenderContext): void {
   artifactPaneCollapsed = context.artifactPaneCollapsed;
   attachmentTrayOpen = context.attachmentTrayOpen;
-  configFilterText = context.configFilterText;
   configDirty = context.configDirty;
 }
 
@@ -633,7 +660,7 @@ function renderProviderOverlay(state: DesktopWebState): string {
     ["openai_compatible_only", "OpenAI互換のみ"],
   ] as const;
   return `
-    <div class="modal-backdrop" data-action="close-overlay">
+    <div class="modal-backdrop">
       <section class="modal wide ${setupRequired ? "setup-modal" : ""}" data-modal>
         <div class="modal-header">
           <h2>${setupRequired ? "初期設定" : "LLM URL"}</h2>
@@ -736,41 +763,127 @@ function providerStatusView(message: string): { kind: string; title: string; hin
 }
 
 function renderConfigOverlay(state: DesktopWebState): string {
-  const normalizedFilter = configFilterText.trim().toLowerCase();
-  const selectedValidation = validateConfigInput(state.config_field_title, state.config_value_text);
   const setupRequired = startupSetupRequired(state);
+  const title = setupRequired ? "初期設定" : "Preferences";
   return `
-    <div class="modal-backdrop" data-action="close-overlay">
-      <section class="modal wide ${setupRequired ? "setup-modal" : ""}" data-modal>
-        <div class="modal-header">
-          <h2>${setupRequired ? "初期設定" : "設定"}</h2>
-          ${setupRequired ? "" : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
+    <div class="modal-backdrop">
+      <section class="modal settings-modal ${setupRequired ? "setup-modal" : ""}" data-modal>
+        <div class="settings-header">
+          <div>
+            <h2>${escapeHtml(title)}</h2>
+            <p>${setupRequired ? "起動に必要な設定を確認します。" : "永続設定を編集します。セッションだけの変更は LLM URL または上部チップから行います。"}</p>
+          </div>
+          <div class="settings-header-actions">
+            <span class="dirty-badge ${configDirty ? "visible" : ""}">変更あり</span>
+            <button data-action="apply-session-config">UIセッションに適用</button>
+            <button data-action="save-global-config">設定ファイルに保存</button>
+            ${setupRequired ? `<button data-action="import-config-toml">config.tomlをImport</button>` : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
+          </div>
         </div>
         ${setupRequired ? `<p class="setup-message">${escapeHtml(state.startup.message)} ${escapeHtml(state.startup.detail)}</p>` : ""}
-        <div class="config-grid">
-          <div class="config-list-pane">
-            <input id="config-filter" value="${escapeHtml(configFilterText)}" placeholder="設定項目を検索" aria-label="設定項目を検索" />
-            <div class="select-list config-list">
-              ${renderConfigItems(state, normalizedFilter)}
-            </div>
-          </div>
-          <div class="config-editor-pane">
-            <div class="config-title-row">
-              <label class="field-label" for="config-value">${escapeHtml(state.config_field_title)}</label>
-              <span class="dirty-badge ${configDirty ? "visible" : ""}">変更あり</span>
-            </div>
-            <textarea id="config-value">${escapeHtml(state.config_value_text)}</textarea>
-            <div id="config-validation" class="validation ${selectedValidation.ok ? "ok" : "error"}">${escapeHtml(
-              selectedValidation.message
-            )}</div>
-            <pre class="feedback">${escapeHtml(state.config_feedback_text)}</pre>
-            <div class="split-actions config-actions">
-              <button data-action="apply-session-config">このUIセッションに適用</button>
-              <button data-action="save-global-config">設定ファイルに保存</button>
-              ${setupRequired ? `<button data-action="import-config-toml">config.tomlをImport</button>` : ""}
-              <button data-action="open-global-config-folder">設定フォルダーを開く</button>
-              ${setupRequired ? "" : `<button data-action="close-overlay">閉じる</button>`}
-            </div>
+        <div id="settings-validation" class="validation ok">入力形式は問題ありません。</div>
+        <div class="settings-layout">
+          <nav class="settings-nav" aria-label="設定カテゴリ">
+            <a href="#settings-provider">Provider</a>
+            <a href="#settings-model">Model</a>
+            <a href="#settings-permissions">Permissions</a>
+            <a href="#settings-tools">Tools</a>
+            <a href="#settings-files">Files</a>
+            <a href="#settings-advanced">Advanced</a>
+            <button data-action="open-global-config-folder">設定フォルダーを開く</button>
+          </nav>
+          <div class="settings-content">
+            <section id="settings-provider" class="settings-section">
+              <div class="settings-section-head">
+                <h3>Provider</h3>
+                <button data-action="show-provider">LLM URL 画面を開く</button>
+              </div>
+              <div class="settings-grid-two">
+                ${renderConfigTextField(state, "model.base_url", "Base URL", "url")}
+                ${renderConfigTextField(state, "model.model", "Model")}
+              </div>
+              ${renderConfigEnumField(state, "model.provider_metadata_mode", "Provider mode", [
+                ["lm_studio_native_required", "LM Studio native"],
+                ["openai_compatible_only", "OpenAI compatible"],
+              ])}
+            </section>
+            <section id="settings-model" class="settings-section">
+              <h3>Model</h3>
+              <div class="settings-grid-two">
+                ${renderConfigTextField(state, "model.context_window", "Context window", "number")}
+                ${renderConfigTextField(state, "model.max_output_tokens", "Max output tokens", "number")}
+                ${renderConfigTextField(state, "model.temperature", "Temperature", "number")}
+                ${renderConfigTextField(state, "model.top_p", "Top P", "number")}
+              </div>
+              <div class="settings-toggle-grid">
+                ${renderConfigToggleField(state, "model.supports_tools", "Tools")}
+                ${renderConfigToggleField(state, "model.supports_reasoning", "Reasoning")}
+                ${renderConfigToggleField(state, "model.supports_images", "Images")}
+                ${renderConfigToggleField(state, "model.parallel_tool_calls", "Parallel tool calls")}
+              </div>
+            </section>
+            <section id="settings-permissions" class="settings-section">
+              <h3>Permissions</h3>
+              ${renderConfigEnumField(state, "permissions.access_mode", "Access mode", [
+                ["default", "標準"],
+                ["auto_review", "自動レビュー"],
+                ["full_access", "フルアクセス"],
+              ])}
+            </section>
+            <section id="settings-tools" class="settings-section">
+              <h3>Tools</h3>
+              <div class="settings-subsection">
+                <div class="settings-section-head compact">
+                  <div>
+                    <h4>Docling</h4>
+                    <p>PDF / DOCX などの構造化 document 変換に使います。無効時は agent tool surface から外れます。</p>
+                  </div>
+                  ${renderConfigToggleField(state, "docling.enabled", "有効")}
+                </div>
+                <div class="settings-grid-two">
+                  ${renderConfigTextField(state, "docling.base_url", "Docling base URL", "url")}
+                  ${renderConfigTextField(state, "docling.timeout_ms", "Timeout ms", "number")}
+                  ${renderConfigTextField(state, "docling.api_key_env", "API key env")}
+                </div>
+                ${renderConfigJsonField(state, "docling.headers_json", "Headers JSON")}
+              </div>
+              <div class="settings-subsection">
+                <div class="settings-section-head compact">
+                  <div>
+                    <h4>MCP</h4>
+                    <p>明示設定した HTTP MCP server だけを使います。</p>
+                  </div>
+                  ${renderConfigToggleField(state, "mcp.enabled", "有効")}
+                </div>
+                ${renderConfigJsonField(state, "mcp.servers_json", "MCP servers JSON")}
+              </div>
+            </section>
+            <section id="settings-files" class="settings-section">
+              <h3>Files</h3>
+              <div class="settings-grid-two">
+                ${renderConfigTextField(state, "inspection.default_max_depth", "Inspection depth", "number")}
+                ${renderConfigTextField(state, "inspection.default_max_entries_per_dir", "Entries per dir", "number")}
+                ${renderConfigTextField(state, "inspection.max_extensions_reported", "Extensions reported", "number")}
+                ${renderConfigTextField(state, "file_guard.max_inline_read_bytes", "Max inline read bytes", "number")}
+                ${renderConfigTextField(state, "file_guard.large_file_warning_bytes", "Large file warning bytes", "number")}
+                ${renderConfigTextField(state, "file_guard.blocked_read_extensions", "Blocked extensions")}
+                ${renderConfigTextField(state, "file_guard.structured_document_extensions", "Structured document extensions")}
+              </div>
+              ${renderConfigToggleField(state, "inspection.include_hidden_by_default", "Hidden files を inspection に含める")}
+            </section>
+            <section id="settings-advanced" class="settings-section">
+              <details>
+                <summary>Advanced raw fields</summary>
+                <div class="settings-raw-grid">
+                  ${state.config_fields
+                    .map((field, index) => ({ field, index }))
+                    .filter(({ field }) => !TYPED_CONFIG_KEYS.has(field.key))
+                    .map(({ field, index }) => renderRawConfigField(field, index))
+                    .join("")}
+                </div>
+              </details>
+              <pre class="feedback">${escapeHtml(state.config_feedback_text)}</pre>
+            </section>
           </div>
         </div>
       </section>
@@ -778,63 +891,84 @@ function renderConfigOverlay(state: DesktopWebState): string {
   `;
 }
 
+function configField(state: DesktopWebState, key: string): { field: ConfigFieldProjection; index: number } | null {
+  const index = state.config_fields.findIndex((field) => field.key === key);
+  if (index < 0) return null;
+  return { field: state.config_fields[index], index };
+}
+
+function renderMissingConfigField(key: string): string {
+  return `<div class="settings-field missing"><label>${escapeHtml(key)}</label><small>未対応の設定項目です。</small></div>`;
+}
+
+function renderConfigTextField(state: DesktopWebState, key: string, label: string, type = "text"): string {
+  const found = configField(state, key);
+  if (!found) return renderMissingConfigField(key);
+  const inputMode = type === "number" ? ' inputmode="numeric"' : "";
+  return `
+    <label class="settings-field">
+      <span>${escapeHtml(label)}${renderEnvBadge(found.field)}</span>
+      <input class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="${type === "number" ? "text" : type}"${inputMode} value="${escapeHtml(found.field.value)}" />
+    </label>
+  `;
+}
+
+function renderConfigJsonField(state: DesktopWebState, key: string, label: string): string {
+  const found = configField(state, key);
+  if (!found) return renderMissingConfigField(key);
+  return `
+    <label class="settings-field wide">
+      <span>${escapeHtml(label)}${renderEnvBadge(found.field)}</span>
+      <textarea class="settings-control settings-json" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}">${escapeHtml(found.field.value)}</textarea>
+    </label>
+  `;
+}
+
+function renderConfigToggleField(state: DesktopWebState, key: string, label: string): string {
+  const found = configField(state, key);
+  if (!found) return renderMissingConfigField(key);
+  const checked = found.field.value.trim().toLowerCase() === "true" ? "checked" : "";
+  return `
+    <label class="settings-toggle">
+      <input class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="checkbox" ${checked} />
+      <span class="toggle-ui"></span>
+      <span>${escapeHtml(label)}${renderEnvBadge(found.field)}</span>
+    </label>
+  `;
+}
+
+function renderConfigEnumField(state: DesktopWebState, key: string, label: string, options: Array<[string, string]>): string {
+  const found = configField(state, key);
+  if (!found) return renderMissingConfigField(key);
+  return `
+    <label class="settings-field wide">
+      <span>${escapeHtml(label)}${renderEnvBadge(found.field)}</span>
+      <select class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}">
+        ${options.map(([value, optionLabel]) => `<option value="${escapeHtml(value)}" ${found.field.value === value ? "selected" : ""}>${escapeHtml(optionLabel)}</option>`).join("")}
+      </select>
+    </label>
+  `;
+}
+
+function renderRawConfigField(field: ConfigFieldProjection, index: number): string {
+  return `
+    <label class="settings-field raw">
+      <span>${escapeHtml(field.key)}${renderEnvBadge(field)}</span>
+      <textarea class="settings-control settings-raw-value" data-config-index="${index}" data-config-key="${escapeHtml(field.key)}">${escapeHtml(field.value)}</textarea>
+    </label>
+  `;
+}
+
+function renderEnvBadge(field: ConfigFieldProjection): string {
+  if (!field.env_override) return "";
+  return ` <small class="env-badge">${escapeHtml(field.env_override)}</small>`;
+}
+
 function startupSetupRequired(state: DesktopWebState): boolean {
   return (
     (state.startup.status === "requires_config" || state.startup.status === "requires_provider") &&
     state.startup.action_overlay === state.overlay
   );
-}
-
-function renderConfigItems(state: DesktopWebState, normalizedFilter: string): string {
-  const filtered = state.config_items
-    .map((item, index) => ({ item, index, key: item.split(" = ")[0] ?? item }))
-    .filter(({ item }) => normalizedFilter.length === 0 || item.toLowerCase().includes(normalizedFilter));
-  if (filtered.length === 0) {
-    return '<div class="empty">一致する設定項目はありません</div>';
-  }
-  const grouped = new Map<string, Array<{ item: string; index: number; key: string }>>();
-  for (const entry of filtered) {
-    const group = configGroupLabel(entry.key);
-    const rows = grouped.get(group) ?? [];
-    rows.push(entry);
-    grouped.set(group, rows);
-  }
-  return Array.from(grouped.entries())
-    .map(
-      ([group, rows]) => `
-        <div class="config-group-label">${escapeHtml(group)}</div>
-        ${rows
-          .map(({ item, index }) => {
-            const [key, value = ""] = item.split(" = ");
-            return `
-              <button class="${index === state.selected_config_index ? "selected" : ""}" data-action="select-config" data-index="${index}" title="${escapeHtml(item)}">
-                <span>${escapeHtml(key)}</span>
-                <small>${escapeHtml(value)}</small>
-              </button>`;
-          })
-          .join("")}`
-    )
-    .join("");
-}
-
-function configGroupLabel(key: string): string {
-  const prefix = key.split(".")[0] ?? "other";
-  const labels: Record<string, string> = {
-    model: "Model",
-    permissions: "Permissions",
-    inspection: "Files",
-    file_guard: "Files",
-    docling: "Tools",
-    mcp: "Tools",
-    session: "Session",
-    shell: "Tools",
-    desktop: "Desktop",
-    logging: "Harness",
-    tool_output: "Tools",
-    instructions: "Instructions",
-    workspace: "Workspace",
-  };
-  return labels[prefix] ?? "Other";
 }
 
 function renderWorkspaceOverlay(state: DesktopWebState): string {

@@ -11,6 +11,13 @@ const TEXT_MUTATION_DEBOUNCE_MS = 180;
 const MIN_WINDOW_OPACITY_PERCENT = 50;
 const MAX_WINDOW_OPACITY_PERCENT = 100;
 
+type SettingsControl = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+
+interface ConfigValueInput {
+  index: number;
+  text: string;
+}
+
 interface PendingTextMutation {
   name: string;
   args: Record<string, unknown> | null;
@@ -112,18 +119,19 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
     if (currentState) currentState.provider_max_output_tokens = text;
     scheduleTextMutation("provider-max-output-tokens", "set_provider_max_output_tokens", { text }, context);
   });
-  document.querySelector<HTMLTextAreaElement>("#config-value")?.addEventListener("input", (event) => {
-    const text = (event.currentTarget as HTMLTextAreaElement).value;
-    const currentState = context.getCurrentState();
-    if (currentState) currentState.config_value_text = text;
-    context.uiState.configDirty = true;
-    updateConfigValidation(state.config_field_title, text, context.uiState);
-    scheduleTextMutation("config-value", "set_config_value", { text }, context);
+  const settingsControls = collectSettingsControls();
+  settingsControls.forEach((control) => {
+    const update = () => {
+      updateSettingsControlDraft(control, context);
+      markConfigDirty(context.uiState);
+      validateSettingsForm(context.uiState, false);
+    };
+    control.addEventListener("input", update);
+    control.addEventListener("change", update);
   });
-  document.querySelector<HTMLInputElement>("#config-filter")?.addEventListener("input", (event) => {
-    context.uiState.configFilterText = (event.currentTarget as HTMLInputElement).value;
-    context.render(state);
-  });
+  if (settingsControls.length > 0) {
+    validateSettingsForm(context.uiState, false);
+  }
   document.querySelector<HTMLInputElement>("#workspace-input")?.addEventListener("input", (event) => {
     void command<DesktopWebState>("set_workspace_input", {
       text: (event.currentTarget as HTMLInputElement).value,
@@ -170,6 +178,8 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
   document.querySelectorAll<HTMLElement>("[data-drag-region], [data-tauri-drag-region]").forEach((node) => {
     node.addEventListener("mousedown", (event) => {
       if (event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
+      event.preventDefault();
+      event.stopPropagation();
       void command("start_window_drag").catch(() => context.desktopWindow.startDragging());
     });
   });
@@ -239,8 +249,93 @@ export async function flushProviderInputMutations(context: ActionContext): Promi
   ]);
 }
 
-export async function flushConfigInputMutations(context: ActionContext): Promise<void> {
+export async function flushConfigInputMutations(context: ActionContext): Promise<boolean> {
+  const values = collectSettingsFormValues();
+  if (values.length > 0) {
+    if (!validateSettingsForm(context.uiState, true)) return false;
+    try {
+      const nextState = await command<DesktopWebState>("set_config_values", { values });
+      context.setCurrentState(nextState);
+      return true;
+    } catch (error) {
+      context.renderError(String(error));
+      return false;
+    }
+  }
   await flushTextMutation("config-value", context);
+  return true;
+}
+
+function collectSettingsControls(): SettingsControl[] {
+  return Array.from(document.querySelectorAll<SettingsControl>(".settings-control"));
+}
+
+function collectSettingsFormValues(): ConfigValueInput[] {
+  const valuesByIndex = new Map<number, ConfigValueInput>();
+  for (const control of collectSettingsControls()) {
+    const index = Number(control.dataset.configIndex ?? "-1");
+    if (!Number.isInteger(index) || index < 0) continue;
+    valuesByIndex.set(index, { index, text: settingsControlValue(control) });
+  }
+  return Array.from(valuesByIndex.values());
+}
+
+function settingsControlValue(control: SettingsControl): string {
+  if (control instanceof HTMLInputElement && control.type === "checkbox") {
+    return control.checked ? "true" : "false";
+  }
+  return control.value;
+}
+
+function updateSettingsControlDraft(control: SettingsControl, context: ActionContext): void {
+  const index = Number(control.dataset.configIndex ?? "-1");
+  if (!Number.isInteger(index) || index < 0) return;
+  const currentState = context.getCurrentState();
+  const text = settingsControlValue(control);
+  if (!currentState || !currentState.config_fields[index]) return;
+  currentState.config_fields[index].value = text;
+  if (index === currentState.selected_config_index) {
+    currentState.config_value_text = text;
+    currentState.config_field_title = control.dataset.configKey ?? currentState.config_field_title;
+  }
+}
+
+function markConfigDirty(uiState: UiLocalState): void {
+  uiState.configDirty = true;
+  updateDirtyBadges(uiState);
+}
+
+function validateSettingsForm(uiState: UiLocalState, focusInvalid: boolean): boolean {
+  const controls = collectSettingsControls();
+  const validation = document.querySelector<HTMLElement>("#settings-validation");
+  for (const control of controls) {
+    const key = control.dataset.configKey ?? "";
+    if (!key) continue;
+    const result = validateConfigInput(key, settingsControlValue(control));
+    if (!result.ok) {
+      if (validation) {
+        validation.textContent = `${key}: ${result.message}`;
+        validation.classList.toggle("ok", false);
+        validation.classList.toggle("error", true);
+      }
+      updateDirtyBadges(uiState);
+      if (focusInvalid) control.focus();
+      return false;
+    }
+  }
+  if (validation && controls.length > 0) {
+    validation.textContent = "入力形式は問題ありません。";
+    validation.classList.toggle("ok", true);
+    validation.classList.toggle("error", false);
+  }
+  updateDirtyBadges(uiState);
+  return true;
+}
+
+function updateDirtyBadges(uiState: UiLocalState): void {
+  document.querySelectorAll<HTMLElement>(".dirty-badge").forEach((node) => {
+    node.classList.toggle("visible", uiState.configDirty);
+  });
 }
 
 function scheduleOpacityPreview(percent: number, context: ActionContext): void {
@@ -359,12 +454,14 @@ async function dispatchAction(action: string, index: number, value: string, stat
     void context.mutate("set_config_selection", { index });
   }
   if (action === "apply-session-config") {
-    await flushConfigInputMutations(context);
-    submitConfigAction("apply_session_config", state, context);
+    if (await flushConfigInputMutations(context)) {
+      submitConfigAction("apply_session_config", state, context);
+    }
   }
   if (action === "save-global-config") {
-    await flushConfigInputMutations(context);
-    submitConfigAction("save_global_config", state, context);
+    if (await flushConfigInputMutations(context)) {
+      submitConfigAction("save_global_config", state, context);
+    }
   }
   if (action === "toggle-access") void context.mutate("toggle_access_mode");
   if (action === "insert-command") void context.mutate("insert_command", { index });
@@ -412,27 +509,11 @@ function confirmLocalRollback(context: ActionContext): void {
   void context.mutate("rollback_session", { index: pending.index });
 }
 
-function submitConfigAction(commandName: string, state: DesktopWebState, context: ActionContext): void {
-  const value = document.querySelector<HTMLTextAreaElement>("#config-value")?.value ?? state.config_value_text;
-  const result = validateConfigInput(state.config_field_title, value);
-  if (!result.ok) {
-    updateConfigValidation(state.config_field_title, value, context.uiState);
-    document.querySelector<HTMLTextAreaElement>("#config-value")?.focus();
-    return;
-  }
+function submitConfigAction(commandName: string, _state: DesktopWebState, context: ActionContext): void {
+  if (!validateSettingsForm(context.uiState, true)) return;
   context.uiState.configDirty = false;
+  updateDirtyBadges(context.uiState);
   void context.mutate(commandName);
-}
-
-function updateConfigValidation(field: string, value: string, uiState: UiLocalState): void {
-  const node = document.querySelector<HTMLElement>("#config-validation");
-  const result = validateConfigInput(field, value);
-  if (node) {
-    node.textContent = result.message;
-    node.classList.toggle("ok", result.ok);
-    node.classList.toggle("error", !result.ok);
-  }
-  document.querySelector<HTMLElement>(".dirty-badge")?.classList.toggle("visible", uiState.configDirty);
 }
 
 function focusOverlayPrimary(state: DesktopWebState, uiState: UiLocalState): void {
@@ -447,7 +528,7 @@ function focusOverlayPrimary(state: DesktopWebState, uiState: UiLocalState): voi
       : overlayKey === "provider"
         ? "#provider-url"
         : overlayKey === "config"
-          ? "#config-filter"
+          ? ".settings-control"
           : overlayKey === "workspace"
             ? "#workspace-input"
             : overlayKey === "prompt_review"
