@@ -402,8 +402,8 @@ export const ACTIONS: ActionDefinition[] = [
   { id: "clear-images", label: "添付を解除", palette: true, enabled: (state) => state.attached_images.length > 0, run: (_state, context) => context.mutate("clear_images") },
   { id: "allow", label: "確認を許可", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.mutate("answer_permission", { allow: true }) },
   { id: "deny", label: "確認を拒否", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.mutate("answer_permission", { allow: false }) },
-  { id: "minimize-window", label: "最小化", enabled: always, run: (_state, context) => context.desktopWindow.minimize() },
-  { id: "toggle-maximize-window", label: "最大化", enabled: always, run: (_state, context) => context.desktopWindow.toggleMaximize() },
+  { id: "minimize-window", label: "最小化", enabled: always, run: () => command("minimize_window") },
+  { id: "toggle-maximize-window", label: "最大化", enabled: always, run: () => command("toggle_maximize_window") },
   { id: "close-window", label: "閉じる", enabled: always, run: (_state, context) => command("hide_to_tray").catch(() => context.desktopWindow.hide()) },
 ];
 

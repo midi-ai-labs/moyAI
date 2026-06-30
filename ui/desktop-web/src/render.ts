@@ -103,9 +103,9 @@ function startupCheckMark(status: string): string {
 
 export function renderTitlebar(): string {
   return `
-    <header class="app-titlebar" data-drag-region data-tauri-drag-region>
-      <div class="titlebar-left" data-drag-region data-tauri-drag-region>
-        <span class="app-brand" data-drag-region data-tauri-drag-region>moyAI</span>
+    <header class="app-titlebar">
+      <div class="titlebar-left">
+        <span class="app-brand" data-drag-region>moyAI</span>
         <nav class="titlebar-menu">
           <button data-action="show-file-menu" aria-label="ファイルメニュー">ファイル</button>
           <button data-action="show-edit-menu" aria-label="編集メニュー">編集</button>
@@ -113,7 +113,7 @@ export function renderTitlebar(): string {
           <button data-action="show-help-menu" aria-label="ヘルプメニュー">ヘルプ</button>
         </nav>
       </div>
-      <div class="titlebar-drag" data-drag-region data-tauri-drag-region></div>
+      <div class="titlebar-drag" data-drag-region></div>
       <div class="titlebar-controls">
         <button data-action="minimize-window" title="最小化" aria-label="最小化">−</button>
         <button data-action="toggle-maximize-window" title="最大化" aria-label="最大化">□</button>

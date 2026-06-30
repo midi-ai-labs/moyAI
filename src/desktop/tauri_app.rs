@@ -139,6 +139,8 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             set_window_opacity,
             answer_permission,
             start_window_drag,
+            minimize_window,
+            toggle_maximize_window,
             hide_to_tray,
             exit_app
         ])
@@ -219,6 +221,29 @@ fn restore_main_window(app: &tauri::AppHandle) {
 fn hide_to_tray(app: tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
+    }
+}
+
+#[tauri::command]
+fn minimize_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    window
+        .minimize()
+        .map_err(|error| format!("failed to minimize window: {error}"))
+}
+
+#[tauri::command]
+fn toggle_maximize_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    let is_maximized = window
+        .is_maximized()
+        .map_err(|error| format!("failed to read maximize state: {error}"))?;
+    if is_maximized {
+        window
+            .unmaximize()
+            .map_err(|error| format!("failed to restore window: {error}"))
+    } else {
+        window
+            .maximize()
+            .map_err(|error| format!("failed to maximize window: {error}"))
     }
 }
 

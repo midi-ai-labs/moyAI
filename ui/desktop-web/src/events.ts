@@ -67,8 +67,14 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
       void command("hide_to_tray").catch(() => context.desktopWindow.hide());
     });
   });
-  document.querySelector<HTMLTextAreaElement>("#prompt")?.addEventListener("input", (event) => {
-    const text = (event.currentTarget as HTMLTextAreaElement).value;
+  const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
+  if (prompt) {
+    resizePromptComposer(prompt);
+  }
+  prompt?.addEventListener("input", (event) => {
+    const prompt = event.currentTarget as HTMLTextAreaElement;
+    const text = prompt.value;
+    resizePromptComposer(prompt);
     const currentState = context.getCurrentState();
     if (currentState) {
       currentState.draft_prompt = text;
@@ -89,6 +95,7 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
         enhance.setAttribute("aria-label", title);
       }
     }
+    resizePromptComposer(prompt);
     void command<DesktopWebState>("set_prompt", { text })
       .then(context.setCurrentState)
       .catch((error) => context.renderError(String(error)));
@@ -184,6 +191,24 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
     });
   });
   focusOverlayPrimary(state, context.uiState);
+}
+
+function resizePromptComposer(prompt: HTMLTextAreaElement): void {
+  prompt.style.height = "auto";
+  const style = window.getComputedStyle(prompt);
+  const maxHeight = Number.parseFloat(style.maxHeight);
+  const nextHeight = Number.isFinite(maxHeight) ? Math.min(prompt.scrollHeight, maxHeight) : prompt.scrollHeight;
+  prompt.style.height = `${Math.ceil(nextHeight)}px`;
+  prompt.style.overflowY = Number.isFinite(maxHeight) && prompt.scrollHeight > maxHeight + 1 ? "auto" : "hidden";
+  updateComposerReserve();
+}
+
+function updateComposerReserve(): void {
+  const conversation = document.querySelector<HTMLElement>(".conversation");
+  const composer = document.querySelector<HTMLElement>(".composer");
+  if (!conversation || !composer) return;
+  const reserve = Math.max(188, Math.ceil(composer.getBoundingClientRect().height + 42));
+  conversation.style.setProperty("--composer-reserve", `${reserve}px`);
 }
 
 function updateGoalCommandHint(text: string): void {
