@@ -1431,6 +1431,52 @@ select:focus-visible,
   color: var(--text);
 }
 
+.token-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: min(220px, 52vw);
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.token-meter span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.token-meter-dot {
+  width: 8px;
+  min-width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #8b949e;
+  box-shadow: 0 0 0 2px rgba(139, 148, 158, 0.14);
+}
+
+.token-meter.low .token-meter-dot {
+  background: #5fbf7a;
+  box-shadow: 0 0 0 2px rgba(95, 191, 122, 0.14);
+}
+
+.token-meter.medium .token-meter-dot {
+  background: #d6a84f;
+  box-shadow: 0 0 0 2px rgba(214, 168, 79, 0.15);
+}
+
+.token-meter.high .token-meter-dot {
+  background: #e07b45;
+  box-shadow: 0 0 0 2px rgba(224, 123, 69, 0.16);
+}
+
+.token-meter.critical .token-meter-dot {
+  background: #e05252;
+  box-shadow: 0 0 0 2px rgba(224, 82, 82, 0.18);
+}
+
 .send {
   margin-left: auto;
   width: 34px;

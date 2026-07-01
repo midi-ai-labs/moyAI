@@ -135,6 +135,8 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             auto_resume_last: Some(config.session.auto_resume_last),
             max_steps_per_turn: Some(config.session.max_steps_per_turn),
             overflow_margin_tokens: Some(config.session.overflow_margin_tokens),
+            auto_compact_enabled: Some(config.session.auto_compact_enabled),
+            auto_compact_keep_recent: Some(config.session.auto_compact_keep_recent),
         }),
         agent: Some(PartialAgentConfig {
             duplicate_success_abort_threshold: Some(config.agent.duplicate_success_abort_threshold),
@@ -493,6 +495,19 @@ fn env_patch() -> PartialResolvedConfig {
     if let Ok(value) = env::var("MOYAI_OVERFLOW_MARGIN_TOKENS") {
         if let Ok(parsed) = value.parse() {
             patch.session.get_or_insert_default().overflow_margin_tokens = Some(parsed);
+        }
+    }
+    if let Ok(value) = env::var("MOYAI_AUTO_COMPACT_ENABLED") {
+        if let Ok(parsed) = value.parse() {
+            patch.session.get_or_insert_default().auto_compact_enabled = Some(parsed);
+        }
+    }
+    if let Ok(value) = env::var("MOYAI_AUTO_COMPACT_KEEP_RECENT") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            patch
+                .session
+                .get_or_insert_default()
+                .auto_compact_keep_recent = Some(parsed.max(1));
         }
     }
 

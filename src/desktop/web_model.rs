@@ -61,6 +61,9 @@ pub struct DesktopWebState {
     pub latest_tool_summary: String,
     pub progress_text: String,
     pub tool_status_text: String,
+    pub token_meter_label: String,
+    pub token_meter_title: String,
+    pub token_meter_level: String,
     pub confirmation_visible: bool,
     pub confirmation_text: String,
     pub confirmation: Option<DesktopPermissionProjection>,
@@ -173,6 +176,10 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         .as_deref()
         .map(display_status_projection)
         .unwrap_or_else(|| ("準備完了".to_string(), String::new()));
+    let token_meter = token_meter_projection(
+        state.app_state.latest_context_window.as_ref(),
+        state.provider_config.effective_config.model.context_window,
+    );
     DesktopWebState {
         workspace_path: state.snapshot.workspace_path.clone(),
         provider_label: state.snapshot.provider_label.clone(),
@@ -196,6 +203,9 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         latest_tool_summary: display_tool_summary(&latest_tool_summary),
         progress_text: detail.progress_text,
         tool_status_text: detail.tool_status_text,
+        token_meter_label: token_meter.label,
+        token_meter_title: token_meter.title,
+        token_meter_level: token_meter.level,
         confirmation_visible: detail.confirmation_visible,
         confirmation_text: detail.confirmation_text,
         confirmation: state.app_state.permission.as_ref().map(|permission| {
@@ -536,6 +546,80 @@ fn config_feedback_text(key: ConfigField) -> String {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenMeterProjection {
+    label: String,
+    title: String,
+    level: String,
+}
+
+fn token_meter_projection(
+    status: Option<&crate::context::ContextWindowTokenStatus>,
+    configured_limit: u32,
+) -> TokenMeterProjection {
+    let Some(status) = status else {
+        return TokenMeterProjection {
+            label: format!("-- / {} 未計測", compact_token_count(configured_limit)),
+            title: "次回 model request 作成時に概算 token 使用量を表示します。".to_string(),
+            level: "unknown".to_string(),
+        };
+    };
+
+    let limit = status.full_context_window_limit.max(1);
+    let ratio = f64::from(status.active_context_tokens) / f64::from(limit);
+    let percent = (ratio * 100.0).round() as u32;
+    let (level, level_label) = token_meter_level(status.token_limit_reached, ratio);
+    TokenMeterProjection {
+        label: format!(
+            "{} / {} {}",
+            compact_token_count(status.active_context_tokens),
+            compact_token_count(status.full_context_window_limit),
+            level_label
+        ),
+        title: format!(
+            "概算 token 使用量: {} / {} ({}%). 出力予約: {}、overflow margin: {}、残り推定: {}。",
+            status.active_context_tokens,
+            status.full_context_window_limit,
+            percent,
+            status.configured_max_output_tokens,
+            status.overflow_margin_tokens,
+            status.tokens_until_limit
+        ),
+        level: level.to_string(),
+    }
+}
+
+fn token_meter_level(limit_reached: bool, ratio: f64) -> (&'static str, &'static str) {
+    if limit_reached {
+        return ("critical", "上限");
+    }
+    if ratio >= 0.85 {
+        ("critical", "非常に高い")
+    } else if ratio >= 0.65 {
+        ("high", "高い")
+    } else if ratio >= 0.35 {
+        ("medium", "中")
+    } else {
+        ("low", "低い")
+    }
+}
+
+fn compact_token_count(value: u32) -> String {
+    if value >= 1_000_000 {
+        trim_trailing_decimal(format!("{:.1}m", f64::from(value) / 1_000_000.0))
+    } else if value >= 100_000 {
+        format!("{}k", value / 1_000)
+    } else if value >= 1_000 {
+        trim_trailing_decimal(format!("{:.1}k", f64::from(value) / 1_000.0))
+    } else {
+        value.to_string()
+    }
+}
+
+fn trim_trailing_decimal(value: String) -> String {
+    value.replace(".0", "")
+}
+
 fn display_status_projection(message: &str) -> (String, String) {
     let lower = message.to_ascii_lowercase();
     if lower.contains("run llm error")
@@ -675,4 +759,41 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_meter_projection_formats_estimated_usage() {
+        let status = crate::context::ContextWindowTokenStatus {
+            active_context_tokens: 12_345,
+            full_context_window_limit: 131_072,
+            configured_max_output_tokens: 8_192,
+            overflow_margin_tokens: 1_024,
+            tokens_until_limit: 109_511,
+            token_limit_reached: false,
+        };
+
+        let projection = token_meter_projection(Some(&status), 131_072);
+
+        assert_eq!(projection.label, "12.3k / 131k 低い");
+        assert_eq!(projection.level, "low");
+        assert!(projection.title.contains("12345 / 131072"));
+    }
+
+    #[test]
+    fn token_meter_projection_marks_reached_limit() {
+        let status = crate::context::ContextWindowTokenStatus {
+            active_context_tokens: 130_000,
+            full_context_window_limit: 131_072,
+            configured_max_output_tokens: 8_192,
+            overflow_margin_tokens: 1_024,
+            tokens_until_limit: -8_144,
+            token_limit_reached: true,
+        };
+
+        let projection = token_meter_projection(Some(&status), 131_072);
+
+        assert_eq!(projection.level, "critical");
+        assert!(projection.label.ends_with("上限"));
+    }
+}

@@ -2,6 +2,7 @@ pub mod agent;
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod context;
 pub mod desktop;
 pub mod docling;
 pub mod edit;

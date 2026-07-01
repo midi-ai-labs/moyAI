@@ -521,6 +521,8 @@ fn session_patch_is_empty(session: &PartialSessionConfig) -> bool {
         && session.auto_resume_last.is_none()
         && session.max_steps_per_turn.is_none()
         && session.overflow_margin_tokens.is_none()
+        && session.auto_compact_enabled.is_none()
+        && session.auto_compact_keep_recent.is_none()
 }
 
 fn shell_patch_is_empty(shell: &PartialShellConfig) -> bool {

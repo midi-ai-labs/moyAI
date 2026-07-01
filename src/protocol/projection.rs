@@ -212,6 +212,12 @@ pub fn project_history_item_for_run_event(
                 diagnostics: diagnostics.clone(),
             }
         }
+        RunEvent::WorldStateUpdated {
+            snapshot, rendered, ..
+        } => HistoryItemPayload::WorldState {
+            snapshot: snapshot.clone(),
+            rendered: rendered.clone(),
+        },
         RunEvent::ToolCallPending {
             tool_call_id,
             tool,
@@ -300,6 +306,7 @@ pub fn project_history_item_for_run_event(
         RunEvent::CompactionCompleted {
             summarized_messages,
             summary,
+            replacement_item_ids,
             continuation,
             ..
         } => HistoryItemPayload::Compaction {
@@ -309,7 +316,7 @@ pub fn project_history_item_for_run_event(
             } else {
                 summary.clone()
             },
-            replacement_item_ids: vec![id],
+            replacement_item_ids: replacement_item_ids.clone(),
             continuation: continuation.clone(),
         },
         RunEvent::StateUpdated { state, .. } => HistoryItemPayload::SessionState {
@@ -536,6 +543,9 @@ pub fn project_turn_item_for_run_event(
         | RunEvent::AssistantStarted { .. }
         | RunEvent::ControlEnvelopePrepared { .. }
         | RunEvent::ModelRequestPrepared { .. } => return None,
+        RunEvent::WorldStateUpdated { snapshot, .. } => TurnItemPayload::WorldState {
+            summary: format!("world state updated: {} sections", snapshot.section_count()),
+        },
     };
     Some(TurnItem {
         id: TurnItemId::new(),
@@ -576,6 +586,9 @@ fn runtime_msg_for_run_event(
                 diagnostics: diagnostics.clone(),
             }
         }
+        RunEvent::WorldStateUpdated { snapshot, .. } => RuntimeEventMsg::WorldStateUpdated {
+            snapshot: snapshot.clone(),
+        },
         RunEvent::TextDelta { message_id, delta } => RuntimeEventMsg::AssistantTextDelta {
             message_id: *message_id,
             delta: delta.clone(),
@@ -739,6 +752,7 @@ fn session_id_for_run_event(event: &RunEvent) -> Option<SessionId> {
         | RunEvent::UserTurnStored { session_id, .. }
         | RunEvent::ControlEnvelopePrepared { session_id, .. }
         | RunEvent::ModelRequestPrepared { session_id, .. }
+        | RunEvent::WorldStateUpdated { session_id, .. }
         | RunEvent::RetryScheduled { session_id, .. }
         | RunEvent::RecoverableRuntimeFeedback { session_id, .. }
         | RunEvent::StateUpdated { session_id, .. }
@@ -1232,6 +1246,7 @@ fn tool_name_from_token(token: &str) -> Option<crate::tool::ToolName> {
         "apply_patch" => Some(crate::tool::ToolName::ApplyPatch),
         "write" => Some(crate::tool::ToolName::Write),
         "shell" => Some(crate::tool::ToolName::Shell),
+        "current_time" => Some(crate::tool::ToolName::CurrentTime),
         "skill" => Some(crate::tool::ToolName::Skill),
         "docling_convert" => Some(crate::tool::ToolName::DoclingConvert),
         "mcp_call" => Some(crate::tool::ToolName::McpCall),

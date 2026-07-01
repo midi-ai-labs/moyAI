@@ -2,7 +2,7 @@
 
 mod goal_steering;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,18 +11,23 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::ConfirmationPrompt;
 use crate::config::{AccessMode, ResolvedConfig};
+use crate::context::context_window::ContextWindowTokenStatus;
+use crate::context::world_state::WorldState;
 use crate::error::AgentError;
 use crate::llm::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, ModelContentPart, ModelMessage, ModelProfile,
     ModelToolCall, ToolSchema,
 };
-use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload, TurnId};
+use crate::protocol::{
+    ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, ProtocolEventStore, TurnId,
+};
 use crate::runtime::{LiveConfigOverrides, RunEventSink};
 use crate::session::{
     AssistantMessageMeta, FinishReason, MessageId, MessageMetadata, MessagePart, MessageRole,
-    NewMessage, NewPart, PartKind, RunConfigSnapshot, RunEvent, RunMetrics, RunSummary,
-    SessionContext, SessionStateSnapshot, SessionStatus, TextPart, ThreadGoal, ThreadGoalStatus,
-    TokenUsage,
+    NewMessage, NewPart, PartKind, RequestDiagnosticsPart, RequestMessageDiagnostic,
+    RequestToolCallDiagnostic, RequestToolSchemaDiagnostic, RunConfigSnapshot, RunEvent,
+    RunMetrics, RunSummary, SessionContext, SessionStateSnapshot, SessionStatus, TextPart,
+    ThreadGoal, ThreadGoalStatus, TokenUsage,
 };
 use crate::storage::StoreBundle;
 use crate::tool::ToolResult;
@@ -33,25 +38,16 @@ use crate::tool::registry::ToolRegistry;
 pub struct PromptBuilder;
 
 impl PromptBuilder {
-    pub fn build(&self, request: &AgentRunRequest, tools: &[ToolSchema]) -> String {
-        let tool_names = tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let tools = if tool_names.is_empty() {
-            "none"
-        } else {
-            tool_names.as_str()
-        };
+    pub fn build(
+        &self,
+        world_state: &WorldState,
+        skills_snapshot: &crate::skill::SkillsSnapshot,
+    ) -> String {
         format!(
-            "{}\n\nEnvironment:\n- workspace: {}\n- cwd: {}\n- access: {:?}\n- model: {}\n- tools: {}",
+            "{}\n\n{}\n\n{}",
             include_str!("../../assets/prompts/system.md").trim(),
-            request.session.workspace.root,
-            request.session.workspace.cwd,
-            request.current_access_mode(),
-            request.model.name,
-            tools
+            world_state.rendered,
+            crate::skill::render_available_skills_from_snapshot(skills_snapshot)
         )
     }
 }
@@ -191,12 +187,38 @@ impl AgentLoop {
                     &messages,
                     goal_for_request.as_ref().map(|goal| &goal.goal),
                 );
-                let chat_request = self.chat_request(&request, &request_messages, &tool_schemas)?;
+                let prepared_request =
+                    self.chat_request(&request, &request_messages, &tool_schemas)?;
+                let prepared_request = self.auto_compact_if_needed(
+                    &request,
+                    assistant.id,
+                    &mut messages,
+                    goal_for_request.as_ref().map(|goal| &goal.goal),
+                    &tool_schemas,
+                    prepared_request,
+                    sink,
+                )?;
+                sink.emit(RunEvent::WorldStateUpdated {
+                    session_id: request.session.session.id,
+                    snapshot: prepared_request.world_state.snapshot.clone(),
+                    rendered: prepared_request.world_state.rendered.clone(),
+                })?;
+                sink.emit(RunEvent::ModelRequestPrepared {
+                    session_id: request.session.session.id,
+                    diagnostics: request_diagnostics(
+                        &prepared_request.chat_request,
+                        request.config.session.overflow_margin_tokens,
+                    ),
+                })?;
                 model_request_count += 1;
                 let mut collector = StreamingResponseCollector::new(assistant.id, sink);
                 let response = self
                     .llm
-                    .stream_chat(chat_request, request.cancel.clone(), &mut collector)
+                    .stream_chat(
+                        prepared_request.chat_request,
+                        request.cancel.clone(),
+                        &mut collector,
+                    )
                     .await?;
                 let collector = collector.into_inner();
                 latest_usage = response.usage.clone();
@@ -351,11 +373,23 @@ impl AgentLoop {
         request: &AgentRunRequest,
         messages: &[ModelMessage],
         tools: &[ToolSchema],
-    ) -> Result<ChatRequest, AgentError> {
+    ) -> Result<PreparedChatRequest, AgentError> {
+        let mut prompt_config = request.config.clone();
+        prompt_config.permissions.access_mode = request.current_access_mode();
+        let tool_names = tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        let world_state =
+            WorldState::build(&request.session.workspace, &prompt_config, &tool_names);
+        let skills_snapshot = self
+            .tool_services
+            .skills
+            .snapshot_for_workspace(&request.session.workspace.root);
         let chat_request = ChatRequest {
             model: request.model.clone(),
             base_url: request.config.model.base_url.clone(),
-            system_prompt: self.prompt_builder.build(request, tools),
+            system_prompt: self.prompt_builder.build(&world_state, &skills_snapshot),
             messages: messages.to_vec(),
             tools: tools.to_vec(),
             tool_choice: None,
@@ -378,7 +412,63 @@ impl AgentLoop {
             extra_body: request.config.model.extra_body_json.clone(),
         };
         chat_request.validate_provider_lifecycle()?;
-        Ok(chat_request)
+        Ok(PreparedChatRequest {
+            chat_request,
+            world_state,
+        })
+    }
+
+    fn auto_compact_if_needed(
+        &self,
+        request: &AgentRunRequest,
+        assistant_message_id: MessageId,
+        messages: &mut Vec<ModelMessage>,
+        goal: Option<&ThreadGoal>,
+        tools: &[ToolSchema],
+        prepared_request: PreparedChatRequest,
+        sink: &mut dyn RunEventSink,
+    ) -> Result<PreparedChatRequest, AgentError> {
+        let status = ContextWindowTokenStatus::for_request(
+            &prepared_request.chat_request,
+            request.config.session.overflow_margin_tokens,
+        );
+        if !request.config.session.auto_compact_enabled || !status.token_limit_reached {
+            return Ok(prepared_request);
+        }
+
+        let keep_recent = request.config.session.auto_compact_keep_recent.max(1);
+        let Some(summarized_messages) = messages.len().checked_sub(keep_recent) else {
+            return Ok(prepared_request);
+        };
+        if summarized_messages == 0 {
+            return Ok(prepared_request);
+        }
+
+        let retained = messages.split_off(summarized_messages);
+        let history_items = self
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(request.session.session.id)?;
+        let replacement_item_ids =
+            auto_compaction_replacement_item_ids(&history_items, keep_recent);
+        let summary = auto_compaction_summary(
+            &status,
+            summarized_messages,
+            retained.len(),
+            replacement_item_ids.len(),
+        );
+        *messages = compacted_provider_messages(retained, &summary);
+
+        sink.emit(RunEvent::CompactionCompleted {
+            message_id: assistant_message_id,
+            summarized_messages,
+            summary,
+            replacement_item_ids,
+            continuation: None,
+        })?;
+
+        let request_messages = messages_with_goal_steering(messages, goal);
+        self.chat_request(request, &request_messages, tools)
     }
 
     async fn handle_tool_call(
@@ -680,6 +770,11 @@ struct AgentGoalForRequest {
     goal_id: String,
 }
 
+struct PreparedChatRequest {
+    chat_request: ChatRequest,
+    world_state: WorldState,
+}
+
 fn messages_with_goal_steering(
     messages: &[ModelMessage],
     goal: Option<&ThreadGoal>,
@@ -909,20 +1004,207 @@ fn run_metrics(
     }
 }
 
+fn request_diagnostics(
+    request: &ChatRequest,
+    overflow_margin_tokens: usize,
+) -> RequestDiagnosticsPart {
+    let context_window = ContextWindowTokenStatus::for_request(request, overflow_margin_tokens);
+    RequestDiagnosticsPart {
+        provider: "openai_compat".to_string(),
+        model_name: request.model.name.clone(),
+        base_url: request.base_url.clone(),
+        request_timeout_ms: request.timeout_ms,
+        stream_idle_timeout_ms: request.stream_idle_timeout_ms,
+        stream_max_retries: request.stream_max_retries,
+        configured_max_output_tokens: Some(request.model.max_output_tokens),
+        effective_max_output_tokens: Some(request.effective_max_output_tokens()),
+        output_budget_reason: Some(request.output_budget_reason().to_string()),
+        supports_tools: Some(request.model.capabilities.supports_tools),
+        supports_reasoning: Some(request.model.capabilities.supports_reasoning),
+        supports_images: Some(request.model.capabilities.supports_images),
+        system_prompt_chars: request.system_prompt.chars().count(),
+        tool_count: request.tools.len(),
+        tool_choice: request
+            .tool_choice
+            .as_ref()
+            .map(|choice| choice.diagnostic_label())
+            .or_else(|| (!request.tools.is_empty()).then(|| "auto".to_string())),
+        parallel_tool_calls: crate::llm::tool_surface_scoped_parallel_tool_calls_projection(
+            request.tools.len(),
+            request.parallel_tool_calls,
+        ),
+        provider_message_count: request.messages.len(),
+        image_count: request.messages.iter().map(message_image_count).sum(),
+        image_bytes: request.messages.iter().map(message_image_bytes).sum(),
+        tool_names: request.tools.iter().map(|tool| tool.name.clone()).collect(),
+        tool_schemas: request
+            .tools
+            .iter()
+            .map(|tool| RequestToolSchemaDiagnostic {
+                name: tool.name.clone(),
+                description_chars: tool.description.chars().count(),
+                strict: tool.strict,
+                input_schema: tool.input_schema.clone(),
+            })
+            .collect(),
+        turn_decision: None,
+        control_envelope: None,
+        replay_policies: Vec::new(),
+        context_window: Some(context_window),
+        messages: request.messages.iter().map(message_diagnostic).collect(),
+    }
+}
+
+fn message_diagnostic(message: &ModelMessage) -> RequestMessageDiagnostic {
+    match message {
+        ModelMessage::System { content } => RequestMessageDiagnostic {
+            role: "system".to_string(),
+            content_chars: Some(content.chars().count()),
+            content_markers: content_markers(content),
+            image_count: 0,
+            image_bytes: 0,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        },
+        ModelMessage::User { content } => RequestMessageDiagnostic {
+            role: "user".to_string(),
+            content_chars: Some(content.chars().count()),
+            content_markers: content_markers(content),
+            image_count: 0,
+            image_bytes: 0,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        },
+        ModelMessage::UserParts { parts } => RequestMessageDiagnostic {
+            role: "user".to_string(),
+            content_chars: Some(
+                parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        ModelContentPart::Text { text } => Some(text.chars().count()),
+                        ModelContentPart::Image { .. } => None,
+                    })
+                    .sum(),
+            ),
+            content_markers: Vec::new(),
+            image_count: message_image_count(message),
+            image_bytes: message_image_bytes(message),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        },
+        ModelMessage::Assistant { content } => RequestMessageDiagnostic {
+            role: "assistant".to_string(),
+            content_chars: Some(content.chars().count()),
+            content_markers: content_markers(content),
+            image_count: 0,
+            image_bytes: 0,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        },
+        ModelMessage::AssistantToolCalls {
+            content,
+            tool_calls,
+        } => RequestMessageDiagnostic {
+            role: "assistant".to_string(),
+            content_chars: content.as_ref().map(|value| value.chars().count()),
+            content_markers: content.as_deref().map(content_markers).unwrap_or_default(),
+            image_count: 0,
+            image_bytes: 0,
+            tool_calls: tool_calls
+                .iter()
+                .map(|call| RequestToolCallDiagnostic {
+                    call_id: call.call_id.clone(),
+                    tool_name: call.tool_name.clone(),
+                    arguments_chars: call.arguments_json.chars().count(),
+                })
+                .collect(),
+            tool_call_id: None,
+        },
+        ModelMessage::Tool {
+            call_id, result, ..
+        } => RequestMessageDiagnostic {
+            role: "tool".to_string(),
+            content_chars: Some(result.chars().count()),
+            content_markers: content_markers(result),
+            image_count: 0,
+            image_bytes: 0,
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.clone()),
+        },
+    }
+}
+
+fn message_image_count(message: &ModelMessage) -> usize {
+    match message {
+        ModelMessage::UserParts { parts } => parts
+            .iter()
+            .filter(|part| matches!(part, ModelContentPart::Image { .. }))
+            .count(),
+        _ => 0,
+    }
+}
+
+fn message_image_bytes(message: &ModelMessage) -> u64 {
+    match message {
+        ModelMessage::UserParts { parts } => parts
+            .iter()
+            .filter_map(|part| match part {
+                ModelContentPart::Image { data_base64, .. } => Some(data_base64.len() as u64),
+                ModelContentPart::Text { .. } => None,
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn content_markers(content: &str) -> Vec<String> {
+    let mut markers = Vec::new();
+    for marker in ["<world_state>", "<instructions>", "<environment_context>"] {
+        if content.contains(marker) {
+            markers.push(marker.to_string());
+        }
+    }
+    markers
+}
+
 fn messages_from_history(history_items: &[HistoryItem]) -> Vec<ModelMessage> {
-    let mut messages = Vec::new();
+    let mut projected = Vec::<(usize, u8, ModelMessage)>::new();
     let mut tool_names_by_call = HashMap::new();
-    for item in history_items {
+    let index_by_id = history_items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.id, index))
+        .collect::<HashMap<_, _>>();
+    let replaced_ids = history_items
+        .iter()
+        .filter_map(|item| match &item.payload {
+            HistoryItemPayload::Compaction {
+                replacement_item_ids,
+                ..
+            } => Some(replacement_item_ids.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<HashSet<_>>();
+    for (index, item) in history_items.iter().enumerate() {
+        if replaced_ids.contains(&item.id) {
+            continue;
+        }
         match &item.payload {
             HistoryItemPayload::UserTurn { content, .. }
             | HistoryItemPayload::SteerTurn { content, .. } => {
-                messages.push(user_message_from_content(content));
+                projected.push((index, 1, user_message_from_content(content)));
             }
             HistoryItemPayload::Message { role, content, .. } => match role {
-                MessageRole::User => messages.push(user_message_from_content(content)),
-                MessageRole::Assistant => messages.push(ModelMessage::Assistant {
-                    content: content_text(content),
-                }),
+                MessageRole::User => projected.push((index, 1, user_message_from_content(content))),
+                MessageRole::Assistant => projected.push((
+                    index,
+                    1,
+                    ModelMessage::Assistant {
+                        content: content_text(content),
+                    },
+                )),
             },
             HistoryItemPayload::ToolCall {
                 call_id,
@@ -940,35 +1222,170 @@ fn messages_from_history(history_items: &[HistoryItem]) -> Vec<ModelMessage> {
                 } else {
                     arguments
                 };
-                messages.push(ModelMessage::AssistantToolCalls {
-                    content: None,
-                    tool_calls: vec![ModelToolCall {
-                        call_id: call_id.to_string(),
-                        tool_name: tool.to_string(),
-                        arguments_json: selected_arguments.to_string(),
-                    }],
-                });
+                projected.push((
+                    index,
+                    1,
+                    ModelMessage::AssistantToolCalls {
+                        content: None,
+                        tool_calls: vec![ModelToolCall {
+                            call_id: call_id.to_string(),
+                            tool_name: tool.to_string(),
+                            arguments_json: selected_arguments.to_string(),
+                        }],
+                    },
+                ));
             }
             HistoryItemPayload::ToolOutput {
                 call_id,
                 output_text,
                 ..
-            } => messages.push(ModelMessage::Tool {
-                call_id: call_id.to_string(),
-                tool_name: tool_names_by_call
-                    .get(&call_id.to_string())
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                result: output_text.clone(),
-                metadata: Value::Null,
-            }),
-            HistoryItemPayload::Error { message, .. } => messages.push(ModelMessage::Assistant {
-                content: format!("Previous run ended with an error: {message}"),
-            }),
+            } => {
+                let call_id_text = call_id.to_string();
+                if let Some(tool_name) = tool_names_by_call.get(&call_id_text).cloned() {
+                    projected.push((
+                        index,
+                        1,
+                        ModelMessage::Tool {
+                            call_id: call_id_text,
+                            tool_name,
+                            result: output_text.clone(),
+                            metadata: Value::Null,
+                        },
+                    ));
+                }
+            }
+            HistoryItemPayload::Compaction {
+                summary,
+                replacement_item_ids,
+                continuation,
+                ..
+            } => {
+                let insertion_index = replacement_item_ids
+                    .iter()
+                    .filter_map(|id| index_by_id.get(id).copied())
+                    .min()
+                    .unwrap_or(index);
+                projected.push((
+                    insertion_index,
+                    0,
+                    ModelMessage::System {
+                        content: compaction_message_for_model(summary, continuation.as_ref()),
+                    },
+                ));
+            }
+            HistoryItemPayload::Error { message, .. } => projected.push((
+                index,
+                1,
+                ModelMessage::Assistant {
+                    content: format!("Previous run ended with an error: {message}"),
+                },
+            )),
             _ => {}
         }
     }
+    projected.sort_by_key(|(index, priority, _)| (*index, *priority));
+    let messages = projected
+        .into_iter()
+        .map(|(_, _, message)| message)
+        .collect::<Vec<_>>();
     messages
+}
+
+fn compaction_message_for_model(
+    summary: &str,
+    continuation: Option<&crate::session::ContinuationContract>,
+) -> String {
+    let mut message = String::from("Earlier conversation context was compacted.\n");
+    message.push_str(summary.trim());
+    if let Some(continuation) = continuation {
+        message.push_str("\n\nContinuation contract:\n");
+        message.push_str(&serde_json::to_string(continuation).unwrap_or_default());
+    }
+    message
+}
+
+fn compacted_provider_messages(
+    retained_messages: Vec<ModelMessage>,
+    summary: &str,
+) -> Vec<ModelMessage> {
+    let mut compacted = Vec::with_capacity(retained_messages.len() + 1);
+    compacted.push(ModelMessage::System {
+        content: compaction_message_for_model(summary, None),
+    });
+    compacted.extend(retained_messages);
+    compacted
+}
+
+fn auto_compaction_summary(
+    status: &ContextWindowTokenStatus,
+    summarized_messages: usize,
+    retained_messages: usize,
+    replacement_items: usize,
+) -> String {
+    format!(
+        "Auto compaction snapshot.\n\
+         Summarized provider messages: {summarized_messages}.\n\
+         Retained recent provider messages: {retained_messages}.\n\
+         Replaced canonical history items: {replacement_items}.\n\
+         Estimated active context tokens before compaction: {}.\n\
+         Context window limit: {}.\n\
+         Continuation invariant: CompactionContinuity.",
+        status.active_context_tokens, status.full_context_window_limit
+    )
+}
+
+fn auto_compaction_replacement_item_ids(
+    history_items: &[HistoryItem],
+    keep_recent: usize,
+) -> Vec<HistoryItemId> {
+    let replayable_indices = history_items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| history_item_replays_to_model(&item.payload).then_some(index))
+        .collect::<Vec<_>>();
+    if replayable_indices.len() <= keep_recent {
+        return Vec::new();
+    }
+
+    let mut boundary = replayable_indices[replayable_indices.len() - keep_recent.max(1)];
+    while boundary < history_items.len() {
+        let HistoryItemPayload::ToolOutput { call_id, .. } = &history_items[boundary].payload
+        else {
+            break;
+        };
+        let compacted_call = history_items[..boundary].iter().any(|item| {
+            matches!(
+                &item.payload,
+                HistoryItemPayload::ToolCall {
+                    call_id: seen_call_id,
+                    ..
+                } if seen_call_id == call_id
+            )
+        });
+        if !compacted_call {
+            break;
+        }
+        boundary += 1;
+    }
+
+    history_items
+        .iter()
+        .take(boundary)
+        .map(|item| item.id)
+        .collect()
+}
+
+fn history_item_replays_to_model(payload: &HistoryItemPayload) -> bool {
+    matches!(
+        payload,
+        HistoryItemPayload::UserTurn { .. }
+            | HistoryItemPayload::SteerTurn { .. }
+            | HistoryItemPayload::Message { .. }
+            | HistoryItemPayload::ToolCall { .. }
+            | HistoryItemPayload::ToolOutput { .. }
+            | HistoryItemPayload::Compaction { .. }
+            | HistoryItemPayload::Error { .. }
+    )
 }
 
 fn user_message_from_content(content: &[ContentPart]) -> ModelMessage {
@@ -1305,6 +1722,20 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, RunEvent::SessionCompleted { .. }))
         );
+        assert!(
+            run.events
+                .iter()
+                .any(|event| matches!(event, RunEvent::WorldStateUpdated { .. }))
+        );
+        assert!(run.events.iter().any(|event| {
+            matches!(
+                event,
+                RunEvent::ModelRequestPrepared { diagnostics, .. }
+                    if diagnostics.context_window.is_some()
+            )
+        }));
+        assert!(run.requests[0].system_prompt.contains("<world_state>"));
+        assert!(run.requests[0].system_prompt.contains("<current_time"));
         assert!(summary.assistant_message_id.is_some());
     }
 
@@ -1737,6 +2168,164 @@ mod tests {
     }
 
     #[test]
+    fn history_projection_replays_compaction_summary_and_skips_replaced_items() {
+        let session_id = crate::session::SessionId::new();
+        let turn_id = TurnId::new();
+        let old_id = crate::protocol::HistoryItemId::new();
+        let recent_id = crate::protocol::HistoryItemId::new();
+        let compaction_id = crate::protocol::HistoryItemId::new();
+        let items = vec![
+            HistoryItem {
+                id: old_id,
+                session_id,
+                turn_id,
+                sequence_no: 0,
+                created_at_ms: 100,
+                payload: HistoryItemPayload::UserTurn {
+                    message_id: Some(MessageId::new()),
+                    content: vec![ContentPart::Text {
+                        text: "old detail".to_string(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                    turn_context: None,
+                },
+            },
+            HistoryItem {
+                id: recent_id,
+                session_id,
+                turn_id,
+                sequence_no: 1,
+                created_at_ms: 200,
+                payload: HistoryItemPayload::UserTurn {
+                    message_id: Some(MessageId::new()),
+                    content: vec![ContentPart::Text {
+                        text: "recent detail".to_string(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                    turn_context: None,
+                },
+            },
+            HistoryItem {
+                id: compaction_id,
+                session_id,
+                turn_id,
+                sequence_no: 2,
+                created_at_ms: 300,
+                payload: HistoryItemPayload::Compaction {
+                    mode: crate::protocol::CompactionMode::MidTurn,
+                    summary: "old detail summary".to_string(),
+                    replacement_item_ids: vec![old_id],
+                    continuation: None,
+                },
+            },
+        ];
+
+        let messages = messages_from_history(&items);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[0],
+            ModelMessage::System { content }
+                if content.contains("old detail summary")
+                    && !content.contains("recent detail")
+        ));
+        assert!(matches!(
+            &messages[1],
+            ModelMessage::User { content } if content == "recent detail"
+        ));
+    }
+
+    #[test]
+    fn auto_compaction_replacement_keeps_tool_call_output_pairs_together() {
+        let session_id = crate::session::SessionId::new();
+        let turn_id = TurnId::new();
+        let user_id = crate::protocol::HistoryItemId::new();
+        let call_id_item = crate::protocol::HistoryItemId::new();
+        let output_id = crate::protocol::HistoryItemId::new();
+        let recent_id = crate::protocol::HistoryItemId::new();
+        let call_id = ToolCallId::new();
+        let items = vec![
+            HistoryItem {
+                id: user_id,
+                session_id,
+                turn_id,
+                sequence_no: 0,
+                created_at_ms: 100,
+                payload: HistoryItemPayload::UserTurn {
+                    message_id: Some(MessageId::new()),
+                    content: vec![ContentPart::Text {
+                        text: "read file".to_string(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                    turn_context: None,
+                },
+            },
+            HistoryItem {
+                id: call_id_item,
+                session_id,
+                turn_id,
+                sequence_no: 1,
+                created_at_ms: 200,
+                payload: HistoryItemPayload::ToolCall {
+                    call_id,
+                    tool: ToolName::Read,
+                    arguments: serde_json::json!({"path":"README.md"}),
+                    model_arguments: Value::Null,
+                    effective_arguments: serde_json::json!({"path":"README.md"}),
+                    adjusted_arguments: None,
+                    permission_decision: None,
+                    sandbox_decision: None,
+                    allowed_surface: Vec::new(),
+                    retry_policy: None,
+                    terminal_guard_policy: None,
+                },
+            },
+            HistoryItem {
+                id: output_id,
+                session_id,
+                turn_id,
+                sequence_no: 2,
+                created_at_ms: 300,
+                payload: HistoryItemPayload::ToolOutput {
+                    call_id,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "read".to_string(),
+                    output_text: "contents".to_string(),
+                    metadata: Value::Null,
+                    success: Some(true),
+                    progress_effect: ToolProgressEffect::MadeProgress,
+                    blocked_action: None,
+                    result_hash: None,
+                    verification_run: None,
+                },
+            },
+            HistoryItem {
+                id: recent_id,
+                session_id,
+                turn_id,
+                sequence_no: 3,
+                created_at_ms: 400,
+                payload: HistoryItemPayload::UserTurn {
+                    message_id: Some(MessageId::new()),
+                    content: vec![ContentPart::Text {
+                        text: "next".to_string(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                    turn_context: None,
+                },
+            },
+        ];
+
+        let replacement_ids = auto_compaction_replacement_item_ids(&items, 2);
+
+        assert_eq!(replacement_ids, vec![user_id, call_id_item, output_id]);
+    }
+
+    #[test]
     fn schema_validation_rejects_required_and_type_mismatches() {
         let schemas = vec![ToolSchema {
             name: "sample".to_string(),
@@ -1994,6 +2583,7 @@ mod tests {
             storage_paths,
             truncator: ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
+            skills: crate::skill::SkillsService::new(),
         }
     }
 

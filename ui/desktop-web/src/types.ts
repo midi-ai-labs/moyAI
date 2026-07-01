@@ -106,6 +106,9 @@ export interface DesktopWebState {
   latest_tool_summary: string;
   progress_text: string;
   tool_status_text: string;
+  token_meter_label: string;
+  token_meter_title: string;
+  token_meter_level: "unknown" | "low" | "medium" | "high" | "critical" | string;
   confirmation_visible: boolean;
   confirmation_text: string;
   confirmation: PermissionProjection | null;

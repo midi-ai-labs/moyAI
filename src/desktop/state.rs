@@ -1,7 +1,7 @@
 use crate::protocol::TurnItem;
 use crate::session::{
     ProjectId, PromptDispatchPart, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus,
-    TodoItem, Transcript,
+    TodoItem, Transcript, latest_context_window_from_transcript,
 };
 use crate::tool::PermissionRequest;
 use crate::tui::state::{AppState, RunStatus};
@@ -753,6 +753,9 @@ impl DesktopState {
         );
         self.app_state
             .load_turn_items(session, turn_items, state, todos);
+        if let Some(context_window) = latest_context_window_from_transcript(transcript) {
+            self.app_state.latest_context_window = Some(context_window);
+        }
         self.open_session = Some(open_session);
         if let Some(index) = self
             .snapshot
@@ -1455,10 +1458,18 @@ pub fn provider_model_summary(info: &ProviderModelInfo) -> String {
 
 #[cfg(test)]
 mod tests {
+    use camino::Utf8PathBuf;
+
     use super::*;
+    use crate::config::AccessMode;
     use crate::desktop::models::{DesktopProjectRow, DesktopSessionRow};
     use crate::llm::ModelAvailabilityStatus;
     use crate::session::ProjectId;
+    use crate::session::{
+        AssistantMessageMeta, MessageId, MessageMetadata, MessagePart, MessageRecord, MessageRole,
+        PartId, PartKind, PartRecord, RequestDiagnosticsPart, SessionModelParameters, TextPart,
+        Transcript, TranscriptMessage,
+    };
 
     fn snapshot(
         session_rows: Vec<DesktopSessionRow>,
@@ -1485,6 +1496,124 @@ mod tests {
 
     fn session_row(session_id: SessionId, title: &str, status: SessionStatus) -> DesktopSessionRow {
         DesktopSessionRow::from_parts(session_id, title, status)
+    }
+
+    fn session_record(session_id: SessionId) -> SessionRecord {
+        SessionRecord {
+            id: session_id,
+            project_id: ProjectId::new(),
+            title: "opened".to_string(),
+            status: SessionStatus::Completed,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "model".to_string(),
+            base_url: "http://local".to_string(),
+            access_mode: AccessMode::FullAccess,
+            model_parameters: SessionModelParameters::default(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            completed_at_ms: Some(2),
+        }
+    }
+
+    fn context_window_status(
+        active_context_tokens: u32,
+    ) -> crate::context::ContextWindowTokenStatus {
+        crate::context::ContextWindowTokenStatus {
+            active_context_tokens,
+            full_context_window_limit: 131_072,
+            configured_max_output_tokens: 8_192,
+            overflow_margin_tokens: 1_024,
+            tokens_until_limit: 121_856 - i64::from(active_context_tokens),
+            token_limit_reached: false,
+        }
+    }
+
+    fn transcript_with_context_window(
+        session: &SessionRecord,
+        context_window: crate::context::ContextWindowTokenStatus,
+    ) -> Transcript {
+        let user_message_id = MessageId::new();
+        let diagnostics_message_id = MessageId::new();
+        Transcript {
+            session: session.clone(),
+            messages: vec![
+                TranscriptMessage {
+                    record: MessageRecord {
+                        id: user_message_id,
+                        session_id: session.id,
+                        role: MessageRole::User,
+                        parent_message_id: None,
+                        sequence_no: 1,
+                        created_at_ms: 1,
+                        metadata: MessageMetadata::User(crate::session::UserMessageMeta {
+                            cwd: session.cwd.clone(),
+                            requested_model: Some(session.model.clone()),
+                            editor_context: None,
+                        }),
+                    },
+                    parts: vec![PartRecord {
+                        id: PartId::new(),
+                        message_id: user_message_id,
+                        sequence_no: 1,
+                        kind: PartKind::Text,
+                        payload: MessagePart::Text(TextPart {
+                            text: "hello".to_string(),
+                        }),
+                    }],
+                },
+                TranscriptMessage {
+                    record: MessageRecord {
+                        id: diagnostics_message_id,
+                        session_id: session.id,
+                        role: MessageRole::Assistant,
+                        parent_message_id: None,
+                        sequence_no: 2,
+                        created_at_ms: 2,
+                        metadata: MessageMetadata::Assistant(AssistantMessageMeta {
+                            model: session.model.clone(),
+                            base_url: session.base_url.clone(),
+                            finish_reason: None,
+                            token_usage: None,
+                            summary: false,
+                        }),
+                    },
+                    parts: vec![PartRecord {
+                        id: PartId::new(),
+                        message_id: diagnostics_message_id,
+                        sequence_no: 1,
+                        kind: PartKind::RequestDiagnostics,
+                        payload: MessagePart::RequestDiagnostics(RequestDiagnosticsPart {
+                            provider: "openai_compat".to_string(),
+                            model_name: session.model.clone(),
+                            base_url: session.base_url.clone(),
+                            request_timeout_ms: 30_000,
+                            stream_idle_timeout_ms: 30_000,
+                            stream_max_retries: 0,
+                            configured_max_output_tokens: Some(8_192),
+                            effective_max_output_tokens: Some(8_192),
+                            output_budget_reason: None,
+                            supports_tools: Some(true),
+                            supports_reasoning: Some(false),
+                            supports_images: Some(false),
+                            system_prompt_chars: 0,
+                            tool_count: 0,
+                            tool_choice: Some("auto".to_string()),
+                            parallel_tool_calls: Some(false),
+                            provider_message_count: 0,
+                            image_count: 0,
+                            image_bytes: 0,
+                            tool_names: Vec::new(),
+                            tool_schemas: Vec::new(),
+                            turn_decision: None,
+                            control_envelope: None,
+                            replay_policies: Vec::new(),
+                            context_window: Some(context_window),
+                            messages: Vec::new(),
+                        }),
+                    }],
+                },
+            ],
+        }
     }
 
     fn passing_model_report(config: &ResolvedConfig) -> ModelAvailabilityReport {
@@ -1540,6 +1669,35 @@ mod tests {
         ));
 
         assert_eq!(state.selected_session_id(), Some(open));
+    }
+
+    #[test]
+    fn load_open_session_restores_latest_context_window_from_transcript() {
+        let session_id = SessionId::new();
+        let session = session_record(session_id);
+        let status = context_window_status(2_100);
+        let transcript = transcript_with_context_window(&session, status.clone());
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(session_id, "opened", SessionStatus::Completed)],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+
+        state.load_open_session(
+            &session,
+            &transcript,
+            &[],
+            SessionStateSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,
+            false,
+        );
+
+        assert_eq!(state.app_state.latest_context_window, Some(status));
     }
 
     #[test]

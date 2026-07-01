@@ -102,6 +102,12 @@ fn apply_session(target: &mut crate::config::SessionConfig, patch: PartialSessio
     if let Some(value) = patch.overflow_margin_tokens {
         target.overflow_margin_tokens = value;
     }
+    if let Some(value) = patch.auto_compact_enabled {
+        target.auto_compact_enabled = value;
+    }
+    if let Some(value) = patch.auto_compact_keep_recent {
+        target.auto_compact_keep_recent = value.max(1);
+    }
 }
 
 fn apply_agent(target: &mut crate::config::AgentConfig, patch: PartialAgentConfig) {

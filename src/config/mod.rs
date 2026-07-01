@@ -1,6 +1,7 @@
 pub mod loader;
 pub mod merge;
 pub mod model;
+pub mod permission_profile_catalog;
 
 pub use loader::ConfigLoader;
 pub use model::{
@@ -10,4 +11,7 @@ pub use model::{
     McpTransportKind, ModelConfig, NewlineStyle, PermissionsConfig, PromptProfile,
     ProviderMetadataMode, ResolvedConfig, SessionConfig, ShellConfig, ShellFamily,
     ToolOutputConfig, WorkspaceConfig,
+};
+pub use permission_profile_catalog::{
+    PermissionProfileCatalog, PermissionProfileEntry, builtin_permission_profiles,
 };

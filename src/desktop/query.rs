@@ -515,6 +515,7 @@ fn transcript_rows_from_turn_items_with_context(
             | crate::protocol::TurnItemPayload::Plan { .. }
             | crate::protocol::TurnItemPayload::PromptDispatch { .. }
             | crate::protocol::TurnItemPayload::State { .. }
+            | crate::protocol::TurnItemPayload::WorldState { .. }
             | crate::protocol::TurnItemPayload::LifecycleGuard { .. } => {}
         }
     }

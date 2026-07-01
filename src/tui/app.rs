@@ -1782,6 +1782,7 @@ fn live_event_requires_canonical_refresh(event: &RunEvent) -> bool {
         RunEvent::UserTurnStored { .. }
             | RunEvent::ControlEnvelopePrepared { .. }
             | RunEvent::ModelRequestPrepared { .. }
+            | RunEvent::WorldStateUpdated { .. }
             | RunEvent::ToolCallPending { .. }
             | RunEvent::ToolCallCompleted { .. }
             | RunEvent::ToolCallFailed { .. }
@@ -2446,6 +2447,7 @@ fn event_requires_sidebar_refresh(event: &RunEvent) -> bool {
         event,
         RunEvent::TextDelta { .. }
             | RunEvent::ReasoningDelta { .. }
+            | RunEvent::WorldStateUpdated { .. }
             | RunEvent::ToolProposalRejected { .. }
             | RunEvent::CandidateRepairEditRecorded { .. }
             | RunEvent::PermissionRequested { .. }

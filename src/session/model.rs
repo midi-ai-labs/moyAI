@@ -786,6 +786,8 @@ pub struct RequestDiagnosticsPart {
     pub control_envelope: Option<RequestControlEnvelopeDiagnostic>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replay_policies: Vec<RequestReplayPolicyDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<crate::context::ContextWindowTokenStatus>,
     pub messages: Vec<RequestMessageDiagnostic>,
 }
 
@@ -1281,6 +1283,11 @@ pub enum RunEvent {
         session_id: SessionId,
         diagnostics: RequestDiagnosticsPart,
     },
+    WorldStateUpdated {
+        session_id: SessionId,
+        snapshot: crate::context::WorldStateSnapshot,
+        rendered: String,
+    },
     TextDelta {
         message_id: MessageId,
         delta: String,
@@ -1327,6 +1334,8 @@ pub enum RunEvent {
         message_id: MessageId,
         summarized_messages: usize,
         summary: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replacement_item_ids: Vec<crate::protocol::HistoryItemId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         continuation: Option<crate::session::ContinuationContract>,
     },
@@ -1385,6 +1394,7 @@ impl RunEvent {
             | Self::UserTurnStored { session_id, .. }
             | Self::ControlEnvelopePrepared { session_id, .. }
             | Self::ModelRequestPrepared { session_id, .. }
+            | Self::WorldStateUpdated { session_id, .. }
             | Self::RetryScheduled { session_id, .. }
             | Self::RecoverableRuntimeFeedback { session_id, .. }
             | Self::StateUpdated { session_id, .. }

@@ -40,10 +40,17 @@ impl Tool for SkillTool {
         ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<SkillInput>(raw_arguments)?;
-        let Some(loaded) =
-            crate::skill::load(&ctx.workspace.root, &input.name).map_err(ToolError::Message)?
+        let Some(loaded) = ctx
+            .services
+            .skills
+            .load(&ctx.workspace.root, &input.name)
+            .map_err(ToolError::Message)?
         else {
-            let available = crate::skill::discover(&ctx.workspace.root)
+            let available = ctx
+                .services
+                .skills
+                .snapshot_for_workspace(&ctx.workspace.root)
+                .skills
                 .into_iter()
                 .map(|skill| skill.name)
                 .collect::<Vec<_>>()

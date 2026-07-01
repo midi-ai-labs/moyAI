@@ -39,6 +39,10 @@ impl ToolRegistry {
         );
         tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
         tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
+        tools.insert(
+            "current_time".to_string(),
+            Arc::new(crate::tool::current_time::CurrentTimeTool),
+        );
         tools.insert("skill".to_string(), Arc::new(crate::tool::skill::SkillTool));
         tools.insert(
             "docling_convert".to_string(),
@@ -141,6 +145,10 @@ fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
     );
     tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
     tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
+    tools.insert(
+        "current_time".to_string(),
+        Arc::new(crate::tool::current_time::CurrentTimeTool),
+    );
 }
 
 fn insert_goal_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
@@ -167,6 +175,7 @@ mod tests {
             vec![
                 "apply_patch",
                 "create_goal",
+                "current_time",
                 "get_goal",
                 "glob",
                 "grep",

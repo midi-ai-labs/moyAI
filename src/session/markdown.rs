@@ -514,6 +514,7 @@ fn history_item_detail_title(item: &HistoryItem) -> &'static str {
         HistoryItemPayload::RejectedToolProposal { .. } => "Rejected Tool Proposal",
         HistoryItemPayload::CandidateRepairEdit { .. } => "Candidate Repair Edit",
         HistoryItemPayload::Continuation { .. } => "Continuation",
+        HistoryItemPayload::WorldState { .. } => "World State",
         HistoryItemPayload::StateProjection { .. } | HistoryItemPayload::SessionState { .. } => {
             "State"
         }
@@ -906,6 +907,16 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
                 &serde_json::to_string_pretty(contract).unwrap_or_default(),
             );
         }
+        HistoryItemPayload::WorldState { snapshot, rendered } => {
+            output.push_str("### World State\n\n");
+            output.push_str(rendered);
+            output.push_str("\n\n");
+            push_fenced(
+                output,
+                "json",
+                &serde_json::to_string_pretty(snapshot).unwrap_or_default(),
+            );
+        }
         HistoryItemPayload::StateProjection { projection } => {
             output.push_str("### State Projection\n\n");
             push_fenced(
@@ -1059,6 +1070,23 @@ fn push_request_diagnostics(output: &mut String, value: &RequestDiagnosticsPart)
             output,
             "Parallel Tool Calls",
             &parallel_tool_calls.to_string(),
+        );
+    }
+    if let Some(context_window) = &value.context_window {
+        push_metadata_line(
+            output,
+            "Active Context Tokens (estimated)",
+            &context_window.active_context_tokens.to_string(),
+        );
+        push_metadata_line(
+            output,
+            "Tokens Until Context Limit (estimated)",
+            &context_window.tokens_until_limit.to_string(),
+        );
+        push_metadata_line(
+            output,
+            "Context Limit Reached",
+            &context_window.token_limit_reached.to_string(),
         );
     }
     if let Some(control) = &value.control_envelope {

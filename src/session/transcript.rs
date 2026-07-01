@@ -1,3 +1,4 @@
+use crate::context::ContextWindowTokenStatus;
 use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload, ToolLifecycleStatus};
 use crate::session::{
     AssistantMessageMeta, DiffSummaryPart, ImagePart, MessageId, MessageMetadata, MessagePart,
@@ -16,6 +17,20 @@ pub fn flatten_text_parts(transcript: &Transcript) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+pub fn latest_context_window_from_transcript(
+    transcript: &Transcript,
+) -> Option<ContextWindowTokenStatus> {
+    transcript
+        .messages
+        .iter()
+        .rev()
+        .flat_map(|message| message.parts.iter().rev())
+        .find_map(|part| match &part.payload {
+            MessagePart::RequestDiagnostics(diagnostics) => diagnostics.context_window.clone(),
+            _ => None,
+        })
 }
 
 pub fn transcript_from_history_items(session: &SessionRecord, items: &[HistoryItem]) -> Transcript {
@@ -209,6 +224,7 @@ fn history_item_parts(message_id: MessageId, payload: &HistoryItemPayload) -> Ve
         HistoryItemPayload::RejectedToolProposal { .. }
         | HistoryItemPayload::CandidateRepairEdit { .. }
         | HistoryItemPayload::Continuation { .. }
+        | HistoryItemPayload::WorldState { .. }
         | HistoryItemPayload::StateProjection { .. }
         | HistoryItemPayload::SessionState { .. }
         | HistoryItemPayload::LifecycleGuard { .. }
@@ -300,4 +316,136 @@ fn steer_context_summary(
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use camino::Utf8PathBuf;
+
+    use super::*;
+    use crate::config::AccessMode;
+    use crate::context::ContextWindowTokenStatus;
+    use crate::session::{
+        ProjectId, RequestDiagnosticsPart, SessionId, SessionModelParameters, SessionStatus,
+    };
+
+    #[test]
+    fn latest_context_window_from_transcript_uses_last_measured_diagnostics() {
+        let first = context_window_status(2_100);
+        let second = context_window_status(12_300);
+        let transcript = transcript_with_diagnostics(vec![
+            request_diagnostics(Some(first.clone())),
+            request_diagnostics(None),
+            request_diagnostics(Some(second.clone())),
+        ]);
+
+        assert_eq!(
+            latest_context_window_from_transcript(&transcript),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn latest_context_window_from_transcript_skips_unmeasured_diagnostics() {
+        let measured = context_window_status(2_100);
+        let transcript = transcript_with_diagnostics(vec![
+            request_diagnostics(Some(measured.clone())),
+            request_diagnostics(None),
+        ]);
+
+        assert_eq!(
+            latest_context_window_from_transcript(&transcript),
+            Some(measured)
+        );
+    }
+
+    fn transcript_with_diagnostics(diagnostics: Vec<RequestDiagnosticsPart>) -> Transcript {
+        let session = SessionRecord {
+            id: SessionId::new(),
+            project_id: ProjectId::new(),
+            title: "test".to_string(),
+            status: SessionStatus::Completed,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "model".to_string(),
+            base_url: "http://local".to_string(),
+            access_mode: AccessMode::FullAccess,
+            model_parameters: SessionModelParameters::default(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            completed_at_ms: Some(2),
+        };
+        let messages = diagnostics
+            .into_iter()
+            .enumerate()
+            .map(|(index, diagnostics)| {
+                let message_id = MessageId::new();
+                TranscriptMessage {
+                    record: MessageRecord {
+                        id: message_id,
+                        session_id: session.id,
+                        role: MessageRole::Assistant,
+                        parent_message_id: None,
+                        sequence_no: index as i64 + 1,
+                        created_at_ms: index as i64 + 1,
+                        metadata: MessageMetadata::Assistant(AssistantMessageMeta {
+                            model: session.model.clone(),
+                            base_url: session.base_url.clone(),
+                            finish_reason: None,
+                            token_usage: None,
+                            summary: false,
+                        }),
+                    },
+                    parts: vec![PartRecord {
+                        id: PartId::new(),
+                        message_id,
+                        sequence_no: 1,
+                        kind: PartKind::RequestDiagnostics,
+                        payload: MessagePart::RequestDiagnostics(diagnostics),
+                    }],
+                }
+            })
+            .collect();
+        Transcript { session, messages }
+    }
+
+    fn request_diagnostics(
+        context_window: Option<ContextWindowTokenStatus>,
+    ) -> RequestDiagnosticsPart {
+        RequestDiagnosticsPart {
+            provider: "openai_compat".to_string(),
+            model_name: "model".to_string(),
+            base_url: "http://local".to_string(),
+            request_timeout_ms: 30_000,
+            stream_idle_timeout_ms: 30_000,
+            stream_max_retries: 0,
+            configured_max_output_tokens: Some(8_192),
+            effective_max_output_tokens: Some(8_192),
+            output_budget_reason: None,
+            supports_tools: Some(true),
+            supports_reasoning: Some(false),
+            supports_images: Some(false),
+            system_prompt_chars: 0,
+            tool_count: 0,
+            tool_choice: Some("auto".to_string()),
+            parallel_tool_calls: Some(false),
+            provider_message_count: 0,
+            image_count: 0,
+            image_bytes: 0,
+            tool_names: Vec::new(),
+            tool_schemas: Vec::new(),
+            turn_decision: None,
+            control_envelope: None,
+            replay_policies: Vec::new(),
+            context_window,
+            messages: Vec::new(),
+        }
+    }
+
+    fn context_window_status(active_context_tokens: u32) -> ContextWindowTokenStatus {
+        ContextWindowTokenStatus {
+            active_context_tokens,
+            full_context_window_limit: 131_072,
+            configured_max_output_tokens: 8_192,
+            overflow_margin_tokens: 1_024,
+            tokens_until_limit: 121_856 - i64::from(active_context_tokens),
+            token_limit_reached: false,
+        }
+    }
+}

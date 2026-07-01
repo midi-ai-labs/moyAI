@@ -1,3 +1,4 @@
+use crate::context::ContextWindowTokenStatus;
 use crate::edit::ChangeSummary;
 use crate::protocol::{
     ToolLifecycleStatus, TurnItem, TurnItemPayload, TurnTerminalStatus,
@@ -161,6 +162,7 @@ pub struct AppState {
     pub status_message: Option<String>,
     pub permission: Option<PermissionOverlayView>,
     pub progress: RunProgressView,
+    pub latest_context_window: Option<ContextWindowTokenStatus>,
     pub prompt_review: Option<PromptReviewState>,
     pub last_summary: Option<RunSummary>,
     active_assistant_message_id: Option<crate::session::MessageId>,
@@ -187,6 +189,7 @@ impl Default for AppState {
             status_message: None,
             permission: None,
             progress: RunProgressView::default(),
+            latest_context_window: None,
             prompt_review: None,
             last_summary: None,
             active_assistant_message_id: None,
@@ -203,6 +206,8 @@ impl AppState {
         state: SessionStateSnapshot,
         todos: Vec<TodoItem>,
     ) {
+        let previous_session_id = self.current_session_id;
+        let previous_context_window = self.latest_context_window.clone();
         self.route = Route::Session;
         self.current_session_id = Some(session.id);
         self.current_session_title = session.title.clone();
@@ -217,6 +222,11 @@ impl AppState {
             SessionStatus::Failed => RunStatus::Failed,
         };
         self.progress = progress_from_loaded_state(self.run_status, &self.tool_statuses, &todos);
+        self.latest_context_window = if previous_session_id == Some(session.id) {
+            previous_context_window
+        } else {
+            None
+        };
         self.sidebar_todos = todos;
         self.session_state = Some(state);
         self.status_message = self.run_status.default_status_message();
@@ -303,6 +313,7 @@ impl AppState {
                     active_step: "Session started".to_string(),
                     ..RunProgressView::default()
                 };
+                self.latest_context_window = None;
             }
             RunEvent::SessionTitleUpdated { session_id, title } => {
                 if self.current_session_id == Some(*session_id) {
@@ -554,11 +565,17 @@ impl AppState {
             }
             RunEvent::ModelRequestPrepared { diagnostics, .. } => {
                 self.progress.model_requests += 1;
+                self.latest_context_window = diagnostics.context_window.clone();
                 self.progress.current_phase = "model".to_string();
                 self.progress.active_step = format!(
                     "Model request {} with {} tools",
                     self.progress.model_requests, diagnostics.tool_count
                 );
+            }
+            RunEvent::WorldStateUpdated { snapshot, .. } => {
+                self.progress.current_phase = "context".to_string();
+                self.progress.active_step =
+                    format!("World state updated: {} sections", snapshot.section_count());
             }
             RunEvent::ToolProposalRejected { proposal, .. } => {
                 self.progress.rejected_tool_proposals += 1;
@@ -916,6 +933,7 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
             TurnItemPayload::Plan { .. }
             | TurnItemPayload::PromptDispatch { .. }
             | TurnItemPayload::State { .. }
+            | TurnItemPayload::WorldState { .. }
             | TurnItemPayload::LifecycleGuard { .. } => None,
             TurnItemPayload::ContextCompaction { summary } => Some(TranscriptEntry {
                 kind: TranscriptKind::System,
@@ -1147,6 +1165,25 @@ fn terminal_transcript_kind(status: TurnTerminalStatus) -> TranscriptKind {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use camino::Utf8PathBuf;
+
+    fn test_session(id: SessionId) -> SessionRecord {
+        SessionRecord {
+            id,
+            project_id: crate::session::ProjectId::new(),
+            title: "test".to_string(),
+            status: SessionStatus::Completed,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "model".to_string(),
+            base_url: "http://local".to_string(),
+            access_mode: crate::config::AccessMode::FullAccess,
+            model_parameters: crate::session::SessionModelParameters::default(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            completed_at_ms: Some(2),
+        }
+    }
 
     #[test]
     fn tui_primary_transcript_omits_internal_projection_items() {
@@ -1156,5 +1193,59 @@ mod tests {
     #[test]
     fn tui_session_search_state_is_explicit_discovery_metadata() {
         assert!(super::tui_session_search_state_is_explicit_discovery_metadata_fixture_passes());
+    }
+
+    #[test]
+    fn latest_context_window_survives_same_session_reload() {
+        let session_id = SessionId::new();
+        let status = ContextWindowTokenStatus {
+            active_context_tokens: 2_100,
+            full_context_window_limit: 131_072,
+            configured_max_output_tokens: 8_192,
+            overflow_margin_tokens: 1_024,
+            tokens_until_limit: 119_756,
+            token_limit_reached: false,
+        };
+        let mut state = AppState {
+            current_session_id: Some(session_id),
+            latest_context_window: Some(status.clone()),
+            ..AppState::default()
+        };
+
+        state.load_turn_items(
+            &test_session(session_id),
+            &[],
+            SessionStateSnapshot::default(),
+            Vec::new(),
+        );
+
+        assert_eq!(state.latest_context_window, Some(status));
+    }
+
+    #[test]
+    fn latest_context_window_clears_on_different_session_reload() {
+        let previous_session_id = SessionId::new();
+        let next_session_id = SessionId::new();
+        let mut state = AppState {
+            current_session_id: Some(previous_session_id),
+            latest_context_window: Some(ContextWindowTokenStatus {
+                active_context_tokens: 2_100,
+                full_context_window_limit: 131_072,
+                configured_max_output_tokens: 8_192,
+                overflow_margin_tokens: 1_024,
+                tokens_until_limit: 119_756,
+                token_limit_reached: false,
+            }),
+            ..AppState::default()
+        };
+
+        state.load_turn_items(
+            &test_session(next_session_id),
+            &[],
+            SessionStateSnapshot::default(),
+            Vec::new(),
+        );
+
+        assert_eq!(state.latest_context_window, None);
     }
 }

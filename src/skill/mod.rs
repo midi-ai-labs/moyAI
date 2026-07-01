@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fs;
+use std::sync::{Arc, Mutex};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use ignore::WalkBuilder;
@@ -23,9 +25,66 @@ pub struct LoadedSkill {
     pub sampled_files: Vec<Utf8PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillsSnapshot {
+    pub workspace_root: Utf8PathBuf,
+    pub roots: Vec<Utf8PathBuf>,
+    pub skills: Vec<DiscoveredSkill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SkillsCacheKey {
+    workspace_root: Utf8PathBuf,
+    roots: Vec<Utf8PathBuf>,
+}
+
+#[derive(Clone, Default)]
+pub struct SkillsService {
+    cache: Arc<Mutex<HashMap<SkillsCacheKey, SkillsSnapshot>>>,
+}
+
+impl SkillsService {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn snapshot_for_workspace(&self, root: &Utf8Path) -> SkillsSnapshot {
+        let roots = skill_roots(root);
+        let key = SkillsCacheKey {
+            workspace_root: root.to_path_buf(),
+            roots: roots.clone(),
+        };
+        let mut cache = self.cache.lock().expect("skills cache mutex");
+        if let Some(snapshot) = cache.get(&key) {
+            return snapshot.clone();
+        }
+        let snapshot = SkillsSnapshot {
+            workspace_root: root.to_path_buf(),
+            roots: roots.clone(),
+            skills: discover_from_roots(root, &roots),
+        };
+        cache.insert(key, snapshot.clone());
+        snapshot
+    }
+
+    pub fn invalidate_workspace(&self, root: &Utf8Path) {
+        let mut cache = self.cache.lock().expect("skills cache mutex");
+        cache.retain(|key, _| key.workspace_root != root);
+    }
+
+    pub fn load(&self, root: &Utf8Path, name: &str) -> Result<Option<LoadedSkill>, String> {
+        let snapshot = self.snapshot_for_workspace(root);
+        load_from_snapshot(snapshot, name)
+    }
+}
+
 pub fn discover(root: &Utf8Path) -> Vec<DiscoveredSkill> {
+    discover_from_roots(root, &skill_roots(root))
+}
+
+fn discover_from_roots(root: &Utf8Path, roots: &[Utf8PathBuf]) -> Vec<DiscoveredSkill> {
     let mut skills = Vec::new();
-    for skill_root in skill_roots(root) {
+    for skill_root in roots {
         if !skill_root.exists() {
             continue;
         }
@@ -68,7 +127,12 @@ pub fn discover(root: &Utf8Path) -> Vec<DiscoveredSkill> {
 }
 
 pub fn load(root: &Utf8Path, name: &str) -> Result<Option<LoadedSkill>, String> {
-    let manifest = discover(root)
+    load_from_snapshot(SkillsService::new().snapshot_for_workspace(root), name)
+}
+
+fn load_from_snapshot(snapshot: SkillsSnapshot, name: &str) -> Result<Option<LoadedSkill>, String> {
+    let manifest = snapshot
+        .skills
         .into_iter()
         .find(|skill| skill.name.eq_ignore_ascii_case(name));
     let Some(manifest) = manifest else {
@@ -89,7 +153,11 @@ pub fn load(root: &Utf8Path, name: &str) -> Result<Option<LoadedSkill>, String> 
 }
 
 pub fn render_available_skills(root: &Utf8Path) -> String {
-    let skills = discover(root);
+    render_available_skills_from_snapshot(&SkillsService::new().snapshot_for_workspace(root))
+}
+
+pub fn render_available_skills_from_snapshot(snapshot: &SkillsSnapshot) -> String {
+    let skills = &snapshot.skills;
     if skills.is_empty() {
         return "No local skills are currently available.".to_string();
     }

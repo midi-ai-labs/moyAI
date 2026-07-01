@@ -101,6 +101,7 @@ impl EventRenderer for HumanRenderer {
             }
             RunEvent::ControlEnvelopePrepared { .. }
             | RunEvent::ModelRequestPrepared { .. }
+            | RunEvent::WorldStateUpdated { .. }
             | RunEvent::LifecycleGuardUpdated { .. } => {}
             RunEvent::TextDelta { delta, .. } => {
                 write!(stdout, "{delta}")?;

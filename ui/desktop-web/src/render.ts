@@ -513,8 +513,23 @@ export function renderComposer(state: DesktopWebState): string {
       </div>
       <div class="composer-meta">
         <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${state.selected_project_index >= 0 ? "プロジェクトで作業" : "プロジェクトを選択"}</button>
+        ${renderTokenMeter(state)}
       </div>
     </section>
+  `;
+}
+
+function renderTokenMeter(state: DesktopWebState): string {
+  const label = state.token_meter_label.trim();
+  if (label.length === 0) {
+    return "";
+  }
+  const level = state.token_meter_level.trim() || "unknown";
+  return `
+    <span class="token-meter ${escapeHtml(level)}" title="${escapeHtml(state.token_meter_title)}" aria-label="${escapeHtml(state.token_meter_title)}">
+      <span class="token-meter-dot"></span>
+      <span>${escapeHtml(label)}</span>
+    </span>
   `;
 }
 

@@ -25,6 +25,7 @@ path = "src/lib.rs"
 async-trait = "0.1.89"
 base64 = "0.22.1"
 camino = { version = "1.2.1", features = ["serde1"] }
+chrono = "0.4.44"
 clap = { version = "4.5.39", features = ["derive", "env"] }
 content_inspector = "0.2.4"
 crossterm = "0.28.1"
@@ -58,7 +59,6 @@ unicode-width = "0.2.0"
 [dev-dependencies]
 assert_cmd = "2.1.1"
 axum = { version = "0.8.6", features = ["multipart"] }
-chrono = "0.4.44"
 
 [build-dependencies]
 tauri-build = { version = "2.5.1", optional = true }

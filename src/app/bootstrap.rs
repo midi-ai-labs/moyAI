@@ -95,6 +95,7 @@ impl AppBootstrap {
             storage_paths: store.paths().clone(),
             truncator: ToolTruncator,
             mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
+            skills: crate::skill::SkillsService::new(),
         };
         let registry = ToolRegistry::core_agent_for_config(&config);
         let api_key = config

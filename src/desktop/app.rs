@@ -3078,6 +3078,7 @@ fn live_event_requires_canonical_refresh(event: &RunEvent) -> bool {
         RunEvent::UserTurnStored { .. }
             | RunEvent::ControlEnvelopePrepared { .. }
             | RunEvent::ModelRequestPrepared { .. }
+            | RunEvent::WorldStateUpdated { .. }
             | RunEvent::ToolCallPending { .. }
             | RunEvent::ToolCallCompleted { .. }
             | RunEvent::ToolCallFailed { .. }

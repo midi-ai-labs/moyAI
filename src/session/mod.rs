@@ -46,4 +46,4 @@ pub use state::{
 pub use todo::{
     TodoItem, TodoKind, TodoPriority, TodoStatus, todo_counts_as_open_work, todo_is_completion_item,
 };
-pub use transcript::transcript_from_history_items;
+pub use transcript::{latest_context_window_from_transcript, transcript_from_history_items};

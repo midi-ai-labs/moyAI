@@ -473,6 +473,9 @@ pub enum RuntimeEventMsg {
     ModelRequestPrepared {
         diagnostics: RequestDiagnosticsPart,
     },
+    WorldStateUpdated {
+        snapshot: crate::context::WorldStateSnapshot,
+    },
     HistoryItemRecorded {
         item_id: HistoryItemId,
     },
@@ -658,6 +661,10 @@ pub enum HistoryItemPayload {
     RequestDiagnostics {
         diagnostics: RequestDiagnosticsPart,
     },
+    WorldState {
+        snapshot: crate::context::WorldStateSnapshot,
+        rendered: String,
+    },
     Continuation {
         contract: ContinuationContract,
     },
@@ -739,7 +746,9 @@ impl HistoryItemPayload {
             Self::ToolOutput { .. } => HistoryItemAuthorityRole::ToolOutput,
             Self::RejectedToolProposal { .. } => HistoryItemAuthorityRole::RejectedModelAction,
             Self::CandidateRepairEdit { .. } => HistoryItemAuthorityRole::CandidateRepairEvidence,
-            Self::RequestDiagnostics { .. } => HistoryItemAuthorityRole::RuntimeDiagnostic,
+            Self::RequestDiagnostics { .. } | Self::WorldState { .. } => {
+                HistoryItemAuthorityRole::RuntimeDiagnostic
+            }
             Self::Continuation { .. } => HistoryItemAuthorityRole::RuntimeControl,
             Self::StateProjection { .. } => HistoryItemAuthorityRole::RuntimeProjection,
             Self::SessionState { .. } => HistoryItemAuthorityRole::StateCache,
@@ -901,6 +910,7 @@ pub fn history_item_projection_roles_are_not_authority_fixture_passes() -> bool 
                 turn_decision: None,
                 control_envelope: None,
                 replay_policies: Vec::new(),
+                context_window: None,
                 messages: Vec::new(),
             },
         },
@@ -1119,6 +1129,9 @@ pub enum TurnItemPayload {
     State {
         summary: String,
     },
+    WorldState {
+        summary: String,
+    },
     LifecycleGuard {
         summary: String,
     },
@@ -1181,9 +1194,10 @@ impl TurnItemPayload {
             }
             Self::AgentMessage { .. } => TurnItemProjectionRole::AssistantVisibleMessage,
             Self::Reasoning { .. } => TurnItemProjectionRole::ReasoningTrace,
-            Self::Plan { .. } | Self::PromptDispatch { .. } | Self::State { .. } => {
-                TurnItemProjectionRole::RuntimeProjection
-            }
+            Self::Plan { .. }
+            | Self::PromptDispatch { .. }
+            | Self::State { .. }
+            | Self::WorldState { .. } => TurnItemProjectionRole::RuntimeProjection,
             Self::LifecycleGuard { .. } => TurnItemProjectionRole::RuntimeControl,
             Self::ToolStatus { .. } => TurnItemProjectionRole::ToolLifecycleEvidence,
             Self::FileChange { .. } => TurnItemProjectionRole::FileEvidence,

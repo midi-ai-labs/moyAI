@@ -150,6 +150,8 @@ pub struct SessionConfig {
     pub auto_resume_last: bool,
     pub max_steps_per_turn: usize,
     pub overflow_margin_tokens: usize,
+    pub auto_compact_enabled: bool,
+    pub auto_compact_keep_recent: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,6 +368,8 @@ impl Default for ResolvedConfig {
                 auto_resume_last: false,
                 max_steps_per_turn: 128,
                 overflow_margin_tokens: 1_024,
+                auto_compact_enabled: true,
+                auto_compact_keep_recent: 40,
             },
             agent: AgentConfig {
                 duplicate_success_abort_threshold: 6,
@@ -531,6 +535,8 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
             auto_resume_last: None,
             max_steps_per_turn: Some(config.session.max_steps_per_turn),
             overflow_margin_tokens: None,
+            auto_compact_enabled: Some(config.session.auto_compact_enabled),
+            auto_compact_keep_recent: Some(config.session.auto_compact_keep_recent),
         }),
         inspection: Some(PartialInspectionConfig {
             default_max_depth: Some(config.inspection.default_max_depth),
@@ -634,6 +640,8 @@ pub struct PartialSessionConfig {
     pub auto_resume_last: Option<bool>,
     pub max_steps_per_turn: Option<usize>,
     pub overflow_margin_tokens: Option<usize>,
+    pub auto_compact_enabled: Option<bool>,
+    pub auto_compact_keep_recent: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

@@ -223,6 +223,7 @@ fn harness_kind_for_run_event(event: &RunEvent) -> HarnessEventKind {
         }
         RunEvent::AssistantStarted { .. } => HarnessEventKind::ModelProjectionBuilt,
         RunEvent::ControlEnvelopePrepared { .. } => HarnessEventKind::ControlEnvelopePrepared,
+        RunEvent::WorldStateUpdated { .. } => HarnessEventKind::StateSnapshotRecorded,
         RunEvent::ModelRequestPrepared { .. } => HarnessEventKind::ModelRequestSent,
         RunEvent::TextDelta { .. } | RunEvent::ReasoningDelta { .. } => {
             HarnessEventKind::ModelResponseReceived

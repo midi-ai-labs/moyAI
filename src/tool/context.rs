@@ -22,6 +22,7 @@ pub struct ToolServices {
     pub storage_paths: StoragePaths,
     pub truncator: ToolTruncator,
     pub mcp: Arc<crate::mcp::McpClient>,
+    pub skills: crate::skill::SkillsService,
 }
 
 pub struct ToolContext<'a> {
