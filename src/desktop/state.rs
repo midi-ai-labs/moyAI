@@ -98,6 +98,18 @@ impl DesktopState {
         self.apply_startup_overlay();
     }
 
+    pub fn begin_startup_provider_model_load(&mut self, base_url: &str) {
+        if self.startup.status == super::startup::DesktopStartupStatus::Ready {
+            return;
+        }
+        self.startup.begin_provider_availability(
+            base_url,
+            &self.provider_config.effective_config.model.model,
+        );
+        self.sync_startup_readiness_operation();
+        self.apply_startup_overlay();
+    }
+
     pub fn fail_startup_provider_model_load(&mut self, message: impl Into<String>) {
         self.startup.fail_provider_availability(message);
         self.sync_startup_readiness_operation();
@@ -953,6 +965,7 @@ impl DesktopState {
             .selected_field()
             .value
             .clone();
+        self.view.startup_overlay_forced = false;
         self.view.overlay = DesktopOverlay::ConfigEditor;
     }
 
@@ -995,6 +1008,7 @@ impl DesktopState {
             self.provider_config.provider_status_text =
                 "Load the model list for this provider.".to_string();
         }
+        self.view.startup_overlay_forced = false;
         self.view.overlay = DesktopOverlay::ProviderEditor;
     }
 
@@ -1030,6 +1044,7 @@ impl DesktopState {
             );
             return;
         }
+        self.view.startup_overlay_forced = false;
         self.view.overlay = DesktopOverlay::None;
     }
 
@@ -1085,6 +1100,7 @@ impl DesktopState {
     }
 
     pub fn begin_provider_model_load(&mut self, normalized_base_url: String) {
+        self.begin_startup_provider_model_load(&normalized_base_url);
         self.provider_config.provider_base_url_input = normalized_base_url;
         self.provider_config.provider_loading = true;
         self.view
@@ -1344,6 +1360,12 @@ impl DesktopState {
             } else if overlay == DesktopOverlay::ConfigEditor {
                 self.show_config_editor();
             }
+            self.view.startup_overlay_forced = true;
+        } else if self.startup.status == super::startup::DesktopStartupStatus::Ready
+            && self.view.startup_overlay_forced
+        {
+            self.view.startup_overlay_forced = false;
+            self.view.overlay = DesktopOverlay::None;
         }
     }
 }
@@ -1435,6 +1457,7 @@ pub fn provider_model_summary(info: &ProviderModelInfo) -> String {
 mod tests {
     use super::*;
     use crate::desktop::models::{DesktopProjectRow, DesktopSessionRow};
+    use crate::llm::ModelAvailabilityStatus;
     use crate::session::ProjectId;
 
     fn snapshot(
@@ -1462,6 +1485,37 @@ mod tests {
 
     fn session_row(session_id: SessionId, title: &str, status: SessionStatus) -> DesktopSessionRow {
         DesktopSessionRow::from_parts(session_id, title, status)
+    }
+
+    fn passing_model_report(config: &ResolvedConfig) -> ModelAvailabilityReport {
+        ModelAvailabilityReport {
+            gate: "model_availability".to_string(),
+            status: ModelAvailabilityStatus::Pass,
+            generated_by: "desktop_state_test".to_string(),
+            model: config.model.model.clone(),
+            base_url: config.model.base_url.clone(),
+            provider_metadata_mode: config.model.provider_metadata_mode,
+            v1_present: true,
+            native_present: true,
+            require_vision: false,
+            vision_capable: false,
+            vision_probe_passed: false,
+            vision_probes: Vec::new(),
+            tool_use_capable: Some(true),
+            capability_overrides: Vec::new(),
+            tool_call_probe_passed: true,
+            tool_call_probes: Vec::new(),
+            reasoning_capable: Some(false),
+            context: Some(config.model.context_window),
+            max_output_tokens: Some(config.model.max_output_tokens),
+            max_parallel_predictions: Some(config.model.max_parallel_predictions),
+            matched_model: None,
+            v1_models: Vec::new(),
+            native_models: Vec::new(),
+            openai_error: None,
+            native_error: None,
+            checked_at_ms: 0,
+        }
     }
 
     #[test]
@@ -1505,6 +1559,37 @@ mod tests {
         assert_eq!(state.selected_session_id(), None);
         assert_eq!(state.snapshot.selected_session_index, 1);
         assert_eq!(state.current_session_label(), "新規チャット");
+    }
+
+    #[test]
+    fn startup_forced_provider_overlay_closes_when_provider_check_passes() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = "http://127.0.0.1:1234".to_string();
+        config.model.model = "qwen/qwen3.6-35b-a3b".to_string();
+        config.docling.enabled = false;
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
+
+        state.begin_startup(true, None, camino::Utf8Path::new("C:/workspace"));
+        state.fail_startup_provider_model_load("provider failed");
+
+        assert_eq!(state.view.overlay, DesktopOverlay::ProviderEditor);
+        assert!(state.view.startup_overlay_forced);
+
+        state.begin_provider_model_load(config.model.base_url.clone());
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::Loading
+        );
+        assert_eq!(state.view.overlay, DesktopOverlay::ProviderEditor);
+
+        state.finish_startup_provider_model_load(&passing_model_report(&config));
+
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::Ready
+        );
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
+        assert!(!state.view.startup_overlay_forced);
     }
 
     #[test]

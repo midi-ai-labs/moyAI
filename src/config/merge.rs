@@ -180,6 +180,9 @@ fn apply_shell(target: &mut crate::config::ShellConfig, patch: PartialShellConfi
     if let Some(value) = patch.env_allowlist {
         target.env_allowlist = value;
     }
+    if let Some(value) = patch.hide_windows {
+        target.hide_windows = value;
+    }
 }
 
 fn apply_format(target: &mut crate::config::FormatConfig, patch: PartialFormatConfig) {

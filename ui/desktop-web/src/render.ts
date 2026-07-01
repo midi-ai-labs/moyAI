@@ -33,6 +33,7 @@ const TYPED_CONFIG_KEYS = new Set([
   "model.supports_images",
   "model.parallel_tool_calls",
   "permissions.access_mode",
+  "shell.hide_windows",
   "inspection.default_max_depth",
   "inspection.default_max_entries_per_dir",
   "inspection.max_extensions_reported",
@@ -274,7 +275,7 @@ export function renderSidebar(state: DesktopWebState): string {
       </div>
       <div class="rail-section row-heading">
         <span class="section-label">チャット${chatRunning ? '<span class="busy-spinner small" title="実行中"></span>' : ""}</span>
-        <button class="tiny-button icon-only" data-action="new-chat" title="新しいチャット" aria-label="新しいチャット">${icon("edit")}</button>
+        <button class="tiny-button icon-only" data-action="new-chat" title="新しい通常チャット" aria-label="新しい通常チャット">${icon("plus")}</button>
       </div>
       <div class="row-list chat-list">${renderChatRows(state)}</div>
       <button class="settings" data-action="show-config" title="設定"><span class="rail-icon">${icon("settings")}</span><span>設定</span></button>
@@ -832,6 +833,15 @@ function renderConfigOverlay(state: DesktopWebState): string {
             </section>
             <section id="settings-tools" class="settings-section">
               <h3>Tools</h3>
+              <div class="settings-subsection">
+                <div class="settings-section-head compact">
+                  <div>
+                    <h4>Shell</h4>
+                    <p>Windows の PowerShell / taskkill helper window 表示を制御します。</p>
+                  </div>
+                  ${renderConfigToggleField(state, "shell.hide_windows", "PowerShell window を隠す")}
+                </div>
+              </div>
               <div class="settings-subsection">
                 <div class="settings-section-head compact">
                   <div>

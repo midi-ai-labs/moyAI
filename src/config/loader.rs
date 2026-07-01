@@ -185,6 +185,7 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             default_timeout_ms: Some(config.shell.default_timeout_ms),
             max_timeout_ms: Some(config.shell.max_timeout_ms),
             env_allowlist: Some(config.shell.env_allowlist.clone()),
+            hide_windows: Some(config.shell.hide_windows),
         }),
         format: Some(PartialFormatConfig {
             default_newline: Some(config.format.default_newline),
@@ -247,6 +248,11 @@ fn env_patch() -> PartialResolvedConfig {
     if let Ok(value) = env::var("MOYAI_ACCESS_MODE") {
         if let Some(parsed) = parse_access_mode(&value) {
             patch.permissions.get_or_insert_default().access_mode = Some(parsed);
+        }
+    }
+    if let Ok(value) = env::var("MOYAI_SHELL_HIDE_WINDOWS") {
+        if let Ok(parsed) = value.parse() {
+            patch.shell.get_or_insert_default().hide_windows = Some(parsed);
         }
     }
     if let Ok(value) = env::var("MOYAI_PROMPT_PROFILE") {

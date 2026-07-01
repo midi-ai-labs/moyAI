@@ -213,6 +213,31 @@ impl DesktopStartupState {
         self.recompute();
     }
 
+    pub fn begin_provider_availability(&mut self, base_url: &str, model: &str) {
+        let base_url = normalize_provider_base_url(base_url);
+        let model = model.trim();
+        if base_url.is_empty() {
+            self.set_provider_check(DesktopStartupCheck::fail(
+                "provider",
+                "LLM 接続",
+                "LLM URL が未設定です。",
+            ));
+        } else if model.is_empty() {
+            self.set_provider_check(DesktopStartupCheck::fail(
+                "provider",
+                "LLM 接続",
+                "model が未設定です。",
+            ));
+        } else {
+            self.set_provider_check(DesktopStartupCheck::pending(
+                "provider",
+                "LLM 接続",
+                format!("{base_url} / {model} を確認しています。"),
+            ));
+        }
+        self.recompute();
+    }
+
     pub fn fail_provider_availability(&mut self, message: impl Into<String>) {
         self.set_provider_check(DesktopStartupCheck::fail(
             "provider",

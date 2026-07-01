@@ -42,7 +42,7 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
       event.preventDefault();
       void dispatchRegisteredAction("send", currentState, context, { index: -1, value: "" });
     }
-    if (event.key === "F8" && currentState && !currentState.busy) {
+    if (event.key === "F8" && currentState) {
       event.preventDefault();
       void dispatchRegisteredAction("toggle-access", currentState, context, { index: -1, value: "" });
     }

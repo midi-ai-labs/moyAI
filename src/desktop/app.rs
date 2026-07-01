@@ -19,7 +19,7 @@ use crate::llm::{
     check_model_availability, extra_body_with_num_ctx, fetch_provider_model_infos,
     normalize_provider_base_url,
 };
-use crate::runtime::{SystemClock, build_cancel_token};
+use crate::runtime::{LiveConfigOverrides, SystemClock, build_cancel_token};
 use crate::session::markdown::{
     MarkdownExportEvent, MarkdownMetadataLine, MarkdownTerminalStatus,
     render_codex_turn_block_markdown,
@@ -231,7 +231,9 @@ pub(crate) struct DesktopController {
     runtime_tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
     runtime_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeMessage>,
     permission_response: Option<mpsc::Sender<bool>>,
+    pending_permission_request: Option<PermissionRequest>,
     active_run_cancel: Option<CancellationToken>,
+    active_live_config: Option<LiveConfigOverrides>,
     next_enhance_request_id: u64,
 }
 
@@ -365,7 +367,9 @@ impl DesktopController {
             runtime_tx,
             runtime_rx,
             permission_response: None,
+            pending_permission_request: None,
             active_run_cancel: None,
+            active_live_config: None,
             next_enhance_request_id: 1,
         };
         controller.persist_preferences();
@@ -1660,13 +1664,19 @@ impl DesktopController {
     }
 
     pub(crate) fn apply_provider_session(&mut self) {
+        let setup_overlay = self.state.view.startup_overlay_forced;
         let Some(config) = self.apply_provider_selection_to_effective_config() else {
             return;
         };
         self.state.reset_effective_config(config);
+        self.state.mark_startup_config_reviewed();
+        self.load_provider_models();
+        self.check_startup_docling();
         self.state
-            .set_status_message("applied provider selection to this UI session");
-        self.state.hide_overlay();
+            .set_status_message("applied provider selection to this UI session; checking provider");
+        if !setup_overlay {
+            self.state.hide_overlay();
+        }
     }
 
     pub(crate) fn save_provider_global(&mut self) {
@@ -1710,18 +1720,38 @@ impl DesktopController {
     }
 
     pub(crate) fn toggle_access_mode_session(&mut self) {
-        if self.state.is_busy() {
-            self.state
-                .set_status_message("access mode cannot change while a run is active");
-            return;
-        }
-
         let mut config = self.state.provider_config.effective_config.clone();
         config.permissions.access_mode = config.permissions.access_mode.next();
         let access_mode = config.permissions.access_mode;
         self.state.reset_effective_config(config);
+        if let Some(live_config) = &self.active_live_config {
+            live_config.set_access_mode(access_mode);
+        }
+        let auto_approved = self
+            .pending_permission_request
+            .as_ref()
+            .is_some_and(|request| {
+                crate::tool::context::access_mode_allows_permission(access_mode, request)
+            });
+        if auto_approved {
+            if let Some(response) = self.permission_response.take() {
+                let _ = response.send(true);
+            }
+            self.pending_permission_request = None;
+            self.state.clear_permission();
+        }
+        let scope = if self.active_live_config.is_some() {
+            "active run"
+        } else {
+            "UI session"
+        };
+        let suffix = if auto_approved {
+            "; pending confirmation approved"
+        } else {
+            ""
+        };
         self.state.set_status_message(format!(
-            "UI session access mode set to {}",
+            "{scope} access mode set to {}{suffix}",
             access_mode.label()
         ));
     }
@@ -2090,6 +2120,7 @@ impl DesktopController {
                     .set_status_message(format!("failed to answer confirmation: {error}"));
             }
         }
+        self.pending_permission_request = None;
         self.state.clear_permission();
     }
 
@@ -2101,10 +2132,12 @@ impl DesktopController {
         }
         if let Some(response) = self.permission_response.take() {
             let _ = response.send(false);
+            self.pending_permission_request = None;
             self.state.clear_permission();
             requested = true;
         }
         if requested {
+            self.active_live_config = None;
             let session_id = self.state.app_state.current_session_id;
             self.state.mark_run_cancellation_requested(
                 "run cancelled by user",
@@ -2158,6 +2191,13 @@ impl DesktopController {
         }
         let image_paths = self.state.composer.image_attachment_paths.clone();
         let cancel = build_cancel_token();
+        let live_config = LiveConfigOverrides::new(
+            self.state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+        );
         self.state.clear_post_run_refresh_pending();
         self.state.begin_agent_run();
         let request = RunRequest {
@@ -2195,8 +2235,10 @@ impl DesktopController {
             review_request,
             image_paths,
             cancel: cancel.clone(),
+            live_config: Some(live_config.clone()),
         };
         self.active_run_cancel = Some(cancel);
+        self.active_live_config = Some(live_config);
         self.state.push_local_prompt_dispatch(&prompt_dispatch);
         self.state.composer.draft_prompt.clear();
         self.state.composer.image_attachment_paths.clear();
@@ -2560,6 +2602,8 @@ impl DesktopController {
                 RuntimeMessage::Finished(result) => match result {
                     Ok(summary) => {
                         self.active_run_cancel = None;
+                        self.active_live_config = None;
+                        self.pending_permission_request = None;
                         self.state.finish_agent_run();
                         self.state.mark_post_run_refresh_pending();
                         self.state.app_state.set_summary(summary);
@@ -2567,6 +2611,8 @@ impl DesktopController {
                     }
                     Err(error) => {
                         self.active_run_cancel = None;
+                        self.active_live_config = None;
+                        self.pending_permission_request = None;
                         self.state.finish_agent_run();
                         if !matches!(
                             self.state.app_state.run_status,
@@ -2584,6 +2630,7 @@ impl DesktopController {
                     }
                 },
                 RuntimeMessage::Permission(request, response) => {
+                    self.pending_permission_request = Some(request.clone());
                     self.permission_response = Some(response);
                     self.state.set_permission(&request);
                 }

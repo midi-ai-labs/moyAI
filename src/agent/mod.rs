@@ -10,14 +10,14 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::ConfirmationPrompt;
-use crate::config::ResolvedConfig;
+use crate::config::{AccessMode, ResolvedConfig};
 use crate::error::AgentError;
 use crate::llm::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, ModelContentPart, ModelMessage, ModelProfile,
     ModelToolCall, ToolSchema,
 };
 use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload, TurnId};
-use crate::runtime::RunEventSink;
+use crate::runtime::{LiveConfigOverrides, RunEventSink};
 use crate::session::{
     AssistantMessageMeta, FinishReason, MessageId, MessageMetadata, MessagePart, MessageRole,
     NewMessage, NewPart, PartKind, RunConfigSnapshot, RunEvent, RunMetrics, RunSummary,
@@ -49,7 +49,7 @@ impl PromptBuilder {
             include_str!("../../assets/prompts/system.md").trim(),
             request.session.workspace.root,
             request.session.workspace.cwd,
-            request.config.permissions.access_mode,
+            request.current_access_mode(),
             request.model.name,
             tools
         )
@@ -82,6 +82,16 @@ pub struct AgentRunRequest {
     pub config: ResolvedConfig,
     pub model: ModelProfile,
     pub cancel: CancellationToken,
+    pub live_config: Option<LiveConfigOverrides>,
+}
+
+impl AgentRunRequest {
+    fn current_access_mode(&self) -> AccessMode {
+        self.live_config
+            .as_ref()
+            .map(LiveConfigOverrides::access_mode)
+            .unwrap_or(self.config.permissions.access_mode)
+    }
 }
 
 #[derive(Clone)]
@@ -428,6 +438,7 @@ impl AgentLoop {
             session: &request.session,
             workspace: &request.session.workspace,
             config: &request.config,
+            live_config: request.live_config.clone(),
             tool_call_id: record.id,
             cancel: request.cancel.clone(),
             prompt,
@@ -1939,6 +1950,7 @@ mod tests {
                     config: config.clone(),
                     model: test_model(&config),
                     cancel: CancellationToken::new(),
+                    live_config: None,
                 },
                 &mut prompt,
                 &mut sink,

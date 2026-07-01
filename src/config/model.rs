@@ -184,6 +184,7 @@ pub struct ShellConfig {
     pub default_timeout_ms: u64,
     pub max_timeout_ms: u64,
     pub env_allowlist: Vec<String>,
+    pub hide_windows: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +394,7 @@ impl Default for ResolvedConfig {
                 default_timeout_ms: 120_000,
                 max_timeout_ms: 600_000,
                 env_allowlist: default_shell_env_allowlist,
+                hide_windows: cfg!(windows),
             },
             format: FormatConfig {
                 default_newline,
@@ -561,7 +563,14 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
             additional_write_roots: Some(config.permissions.additional_write_roots.clone()),
         }),
         agent: None,
-        shell: None,
+        shell: Some(PartialShellConfig {
+            program: config.shell.program.clone().map(Some),
+            family: config.shell.family.map(Some),
+            default_timeout_ms: Some(config.shell.default_timeout_ms),
+            max_timeout_ms: Some(config.shell.max_timeout_ms),
+            env_allowlist: Some(config.shell.env_allowlist.clone()),
+            hide_windows: Some(config.shell.hide_windows),
+        }),
         format: None,
         instructions: None,
         workspace: None,
@@ -659,6 +668,7 @@ pub struct PartialShellConfig {
     pub default_timeout_ms: Option<u64>,
     pub max_timeout_ms: Option<u64>,
     pub env_allowlist: Option<Vec<String>>,
+    pub hide_windows: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

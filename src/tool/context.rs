@@ -7,6 +7,7 @@ use crate::cli::ConfirmationPrompt;
 use crate::config::{AccessMode, ResolvedConfig};
 use crate::edit::{ChangeTracker, EditSafety, Formatter};
 use crate::error::ToolError;
+use crate::runtime::LiveConfigOverrides;
 use crate::session::{SessionContext, ToolCallId};
 use crate::storage::{StoragePaths, StoreBundle};
 use crate::tool::truncate::ToolTruncator;
@@ -27,6 +28,7 @@ pub struct ToolContext<'a> {
     pub session: &'a SessionContext,
     pub workspace: &'a Workspace,
     pub config: &'a ResolvedConfig,
+    pub live_config: Option<LiveConfigOverrides>,
     pub tool_call_id: ToolCallId,
     pub cancel: CancellationToken,
     pub prompt: &'a mut dyn ConfirmationPrompt,
@@ -70,7 +72,7 @@ impl<'a> ToolContext<'a> {
             risks,
         };
 
-        if permission_preset_allows(self.config.permissions.access_mode, &request) {
+        if access_mode_allows_permission(self.current_access_mode(), &request) {
             return Ok(());
         }
 
@@ -82,9 +84,16 @@ impl<'a> ToolContext<'a> {
             Err(ToolError::Message("permission denied by user".to_string()))
         }
     }
+
+    fn current_access_mode(&self) -> AccessMode {
+        self.live_config
+            .as_ref()
+            .map(LiveConfigOverrides::access_mode)
+            .unwrap_or(self.config.permissions.access_mode)
+    }
 }
 
-fn permission_preset_allows(
+pub fn access_mode_allows_permission(
     access_mode: AccessMode,
     request: &crate::tool::PermissionRequest,
 ) -> bool {
@@ -145,4 +154,50 @@ impl PermissionRiskClass for crate::tool::PermissionRisk {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use camino::Utf8PathBuf;
+
+    use super::*;
+    use crate::workspace::AccessKind;
+
+    fn permission(
+        access: AccessKind,
+        risks: Vec<crate::tool::PermissionRisk>,
+    ) -> crate::tool::PermissionRequest {
+        crate::tool::PermissionRequest {
+            access,
+            summary: "run shell".to_string(),
+            details: Vec::new(),
+            targets: vec![Utf8PathBuf::from("C:/workspace")],
+            outside_workspace: false,
+            risks,
+        }
+    }
+
+    #[test]
+    fn access_mode_policy_allows_shell_when_switched_to_full_access() {
+        let request = permission(AccessKind::Shell, Vec::new());
+
+        assert!(!access_mode_allows_permission(
+            AccessMode::AutoReview,
+            &request
+        ));
+        assert!(access_mode_allows_permission(
+            AccessMode::FullAccess,
+            &request
+        ));
+    }
+
+    #[test]
+    fn access_mode_policy_still_blocks_external_connections() {
+        let request = permission(
+            AccessKind::Shell,
+            vec![crate::tool::PermissionRisk::ExternalConnection],
+        );
+
+        assert!(!access_mode_allows_permission(
+            AccessMode::FullAccess,
+            &request
+        ));
+    }
+}

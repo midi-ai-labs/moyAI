@@ -303,6 +303,7 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             },
             image_paths: args.image_paths.clone(),
             cancel: build_cancel_token(),
+            live_config: None,
         }),
         CliCommand::SessionList(args) => AppCommand::SessionList(SessionListRequest {
             project_id: app.workspace.project_id,

@@ -199,6 +199,7 @@ impl RunService {
                 review_request: None,
                 image_paths: Vec::new(),
                 cancel: request.cancel.clone(),
+                live_config: request.live_config.clone(),
             };
             summary = self
                 .execute_single_run(continuation_request, renderer, prompt)
@@ -440,6 +441,7 @@ impl RunService {
                     config: effective_config,
                     model,
                     cancel: request.cancel.clone(),
+                    live_config: request.live_config.clone(),
                 },
                 prompt,
                 &mut sink,

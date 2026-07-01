@@ -33,7 +33,13 @@ export function validateConfigInput(field: string, rawValue: string): { ok: bool
       return { ok: false, message: `JSON として解釈できません: ${String(error)}` };
     }
   }
-  if (field.includes("enabled") || field.includes("supports_") || field.includes("include_hidden") || field.includes("parallel_tool_calls")) {
+  if (
+    field.includes("enabled") ||
+    field.includes("supports_") ||
+    field.includes("include_hidden") ||
+    field.includes("hide_windows") ||
+    field.includes("parallel_tool_calls")
+  ) {
     if (!["true", "false"].includes(value.toLowerCase())) {
       return { ok: false, message: "true または false を入力してください。" };
     }

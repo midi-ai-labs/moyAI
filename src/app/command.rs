@@ -5,7 +5,9 @@ use crate::cli::OutputMode;
 use crate::config::AccessMode;
 use crate::error::StorageError;
 use crate::protocol::ProtocolEventStore;
-use crate::runtime::{SessionRuntimeEventHub, SessionRuntimeEventSubscription};
+use crate::runtime::{
+    LiveConfigOverrides, SessionRuntimeEventHub, SessionRuntimeEventSubscription,
+};
 use crate::session::{
     EditorContext, PromptDispatchPart, SessionId, SessionMemoryMode, ThreadGoalStatus,
 };
@@ -64,6 +66,7 @@ pub struct RunRequest {
     pub review_request: Option<ReviewRequest>,
     pub image_paths: Vec<Utf8PathBuf>,
     pub cancel: CancellationToken,
+    pub live_config: Option<LiveConfigOverrides>,
 }
 
 #[derive(Debug, Clone)]

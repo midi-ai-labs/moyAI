@@ -169,7 +169,7 @@ export const ACTIONS: ActionDefinition[] = [
     label: "アクセスモード切替",
     shortcut: "F8",
     palette: true,
-    enabled: (state) => !state.busy,
+    enabled: always,
     run: (_state, context) => context.mutate("toggle_access_mode"),
   },
   {

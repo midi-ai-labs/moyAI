@@ -626,6 +626,7 @@ impl TuiController {
             review_request,
             image_paths: Vec::new(),
             cancel: build_cancel_token(),
+            live_config: None,
         };
         self.state.push_local_prompt_dispatch(&prompt_dispatch);
         self.composer = build_composer();

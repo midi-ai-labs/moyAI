@@ -8,8 +8,8 @@ use crate::config::loader::global_config_path;
 use crate::config::model::{
     AccessMode, McpServerConfig, PartialDoclingConfig, PartialFileGuardConfig,
     PartialInspectionConfig, PartialMcpConfig, PartialModelConfig, PartialPermissionsConfig,
-    PartialResolvedConfig, PartialSessionConfig, PromptProfile, ProviderMetadataMode,
-    ResolvedConfig,
+    PartialResolvedConfig, PartialSessionConfig, PartialShellConfig, PromptProfile,
+    ProviderMetadataMode, ResolvedConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,7 @@ pub enum ConfigField {
     MaxParallelPredictions,
     ExtraHeadersJson,
     ExtraBodyJson,
+    ShellHideWindows,
     InspectionDefaultMaxDepth,
     InspectionDefaultMaxEntriesPerDir,
     InspectionMaxExtensionsReported,
@@ -65,7 +66,7 @@ pub enum ConfigField {
 }
 
 impl ConfigField {
-    pub const ALL: [ConfigField; 42] = [
+    pub const ALL: [ConfigField; 43] = [
         ConfigField::BaseUrl,
         ConfigField::Model,
         ConfigField::PromptProfile,
@@ -93,6 +94,7 @@ impl ConfigField {
         ConfigField::MaxParallelPredictions,
         ConfigField::ExtraHeadersJson,
         ConfigField::ExtraBodyJson,
+        ConfigField::ShellHideWindows,
         ConfigField::InspectionDefaultMaxDepth,
         ConfigField::InspectionDefaultMaxEntriesPerDir,
         ConfigField::InspectionMaxExtensionsReported,
@@ -139,6 +141,7 @@ impl ConfigField {
             ConfigField::MaxParallelPredictions => "model.max_parallel_predictions",
             ConfigField::ExtraHeadersJson => "model.extra_headers_json",
             ConfigField::ExtraBodyJson => "model.extra_body_json",
+            ConfigField::ShellHideWindows => "shell.hide_windows",
             ConfigField::InspectionDefaultMaxDepth => "inspection.default_max_depth",
             ConfigField::InspectionDefaultMaxEntriesPerDir => {
                 "inspection.default_max_entries_per_dir"
@@ -190,6 +193,7 @@ impl ConfigField {
             ConfigField::MaxParallelPredictions => Some("MOYAI_MAX_PARALLEL_PREDICTIONS"),
             ConfigField::ExtraHeadersJson => Some("MOYAI_EXTRA_HEADERS"),
             ConfigField::ExtraBodyJson => Some("MOYAI_EXTRA_BODY_JSON"),
+            ConfigField::ShellHideWindows => Some("MOYAI_SHELL_HIDE_WINDOWS"),
             ConfigField::InspectionDefaultMaxDepth => Some("MOYAI_INSPECTION_MAX_DEPTH"),
             ConfigField::InspectionDefaultMaxEntriesPerDir => {
                 Some("MOYAI_INSPECTION_MAX_ENTRIES_PER_DIR")
@@ -296,6 +300,7 @@ fn save_config_sections(path: &Utf8Path, editor: &ConfigEditorState) -> Result<(
         .permissions
         .filter(|value| !permissions_patch_is_empty(value));
     existing.session = patch.session.filter(|value| !session_patch_is_empty(value));
+    existing.shell = merge_shell_editor_patch(existing.shell, patch.shell);
     existing.inspection = patch
         .inspection
         .filter(|value| !inspection_patch_is_empty(value));
@@ -344,6 +349,7 @@ fn parse_editor_patch(editor: &ConfigEditorState) -> Result<PartialResolvedConfi
     let mut model = PartialModelConfig::default();
     let mut permissions = PartialPermissionsConfig::default();
     let mut session = PartialSessionConfig::default();
+    let mut shell = PartialShellConfig::default();
     let mut inspection = PartialInspectionConfig::default();
     let mut file_guard = PartialFileGuardConfig::default();
     let mut docling = PartialDoclingConfig::default();
@@ -412,6 +418,7 @@ fn parse_editor_patch(editor: &ConfigEditorState) -> Result<PartialResolvedConfi
                     None => None,
                 }
             }
+            ConfigField::ShellHideWindows => shell.hide_windows = parse_bool(text)?,
             ConfigField::InspectionDefaultMaxDepth => {
                 inspection.default_max_depth = parse_number(text)?
             }
@@ -465,6 +472,7 @@ fn parse_editor_patch(editor: &ConfigEditorState) -> Result<PartialResolvedConfi
     patch.model = Some(model);
     patch.permissions = Some(permissions);
     patch.session = Some(session);
+    patch.shell = Some(shell);
     patch.inspection = Some(inspection);
     patch.file_guard = Some(file_guard);
     patch.docling = Some(docling);
@@ -513,6 +521,28 @@ fn session_patch_is_empty(session: &PartialSessionConfig) -> bool {
         && session.auto_resume_last.is_none()
         && session.max_steps_per_turn.is_none()
         && session.overflow_margin_tokens.is_none()
+}
+
+fn shell_patch_is_empty(shell: &PartialShellConfig) -> bool {
+    shell.program.is_none()
+        && shell.family.is_none()
+        && shell.default_timeout_ms.is_none()
+        && shell.max_timeout_ms.is_none()
+        && shell.env_allowlist.is_none()
+        && shell.hide_windows.is_none()
+}
+
+fn merge_shell_editor_patch(
+    existing: Option<PartialShellConfig>,
+    patch: Option<PartialShellConfig>,
+) -> Option<PartialShellConfig> {
+    let mut merged = existing.unwrap_or_default();
+    if let Some(patch) = patch {
+        if patch.hide_windows.is_some() {
+            merged.hide_windows = patch.hide_windows;
+        }
+    }
+    (!shell_patch_is_empty(&merged)).then_some(merged)
 }
 
 fn inspection_patch_is_empty(patch: &PartialInspectionConfig) -> bool {
@@ -690,6 +720,7 @@ fn field_value(key: ConfigField, config: &ResolvedConfig) -> String {
             .as_ref()
             .map(ValueExt::to_json_string)
             .unwrap_or_default(),
+        ConfigField::ShellHideWindows => config.shell.hide_windows.to_string(),
         ConfigField::InspectionDefaultMaxDepth => config.inspection.default_max_depth.to_string(),
         ConfigField::InspectionDefaultMaxEntriesPerDir => {
             config.inspection.default_max_entries_per_dir.to_string()
@@ -742,8 +773,9 @@ mod tests {
 
     use super::{
         ConfigEditorState, ConfigField, PartialModelConfig, PartialResolvedConfig,
-        parse_editor_patch, write_partial,
+        merge_shell_editor_patch, parse_editor_patch, write_partial,
     };
+    use crate::config::model::PartialShellConfig;
     use crate::config::{ProviderMetadataMode, ResolvedConfig};
 
     #[test]
@@ -763,6 +795,43 @@ mod tests {
             patch.model.and_then(|model| model.provider_metadata_mode),
             Some(ProviderMetadataMode::OpenAiCompatibleOnly)
         );
+    }
+
+    #[test]
+    fn config_editor_projects_shell_hide_windows_patch() {
+        let mut config = ResolvedConfig::default();
+        config.shell.hide_windows = true;
+        let mut editor = ConfigEditorState::from_config(&config);
+        let field = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::ShellHideWindows)
+            .expect("shell hide window field is present");
+        field.value = "false".to_string();
+
+        let patch = parse_editor_patch(&editor).expect("shell hide_windows parses");
+
+        assert_eq!(
+            patch.shell.and_then(|shell| shell.hide_windows),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn config_editor_shell_patch_preserves_existing_shell_fields() {
+        let existing = PartialShellConfig {
+            program: Some(Some(Utf8PathBuf::from("pwsh"))),
+            ..PartialShellConfig::default()
+        };
+        let patch = PartialShellConfig {
+            hide_windows: Some(false),
+            ..PartialShellConfig::default()
+        };
+
+        let merged = merge_shell_editor_patch(Some(existing), Some(patch)).expect("merged shell");
+
+        assert_eq!(merged.program, Some(Some(Utf8PathBuf::from("pwsh"))));
+        assert_eq!(merged.hide_windows, Some(false));
     }
 
     #[test]

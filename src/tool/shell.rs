@@ -734,7 +734,7 @@ async fn execute_shell_command(
 
     command.current_dir(workdir.as_std_path());
     apply_shell_environment(&mut command, shell);
-    configure_process_group(&mut command);
+    configure_process_group(&mut command, shell.hide_windows);
     command.kill_on_drop(true);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -756,19 +756,19 @@ async fn execute_shell_command(
 
     let (status, timed_out) = tokio::select! {
         _ = cancel.cancelled() => {
-            let _ = terminate_shell_child(&mut child, pid).await;
-            return Err(ToolError::Message("shell command cancelled by user".to_string()));
-        }
+                let _ = terminate_shell_child(&mut child, pid, shell.hide_windows).await;
+                return Err(ToolError::Message("shell command cancelled by user".to_string()));
+            }
         result = timeout(Duration::from_millis(timeout_ms), child.wait()) => match result {
             Ok(result) => (result?, false),
             Err(_) => {
-                let status = terminate_shell_child(&mut child, pid).await?;
+                let status = terminate_shell_child(&mut child, pid, shell.hide_windows).await?;
                 (status, true)
             }
         }
     };
 
-    cleanup_shell_process_tree_after_parent_exit(pid).await?;
+    cleanup_shell_process_tree_after_parent_exit(pid, shell.hide_windows).await?;
 
     let stdout = decode_shell_bytes_for_display(&join_pipe(stdout_task, "stdout").await?);
     let stderr_bytes = join_pipe(stderr_task, "stderr").await?;
@@ -871,23 +871,28 @@ fn platform_bootstrap_env(
 }
 
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
+fn configure_process_group(command: &mut Command, _hide_window: bool) {
     use std::os::unix::process::CommandExt;
 
     command.process_group(0);
 }
 
 #[cfg(windows)]
-fn configure_process_group(command: &mut Command) {
+fn configure_process_group(command: &mut Command, hide_window: bool) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut flags = CREATE_NEW_PROCESS_GROUP;
+    if hide_window {
+        flags |= CREATE_NO_WINDOW;
+    }
+    command.creation_flags(flags);
 }
 
 #[cfg(not(any(unix, windows)))]
-fn configure_process_group(_command: &mut Command) {}
+fn configure_process_group(_command: &mut Command, _hide_window: bool) {}
 
 #[cfg(unix)]
-async fn kill_process_tree(pid: u32) -> Result<(), ToolError> {
+async fn kill_process_tree(pid: u32, _hide_window: bool) -> Result<(), ToolError> {
     let process_group = format!("-{pid}");
     let _ = Command::new("kill")
         .args(["-TERM", &process_group])
@@ -906,24 +911,31 @@ async fn kill_process_tree(pid: u32) -> Result<(), ToolError> {
 }
 
 #[cfg(windows)]
-async fn kill_process_tree(pid: u32) -> Result<(), ToolError> {
-    let _ = Command::new("taskkill")
+async fn kill_process_tree(pid: u32, hide_window: bool) -> Result<(), ToolError> {
+    let mut command = Command::new("taskkill");
+    command
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    kill_process_descendants_by_parent_id(pid).await?;
+        .stderr(Stdio::null());
+    configure_process_group(&mut command, hide_window);
+    let _ = command.status().await;
+    kill_process_descendants_by_parent_id(pid, hide_window).await?;
     Ok(())
 }
 
 #[cfg(windows)]
-async fn cleanup_shell_process_tree_after_parent_exit(pid: u32) -> Result<(), ToolError> {
-    kill_process_descendants_by_parent_id(pid).await
+async fn cleanup_shell_process_tree_after_parent_exit(
+    pid: u32,
+    hide_window: bool,
+) -> Result<(), ToolError> {
+    kill_process_descendants_by_parent_id(pid, hide_window).await
 }
 
 #[cfg(windows)]
-async fn kill_process_descendants_by_parent_id(pid: u32) -> Result<(), ToolError> {
+async fn kill_process_descendants_by_parent_id(
+    pid: u32,
+    hide_window: bool,
+) -> Result<(), ToolError> {
     let script = format!(
         r#"
 $root = {pid}
@@ -948,33 +960,41 @@ foreach ($processId in ($descendants | Sort-Object -Descending)) {{
 }}
 "#
     );
-    let _ = Command::new("powershell")
+    let mut command = Command::new("powershell");
+    command
         .args(["-NoProfile", "-Command", &script])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+        .stderr(Stdio::null());
+    configure_process_group(&mut command, hide_window);
+    let _ = command.status().await;
     Ok(())
 }
 
 #[cfg(unix)]
-async fn cleanup_shell_process_tree_after_parent_exit(pid: u32) -> Result<(), ToolError> {
-    kill_process_tree(pid).await
+async fn cleanup_shell_process_tree_after_parent_exit(
+    pid: u32,
+    _hide_window: bool,
+) -> Result<(), ToolError> {
+    kill_process_tree(pid, false).await
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn cleanup_shell_process_tree_after_parent_exit(_pid: u32) -> Result<(), ToolError> {
+async fn cleanup_shell_process_tree_after_parent_exit(
+    _pid: u32,
+    _hide_window: bool,
+) -> Result<(), ToolError> {
     Ok(())
 }
 
 async fn terminate_shell_child(
     child: &mut tokio::process::Child,
     pid: u32,
+    hide_window: bool,
 ) -> Result<ExitStatus, ToolError> {
     for step in shell_timeout_termination_plan() {
         match step {
             ShellTerminationStep::ProcessTreeKill => {
-                kill_process_tree(pid).await?;
+                kill_process_tree(pid, hide_window).await?;
             }
             ShellTerminationStep::ParentStartKill => {
                 let _ = child.start_kill();
@@ -998,7 +1018,7 @@ async fn terminate_shell_child(
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn kill_process_tree(_pid: u32) -> Result<(), ToolError> {
+async fn kill_process_tree(_pid: u32, _hide_window: bool) -> Result<(), ToolError> {
     Ok(())
 }
 

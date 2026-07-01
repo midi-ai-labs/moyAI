@@ -54,7 +54,7 @@ const eventContext: ActionContext = {
 
 void refresh();
 window.setInterval(() => {
-  if (currentState?.async_polling_required && !shouldDeferAutoRefresh()) {
+  if (currentState?.async_polling_required && shouldAutoRefresh(currentState)) {
     void refresh();
   }
 }, 600);
@@ -82,6 +82,7 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
     currentState = await command<DesktopWebState>(name, args);
     reconcileUiLocalState(previous, currentState, name);
     render(currentState);
+    scheduleNavigationRefresh(currentState);
   } catch (error) {
     renderError(String(error));
   }
@@ -269,6 +270,21 @@ function restoreThreadPosition(thread: HTMLElement, scrollTop: number): void {
     thread.scrollTop = Math.min(scrollTop, Math.max(0, thread.scrollHeight - thread.clientHeight));
   };
   requestAnimationFrame(scroll);
+}
+
+function shouldAutoRefresh(state: DesktopWebState): boolean {
+  return state.navigation_loading || !shouldDeferAutoRefresh();
+}
+
+function scheduleNavigationRefresh(state: DesktopWebState): void {
+  if (!state.async_polling_required || !state.navigation_loading) {
+    return;
+  }
+  window.setTimeout(() => {
+    if (currentState?.async_polling_required && currentState.navigation_loading) {
+      void refresh();
+    }
+  }, 80);
 }
 
 function shouldDeferAutoRefresh(): boolean {
