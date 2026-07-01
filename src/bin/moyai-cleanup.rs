@@ -5,6 +5,23 @@ use camino::{Utf8Path, Utf8PathBuf};
 use directories_next::ProjectDirs;
 
 fn main() -> ExitCode {
+    match cleanup_command(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        Ok(CleanupCommand::Help) => {
+            println!("{}", cleanup_help());
+            return ExitCode::SUCCESS;
+        }
+        Ok(CleanupCommand::Version) => {
+            println!("moyai-cleanup {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Ok(CleanupCommand::Clean) => {}
+        Err(message) => {
+            eprintln!("{message}");
+            eprintln!("{}", cleanup_help());
+            return ExitCode::from(2);
+        }
+    }
+
     match run() {
         Ok(message) => {
             println!("{message}");
@@ -15,6 +32,30 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupCommand {
+    Clean,
+    Help,
+    Version,
+}
+
+fn cleanup_command(args: &[String]) -> Result<CleanupCommand, String> {
+    if args.is_empty() {
+        return Ok(CleanupCommand::Clean);
+    }
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return Ok(CleanupCommand::Help);
+    }
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        return Ok(CleanupCommand::Version);
+    }
+    Err(format!("unexpected argument `{}`", args[0]))
+}
+
+fn cleanup_help() -> &'static str {
+    "Usage: moyai-cleanup\n\nRemoves moyAI AppData config, data, and cache directories.\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version"
 }
 
 fn run() -> Result<String, String> {
@@ -147,5 +188,25 @@ mod tests {
         let report = cleanup_report(&removed, &[]);
         assert!(report.contains("removed"));
         assert!(report.contains("midi-ai-labs/moyai"));
+    }
+
+    #[test]
+    fn help_and_version_args_do_not_clean() {
+        assert_eq!(
+            cleanup_command(&["--help".to_string()]),
+            Ok(CleanupCommand::Help)
+        );
+        assert_eq!(
+            cleanup_command(&["-V".to_string()]),
+            Ok(CleanupCommand::Version)
+        );
+    }
+
+    #[test]
+    fn unknown_args_fail_before_cleanup() {
+        assert_eq!(
+            cleanup_command(&["--not-a-real-option".to_string()]),
+            Err("unexpected argument `--not-a-real-option`".to_string())
+        );
     }
 }
