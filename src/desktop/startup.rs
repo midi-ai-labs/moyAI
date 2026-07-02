@@ -278,6 +278,10 @@ impl DesktopStartupState {
         self.recompute();
     }
 
+    pub fn requires_initial_setup(&self) -> bool {
+        self.config_requires_attention
+    }
+
     fn set_provider_check(&mut self, check: DesktopStartupCheck) {
         self.set_check(check);
     }

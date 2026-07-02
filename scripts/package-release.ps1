@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "0.6.0",
+  [string]$Version = "0.6.1",
   [string]$Target = "windows-x86_64",
   [string]$OutputRoot = "",
   [switch]$SkipBuild

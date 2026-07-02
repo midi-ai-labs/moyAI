@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.0"><img alt="Release" src="https://img.shields.io/badge/release-v0.6.0-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.1"><img alt="Release" src="https://img.shields.io/badge/release-v0.6.1-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.ja.md">日本語 README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.0">Download release</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.1">Download release</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -72,7 +72,7 @@ moyAI is designed around those constraints:
 
 The current beta release is available here:
 
-[**moyAI v0.6.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.0)
+[**moyAI v0.6.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.1)
 
 The Windows release zip includes:
 
@@ -117,7 +117,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.6.0
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.6.1
 ```
 
 By default, release artifacts are written outside the repository under `project_sandbox/releases/`.

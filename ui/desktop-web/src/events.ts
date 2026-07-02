@@ -495,10 +495,7 @@ async function dispatchAction(action: string, index: number, value: string, stat
 }
 
 function startupSetupRequired(state: DesktopWebState): boolean {
-  return (
-    (state.startup.status === "requires_config" || state.startup.status === "requires_provider") &&
-    state.startup.action_overlay === state.overlay
-  );
+  return state.startup.initial_setup_required && state.startup.action_overlay === state.overlay;
 }
 
 function confirmLocalDelete(context: ActionContext): void {

@@ -81,6 +81,7 @@ export interface StartupProjection {
   message: string;
   detail: string;
   action_overlay: string;
+  initial_setup_required: boolean;
   checks: StartupCheckProjection[];
 }
 

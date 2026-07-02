@@ -1057,11 +1057,7 @@ impl DesktopState {
     }
 
     fn startup_requires_overlay(&self, overlay: DesktopOverlay) -> bool {
-        matches!(
-            self.startup.status,
-            super::startup::DesktopStartupStatus::RequiresConfig
-                | super::startup::DesktopStartupStatus::RequiresProvider
-        ) && self.startup.action_overlay == Some(overlay)
+        self.startup.requires_initial_setup() && self.startup.action_overlay == Some(overlay)
     }
 
     pub fn set_config_selection(&mut self, index: usize) {
@@ -1748,6 +1744,50 @@ mod tests {
         );
         assert_eq!(state.view.overlay, DesktopOverlay::None);
         assert!(!state.view.startup_overlay_forced);
+    }
+
+    #[test]
+    fn configured_provider_startup_overlay_can_be_closed() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = "http://127.0.0.1:1234".to_string();
+        config.model.model = "qwen/qwen3.6-35b-a3b".to_string();
+        config.docling.enabled = false;
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), config);
+
+        state.begin_startup(true, None, camino::Utf8Path::new("C:/workspace"));
+        state.fail_startup_provider_model_load("provider failed");
+
+        assert_eq!(state.view.overlay, DesktopOverlay::ProviderEditor);
+        assert!(!state.startup.requires_initial_setup());
+
+        state.hide_overlay();
+
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
+        assert!(!state.view.startup_overlay_forced);
+    }
+
+    #[test]
+    fn missing_config_startup_overlay_remains_blocking() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = "http://127.0.0.1:1234".to_string();
+        config.model.model = "qwen/qwen3.6-35b-a3b".to_string();
+        config.docling.enabled = false;
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
+
+        state.begin_startup(false, None, camino::Utf8Path::new("C:/workspace"));
+        state.finish_startup_provider_model_load(&passing_model_report(&config));
+
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::RequiresConfig
+        );
+        assert_eq!(state.view.overlay, DesktopOverlay::ConfigEditor);
+        assert!(state.startup.requires_initial_setup());
+
+        state.hide_overlay();
+
+        assert_eq!(state.view.overlay, DesktopOverlay::ConfigEditor);
+        assert!(state.view.startup_overlay_forced);
     }
 
     #[test]

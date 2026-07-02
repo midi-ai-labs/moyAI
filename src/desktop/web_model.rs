@@ -34,6 +34,7 @@ pub struct DesktopStartupProjection {
     pub message: String,
     pub detail: String,
     pub action_overlay: String,
+    pub initial_setup_required: bool,
     pub checks: Vec<DesktopStartupCheckProjection>,
 }
 
@@ -330,6 +331,7 @@ fn startup_projection(state: &DesktopState) -> DesktopStartupProjection {
             .map(overlay_key)
             .unwrap_or("none")
             .to_string(),
+        initial_setup_required: state.startup.requires_initial_setup(),
         checks: state
             .startup
             .checks

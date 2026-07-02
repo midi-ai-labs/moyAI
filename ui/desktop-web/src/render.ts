@@ -990,10 +990,7 @@ function renderEnvBadge(field: ConfigFieldProjection): string {
 }
 
 function startupSetupRequired(state: DesktopWebState): boolean {
-  return (
-    (state.startup.status === "requires_config" || state.startup.status === "requires_provider") &&
-    state.startup.action_overlay === state.overlay
-  );
+  return state.startup.initial_setup_required && state.startup.action_overlay === state.overlay;
 }
 
 function renderWorkspaceOverlay(state: DesktopWebState): string {

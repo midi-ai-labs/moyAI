@@ -1575,40 +1575,41 @@ mod tests {
 
     #[tokio::test]
     async fn provider_model_infos_can_load_from_lmstudio_native_when_v1_models_is_missing() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        use std::thread;
-        use std::time::{Duration, Instant};
+        use axum::{Json, Router, http::StatusCode, routing::get};
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let app = Router::new()
+            .route(
+                "/api/v1/models",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "models": [
+                            {
+                                "key": "native-model",
+                                "type": "llm",
+                                "display_name": "Native Model",
+                                "context_length": 32768,
+                                "max_prediction_tokens": 4096,
+                                "capabilities": {
+                                    "trained_for_tool_use": true,
+                                    "reasoning": true
+                                }
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .fallback(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "not found"})),
+                )
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("addr");
-        listener.set_nonblocking(true).expect("nonblocking");
-        let server = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut handled = 0;
-            while handled < 4 && Instant::now() < deadline {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                };
-                handled += 1;
-                let mut buf = [0_u8; 2048];
-                let read = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..read]);
-                let (status, body) = if request.starts_with("GET /api/v1/models ") {
-                    (
-                        "200 OK",
-                        r#"{"models":[{"key":"native-model","type":"llm","display_name":"Native Model","context_length":32768,"max_prediction_tokens":4096,"capabilities":{"trained_for_tool_use":true,"reasoning":true}}]}"#,
-                    )
-                } else {
-                    ("404 Not Found", r#"{"error":"not found"}"#)
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-            }
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
         });
 
         let mut config = ResolvedConfig::default();
@@ -1625,7 +1626,7 @@ mod tests {
         assert_eq!(models[0].supports_tools, Some(true));
         assert_eq!(models[0].supports_reasoning, Some(true));
 
-        server.join().expect("server");
+        server.abort();
     }
 
     #[test]
