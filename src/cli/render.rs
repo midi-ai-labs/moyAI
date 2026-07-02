@@ -834,7 +834,7 @@ pub fn cli_history_renderer_uses_canonical_transcript_projection_fixture_passes(
             }],
         },
     };
-    let projected = transcript_for_history_render(&session, &[later, earlier], true);
+    let projected = transcript_for_history_render(&session, &[earlier, later], true);
     projected
         .messages
         .first()

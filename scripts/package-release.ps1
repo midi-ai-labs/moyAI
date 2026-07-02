@@ -1,7 +1,9 @@
 param(
-  [string]$Version = "0.6.1",
+  [string]$Version = "0.6.2",
   [string]$Target = "windows-x86_64",
   [string]$OutputRoot = "",
+  [string]$ManualGuiStResultsPath = "",
+  [switch]$SkipManualGuiStGate,
   [switch]$SkipBuild
 )
 
@@ -29,6 +31,27 @@ function Copy-RequiredFile([string]$Source, [string]$Destination) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
   }
   Copy-Item -LiteralPath $Source -Destination $Destination -Force
+}
+
+function Get-CargoPackageVersion {
+  $insidePackage = $false
+  foreach ($line in Get-Content -LiteralPath "Cargo.toml" -Encoding UTF8) {
+    $trimmed = $line.Trim()
+    if ($trimmed -eq "[package]") {
+      $insidePackage = $true
+      continue
+    }
+    if ($insidePackage -and $trimmed.StartsWith("[") -and $trimmed.EndsWith("]")) {
+      break
+    }
+    if ($insidePackage -and $trimmed.StartsWith("version")) {
+      $parts = $trimmed.Split("=", 2)
+      if ($parts.Length -eq 2) {
+        return $parts[1].Trim().Trim('"')
+      }
+    }
+  }
+  throw "Cargo.toml package version was not found"
 }
 
 function Get-RelativePathForRelease([string]$BasePath, [string]$FullPath) {
@@ -76,9 +99,9 @@ $zipShaPath = Assert-ReleaseOutputPath $OutputRoot "$zipPath.sha256" "release ch
 
 Push-Location $repoRoot
 try {
-  $cargoVersionLine = Select-String -LiteralPath "Cargo.toml" -Pattern '^\s*version\s*=\s*"(.+)"' | Select-Object -First 1
-  if ($cargoVersionLine.Matches[0].Groups[1].Value -ne $Version) {
-    throw "Cargo.toml version is $($cargoVersionLine.Matches[0].Groups[1].Value), expected $Version"
+  $cargoVersion = Get-CargoPackageVersion
+  if ($cargoVersion -ne $Version) {
+    throw "Cargo.toml version is $cargoVersion, expected $Version"
   }
 
   $tauriConfig = Get-Content -Raw -Encoding UTF8 "tauri.conf.json" | ConvertFrom-Json
@@ -89,6 +112,23 @@ try {
   $packageJson = Get-Content -Raw -Encoding UTF8 "package.json" | ConvertFrom-Json
   if ($packageJson.version -ne $Version) {
     throw "package.json version is $($packageJson.version), expected $Version"
+  }
+
+  $manualGuiStResultsResolved = $null
+  if ($SkipManualGuiStGate) {
+    Write-Warning "Skipping GUI manual ST release gate. Do not use this for published releases."
+  } else {
+    if ([string]::IsNullOrWhiteSpace($ManualGuiStResultsPath)) {
+      throw "GUI manual ST release gate requires -ManualGuiStResultsPath pointing to a UTF-8 results file containing 'Manual ST Gate: PASS'."
+    }
+    $manualGuiStResultsResolved = (Resolve-Path -LiteralPath $ManualGuiStResultsPath).Path
+    if (-not (Test-Path -LiteralPath $manualGuiStResultsResolved -PathType Leaf)) {
+      throw "GUI manual ST results file not found: $manualGuiStResultsResolved"
+    }
+    $manualGuiStResultsContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $manualGuiStResultsResolved
+    if (-not $manualGuiStResultsContent.Contains("Manual ST Gate: PASS")) {
+      throw "GUI manual ST results file must contain 'Manual ST Gate: PASS': $manualGuiStResultsResolved"
+    }
   }
 
   if (-not $SkipBuild) {
@@ -126,6 +166,9 @@ try {
   Copy-RequiredFile (Join-Path $repoRoot "README.ja.md") (Join-Path $releaseRoot "README.ja.md")
   Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $releaseRoot "LICENSE")
   Copy-RequiredFile (Join-Path $repoRoot "docs\user\getting-started.md") (Join-Path $releaseRoot "docs\user\getting-started.md")
+  if ($manualGuiStResultsResolved) {
+    Copy-RequiredFile $manualGuiStResultsResolved (Join-Path $releaseRoot "docs\release\manual-gui-st-results.md")
+  }
   $desktopDistDestination = Join-Path $releaseRoot "ui\desktop-web\dist"
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $desktopDistDestination) | Out-Null
   Copy-Item -LiteralPath $desktopDist -Destination $desktopDistDestination -Recurse -Force
@@ -176,6 +219,8 @@ This release module contains the Windows CLI and Tauri Desktop binaries.
 - Desktop token meter showing approximate `used / max` context tokens, including session reopen restoration from recorded diagnostics.
 - Desktop UX hardening for quick chat, live access-mode changes, hidden shell windows, composer autosize, and window controls.
 - Vision attachment path verified through Desktop GUI with provider request diagnostics recording `image_count`.
+- v0.6.2 fixes canonical cross-turn history ordering for transcript projection and Markdown export.
+- Published release packages are gated by a visible Desktop GUI manual ST results artifact.
 
 ## Quick Start
 
@@ -221,6 +266,13 @@ To reset moyAI to its first-run state, close all moyAI windows and run `bin/moya
       zip = $zipPath
       zip_sha256 = $zipHash
       zip_sha256_file = $zipShaPath
+    }
+    gates = [ordered]@{
+      manual_gui_st = [ordered]@{
+        required = -not $SkipManualGuiStGate
+        results_file = if ($manualGuiStResultsResolved) { $manualGuiStResultsResolved } else { $null }
+        package_copy = if ($manualGuiStResultsResolved) { "docs/release/manual-gui-st-results.md" } else { $null }
+      }
     }
   }
   Write-Utf8File $manifestPath ($manifest | ConvertTo-Json -Depth 8)

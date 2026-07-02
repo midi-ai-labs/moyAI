@@ -248,10 +248,13 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
     ) -> Result<Vec<HistoryItem>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, turn_id, sequence_no, payload_json, created_at_ms
-             FROM protocol_history_items
-             WHERE session_id = ?1
-             ORDER BY rowid ASC",
+            "SELECT history.id, history.turn_id, history.sequence_no, history.payload_json, history.created_at_ms
+             FROM protocol_history_items AS history
+             LEFT JOIN protocol_item_append_order AS append_order
+               ON append_order.source_kind = 'history_item'
+              AND append_order.source_id = history.id
+             WHERE history.session_id = ?1
+             ORDER BY COALESCE(append_order.append_position, history.rowid) ASC",
         )?;
         let rows = statement.query_map(params![session_id.to_string()], |row| {
             Ok((
@@ -830,4 +833,60 @@ where
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::protocol::ContentPart;
+
+    #[test]
+    fn list_history_items_for_session_uses_append_order_across_turns() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = SessionId::new();
+        let older = history_message(session_id, TurnId::new(), 29, 100, "older-stage");
+        let newer = history_message(session_id, TurnId::new(), 15, 200, "newer-stage");
+
+        store.append_history_item(&older).expect("older insert");
+        store.append_history_item(&newer).expect("newer insert");
+
+        let listed = store
+            .list_history_items_for_session(session_id)
+            .expect("history list");
+        assert_eq!(
+            listed.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![older.id, newer.id]
+        );
+    }
+
+    fn history_message(
+        session_id: SessionId,
+        turn_id: TurnId,
+        sequence_no: i64,
+        created_at_ms: i64,
+        text: &str,
+    ) -> HistoryItem {
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no,
+            created_at_ms,
+            payload: HistoryItemPayload::Message {
+                message_id: None,
+                role: crate::session::MessageRole::User,
+                content: vec![ContentPart::Text {
+                    text: text.to_string(),
+                }],
+            },
+        }
+    }
+}

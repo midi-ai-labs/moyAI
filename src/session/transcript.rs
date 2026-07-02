@@ -34,52 +34,48 @@ pub fn latest_context_window_from_transcript(
 }
 
 pub fn transcript_from_history_items(session: &SessionRecord, items: &[HistoryItem]) -> Transcript {
-    let mut ordered = items.iter().enumerate().collect::<Vec<_>>();
-    ordered.sort_by_key(|(index, item)| (item.sequence_no, item.created_at_ms, *index));
-    let messages = ordered
-        .iter()
-        .filter_map(|(_, item)| {
-            let role = history_item_role(&item.payload);
-            let message_id = MessageId::new();
-            let parts = history_item_parts(message_id, &item.payload);
-            if parts.is_empty() {
-                return None;
-            }
-            let metadata = match role {
-                MessageRole::User => MessageMetadata::User(UserMessageMeta {
-                    cwd: session.cwd.clone(),
-                    requested_model: Some(session.model.clone()),
-                    editor_context: match &item.payload {
-                        HistoryItemPayload::UserTurn { editor_context, .. }
-                        | HistoryItemPayload::PromptDispatch { editor_context, .. } => {
-                            editor_context.clone()
-                        }
-                        HistoryItemPayload::SteerTurn { .. } => None,
-                        _ => None,
-                    },
-                }),
-                MessageRole::Assistant => MessageMetadata::Assistant(AssistantMessageMeta {
-                    model: session.model.clone(),
-                    base_url: session.base_url.clone(),
-                    finish_reason: None,
-                    token_usage: None,
-                    summary: matches!(item.payload, HistoryItemPayload::Compaction { .. }),
-                }),
-            };
-            Some(TranscriptMessage {
-                record: MessageRecord {
-                    id: message_id,
-                    session_id: session.id,
-                    role,
-                    parent_message_id: None,
-                    sequence_no: item.sequence_no,
-                    created_at_ms: item.created_at_ms,
-                    metadata,
+    let mut messages = Vec::new();
+    for item in items {
+        let role = history_item_role(&item.payload);
+        let message_id = MessageId::new();
+        let parts = history_item_parts(message_id, &item.payload);
+        if parts.is_empty() {
+            continue;
+        }
+        let metadata = match role {
+            MessageRole::User => MessageMetadata::User(UserMessageMeta {
+                cwd: session.cwd.clone(),
+                requested_model: Some(session.model.clone()),
+                editor_context: match &item.payload {
+                    HistoryItemPayload::UserTurn { editor_context, .. }
+                    | HistoryItemPayload::PromptDispatch { editor_context, .. } => {
+                        editor_context.clone()
+                    }
+                    HistoryItemPayload::SteerTurn { .. } => None,
+                    _ => None,
                 },
-                parts,
-            })
-        })
-        .collect();
+            }),
+            MessageRole::Assistant => MessageMetadata::Assistant(AssistantMessageMeta {
+                model: session.model.clone(),
+                base_url: session.base_url.clone(),
+                finish_reason: None,
+                token_usage: None,
+                summary: matches!(item.payload, HistoryItemPayload::Compaction { .. }),
+            }),
+        };
+        messages.push(TranscriptMessage {
+            record: MessageRecord {
+                id: message_id,
+                session_id: session.id,
+                role,
+                parent_message_id: None,
+                sequence_no: messages.len() as i64 + 1,
+                created_at_ms: item.created_at_ms,
+                metadata,
+            },
+            parts,
+        });
+    }
     Transcript {
         session: session.clone(),
         messages,
@@ -322,6 +318,7 @@ mod tests {
     use super::*;
     use crate::config::AccessMode;
     use crate::context::ContextWindowTokenStatus;
+    use crate::protocol::{HistoryItemId, TurnId};
     use crate::session::{
         ProjectId, RequestDiagnosticsPart, SessionId, SessionModelParameters, SessionStatus,
     };
@@ -356,21 +353,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transcript_from_history_items_preserves_canonical_cross_turn_order() {
+        let session = test_session();
+        let older_turn = TurnId::new();
+        let newer_turn = TurnId::new();
+        let older = context_window_status(8_822);
+        let newer = context_window_status(12_434);
+        let transcript = transcript_from_history_items(
+            &session,
+            &[
+                history_diagnostics(&session, older_turn, 29, 100, Some(older)),
+                history_diagnostics(&session, newer_turn, 15, 200, Some(newer.clone())),
+            ],
+        );
+
+        assert_eq!(
+            latest_context_window_from_transcript(&transcript),
+            Some(newer)
+        );
+        assert_eq!(
+            transcript
+                .messages
+                .iter()
+                .map(|message| message.record.sequence_no)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
     fn transcript_with_diagnostics(diagnostics: Vec<RequestDiagnosticsPart>) -> Transcript {
-        let session = SessionRecord {
-            id: SessionId::new(),
-            project_id: ProjectId::new(),
-            title: "test".to_string(),
-            status: SessionStatus::Completed,
-            cwd: Utf8PathBuf::from("C:/workspace"),
-            model: "model".to_string(),
-            base_url: "http://local".to_string(),
-            access_mode: AccessMode::FullAccess,
-            model_parameters: SessionModelParameters::default(),
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            completed_at_ms: Some(2),
-        };
+        let session = test_session();
         let messages = diagnostics
             .into_iter()
             .enumerate()
@@ -403,6 +416,42 @@ mod tests {
             })
             .collect();
         Transcript { session, messages }
+    }
+
+    fn history_diagnostics(
+        session: &SessionRecord,
+        turn_id: TurnId,
+        sequence_no: i64,
+        created_at_ms: i64,
+        context_window: Option<ContextWindowTokenStatus>,
+    ) -> HistoryItem {
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: session.id,
+            turn_id,
+            sequence_no,
+            created_at_ms,
+            payload: HistoryItemPayload::RequestDiagnostics {
+                diagnostics: request_diagnostics(context_window),
+            },
+        }
+    }
+
+    fn test_session() -> SessionRecord {
+        SessionRecord {
+            id: SessionId::new(),
+            project_id: ProjectId::new(),
+            title: "test".to_string(),
+            status: SessionStatus::Completed,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "model".to_string(),
+            base_url: "http://local".to_string(),
+            access_mode: AccessMode::FullAccess,
+            model_parameters: SessionModelParameters::default(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            completed_at_ms: Some(2),
+        }
     }
 
     fn request_diagnostics(

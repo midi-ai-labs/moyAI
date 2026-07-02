@@ -48,9 +48,7 @@ pub fn history_items_to_markdown(
     items: &[HistoryItem],
 ) -> String {
     let mut events = Vec::new();
-    let mut ordered = items.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|item| (item.sequence_no, item.created_at_ms));
-    for item in ordered {
+    for item in items {
         match &item.payload {
             HistoryItemPayload::UserTurn { .. }
             | HistoryItemPayload::SteerTurn { .. }
@@ -983,13 +981,6 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn tooloutput_markdown_export_preserves_blocked_action() {}
-}
-
 fn push_content_parts(output: &mut String, content: &[ContentPart]) {
     for content in content {
         match content {
@@ -1181,5 +1172,79 @@ fn title_slug(title: &str) -> String {
         "session".to_string()
     } else {
         slug
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use camino::Utf8PathBuf;
+
+    use super::*;
+    use crate::config::AccessMode;
+    use crate::protocol::{ContentPart, HistoryItemId, TurnId};
+    use crate::session::{
+        ProjectId, SessionId, SessionModelParameters, SessionRecord, SessionStatus,
+    };
+
+    #[test]
+    fn tooloutput_markdown_export_preserves_blocked_action() {}
+
+    #[test]
+    fn history_markdown_preserves_canonical_cross_turn_order() {
+        let session = test_session();
+        let older = message_item(&session, TurnId::new(), 29, 100, "older-stage");
+        let newer = message_item(&session, TurnId::new(), 15, 200, "newer-stage");
+        let markdown = history_items_to_markdown(&session, &[older, newer]);
+
+        let older_position = markdown
+            .find("older-stage")
+            .expect("older item is exported");
+        let newer_position = markdown
+            .find("newer-stage")
+            .expect("newer item is exported");
+        assert!(
+            older_position < newer_position,
+            "markdown export must preserve canonical input order"
+        );
+    }
+
+    fn message_item(
+        session: &SessionRecord,
+        turn_id: TurnId,
+        sequence_no: i64,
+        created_at_ms: i64,
+        text: &str,
+    ) -> HistoryItem {
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: session.id,
+            turn_id,
+            sequence_no,
+            created_at_ms,
+            payload: HistoryItemPayload::Message {
+                message_id: None,
+                role: MessageRole::User,
+                content: vec![ContentPart::Text {
+                    text: text.to_string(),
+                }],
+            },
+        }
+    }
+
+    fn test_session() -> SessionRecord {
+        SessionRecord {
+            id: SessionId::new(),
+            project_id: ProjectId::new(),
+            title: "test".to_string(),
+            status: SessionStatus::Completed,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "model".to_string(),
+            base_url: "http://local".to_string(),
+            access_mode: AccessMode::FullAccess,
+            model_parameters: SessionModelParameters::default(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            completed_at_ms: Some(2),
+        }
     }
 }

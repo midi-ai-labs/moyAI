@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.1"><img alt="Release" src="https://img.shields.io/badge/release-v0.6.1-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.2"><img alt="Release" src="https://img.shields.io/badge/release-v0.6.2-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.md">English README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.1">release をダウンロード</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.2">release をダウンロード</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -74,7 +74,7 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 
 現在の beta release を公開しています。
 
-[**moyAI v0.6.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.1)
+[**moyAI v0.6.2 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.2)
 
 Windows 向け release zip には、次のものが含まれています。
 
@@ -119,7 +119,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.6.1
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.6.2 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 既定では、release artifact は repository の外側にある `project_sandbox/releases/` に出力されます。
@@ -226,6 +226,11 @@ cargo test --lib
 cargo test --tests
 cargo run --bin moyai -- preflight run
 ```
+
+公開する release package は、upload 前に visible Desktop GUI の manual ST を gate として通します。
+結果は `Manual ST Gate: PASS` を含む UTF-8 Markdown artifact に記録し、
+`scripts/package-release.ps1 -ManualGuiStResultsPath ...` に渡してください。この artifact は
+release zip の `docs/release/manual-gui-st-results.md` に同梱されます。
 
 ## 開発状況
 
