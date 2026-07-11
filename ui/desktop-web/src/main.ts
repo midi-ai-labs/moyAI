@@ -400,9 +400,9 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
   const preservedTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
   preservedTitlebar?.remove();
   appRoot.innerHTML = `
-    <div class="app-frame ${uiState.artifactPaneCollapsed ? "artifact-collapsed" : ""}" style="--window-opacity: ${state.window_opacity_percent / 100}" ${backgroundInert ? 'inert aria-hidden="true"' : ""}>
-      ${renderTitlebar(uiState.windowMaximized)}
-      <div class="shell">
+    <div class="app-frame ${uiState.artifactPaneCollapsed ? "artifact-collapsed" : ""}" style="--window-opacity: ${state.window_opacity_percent / 100}">
+      ${renderTitlebar(uiState.windowMaximized, backgroundInert)}
+      <div class="shell" ${backgroundInert ? 'inert aria-hidden="true"' : ""}>
         ${renderSidebar(state)}
         <main class="conversation">
           ${renderTopbar(state)}
@@ -430,6 +430,13 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
   const nextTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
   if (preservedTitlebar && nextTitlebar) {
     nextTitlebar.replaceWith(preservedTitlebar);
+    const applicationCommands = preservedTitlebar.querySelector<HTMLElement>(".titlebar-menu");
+    applicationCommands?.toggleAttribute("inert", backgroundInert);
+    if (backgroundInert) {
+      applicationCommands?.setAttribute("aria-hidden", "true");
+    } else {
+      applicationCommands?.removeAttribute("aria-hidden");
+    }
   }
   const thread = document.querySelector<HTMLElement>("#thread");
   if (thread && shouldRevealEnd) {
