@@ -106,13 +106,14 @@ function startupCheckMark(status: string): string {
   return "…";
 }
 
-export function renderTitlebar(maximized = false): string {
+export function renderTitlebar(maximized = false, applicationCommandsInert = false): string {
   const maximizeLabel = maximized ? "元のサイズに戻す" : "最大化";
+  const applicationCommandsState = applicationCommandsInert ? ' inert aria-hidden="true"' : "";
   return `
     <header class="app-titlebar">
       <div class="titlebar-left">
         <span class="app-brand" data-drag-region>moyAI</span>
-        <nav class="titlebar-menu">
+        <nav class="titlebar-menu"${applicationCommandsState}>
           <button data-action="show-file-menu" aria-label="ファイルメニュー">ファイル</button>
           <button data-action="show-edit-menu" aria-label="編集メニュー">編集</button>
           <button data-action="show-view-menu" aria-label="表示メニュー">表示</button>

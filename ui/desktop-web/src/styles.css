@@ -14,6 +14,8 @@
   --accent: #8db9ff;
   --ok: #47c36a;
   --danger: #ff6b78;
+  --titlebar-height: 34px;
+  --layer-modal: 100;
 }
 
 * {
@@ -189,7 +191,7 @@ select:focus-visible,
 
 .app-frame {
   display: grid;
-  grid-template-rows: 34px minmax(0, 1fr);
+  grid-template-rows: var(--titlebar-height) minmax(0, 1fr);
   height: 100vh;
   background: var(--bg);
 }
@@ -199,7 +201,7 @@ select:focus-visible,
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   min-width: 0;
-  height: 34px;
+  height: var(--titlebar-height);
   padding: 0 0 0 12px;
   border-bottom: 1px solid #2b2a26;
   background: #171714;
@@ -248,7 +250,7 @@ select:focus-visible,
   display: grid;
   place-items: center;
   width: 46px;
-  height: 34px;
+  height: var(--titlebar-height);
   padding: 0;
   color: #d8dde6;
 }
@@ -333,7 +335,7 @@ select:focus-visible,
 
 .menu-scrim {
   position: fixed;
-  inset: 34px 0 0;
+  inset: var(--titlebar-height) 0 0;
   z-index: 90;
   background: transparent;
 }
@@ -1679,8 +1681,8 @@ pre {
 
 .modal-backdrop {
   position: fixed;
-  inset: 0;
-  z-index: 100;
+  inset: var(--titlebar-height) 0 0;
+  z-index: var(--layer-modal);
   display: grid;
   place-items: center;
   background: rgba(0, 0, 0, 0.54);
