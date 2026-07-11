@@ -153,6 +153,14 @@ impl TuiController {
         if key.kind == KeyEventKind::Release {
             return Ok(());
         }
+        if is_stop_key(key)
+            && matches!(
+                self.state.run_status,
+                RunStatus::Running | RunStatus::Confirming
+            )
+        {
+            return self.stop_current_run().await;
+        }
         if self.state.permission.is_some() {
             return self.handle_permission_key(key);
         }
@@ -282,8 +290,7 @@ impl TuiController {
             }
             KeyCode::Enter
                 if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.state.run_status != RunStatus::Running
-                    && self.state.run_status != RunStatus::Confirming =>
+                    && ctrl_enter_available(self.state.route, self.state.run_status) =>
             {
                 if self.state.route == Route::History {
                     self.open_or_rejoin_selected_history_session().await?;
@@ -448,6 +455,31 @@ impl TuiController {
                 .map_err(|error| AppRunError::Message(error.to_string()))?;
         }
         self.state.clear_permission();
+        Ok(())
+    }
+
+    async fn stop_current_run(&mut self) -> Result<(), AppRunError> {
+        if self.state.permission.is_some() {
+            self.answer_permission(false)?;
+        }
+        let Some(session_id) = self.state.current_session_id else {
+            self.state.status_message = Some("no active session to stop".to_string());
+            return Ok(());
+        };
+        match self
+            .app
+            .session_service
+            .interrupt_running_session(session_id, "Stopped from TUI.".to_string())
+            .await
+        {
+            Ok(_) => {
+                self.state.run_status = RunStatus::Cancelled;
+                self.state.status_message = Some("stop requested for active run".to_string());
+            }
+            Err(error) => {
+                self.state.status_message = Some(format!("failed to stop active run: {error}"));
+            }
+        }
         Ok(())
     }
 
@@ -1268,9 +1300,9 @@ impl TuiController {
             return;
         }
         let help = if self.state.route == Route::Home {
-            "Ctrl+Enter=send/open  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  F9=export_md  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
+            "Ctrl+Enter=send/open/steer  Ctrl+X=stop  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  F9=export_md  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
         } else {
-            "Ctrl+Enter=send  F1=home  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  F9=export_md  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
+            "Ctrl+Enter=send/steer  Ctrl+X=stop  F1=home  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  F9=export_md  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
         };
         frame.render_widget(Clear, area);
         let block = Block::default().borders(Borders::ALL).title(help);
@@ -1753,6 +1785,7 @@ impl TuiController {
                 Line::from(""),
                 Line::from("a = allow once"),
                 Line::from("d / Esc = reject"),
+                Line::from("Ctrl+X = stop active run"),
             ]);
             frame.render_widget(
                 Paragraph::new(Text::from(lines))
@@ -1926,6 +1959,14 @@ fn build_composer() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     textarea.set_cursor_line_style(Style::default());
     textarea
+}
+
+fn is_stop_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn ctrl_enter_available(route: Route, status: RunStatus) -> bool {
+    status != RunStatus::Confirming && !(route == Route::History && status == RunStatus::Running)
 }
 
 fn textarea_value(textarea: &TextArea<'_>) -> String {
@@ -2453,4 +2494,28 @@ fn event_requires_sidebar_refresh(event: &RunEvent) -> bool {
             | RunEvent::PermissionRequested { .. }
             | RunEvent::RetryScheduled { .. }
     )
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn running_session_accepts_ctrl_enter_for_steer() {
+        assert!(ctrl_enter_available(Route::Session, RunStatus::Running));
+        assert!(!ctrl_enter_available(Route::History, RunStatus::Running));
+        assert!(!ctrl_enter_available(Route::Session, RunStatus::Confirming));
+    }
+
+    #[test]
+    fn ctrl_x_is_the_explicit_stop_key() {
+        assert!(is_stop_key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!is_stop_key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+    }
 }

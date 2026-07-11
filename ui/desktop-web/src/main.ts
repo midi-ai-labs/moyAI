@@ -1,7 +1,14 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { command } from "./api";
+import { commandConflictState } from "./command_error";
 import type { ActionContext } from "./actions";
-import { flushConfigInputMutations, flushProviderInputMutations, installGlobalKeyboardShortcuts, wireEvents } from "./events";
+import {
+  flushProviderInputMutations,
+  installGlobalKeyboardShortcuts,
+  prepareConfigMutation,
+  textMutationPending,
+  wireEvents,
+} from "./events";
 import {
   renderArtifactPane,
   renderComposer,
@@ -18,7 +25,27 @@ import {
 } from "./render";
 import type { DesktopWebState } from "./types";
 import { createUiLocalState } from "./ui_state";
+import { PointerRenderGate } from "./pointer_render_gate";
+import {
+  appliedProjectionRevision,
+  deferredProjectionCandidatePreferred,
+  projectionUpdateAccepted,
+} from "./projection_state";
+import { modalIsOpen } from "./modal_state";
+import {
+  beginPermissionDecision,
+  failPermissionDecision,
+  finishLocalDecision,
+  finishPermissionDecision,
+  permissionDecisionResponseAccepted,
+} from "./decision_state";
 import { escapeHtml, humanizeError } from "./utils";
+import {
+  configDraftAppliesTo,
+  configMutationPending,
+  reconcileConfigDraftTarget,
+} from "./config_mutation";
+import { rowMutationTargetStillMatches } from "./row_target";
 import "./styles.css";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -27,12 +54,44 @@ let currentState: DesktopWebState | null = null;
 let lastRenderedState: DesktopWebState | null = null;
 let polling = false;
 let previousSessionKey = "";
+let lastRenderedLocalConfirmationPending = false;
 let splashDismissed = false;
 let splashTimer: number | null = null;
 const splashStartedAt = performance.now();
 const SPLASH_MIN_VISIBLE_MS = 5000;
 const THREAD_END_THRESHOLD_PX = 96;
 const uiState = createUiLocalState();
+
+interface StateUpdate {
+  state: DesktopWebState;
+  render: boolean;
+  mutationName: string | null;
+  scheduleNavigation: boolean;
+  sequence: number;
+}
+
+const pointerRenderGate = new PointerRenderGate<StateUpdate>((current, candidate) =>
+  deferredProjectionCandidatePreferred(
+    current.state.projection_revision,
+    candidate.state.projection_revision,
+    current.sequence,
+    candidate.sequence,
+  ),
+);
+let compositionActive = false;
+let deferredCompositionUpdate: StateUpdate | null = null;
+let renderAfterPointerRelease = false;
+const keyboardInteractionCodes = new Set<string>();
+let deferredKeyboardUpdate: StateUpdate | null = null;
+let renderAfterKeyboardRelease = false;
+let nextStateSequence = 1;
+let lastAppliedStateSequence = 0;
+let lastAppliedProjectionRevision = "0";
+let pointerGateWatchdog: number | null = null;
+let keyboardGateWatchdog: number | null = null;
+const modalScrollReturnStack: ScrollSnapshot[][] = [];
+const modalDetailsReturnStack: DetailSnapshot[][] = [];
+const modalFocusReturnStack: Array<FocusSnapshot | null> = [];
 
 if (!app) {
   throw new Error("app root missing");
@@ -42,16 +101,21 @@ const eventContext: ActionContext = {
   desktopWindow,
   uiState,
   getCurrentState: () => currentState,
-  setCurrentState: (state: DesktopWebState) => {
-    currentState = state;
-  },
+  setCurrentState: (state: DesktopWebState) => acceptState(state, false),
   render,
   mutate,
+  recoverCommandConflict,
   renderError,
   flushProviderInputMutations: async () => flushProviderInputMutations(eventContext),
-  flushConfigInputMutations: async () => flushConfigInputMutations(eventContext),
+  prepareConfigMutation: (target) => prepareConfigMutation(eventContext, target),
+  submitPermissionDecision,
+  setWindowMaximized,
 };
 
+installPointerRenderGate();
+installKeyboardStateGate();
+installCompositionStateGate();
+installWindowMaximizedSync();
 void refresh();
 window.setInterval(() => {
   if (currentState?.async_polling_required && shouldAutoRefresh(currentState)) {
@@ -67,8 +131,7 @@ async function refresh(): Promise<void> {
   }
   polling = true;
   try {
-    currentState = await command<DesktopWebState>("desktop_state");
-    render(currentState);
+    render(await command<DesktopWebState>("desktop_state"));
   } catch (error) {
     renderError(String(error));
   } finally {
@@ -77,18 +140,205 @@ async function refresh(): Promise<void> {
 }
 
 async function mutate(name: string, args?: Record<string, unknown>): Promise<void> {
+  const invalidatesPrompt = operationInvalidatesComposerTray(name);
+  if (invalidatesPrompt) {
+    uiState.promptDraftPreservationBlocked = true;
+    uiState.promptInvalidationCommandPending = true;
+  }
   try {
-    const previous = currentState;
-    currentState = await command<DesktopWebState>(name, args);
-    reconcileUiLocalState(previous, currentState, name);
-    render(currentState);
-    scheduleNavigationRefresh(currentState);
+    const state = await command<DesktopWebState>(name, args);
+    if (invalidatesPrompt) uiState.promptInvalidationCommandPending = false;
+    acceptState(state, true, name, true);
   } catch (error) {
-    renderError(String(error));
+    if (invalidatesPrompt) {
+      uiState.promptDraftPreservationBlocked = false;
+      uiState.promptInvalidationCommandPending = false;
+    }
+    if (!recoverCommandConflict(error)) renderError(String(error));
   }
 }
 
+function recoverCommandConflict(error: unknown): boolean {
+  const state = commandConflictState(error);
+  if (!state) return false;
+  acceptState(state, true, "command_conflict");
+  return true;
+}
+
 function render(state: DesktopWebState): void {
+  acceptState(state, true);
+}
+
+function acceptState(
+  state: DesktopWebState,
+  shouldRender: boolean,
+  mutationName: string | null = null,
+  scheduleNavigation = false,
+): void {
+  const stateChangeRequiresRender = currentState !== null && requiresRenderForStateChange(currentState, state);
+  const update: StateUpdate = {
+    state,
+    render: shouldRender || stateChangeRequiresRender,
+    mutationName,
+    scheduleNavigation,
+    sequence: nextStateSequence++,
+  };
+  applyStateUpdate(update);
+}
+
+function requiresRenderForStateChange(previous: DesktopWebState, state: DesktopWebState): boolean {
+  if (
+    previous.provider_label !== state.provider_label ||
+    previous.model_label !== state.model_label ||
+    previous.access_label !== state.access_label ||
+    previous.current_session_label !== state.current_session_label ||
+    previous.selected_session_title !== state.selected_session_title ||
+    previous.status_message !== state.status_message ||
+    previous.status_detail !== state.status_detail ||
+    previous.run_status_text !== state.run_status_text ||
+    previous.run_phase !== state.run_phase ||
+    previous.run_active_step !== state.run_active_step ||
+    previous.latest_tool_summary !== state.latest_tool_summary ||
+    previous.progress_text !== state.progress_text ||
+    previous.tool_status_text !== state.tool_status_text ||
+    previous.token_meter_label !== state.token_meter_label ||
+    previous.confirmation_visible !== state.confirmation_visible ||
+    previous.confirmation_id !== state.confirmation_id ||
+    previous.async_polling_required !== state.async_polling_required ||
+    previous.provider_loading !== state.provider_loading ||
+    previous.navigation_loading !== state.navigation_loading ||
+    previous.busy !== state.busy ||
+    previous.post_run_refresh_pending !== state.post_run_refresh_pending ||
+    previous.background_mutation_pending !== state.background_mutation_pending ||
+    previous.overlay !== state.overlay ||
+    previous.startup.status !== state.startup.status ||
+    previous.run_status_key !== state.run_status_key ||
+    previous.can_submit !== state.can_submit ||
+    previous.selected_project_index !== state.selected_project_index ||
+    previous.selected_session_index !== state.selected_session_index ||
+    previous.selected_artifact_index !== state.selected_artifact_index ||
+    previous.thread_empty !== state.thread_empty ||
+    previous.turn_page_offset !== state.turn_page_offset ||
+    previous.turn_page_total !== state.turn_page_total ||
+    previous.turn_page_has_more !== state.turn_page_has_more ||
+    previous.transcript_rows.length !== state.transcript_rows.length ||
+    previous.artifact_preview_available !== state.artifact_preview_available ||
+    previous.artifact_preview_text !== state.artifact_preview_text ||
+    previous.provider_metadata_mode !== state.provider_metadata_mode ||
+    previous.provider_selected_index !== state.provider_selected_index ||
+    previous.provider_status_text !== state.provider_status_text ||
+    previous.provider_selected_model_summary.join("\u0000") !== state.provider_selected_model_summary.join("\u0000") ||
+    previous.provider_model_ids.join("\u0000") !== state.provider_model_ids.join("\u0000") ||
+    previous.provider_apply_enabled !== state.provider_apply_enabled ||
+    previous.config_target.workspacePath !== state.config_target.workspacePath ||
+    previous.config_target.sessionId !== state.config_target.sessionId ||
+    previous.config_target.configGeneration !== state.config_target.configGeneration ||
+    previous.config_feedback_text !== state.config_feedback_text ||
+    previous.review_status_text !== state.review_status_text ||
+    previous.send_enhanced_enabled !== state.send_enhanced_enabled ||
+    previous.send_raw_enabled !== state.send_raw_enabled ||
+    previous.history_export_enabled !== state.history_export_enabled ||
+    previous.enhance_enabled !== state.enhance_enabled ||
+    previous.image_input_enabled !== state.image_input_enabled
+  ) {
+    return true;
+  }
+  return (
+    keyedRowsChanged(previous.project_rows, state.project_rows, (row) => `${row.project_id}:${row.path}:${row.label}`) ||
+    keyedRowsChanged(
+      previous.session_rows,
+      state.session_rows,
+      (row) => `${row.session_id}:${row.label}:${row.status}:${row.loaded_status}:${row.archived}:${row.pending_permission_requests}:${row.pending_user_input_requests}`,
+    ) ||
+    keyedRowsChanged(
+      previous.chat_session_rows,
+      state.chat_session_rows,
+      (row) => `${row.session_id}:${row.label}:${row.status}:${row.loaded_status}:${row.archived}:${row.pending_permission_requests}:${row.pending_user_input_requests}`,
+    ) ||
+    keyedRowsChanged(previous.artifact_rows, state.artifact_rows, (row) => `${row.path}:${row.action}:${row.label}`) ||
+    keyedRowsChanged(previous.file_change_rows, state.file_change_rows, (row) => `${row.path}:${row.action}:${row.summary}`) ||
+    keyedRowsChanged(previous.provider_models, state.provider_models, (model) => model) ||
+    keyedRowsChanged(previous.config_fields, state.config_fields, (field) => `${field.key}:${field.value}:${field.env_override ?? ""}`) ||
+    keyedRowsChanged(previous.attached_images, state.attached_images, (imagePath) => imagePath)
+  );
+}
+
+function keyedRowsChanged<T>(previous: T[], state: T[], key: (value: T) => string): boolean {
+  return previous.length !== state.length || previous.some((value, index) => key(value) !== key(state[index]));
+}
+
+function preferredDeferredStateUpdate(
+  current: StateUpdate | null,
+  candidate: StateUpdate,
+): StateUpdate {
+  if (!current) return candidate;
+  return deferredProjectionCandidatePreferred(
+    current.state.projection_revision,
+    candidate.state.projection_revision,
+    current.sequence,
+    candidate.sequence,
+  )
+    ? candidate
+    : current;
+}
+
+function deferredStateUpdateStillAccepted(update: StateUpdate): boolean {
+  return projectionUpdateAccepted(
+    lastAppliedProjectionRevision,
+    update.state.projection_revision,
+    update.state === currentState,
+  );
+}
+
+function applyStateUpdate(update: StateUpdate): void {
+  if (update.sequence <= lastAppliedStateSequence) return;
+  if (
+    !projectionUpdateAccepted(
+      lastAppliedProjectionRevision,
+      update.state.projection_revision,
+      update.state === currentState,
+    )
+  ) {
+    return;
+  }
+  if (compositionActive) {
+    deferredCompositionUpdate = preferredDeferredStateUpdate(deferredCompositionUpdate, update);
+    return;
+  }
+  if (keyboardInteractionCodes.size > 0 && update.state === currentState) {
+    renderAfterKeyboardRelease ||= update.render;
+    return;
+  }
+  if (keyboardInteractionCodes.size > 0) {
+    deferredKeyboardUpdate = preferredDeferredStateUpdate(
+      deferredKeyboardUpdate,
+      { ...update, render: true },
+    );
+    return;
+  }
+  if (pointerRenderGate.active && update.state === currentState) {
+    renderAfterPointerRelease ||= update.render;
+    return;
+  }
+  if (pointerRenderGate.defer({ ...update, render: true })) {
+    return;
+  }
+  preserveUiDrafts(update.state, update.mutationName);
+  currentState = update.state;
+  lastAppliedStateSequence = update.sequence;
+  lastAppliedProjectionRevision = appliedProjectionRevision(
+    lastAppliedProjectionRevision,
+    update.state.projection_revision,
+  );
+  if (update.render) {
+    renderCommitted(update.state, update.mutationName);
+  }
+  if (update.scheduleNavigation) {
+    scheduleNavigationRefresh(update.state);
+  }
+}
+
+function renderCommitted(state: DesktopWebState, mutationName: string | null): void {
   const elapsedSplashMs = performance.now() - splashStartedAt;
   if (!splashDismissed && shouldShowSplash(state, elapsedSplashMs)) {
     appRoot.innerHTML = renderStartupSplash(state, elapsedSplashMs, SPLASH_MIN_VISIBLE_MS);
@@ -104,7 +354,27 @@ function render(state: DesktopWebState): void {
     }
   }
   const previous = lastRenderedState;
-  reconcileUiLocalState(previous, state, null);
+  reconcileUiLocalState(previous, state, mutationName);
+  const localConfirmationPending = uiState.pendingLocalConfirmation !== null;
+  const backgroundInert = modalIsOpen(state, localConfirmationPending);
+  const localConfirmationOpening = !lastRenderedLocalConfirmationPending && localConfirmationPending;
+  const localConfirmationClosing = lastRenderedLocalConfirmationPending && !localConfirmationPending;
+  const modalOpening = (previous !== null && isModalOpening(previous, state)) || localConfirmationOpening;
+  const modalClosing = (previous !== null && isModalClosing(previous, state)) || localConfirmationClosing;
+  if (modalOpening) {
+    modalScrollReturnStack.push(captureSelectorScrollSnapshots(MODAL_SCROLL_SELECTORS));
+    modalDetailsReturnStack.push(captureCurrentDetailSnapshots());
+    modalFocusReturnStack.push(captureCurrentFocusSnapshot());
+  }
+  const focusSnapshot = modalClosing
+    ? (modalFocusReturnStack.pop() ?? null)
+    : modalOpening
+      ? null
+      : captureFocusSnapshot(previous, state);
+  const scrollSnapshots = captureScrollSnapshots(previous, state);
+  if (modalClosing) scrollSnapshots.push(...(modalScrollReturnStack.pop() ?? []));
+  const detailSnapshots = captureDetailSnapshots(previous, state);
+  if (modalClosing) detailSnapshots.push(...(modalDetailsReturnStack.pop() ?? []));
   const previousThread = document.querySelector<HTMLElement>("#thread");
   const previousThreadScrollTop = previousThread?.scrollTop ?? 0;
   const previousThreadWasNearEnd = previousThread ? isThreadNearEnd(previousThread) : true;
@@ -115,19 +385,23 @@ function render(state: DesktopWebState): void {
   const contentAdvanced = state.transcript_rows.length > previousTranscriptCount || state.file_change_rows.length > previousChangeCount;
   const runCompleted = Boolean(previous?.busy && !state.busy) || isTerminalRunStatus(state.run_status_key);
   const shouldRevealEnd = sessionChanged || (previousThreadWasNearEnd && (state.busy || contentAdvanced || runCompleted));
-  const hasArtifactContext = state.artifact_rows.length > 0 || state.file_change_rows.length > 0 || state.busy;
-  if (hasArtifactContext && uiState.artifactPaneCollapsed) {
+  const previousArtifactCount = (previous?.artifact_rows.length ?? 0) + (previous?.file_change_rows.length ?? 0);
+  const artifactCount = state.artifact_rows.length + state.file_change_rows.length;
+  if (previous && artifactCount > 0 && previousArtifactCount === 0 && uiState.artifactPaneCollapsed) {
     uiState.artifactPaneCollapsed = false;
     window.localStorage.setItem("moyai.artifactPaneCollapsed", "false");
   }
   setRenderContext({
     artifactPaneCollapsed: uiState.artifactPaneCollapsed,
     attachmentTrayOpen: uiState.attachmentTrayOpen,
-    configDirty: uiState.configDirty,
+    configDirty: configDraftAppliesTo(uiState, state.config_target),
+    configMutationPending: configMutationPending(uiState),
   });
+  const preservedTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
+  preservedTitlebar?.remove();
   appRoot.innerHTML = `
-    <div class="app-frame ${uiState.artifactPaneCollapsed ? "artifact-collapsed" : ""}" style="--window-opacity: ${state.window_opacity_percent / 100}">
-      ${renderTitlebar()}
+    <div class="app-frame ${uiState.artifactPaneCollapsed ? "artifact-collapsed" : ""}" style="--window-opacity: ${state.window_opacity_percent / 100}" ${backgroundInert ? 'inert aria-hidden="true"' : ""}>
+      ${renderTitlebar(uiState.windowMaximized)}
       <div class="shell">
         ${renderSidebar(state)}
         <main class="conversation">
@@ -141,10 +415,22 @@ function render(state: DesktopWebState): void {
         ${renderArtifactPane(state)}
       </div>
     </div>
-    ${uiState.pendingLocalConfirmation ? renderLocalConfirmation(uiState.pendingLocalConfirmation) : ""}
+    ${
+      !state.confirmation_visible && uiState.pendingLocalConfirmation
+        ? renderLocalConfirmation(
+            uiState.pendingLocalConfirmation,
+            uiState.localConfirmationDecisionPending,
+            uiState.localConfirmationDecisionError,
+          )
+        : ""
+    }
     ${state.confirmation_visible ? renderConfirmation(state) : ""}
-    ${state.overlay !== "none" ? renderOverlay(state) : ""}
+    ${!state.confirmation_visible && !localConfirmationPending && state.overlay !== "none" ? renderOverlay(state) : ""}
   `;
+  const nextTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
+  if (preservedTitlebar && nextTitlebar) {
+    nextTitlebar.replaceWith(preservedTitlebar);
+  }
   const thread = document.querySelector<HTMLElement>("#thread");
   if (thread && shouldRevealEnd) {
     revealThreadEnd(thread);
@@ -152,9 +438,72 @@ function render(state: DesktopWebState): void {
     restoreThreadPosition(thread, previousThreadScrollTop);
   }
   previousSessionKey = nextSessionKey;
+  lastRenderedLocalConfirmationPending = localConfirmationPending;
   lastRenderedState = state;
+  restoreScrollSnapshots(scrollSnapshots);
+  restoreDetailSnapshots(detailSnapshots);
+  restoreFocusSnapshot(focusSnapshot);
   wireEvents(state, eventContext);
+  if (state.confirmation_visible && uiState.permissionDecisionPending && uiState.permissionDecisionAllow !== null) {
+    setPermissionDecisionPendingUi(uiState.permissionDecisionAllow);
+  } else if (state.confirmation_visible && uiState.permissionDecisionError) {
+    const status = document.querySelector<HTMLElement>(".permission-decision-status");
+    if (status) status.textContent = uiState.permissionDecisionError;
+  }
+  if (
+    modalClosing &&
+    !focusSnapshot &&
+    !state.confirmation_visible &&
+    !localConfirmationPending &&
+    state.overlay === "none"
+  ) {
+    requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#prompt")?.focus());
+  }
   focusPromptIfRequested(state);
+  if (
+    uiState.promptDraftPreservationBlocked &&
+    !uiState.promptInvalidationCommandPending &&
+    !state.navigation_loading
+  ) {
+    uiState.promptDraftPreservationBlocked = false;
+  }
+}
+
+function preserveUiDrafts(state: DesktopWebState, mutationName: string | null): void {
+  reconcileConfigDraftTarget(uiState, state.config_target);
+  const active = document.activeElement;
+  if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+    if (
+      active.id === "prompt" &&
+      !uiState.promptDraftPreservationBlocked &&
+      !operationInvalidatesComposerTray(mutationName)
+    ) {
+      state.draft_prompt = active.value;
+    }
+    if (active.id === "image-input") state.image_input = active.value;
+    if (active.id === "provider-url") state.provider_base_url = active.value;
+    if (active.id === "provider-context-window") state.provider_context_window = active.value;
+    if (active.id === "provider-max-output-tokens") state.provider_max_output_tokens = active.value;
+    if (active.id === "workspace-input") state.workspace_input = active.value;
+    if (active.id === "local-search") state.local_search_text = active.value;
+    if (active.id === "session-search") state.session_search_text = active.value;
+    if (active.id === "review-draft") state.review_draft_text = active.value;
+  }
+  if (currentState) {
+    if (textMutationPending("provider-url")) state.provider_base_url = currentState.provider_base_url;
+    if (textMutationPending("provider-context-window")) state.provider_context_window = currentState.provider_context_window;
+    if (textMutationPending("provider-max-output-tokens")) {
+      state.provider_max_output_tokens = currentState.provider_max_output_tokens;
+    }
+    if (textMutationPending("local-search")) state.local_search_text = currentState.local_search_text;
+    if (textMutationPending("session-search")) state.session_search_text = currentState.session_search_text;
+  }
+  if (configDraftAppliesTo(uiState, state.config_target) && state.overlay === "config") {
+    for (const field of state.config_fields) {
+      field.value = uiState.configDraftValues.get(field.key) ?? field.value;
+    }
+    state.config_value_text = state.config_fields[state.selected_config_index]?.value ?? state.config_value_text;
+  }
 }
 
 function shouldShowSplash(state: DesktopWebState, elapsedMs: number): boolean {
@@ -177,7 +526,6 @@ function reconcileUiLocalState(previous: DesktopWebState | null, state: DesktopW
   const nextSessionKey = state.session_rows[state.selected_session_index]?.session_id ?? state.selected_session_title;
   const previousSessionKey = previous?.session_rows[previous.selected_session_index]?.session_id ?? previous?.selected_session_title ?? "";
   const sessionChanged = previous !== null && nextSessionKey !== previousSessionKey;
-  const overlayChanged = previous !== null && previous.overlay !== state.overlay;
   const imagesCleared = state.attached_images.length === 0 && state.image_input.trim().length === 0;
 
   if (sessionChanged || operationInvalidatesComposerTray(mutationName)) {
@@ -192,11 +540,16 @@ function reconcileUiLocalState(previous: DesktopWebState | null, state: DesktopW
   if ((mutationName === "clear_images" || mutationName === "remove_image") && imagesCleared) {
     uiState.attachmentTrayOpen = false;
   }
-  if (overlayChanged && state.overlay !== "config") {
-    uiState.configDirty = false;
-  }
   if (uiState.pendingLocalConfirmation && !localConfirmationStillTargetsRow(uiState.pendingLocalConfirmation, state)) {
     uiState.pendingLocalConfirmation = null;
+    finishLocalDecision(uiState);
+  }
+  if (
+    !state.confirmation_visible
+    || (uiState.permissionDecisionPending
+      && state.confirmation_id !== uiState.permissionDecisionConfirmationId)
+  ) {
+    finishPermissionDecision(uiState);
   }
 }
 
@@ -236,17 +589,354 @@ function operationInvalidatesComposerTray(name: string | null): boolean {
   return false;
 }
 
+interface FocusSnapshot {
+  selector: string;
+  occurrence: number;
+  selectionStart: number | null;
+  selectionEnd: number | null;
+}
+
+interface ScrollSnapshot {
+  selector: string;
+  occurrence: number;
+  scrollLeft: number;
+  scrollTop: number;
+}
+
+interface DetailSnapshot {
+  key: string;
+  open: boolean;
+}
+
+const STABLE_LIST_SCROLL_SELECTORS = [".project-list", ".chat-list", ".artifact-list"];
+const MODAL_SCROLL_SELECTORS = [".modal", ".settings-content", ".settings-nav", ".select-list"];
+
+function captureFocusSnapshot(previous: DesktopWebState | null, state: DesktopWebState): FocusSnapshot | null {
+  if (!previous || previous.overlay !== state.overlay || previous.confirmation_visible !== state.confirmation_visible) {
+    return null;
+  }
+  return captureCurrentFocusSnapshot();
+}
+
+function captureCurrentFocusSnapshot(): FocusSnapshot | null {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement)) {
+    return null;
+  }
+  const selector = active.id
+    ? `#${CSS.escape(active.id)}`
+    : active.dataset.configKey
+      ? `[data-config-key="${CSS.escape(active.dataset.configKey)}"]`
+      : active.dataset.action
+        ? `[data-action="${CSS.escape(active.dataset.action)}"]`
+      : "";
+  if (!selector) return null;
+  const occurrence = Array.from(document.querySelectorAll(selector)).indexOf(active);
+  if (occurrence < 0) return null;
+  return {
+    selector,
+    occurrence,
+    selectionStart: active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement ? active.selectionStart : null,
+    selectionEnd: active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement ? active.selectionEnd : null,
+  };
+}
+
+function restoreFocusSnapshot(snapshot: FocusSnapshot | null): void {
+  if (!snapshot) return;
+  const target = document.querySelectorAll<HTMLElement>(snapshot.selector)[snapshot.occurrence];
+  if (!target || (target instanceof HTMLButtonElement && target.disabled)) return;
+  target.focus({ preventScroll: true });
+  if (
+    (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) &&
+    snapshot.selectionStart !== null &&
+    snapshot.selectionEnd !== null
+  ) {
+    target.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd);
+  }
+}
+
+function captureScrollSnapshots(previous: DesktopWebState | null, state: DesktopWebState): ScrollSnapshot[] {
+  const selectors = [...STABLE_LIST_SCROLL_SELECTORS];
+  if (previous && selectedSessionIdentity(previous) === selectedSessionIdentity(state)) selectors.push(".activity");
+  if (previous && selectedArtifactIdentity(previous) === selectedArtifactIdentity(state)) selectors.push(".preview");
+  if (previous && modalIdentity(previous) === modalIdentity(state) && modalIdentity(state) !== "none") {
+    selectors.push(...MODAL_SCROLL_SELECTORS);
+  }
+  return captureSelectorScrollSnapshots(selectors);
+}
+
+function captureSelectorScrollSnapshots(selectors: string[]): ScrollSnapshot[] {
+  const snapshots: ScrollSnapshot[] = [];
+  for (const selector of selectors) {
+    document.querySelectorAll<HTMLElement>(selector).forEach((node, occurrence) => {
+      snapshots.push({ selector, occurrence, scrollLeft: node.scrollLeft, scrollTop: node.scrollTop });
+    });
+  }
+  return snapshots;
+}
+
+function restoreScrollSnapshots(snapshots: ScrollSnapshot[]): void {
+  for (const snapshot of snapshots) {
+    const target = document.querySelectorAll<HTMLElement>(snapshot.selector)[snapshot.occurrence];
+    if (!target) continue;
+    target.scrollLeft = snapshot.scrollLeft;
+    target.scrollTop = snapshot.scrollTop;
+  }
+}
+
+function captureDetailSnapshots(previous: DesktopWebState | null, state: DesktopWebState): DetailSnapshot[] {
+  if (
+    !previous ||
+    selectedSessionIdentity(previous) !== selectedSessionIdentity(state) ||
+    modalIdentity(previous) !== modalIdentity(state)
+  ) {
+    return [];
+  }
+  return captureCurrentDetailSnapshots();
+}
+
+function captureCurrentDetailSnapshots(): DetailSnapshot[] {
+  return Array.from(document.querySelectorAll<HTMLDetailsElement>("details[data-details-key]"), (detail) => ({
+    key: detail.dataset.detailsKey ?? "",
+    open: detail.open,
+  })).filter((snapshot) => snapshot.key.length > 0);
+}
+
+function restoreDetailSnapshots(snapshots: DetailSnapshot[]): void {
+  const details = Array.from(document.querySelectorAll<HTMLDetailsElement>("details[data-details-key]"));
+  for (const snapshot of snapshots) {
+    const detail = details.find((candidate) => candidate.dataset.detailsKey === snapshot.key);
+    if (detail) detail.open = snapshot.open;
+  }
+}
+
+function selectedSessionIdentity(state: DesktopWebState): string {
+  return state.session_rows[state.selected_session_index]?.session_id ?? state.selected_session_title;
+}
+
+function selectedArtifactIdentity(state: DesktopWebState): string {
+  return state.artifact_rows[state.selected_artifact_index]?.path ?? "none";
+}
+
+function modalIdentity(state: DesktopWebState): string {
+  return state.confirmation_visible ? "permission" : state.overlay;
+}
+
+function isModalOpening(previous: DesktopWebState, state: DesktopWebState): boolean {
+  return (
+    (!previous.confirmation_visible && state.confirmation_visible) ||
+    (!state.confirmation_visible && previous.overlay === "none" && state.overlay !== "none")
+  );
+}
+
+function isModalClosing(previous: DesktopWebState, state: DesktopWebState): boolean {
+  return (
+    (previous.confirmation_visible && !state.confirmation_visible) ||
+    (!previous.confirmation_visible && previous.overlay !== "none" && state.overlay === "none")
+  );
+}
+
+function installPointerRenderGate(): void {
+  document.addEventListener(
+    "pointerdown",
+    (event) => {
+      const target = event.target;
+      if (event.button !== 0 || !(target instanceof Element)) return;
+      const directOwner = target.closest<HTMLElement>(
+        'input, textarea, select, summary, [contenteditable="true"]',
+      );
+      const action = target.closest<HTMLElement>("[data-action]");
+      const owner = directOwner ?? action;
+      if (!owner || owner.matches(":disabled")) return;
+      if (
+        !directOwner &&
+        action &&
+        target.closest("[data-modal]") &&
+        (action.classList.contains("modal-backdrop") || action.classList.contains("menu-scrim"))
+      ) {
+        return;
+      }
+      if (!pointerRenderGate.begin(event.pointerId)) return;
+      try {
+        owner.setPointerCapture(event.pointerId);
+      } catch {
+        // Some synthetic and accessibility-generated pointer events cannot be captured.
+      }
+      if (pointerGateWatchdog !== null) window.clearTimeout(pointerGateWatchdog);
+      pointerGateWatchdog = window.setTimeout(() => releasePointerRenderGate(pointerRenderGate.cancel()), 30_000);
+    },
+    true,
+  );
+  document.addEventListener(
+    "pointerup",
+    (event) => window.setTimeout(() => releasePointerRenderGate(pointerRenderGate.end(event.pointerId)), 0),
+    true,
+  );
+  document.addEventListener("pointercancel", (event) => releasePointerRenderGate(pointerRenderGate.end(event.pointerId)), true);
+  document.addEventListener(
+    "lostpointercapture",
+    (event) => window.setTimeout(() => releasePointerRenderGate(pointerRenderGate.end(event.pointerId)), 0),
+    true,
+  );
+  window.addEventListener("blur", () => releasePointerRenderGate(pointerRenderGate.cancel()));
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) releasePointerRenderGate(pointerRenderGate.cancel());
+  });
+}
+
+function installKeyboardStateGate(): void {
+  const interactiveSelector = 'button, [data-action], input, textarea, select, summary, [contenteditable="true"]';
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      if (event.isComposing || event.code === "Unidentified") return;
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const owner = target.closest<HTMLElement>(interactiveSelector);
+      if (!owner || owner.matches(":disabled")) return;
+      keyboardInteractionCodes.add(event.code);
+      if (keyboardGateWatchdog !== null) window.clearTimeout(keyboardGateWatchdog);
+      keyboardGateWatchdog = window.setTimeout(cancelKeyboardStateGate, 30_000);
+    },
+    true,
+  );
+  document.addEventListener(
+    "keyup",
+    (event) => {
+      keyboardInteractionCodes.delete(event.code);
+      if (keyboardInteractionCodes.size === 0) window.setTimeout(releaseKeyboardStateGate, 0);
+    },
+    true,
+  );
+  window.addEventListener("blur", cancelKeyboardStateGate);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) cancelKeyboardStateGate();
+  });
+}
+
+function cancelKeyboardStateGate(): void {
+  keyboardInteractionCodes.clear();
+  releaseKeyboardStateGate();
+}
+
+function releaseKeyboardStateGate(): void {
+  if (keyboardInteractionCodes.size > 0) return;
+  if (keyboardGateWatchdog !== null) {
+    window.clearTimeout(keyboardGateWatchdog);
+    keyboardGateWatchdog = null;
+  }
+  const deferred = deferredKeyboardUpdate;
+  deferredKeyboardUpdate = null;
+  const shouldRenderCurrent = renderAfterKeyboardRelease;
+  renderAfterKeyboardRelease = false;
+  if (deferred && deferredStateUpdateStillAccepted(deferred)) {
+    applyStateUpdate({ ...deferred, render: deferred.render || shouldRenderCurrent });
+  } else if (shouldRenderCurrent && currentState) {
+    acceptState(currentState, true);
+  }
+}
+
+function releasePointerRenderGate(deferred: StateUpdate | null): void {
+  if (pointerRenderGate.active) return;
+  if (pointerGateWatchdog !== null) {
+    window.clearTimeout(pointerGateWatchdog);
+    pointerGateWatchdog = null;
+  }
+  const shouldRenderCurrent = renderAfterPointerRelease;
+  renderAfterPointerRelease = false;
+  if (deferred && deferredStateUpdateStillAccepted(deferred)) {
+    applyStateUpdate({ ...deferred, render: deferred.render || shouldRenderCurrent });
+  } else if (shouldRenderCurrent && currentState) {
+    acceptState(currentState, true);
+  }
+}
+
+function installCompositionStateGate(): void {
+  document.addEventListener("compositionstart", () => {
+    compositionActive = true;
+  }, true);
+  document.addEventListener("compositionend", () => {
+    compositionActive = false;
+    const deferred = deferredCompositionUpdate;
+    deferredCompositionUpdate = null;
+    if (!deferred || !deferredStateUpdateStillAccepted(deferred)) return;
+    window.setTimeout(() => applyStateUpdate({ ...deferred, render: true }), 0);
+  }, true);
+}
+
+async function submitPermissionDecision(allow: boolean): Promise<void> {
+  const confirmationId = currentState?.confirmation_id ?? null;
+  if (confirmationId === null || !beginPermissionDecision(uiState, confirmationId, allow)) return;
+  setPermissionDecisionPendingUi(allow);
+  try {
+    const state = await command<DesktopWebState>("answer_permission", { allow, confirmationId });
+    if (!permissionDecisionResponseAccepted(confirmationId, state.confirmation_visible, state.confirmation_id)) {
+      failPermissionDecision(uiState, "決定を反映できませんでした。もう一度お試しください。");
+    } else {
+      finishPermissionDecision(uiState);
+    }
+    acceptState(state, true, "answer_permission", true);
+  } catch {
+    failPermissionDecision(uiState, "決定を反映できませんでした。もう一度お試しください。");
+    if (currentState) render(currentState);
+  }
+}
+
+function setPermissionDecisionPendingUi(allow: boolean): void {
+  const dialog = document.querySelector<HTMLElement>(".confirmation[role='alertdialog']");
+  dialog?.setAttribute("aria-busy", "true");
+  document.querySelectorAll<HTMLButtonElement>("[data-permission-action]").forEach((button) => {
+    button.disabled = true;
+  });
+  const selected = document.querySelector<HTMLButtonElement>(`[data-action="${allow ? "allow" : "deny"}"]`);
+  if (selected) selected.textContent = allow ? "許可しています…" : "拒否しています…";
+  const status = document.querySelector<HTMLElement>(".permission-decision-status");
+  if (status) {
+    status.textContent = allow ? "許可を反映しています。" : "拒否を反映しています。";
+    status.tabIndex = 0;
+    status.focus({ preventScroll: true });
+  }
+}
+
+function installWindowMaximizedSync(): void {
+  let frame: number | null = null;
+  const sync = () => {
+    if (frame !== null) window.cancelAnimationFrame(frame);
+    frame = window.requestAnimationFrame(() => {
+      frame = null;
+      void command<boolean>("is_window_maximized").then(setWindowMaximized).catch(() => undefined);
+    });
+  };
+  window.addEventListener("resize", sync);
+  sync();
+}
+
+function setWindowMaximized(maximized: boolean): void {
+  uiState.windowMaximized = maximized;
+  const button = document.querySelector<HTMLButtonElement>('[data-action="toggle-maximize-window"]');
+  if (!button) return;
+  const label = maximized ? "元のサイズに戻す" : "最大化";
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.setAttribute("aria-pressed", String(maximized));
+  button.querySelector<HTMLElement>(".maximize-icon")?.classList.toggle("restore", maximized);
+}
+
 function localConfirmationStillTargetsRow(
   confirmation: NonNullable<typeof uiState.pendingLocalConfirmation>,
   state: DesktopWebState
 ): boolean {
   if (confirmation.kind === "project") {
     const row = state.project_rows[confirmation.index];
-    return row?.label === confirmation.title && row?.path === confirmation.detail;
+    return row?.label === confirmation.title
+      && row?.path === confirmation.detail
+      && rowMutationTargetStillMatches(state, confirmation.expectedTarget, row?.project_id);
   }
   const rows = confirmation.kind === "chat_session" ? state.chat_session_rows : state.session_rows;
   const row = rows[confirmation.index];
-  return row?.label === confirmation.title && row?.session_id === confirmation.detail;
+  return row?.label === confirmation.title
+    && row?.session_id === confirmation.detail
+    && rowMutationTargetStillMatches(state, confirmation.expectedTarget, row?.session_id);
 }
 
 function isTerminalRunStatus(status: DesktopWebState["run_status_key"]): boolean {
@@ -273,7 +963,7 @@ function restoreThreadPosition(thread: HTMLElement, scrollTop: number): void {
 }
 
 function shouldAutoRefresh(state: DesktopWebState): boolean {
-  return state.navigation_loading || !shouldDeferAutoRefresh();
+  return !state.confirmation_visible && (state.navigation_loading || !shouldDeferAutoRefresh());
 }
 
 function scheduleNavigationRefresh(state: DesktopWebState): void {
@@ -288,12 +978,7 @@ function scheduleNavigationRefresh(state: DesktopWebState): void {
 }
 
 function shouldDeferAutoRefresh(): boolean {
-  const active = document.activeElement;
-  const editingText =
-    active instanceof HTMLInputElement ||
-    active instanceof HTMLTextAreaElement ||
-    active instanceof HTMLSelectElement;
-  return editingText || currentState?.overlay === "provider" || currentState?.overlay === "config";
+  return pointerRenderGate.active || compositionActive;
 }
 
 function renderError(message: string): void {

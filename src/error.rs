@@ -140,6 +140,11 @@ pub enum SessionError {
 
 #[derive(Debug, Error)]
 pub enum AgentError {
+    #[error("run admission `{admission_id}` no longer owns session {session_id}")]
+    RunSuperseded {
+        session_id: crate::session::SessionId,
+        admission_id: String,
+    },
     #[error("agent llm error: {0}")]
     Llm(#[from] LlmError),
     #[error("agent tool error: {0}")]

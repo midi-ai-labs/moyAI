@@ -41,24 +41,35 @@ typed_id!(ToolCallId);
 typed_id!(ChangeId);
 typed_id!(TodoId);
 
+fn stable_ulid(input: &str) -> Ulid {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Ulid::from_bytes(bytes)
+}
+
 impl ProjectId {
     pub fn from_stable_input(input: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(input.as_bytes());
-        let digest = hasher.finalize();
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        Self(Ulid::from_bytes(bytes))
+        Self(stable_ulid(input))
+    }
+}
+
+impl MessageId {
+    pub fn from_stable_input(input: &str) -> Self {
+        Self(stable_ulid(input))
+    }
+}
+
+impl PartId {
+    pub fn from_stable_input(input: &str) -> Self {
+        Self(stable_ulid(input))
     }
 }
 
 impl TodoId {
     pub fn from_stable_input(input: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(input.as_bytes());
-        let digest = hasher.finalize();
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        Self(Ulid::from_bytes(bytes))
+        Self(stable_ulid(input))
     }
 }

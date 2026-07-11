@@ -1,7 +1,7 @@
 use crate::protocol::TurnId;
 use crate::session::{
-    ChangeKind, LoadedSessionStatus, LoadedSessionSummary, ProjectId, SessionId, SessionStatus,
-    ToolCallId,
+    ChangeKind, LoadedSessionStatus, LoadedSessionSummary, ProjectId, SessionId, SessionMemoryMode,
+    SessionStatus, ToolCallId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +116,10 @@ pub struct DesktopSessionRow {
     pub status_kind: SessionStatus,
     pub status: String,
     pub loaded_status: LoadedSessionStatus,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub memory_mode: SessionMemoryMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,7 +134,7 @@ pub struct DesktopSessionRow {
 
 impl DesktopSessionRow {
     pub(crate) fn from_loaded_summary(summary: &LoadedSessionSummary) -> Self {
-        Self::from_parts_with_loaded(
+        let mut row = Self::from_parts_with_loaded(
             summary.session.id,
             &summary.session.title,
             summary.session.status,
@@ -139,7 +143,10 @@ impl DesktopSessionRow {
             summary.active_turn_sequence_no,
             summary.pending_permission_requests,
             summary.pending_user_input_requests,
-        )
+        );
+        row.archived = summary.archived;
+        row.memory_mode = summary.memory_mode;
+        row
     }
 
     pub(crate) fn set_title_preserving_status(&mut self, title: &str) {
@@ -149,7 +156,27 @@ impl DesktopSessionRow {
 
     pub(crate) fn set_status(&mut self, status: SessionStatus) {
         let title = self.title.clone();
+        match status {
+            SessionStatus::Running | SessionStatus::AwaitingUser => {
+                self.loaded_status = LoadedSessionStatus::Active;
+            }
+            SessionStatus::Idle | SessionStatus::Completed | SessionStatus::Cancelled => {
+                self.loaded_status = LoadedSessionStatus::Idle;
+                self.clear_active_projection();
+            }
+            SessionStatus::Failed => {
+                self.loaded_status = LoadedSessionStatus::SystemError;
+                self.clear_active_projection();
+            }
+        }
         self.apply_parts(&title, status);
+    }
+
+    fn clear_active_projection(&mut self) {
+        self.active_turn_id = None;
+        self.active_turn_sequence_no = None;
+        self.pending_permission_requests = 0;
+        self.pending_user_input_requests = 0;
     }
 
     #[cfg(test)]
@@ -182,6 +209,8 @@ impl DesktopSessionRow {
             status_kind: status,
             status: String::new(),
             loaded_status,
+            archived: false,
+            memory_mode: SessionMemoryMode::default(),
             active_turn_id,
             active_turn_sequence_no,
             pending_permission_requests,
@@ -336,8 +365,17 @@ mod tests {
     #[test]
     fn session_row_terminal_status_replaces_running_label() {
         let session_id = SessionId::new();
-        let mut row =
-            DesktopSessionRow::from_parts(session_id, "docx/xlsx要約", SessionStatus::Running);
+        let turn_id = TurnId::new();
+        let mut row = DesktopSessionRow::from_parts_with_loaded(
+            session_id,
+            "docx/xlsx要約",
+            SessionStatus::Running,
+            LoadedSessionStatus::Active,
+            Some(turn_id),
+            Some(3),
+            1,
+            2,
+        );
 
         row.set_status(SessionStatus::Completed);
 
@@ -346,6 +384,24 @@ mod tests {
             format_session_row_parts("docx/xlsx要約", SessionStatus::Completed, session_id)
         );
         assert!(!row.label.contains("[実行中]"));
+        assert_eq!(row.loaded_status, LoadedSessionStatus::Idle);
+        assert_eq!(row.active_turn_id, None);
+        assert_eq!(row.active_turn_sequence_no, None);
+        assert_eq!(row.pending_permission_requests, 0);
+        assert_eq!(row.pending_user_input_requests, 0);
+    }
+
+    #[test]
+    fn session_row_run_status_projects_loaded_capabilities_immediately() {
+        let session_id = SessionId::new();
+        let mut row = DesktopSessionRow::from_parts(session_id, "new run", SessionStatus::Idle);
+
+        row.set_status(SessionStatus::Running);
+        assert_eq!(row.loaded_status, LoadedSessionStatus::Active);
+
+        row.set_status(SessionStatus::Failed);
+        assert_eq!(row.loaded_status, LoadedSessionStatus::SystemError);
+        assert_eq!(row.active_turn_id, None);
     }
 
     #[test]

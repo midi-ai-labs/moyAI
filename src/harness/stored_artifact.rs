@@ -1,13 +1,11 @@
-use std::collections::BTreeSet;
-
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::json;
 
 use crate::error::RuntimeError;
-use crate::harness::artifact::{ArtifactKind, ArtifactManifest, ArtifactTag, hash_file};
-use crate::harness::contract::{ContractKind, ContractRecord};
+use crate::harness::artifact::ArtifactManifest;
+use crate::harness::contract::ContractRecord;
 use crate::harness::event::{HarnessEvent, HarnessEventKind, HarnessEventPayload};
-use crate::harness::{ArtifactId, ContractId, HarnessEventId, HarnessRunId};
+use crate::harness::{HarnessEventId, HarnessRunId};
 use crate::runtime::SystemClock;
 
 #[derive(Debug, Clone)]
@@ -23,9 +21,9 @@ pub fn synthesize_from_artifact_root(
     artifact_root: &Utf8Path,
     scenario_id: &str,
 ) -> Result<StoredArtifactReplaySnapshot, RuntimeError> {
-    if !artifact_root.exists() {
+    if !artifact_root.is_dir() {
         return Err(RuntimeError::Message(format!(
-            "artifact root does not exist: {artifact_root}"
+            "artifact root is not a directory: {artifact_root}"
         )));
     }
     let run_id = HarnessRunId::new();
@@ -45,46 +43,20 @@ pub fn synthesize_from_artifact_root(
         artifact_refs: Vec::new(),
         parent_event_id: None,
     }];
-    let mut artifacts = Vec::new();
-    collect_artifacts(run_id, artifact_root, artifact_root, &mut artifacts)?;
-    if artifacts.is_empty() {
-        events.push(generic_event(
-            run_id,
-            1,
-            HarnessEventKind::RunTerminalized,
-            json!({"stored_artifact_synthesized": true, "status": "blocked", "reason": "no artifacts found"}),
-        ));
-    } else {
-        events.push(generic_event(
-            run_id,
-            1,
-            HarnessEventKind::StateSnapshotRecorded,
-            json!({"stored_artifact_synthesized": true, "scenario_id": scenario_id}),
-        ));
-        events.push(generic_event(
-            run_id,
-            2,
-            HarnessEventKind::ToolExecuted,
-            json!({"stored_artifact_synthesized": true, "artifact_count": artifacts.len()}),
-        ));
-        events.push(generic_event(
-            run_id,
-            3,
-            HarnessEventKind::RunTerminalized,
-            json!({"stored_artifact_synthesized": true, "status": "recorded"}),
-        ));
-    }
-    let contracts = vec![ContractRecord {
-        id: ContractId::new(format!("scenario.{scenario_id}")),
-        kind: ContractKind::Scenario,
-        version: "stored-artifact-synthesized".to_string(),
-        source_path: Utf8PathBuf::from(format!("moyai/tests/manual_ST/{scenario_id}.md")),
-        content_sha256: "stored-artifact-synthesized".to_string(),
-        schema_ref: None,
-        model_visible_summary: Some(format!(
-            "Stored artifact synthesized scenario contract for {scenario_id}"
-        )),
-    }];
+    let artifacts = Vec::new();
+    events.push(generic_event(
+        run_id,
+        1,
+        HarnessEventKind::RunTerminalized,
+        json!({
+            "stored_artifact_import": true,
+            "status": "blocked",
+            "scenario_id": scenario_id,
+            "artifact_count": artifacts.len(),
+            "reason": "raw files do not prove state transitions, tool execution, verification, or a scenario contract"
+        }),
+    ));
+    let contracts = Vec::new();
     Ok(StoredArtifactReplaySnapshot {
         run_id,
         artifact_root: artifact_root.to_path_buf(),
@@ -113,161 +85,33 @@ fn generic_event(
     }
 }
 
-fn collect_artifacts(
-    run_id: HarnessRunId,
-    root: &Utf8Path,
-    current: &Utf8Path,
-    output: &mut Vec<ArtifactManifest>,
-) -> Result<(), RuntimeError> {
-    for entry in std::fs::read_dir(current.as_std_path())
-        .map_err(|error| RuntimeError::Message(error.to_string()))?
-    {
-        let entry = entry.map_err(|error| RuntimeError::Message(error.to_string()))?;
-        let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|_| {
-            RuntimeError::Message("stored artifact path is not valid UTF-8".to_string())
-        })?;
-        let file_type = entry
-            .file_type()
-            .map_err(|error| RuntimeError::Message(error.to_string()))?;
-        if file_type.is_dir() {
-            collect_artifacts(run_id, root, &path, output)?;
-            continue;
-        }
-        if !file_type.is_file() {
-            continue;
-        }
-        let relative = path.strip_prefix(root).map_err(|error| {
-            RuntimeError::Message(format!("failed to compute artifact relative path: {error}"))
-        })?;
-        let (sha256, size_bytes) =
-            hash_file(&path).map_err(|error| RuntimeError::Message(error.to_string()))?;
-        let mut tags = BTreeSet::new();
-        let kind = classify_artifact(relative.as_str(), &mut tags);
-        output.push(ArtifactManifest {
-            id: ArtifactId::new(),
-            run_id,
-            kind,
-            relative_path: relative.to_path_buf(),
-            sha256,
-            size_bytes,
-            tags,
-            created_by_event: None,
-            contract_refs: Vec::new(),
-        });
-    }
-    Ok(())
-}
-
-fn classify_artifact(path: &str, tags: &mut BTreeSet<ArtifactTag>) -> ArtifactKind {
-    let normalized_path = path.replace('\\', "/");
-    let file_name = normalized_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(normalized_path.as_str());
-    if file_name == "result.json" {
-        tags.insert(ArtifactTag::Replay);
-        ArtifactKind::ReplayReport
-    } else if is_request_diagnostics_artifact(&normalized_path, file_name) {
-        tags.insert(ArtifactTag::Diagnostics);
-        ArtifactKind::RequestDiagnostics
-    } else if artifact_name_has_role_token(file_name, "transcript") {
-        ArtifactKind::Transcript
-    } else if file_name.ends_with(".png")
-        || file_name.ends_with(".jpg")
-        || file_name.ends_with(".jpeg")
-    {
-        tags.insert(ArtifactTag::ImageTransport);
-        ArtifactKind::ImageAttachment
-    } else if file_name.ends_with(".log") || artifact_name_has_verification_role(file_name) {
-        tags.insert(ArtifactTag::Verification);
-        ArtifactKind::VerificationLog
-    } else {
-        tags.insert(ArtifactTag::ScenarioOutput);
-        ArtifactKind::WorkspaceFile
-    }
-}
-
-const VERIFICATION_ROLE_STEM_TOKENS: &[&str] = &[
-    "jest",
-    "pytest",
-    "unittest",
-    "verification",
-    "verify",
-    "vitest",
-];
-
-fn artifact_name_has_verification_role(file_name: &str) -> bool {
-    let stem = file_name
-        .strip_suffix(".json")
-        .or_else(|| file_name.strip_suffix(".md"))
-        .or_else(|| file_name.strip_suffix(".txt"))
-        .or_else(|| file_name.strip_suffix(".log"))
-        .unwrap_or(file_name);
-    stem.split(['.', '-', '_'])
-        .any(|part| VERIFICATION_ROLE_STEM_TOKENS.contains(&part))
-}
-
-fn is_request_diagnostics_artifact(path: &str, file_name: &str) -> bool {
-    path.split('/')
-        .any(|segment| segment == "request_diagnostics")
-        || artifact_name_has_role_token(file_name, "diagnostic")
-        || artifact_name_has_role_token(file_name, "diagnostics")
-        || file_name == "model_request.json"
-        || file_name.ends_with("_model_request.json")
-        || file_name == "request.json"
-}
-
-fn artifact_name_has_role_token(file_name: &str, token: &str) -> bool {
-    let stem = file_name
-        .strip_suffix(".json")
-        .or_else(|| file_name.strip_suffix(".md"))
-        .or_else(|| file_name.strip_suffix(".txt"))
-        .or_else(|| file_name.strip_suffix(".log"))
-        .unwrap_or(file_name);
-    stem.split(['.', '-', '_']).any(|part| part == token)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use camino::Utf8Path;
 
-    use crate::harness::{ArtifactKind, ArtifactTag};
+    use crate::harness::HarnessEventKind;
 
-    use super::classify_artifact;
-
-    #[test]
-    fn stored_artifact_classifier_does_not_treat_request_named_outputs_as_diagnostics() {
-        let mut tags = BTreeSet::new();
-        let kind = classify_artifact("workspace/request-handler.source", &mut tags);
-
-        assert_eq!(kind, ArtifactKind::WorkspaceFile);
-        assert!(tags.contains(&ArtifactTag::ScenarioOutput));
-        assert!(!tags.contains(&ArtifactTag::Diagnostics));
-    }
+    use super::synthesize_from_artifact_root;
 
     #[test]
-    fn stored_artifact_classifier_keeps_explicit_request_diagnostics() {
-        let mut tags = BTreeSet::new();
-        let kind = classify_artifact("events/000001_model_request.json", &mut tags);
+    fn arbitrary_files_do_not_synthesize_success_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("junk.txt"), "not replay evidence").expect("junk");
+        let root = Utf8Path::from_path(temp.path()).expect("utf8 root");
 
-        assert_eq!(kind, ArtifactKind::RequestDiagnostics);
-        assert!(tags.contains(&ArtifactTag::Diagnostics));
-    }
+        let snapshot = synthesize_from_artifact_root(root, "case1").expect("snapshot");
 
-    #[test]
-    fn stored_artifact_classifier_uses_generic_verification_role_stems() {
-        let mut tags = BTreeSet::new();
-        let kind = classify_artifact("verification/vitest.txt", &mut tags);
-
-        assert_eq!(kind, ArtifactKind::VerificationLog);
-        assert!(tags.contains(&ArtifactTag::Verification));
-
-        let mut non_verification_tags = BTreeSet::new();
-        let non_verification =
-            classify_artifact("workspace/test_plan.txt", &mut non_verification_tags);
-
-        assert_eq!(non_verification, ArtifactKind::WorkspaceFile);
-        assert!(non_verification_tags.contains(&ArtifactTag::ScenarioOutput));
-        assert!(!non_verification_tags.contains(&ArtifactTag::Verification));
+        assert!(snapshot.contracts.is_empty());
+        assert!(snapshot.artifacts.is_empty());
+        assert!(!snapshot.events.iter().any(|event| matches!(
+            event.kind,
+            HarnessEventKind::StateSnapshotRecorded | HarnessEventKind::ToolExecuted
+        )));
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| event.kind == HarnessEventKind::RunTerminalized)
+        );
     }
 }

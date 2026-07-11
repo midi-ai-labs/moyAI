@@ -1,3 +1,5 @@
+# Historical lab profile example, not a product default or mandatory test endpoint.
+# Copy to an isolated config and update endpoint/model values for the current run.
 [model]
 base_url = "http://127.0.0.1:1234"
 model = "qwen/qwen3.6-35b-a3b"
@@ -29,22 +31,6 @@ transcript_limit_messages = 200
 auto_resume_last = false
 max_steps_per_turn = 128
 overflow_margin_tokens = 1024
-
-[agent]
-duplicate_success_abort_threshold = 6
-repetitive_text_line_threshold = 6
-readonly_stall_threshold_implementation = 3
-readonly_stall_threshold_general = 4
-verification_repair_grace_steps = 4
-verification_failure_attempt_limit = 4
-verification_failure_repair_read_budget = 2
-staged_task_documentation_finish_grace_steps = 128
-staged_task_discovery_redirect_repeat_threshold = 2
-staged_task_authoring_read_limit = 160
-staged_task_authoring_successful_read_budget_after_progress = 3
-staged_task_audit_repair_read_budget = 3
-staged_task_audit_repair_rewrite_escalation_threshold = 2
-staged_task_recovery_stall_threshold = 3
 
 [permissions]
 access_mode = "default"

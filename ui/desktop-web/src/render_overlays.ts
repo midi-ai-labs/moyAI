@@ -1,4 +1,4 @@
-import type { DesktopWebState } from "./types";
+import type { DesktopWebState, RowMutationTarget } from "./types";
 import { escapeHtml } from "./utils";
 
 export type LocalConfirmation = {
@@ -6,6 +6,7 @@ export type LocalConfirmation = {
   index: number;
   title: string;
   detail: string;
+  expectedTarget: RowMutationTarget;
 };
 
 export function renderConfirmation(state: DesktopWebState): string {
@@ -21,25 +22,26 @@ export function renderConfirmation(state: DesktopWebState): string {
   const details = confirmation.details.length > 0 ? confirmation.details.join("\n") : "なし";
   return `
     <div class="modal-backdrop">
-      <section class="modal confirmation" role="alertdialog" aria-modal="true">
-        <h2>確認が必要です</h2>
-        <div class="confirm-summary">${escapeHtml(confirmation.summary)}</div>
+      <section class="modal confirmation" role="alertdialog" aria-modal="true" aria-labelledby="permission-title" aria-describedby="permission-summary" tabindex="-1">
+        <h2 id="permission-title">確認が必要です</h2>
+        <div class="confirm-summary" id="permission-summary">${escapeHtml(confirmation.summary)}</div>
         <div class="confirm-command" aria-label="実行内容">${escapeHtml(details)}</div>
         <dl class="confirm-details">
           <dt>対象</dt><dd>${escapeHtml(targets)}</dd>
           <dt>ワークスペース外</dt><dd>${escapeHtml(confirmation.outside_workspace ? "はい" : "いいえ")}</dd>
           <dt>リスク</dt><dd>${escapeHtml(risks)}</dd>
         </dl>
+        <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1"></div>
         <div class="modal-actions">
-          <button data-action="deny" autofocus>拒否</button>
-          <button class="send wide-send" data-action="allow">許可</button>
+          <button data-action="deny" data-permission-action autofocus>拒否</button>
+          <button class="send wide-send" data-action="allow" data-permission-action>許可</button>
         </div>
       </section>
     </div>
   `;
 }
 
-export function renderLocalConfirmation(confirm: LocalConfirmation): string {
+export function renderLocalConfirmation(confirm: LocalConfirmation, pending = false, error = ""): string {
   const archive = confirm.kind === "archive_session";
   const unarchive = confirm.kind === "unarchive_session";
   const rollback = confirm.kind === "rollback_session";
@@ -58,16 +60,17 @@ export function renderLocalConfirmation(confirm: LocalConfirmation): string {
   const historyMutation = rollback;
   return `
     <div class="modal-backdrop">
-      <section class="modal confirmation" role="alertdialog" aria-modal="true">
-        <h2>${target}を${verb}しますか？</h2>
-        <div class="confirm-summary">${escapeHtml(confirm.title)}</div>
+      <section class="modal confirmation" role="alertdialog" aria-modal="true" aria-labelledby="local-confirm-title" aria-describedby="local-confirm-summary" tabindex="-1" ${pending ? 'aria-busy="true"' : ""}>
+        <h2 id="local-confirm-title">${target}を${verb}しますか？</h2>
+        <div class="confirm-summary" id="local-confirm-summary">${escapeHtml(confirm.title)}</div>
         <dl class="confirm-details">
           <dt>対象</dt><dd>${escapeHtml(confirm.detail)}</dd>
           <dt>影響</dt><dd>${escapeHtml(consequence)}</dd>
         </dl>
+        <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1">${pending ? `${verb}を反映しています。` : escapeHtml(error)}</div>
         <div class="modal-actions">
-          <button data-action="cancel-local-confirm" autofocus>キャンセル</button>
-          <button class="${archiveStateChange ? "wide-send" : "danger-button"}" data-action="${archiveStateChange ? "confirm-local-archive-state" : historyMutation ? "confirm-local-rollback" : "confirm-local-delete"}">${verb}</button>
+          <button data-action="cancel-local-confirm" ${pending ? "disabled" : "autofocus"}>キャンセル</button>
+          <button class="${archiveStateChange ? "wide-send" : "danger-button"}" data-action="${archiveStateChange ? "confirm-local-archive-state" : historyMutation ? "confirm-local-rollback" : "confirm-local-delete"}" ${pending ? "disabled" : ""}>${pending ? `${verb}しています…` : verb}</button>
         </div>
       </section>
     </div>

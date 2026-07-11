@@ -1,25 +1,16 @@
-# case1 spec
+# case1: empty-workspace calculator
 
-## 目的
+## Purpose
 
-empty workspace から Python の CLI 電卓を生成し、file creation、test generation、verification、completion gate が end-to-end で成立することを確認する。
+empty workspace から Python CLI 電卓を生成し、file creation、test generation、verification、user-visible な完了が Desktop GUI で成立することを確認する。`case1 -> case3` を選んだ場合は先頭 scenario とし、case1 failure 後に case3 へ進まない。
 
-Route role: Required Core Route A の先頭 case。`case1` が fail した場合、同じ route の `case3` へ進まない。
+## Setup
 
-## 主に見る点
+- `project_sandbox/<task>/case1/workspace/` に empty workspace を作る。
+- config/data directory も fresh にする。
+- visible Desktop GUI から Project Chat を開始する。
 
-- empty workspace bootstrap
-- `write` / `apply_patch` / `read` / `list` の基本協調
-- `python -m unittest` による verification evidence の受理
-- `session_completed` までの clean close-out
-
-## セットアップ
-
-- fresh workspace を `project_sandbox/manual-st-<date>/case1-python-calculator/workspace` に作成する
-- current directory は上記 workspace とし、開始時点では空または agent が作成した生成物のみを含む
-- data dir は workspace と対になる fresh directory を使う
-
-## canonical user request
+## Canonical user request
 
 ```text
 current directory に Python の CLI 電卓を作成してください。
@@ -28,42 +19,33 @@ current directory に Python の CLI 電卓を作成してください。
 Python のテキスト入出力は UTF-8 前提で扱ってください。
 ```
 
-## 必須成果物
+## Requirements
 
-- `calculator.py`
-- `test_calculator.py`
+- `calculator.py` は四則演算を行う callable API と CLI entrypoint を持つ。
+- ゼロ除算と無効演算子を error として扱う。
+- `test_calculator.py` は四則演算、ゼロ除算、無効演算子を検証する。
+- workspace 外を参照・変更しない。
 
-## 機能要件
+## Required verification
 
-- `calculator.py` は四則演算を行う関数と CLI entrypoint を持つ
-- ゼロ除算と無効演算子をエラーとして扱う
-- `test_calculator.py` は四則演算、ゼロ除算、無効演算子を検証する
+```text
+python -m unittest
+```
 
-## 必須 verification
+## Pass criteria
 
-- `python -m unittest`
+- `calculator.py` と `test_calculator.py` が workspace 直下に存在する。
+- moyAI transcript に file change と successful verification が残る。
+- external `python -m unittest` も exit code 0 になる。
+- session が正常終了し、未完了を完了と報告していない。
+- workspace 外の差分がない。
 
-## 合格条件
+## Evidence
 
-- `python -m unittest` が成功する
-- `calculator.py` と `test_calculator.py` が current directory 直下に存在する
-- current directory 外を参照・変更していない
-- route-level harness-owned gate result が pass である
-- `session_completed` に到達する
+- `RESULTS.md`
+- request送信後、成果物、final state の screenshots
+- transcript Markdown export
+- external unittest log
+- generated files と workspace diff summary
 
-## 記録すべき証跡
-
-- `route_manifest.json`
-- `case_progress.json`
-- `verification_command_log.json`
-- `workspace_diff_manifest.json`
-- `run.jsonl`
-- workspace 内の生成物
-- `python -m unittest` の実行結果
-
-## failure handling
-
-- failure が出た場合は Required Core Route A の `case3` へ進まない
-- 直接原因と根本原因を切り分け、`worklog.md` と `manual-st-history.md` に記録する
-- 修正は failure class 単位で行い、必要なら `Kanban.md` も更新する
-- 修正後は fresh workspace / fresh data dir で rerun する
+failure 時は case3 へ進まず、Desktop / provider / tool / generated source / verification のどこで失敗したかを evidence から分け、task-local `RESULTS.md` に記録する。親orchestration workspaceにworklogがある場合だけ判断概要も追記する。

@@ -7,8 +7,10 @@ use crate::cli::ConfirmationPrompt;
 use crate::config::{AccessMode, ResolvedConfig};
 use crate::edit::{ChangeTracker, EditSafety, Formatter};
 use crate::error::ToolError;
+use crate::protocol::TurnId;
 use crate::runtime::LiveConfigOverrides;
-use crate::session::{SessionContext, ToolCallId};
+use crate::session::{SessionContext, SessionId, ToolCallId};
+use crate::storage::{SqliteSessionRepository, session_repo::RunAdmissionLeaseRenewalOutcome};
 use crate::storage::{StoragePaths, StoreBundle};
 use crate::tool::truncate::ToolTruncator;
 use crate::workspace::{AccessKind, Workspace};
@@ -32,8 +34,76 @@ pub struct ToolContext<'a> {
     pub live_config: Option<LiveConfigOverrides>,
     pub tool_call_id: ToolCallId,
     pub cancel: CancellationToken,
+    pub run_mutation_fence: RunMutationFence,
     pub prompt: &'a mut dyn ConfirmationPrompt,
     pub services: &'a ToolServices,
+}
+
+#[derive(Clone)]
+pub struct RunMutationFence {
+    repo: SqliteSessionRepository,
+    session_id: SessionId,
+    admission_id: String,
+    turn_id: TurnId,
+    cancel: CancellationToken,
+}
+
+impl RunMutationFence {
+    pub fn new(
+        repo: SqliteSessionRepository,
+        session_id: SessionId,
+        admission_id: String,
+        turn_id: TurnId,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            repo,
+            session_id,
+            admission_id,
+            turn_id,
+            cancel,
+        }
+    }
+
+    pub async fn assert_owned(&self) -> Result<(), ToolError> {
+        if self.cancel.is_cancelled() {
+            return Err(self.rejected_error("the run is cancelled"));
+        }
+        let outcome = match self
+            .repo
+            .renew_admitted_run_lease(self.session_id, &self.admission_id, self.turn_id)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.cancel.cancel();
+                return Err(ToolError::Storage(error));
+            }
+        };
+        if outcome != RunAdmissionLeaseRenewalOutcome::Renewed {
+            self.cancel.cancel();
+            return Err(self.rejected_error(match outcome {
+                RunAdmissionLeaseRenewalOutcome::GracefulTerminal => {
+                    "the admitted turn is already terminal"
+                }
+                RunAdmissionLeaseRenewalOutcome::SupersededOrExpired => {
+                    "the admission was superseded or its lease expired"
+                }
+                RunAdmissionLeaseRenewalOutcome::Renewed => unreachable!(),
+            }));
+        }
+        if self.cancel.is_cancelled() {
+            return Err(self.rejected_error("the run was cancelled while checking ownership"));
+        }
+        Ok(())
+    }
+
+    fn rejected_error(&self, reason: &str) -> ToolError {
+        ToolError::Message(format!(
+            "run mutation rejected for session {} admission {} turn {} because {reason}",
+            self.session_id, self.admission_id, self.turn_id
+        ))
+    }
 }
 
 impl<'a> ToolContext<'a> {
@@ -159,7 +229,41 @@ mod tests {
     use camino::Utf8PathBuf;
 
     use super::*;
+    use crate::session::{NewSession, ProjectId, ProjectRepository, SessionRepository};
+    use crate::storage::{SqliteStore, StoragePaths};
     use crate::workspace::AccessKind;
+
+    async fn fence_test_session() -> (StoreBundle, SessionId) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir: data_dir.clone(),
+        };
+        let sqlite = SqliteStore::open(&paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "test", "none")
+            .await
+            .expect("project");
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "mutation fence".to_string(),
+                cwd: data_dir,
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("session");
+        (store, session.id)
+    }
 
     fn permission(
         access: AccessKind,
@@ -200,5 +304,53 @@ mod tests {
             AccessMode::FullAccess,
             &request
         ));
+    }
+
+    #[tokio::test]
+    async fn run_mutation_fence_rejects_cancelled_and_expired_owners_before_mutation() {
+        let (store, session_id) = fence_test_session().await;
+        let repo = store.session_repo();
+        let admission_id = repo
+            .admit_session_run(session_id)
+            .await
+            .expect("admission")
+            .expect("admitted");
+        let turn_id = TurnId::new();
+        assert!(
+            repo.activate_admitted_turn(session_id, &admission_id, turn_id)
+                .await
+                .expect("activate turn")
+        );
+        let cancel = CancellationToken::new();
+        let fence = RunMutationFence::new(repo, session_id, admission_id, turn_id, cancel.clone());
+        fence.assert_owned().await.expect("fresh owner");
+        cancel.cancel();
+        let mut cancelled_mutation_ran = false;
+        if fence.assert_owned().await.is_ok() {
+            cancelled_mutation_ran = true;
+        }
+        assert!(!cancelled_mutation_ran);
+
+        let (expired_store, expired_session_id) = fence_test_session().await;
+        let expired_repo = expired_store.session_repo();
+        let expired_admission_id = expired_repo
+            .admit_session_run_at(expired_session_id, 0, 1)
+            .await
+            .expect("expired admission")
+            .expect("admitted");
+        let expired_cancel = CancellationToken::new();
+        let expired_fence = RunMutationFence::new(
+            expired_repo,
+            expired_session_id,
+            expired_admission_id,
+            TurnId::new(),
+            expired_cancel.clone(),
+        );
+        let mut expired_mutation_ran = false;
+        if expired_fence.assert_owned().await.is_ok() {
+            expired_mutation_ran = true;
+        }
+        assert!(!expired_mutation_ran);
+        assert!(expired_cancel.is_cancelled());
     }
 }

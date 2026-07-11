@@ -1,0 +1,376 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { commandConflictState } from "../src/command_error.ts";
+import {
+  beginConfigMutation,
+  configDraftAppliesTo,
+  configMutationValues,
+  finishConfigMutation,
+  reconcileConfigDraftTarget,
+  updateConfigDraftValue,
+} from "../src/config_mutation.ts";
+import { isRegularModalOverlay, modalIsOpen, nextDialogFocusIndex } from "../src/modal_state.ts";
+import {
+  configCommitEnabled,
+  navigationIsIdle,
+  quickChatDeleteAction,
+  sessionMemoryActions,
+  sessionRowCapabilities,
+  sessionRowActionAvailable,
+} from "../src/navigation_state.ts";
+import {
+  appliedProjectionRevision,
+  projectionUpdateAccepted,
+} from "../src/projection_state.ts";
+import {
+  rowMutationArgs,
+  rowMutationTargetStillMatches,
+} from "../src/row_target.ts";
+import type { DesktopWebState } from "../src/types.ts";
+
+function dirtyDraft(draftTarget = target()) {
+  return {
+    configDirty: true,
+    configDraftValues: new Map([["model.model", "draft-value"]]),
+    configDraftTarget: draftTarget,
+    configDraftRevision: 1,
+    nextConfigMutationGeneration: 1,
+    activeConfigMutationGeneration: null as number | null,
+  };
+}
+
+function target(
+  workspacePath = "C:/workspace",
+  sessionId: string | null = "session-a",
+  configGeneration = 1,
+) {
+  return { workspacePath, sessionId, configGeneration };
+}
+
+test("failed config apply retains dirty state and drafts", () => {
+  const draft = dirtyDraft();
+  const request = beginConfigMutation(draft, target());
+
+  assert.equal(finishConfigMutation(draft, request, false, target()), true);
+
+  assert.equal(draft.configDirty, true);
+  assert.deepEqual(Array.from(draft.configDraftValues), [["model.model", "draft-value"]]);
+});
+
+test("cancelled or invalid config import retains dirty state and drafts", () => {
+  const cancelled = dirtyDraft();
+  const invalid = dirtyDraft(target("C:/provider"));
+  const cancelledRequest = beginConfigMutation(cancelled, target());
+  const invalidRequest = beginConfigMutation(invalid, target("C:/provider"));
+
+  finishConfigMutation(cancelled, cancelledRequest, false, target());
+  finishConfigMutation(invalid, invalidRequest, false, target("C:/provider"));
+
+  assert.equal(cancelled.configDirty, true);
+  assert.equal(invalid.configDirty, true);
+  assert.equal(cancelled.configDraftValues.get("model.model"), "draft-value");
+  assert.equal(invalid.configDraftValues.get("model.model"), "draft-value");
+});
+
+test("successful config apply, save, or import clears dirty state and drafts", () => {
+  for (const operation of ["apply", "save", "import"]) {
+    const draft = dirtyDraft();
+    const request = beginConfigMutation(draft, target());
+
+    finishConfigMutation(draft, request, true, target());
+
+    assert.equal(draft.configDirty, false, operation);
+    assert.equal(draft.configDraftValues.size, 0, operation);
+  }
+});
+
+test("config mutation accepts only the latest generation and preserves newer drafts", () => {
+  const draft = dirtyDraft();
+  const stale = beginConfigMutation(draft, target());
+  const latest = beginConfigMutation(draft, target());
+
+  assert.equal(finishConfigMutation(draft, stale, true, target()), false);
+  assert.equal(draft.configDirty, true);
+
+  updateConfigDraftValue(
+    draft,
+    target(),
+    [{ key: "model.model", text: "draft-value" }],
+    "model.model",
+    "newer-value",
+  );
+  assert.equal(finishConfigMutation(draft, latest, true, target()), true);
+  assert.equal(draft.configDirty, true);
+  assert.equal(draft.configDraftValues.get("model.model"), "newer-value");
+});
+
+test("config mutation rejects a response after workspace, session, or generation changes", () => {
+  const draft = dirtyDraft();
+  const request = beginConfigMutation(draft, target());
+
+  assert.equal(finishConfigMutation(draft, request, true, target("C:/other")), false);
+  assert.equal(draft.configDirty, true);
+  assert.equal(draft.activeConfigMutationGeneration, null);
+
+  for (const changedTarget of [target("C:/workspace", "session-b"), target("C:/workspace", "session-a", 2)]) {
+    const nextDraft = dirtyDraft();
+    const nextRequest = beginConfigMutation(nextDraft, target());
+    assert.equal(finishConfigMutation(nextDraft, nextRequest, true, changedTarget), false);
+    assert.equal(nextDraft.configDirty, true);
+  }
+});
+
+test("config draft is discarded at a target barrier and cannot reappear after ABA navigation", () => {
+  const draft = dirtyDraft();
+  const targetA = target();
+  const targetB = target("C:/workspace", "session-b");
+
+  assert.equal(configDraftAppliesTo(draft, targetA), true);
+  assert.equal(reconcileConfigDraftTarget(draft, targetB), false);
+  assert.equal(draft.configDirty, false);
+  assert.equal(draft.configDraftValues.size, 0);
+  assert.equal(draft.configDraftTarget, null);
+
+  assert.equal(reconcileConfigDraftTarget(draft, targetA), true);
+  assert.equal(configDraftAppliesTo(draft, targetA), false, "the abandoned A draft must not return");
+});
+
+test("config mutation admission drops a draft owned by another target", () => {
+  const draft = dirtyDraft();
+  const nextTarget = target("C:/workspace", "session-b", 2);
+
+  const request = beginConfigMutation(draft, nextTarget);
+
+  assert.deepEqual(request.target, nextTarget);
+  assert.equal(draft.configDirty, false);
+  assert.equal(draft.configDraftValues.size, 0);
+  assert.equal(draft.configDraftTarget, null);
+});
+
+test("config draft edit binds to its creation target and same-target failures retain it", () => {
+  const draft = dirtyDraft();
+  const current = target("C:/workspace", "session-a", 2);
+
+  reconcileConfigDraftTarget(draft, current);
+  updateConfigDraftValue(
+    draft,
+    current,
+    [{ key: "model.model", text: "draft-value" }],
+    "model.model",
+    "generation-two",
+  );
+  const request = beginConfigMutation(draft, current);
+
+  assert.equal(finishConfigMutation(draft, request, false, current), true);
+  assert.equal(configDraftAppliesTo(draft, current), true);
+  assert.equal(draft.configDraftValues.get("model.model"), "generation-two");
+});
+
+test("config mutation payload survives closing settings and remains draft-owned", () => {
+  const draft = {
+    configDirty: false,
+    configDraftValues: new Map<string, string>(),
+    configDraftTarget: null,
+    configDraftRevision: 0,
+    nextConfigMutationGeneration: 1,
+    activeConfigMutationGeneration: null as number | null,
+  };
+  const current = target();
+
+  updateConfigDraftValue(
+    draft,
+    current,
+    [
+      { key: "model.model", text: "original" },
+      { key: "permissions.access_mode", text: "default" },
+    ],
+    "model.model",
+    "edited-after-close",
+  );
+
+  assert.deepEqual(configMutationValues(draft, current), [
+    { key: "model.model", text: "edited-after-close" },
+    { key: "permissions.access_mode", text: "default" },
+  ]);
+  const request = beginConfigMutation(draft, current);
+  assert.equal(finishConfigMutation(draft, request, false, current), true);
+  assert.equal(configMutationValues(draft, current)?.[0].text, "edited-after-close");
+});
+
+test("row mutation args retain stable owner and reject an index reused by another row", () => {
+  const state = rowState("session-a", ["session-a", "session-b"]);
+  const args = rowMutationArgs(state, 1, state.session_rows[1].session_id);
+  assert.ok(args);
+  assert.equal(args.expectedTarget.rowId, "session-b");
+  assert.equal(args.expectedTarget.ownerSessionId, "session-a");
+
+  state.session_rows[1].session_id = "session-c";
+  assert.equal(
+    rowMutationTargetStillMatches(state, args.expectedTarget, state.session_rows[1].session_id),
+    false,
+  );
+
+  state.session_rows[1].session_id = "session-b";
+  state.session_rows[0].session_id = "session-new-owner";
+  assert.equal(
+    rowMutationTargetStillMatches(state, args.expectedTarget, state.session_rows[1].session_id),
+    false,
+  );
+});
+
+test("row payload admission is independent from palette selected-session admission", () => {
+  const state = rowState("missing-owner", ["external-running"]);
+  Object.assign(state, {
+    busy: false,
+    background_mutation_pending: false,
+    navigation_loading: false,
+  });
+  assert.equal(
+    sessionRowActionAvailable(state.session_rows.length, state.selected_session_index, -1),
+    false,
+    "palette needs a selected session",
+  );
+  assert.equal(
+    sessionRowActionAvailable(state.session_rows.length, state.selected_session_index, 0),
+    true,
+    "the visible external row owns its own admission payload",
+  );
+  assert.equal(
+    rowMutationArgs(state, 0, state.session_rows[0].session_id)?.expectedTarget.ownerSessionId,
+    null,
+  );
+});
+
+test("session row capabilities use row state rather than the global archived-search flag", () => {
+  assert.deepEqual(sessionRowCapabilities("active", false), {
+    rejoinAction: "rejoin-session",
+    secondaryAction: "interrupt-session",
+    rollbackAction: "",
+    deleteAction: "",
+  });
+  for (const loadedStatus of ["idle", "not_loaded", "system_error"]) {
+    assert.deepEqual(sessionRowCapabilities(loadedStatus, true), {
+      rejoinAction: "",
+      secondaryAction: "unarchive-session",
+      rollbackAction: "rollback-session",
+      deleteAction: "delete-session",
+    }, loadedStatus);
+  }
+  assert.deepEqual(sessionRowCapabilities("active", true), {
+    rejoinAction: "rejoin-session",
+    secondaryAction: "unarchive-session",
+    rollbackAction: "",
+    deleteAction: "",
+  });
+  assert.equal(quickChatDeleteAction("active"), "");
+  assert.equal(quickChatDeleteAction("not_loaded"), "delete-chat-session");
+});
+
+test("session memory actions are mutually exclusive from authoritative row state", () => {
+  assert.deepEqual(sessionMemoryActions("idle", "enabled"), {
+    enable: false,
+    disable: true,
+  });
+  assert.deepEqual(sessionMemoryActions("not_loaded", "disabled"), {
+    enable: true,
+    disable: false,
+  });
+  assert.deepEqual(sessionMemoryActions("system_error", "enabled"), {
+    enable: false,
+    disable: true,
+  });
+  assert.deepEqual(sessionMemoryActions("active", "disabled"), {
+    enable: false,
+    disable: false,
+  });
+});
+
+test("settings commit requires a draft except during initial setup", () => {
+  assert.equal(configCommitEnabled(false, false, false), false);
+  assert.equal(configCommitEnabled(false, true, false), true);
+  assert.equal(configCommitEnabled(true, false, false), true);
+  assert.equal(configCommitEnabled(true, true, true), false);
+});
+
+test("typed conflict carries a refresh projection while internal and transport errors stay fatal", () => {
+  const state = rowState("session-a", ["session-a"]);
+  state.projection_revision = "8";
+  const conflict = { kind: "conflict", message: "row changed", state };
+
+  assert.equal(commandConflictState(conflict), state);
+  assert.equal(commandConflictState(JSON.stringify(conflict))?.projection_revision, "8");
+  assert.equal(commandConflictState({ kind: "internal", message: "bug", state }), null);
+  assert.equal(commandConflictState("transport closed"), null);
+});
+
+test("a repeated-click conflict wins over the earlier command response by Rust revision", () => {
+  const firstClickState = rowState("session-a", ["session-a"]);
+  firstClickState.projection_revision = "21";
+  const repeatedClickState = rowState("session-a", ["session-a"]);
+  repeatedClickState.projection_revision = "22";
+  const conflictState = commandConflictState({
+    kind: "conflict",
+    message: "row changed",
+    state: repeatedClickState,
+  });
+  assert.ok(conflictState);
+
+  let revision = "0";
+  assert.equal(projectionUpdateAccepted(revision, conflictState.projection_revision, false), true);
+  revision = appliedProjectionRevision(revision, conflictState.projection_revision);
+  assert.equal(
+    projectionUpdateAccepted(revision, firstClickState.projection_revision, false),
+    false,
+    "a delayed success from the first click cannot roll back the conflict refresh",
+  );
+});
+
+test("regular modal detection excludes menu popovers and contains focus cyclically", () => {
+  assert.equal(isRegularModalOverlay("provider"), true);
+  assert.equal(isRegularModalOverlay("shortcuts"), true);
+  assert.equal(isRegularModalOverlay("file_menu"), false);
+  assert.equal(modalIsOpen({ confirmation_visible: false, overlay: "config" }, false), true);
+  assert.equal(modalIsOpen({ confirmation_visible: false, overlay: "none" }, true), true);
+  assert.equal(modalIsOpen({ confirmation_visible: false, overlay: "none" }, false), false);
+
+  assert.equal(nextDialogFocusIndex(-1, 3, false), 0);
+  assert.equal(nextDialogFocusIndex(2, 3, false), 0);
+  assert.equal(nextDialogFocusIndex(0, 3, true), 2);
+  assert.equal(nextDialogFocusIndex(1, 3, true), 0);
+  assert.equal(nextDialogFocusIndex(-1, 0, false), -1);
+});
+
+test("navigation admission rejects run, background mutation, and active navigation", () => {
+  assert.equal(
+    navigationIsIdle({ busy: false, background_mutation_pending: false, navigation_loading: false }),
+    true,
+  );
+  assert.equal(
+    navigationIsIdle({ busy: true, background_mutation_pending: false, navigation_loading: false }),
+    false,
+  );
+  assert.equal(
+    navigationIsIdle({ busy: false, background_mutation_pending: true, navigation_loading: false }),
+    false,
+  );
+  assert.equal(
+    navigationIsIdle({ busy: false, background_mutation_pending: false, navigation_loading: true }),
+    false,
+  );
+});
+
+function rowState(ownerSessionId: string, sessionIds: string[]): DesktopWebState {
+  return {
+    workspace_path: "C:/workspace",
+    project_rows: [{ project_id: "project-a", label: "A", path: "C:/workspace" }],
+    selected_project_index: 0,
+    session_rows: sessionIds.map((sessionId) => ({
+      session_id: sessionId,
+      loaded_status: "idle",
+      archived: false,
+      memory_mode: "enabled",
+    })),
+    selected_session_index: sessionIds.indexOf(ownerSessionId),
+  } as DesktopWebState;
+}

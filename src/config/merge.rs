@@ -1,8 +1,8 @@
 use super::model::{
-    PartialAgentConfig, PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig,
-    PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig,
-    PartialModelConfig, PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig,
-    PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig, ResolvedConfig,
+    PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig, PartialInspectionConfig,
+    PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig, PartialModelConfig,
+    PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig, PartialShellConfig,
+    PartialToolOutputConfig, PartialWorkspaceConfig, ResolvedConfig,
 };
 
 fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfig) {
@@ -101,57 +101,6 @@ fn apply_session(target: &mut crate::config::SessionConfig, patch: PartialSessio
     }
     if let Some(value) = patch.overflow_margin_tokens {
         target.overflow_margin_tokens = value;
-    }
-    if let Some(value) = patch.auto_compact_enabled {
-        target.auto_compact_enabled = value;
-    }
-    if let Some(value) = patch.auto_compact_keep_recent {
-        target.auto_compact_keep_recent = value.max(1);
-    }
-}
-
-fn apply_agent(target: &mut crate::config::AgentConfig, patch: PartialAgentConfig) {
-    if let Some(value) = patch.duplicate_success_abort_threshold {
-        target.duplicate_success_abort_threshold = value;
-    }
-    if let Some(value) = patch.repetitive_text_line_threshold {
-        target.repetitive_text_line_threshold = value;
-    }
-    if let Some(value) = patch.readonly_stall_threshold_implementation {
-        target.readonly_stall_threshold_implementation = value;
-    }
-    if let Some(value) = patch.readonly_stall_threshold_general {
-        target.readonly_stall_threshold_general = value;
-    }
-    if let Some(value) = patch.verification_repair_grace_steps {
-        target.verification_repair_grace_steps = value;
-    }
-    if let Some(value) = patch.verification_failure_attempt_limit {
-        target.verification_failure_attempt_limit = value;
-    }
-    if let Some(value) = patch.verification_failure_repair_read_budget {
-        target.verification_failure_repair_read_budget = value;
-    }
-    if let Some(value) = patch.staged_task_documentation_finish_grace_steps {
-        target.staged_task_documentation_finish_grace_steps = value;
-    }
-    if let Some(value) = patch.staged_task_discovery_redirect_repeat_threshold {
-        target.staged_task_discovery_redirect_repeat_threshold = value;
-    }
-    if let Some(value) = patch.staged_task_authoring_read_limit {
-        target.staged_task_authoring_read_limit = value;
-    }
-    if let Some(value) = patch.staged_task_authoring_successful_read_budget_after_progress {
-        target.staged_task_authoring_successful_read_budget_after_progress = value;
-    }
-    if let Some(value) = patch.staged_task_audit_repair_read_budget {
-        target.staged_task_audit_repair_read_budget = value;
-    }
-    if let Some(value) = patch.staged_task_audit_repair_rewrite_escalation_threshold {
-        target.staged_task_audit_repair_rewrite_escalation_threshold = value;
-    }
-    if let Some(value) = patch.staged_task_recovery_stall_threshold {
-        target.staged_task_recovery_stall_threshold = value;
     }
 }
 
@@ -311,9 +260,6 @@ pub fn apply_patch(mut target: ResolvedConfig, patch: PartialResolvedConfig) -> 
     }
     if let Some(value) = patch.session {
         apply_session(&mut target.session, value);
-    }
-    if let Some(value) = patch.agent {
-        apply_agent(&mut target.agent, value);
     }
     if let Some(value) = patch.permissions {
         apply_permissions(&mut target.permissions, value);

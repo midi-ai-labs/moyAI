@@ -44,8 +44,8 @@ pub use projection::{
     tool_output_projection_preserves_blocked_action_fixture_passes,
 };
 pub use recording::ProtocolRecordingSink;
-pub(crate) use store::insert_event_bundle_in_transaction;
 pub use store::{ProtocolEventStore, SqliteProtocolEventStore};
+pub(crate) use store::{insert_event_bundle_in_transaction, latest_turn_position_for_session};
 
 macro_rules! protocol_id {
     ($name:ident) => {

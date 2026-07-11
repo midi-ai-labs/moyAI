@@ -1357,11 +1357,6 @@ fn parse_lmstudio_model_infos(payload: &Value) -> Vec<ProviderModelInfo> {
                             "maxTokens",
                         ],
                     )
-                })
-                .or_else(|| {
-                    loaded_instance.and_then(|loaded| {
-                        number_field_u32(loaded, &["context_length", "contextLength"])
-                    })
                 }),
             supports_images: bool_field_nested(
                 entry,
@@ -1571,6 +1566,33 @@ mod tests {
         assert_eq!(models[0].context_window, Some(131_072));
         assert_eq!(models[0].max_output_tokens, Some(8_192));
         assert!(models[0].loaded);
+    }
+
+    #[test]
+    fn lmstudio_context_without_output_limit_preserves_configured_max_output() {
+        let payload = serde_json::json!({
+            "models": [
+                {
+                    "key": "openai-compatible-fixture-model",
+                    "type": "llm",
+                    "loaded_instances": [
+                        {
+                            "context_length": 131072
+                        }
+                    ]
+                }
+            ]
+        });
+        let models = parse_lmstudio_model_infos(&payload);
+        let mut config = ResolvedConfig::default().model;
+        config.max_output_tokens = 4_096;
+
+        apply_provider_model_info_to_config(&mut config, &models[0]);
+
+        assert_eq!(models[0].context_window, Some(131_072));
+        assert_eq!(models[0].max_output_tokens, None);
+        assert_eq!(config.context_window, 131_072);
+        assert_eq!(config.max_output_tokens, 4_096);
     }
 
     #[tokio::test]

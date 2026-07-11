@@ -36,6 +36,8 @@ export interface SessionRow {
   title: string;
   status: "idle" | "running" | "completed" | "awaiting_user" | "cancelled" | "failed";
   loaded_status: "not_loaded" | "idle" | "active" | "system_error";
+  archived: boolean;
+  memory_mode: "enabled" | "disabled";
   active_turn_id?: RowId | null;
   active_turn_sequence_no?: number | null;
   pending_permission_requests: number;
@@ -91,7 +93,21 @@ export interface ConfigFieldProjection {
   env_override: string | null;
 }
 
+export interface ConfigMutationTarget {
+  workspacePath: string;
+  sessionId: string | null;
+  configGeneration: number;
+}
+
+export interface RowMutationTarget {
+  workspacePath: string;
+  ownerProjectId: string | null;
+  ownerSessionId: string | null;
+  rowId: string;
+}
+
 export interface DesktopWebState {
+  projection_revision: string;
   workspace_path: string;
   provider_label: string;
   model_label: string;
@@ -111,6 +127,7 @@ export interface DesktopWebState {
   token_meter_title: string;
   token_meter_level: "unknown" | "low" | "medium" | "high" | "critical" | string;
   confirmation_visible: boolean;
+  confirmation_id: number | null;
   confirmation_text: string;
   confirmation: PermissionProjection | null;
   startup: StartupProjection;
@@ -152,6 +169,7 @@ export interface DesktopWebState {
   provider_context_window: string;
   provider_max_output_tokens: string;
   provider_models: string[];
+  provider_model_ids: string[];
   provider_selected_index: number;
   provider_status_text: string;
   provider_selected_model_summary: string[];
@@ -163,6 +181,7 @@ export interface DesktopWebState {
   config_field_title: string;
   config_value_text: string;
   config_feedback_text: string;
+  config_target: ConfigMutationTarget;
   workspace_input: string;
   review_raw_text: string;
   review_draft_text: string;

@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::fs;
+use std::io::Read as _;
 use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
@@ -10,6 +11,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::config::model::FileGuardConfig;
 use crate::error::ToolError;
 use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
@@ -48,6 +50,79 @@ pub struct GlobTool;
 
 #[derive(Debug, Default)]
 pub struct GrepTool;
+
+const GREP_BINARY_SAMPLE_BYTES: u64 = 8 * 1024;
+const GREP_MAX_SKIP_DETAILS: usize = 64;
+const GREP_MAX_SKIP_DETAIL_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrepSkipReason {
+    BlockedExtension,
+    StructuredDocument,
+    LargeFile,
+    BinaryContent,
+}
+
+impl GrepSkipReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockedExtension => "blocked_extension",
+            Self::StructuredDocument => "structured_document",
+            Self::LargeFile => "large_file",
+            Self::BinaryContent => "binary_content",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::BlockedExtension => 0,
+            Self::StructuredDocument => 1,
+            Self::LargeFile => 2,
+            Self::BinaryContent => 3,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SkippedGrepCandidate {
+    path: Utf8PathBuf,
+    reason: GrepSkipReason,
+}
+
+#[derive(Debug, Default)]
+struct GrepSkipSummary {
+    total: usize,
+    reason_counts: [usize; 4],
+    details: Vec<SkippedGrepCandidate>,
+    detail_bytes: usize,
+}
+
+impl GrepSkipSummary {
+    fn record(&mut self, path: Utf8PathBuf, reason: GrepSkipReason) {
+        self.total = self.total.saturating_add(1);
+        self.reason_counts[reason.index()] = self.reason_counts[reason.index()].saturating_add(1);
+
+        let rendered_bytes = path
+            .as_str()
+            .len()
+            .saturating_add(reason.as_str().len())
+            .saturating_add(6);
+        if self.details.len() < GREP_MAX_SKIP_DETAILS
+            && self.detail_bytes.saturating_add(rendered_bytes) <= GREP_MAX_SKIP_DETAIL_BYTES
+        {
+            self.details.push(SkippedGrepCandidate { path, reason });
+            self.detail_bytes = self.detail_bytes.saturating_add(rendered_bytes);
+        }
+    }
+
+    fn omitted_count(&self) -> usize {
+        self.total.saturating_sub(self.details.len())
+    }
+
+    fn reason_count(&self, reason: GrepSkipReason) -> usize {
+        self.reason_counts[reason.index()]
+    }
+}
 
 #[async_trait(?Send)]
 impl Tool for ListTool {
@@ -94,7 +169,7 @@ impl Tool for ListTool {
             )));
         }
 
-        let limit = input.limit.unwrap_or(ctx.config.tool_output.max_results);
+        let limit = bounded_result_limit(input.limit, ctx.config.tool_output.max_results);
         let entries = collect_entries(
             &guarded.absolute,
             ctx.workspace,
@@ -208,7 +283,7 @@ impl Tool for GlobTool {
             glob_matches_path(&matcher, path, &guarded.absolute, &ctx.workspace.root)
         });
         matches.sort_by_key(|(_, modified)| Reverse(*modified));
-        let limit = input.limit.unwrap_or(ctx.config.tool_output.max_results);
+        let limit = bounded_result_limit(input.limit, ctx.config.tool_output.max_results);
         let lines = matches
             .iter()
             .take(limit)
@@ -303,44 +378,42 @@ impl Tool for GrepTool {
             .map_err(|error| ToolError::Message(format!("invalid regex pattern: {error}")))?;
         let include_glob = input
             .include_glob
-            .map(|value| {
-                let mut builder = GlobSetBuilder::new();
-                builder.add(Glob::new(&value).expect("validated by GlobSetBuilder"));
-                builder.build()
-            })
-            .transpose()
-            .map_err(|error| ToolError::Message(format!("invalid include_glob: {error}")))?;
+            .as_deref()
+            .map(compile_include_glob)
+            .transpose()?;
 
         let mut files = collect_file_metadata(&guarded.absolute, ctx.workspace)?;
         files.sort_by_key(|(_, modified)| Reverse(*modified));
-        let limit = input.limit.unwrap_or(ctx.config.tool_output.max_results);
+        let limit = bounded_result_limit(input.limit, ctx.config.tool_output.max_results);
         let mut matches = Vec::new();
+        let mut skipped = GrepSkipSummary::default();
         for (path, _) in files {
+            if matches.len() >= limit {
+                break;
+            }
             if include_glob
                 .as_ref()
                 .map(|glob| glob.is_match(path.as_str()))
                 .unwrap_or(true)
             {
-                let text = match fs::read(&path) {
-                    Ok(bytes) if !content_inspector::inspect(&bytes).is_binary() => {
-                        String::from_utf8(bytes).ok()
-                    }
-                    _ => None,
-                };
-                if let Some(text) = text {
-                    for (line_index, line) in text.lines().enumerate() {
-                        if regex.is_match(line) {
-                            matches.push(format!(
-                                "{}:{}: {}",
-                                path,
-                                line_index + 1,
-                                truncate_line(line)
-                            ));
-                            if matches.len() >= limit {
-                                break;
+                let path = Utf8PathBuf::from(path);
+                match read_grep_candidate(path.as_path(), &ctx.config.file_guard)? {
+                    Ok(text) => {
+                        for (line_index, line) in text.lines().enumerate() {
+                            if regex.is_match(line) {
+                                matches.push(format!(
+                                    "{}:{}: {}",
+                                    path,
+                                    line_index + 1,
+                                    truncate_line(line)
+                                ));
+                                if matches.len() >= limit {
+                                    break;
+                                }
                             }
                         }
                     }
+                    Err(reason) => skipped.record(path, reason),
                 }
             }
             if matches.len() >= limit {
@@ -348,8 +421,9 @@ impl Tool for GrepTool {
             }
         }
 
+        let output_text = render_grep_output(&matches, &skipped);
         let preview = ctx.services.truncator.preview(
-            matches.join("\n"),
+            output_text,
             &ctx.config.tool_output,
             &ctx.services.storage_paths,
         )?;
@@ -359,6 +433,19 @@ impl Tool for GrepTool {
             output_text: preview.preview_text,
             metadata: json!({
                 "total_matches": matches.len(),
+                "skipped_file_count": skipped.total,
+                "skipped_file_detail_count": skipped.details.len(),
+                "skipped_file_details_omitted": skipped.omitted_count(),
+                "skipped_reason_counts": {
+                    "blocked_extension": skipped.reason_count(GrepSkipReason::BlockedExtension),
+                    "structured_document": skipped.reason_count(GrepSkipReason::StructuredDocument),
+                    "large_file": skipped.reason_count(GrepSkipReason::LargeFile),
+                    "binary_content": skipped.reason_count(GrepSkipReason::BinaryContent),
+                },
+                "skipped_files": skipped.details.iter().map(|candidate| json!({
+                    "path": candidate.path,
+                    "reason": candidate.reason.as_str(),
+                })).collect::<Vec<_>>(),
                 "truncated": preview.truncated
             }),
             truncated_output_path: preview.truncated_output_path,
@@ -366,6 +453,114 @@ impl Tool for GrepTool {
             change_summaries: Vec::new(),
         })
     }
+}
+
+fn compile_include_glob(value: &str) -> Result<globset::GlobSet, ToolError> {
+    let mut builder = GlobSetBuilder::new();
+    let glob = Glob::new(value)
+        .map_err(|error| ToolError::Message(format!("invalid include_glob: {error}")))?;
+    builder.add(glob);
+    builder
+        .build()
+        .map_err(|error| ToolError::Message(format!("invalid include_glob: {error}")))
+}
+
+fn bounded_result_limit(requested: Option<usize>, configured_max: usize) -> usize {
+    requested.unwrap_or(configured_max).min(configured_max)
+}
+
+fn read_grep_candidate(
+    path: &Utf8Path,
+    guard: &FileGuardConfig,
+) -> Result<Result<String, GrepSkipReason>, ToolError> {
+    let metadata = fs::metadata(path)?;
+    let extension = normalized_extension(path);
+    if normalized_extension_list(&guard.blocked_read_extensions)
+        .iter()
+        .any(|blocked| blocked == &extension)
+    {
+        return Ok(Err(GrepSkipReason::BlockedExtension));
+    }
+    if normalized_extension_list(&guard.structured_document_extensions)
+        .iter()
+        .any(|structured| structured == &extension)
+    {
+        return Ok(Err(GrepSkipReason::StructuredDocument));
+    }
+    if metadata.len() > guard.max_inline_read_bytes {
+        return Ok(Err(GrepSkipReason::LargeFile));
+    }
+
+    let mut file = fs::File::open(path)?;
+    let mut sample = Vec::new();
+    file.by_ref()
+        .take(GREP_BINARY_SAMPLE_BYTES)
+        .read_to_end(&mut sample)?;
+    if content_inspector::inspect(&sample).is_binary() {
+        return Ok(Err(GrepSkipReason::BinaryContent));
+    }
+
+    let max_bytes = guard.max_inline_read_bytes.min(usize::MAX as u64) as usize;
+    let mut bytes = sample;
+    file.take(max_bytes.saturating_sub(bytes.len()).saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Ok(Err(GrepSkipReason::LargeFile));
+    }
+    if content_inspector::inspect(&bytes).is_binary() {
+        return Ok(Err(GrepSkipReason::BinaryContent));
+    }
+    String::from_utf8(bytes)
+        .map(Ok)
+        .map_err(|error| ToolError::Message(format!("grep candidate is not UTF-8: {error}")))
+}
+
+fn render_grep_output(matches: &[String], skipped: &GrepSkipSummary) -> String {
+    let mut sections = Vec::new();
+    if !matches.is_empty() {
+        sections.push(matches.join("\n"));
+    }
+    if skipped.total > 0 {
+        let mut lines = vec![format!(
+            "Skipped {} file(s) before full-text search because of file guards:",
+            skipped.total
+        )];
+        lines.push(format!(
+            "- reasons: blocked_extension={}, structured_document={}, large_file={}, binary_content={}",
+            skipped.reason_count(GrepSkipReason::BlockedExtension),
+            skipped.reason_count(GrepSkipReason::StructuredDocument),
+            skipped.reason_count(GrepSkipReason::LargeFile),
+            skipped.reason_count(GrepSkipReason::BinaryContent),
+        ));
+        lines.extend(
+            skipped
+                .details
+                .iter()
+                .map(|candidate| format!("- {} ({})", candidate.path, candidate.reason.as_str())),
+        );
+        if skipped.omitted_count() > 0 {
+            lines.push(format!(
+                "- {} additional skipped file detail(s) omitted by the bounded output policy",
+                skipped.omitted_count()
+            ));
+        }
+        sections.push(lines.join("\n"));
+    }
+    sections.join("\n\n")
+}
+
+fn normalized_extension(path: &Utf8Path) -> String {
+    path.extension()
+        .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn normalized_extension_list(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 fn collect_entries(
@@ -464,5 +659,104 @@ fn truncate_line(line: &str) -> String {
         line.to_string()
     } else {
         clip_text_with_ellipsis(line, LIMIT + 3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use camino::Utf8PathBuf;
+
+    use super::{
+        GREP_MAX_SKIP_DETAIL_BYTES, GREP_MAX_SKIP_DETAILS, GrepSkipReason, GrepSkipSummary,
+        bounded_result_limit, compile_include_glob, read_grep_candidate, render_grep_output,
+    };
+
+    #[test]
+    fn invalid_include_glob_returns_typed_tool_error() {
+        let error = compile_include_glob("[").expect_err("invalid glob must be rejected");
+        assert!(error.to_string().contains("invalid include_glob"));
+    }
+
+    #[test]
+    fn requested_result_limit_cannot_exceed_the_configured_output_bound() {
+        assert_eq!(bounded_result_limit(Some(usize::MAX), 64), 64);
+        assert_eq!(bounded_result_limit(Some(12), 64), 12);
+        assert_eq!(bounded_result_limit(None, 64), 64);
+        assert_eq!(bounded_result_limit(Some(0), 64), 0);
+    }
+
+    #[test]
+    fn grep_candidates_apply_file_guards_before_full_text_search() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 tempdir");
+        let mut guard = crate::config::ResolvedConfig::default().file_guard;
+        guard.max_inline_read_bytes = 8;
+
+        let blocked = root.join("weights.bin");
+        fs::write(&blocked, b"text").expect("write blocked fixture");
+        assert_eq!(
+            read_grep_candidate(&blocked, &guard).expect("guard result"),
+            Err(GrepSkipReason::BlockedExtension)
+        );
+
+        let large = root.join("large.txt");
+        fs::write(&large, b"0123456789").expect("write large fixture");
+        assert_eq!(
+            read_grep_candidate(&large, &guard).expect("guard result"),
+            Err(GrepSkipReason::LargeFile)
+        );
+
+        let binary = root.join("binary.txt");
+        fs::write(&binary, [0_u8, 1, 2]).expect("write binary fixture");
+        assert_eq!(
+            read_grep_candidate(&binary, &guard).expect("guard result"),
+            Err(GrepSkipReason::BinaryContent)
+        );
+
+        let text = root.join("source.txt");
+        fs::write(&text, b"needle").expect("write text fixture");
+        assert_eq!(
+            read_grep_candidate(&text, &guard).expect("guard result"),
+            Ok("needle".to_string())
+        );
+    }
+
+    #[test]
+    fn grep_skip_details_are_bounded_while_totals_and_reasons_remain_exact() {
+        let mut skipped = GrepSkipSummary::default();
+        for index in 0..(GREP_MAX_SKIP_DETAILS + 25) {
+            skipped.record(
+                Utf8PathBuf::from(format!("fixtures/{index:04}/artifact.bin")),
+                GrepSkipReason::BinaryContent,
+            );
+        }
+
+        assert_eq!(skipped.total, GREP_MAX_SKIP_DETAILS + 25);
+        assert!(skipped.details.len() <= GREP_MAX_SKIP_DETAILS);
+        assert!(skipped.detail_bytes <= GREP_MAX_SKIP_DETAIL_BYTES);
+        assert_eq!(
+            skipped.reason_count(GrepSkipReason::BinaryContent),
+            GREP_MAX_SKIP_DETAILS + 25
+        );
+        assert_eq!(skipped.omitted_count(), 25);
+
+        let rendered = render_grep_output(&[], &skipped);
+        assert!(rendered.contains("additional skipped file detail(s) omitted"));
+        assert!(rendered.contains(&format!("binary_content={}", GREP_MAX_SKIP_DETAILS + 25)));
+    }
+
+    #[test]
+    fn grep_skip_detail_byte_budget_rejects_an_oversized_path() {
+        let mut skipped = GrepSkipSummary::default();
+        skipped.record(
+            Utf8PathBuf::from("x".repeat(GREP_MAX_SKIP_DETAIL_BYTES + 1)),
+            GrepSkipReason::LargeFile,
+        );
+
+        assert_eq!(skipped.total, 1);
+        assert!(skipped.details.is_empty());
+        assert_eq!(skipped.omitted_count(), 1);
     }
 }

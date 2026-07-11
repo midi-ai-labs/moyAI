@@ -20,6 +20,8 @@ pub enum HarnessEventKind {
     ModelNoToolStop,
     ToolDispatchRequested,
     ToolDispatchDenied,
+    PermissionRequested,
+    PermissionResolved,
     ToolExecuted,
     ToolResultNormalized,
     CorrectiveResultEmitted,

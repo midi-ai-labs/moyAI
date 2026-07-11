@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
+use std::io::Read as _;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::EditError;
 use crate::session::SessionId;
@@ -16,6 +18,15 @@ pub struct FileReadStamp {
     pub read_at_ms: i64,
     pub mtime_ms: Option<i64>,
     pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub content_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FileContentIdentity {
+    pub mtime_ms: Option<i64>,
+    pub size_bytes: u64,
+    pub content_sha256: String,
 }
 
 #[derive(Clone, Default)]
@@ -43,7 +54,7 @@ impl EditSafety {
         session_id: SessionId,
         path: &Utf8Path,
     ) -> Result<(), EditError> {
-        let metadata = fs::metadata(path)?;
+        let (_, identity) = read_file_with_identity(path)?;
         self.record_read(
             session_id,
             FileReadStamp {
@@ -52,12 +63,9 @@ impl EditSafety {
                     .duration_since(UNIX_EPOCH)
                     .map(|value| value.as_millis() as i64)
                     .unwrap_or_default(),
-                mtime_ms: metadata
-                    .modified()
-                    .ok()
-                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                    .map(|value| value.as_millis() as i64),
-                size_bytes: Some(metadata.len()),
+                mtime_ms: identity.mtime_ms,
+                size_bytes: Some(identity.size_bytes),
+                content_sha256: Some(identity.content_sha256),
             },
         )
     }
@@ -125,18 +133,51 @@ impl EditSafety {
         &self,
         session_id: SessionId,
         path: &Utf8Path,
-        current_mtime_ms: Option<i64>,
-        current_size_bytes: Option<u64>,
+        current: &FileContentIdentity,
     ) -> Result<(), EditError> {
         let stamp = self.get_stamp(session_id, path).ok_or_else(|| {
             EditError::Message(format!(
                 "path `{path}` was not read in this session. Read the file with the `read` tool before the first replacement, update, or delete of an existing file in this session."
             ))
         })?;
-        if stamp.mtime_ms != current_mtime_ms || stamp.size_bytes != current_size_bytes {
+        if stamp.mtime_ms != current.mtime_ms
+            || stamp.size_bytes != Some(current.size_bytes)
+            || stamp.content_sha256.as_deref() != Some(current.content_sha256.as_str())
+        {
             return Err(EditError::Message(format!(
                 "path `{path}` changed since its last confirmed contents in this session. Read the current contents again before another replacement, update, or delete."
             )));
+        }
+        Ok(())
+    }
+
+    pub fn assert_path_unchanged(
+        &self,
+        path: &Utf8Path,
+        expected: Option<&FileContentIdentity>,
+    ) -> Result<(), EditError> {
+        match expected {
+            Some(expected) => {
+                let (_, current) = read_file_with_identity(path).map_err(|error| {
+                    EditError::Message(format!(
+                        "path `{path}` changed before commit and could not be revalidated: {error}"
+                    ))
+                })?;
+                if &current != expected {
+                    return Err(EditError::Message(format!(
+                        "path `{path}` changed while the edit was being prepared. The external contents were not overwritten; read the file again before retrying."
+                    )));
+                }
+            }
+            None => match fs::symlink_metadata(path) {
+                Ok(_) => {
+                    return Err(EditError::Message(format!(
+                        "path `{path}` was created while the edit was being prepared. The external file was not overwritten; read it before retrying."
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(EditError::Io(error)),
+            },
         }
         Ok(())
     }
@@ -195,7 +236,105 @@ impl EditSafety {
         }
         Ok(())
     }
+
+    pub fn invalidate_roots(
+        &self,
+        session_id: SessionId,
+        roots: &[Utf8PathBuf],
+    ) -> Result<(), EditError> {
+        let mut store = self.read_stamps.lock().expect("edit safety mutex poisoned");
+        if let Some(entries) = store.get_mut(&session_id) {
+            entries.retain(|path, _| !roots.iter().any(|root| path.starts_with(root)));
+        }
+        Ok(())
+    }
+}
+
+pub fn read_file_with_identity(
+    path: &Utf8Path,
+) -> Result<(Vec<u8>, FileContentIdentity), EditError> {
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let metadata = file.metadata()?;
+    let identity = FileContentIdentity {
+        mtime_ms: metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_millis() as i64),
+        size_bytes: metadata.len(),
+        content_sha256: format!("{:x}", Sha256::digest(&bytes)),
+    };
+    Ok((bytes, identity))
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use camino::Utf8PathBuf;
+
+    use super::{EditSafety, read_file_with_identity};
+
+    #[test]
+    fn commit_revalidation_rejects_external_same_size_change() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("source.txt")).expect("utf8 path");
+        std::fs::write(&path, "alpha").expect("seed file");
+        let (_, expected) = read_file_with_identity(&path).expect("capture identity");
+
+        std::fs::write(&path, "bravo").expect("external rewrite");
+
+        let error = EditSafety::default()
+            .assert_path_unchanged(&path, Some(&expected))
+            .expect_err("same-size external rewrite must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("external contents were not overwritten")
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read file"), "bravo");
+    }
+
+    #[test]
+    fn commit_revalidation_rejects_new_external_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("new.txt")).expect("utf8 path");
+        std::fs::write(&path, "external").expect("external create");
+
+        let error = EditSafety::default()
+            .assert_path_unchanged(&path, None)
+            .expect_err("external creation must be rejected");
+        assert!(error.to_string().contains("was created while"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read file"),
+            "external"
+        );
+    }
+
+    #[test]
+    fn invalidating_snapshot_roots_removes_only_affected_baselines() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("scope")).expect("utf8 root");
+        let outside =
+            Utf8PathBuf::from_path_buf(temp.path().join("outside.txt")).expect("utf8 outside");
+        std::fs::create_dir_all(&root).expect("create scope");
+        let inside = root.join("inside.txt");
+        std::fs::write(&inside, "inside").expect("write inside");
+        std::fs::write(&outside, "outside").expect("write outside");
+        let session_id = crate::session::SessionId::new();
+        let safety = EditSafety::default();
+        safety
+            .record_current_file_state(session_id, &inside)
+            .expect("record inside");
+        safety
+            .record_current_file_state(session_id, &outside)
+            .expect("record outside");
+
+        safety
+            .invalidate_roots(session_id, std::slice::from_ref(&root))
+            .expect("invalidate scope");
+
+        assert!(safety.get_stamp(session_id, &inside).is_none());
+        assert!(safety.get_stamp(session_id, &outside).is_some());
+    }
+}

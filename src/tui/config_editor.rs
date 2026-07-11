@@ -219,12 +219,25 @@ impl ConfigField {
             ConfigField::McpServersJson => Some("MOYAI_MCP_SERVERS_JSON"),
         }
     }
+
+    fn toml_path(self) -> (&'static str, &'static str) {
+        match self {
+            ConfigField::ExtraHeadersJson => ("model", "extra_headers"),
+            ConfigField::DoclingHeadersJson => ("docling", "headers"),
+            ConfigField::McpServersJson => ("mcp", "servers"),
+            _ => self
+                .label()
+                .split_once('.')
+                .expect("config editor labels are section-qualified"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ConfigFieldState {
     pub key: ConfigField,
     pub value: String,
+    pub dirty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +255,7 @@ impl ConfigEditorState {
                 .map(|key| ConfigFieldState {
                     key,
                     value: field_value(key, config),
+                    dirty: false,
                 })
                 .collect(),
             selected: 0,
@@ -264,14 +278,17 @@ impl ConfigEditorState {
 
     pub fn insert_char(&mut self, value: char) {
         self.fields[self.selected].value.push(value);
+        self.fields[self.selected].dirty = true;
     }
 
     pub fn backspace(&mut self) {
         self.fields[self.selected].value.pop();
+        self.fields[self.selected].dirty = true;
     }
 
     pub fn clear_selected(&mut self) {
         self.fields[self.selected].value.clear();
+        self.fields[self.selected].dirty = true;
     }
 
     pub fn build_session_override(&self) -> Result<PartialResolvedConfig, String> {
@@ -293,39 +310,70 @@ impl ConfigEditorState {
 }
 
 fn save_config_sections(path: &Utf8Path, editor: &ConfigEditorState) -> Result<(), String> {
-    let mut existing = read_partial(path)?;
-    let patch = parse_editor_patch(editor)?;
-    existing.model = patch.model.filter(|value| !model_patch_is_empty(value));
-    existing.permissions = patch
-        .permissions
-        .filter(|value| !permissions_patch_is_empty(value));
-    existing.session = patch.session.filter(|value| !session_patch_is_empty(value));
-    existing.shell = merge_shell_editor_patch(existing.shell, patch.shell);
-    existing.inspection = patch
-        .inspection
-        .filter(|value| !inspection_patch_is_empty(value));
-    existing.file_guard = patch
-        .file_guard
-        .filter(|value| !file_guard_patch_is_empty(value));
-    existing.docling = patch.docling.filter(|value| !docling_patch_is_empty(value));
-    existing.mcp = patch.mcp.filter(|value| !mcp_patch_is_empty(value));
-    write_partial(path, &existing)
-}
-
-fn read_partial(path: &Utf8Path) -> Result<PartialResolvedConfig, String> {
-    if !path.exists() {
-        return Ok(PartialResolvedConfig::default());
+    let dirty_fields = editor
+        .fields
+        .iter()
+        .filter(|field| field.dirty)
+        .map(|field| field.key)
+        .collect::<Vec<_>>();
+    if dirty_fields.is_empty() {
+        return Ok(());
     }
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    toml::from_str(&text).map_err(|error| error.to_string())
-}
 
-fn write_partial(path: &Utf8Path, patch: &PartialResolvedConfig) -> Result<(), String> {
+    let mut existing = read_toml_document(path)?;
+    let patch = parse_editor_patch_matching(editor, true)?;
+    let patch = toml::Value::try_from(patch).map_err(|error| error.to_string())?;
+    for field in dirty_fields {
+        apply_dirty_toml_field(&mut existing, &patch, field)?;
+    }
+    let text = toml::to_string_pretty(&existing).map_err(|error| error.to_string())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let text = toml::to_string_pretty(patch).map_err(|error| error.to_string())?;
     persist_config_tempfile(path, &text)
+}
+
+fn read_toml_document(path: &Utf8Path) -> Result<toml::Value, String> {
+    if !path.exists() {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
+    }
+    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    if text.trim().is_empty() {
+        Ok(toml::Value::Table(toml::map::Map::new()))
+    } else {
+        toml::from_str(&text).map_err(|error| error.to_string())
+    }
+}
+
+fn apply_dirty_toml_field(
+    existing: &mut toml::Value,
+    patch: &toml::Value,
+    field: ConfigField,
+) -> Result<(), String> {
+    let (section_name, field_name) = field.toml_path();
+    let patch_value = patch
+        .get(section_name)
+        .and_then(|section| section.get(field_name))
+        .cloned();
+    let root = existing
+        .as_table_mut()
+        .ok_or_else(|| "global config root must be a TOML table".to_string())?;
+
+    if let Some(value) = patch_value {
+        let section = root
+            .entry(section_name.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        let section = section.as_table_mut().ok_or_else(|| {
+            format!("global config section `{section_name}` must be a TOML table")
+        })?;
+        section.insert(field_name.to_string(), value);
+    } else if let Some(section) = root.get_mut(section_name) {
+        let section = section.as_table_mut().ok_or_else(|| {
+            format!("global config section `{section_name}` must be a TOML table")
+        })?;
+        section.remove(field_name);
+    }
+    Ok(())
 }
 
 fn persist_config_tempfile(path: &Utf8Path, text: &str) -> Result<(), String> {
@@ -345,6 +393,13 @@ fn persist_config_tempfile(path: &Utf8Path, text: &str) -> Result<(), String> {
 }
 
 fn parse_editor_patch(editor: &ConfigEditorState) -> Result<PartialResolvedConfig, String> {
+    parse_editor_patch_matching(editor, false)
+}
+
+fn parse_editor_patch_matching(
+    editor: &ConfigEditorState,
+    dirty_only: bool,
+) -> Result<PartialResolvedConfig, String> {
     let mut patch = PartialResolvedConfig::default();
     let mut model = PartialModelConfig::default();
     let mut permissions = PartialPermissionsConfig::default();
@@ -356,6 +411,9 @@ fn parse_editor_patch(editor: &ConfigEditorState) -> Result<PartialResolvedConfi
     let mut mcp = PartialMcpConfig::default();
 
     for field in &editor.fields {
+        if dirty_only && !field.dirty {
+            continue;
+        }
         let text = field.value.trim();
         match field.key {
             ConfigField::BaseUrl => model.base_url = parse_string(text),
@@ -478,99 +536,6 @@ fn parse_editor_patch(editor: &ConfigEditorState) -> Result<PartialResolvedConfi
     patch.docling = Some(docling);
     patch.mcp = Some(mcp);
     Ok(patch)
-}
-
-fn model_patch_is_empty(model: &PartialModelConfig) -> bool {
-    model.base_url.is_none()
-        && model.model.is_none()
-        && model.prompt_profile.is_none()
-        && model.provider_metadata_mode.is_none()
-        && model.api_key_env.is_none()
-        && model.extra_headers.is_none()
-        && model.request_timeout_ms.is_none()
-        && model.stream_idle_timeout_ms.is_none()
-        && model.connect_timeout_ms.is_none()
-        && model.max_retries.is_none()
-        && model.stream_max_retries.is_none()
-        && model.context_window.is_none()
-        && model.max_output_tokens.is_none()
-        && model.temperature.is_none()
-        && model.top_p.is_none()
-        && model.top_k.is_none()
-        && model.presence_penalty.is_none()
-        && model.frequency_penalty.is_none()
-        && model.seed.is_none()
-        && model.stop_sequences.is_none()
-        && model.supports_tools.is_none()
-        && model.supports_reasoning.is_none()
-        && model.supports_images.is_none()
-        && model.parallel_tool_calls.is_none()
-        && model.max_parallel_predictions.is_none()
-        && model.extra_body_json.is_none()
-}
-
-fn permissions_patch_is_empty(permissions: &PartialPermissionsConfig) -> bool {
-    permissions.access_mode.is_none()
-        && permissions.additional_read_roots.is_none()
-        && permissions.additional_write_roots.is_none()
-}
-
-fn session_patch_is_empty(session: &PartialSessionConfig) -> bool {
-    session.default_title_max_len.is_none()
-        && session.transcript_limit_messages.is_none()
-        && session.auto_resume_last.is_none()
-        && session.max_steps_per_turn.is_none()
-        && session.overflow_margin_tokens.is_none()
-        && session.auto_compact_enabled.is_none()
-        && session.auto_compact_keep_recent.is_none()
-}
-
-fn shell_patch_is_empty(shell: &PartialShellConfig) -> bool {
-    shell.program.is_none()
-        && shell.family.is_none()
-        && shell.default_timeout_ms.is_none()
-        && shell.max_timeout_ms.is_none()
-        && shell.env_allowlist.is_none()
-        && shell.hide_windows.is_none()
-}
-
-fn merge_shell_editor_patch(
-    existing: Option<PartialShellConfig>,
-    patch: Option<PartialShellConfig>,
-) -> Option<PartialShellConfig> {
-    let mut merged = existing.unwrap_or_default();
-    if let Some(patch) = patch {
-        if patch.hide_windows.is_some() {
-            merged.hide_windows = patch.hide_windows;
-        }
-    }
-    (!shell_patch_is_empty(&merged)).then_some(merged)
-}
-
-fn inspection_patch_is_empty(patch: &PartialInspectionConfig) -> bool {
-    patch.default_max_depth.is_none()
-        && patch.default_max_entries_per_dir.is_none()
-        && patch.max_extensions_reported.is_none()
-        && patch.include_hidden_by_default.is_none()
-}
-
-fn file_guard_patch_is_empty(patch: &PartialFileGuardConfig) -> bool {
-    patch.max_inline_read_bytes.is_none()
-        && patch.large_file_warning_bytes.is_none()
-        && patch.blocked_read_extensions.is_none()
-        && patch.structured_document_extensions.is_none()
-}
-
-fn docling_patch_is_empty(patch: &PartialDoclingConfig) -> bool {
-    patch.enabled.is_none()
-        && patch.base_url.is_none()
-        && patch.timeout_ms.is_none()
-        && patch.api_key_env.is_none()
-        && patch.headers.is_none()
-}
-
-fn mcp_patch_is_empty(patch: &PartialMcpConfig) -> bool {
-    patch.enabled.is_none() && patch.servers.is_none()
 }
 
 fn parse_prompt_profile(value: &str) -> Result<PromptProfile, String> {
@@ -773,11 +738,7 @@ impl ValueExt for serde_json::Value {
 mod tests {
     use camino::Utf8PathBuf;
 
-    use super::{
-        ConfigEditorState, ConfigField, PartialModelConfig, PartialResolvedConfig,
-        merge_shell_editor_patch, parse_editor_patch, write_partial,
-    };
-    use crate::config::model::PartialShellConfig;
+    use super::{ConfigEditorState, ConfigField, parse_editor_patch, save_config_sections};
     use crate::config::{ProviderMetadataMode, ResolvedConfig};
 
     #[test]
@@ -820,39 +781,116 @@ mod tests {
     }
 
     #[test]
-    fn config_editor_shell_patch_preserves_existing_shell_fields() {
-        let existing = PartialShellConfig {
-            program: Some(Some(Utf8PathBuf::from("pwsh"))),
-            ..PartialShellConfig::default()
-        };
-        let patch = PartialShellConfig {
-            hide_windows: Some(false),
-            ..PartialShellConfig::default()
-        };
-
-        let merged = merge_shell_editor_patch(Some(existing), Some(patch)).expect("merged shell");
-
-        assert_eq!(merged.program, Some(Some(Utf8PathBuf::from("pwsh"))));
-        assert_eq!(merged.hide_windows, Some(false));
-    }
-
-    #[test]
-    fn config_editor_global_write_persists_existing_file() {
+    fn config_editor_global_save_preserves_unsupported_shell_fields() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
             .expect("utf8 temp path");
-        std::fs::write(&path, "[model]\nmodel = \"old\"\n").expect("seed existing config");
-        let patch = PartialResolvedConfig {
-            model: Some(PartialModelConfig {
-                model: Some("new-model".to_string()),
-                ..PartialModelConfig::default()
-            }),
-            ..PartialResolvedConfig::default()
-        };
+        std::fs::write(
+            &path,
+            "[shell]\nprogram = \"pwsh\"\ndefault_timeout_ms = 777\nhide_windows = true\n",
+        )
+        .expect("seed existing config");
+        let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let hide_windows = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::ShellHideWindows)
+            .expect("shell hide_windows field");
+        hide_windows.value = "false".to_string();
+        hide_windows.dirty = true;
 
-        write_partial(&path, &patch).expect("persist config");
+        save_config_sections(&path, &editor).expect("save shell field");
+        let saved = std::fs::read_to_string(&path).expect("read saved config");
+        let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+        assert_eq!(saved["shell"]["program"].as_str(), Some("pwsh"));
+        assert_eq!(saved["shell"]["default_timeout_ms"].as_integer(), Some(777));
+        assert_eq!(saved["shell"]["hide_windows"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn global_save_merges_only_dirty_fields_into_current_toml() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        let mut effective = ResolvedConfig::default();
+        effective.model.base_url = "http://effective-env-value".to_string();
+        effective.model.model = "effective-default".to_string();
+        let mut editor = ConfigEditorState::from_config(&effective);
+
+        std::fs::write(
+            &path,
+            "[model]\nmodel = \"external-current\"\napi_key_env = \"EXTERNAL_KEY\"\n\n[format]\nensure_trailing_newline = false\n\n[future]\nflag = \"keep\"\n",
+        )
+        .expect("external current config");
+        let access = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::AccessMode)
+            .expect("access mode field");
+        access.value = "full_access".to_string();
+        access.dirty = true;
+
+        save_config_sections(&path, &editor).expect("merge dirty config");
 
         let saved = std::fs::read_to_string(&path).expect("read saved config");
-        assert!(saved.contains("new-model"));
+        let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+        assert_eq!(saved["model"]["model"].as_str(), Some("external-current"));
+        assert_eq!(saved["model"]["api_key_env"].as_str(), Some("EXTERNAL_KEY"));
+        assert!(saved["model"].get("base_url").is_none());
+        assert_eq!(
+            saved["format"]["ensure_trailing_newline"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(saved["future"]["flag"].as_str(), Some("keep"));
+        assert_eq!(
+            saved["permissions"]["access_mode"].as_str(),
+            Some("full_access")
+        );
+    }
+
+    #[test]
+    fn global_save_without_dirty_fields_does_not_rewrite_or_pin_effective_values() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        let original = "# keep formatting exactly\n[model]\nmodel='current'\n";
+        std::fs::write(&path, original).expect("seed config");
+        let mut effective = ResolvedConfig::default();
+        effective.model.base_url = "http://env-only".to_string();
+        let editor = ConfigEditorState::from_config(&effective);
+
+        save_config_sections(&path, &editor).expect("no-op save");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read config"),
+            original
+        );
+    }
+
+    #[test]
+    fn clearing_dirty_optional_field_removes_only_that_override() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        std::fs::write(
+            &path,
+            "[model]\ntemperature = 0.7\nmodel = \"keep-model\"\n",
+        )
+        .expect("seed config");
+        let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let temperature = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::Temperature)
+            .expect("temperature field");
+        temperature.value.clear();
+        temperature.dirty = true;
+
+        save_config_sections(&path, &editor).expect("clear temperature override");
+
+        let saved = std::fs::read_to_string(&path).expect("read saved config");
+        let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+        assert!(saved["model"].get("temperature").is_none());
+        assert_eq!(saved["model"]["model"].as_str(), Some("keep-model"));
     }
 }

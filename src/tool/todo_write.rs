@@ -169,10 +169,10 @@ impl Tool for TodoWriteTool {
     ) -> Result<ToolResult, ToolError> {
         let session_repo = ctx.services.store.session_repo();
         let existing_todos = session_repo.list_todos(ctx.session.session.id).await?;
-        let mut todos =
+        let todos =
             effective_todos_from_arguments(ctx.session.session.id, raw_arguments, &existing_todos)?;
-        normalize_progress_projection_todos(&mut todos);
         validate_todos(&todos)?;
+        ctx.run_mutation_fence.assert_owned().await?;
         session_repo
             .update_todos(ctx.session.session.id, &todos)
             .await?;
@@ -207,7 +207,7 @@ pub(crate) fn effective_todos_from_arguments(
     let _ = existing_todos;
     let input =
         serde_json::from_value::<TodoWriteInput>(normalize_todo_write_arguments(raw_arguments)?)?;
-    Ok(normalize_todos(session_id, input.todos))
+    normalize_todos(session_id, input.todos)
 }
 
 pub(crate) fn normalize_todo_write_arguments(raw_arguments: Value) -> Result<Value, ToolError> {
@@ -241,19 +241,10 @@ pub(crate) fn normalize_todo_write_arguments(raw_arguments: Value) -> Result<Val
     Ok(normalized)
 }
 
-fn normalize_progress_projection_todos(todos: &mut [TodoItem]) {
-    for todo in todos {
-        todo.kind = TodoKind::Work;
-        todo.targets.clear();
-        todo.depends_on.clear();
-        todo.success_criteria.clear();
-    }
-}
-
 fn normalize_todos(
     session_id: crate::session::SessionId,
     input: Vec<TodoWriteInputItem>,
-) -> Vec<TodoItem> {
+) -> Result<Vec<TodoItem>, ToolError> {
     let normalized = input
         .into_iter()
         .enumerate()
@@ -274,14 +265,26 @@ fn normalize_todos(
         .map(|(raw_id, _, _)| (raw_id.clone(), resolve_supplied_todo_id(session_id, raw_id)))
         .collect::<HashMap<_, _>>();
 
-    let todos = normalized
+    normalized
         .into_iter()
         .map(|(raw_id, content, todo)| {
-            let kind = TodoKind::Work;
+            let kind = todo.kind.unwrap_or(TodoKind::Work);
             let priority = todo
                 .priority
-                .unwrap_or_else(|| infer_todo_priority(todo.status));
-            TodoItem {
+                .unwrap_or_else(|| infer_todo_priority(kind, todo.status));
+            let depends_on = todo
+                .depends_on
+                .into_iter()
+                .map(|dependency| {
+                    let dependency = dependency.trim();
+                    id_map.get(dependency).copied().ok_or_else(|| {
+                        ToolError::Message(format!(
+                            "todowrite dependency `{dependency}` does not reference an id in the submitted checklist"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(TodoItem {
                 id: *id_map
                     .get(&raw_id)
                     .expect("normalized todo id should exist in id_map"),
@@ -289,15 +292,13 @@ fn normalize_todos(
                 kind,
                 status: todo.status,
                 priority,
-                targets: Vec::new(),
-                depends_on: Vec::new(),
-                success_criteria: Vec::new(),
+                targets: dedup_paths(todo.targets),
+                depends_on,
+                success_criteria: dedup_trimmed(todo.success_criteria),
                 blocked_by: dedup_trimmed(todo.blocked_by),
-            }
+            })
         })
-        .collect::<Vec<_>>();
-
-    todos
+        .collect()
 }
 
 fn resolve_supplied_todo_id(session_id: crate::session::SessionId, raw_id: &str) -> TodoId {
@@ -342,12 +343,29 @@ fn validate_todos(todos: &[TodoItem]) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn infer_todo_priority(status: TodoStatus) -> TodoPriority {
+fn infer_todo_priority(kind: TodoKind, status: TodoStatus) -> TodoPriority {
+    if !matches!(kind, TodoKind::Work) {
+        return TodoPriority::High;
+    }
     match status {
         TodoStatus::InProgress => TodoPriority::High,
         TodoStatus::Pending | TodoStatus::Blocked => TodoPriority::Medium,
         TodoStatus::Completed | TodoStatus::Cancelled => TodoPriority::Medium,
     }
+}
+
+fn dedup_paths(values: Vec<Utf8PathBuf>) -> Vec<Utf8PathBuf> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for value in values {
+        if value.as_str().trim().is_empty() {
+            continue;
+        }
+        if seen.insert(value.clone()) {
+            result.push(value);
+        }
+    }
+    result
 }
 
 fn dedup_trimmed(values: Vec<String>) -> Vec<String> {
@@ -372,5 +390,65 @@ fn todo_status_text(value: TodoStatus) -> &'static str {
         TodoStatus::Blocked => "blocked",
         TodoStatus::Completed => "completed",
         TodoStatus::Cancelled => "cancelled",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn todo_write_preserves_declared_contract_fields() {
+        let session_id = SessionId::new();
+        let todos = effective_todos_from_arguments(
+            session_id,
+            json!({
+                "todos": [
+                    {
+                        "id": "implement",
+                        "content": "Implement the fix",
+                        "kind": "work",
+                        "status": "completed",
+                        "targets": ["src/lib.rs"],
+                        "success_criteria": ["build passes"]
+                    },
+                    {
+                        "id": "verify",
+                        "content": "Verify the fix",
+                        "kind": "verification",
+                        "status": "in_progress",
+                        "depends_on": ["implement"],
+                        "success_criteria": ["tests pass"]
+                    }
+                ]
+            }),
+            &[],
+        )
+        .expect("todos");
+
+        assert_eq!(todos[0].targets, vec![Utf8PathBuf::from("src/lib.rs")]);
+        assert_eq!(todos[0].success_criteria, vec!["build passes"]);
+        assert_eq!(todos[1].kind, TodoKind::Verification);
+        assert_eq!(todos[1].depends_on, vec![todos[0].id]);
+        assert_eq!(todos[1].priority, TodoPriority::High);
+    }
+
+    #[test]
+    fn todo_write_rejects_unknown_dependency_ids() {
+        let error = effective_todos_from_arguments(
+            SessionId::new(),
+            json!({
+                "todos": [{
+                    "id": "verify",
+                    "content": "Verify",
+                    "status": "pending",
+                    "depends_on": ["missing"]
+                }]
+            }),
+            &[],
+        )
+        .expect_err("unknown dependency");
+
+        assert!(error.to_string().contains("does not reference an id"));
     }
 }

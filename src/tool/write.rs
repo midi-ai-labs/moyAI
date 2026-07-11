@@ -1,17 +1,22 @@
 use std::fs;
-use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::edit::{ChangeSummary, FileChange, FileReadStamp, path_for_change_storage};
+use crate::edit::{
+    ChangeSummary, FileChange, FileContentIdentity, FileReadStamp, FormatterExecutionOptions,
+    path_for_change_storage,
+};
 use crate::error::ToolError;
 use crate::session::{ChangeId, ChangeRepository};
 use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
-use crate::tool::write_support::{build_read_stamp, to_summary, write_text_file};
+use crate::tool::write_support::{
+    build_read_stamp, read_text_file_with_identity, to_summary, write_text_file,
+    write_text_file_noclobber,
+};
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
 use crate::workspace::{AccessKind, PathGuard, is_protected_workspace_authority_path};
 
@@ -65,6 +70,7 @@ impl Tool for WriteTool {
             !guarded.inside_workspace && !guarded.trusted_external,
             risks,
         )?;
+        ctx.run_mutation_fence.assert_owned().await?;
 
         let services = ctx.services.clone();
         let session_id = ctx.session.session.id;
@@ -76,30 +82,29 @@ impl Tool for WriteTool {
         let path_in_task = path.clone();
         let stored_path_in_task = stored_path.clone();
         let content = input.content;
+        let formatter_timeout_ms = ctx
+            .config
+            .shell
+            .default_timeout_ms
+            .min(ctx.config.shell.max_timeout_ms);
+        let formatter_output_slack =
+            usize::try_from(ctx.config.file_guard.max_inline_read_bytes).unwrap_or(usize::MAX);
+        let formatter_cancel = ctx.cancel.clone();
+        let run_mutation_fence = ctx.run_mutation_fence.clone();
         let edit_safety = services.edit_safety.clone();
         let outcome = edit_safety
             .with_file_lock(&locked_path, async move {
-                let original = if path_in_task.exists() {
-                    let original = fs::read_to_string(&path_in_task)?;
-                    let metadata = fs::metadata(&path_in_task)?;
-                    let current_mtime_ms = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                        .map(|value| value.as_millis() as i64);
+                let (original, expected_identity) = if path_in_task.exists() {
+                    let (original, identity) = read_text_file_with_identity(&path_in_task)?;
                     services.edit_safety.assert_fresh_write(
                         session_id,
                         &path_in_task,
-                        current_mtime_ms,
-                        Some(metadata.len()),
+                        &identity,
                     )?;
-                    Some(original)
+                    (Some(original), Some(identity))
                 } else {
-                    None
+                    (None, None)
                 };
-                if let Some(parent) = path_in_task.parent() {
-                    fs::create_dir_all(parent)?;
-                }
                 let normalized = services.formatter.normalize_text(
                     &path_in_task,
                     original.as_deref(),
@@ -107,9 +112,23 @@ impl Tool for WriteTool {
                 )?;
                 let formatted = services
                     .formatter
-                    .format_if_configured(&path_in_task, normalized)
+                    .format_if_configured(
+                        &path_in_task,
+                        normalized.clone(),
+                        FormatterExecutionOptions {
+                            workspace_root: workspace_root.clone(),
+                            timeout_ms: formatter_timeout_ms,
+                            max_output_bytes: normalized
+                                .len()
+                                .saturating_add(formatter_output_slack),
+                            cancel: formatter_cancel.clone(),
+                        },
+                    )
                     .await?;
                 if original.as_deref() == Some(formatted.as_str()) {
+                    services
+                        .edit_safety
+                        .assert_path_unchanged(&path_in_task, expected_identity.as_ref())?;
                     services
                         .edit_safety
                         .record_read(session_id, build_read_stamp(&path_in_task)?)?;
@@ -130,9 +149,11 @@ impl Tool for WriteTool {
                 )?;
                 commit_write_change(
                     &services,
+                    &run_mutation_fence,
                     session_id,
                     &path_in_task,
                     original,
+                    expected_identity,
                     formatted,
                     change,
                 )
@@ -184,9 +205,11 @@ enum WriteExecutionOutcome {
 
 async fn commit_write_change(
     services: &crate::tool::context::ToolServices,
+    run_mutation_fence: &crate::tool::context::RunMutationFence,
     session_id: crate::session::SessionId,
     path: &Utf8Path,
     original: Option<String>,
+    expected_identity: Option<FileContentIdentity>,
     formatted: String,
     change: FileChange,
 ) -> Result<WriteExecutionOutcome, ToolError> {
@@ -198,8 +221,17 @@ async fn commit_write_change(
         None => WriteRollbackState::Absent,
     };
 
-    if let Err(error) = write_text_file(path, &formatted) {
-        rollback_write_commit(path, &rollback_state, None)?;
+    validate_write_commit_precondition(&services.edit_safety, path, expected_identity.as_ref())?;
+    run_mutation_fence.assert_owned().await?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let write_result = match &rollback_state {
+        WriteRollbackState::Present(_) => write_text_file(path, &formatted),
+        WriteRollbackState::Absent => write_text_file_noclobber(path, &formatted),
+    };
+    if let Err(error) = write_result {
         return Err(ToolError::from(error));
     }
 
@@ -214,6 +246,15 @@ async fn commit_write_change(
             Some((&services.edit_safety, session_id, &baseline_snapshot)),
         )?;
         return Err(ToolError::from(error));
+    }
+
+    if let Err(error) = run_mutation_fence.assert_owned().await {
+        rollback_write_commit(
+            path,
+            &rollback_state,
+            Some((&services.edit_safety, session_id, &baseline_snapshot)),
+        )?;
+        return Err(error);
     }
 
     match services
@@ -239,6 +280,16 @@ async fn commit_write_change(
             Err(ToolError::from(error))
         }
     }
+}
+
+fn validate_write_commit_precondition(
+    edit_safety: &crate::edit::EditSafety,
+    path: &Utf8Path,
+    expected_identity: Option<&FileContentIdentity>,
+) -> Result<(), ToolError> {
+    edit_safety
+        .assert_path_unchanged(path, expected_identity)
+        .map_err(ToolError::from)
 }
 
 #[derive(Debug)]
@@ -314,5 +365,42 @@ fn no_content_write_result(path: String) -> ToolResult {
         truncated_output_path: None,
         recorded_changes: Vec::new(),
         change_summaries: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use camino::Utf8PathBuf;
+
+    use crate::edit::{EditSafety, read_file_with_identity};
+
+    use super::validate_write_commit_precondition;
+
+    #[test]
+    fn commit_revalidation_preserves_same_size_external_rewrite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("source.txt")).expect("utf8 path");
+        std::fs::write(&path, "alpha").expect("seed file");
+        let (_, expected) = read_file_with_identity(&path).expect("capture identity");
+
+        std::fs::write(&path, "bravo").expect("external rewrite");
+
+        validate_write_commit_precondition(&EditSafety::default(), &path, Some(&expected))
+            .expect_err("external rewrite must stop the commit");
+        assert_eq!(std::fs::read_to_string(&path).expect("read file"), "bravo");
+    }
+
+    #[test]
+    fn commit_revalidation_preserves_externally_created_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("new.txt")).expect("utf8 path");
+        std::fs::write(&path, "external").expect("external create");
+
+        validate_write_commit_precondition(&EditSafety::default(), &path, None)
+            .expect_err("external creation must stop the commit");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read file"),
+            "external"
+        );
     }
 }

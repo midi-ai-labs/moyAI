@@ -738,6 +738,8 @@ fn loaded_summary_from_session(session: SessionRecord) -> LoadedSessionSummary {
     LoadedSessionSummary {
         session,
         loaded_status: LoadedSessionStatus::NotLoaded,
+        archived: false,
+        memory_mode: crate::session::SessionMemoryMode::default(),
         active_turn_id: None,
         active_turn_sequence_no: None,
         pending_permission_requests: 0,

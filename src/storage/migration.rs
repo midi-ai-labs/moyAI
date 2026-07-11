@@ -40,8 +40,31 @@ const V23_SESSIONS_MEMORY_MODE: &str =
 const V24_SESSIONS_MODEL_PARAMETERS: &str =
     include_str!("../../migrations/V24__sessions_model_parameters.sql");
 const V25_THREAD_GOALS: &str = include_str!("../../migrations/V25__thread_goals.sql");
+const V26_SESSIONS_ACTIVE_RUN_ID: &str =
+    include_str!("../../migrations/V26__sessions_active_run_id.sql");
+const V27_PROTOCOL_TURN_SEQUENCE_ALLOCATORS: &str =
+    include_str!("../../migrations/V27__protocol_turn_sequence_allocators.sql");
+const V28_SESSIONS_ACTIVE_TURN_ID: &str =
+    include_str!("../../migrations/V28__sessions_active_turn_id.sql");
+const V29_SESSIONS_ACTIVE_RUN_LEASE: &str =
+    include_str!("../../migrations/V29__sessions_active_run_lease.sql");
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
+    run_through_v25(connection)?;
+    if needs_sessions_active_run_id_migration(connection)? {
+        connection.execute_batch(V26_SESSIONS_ACTIVE_RUN_ID)?;
+    }
+    connection.execute_batch(V27_PROTOCOL_TURN_SEQUENCE_ALLOCATORS)?;
+    if needs_sessions_active_turn_id_migration(connection)? {
+        connection.execute_batch(V28_SESSIONS_ACTIVE_TURN_ID)?;
+    }
+    if needs_sessions_active_run_lease_migration(connection)? {
+        connection.execute_batch(V29_SESSIONS_ACTIVE_RUN_LEASE)?;
+    }
+    Ok(())
+}
+
+fn run_through_v25(connection: &Connection) -> Result<(), StorageError> {
     connection.execute_batch(V1_INIT)?;
     connection.execute_batch(V2_INDEXES)?;
     connection.execute_batch(V3_TODOS)?;
@@ -287,4 +310,86 @@ fn needs_sessions_model_parameters_migration(
     Ok(!columns
         .iter()
         .any(|column| column == "model_parameters_json"))
+}
+
+fn needs_sessions_active_run_id_migration(connection: &Connection) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(!columns.iter().any(|column| column == "active_run_id"))
+}
+
+fn needs_sessions_active_turn_id_migration(connection: &Connection) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(!columns.iter().any(|column| column == "active_turn_id"))
+}
+
+fn needs_sessions_active_run_lease_migration(
+    connection: &Connection,
+) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(!columns
+        .iter()
+        .any(|column| column == "active_run_lease_expires_at_ms"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_identity_turn_and_lease_migrate_v25_schema_and_are_idempotent() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v25(&connection).expect("v25 schema");
+
+        run(&connection).expect("forward migration");
+        run(&connection).expect("idempotent migration");
+
+        let mut statement = connection
+            .prepare("PRAGMA table_info(sessions)")
+            .expect("session columns");
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("column rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("columns");
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|column| column.as_str() == "active_run_id")
+                .count(),
+            1
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|column| column.as_str() == "active_run_lease_expires_at_ms")
+                .count(),
+            1
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|column| column.as_str() == "active_turn_id")
+                .count(),
+            1
+        );
+        let allocator_table_count = connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'protocol_turn_sequence_allocators'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("allocator table");
+        assert_eq!(allocator_table_count, 1);
+    }
 }

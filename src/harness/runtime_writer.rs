@@ -1,14 +1,13 @@
 use std::collections::BTreeSet;
 
 use camino::Utf8PathBuf;
-use serde_json::{Value, json};
 
 use crate::error::RuntimeError;
 use crate::harness::{
-    ArtifactId, ArtifactKind, ArtifactManifest, ArtifactStore, ArtifactTag, ContractId,
-    ContractRef, HarnessEvent, HarnessEventId, HarnessEventKind, HarnessEventPayload,
-    HarnessEventStore, HarnessRunId, HarnessRunRecord, HarnessRunStatus, HarnessRunStore,
-    SqliteArtifactStore, SqliteHarnessEventStore, SqliteHarnessRunStore, artifact::hash_bytes,
+    ArtifactId, ArtifactKind, ArtifactManifest, ArtifactStore, ArtifactTag, ContractRef,
+    HarnessEvent, HarnessEventId, HarnessEventKind, HarnessEventPayload, HarnessEventStore,
+    HarnessRunId, HarnessRunRecord, HarnessRunStatus, HarnessRunStore, SqliteArtifactStore,
+    SqliteHarnessEventStore, SqliteHarnessRunStore, artifact::hash_bytes,
 };
 use crate::protocol::TurnId;
 use crate::runtime::{RunEventSink, SystemClock};
@@ -41,6 +40,15 @@ impl NativeHarnessRecorder {
         store: &StoreBundle,
         session_id: Option<SessionId>,
         workspace_root: Utf8PathBuf,
+    ) -> Result<Self, RuntimeError> {
+        Self::start_harness_only_for_turn(store, session_id, workspace_root, TurnId::new())
+    }
+
+    pub fn start_harness_only_for_turn(
+        store: &StoreBundle,
+        session_id: Option<SessionId>,
+        workspace_root: Utf8PathBuf,
+        protocol_turn_id: TurnId,
     ) -> Result<Self, RuntimeError> {
         let run_id = HarnessRunId::new();
         let artifact_root = store
@@ -75,7 +83,7 @@ impl NativeHarnessRecorder {
             artifact_root,
             started_at_ms,
             next_sequence_no: 0,
-            protocol_turn_id: TurnId::new(),
+            protocol_turn_id,
         })
     }
 
@@ -114,8 +122,7 @@ impl NativeHarnessRecorder {
         payload: HarnessEventPayload,
     ) -> Result<(), RuntimeError> {
         let event_id = HarnessEventId::new();
-        let payload = enrich_payload(kind, payload)?;
-        let contract_refs = contract_refs_for_kind(kind);
+        let contract_refs = Vec::new();
         let artifact_refs =
             self.record_payload_artifact(event_id, kind, &payload, &contract_refs)?;
         let event = HarnessEvent {
@@ -235,9 +242,8 @@ fn harness_kind_for_run_event(event: &RunEvent) -> HarnessEventKind {
         RunEvent::CandidateRepairEditRecorded { .. } => HarnessEventKind::StateSnapshotRecorded,
         RunEvent::FileChangesRecorded { .. } => HarnessEventKind::ArtifactRegistered,
         RunEvent::CompactionCompleted { .. } => HarnessEventKind::StateSnapshotRecorded,
-        RunEvent::PermissionRequested { .. } | RunEvent::PermissionResolved { .. } => {
-            HarnessEventKind::ToolDispatchDenied
-        }
+        RunEvent::PermissionRequested { .. } => HarnessEventKind::PermissionRequested,
+        RunEvent::PermissionResolved { .. } => HarnessEventKind::PermissionResolved,
         RunEvent::RetryScheduled { .. } | RunEvent::RecoverableRuntimeFeedback { .. } => {
             HarnessEventKind::CorrectiveResultEmitted
         }
@@ -268,273 +274,6 @@ fn payload_for_run_event(
         .map_err(runtime_error)
 }
 
-fn enrich_payload(
-    kind: HarnessEventKind,
-    payload: HarnessEventPayload,
-) -> Result<HarnessEventPayload, RuntimeError> {
-    match payload {
-        HarnessEventPayload::Generic(mut value) => {
-            if let Value::Object(ref mut map) = value {
-                let control_envelope = map.get("envelope").cloned();
-                let state_projection = map.get("state").cloned();
-                if let Some(state) = state_projection {
-                    let turn_decision = state.get("turn_decision").cloned();
-                    let allowed_surface_snapshot = turn_decision.as_ref().map(|turn_decision| {
-                        json!({
-                            "allowed_tools": turn_decision.get("allowed_tools").cloned().unwrap_or_else(|| json!([])),
-                            "tool_choice": turn_decision.get("tool_choice").cloned().unwrap_or(Value::Null),
-                            "active_targets": turn_decision.get("active_targets").cloned().unwrap_or_else(|| json!([])),
-                        })
-                    });
-                    let repair_lane = turn_decision
-                        .as_ref()
-                        .and_then(|turn_decision| turn_decision.get("repair_lane"))
-                        .cloned();
-                    let operation_template = repair_lane
-                        .as_ref()
-                        .and_then(|repair_lane| repair_lane.get("operation_template"))
-                        .cloned();
-                    let verification_cluster = repair_lane
-                        .as_ref()
-                        .and_then(|repair_lane| repair_lane.get("verification_cluster"))
-                        .cloned();
-                    if let Some(snapshot) = allowed_surface_snapshot {
-                        map.insert("allowed_surface_snapshot".to_string(), snapshot);
-                    }
-                    if let Some(template) = operation_template {
-                        map.insert("repair_operation_template".to_string(), template);
-                    }
-                    if let Some(cluster) = verification_cluster {
-                        map.insert("verification_cluster".to_string(), cluster);
-                    }
-                    if !map.contains_key("allowed_surface_snapshot") {
-                        map.insert(
-                            "missing_control_projection".to_string(),
-                            json!({
-                                "status": "missing",
-                                "reason": "StateUpdated event lacks a typed TurnControlEnvelope/RepairControlSnapshot projection; harness must report this instead of synthesizing authority from state",
-                                "required_artifacts": [
-                                    "turn_control_envelope",
-                                    "allowed_surface_snapshot",
-                                    "repair_operation_template",
-                                    "verification_cluster"
-                                ]
-                            }),
-                        );
-                    }
-                    map.insert(
-                        "completed_todo_evidence_state".to_string(),
-                        json!({
-                            "status": "not_captured",
-                            "contradicted_todos": [],
-                            "missing_evidence_todos": [],
-                            "evidence_refs": []
-                        }),
-                    );
-                }
-                if let Some(envelope) = control_envelope {
-                    let authority = envelope.get("action_authority");
-                    map.insert(
-                        "allowed_surface_snapshot".to_string(),
-                        json!({
-                            "projection_id": envelope.get("projection_id").cloned().unwrap_or(Value::Null),
-                            "allowed_tools": authority
-                                .and_then(|authority| authority.get("allowed_tools"))
-                                .cloned()
-                                .unwrap_or_else(|| json!([])),
-                            "forbidden_tools": authority
-                                .and_then(|authority| authority.get("forbidden_tools"))
-                                .cloned()
-                                .unwrap_or_else(|| json!([])),
-                            "tool_choice": authority
-                                .and_then(|authority| authority.get("tool_choice"))
-                                .cloned()
-                                .unwrap_or(Value::Null),
-                        }),
-                    );
-                }
-                let typed_tool_projection_applied = apply_tool_lifecycle_metadata_projection(map);
-                let should_build_tool_feedback_projection = typed_tool_projection_applied
-                    && !matches!(kind, HarnessEventKind::ToolDispatchRequested);
-                let stored_text_projection_seen =
-                    map.get("metadata").is_some_and(stored_text_projection_seen);
-                if should_build_tool_feedback_projection
-                    || (stored_text_projection_seen
-                        && matches!(
-                            kind,
-                            HarnessEventKind::ToolDispatchDenied
-                                | HarnessEventKind::CorrectiveResultEmitted
-                                | HarnessEventKind::ToolResultNormalized
-                        ))
-                {
-                    if stored_text_projection_seen {
-                        map.insert(
-                            "text_projection_rejected".to_string(),
-                            json!({
-                                "source": "diagnostic_text",
-                                "mode": map
-                                    .get("metadata")
-                                    .and_then(stored_text_projection_mode)
-                                    .unwrap_or("explicit_text_projection"),
-                                "status": "not_promoted_to_authority",
-                                "reason": "typed projection is required; harness artifacts must not synthesize allowed surface or lifecycle policy from text",
-                            }),
-                        );
-                    }
-                    let signature_source = serde_json::to_string(&map).map_err(runtime_error)?;
-                    let result_hash = map
-                        .get("result_hash")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| hash_bytes(signature_source.as_bytes()));
-                    map.insert(
-                        "no_progress_signature".to_string(),
-                        no_progress_signature_projection(map, result_hash),
-                    );
-                }
-            }
-            Ok(HarnessEventPayload::Generic(value))
-        }
-        other => Ok(other),
-    }
-}
-
-fn apply_tool_lifecycle_metadata_projection(map: &mut serde_json::Map<String, Value>) -> bool {
-    let Some(metadata) = map.get("metadata").and_then(Value::as_object).cloned() else {
-        return false;
-    };
-    let mut applied = false;
-
-    if let Some(route) = metadata.get("tool_route").and_then(Value::as_object) {
-        map.insert(
-            "tool_route_decision".to_string(),
-            Value::Object(route.clone()),
-        );
-        if !map.contains_key("allowed_surface_snapshot") {
-            map.insert(
-                "allowed_surface_snapshot".to_string(),
-                json!({
-                    "source": "tool_route_decision",
-                    "allowed_tools": route.get("allowed_tools").cloned().unwrap_or_else(|| json!([])),
-                    "tool_choice": route.get("tool_choice").cloned().unwrap_or(Value::Null),
-                }),
-            );
-        }
-        applied = true;
-    }
-
-    if let Some(control_projection) = metadata.get("control_projection") {
-        map.insert("control_projection".to_string(), control_projection.clone());
-        map.insert(
-            "allowed_surface_snapshot".to_string(),
-            json!({
-                "source": "control_projection",
-                "projection_id": control_projection.get("projection_id").cloned().unwrap_or(Value::Null),
-                "surface": control_projection.get("surface").cloned().unwrap_or(Value::Null),
-                "allowed_tools": control_projection.get("allowed_tools").cloned().unwrap_or_else(|| json!([])),
-                "forbidden_tools": control_projection.get("forbidden_tools").cloned().unwrap_or_else(|| json!([])),
-            }),
-        );
-        applied = true;
-    }
-
-    if let Some(feedback) = metadata.get("tool_feedback_envelope") {
-        map.insert("tool_feedback_envelope".to_string(), feedback.clone());
-        map.insert(
-            "allowed_surface_snapshot".to_string(),
-            json!({
-                "source": "tool_feedback_envelope",
-                "allowed_tools": feedback.get("allowed_surface_snapshot").cloned().unwrap_or_else(|| json!([])),
-                "required_target": feedback.get("required_target").cloned().unwrap_or(Value::Null),
-            }),
-        );
-        for key in [
-            "required_target",
-            "repair_operation_template",
-            "verification_cluster",
-            "repair_control_snapshot",
-            "contract_reconciliation",
-            "result_hash",
-        ] {
-            if let Some(value) = feedback.get(key).cloned() {
-                map.insert(key.to_string(), value);
-            }
-        }
-        applied = true;
-    }
-
-    applied
-}
-
-fn no_progress_signature_projection(
-    map: &serde_json::Map<String, Value>,
-    result_hash: String,
-) -> Value {
-    let tool_feedback = map.get("tool_feedback_envelope").and_then(Value::as_object);
-    let blocked_action = map
-        .get("blocked_action")
-        .cloned()
-        .or_else(|| tool_feedback.and_then(|feedback| feedback.get("blocked_action").cloned()))
-        .unwrap_or(Value::Null);
-    json!({
-        "result_hash": result_hash,
-        "tool": map.get("tool").cloned().unwrap_or(Value::Null),
-        "progress_effect": map.get("progress_effect").cloned().unwrap_or_else(|| json!("no_progress")),
-        "blocked_action": blocked_action,
-        "allowed_surface_snapshot": map.get("allowed_surface_snapshot").cloned().unwrap_or_else(|| json!([])),
-        "repeat_count": 1
-    })
-}
-
-fn stored_text_projection_seen(metadata: &Value) -> bool {
-    stored_text_projection_mode(metadata).is_some()
-}
-
-fn stored_text_projection_mode(metadata: &Value) -> Option<&'static str> {
-    match metadata.get("projection_mode").and_then(Value::as_str) {
-        Some("legacy_import") => Some("legacy_import"),
-        Some("stored_artifact_replay") => Some("stored_artifact_replay"),
-        Some("migration_backfill") => Some("migration_backfill"),
-        _ => None,
-    }
-}
-
-fn contract_refs_for_kind(kind: HarnessEventKind) -> Vec<ContractRef> {
-    let ids: &[&str] = match kind {
-        HarnessEventKind::RunStarted => &["runtime_contract"],
-        HarnessEventKind::UserTurnAccepted => &["requested_work_contract"],
-        HarnessEventKind::ControlEnvelopePrepared => &[
-            "model_projection_schema",
-            "active_work_contract",
-            "turn_control_envelope",
-        ],
-        HarnessEventKind::ModelProjectionBuilt | HarnessEventKind::ModelRequestSent => {
-            &["model_projection_schema", "active_work_contract"]
-        }
-        HarnessEventKind::ToolDispatchRequested
-        | HarnessEventKind::ToolDispatchDenied
-        | HarnessEventKind::ToolExecuted => &["tool_dispatch_contract"],
-        HarnessEventKind::ToolResultNormalized | HarnessEventKind::CorrectiveResultEmitted => {
-            &["tool_result_schema", "repair_operation_template"]
-        }
-        HarnessEventKind::StateSnapshotRecorded | HarnessEventKind::StateTransitionRecorded => {
-            &["state_machine_contract"]
-        }
-        HarnessEventKind::QualityGateEvaluated | HarnessEventKind::ScenarioGateEvaluated => {
-            &["quality_gate_schema"]
-        }
-        HarnessEventKind::ArtifactRegistered => &["artifact_manifest_schema"],
-        HarnessEventKind::RunTerminalized => &["terminal_state_contract"],
-        _ => &["runtime_contract"],
-    };
-    ids.iter()
-        .map(|id| ContractRef {
-            id: ContractId::new(*id),
-            version: "current".to_string(),
-        })
-        .collect()
-}
-
 fn artifact_kind_for_event(kind: HarnessEventKind) -> Option<ArtifactKind> {
     match kind {
         HarnessEventKind::StateSnapshotRecorded | HarnessEventKind::StateTransitionRecorded => {
@@ -544,6 +283,8 @@ fn artifact_kind_for_event(kind: HarnessEventKind) -> Option<ArtifactKind> {
         | HarnessEventKind::ModelProjectionBuilt
         | HarnessEventKind::ModelRequestSent => Some(ArtifactKind::RequestDiagnostics),
         HarnessEventKind::ToolDispatchDenied
+        | HarnessEventKind::PermissionRequested
+        | HarnessEventKind::PermissionResolved
         | HarnessEventKind::ToolExecuted
         | HarnessEventKind::ToolResultNormalized
         | HarnessEventKind::CorrectiveResultEmitted => Some(ArtifactKind::VerificationLog),
@@ -568,6 +309,8 @@ fn event_kind_file_label(kind: HarnessEventKind) -> &'static str {
         HarnessEventKind::ModelNoToolStop => "model_no_tool_stop",
         HarnessEventKind::ToolDispatchRequested => "tool_dispatch_requested",
         HarnessEventKind::ToolDispatchDenied => "tool_dispatch_denied",
+        HarnessEventKind::PermissionRequested => "permission_requested",
+        HarnessEventKind::PermissionResolved => "permission_resolved",
         HarnessEventKind::ToolExecuted => "tool_executed",
         HarnessEventKind::ToolResultNormalized => "tool_result_normalized",
         HarnessEventKind::CorrectiveResultEmitted => "corrective_result_emitted",
@@ -591,4 +334,49 @@ fn terminal_status_for_run_event(event: &RunEvent) -> Option<HarnessRunStatus> {
 
 fn runtime_error(error: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Message(format!("native harness event writer failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::HarnessEventStore;
+    use crate::session::MessageId;
+    use crate::storage::{SqliteStore, StoragePaths};
+
+    #[test]
+    fn records_only_the_runtime_event_without_synthetic_contracts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 path");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let store = SqliteStore::open(&paths).expect("open store");
+        store.migrate().expect("migrate store");
+        let bundle = StoreBundle::new(store);
+        let workspace = Utf8PathBuf::from("C:/workspace");
+        let mut recorder =
+            NativeHarnessRecorder::start_harness_only(&bundle, None, workspace).expect("recorder");
+        let run_id = recorder.run_id();
+        let event = RunEvent::TextDelta {
+            message_id: MessageId::new(),
+            delta: "visible text".to_string(),
+        };
+
+        recorder.record_run_event(&event).expect("record event");
+
+        let events = bundle
+            .harness_event_store()
+            .list_events(run_id)
+            .expect("list events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, HarnessEventKind::ModelResponseReceived);
+        assert!(events[0].contract_refs.is_empty());
+        assert!(events[0].artifact_refs.is_empty());
+        assert_eq!(
+            events[0].payload,
+            HarnessEventPayload::generic(serde_json::to_value(event).expect("serialize event"))
+        );
+    }
 }

@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use directories_next::ProjectDirs;
@@ -7,11 +8,10 @@ use directories_next::ProjectDirs;
 use crate::cli::RunArgs;
 use crate::config::merge::apply_patch;
 use crate::config::model::{
-    AccessMode, PartialAgentConfig, PartialDoclingConfig, PartialFileGuardConfig,
-    PartialFormatConfig, PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig,
-    PartialMcpConfig, PartialModelConfig, PartialPermissionsConfig, PartialResolvedConfig,
-    PartialSessionConfig, PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig,
-    ResolvedConfig,
+    AccessMode, PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig,
+    PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig,
+    PartialModelConfig, PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig,
+    PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig, ResolvedConfig,
 };
 use crate::error::ConfigError;
 
@@ -89,14 +89,17 @@ fn write_default_global_config_if_missing(path: &Utf8Path) -> Result<(), ConfigE
     }
     let defaults = default_config_patch(&ResolvedConfig::default());
     let encoded = toml::to_string_pretty(&defaults)?;
-    let temp_path = path.with_extension("tmp");
-    fs::write(&temp_path, encoded)?;
-    if path.exists() {
-        let _ = fs::remove_file(&temp_path);
-        return Ok(());
+    let parent = path.parent().ok_or_else(|| {
+        ConfigError::Message(format!("config path `{path}` has no parent directory"))
+    })?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent.as_std_path())?;
+    temp.write_all(encoded.as_bytes())?;
+    temp.as_file().sync_all()?;
+    match temp.persist_noclobber(path.as_std_path()) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(ConfigError::Io(error.error)),
     }
-    fs::rename(&temp_path, path)?;
-    Ok(())
 }
 
 fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
@@ -135,46 +138,6 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             auto_resume_last: Some(config.session.auto_resume_last),
             max_steps_per_turn: Some(config.session.max_steps_per_turn),
             overflow_margin_tokens: Some(config.session.overflow_margin_tokens),
-            auto_compact_enabled: Some(config.session.auto_compact_enabled),
-            auto_compact_keep_recent: Some(config.session.auto_compact_keep_recent),
-        }),
-        agent: Some(PartialAgentConfig {
-            duplicate_success_abort_threshold: Some(config.agent.duplicate_success_abort_threshold),
-            repetitive_text_line_threshold: Some(config.agent.repetitive_text_line_threshold),
-            readonly_stall_threshold_implementation: Some(
-                config.agent.readonly_stall_threshold_implementation,
-            ),
-            readonly_stall_threshold_general: Some(config.agent.readonly_stall_threshold_general),
-            verification_repair_grace_steps: Some(config.agent.verification_repair_grace_steps),
-            verification_failure_attempt_limit: Some(
-                config.agent.verification_failure_attempt_limit,
-            ),
-            verification_failure_repair_read_budget: Some(
-                config.agent.verification_failure_repair_read_budget,
-            ),
-            staged_task_documentation_finish_grace_steps: Some(
-                config.agent.staged_task_documentation_finish_grace_steps,
-            ),
-            staged_task_discovery_redirect_repeat_threshold: Some(
-                config.agent.staged_task_discovery_redirect_repeat_threshold,
-            ),
-            staged_task_authoring_read_limit: Some(config.agent.staged_task_authoring_read_limit),
-            staged_task_authoring_successful_read_budget_after_progress: Some(
-                config
-                    .agent
-                    .staged_task_authoring_successful_read_budget_after_progress,
-            ),
-            staged_task_audit_repair_read_budget: Some(
-                config.agent.staged_task_audit_repair_read_budget,
-            ),
-            staged_task_audit_repair_rewrite_escalation_threshold: Some(
-                config
-                    .agent
-                    .staged_task_audit_repair_rewrite_escalation_threshold,
-            ),
-            staged_task_recovery_stall_threshold: Some(
-                config.agent.staged_task_recovery_stall_threshold,
-            ),
         }),
         permissions: Some(PartialPermissionsConfig {
             access_mode: Some(config.permissions.access_mode),
@@ -497,20 +460,6 @@ fn env_patch() -> PartialResolvedConfig {
             patch.session.get_or_insert_default().overflow_margin_tokens = Some(parsed);
         }
     }
-    if let Ok(value) = env::var("MOYAI_AUTO_COMPACT_ENABLED") {
-        if let Ok(parsed) = value.parse() {
-            patch.session.get_or_insert_default().auto_compact_enabled = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_AUTO_COMPACT_KEEP_RECENT") {
-        if let Ok(parsed) = value.parse::<usize>() {
-            patch
-                .session
-                .get_or_insert_default()
-                .auto_compact_keep_recent = Some(parsed.max(1));
-        }
-    }
-
     patch
 }
 
@@ -536,6 +485,7 @@ mod tests {
         assert!(text.contains("base_url = \"http://127.0.0.1:8123\""));
         assert!(text.contains("base_url = \"http://127.0.0.1:8123/mcp\""));
         assert!(text.contains("[permissions]"));
+        assert!(!text.contains("[agent]"));
         toml::from_str::<PartialResolvedConfig>(&text).expect("generated config parses");
     }
 
@@ -578,6 +528,40 @@ mod tests {
 
         assert_eq!(config.model.model, "global-model");
         assert_eq!(config.model.base_url, "http://global");
+    }
+
+    #[test]
+    fn legacy_agent_section_is_ignored_when_loading_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 path");
+        fs::write(
+            &path,
+            "[model]\nmodel = \"current-model\"\n\n[agent]\nduplicate_success_abort_threshold = 99\nstaged_task_recovery_stall_threshold = 77\n",
+        )
+        .expect("legacy config");
+
+        let config = ConfigLoader::load_with_global_path(path, None).expect("load legacy config");
+
+        assert_eq!(config.model.model, "current-model");
+    }
+
+    #[test]
+    fn concurrent_default_config_creation_is_noclobbering() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 path");
+        let handles = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || write_default_global_config_if_missing(&path))
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().expect("writer thread").expect("write config");
+        }
+
+        let text = fs::read_to_string(&path).expect("read config");
+        toml::from_str::<PartialResolvedConfig>(&text).expect("complete config");
     }
 }
 
