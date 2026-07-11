@@ -2,18 +2,18 @@ use std::fs;
 
 use crate::error::SessionError;
 use crate::protocol::{
-    CompactionMode, HistoryItem, HistoryItemId, HistoryItemPayload, ProtocolEventStore,
-    RuntimeEvent, RuntimeEventId, RuntimeEventMsg, SteerTurn, TurnId, TurnItem, TurnItemId,
-    TurnItemPayload, TurnTerminalStatus, UserTurn,
+    HistoryItem, HistoryItemId, HistoryItemPayload, ProtocolEventStore, RuntimeEvent,
+    RuntimeEventId, RuntimeEventMsg, SteerTurn, TurnId, TurnItem, TurnItemId, TurnItemPayload,
+    TurnTerminalStatus, UserTurn,
 };
 use crate::runtime::{Clock, SystemClock};
 use crate::session::{
     CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionRead, CanonicalTurnPage,
-    ContinuationContract, IdleTurnAdmission, IdleTurnRejectionReason, LoadedSessionList,
-    LoadedSessionStatus, LoadedSessionSummary, MessageMetadata, MessagePart, MessageRole,
-    NewMessage, NewPart, NewSession, PartKind, ProjectId, ProjectRecord, ProjectRepository,
-    RunEvent, RunningSessionRejoin, SessionCompactResult, SessionContext, SessionForkResult,
-    SessionId, SessionMemoryMode, SessionMemoryModeUpdate, SessionRecord, SessionRepository,
+    IdleTurnAdmission, IdleTurnRejectionReason, LoadedSessionList, LoadedSessionStatus,
+    LoadedSessionSummary, MessageMetadata, MessagePart, MessageRole, NewMessage, NewPart,
+    NewSession, PartKind, ProjectId, ProjectRecord, ProjectRepository, RunEvent,
+    RunningSessionRejoin, SessionCompactResult, SessionContext, SessionForkResult, SessionId,
+    SessionMemoryMode, SessionMemoryModeUpdate, SessionRecord, SessionRepository,
     SessionRollbackResult, SessionSelector, SessionSettingsPatch, SessionSettingsUpdate,
     SessionStartRequest, SessionStateSnapshot, SessionStatus, SessionTitleUpdate, Transcript,
     UserMessageMeta, transcript_from_history_items,
@@ -37,7 +37,7 @@ impl SessionService {
         workspace: Workspace,
     ) -> Result<SessionContext, SessionError> {
         let repository = self.store.session_repo();
-        let session = match request.selector {
+        let session = match &request.selector {
             SessionSelector::New => {
                 let title = request.title.unwrap_or_else(|| "New Session".to_string());
                 repository
@@ -51,14 +51,15 @@ impl SessionService {
                     })
                     .await?
             }
-            SessionSelector::ById(id) => repository.get_session(id).await?,
-            SessionSelector::Latest => repository
-                .latest_session(workspace.project_id)
+            SessionSelector::ById(_) | SessionSelector::Latest => self
+                .resolve_session_for_workspace(&request.selector, &workspace)
                 .await?
                 .ok_or_else(|| SessionError::Message("no recent session exists".to_string()))?,
         };
 
-        if session.status == SessionStatus::Running {
+        if self.store.active_runs().is_active(session.id)
+            || repository.has_fresh_run_admission(session.id).await?
+        {
             return Err(SessionError::Message(format!(
                 "session {} is already running; use cancel or an active-turn steer/rejoin surface instead of starting a replacement run",
                 session.id
@@ -74,9 +75,32 @@ impl SessionService {
         })
     }
 
+    pub async fn resolve_session_for_workspace(
+        &self,
+        selector: &SessionSelector,
+        workspace: &Workspace,
+    ) -> Result<Option<SessionRecord>, SessionError> {
+        let repository = self.store.session_repo();
+        let session = match selector {
+            SessionSelector::New => None,
+            SessionSelector::ById(id) => Some(repository.get_session(*id).await?),
+            SessionSelector::Latest => repository.latest_session(workspace.project_id).await?,
+        };
+        if let Some(session) = &session
+            && session.project_id != workspace.project_id
+        {
+            return Err(SessionError::Message(format!(
+                "session {} belongs to project {}, not the current workspace project {}; reopen its workspace before resuming it",
+                session.id, session.project_id, workspace.project_id
+            )));
+        }
+        Ok(session)
+    }
+
     pub async fn store_user_thread_op_with_protocol_bundle(
         &self,
         ctx: &SessionContext,
+        admission_id: &str,
         turn: &UserTurn,
         requested_model: Option<String>,
         initial_state: SessionStateSnapshot,
@@ -112,6 +136,7 @@ impl SessionService {
                         editor_context: turn.editor_context.clone(),
                     }),
                 },
+                admission_id,
                 parts,
                 &initial_state,
                 turn,
@@ -135,21 +160,25 @@ impl SessionService {
         session_id: crate::session::SessionId,
         reason: &str,
     ) -> Result<bool, SessionError> {
+        let cancelled_live_run = self.store.active_runs().cancel(session_id);
         let session = self.store.session_repo().get_session(session_id).await?;
-        if session.status != SessionStatus::Running {
-            return Ok(false);
+        if !matches!(
+            session.status,
+            SessionStatus::Running | SessionStatus::AwaitingUser
+        ) {
+            return Ok(cancelled_live_run);
         }
-        self.terminalize_running_session(
-            session_id,
-            SessionStatus::Cancelled,
-            RunEvent::SessionInterrupted {
+        let terminalized = self
+            .terminalize_running_session(
                 session_id,
-                reason: reason.to_string(),
-            },
-            reason,
-        )
-        .await?;
-        Ok(true)
+                SessionStatus::Cancelled,
+                RunEvent::SessionInterrupted {
+                    session_id,
+                    reason: reason.to_string(),
+                },
+            )
+            .await?;
+        Ok(cancelled_live_run || terminalized)
     }
 
     pub async fn interrupt_running_session(
@@ -195,94 +224,24 @@ impl SessionService {
         })
     }
 
-    pub async fn validate_active_turn_steer(
-        &self,
-        session_id: crate::session::SessionId,
-        expected_turn_id: TurnId,
-    ) -> Result<TurnId, SessionError> {
-        let session = self.store.session_repo().get_session(session_id).await?;
-        if session.status != SessionStatus::Running {
-            return Err(SessionError::Message(format!(
-                "no active running turn to steer for session {}; current status is {}",
-                session.id,
-                session.status.key()
-            )));
-        }
-        let Some((active_turn_id, _sequence_no)) = self
-            .store
-            .protocol_event_store()
-            .latest_turn_position_for_session(session_id)
-            .map_err(|error| SessionError::Message(error.to_string()))?
-        else {
-            return Err(SessionError::Message(format!(
-                "running session {} has no recorded active turn to steer",
-                session.id
-            )));
-        };
-        if active_turn_id != expected_turn_id {
-            return Err(SessionError::Message(format!(
-                "expected active turn id `{}` but current active turn id is `{}`",
-                expected_turn_id, active_turn_id
-            )));
-        }
-        Ok(active_turn_id)
-    }
-
     pub async fn store_active_turn_steer(
         &self,
         session_id: crate::session::SessionId,
         steer: &SteerTurn,
     ) -> Result<(), SessionError> {
-        self.validate_active_turn_steer(session_id, steer.expected_turn_id)
-            .await?;
-        let (_, sequence_no) = self
+        let history_item_id = self
             .store
-            .protocol_event_store()
-            .latest_turn_position_for_session(session_id)
-            .map_err(|error| SessionError::Message(error.to_string()))?
-            .ok_or_else(|| {
-                SessionError::Message(format!(
-                    "running session {} has no recorded active turn to steer",
-                    session_id
-                ))
-            })?;
-        let now = SystemClock.now_ms();
-        let history_item = HistoryItem {
-            id: HistoryItemId::new(),
-            session_id,
-            turn_id: steer.expected_turn_id,
-            sequence_no,
-            created_at_ms: now,
-            payload: HistoryItemPayload::SteerTurn {
-                expected_turn_id: steer.expected_turn_id,
-                content: steer.content_parts(),
-                additional_context: steer.additional_context.clone(),
-                client_user_message_id: steer.client_user_message_id.clone(),
-            },
-        };
-        let turn_item = TurnItem {
-            id: TurnItemId::new(),
-            session_id,
-            turn_id: steer.expected_turn_id,
-            source_item_id: Some(history_item.id),
-            sequence_no,
-            payload: TurnItemPayload::SteerMessage { text: steer.text() },
-        };
-        let event = RuntimeEvent {
-            id: RuntimeEventId::new(),
-            session_id,
-            turn_id: steer.expected_turn_id,
-            sequence_no,
-            created_at_ms: now,
-            msg: RuntimeEventMsg::SteerInputAccepted {
-                item_count: steer.items.len(),
-                client_user_message_id: steer.client_user_message_id.clone(),
-            },
-        };
-        self.store
-            .protocol_event_store()
-            .append_event_bundle(&event, Some(&history_item), Some(&turn_item))
-            .map_err(|error| SessionError::Message(error.to_string()))?;
+            .session_repo()
+            .accept_active_turn_steer(session_id, steer)
+            .await?;
+        if self.store.active_runs().is_active(session_id) {
+            let _ = self.store.active_runs().enqueue_steer(
+                session_id,
+                steer.expected_turn_id,
+                history_item_id,
+                steer.clone(),
+            );
+        }
         Ok(())
     }
 
@@ -308,22 +267,36 @@ impl SessionService {
         session_id: SessionId,
         status: SessionStatus,
         event: RunEvent,
-        unfinished_tool_reason: &str,
-    ) -> Result<(), SessionError> {
-        let (turn_id, sequence_no) = self
+    ) -> Result<bool, SessionError> {
+        let active_turn_id = self
+            .store
+            .session_repo()
+            .active_turn_for_session(session_id)
+            .await?;
+        let latest_turn_position = self
             .store
             .protocol_event_store()
-            .latest_turn_position_for_session(session_id)?
-            .unwrap_or_else(|| (TurnId::new(), 0));
-        self.store
+            .latest_turn_position_for_session(session_id)?;
+        let (turn_id, sequence_no) = match (active_turn_id, latest_turn_position) {
+            (Some(turn_id), Some((latest_turn_id, sequence_no))) if latest_turn_id == turn_id => {
+                (turn_id, sequence_no)
+            }
+            (Some(turn_id), _) => (turn_id, 0),
+            (None, Some(position)) => position,
+            (None, None) => (TurnId::new(), 0),
+        };
+        let terminalized = self
+            .store
             .session_repo()
-            .set_status_with_protocol_event(session_id, status, &event, turn_id, Some(sequence_no))
+            .terminalize_active_session_with_protocol_event(
+                session_id,
+                status,
+                &event,
+                turn_id,
+                Some(sequence_no),
+            )
             .await?;
-        self.store
-            .session_repo()
-            .fail_unfinished_tool_calls(session_id, unfinished_tool_reason)
-            .await?;
-        Ok(())
+        Ok(terminalized)
     }
 
     pub async fn load_state(
@@ -393,6 +366,20 @@ impl SessionService {
         session_id: SessionId,
         archived: bool,
     ) -> Result<SessionRecord, SessionError> {
+        if archived {
+            let session = self.store.session_repo().get_session(session_id).await?;
+            if self.store.active_runs().is_active(session_id)
+                || matches!(
+                    session.status,
+                    SessionStatus::Running | SessionStatus::AwaitingUser
+                )
+            {
+                return Err(SessionError::Message(format!(
+                    "session {} is active; stop it before archiving it",
+                    session.id
+                )));
+            }
+        }
         Ok(self
             .store
             .session_repo()
@@ -411,10 +398,16 @@ impl SessionService {
             ));
         }
         let session = self.store.session_repo().get_session(session_id).await?;
-        if session.status == SessionStatus::Running {
+        if self.store.active_runs().is_active(session_id)
+            || matches!(
+                session.status,
+                SessionStatus::Running | SessionStatus::AwaitingUser
+            )
+        {
             return Err(SessionError::Message(format!(
-                "session {} is running; settings update requires an idle or terminal session",
-                session.id
+                "session {} is {}; settings update requires an idle or terminal session",
+                session.id,
+                session.status.key()
             )));
         }
         let normalized = normalize_session_settings_patch(patch)?;
@@ -477,7 +470,10 @@ impl SessionService {
             ));
         }
         let session = self.store.session_repo().get_session(session_id).await?;
-        if session.status == SessionStatus::Running {
+        if matches!(
+            session.status,
+            SessionStatus::Running | SessionStatus::AwaitingUser
+        ) {
             return Err(SessionError::Message(format!(
                 "session {} is running; rollback requires cancelling or completing the active turn first",
                 session.id
@@ -636,81 +632,24 @@ impl SessionService {
     pub async fn compact_session(
         &self,
         session_id: SessionId,
-        keep_recent: usize,
+        _keep_recent: usize,
     ) -> Result<SessionCompactResult, SessionError> {
-        if keep_recent == 0 {
-            return Err(SessionError::Message(
-                "session compact --keep-recent must be greater than zero".to_string(),
-            ));
-        }
         let session = self.store.session_repo().get_session(session_id).await?;
-        let history = self.canonical_history_items(session_id).await?;
-        if history.len() <= keep_recent {
+        if self.store.active_runs().is_active(session_id)
+            || matches!(
+                session.status,
+                SessionStatus::Running | SessionStatus::AwaitingUser
+            )
+        {
             return Err(SessionError::Message(format!(
-                "session {} has {} canonical history item(s); compact requires more than --keep-recent {}",
-                session.id,
-                history.len(),
-                keep_recent
+                "session {} is active; stop the run before requesting compaction",
+                session.id
             )));
         }
-        let summarized_count = history.len() - keep_recent;
-        let summarized_ids = history
-            .iter()
-            .take(summarized_count)
-            .map(|item| item.id)
-            .collect::<Vec<_>>();
-        let continuation = compact_continuation_from_state(&self.load_state(session_id).await?);
-        let summary = manual_compaction_summary(&session, summarized_count, keep_recent);
-        let (turn_id, sequence_no) = self
-            .store
-            .protocol_event_store()
-            .latest_turn_position_for_session(session_id)?
-            .unwrap_or_else(|| (TurnId::new(), 0));
-        let now = SystemClock.now_ms();
-        let history_item = HistoryItem {
-            id: HistoryItemId::new(),
-            session_id,
-            turn_id,
-            sequence_no,
-            created_at_ms: now,
-            payload: HistoryItemPayload::Compaction {
-                mode: CompactionMode::Manual,
-                summary: summary.clone(),
-                replacement_item_ids: summarized_ids,
-                continuation,
-            },
-        };
-        let turn_item = TurnItem {
-            id: TurnItemId::new(),
-            session_id,
-            turn_id,
-            source_item_id: Some(history_item.id),
-            sequence_no,
-            payload: TurnItemPayload::ContextCompaction {
-                summary: summary.clone(),
-            },
-        };
-        let event = RuntimeEvent {
-            id: RuntimeEventId::new(),
-            session_id,
-            turn_id,
-            sequence_no,
-            created_at_ms: now,
-            msg: RuntimeEventMsg::ContextCompacted {
-                item_id: history_item.id,
-                mode: CompactionMode::Manual,
-            },
-        };
-        self.store
-            .protocol_event_store()
-            .append_event_bundle(&event, Some(&history_item), Some(&turn_item))
-            .map_err(|error| SessionError::Message(error.to_string()))?;
-        Ok(SessionCompactResult {
-            session,
-            compaction_item_id: history_item.id,
-            summarized_history_items: summarized_count,
-            retained_history_items: keep_recent,
-        })
+        Err(SessionError::Message(
+            "semantic session compaction is unavailable; history was left unchanged. Start a new session, reduce attached context, or split the task instead"
+                .to_string(),
+        ))
     }
 
     pub async fn list_recent_sessions(
@@ -731,11 +670,47 @@ impl SessionService {
         include_archived: bool,
     ) -> Result<LoadedSessionList, SessionError> {
         let sessions = self
-            .list_sessions_with_archived(project_id, limit, include_archived)
+            .store
+            .session_repo()
+            .list_sessions_with_projection_state(project_id, limit, include_archived)
             .await?;
         let mut summaries = Vec::with_capacity(sessions.len());
-        for session in sessions {
-            summaries.push(self.loaded_session_summary(session).await?);
+        for (session, archived, memory_mode) in sessions {
+            summaries.push(
+                self.loaded_session_summary_with_projection_state(session, archived, memory_mode)
+                    .await?,
+            );
+        }
+        Ok(LoadedSessionList {
+            project_id,
+            include_archived,
+            sessions: summaries,
+        })
+    }
+
+    pub async fn search_loaded_sessions(
+        &self,
+        project_id: ProjectId,
+        query: &str,
+        limit: usize,
+        include_archived: bool,
+    ) -> Result<LoadedSessionList, SessionError> {
+        if query.trim().is_empty() {
+            return self
+                .loaded_sessions(project_id, limit, include_archived)
+                .await;
+        }
+        let sessions = self
+            .store
+            .session_repo()
+            .search_sessions_with_projection_state(project_id, query, limit, include_archived)
+            .await?;
+        let mut summaries = Vec::with_capacity(sessions.len());
+        for (session, archived, memory_mode) in sessions {
+            summaries.push(
+                self.loaded_session_summary_with_projection_state(session, archived, memory_mode)
+                    .await?,
+            );
         }
         Ok(LoadedSessionList {
             project_id,
@@ -747,6 +722,21 @@ impl SessionService {
     pub async fn loaded_session_summary(
         &self,
         session: SessionRecord,
+    ) -> Result<LoadedSessionSummary, SessionError> {
+        let (archived, memory_mode) = self
+            .store
+            .session_repo()
+            .session_projection_state(session.id)
+            .await?;
+        self.loaded_session_summary_with_projection_state(session, archived, memory_mode)
+            .await
+    }
+
+    async fn loaded_session_summary_with_projection_state(
+        &self,
+        session: SessionRecord,
+        archived: bool,
+        memory_mode: SessionMemoryMode,
     ) -> Result<LoadedSessionSummary, SessionError> {
         let is_active = matches!(
             session.status,
@@ -762,6 +752,8 @@ impl SessionService {
         };
         Ok(LoadedSessionSummary {
             loaded_status: loaded_status_from_session_status(session.status),
+            archived,
+            memory_mode,
             active_turn_id: active_turn_position.map(|(turn_id, _)| turn_id),
             active_turn_sequence_no: active_turn_position.map(|(_, sequence_no)| sequence_no),
             pending_permission_requests: 0,
@@ -813,10 +805,42 @@ impl SessionService {
     }
 
     pub async fn delete_session(&self, session_id: SessionId) -> Result<(), SessionError> {
+        let session = self.store.session_repo().get_session(session_id).await?;
+        if self.store.active_runs().is_active(session_id)
+            || matches!(
+                session.status,
+                SessionStatus::Running | SessionStatus::AwaitingUser
+            )
+        {
+            return Err(SessionError::Message(format!(
+                "session {} is active; stop it before deleting it",
+                session.id
+            )));
+        }
         Ok(self.store.session_repo().delete_session(session_id).await?)
     }
 
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), SessionError> {
+        let mut active_session_id = self
+            .store
+            .session_repo()
+            .active_session_for_project(project_id)
+            .await?;
+        if active_session_id.is_none() {
+            for session_id in self.store.active_runs().active_session_ids() {
+                let session = self.store.session_repo().get_session(session_id).await?;
+                if session.project_id == project_id {
+                    active_session_id = Some(session_id);
+                    break;
+                }
+            }
+        }
+        if let Some(session_id) = active_session_id {
+            return Err(SessionError::Message(format!(
+                "project {} contains active session {}; stop it before deleting the project",
+                project_id, session_id
+            )));
+        }
         Ok(self.store.project_repo().delete_project(project_id).await?)
     }
 
@@ -1081,59 +1105,6 @@ fn normalize_session_interrupt_reason(reason: String) -> String {
     }
 }
 
-fn manual_compaction_summary(
-    session: &SessionRecord,
-    summarized_history_items: usize,
-    retained_history_items: usize,
-) -> String {
-    let snapshot_kind = if matches!(
-        session.status,
-        SessionStatus::Running | SessionStatus::AwaitingUser
-    ) {
-        "Active live-turn manual compaction snapshot"
-    } else {
-        "Manual compaction snapshot"
-    };
-    format!(
-        "Summarized history items: {summarized_history_items}.\nContinuation invariant: CompactionContinuity.\nRetained recent history items: {retained_history_items}.\n{snapshot_kind} for session `{}`.",
-        session.title
-    )
-}
-
-fn compact_continuation_from_state(state: &SessionStateSnapshot) -> Option<ContinuationContract> {
-    let has_payload = !state.active_targets.is_empty()
-        || !state.verification.required_commands.is_empty()
-        || state.failure.is_some()
-        || state.completion.blocked_reason.is_some();
-    if !has_payload {
-        return None;
-    }
-    Some(ContinuationContract {
-        route: state.route.key().to_string(),
-        process_phase: state.process_phase.key().to_string(),
-        active_work_kind: Some("manual_compaction_continuity".to_string()),
-        active_work_summary: state.completion.blocked_reason.clone().or_else(|| {
-            state
-                .failure
-                .as_ref()
-                .map(|failure| failure.summary.clone())
-        }),
-        target_files: state.active_targets.clone(),
-        verification_commands: state.verification.required_commands.clone(),
-        failure_kind: state
-            .failure
-            .as_ref()
-            .map(|failure| format!("{:?}", failure.kind)),
-        failure_summary: state
-            .failure
-            .as_ref()
-            .map(|failure| failure.summary.clone()),
-        completion_blocker: state.completion.blocked_reason.clone(),
-        invariant_refs: vec!["CompactionContinuity".to_string()],
-        ..ContinuationContract::default()
-    })
-}
-
 trait NonEmptySetting {
     fn transpose_non_empty(self, label: &str) -> Result<Option<String>, SessionError>;
 }
@@ -1150,4 +1121,350 @@ impl NonEmptySetting for Option<String> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::config::{AccessMode, ResolvedConfig};
+    use crate::protocol::UserInputItem;
+    use crate::storage::{SqliteStore, StoragePaths};
+    use crate::workspace::WorkspaceDiscovery;
+
+    async fn service_fixture() -> (SessionService, Workspace, Workspace) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8PathBuf::from_path_buf(temp.keep()).expect("utf8 root");
+        let first_root = root.join("first");
+        let second_root = root.join("second");
+        fs::create_dir_all(first_root.as_std_path()).expect("first root");
+        fs::create_dir_all(second_root.as_std_path()).expect("second root");
+        let paths = StoragePaths {
+            data_dir: root.join("data"),
+            database_path: root.join("data/moyai.sqlite3"),
+            truncation_dir: root.join("data/truncation"),
+        };
+        let sqlite = SqliteStore::open(&paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let config = ResolvedConfig::default();
+        let first = WorkspaceDiscovery::discover_fixed_root(&first_root, &config).expect("first");
+        let second =
+            WorkspaceDiscovery::discover_fixed_root(&second_root, &config).expect("second");
+        for workspace in [&first, &second] {
+            store
+                .project_repo()
+                .upsert_project(workspace.project_id, &workspace.root, "test", "none")
+                .await
+                .expect("project");
+        }
+        (SessionService::new(store), first, second)
+    }
+
+    async fn create_session(service: &SessionService, workspace: &Workspace) -> SessionContext {
+        service
+            .start_or_resume(
+                SessionStartRequest {
+                    selector: SessionSelector::New,
+                    title: Some("test".to_string()),
+                    cwd: workspace.cwd.clone(),
+                    model: "model".to_string(),
+                    base_url: "http://localhost:1234".to_string(),
+                    access_mode: AccessMode::Default,
+                },
+                workspace.clone(),
+            )
+            .await
+            .expect("session")
+    }
+
+    fn turn_context(session_id: SessionId, workspace: &Workspace) -> crate::protocol::TurnContext {
+        crate::protocol::TurnContext {
+            session_id,
+            cwd: workspace.cwd.clone(),
+            workspace_root: workspace.root.clone(),
+            provider: "test".to_string(),
+            model: "model".to_string(),
+            base_url: "http://localhost:1234".to_string(),
+            access_mode: AccessMode::Default,
+            sandbox: crate::protocol::SandboxProfile::WorkspaceWrite,
+            shell_family: crate::config::ShellFamily::PowerShell,
+            model_capabilities: crate::protocol::ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
+                parallel_tool_calls: false,
+                context_window: 8192,
+                max_output_tokens: 1024,
+            },
+            route: crate::session::TaskRoute::Code,
+            process_phase: crate::session::ProcessPhase::Discover,
+            active_contract: crate::protocol::ActiveWorkContractProjection {
+                route: crate::session::TaskRoute::Code,
+                process_phase: crate::session::ProcessPhase::Discover,
+                active_work_kind: None,
+                summary: "test".to_string(),
+                active_targets: Vec::new(),
+                operation_intents: Vec::new(),
+                required_verification_commands: Vec::new(),
+                allowed_tools: Vec::new(),
+                forbidden_tools: Vec::new(),
+                projection_id: crate::protocol::ProjectionId::new(),
+            },
+            allowed_tools: Vec::new(),
+            tool_choice: crate::protocol::ToolChoice::Auto,
+            images: Vec::new(),
+            output_contract: crate::protocol::OutputContract {
+                final_answer_required: true,
+                structured_schema_name: None,
+                history_markdown_projection: true,
+            },
+            continuation: None,
+            turn_decision_projection: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_a_session_from_another_workspace_project() {
+        let (service, first, second) = service_fixture().await;
+        let session = create_session(&service, &first).await;
+
+        let error = service
+            .resolve_session_for_workspace(&SessionSelector::ById(session.session.id), &second)
+            .await
+            .expect_err("foreign workspace must fail");
+
+        assert!(error.to_string().contains("belongs to project"));
+        assert!(error.to_string().contains("reopen its workspace"));
+    }
+
+    #[tokio::test]
+    async fn active_run_blocks_session_project_delete_and_manual_compaction() {
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let token = CancellationToken::new();
+        let _lease = service
+            .store
+            .active_runs()
+            .try_start(session.session.id, token)
+            .expect("active run");
+
+        assert!(service.delete_session(session.session.id).await.is_err());
+        assert!(service.delete_project(workspace.project_id).await.is_err());
+        assert!(
+            service
+                .compact_session(session.session.id, 20)
+                .await
+                .is_err()
+        );
+        assert!(service.get_session(session.session.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn disabled_compaction_preserves_canonical_history() {
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let turn_id = TurnId::new();
+        let user_turn = UserTurn {
+            turn_id,
+            items: vec![UserInputItem::Text {
+                text: "keep this history".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            context: turn_context(session.session.id, &workspace),
+        };
+        let admission_id = service
+            .store
+            .session_repo()
+            .admit_session_run(session.session.id)
+            .await
+            .expect("admit run")
+            .expect("run admitted");
+        service
+            .store_user_thread_op_with_protocol_bundle(
+                &session,
+                &admission_id,
+                &user_turn,
+                None,
+                SessionStateSnapshot::default(),
+                turn_id,
+                0,
+            )
+            .await
+            .expect("store user");
+        service
+            .store
+            .session_repo()
+            .terminalize_active_session_with_protocol_event(
+                session.session.id,
+                SessionStatus::Completed,
+                &RunEvent::SessionCompleted {
+                    session_id: session.session.id,
+                    finish_reason: None,
+                },
+                turn_id,
+                None,
+            )
+            .await
+            .expect("complete session");
+        let before = service
+            .canonical_history_items(session.session.id)
+            .await
+            .expect("before");
+
+        let error = service
+            .compact_session(session.session.id, 1)
+            .await
+            .expect_err("compaction unavailable");
+        let after = service
+            .canonical_history_items(session.session.id)
+            .await
+            .expect("after");
+
+        assert!(error.to_string().contains("history was left unchanged"));
+        assert_eq!(
+            before.iter().map(|item| item.id).collect::<Vec<_>>(),
+            after.iter().map(|item| item.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_history_queues_steer_for_a_run_owned_by_another_process() {
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let turn_id = TurnId::new();
+        let user_turn = UserTurn {
+            turn_id,
+            items: vec![UserInputItem::Text {
+                text: "start".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+            context: turn_context(session.session.id, &workspace),
+        };
+        let admission_id = service
+            .store
+            .session_repo()
+            .admit_session_run(session.session.id)
+            .await
+            .expect("admit run")
+            .expect("run admitted");
+        service
+            .store_user_thread_op_with_protocol_bundle(
+                &session,
+                &admission_id,
+                &user_turn,
+                None,
+                SessionStateSnapshot::default(),
+                turn_id,
+                0,
+            )
+            .await
+            .expect("store user");
+        assert_eq!(
+            service
+                .store
+                .session_repo()
+                .get_session(session.session.id)
+                .await
+                .expect("running session")
+                .status,
+            SessionStatus::Running
+        );
+        let steer = SteerTurn {
+            expected_turn_id: turn_id,
+            items: vec![UserInputItem::Text {
+                text: "steer from another process".to_string(),
+            }],
+            additional_context: Default::default(),
+            client_user_message_id: Some("cross-process".to_string()),
+        };
+
+        service
+            .store_active_turn_steer(session.session.id, &steer)
+            .await
+            .expect("queue steer");
+        let history = service
+            .canonical_history_items(session.session.id)
+            .await
+            .expect("history");
+
+        assert!(history.iter().any(|item| matches!(
+            &item.payload,
+            HistoryItemPayload::SteerTurn { client_user_message_id, .. }
+                if client_user_message_id.as_deref() == Some("cross-process")
+        )));
+    }
+
+    #[tokio::test]
+    async fn active_archive_is_rejected_while_projection_and_unarchive_remain_consistent() {
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        service
+            .update_session_memory_mode(session.session.id, SessionMemoryMode::Disabled)
+            .await
+            .expect("disable memory");
+        service
+            .set_session_archived(session.session.id, true)
+            .await
+            .expect("archive idle session");
+        service
+            .store
+            .session_repo()
+            .admit_session_run(session.session.id)
+            .await
+            .expect("admit run")
+            .expect("run owner");
+
+        let visible = service
+            .loaded_sessions(workspace.project_id, 20, true)
+            .await
+            .expect("loaded projection");
+        let summary = visible
+            .sessions
+            .iter()
+            .find(|summary| summary.session.id == session.session.id)
+            .expect("active archived summary");
+        assert_eq!(summary.loaded_status, LoadedSessionStatus::Active);
+        assert!(summary.archived);
+        assert_eq!(summary.memory_mode, SessionMemoryMode::Disabled);
+        let searched = service
+            .search_loaded_sessions(workspace.project_id, "test", 20, true)
+            .await
+            .expect("atomic search projection");
+        let searched_summary = searched
+            .sessions
+            .iter()
+            .find(|summary| summary.session.id == session.session.id)
+            .expect("searched archived summary");
+        assert!(searched_summary.archived);
+        assert_eq!(searched_summary.memory_mode, SessionMemoryMode::Disabled);
+        assert!(
+            service
+                .loaded_sessions(workspace.project_id, 20, false)
+                .await
+                .expect("filtered projection")
+                .sessions
+                .iter()
+                .all(|summary| summary.session.id != session.session.id)
+        );
+
+        let error = service
+            .set_session_archived(session.session.id, true)
+            .await
+            .expect_err("active session cannot be archived");
+        assert!(error.to_string().contains("active"));
+
+        service
+            .set_session_archived(session.session.id, false)
+            .await
+            .expect("active archived session can be recovered");
+        let (archived, memory_mode) = service
+            .store
+            .session_repo()
+            .session_projection_state(session.session.id)
+            .await
+            .expect("projection state");
+        assert!(!archived);
+        assert_eq!(memory_mode, SessionMemoryMode::Disabled);
+    }
+}

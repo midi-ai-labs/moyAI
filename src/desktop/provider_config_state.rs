@@ -8,6 +8,7 @@ use super::state::{initial_provider_model_infos, initial_provider_models};
 pub struct DesktopProviderConfigState {
     pub effective_config: ResolvedConfig,
     pub config_editor: ConfigEditorState,
+    pub config_generation: u64,
     pub config_value_text: String,
     pub provider_base_url_input: String,
     pub provider_models: Vec<String>,
@@ -38,6 +39,7 @@ impl DesktopProviderConfigState {
         Self {
             effective_config,
             config_editor,
+            config_generation: 1,
             config_value_text,
             provider_base_url_input: String::new(),
             provider_models,
@@ -53,6 +55,7 @@ impl DesktopProviderConfigState {
     }
 
     pub fn replace_effective_config(&mut self, config: ResolvedConfig) {
+        self.config_generation = self.config_generation.saturating_add(1);
         self.effective_config = config.clone();
         self.config_editor = ConfigEditorState::from_config(&config);
         self.config_value_text = self.config_editor.selected_field().value.clone();

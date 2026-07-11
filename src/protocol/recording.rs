@@ -7,6 +7,7 @@ pub struct ProtocolRecordingSink<'a, S: RunEventSink + ?Sized> {
     store: crate::protocol::SqliteProtocolEventStore,
     fallback_session_id: Option<SessionId>,
     turn_id: TurnId,
+    admission_id: Option<String>,
     next_sequence_no: i64,
     runtime_event_publisher: Option<SessionRuntimeEventPublisher>,
     inner: &'a mut S,
@@ -23,6 +24,7 @@ impl<'a, S: RunEventSink + ?Sized> ProtocolRecordingSink<'a, S> {
             store,
             fallback_session_id,
             turn_id,
+            admission_id: None,
             next_sequence_no: 0,
             runtime_event_publisher: None,
             inner,
@@ -31,6 +33,11 @@ impl<'a, S: RunEventSink + ?Sized> ProtocolRecordingSink<'a, S> {
 
     pub fn with_runtime_event_publisher(mut self, publisher: SessionRuntimeEventPublisher) -> Self {
         self.runtime_event_publisher = Some(publisher);
+        self
+    }
+
+    pub fn with_admission_id(mut self, admission_id: impl Into<String>) -> Self {
+        self.admission_id = Some(admission_id.into());
         self
     }
 
@@ -73,17 +80,34 @@ impl<S: RunEventSink + ?Sized> RunEventSink for ProtocolRecordingSink<'_, S> {
             self.turn_id,
             self.next_sequence_no,
         ) {
-            self.store
-                .append_event_bundle(
-                    &projection.runtime_event,
-                    projection.history_item.as_ref(),
-                    projection.turn_item.as_ref(),
-                )
-                .map_err(runtime_error)?;
+            let stored = if let Some(admission_id) = &self.admission_id {
+                self.store
+                    .append_admitted_event_bundle_allocating(
+                        admission_id,
+                        &projection.runtime_event,
+                        projection.history_item.as_ref(),
+                        projection.turn_item.as_ref(),
+                    )
+                    .map_err(runtime_error)?
+                    .ok_or_else(|| {
+                        RuntimeError::Message(format!(
+                            "run admission {admission_id} no longer owns protocol turn {}",
+                            self.turn_id
+                        ))
+                    })?
+            } else {
+                self.store
+                    .append_event_bundle_allocating(
+                        &projection.runtime_event,
+                        projection.history_item.as_ref(),
+                        projection.turn_item.as_ref(),
+                    )
+                    .map_err(runtime_error)?
+            };
             if let Some(publisher) = &self.runtime_event_publisher {
-                publisher.publish(projection.runtime_event.clone())?;
+                publisher.publish(stored.runtime_event.clone())?;
             }
-            self.next_sequence_no += 1;
+            self.next_sequence_no = stored.runtime_event.sequence_no.saturating_add(1);
         }
         self.inner.emit(event)
     }

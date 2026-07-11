@@ -1,17 +1,21 @@
 use std::fs;
-use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use camino::Utf8Path;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::edit::{PatchChunk, PatchOperation, PatchParser, path_for_change_storage};
+use crate::edit::{
+    FileContentIdentity, FormatterExecutionOptions, PatchChunk, PatchOperation, PatchParser,
+    path_for_change_storage,
+};
 use crate::error::ToolError;
 use crate::session::ChangeRepository;
 use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
-use crate::tool::write_support::{to_summary, write_text_file};
+use crate::tool::write_support::{
+    read_text_file_with_identity, to_summary, write_text_file, write_text_file_noclobber,
+};
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
 use crate::workspace::{AccessKind, GuardedPath, PathGuard, is_protected_workspace_authority_path};
 
@@ -66,6 +70,7 @@ async fn execute_admitted_patch_operations(
     ctx: &mut ToolContext<'_>,
     operations: Vec<PatchOperation>,
 ) -> Result<ToolResult, ToolError> {
+    ctx.run_mutation_fence.assert_owned().await?;
     let admission =
         classify_patch_operations_before_side_effects(ctx, operations.as_slice()).await?;
     if let Some(path) = admission.all_update_operations_no_content_path {
@@ -124,6 +129,7 @@ fn stage_admitted_patch_commit(
                 mutations.push(PatchMutation::Write {
                     path: path.clone(),
                     text: formatted.clone(),
+                    expected_identity: None,
                     rollback: FileRollbackState::Absent,
                 });
                 current_paths.push(path);
@@ -140,6 +146,7 @@ fn stage_admitted_patch_commit(
                 destination,
                 original,
                 formatted,
+                source_identity,
             } => {
                 let stored_source_path =
                     path_for_apply_patch_change_storage(&source_path, &workspace_root);
@@ -148,6 +155,11 @@ fn stage_admitted_patch_commit(
                 mutations.push(PatchMutation::Write {
                     path: destination.clone(),
                     text: formatted.clone(),
+                    expected_identity: if destination == source_path {
+                        Some(source_identity.clone())
+                    } else {
+                        None
+                    },
                     rollback: if destination == source_path {
                         FileRollbackState::Present(original.clone())
                     } else {
@@ -158,6 +170,7 @@ fn stage_admitted_patch_commit(
                 if destination != source_path {
                     mutations.push(PatchMutation::Delete {
                         path: source_path.clone(),
+                        expected_identity: source_identity,
                         rollback: FileRollbackState::Present(original.clone()),
                     });
                     removed_paths.push(source_path.clone());
@@ -170,10 +183,15 @@ fn stage_admitted_patch_commit(
                     Some(&formatted),
                 )
             }
-            AdmittedPatchOperation::Delete { path, original } => {
+            AdmittedPatchOperation::Delete {
+                path,
+                original,
+                identity,
+            } => {
                 let stored_path = path_for_apply_patch_change_storage(&path, &workspace_root);
                 mutations.push(PatchMutation::Delete {
                     path: path.clone(),
+                    expected_identity: identity,
                     rollback: FileRollbackState::Present(original.clone()),
                 });
                 removed_paths.push(path);
@@ -212,7 +230,8 @@ async fn commit_admitted_patch(
         .edit_safety
         .snapshot_path_stamps(session_id, &baseline_paths);
 
-    let applied_count = match apply_patch_mutations(&commit.mutations) {
+    ctx.run_mutation_fence.assert_owned().await?;
+    let applied_count = match apply_patch_mutations(&ctx.services.edit_safety, &commit.mutations) {
         Ok(value) => value,
         Err((error, applied_count)) => {
             rollback_patch_commit(&commit.mutations, applied_count, None)?;
@@ -231,6 +250,15 @@ async fn commit_admitted_patch(
             Some((&ctx.services.edit_safety, session_id, &baseline_snapshot)),
         )?;
         return Err(ToolError::from(error));
+    }
+
+    if let Err(error) = ctx.run_mutation_fence.assert_owned().await {
+        rollback_patch_commit(
+            &commit.mutations,
+            applied_count,
+            Some((&ctx.services.edit_safety, session_id, &baseline_snapshot)),
+        )?;
+        return Err(error);
     }
 
     match ctx
@@ -270,10 +298,12 @@ enum AdmittedPatchOperation {
         destination: camino::Utf8PathBuf,
         original: String,
         formatted: String,
+        source_identity: FileContentIdentity,
     },
     Delete {
         path: camino::Utf8PathBuf,
         original: String,
+        identity: FileContentIdentity,
     },
 }
 
@@ -291,10 +321,12 @@ enum PatchMutation {
     Write {
         path: camino::Utf8PathBuf,
         text: String,
+        expected_identity: Option<FileContentIdentity>,
         rollback: FileRollbackState,
     },
     Delete {
         path: camino::Utf8PathBuf,
+        expected_identity: FileContentIdentity,
         rollback: FileRollbackState,
     },
 }
@@ -305,7 +337,13 @@ enum FileRollbackState {
     Present(String),
 }
 
-fn apply_patch_mutations(mutations: &[PatchMutation]) -> Result<usize, (ToolError, usize)> {
+fn apply_patch_mutations(
+    edit_safety: &crate::edit::EditSafety,
+    mutations: &[PatchMutation],
+) -> Result<usize, (ToolError, usize)> {
+    if let Err(error) = validate_patch_mutation_preconditions(edit_safety, mutations) {
+        return Err((error, 0));
+    }
     let mut applied_count = 0;
     for mutation in mutations {
         if let Err(error) = apply_patch_mutation(mutation) {
@@ -318,14 +356,44 @@ fn apply_patch_mutations(mutations: &[PatchMutation]) -> Result<usize, (ToolErro
 
 fn apply_patch_mutation(mutation: &PatchMutation) -> Result<(), ToolError> {
     match mutation {
-        PatchMutation::Write { path, text, .. } => {
+        PatchMutation::Write {
+            path,
+            text,
+            expected_identity,
+            ..
+        } => {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            write_text_file(path, text)?;
+            if expected_identity.is_some() {
+                write_text_file(path, text)?;
+            } else {
+                write_text_file_noclobber(path, text)?;
+            }
         }
         PatchMutation::Delete { path, .. } => {
             fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_patch_mutation_preconditions(
+    edit_safety: &crate::edit::EditSafety,
+    mutations: &[PatchMutation],
+) -> Result<(), ToolError> {
+    for mutation in mutations {
+        match mutation {
+            PatchMutation::Write {
+                path,
+                expected_identity,
+                ..
+            } => edit_safety.assert_path_unchanged(path, expected_identity.as_ref())?,
+            PatchMutation::Delete {
+                path,
+                expected_identity,
+                ..
+            } => edit_safety.assert_path_unchanged(path, Some(expected_identity))?,
         }
     }
     Ok(())
@@ -363,9 +431,8 @@ fn rollback_patch_commit(
 
 fn rollback_patch_mutation(mutation: &PatchMutation) -> Result<(), ToolError> {
     match mutation {
-        PatchMutation::Write { path, rollback, .. } | PatchMutation::Delete { path, rollback } => {
-            restore_file_state(path, rollback)
-        }
+        PatchMutation::Write { path, rollback, .. }
+        | PatchMutation::Delete { path, rollback, .. } => restore_file_state(path, rollback),
     }
 }
 
@@ -424,7 +491,11 @@ async fn classify_patch_operations_before_side_effects(
                 let formatted = ctx
                     .services
                     .formatter
-                    .format_if_configured(&guarded.absolute, normalized)
+                    .format_if_configured(
+                        &guarded.absolute,
+                        normalized.clone(),
+                        formatter_execution_options(ctx, normalized.len()),
+                    )
                     .await?;
                 planned_operations.push(AdmittedPatchOperation::Add {
                     path: guarded.absolute,
@@ -451,18 +522,11 @@ async fn classify_patch_operations_before_side_effects(
                     .map(|target| target.absolute.clone())
                     .unwrap_or_else(|| source_path.clone());
                 validate_move_destination_admission(&source_path, &destination)?;
-                let original = fs::read_to_string(&source_path)?;
-                let metadata = fs::metadata(&source_path)?;
-                let current_mtime_ms = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                    .map(|value| value.as_millis() as i64);
+                let (original, source_identity) = read_text_file_with_identity(&source_path)?;
                 ctx.services.edit_safety.assert_fresh_write(
                     ctx.session.session.id,
                     &source_path,
-                    current_mtime_ms,
-                    Some(metadata.len()),
+                    &source_identity,
                 )?;
                 let patched = PatchParser::apply_to_text(&original, hunks)
                     .map_err(|error| crate::error::EditError::Message(error.to_string()))?;
@@ -474,7 +538,11 @@ async fn classify_patch_operations_before_side_effects(
                 let formatted = ctx
                     .services
                     .formatter
-                    .format_if_configured(&destination, normalized)
+                    .format_if_configured(
+                        &destination,
+                        normalized.clone(),
+                        formatter_execution_options(ctx, normalized.len()),
+                    )
                     .await?;
                 if update_operation_is_no_content(&formatted, &original, &destination, &source_path)
                 {
@@ -492,6 +560,7 @@ async fn classify_patch_operations_before_side_effects(
                     destination,
                     original,
                     formatted,
+                    source_identity,
                 });
             }
             PatchOperation::Delete { path } => {
@@ -500,22 +569,16 @@ async fn classify_patch_operations_before_side_effects(
                 ));
                 saw_non_update = true;
                 let guarded = PathGuard::require_path(ctx.workspace, path, AccessKind::Edit)?;
-                let original = fs::read_to_string(&guarded.absolute)?;
-                let metadata = fs::metadata(&guarded.absolute)?;
-                let current_mtime_ms = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                    .map(|value| value.as_millis() as i64);
+                let (original, identity) = read_text_file_with_identity(&guarded.absolute)?;
                 ctx.services.edit_safety.assert_fresh_write(
                     ctx.session.session.id,
                     &guarded.absolute,
-                    current_mtime_ms,
-                    Some(metadata.len()),
+                    &identity,
                 )?;
                 planned_operations.push(AdmittedPatchOperation::Delete {
                     path: guarded.absolute,
                     original,
+                    identity,
                 });
             }
         }
@@ -538,6 +601,24 @@ fn patch_operation_requires_pre_side_effect_admission(operation: &PatchOperation
         operation,
         PatchOperation::Add { .. } | PatchOperation::Update { .. } | PatchOperation::Delete { .. }
     )
+}
+
+fn formatter_execution_options(
+    ctx: &ToolContext<'_>,
+    input_bytes: usize,
+) -> FormatterExecutionOptions {
+    let output_slack =
+        usize::try_from(ctx.config.file_guard.max_inline_read_bytes).unwrap_or(usize::MAX);
+    FormatterExecutionOptions {
+        workspace_root: ctx.workspace.root.clone(),
+        timeout_ms: ctx
+            .config
+            .shell
+            .default_timeout_ms
+            .min(ctx.config.shell.max_timeout_ms),
+        max_output_bytes: input_bytes.saturating_add(output_slack),
+        cancel: ctx.cancel.clone(),
+    }
 }
 
 fn build_patch_permission_admission(
@@ -948,4 +1029,90 @@ fn starts_with_indentation(line: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use camino::Utf8PathBuf;
+
+    use crate::edit::{EditSafety, read_file_with_identity};
+
+    use super::{FileRollbackState, PatchMutation, apply_patch_mutations};
+
+    #[test]
+    fn mutation_commit_preserves_same_size_external_rewrite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("source.txt")).expect("utf8 path");
+        std::fs::write(&path, "alpha").expect("seed file");
+        let (_, expected_identity) = read_file_with_identity(&path).expect("capture identity");
+        let mutations = vec![PatchMutation::Write {
+            path: path.clone(),
+            text: "agent".to_string(),
+            expected_identity: Some(expected_identity),
+            rollback: FileRollbackState::Present("alpha".to_string()),
+        }];
+
+        std::fs::write(&path, "bravo").expect("external rewrite");
+
+        let (_, applied_count) = apply_patch_mutations(&EditSafety::default(), &mutations)
+            .expect_err("external rewrite must stop the commit");
+        assert_eq!(applied_count, 0);
+        assert_eq!(std::fs::read_to_string(&path).expect("read file"), "bravo");
+    }
+
+    #[test]
+    fn mutation_commit_preserves_externally_created_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("new.txt")).expect("utf8 path");
+        let mutations = vec![PatchMutation::Write {
+            path: path.clone(),
+            text: "agent".to_string(),
+            expected_identity: None,
+            rollback: FileRollbackState::Absent,
+        }];
+        std::fs::write(&path, "external").expect("external create");
+
+        let (_, applied_count) = apply_patch_mutations(&EditSafety::default(), &mutations)
+            .expect_err("external creation must stop the commit");
+        assert_eq!(applied_count, 0);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read file"),
+            "external"
+        );
+    }
+
+    #[test]
+    fn all_preconditions_are_checked_before_first_multi_file_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = Utf8PathBuf::from_path_buf(temp.path().join("first.txt")).expect("utf8 path");
+        let second = Utf8PathBuf::from_path_buf(temp.path().join("second.txt")).expect("utf8 path");
+        std::fs::write(&first, "first-old").expect("seed first");
+        std::fs::write(&second, "second-old").expect("seed second");
+        let (_, first_identity) = read_file_with_identity(&first).expect("first identity");
+        let (_, second_identity) = read_file_with_identity(&second).expect("second identity");
+        let mutations = vec![
+            PatchMutation::Write {
+                path: first.clone(),
+                text: "first-agent".to_string(),
+                expected_identity: Some(first_identity),
+                rollback: FileRollbackState::Present("first-old".to_string()),
+            },
+            PatchMutation::Write {
+                path: second.clone(),
+                text: "second-agent".to_string(),
+                expected_identity: Some(second_identity),
+                rollback: FileRollbackState::Present("second-old".to_string()),
+            },
+        ];
+        std::fs::write(&second, "second-out").expect("external rewrite");
+
+        let (_, applied_count) = apply_patch_mutations(&EditSafety::default(), &mutations)
+            .expect_err("any stale participant must stop the whole commit");
+        assert_eq!(applied_count, 0);
+        assert_eq!(
+            std::fs::read_to_string(&first).expect("read first"),
+            "first-old"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second).expect("read second"),
+            "second-out"
+        );
+    }
+}

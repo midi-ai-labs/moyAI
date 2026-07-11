@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -9,6 +10,7 @@ use crate::tool::truncate::clip_text_with_ellipsis;
 
 pub const MCP_TOOLS_LIST_DESCRIPTOR_SCHEMA_VALIDATION_MARKER: &str =
     "mcp_tools_list_descriptor_schema_validation";
+const MAX_MCP_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolDescriptor {
@@ -197,9 +199,25 @@ impl McpClient {
             .await
             .map_err(|error| ToolError::Message(format!("mcp request failed: {error}")))?;
         let status = response.status();
-        let body = response.text().await.map_err(|error| {
-            ToolError::Message(format!("failed to read mcp response body: {error}"))
-        })?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_MCP_RESPONSE_BYTES as u64)
+        {
+            return Err(ToolError::Message(format!(
+                "mcp response from `{endpoint}` exceeds the {} byte limit",
+                MAX_MCP_RESPONSE_BYTES
+            )));
+        }
+        let mut body_bytes = Vec::new();
+        let mut body_stream = response.bytes_stream();
+        while let Some(chunk) = body_stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                ToolError::Message(format!("failed to read mcp response body: {error}"))
+            })?;
+            append_bounded_response_chunk(&mut body_bytes, &chunk, endpoint)?;
+        }
+        let body = String::from_utf8(body_bytes)
+            .map_err(|_| ToolError::Message("mcp response body is not valid UTF-8".to_string()))?;
         if !status.is_success() {
             let mut hint = String::new();
             if body.to_ascii_lowercase().contains("invalid host header") {
@@ -237,6 +255,21 @@ impl McpClient {
             ToolError::Message("mcp request failed without a detailed error".to_string())
         }))
     }
+}
+
+fn append_bounded_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    endpoint: &str,
+) -> Result<(), ToolError> {
+    if body.len().saturating_add(chunk.len()) > MAX_MCP_RESPONSE_BYTES {
+        return Err(ToolError::Message(format!(
+            "mcp response from `{endpoint}` exceeds the {} byte limit",
+            MAX_MCP_RESPONSE_BYTES
+        )));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn endpoint_candidates(base_url: &str) -> Vec<String> {
@@ -439,4 +472,20 @@ pub fn mcp_tools_list_rejects_malformed_tool_descriptors_fixture_passes() -> boo
             .unwrap_or(false)
         && parse_tools(&malformed).is_err()
         && parse_tools(&non_string_name).is_err()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streamed_response_limit_is_enforced_without_content_length() {
+        let mut body = vec![b'a'; MAX_MCP_RESPONSE_BYTES - 1];
+        append_bounded_response_chunk(&mut body, b"b", "http://mcp").expect("exact limit");
+        let error =
+            append_bounded_response_chunk(&mut body, b"c", "http://mcp").expect_err("over limit");
+
+        assert_eq!(body.len(), MAX_MCP_RESPONSE_BYTES);
+        assert!(error.to_string().contains("exceeds"));
+    }
 }

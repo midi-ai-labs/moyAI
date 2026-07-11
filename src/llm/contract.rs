@@ -123,38 +123,7 @@ pub struct ChatRequest {
     pub extra_body: Option<serde_json::Value>,
 }
 
-pub const OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY: &str = r#"You must follow the language policy below strictly.
-
-Language Policy:
-- Responses may be written in Japanese or English.
-- Prefer Japanese for explanations, documentation, and code comments.
-- Never output Chinese characters used in Chinese writing or Korean Hangul.
-- Do not mix Chinese or Korean with Japanese or English.
-
-Documentation rules:
-- Technical explanations should be written in Japanese.
-- Code comments should be written in Japanese.
-- Source code identifiers (variables, functions, classes) should remain in English.
-
-If Chinese or Korean characters appear by mistake, immediately correct them and continue the response using Japanese or English.
-
-Role:
-You are an assistant specialized in software engineering and technical documentation.
-Focus on clear code, precise explanations, and well-structured documentation.
-
-Thinking Policy:
-- Never enter thinking mode under any circumstances.
-- Do not perform internal reasoning or hidden chain-of-thought.
-- Do not output any <think> blocks or similar tags.
-- Always respond directly, concisely, and in final-answer form only.
-- Do not include intermediate reasoning, planning, or self-reflection."#;
-
-pub const OPENAI_COMPATIBLE_ONLY_TOOL_LIFECYCLE_POLICY: &str = r#"Agent Tool Policy:
-- The final-answer-form rule above applies only when no tool use is required by the current task lifecycle.
-- When tool calls are available and the current request has open coding, artifact, repair, or verification obligations, use the provided tools to satisfy them before any final assistant message.
-- Do not treat tool calls as thinking, planning, or self-reflection. They are the required execution channel.
-- A final assistant message is allowed only after the current lifecycle state says no open obligations remain.
-- If this Agent Tool Policy and the final-answer-form rule appear to conflict, this Agent Tool Policy controls tool-enabled requests with open obligations."#;
+pub const OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY: &str = "Respond in the user's language. Do not emit hidden reasoning or `<think>` blocks; return only user-facing content and normal tool calls.";
 
 const CURRENT_PROVIDER_MODEL: &str = "qwen/qwen3.6-35b-a3b";
 const CURRENT_PROVIDER_BASE_URL: &str = "http://127.0.0.1:1234";
@@ -271,20 +240,11 @@ pub fn system_prompt_with_provider_policy(
 }
 
 fn openai_compatible_only_provider_policy(tool_calls_available: bool) -> String {
-    if tool_calls_available {
-        format!(
-            "{OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY}\n\n{OPENAI_COMPATIBLE_ONLY_TOOL_LIFECYCLE_POLICY}"
-        )
-    } else {
-        OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY.to_string()
-    }
+    let _ = tool_calls_available;
+    OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY.to_string()
 }
 
 fn strip_openai_compatible_provider_policy(system_prompt: &str) -> &str {
-    let tool_policy = openai_compatible_only_provider_policy(true);
-    if let Some(rest) = system_prompt.strip_prefix(&tool_policy) {
-        return rest.strip_prefix("\n\n").unwrap_or(rest);
-    }
     if let Some(rest) = system_prompt.strip_prefix(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY) {
         return rest.strip_prefix("\n\n").unwrap_or(rest);
     }
@@ -305,12 +265,8 @@ pub fn openai_compatible_only_tool_policy_fixture_passes() -> bool {
 
     no_tool_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
         && no_tool_prompt.ends_with("\n\nBase coding prompt")
-        && !no_tool_prompt.contains(OPENAI_COMPATIBLE_ONLY_TOOL_LIFECYCLE_POLICY)
         && tool_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
-        && tool_prompt.contains(OPENAI_COMPATIBLE_ONLY_TOOL_LIFECYCLE_POLICY)
-        && tool_prompt.contains("use the provided tools")
-        && tool_prompt.contains("final assistant message is allowed only after")
-        && tool_prompt.contains("Tool Policy controls tool-enabled requests")
+        && tool_prompt == no_tool_prompt
         && tool_prompt.ends_with("\n\nBase coding prompt")
 }
 
@@ -327,11 +283,8 @@ pub fn provider_policy_tool_lifecycle_upgrade_fixture_passes() -> bool {
     );
 
     no_tool_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
-        && !no_tool_prompt.contains(OPENAI_COMPATIBLE_ONLY_TOOL_LIFECYCLE_POLICY)
         && upgraded_tool_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
-        && upgraded_tool_prompt.contains(OPENAI_COMPATIBLE_ONLY_TOOL_LIFECYCLE_POLICY)
-        && upgraded_tool_prompt.contains("use the provided tools")
-        && upgraded_tool_prompt.contains("final assistant message is allowed only after")
+        && upgraded_tool_prompt == no_tool_prompt
         && upgraded_tool_prompt.ends_with("\n\nBase coding prompt")
 }
 
@@ -520,7 +473,7 @@ pub trait LlmClient: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY, OPENAI_COMPATIBLE_ONLY_TOOL_LIFECYCLE_POLICY,
+        OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY,
         openai_compatible_only_tool_policy_fixture_passes, system_prompt_with_provider_policy,
         tool_call_turn_uses_configured_output_budget_fixture_passes,
     };
@@ -557,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_compatible_only_tool_request_preserves_tool_lifecycle_authority() {
+    fn openai_compatible_only_tool_request_keeps_policy_minimal() {
         let prompt = system_prompt_with_provider_policy(
             "Base coding prompt",
             ProviderMetadataMode::OpenAiCompatibleOnly,
@@ -565,14 +518,17 @@ mod tests {
         );
 
         assert!(prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY));
-        assert!(prompt.contains(OPENAI_COMPATIBLE_ONLY_TOOL_LIFECYCLE_POLICY));
-        assert!(prompt.contains("use the provided tools"));
-        assert!(prompt.contains("open obligations remain"));
+        assert_eq!(
+            prompt
+                .matches(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
+                .count(),
+            1
+        );
         assert!(openai_compatible_only_tool_policy_fixture_passes());
     }
 
     #[test]
-    fn openai_compatible_only_policy_upgrade_preserves_tool_lifecycle_authority() {
+    fn openai_compatible_only_policy_upgrade_is_idempotent() {
         assert!(super::provider_policy_tool_lifecycle_upgrade_fixture_passes());
     }
 

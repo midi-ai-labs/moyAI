@@ -50,7 +50,7 @@ impl HarnessEventStore for SqliteHarnessEventStore {
     fn list_events(&self, run_id: HarnessRunId) -> Result<Vec<HarnessEvent>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, sequence_no, kind, payload_json, contract_refs_json, artifact_refs_json, parent_event_id, created_at_ms
+            "SELECT id, sequence_no, kind, payload_json, contract_refs_json, artifact_refs_json, parent_event_id, payload_sha256, created_at_ms
              FROM harness_events WHERE run_id = ?1 ORDER BY sequence_no ASC",
         )?;
         let rows = statement.query_map(params![run_id.to_string()], |row| {
@@ -60,6 +60,7 @@ impl HarnessEventStore for SqliteHarnessEventStore {
             let contract_refs_json: String = row.get(4)?;
             let artifact_refs_json: String = row.get(5)?;
             let parent: Option<String> = row.get(6)?;
+            let payload_sha256: String = row.get(7)?;
             Ok((
                 id,
                 row.get::<_, i64>(1)?,
@@ -68,7 +69,8 @@ impl HarnessEventStore for SqliteHarnessEventStore {
                 contract_refs_json,
                 artifact_refs_json,
                 parent,
-                row.get::<_, i64>(7)?,
+                payload_sha256,
+                row.get::<_, i64>(8)?,
             ))
         })?;
         let mut events = Vec::new();
@@ -81,8 +83,15 @@ impl HarnessEventStore for SqliteHarnessEventStore {
                 contract_refs_json,
                 artifact_refs_json,
                 parent,
+                payload_sha256,
                 created_at_ms,
             ) = row?;
+            let actual_payload_sha256 = hash_bytes(payload_json.as_bytes());
+            if actual_payload_sha256 != payload_sha256 {
+                return Err(StorageError::Message(format!(
+                    "harness event payload hash mismatch for event `{id}`"
+                )));
+            }
             events.push(HarnessEvent {
                 id: id.parse::<HarnessEventId>().map_err(|error| {
                     StorageError::Message(format!("invalid harness event id `{id}`: {error}"))
@@ -106,5 +115,69 @@ impl HarnessEventStore for SqliteHarnessEventStore {
             });
         }
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::{HarnessEventKind, HarnessEventPayload};
+
+    fn test_store() -> (SqliteHarnessEventStore, Arc<Mutex<Connection>>) {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("open sqlite"),
+        ));
+        connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute_batch(
+                "CREATE TABLE harness_events (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    run_id TEXT NOT NULL,
+                    sequence_no INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    contract_refs_json TEXT NOT NULL,
+                    artifact_refs_json TEXT NOT NULL,
+                    parent_event_id TEXT,
+                    payload_sha256 TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL
+                );",
+            )
+            .expect("create harness_events");
+        (SqliteHarnessEventStore::new(connection.clone()), connection)
+    }
+
+    #[test]
+    fn rejects_payload_tampering_in_persisted_event() {
+        let (store, connection) = test_store();
+        let event = HarnessEvent {
+            id: HarnessEventId::new(),
+            run_id: HarnessRunId::new(),
+            sequence_no: 0,
+            created_at_ms: 1,
+            kind: HarnessEventKind::UserTurnAccepted,
+            payload: HarnessEventPayload::generic(serde_json::json!({"message": "original"})),
+            contract_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            parent_event_id: None,
+        };
+        store.append_event(&event).expect("append event");
+        connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute(
+                "UPDATE harness_events SET payload_json = ?1 WHERE id = ?2",
+                params![
+                    "{\"type\":\"generic\",\"data\":{\"message\":\"tampered\"}}",
+                    event.id.to_string()
+                ],
+            )
+            .expect("tamper event");
+
+        let error = store
+            .list_events(event.run_id)
+            .expect_err("tampered event must fail integrity validation");
+        assert!(error.to_string().contains("payload hash mismatch"));
     }
 }

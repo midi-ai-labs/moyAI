@@ -1,12 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use camino::{Utf8Path, Utf8PathBuf};
+use futures_util::FutureExt;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentLoop, AgentRunRequest, RuntimeInputView};
-use crate::app::session_title::{generate_session_title, is_placeholder_session_title};
+use crate::app::session_title::{derive_session_title, is_placeholder_session_title};
 use crate::app::{
     AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionCompactRequest,
     SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest, SessionGoalGetRequest,
@@ -22,8 +28,8 @@ use crate::config::{ModelConfig, ResolvedConfig, merge::apply_patch as apply_con
 use crate::error::{AppRunError, RuntimeError};
 use crate::harness::{HarnessRecordingSink, NativeHarnessRecorder};
 use crate::llm::{
-    ConfigModelCatalog, ModelCatalog, apply_model_availability_report_to_config,
-    check_model_availability,
+    ConfigModelCatalog, ModelAvailabilityReport, ModelCatalog,
+    apply_model_availability_report_to_config, check_model_availability,
 };
 use crate::protocol::{
     ActiveWorkContractProjection, AdditionalContextEntry, AdditionalContextKind,
@@ -38,12 +44,49 @@ use crate::session::{
     SessionStateSnapshot, SessionStatus, TaskRoute, ThreadGoalClearResult, ThreadGoalGetResult,
     ThreadGoalSetResult, ThreadGoalStatus, validate_thread_goal_objective,
 };
-use crate::storage::StoreBundle;
+use crate::storage::{
+    StoreBundle,
+    session_repo::{RUN_ADMISSION_HEARTBEAT_INTERVAL_MS, RunAdmissionLeaseRenewalOutcome},
+};
 use crate::workspace::{branch_review_scope, uncommitted_review_scope};
 
 const MAX_IMAGE_ATTACHMENTS_PER_TURN: usize = 8;
 const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_GOAL_IDLE_CONTINUATIONS_PER_RUN: usize = 3;
+const PROVIDER_PROBE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Default)]
+struct ProviderProbeCache {
+    entries: Arc<Mutex<HashMap<String, CachedProbeReport>>>,
+}
+
+struct CachedProbeReport {
+    checked_at: Instant,
+    report: ModelAvailabilityReport,
+}
+
+impl ProviderProbeCache {
+    async fn get_or_probe<F, Fut>(&self, key: String, probe: F) -> ModelAvailabilityReport
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ModelAvailabilityReport>,
+    {
+        let mut entries = self.entries.lock().await;
+        entries.retain(|_, cached| cached.checked_at.elapsed() < PROVIDER_PROBE_CACHE_TTL);
+        if let Some(cached) = entries.get(&key) {
+            return cached.report.clone();
+        }
+        let report = probe().await;
+        entries.insert(
+            key,
+            CachedProbeReport {
+                checked_at: Instant::now(),
+                report: report.clone(),
+            },
+        );
+        report
+    }
+}
 
 #[derive(Clone)]
 pub struct RunService {
@@ -53,6 +96,7 @@ pub struct RunService {
     session_service: crate::session::SessionService,
     agent_loop: AgentLoop,
     session_event_hub: SessionRuntimeEventHub,
+    provider_probe_cache: ProviderProbeCache,
 }
 
 impl RunService {
@@ -71,6 +115,7 @@ impl RunService {
             session_service,
             agent_loop,
             session_event_hub,
+            provider_probe_cache: ProviderProbeCache::default(),
         }
     }
 
@@ -262,11 +307,39 @@ impl RunService {
             && request
                 .title
                 .as_deref()
-                .map(is_placeholder_session_title)
-                .unwrap_or(false)
+                .is_none_or(is_placeholder_session_title)
             && !request.prompt.trim().is_empty();
         let image_parts = load_image_attachments(&request.cwd, &request.image_paths)?;
-        hydrate_configured_model_from_provider(&mut effective_config, !image_parts.is_empty())
+        let prepared = prepare_run_turn(&self.workspace, &request)?;
+        if let Some(existing) = session_settings.as_ref()
+            && (self.store.active_runs().is_active(existing.id)
+                || (matches!(
+                    existing.status,
+                    SessionStatus::Running | SessionStatus::AwaitingUser
+                ) && self
+                    .store
+                    .session_repo()
+                    .has_fresh_run_admission(existing.id)
+                    .await?))
+            && request.review_request.is_none()
+            && !prepared.prompt.trim().is_empty()
+        {
+            return self
+                .store_active_turn_steer_from_parts(
+                    SessionSteerRequest {
+                        session_id: existing.id,
+                        prompt: prepared.prompt.clone(),
+                        cwd: request.cwd.clone(),
+                        image_paths: request.image_paths.clone(),
+                        client_user_message_id: None,
+                    },
+                    image_parts,
+                    Some("run request against active session".to_string()),
+                    renderer,
+                )
+                .await;
+        }
+        self.hydrate_configured_model_from_provider(&mut effective_config, !image_parts.is_empty())
             .await?;
         let model = ConfigModelCatalog::new(effective_config.clone()).resolve(None)?;
         if !image_parts.is_empty() && !effective_config.model.supports_images {
@@ -274,29 +347,6 @@ impl RunService {
                 "configured model `{}` does not advertise image support; choose a vision-capable model before sending images",
                 effective_config.model.model
             )));
-        }
-        let prepared = prepare_run_turn(&self.workspace, &request)?;
-        if let Some(session_id) = request.session_id
-            && request.review_request.is_none()
-            && !prepared.prompt.trim().is_empty()
-        {
-            let existing = self.store.session_repo().get_session(session_id).await?;
-            if existing.status == SessionStatus::Running {
-                return self
-                    .store_active_turn_steer_from_parts(
-                        SessionSteerRequest {
-                            session_id,
-                            prompt: prepared.prompt.clone(),
-                            cwd: request.cwd.clone(),
-                            image_paths: request.image_paths.clone(),
-                            client_user_message_id: None,
-                        },
-                        image_parts,
-                        Some("run --session against active session".to_string()),
-                        renderer,
-                    )
-                    .await;
-            }
         }
 
         let session_context = self
@@ -313,185 +363,202 @@ impl RunService {
                 self.workspace.clone(),
             )
             .await?;
-        if let Some(GoalSlashCommand::SetObjective(objective)) = slash_goal_command {
-            self.set_goal_from_slash(session_context.session.id, &objective, renderer)
+        let process_run_lease = self
+            .store
+            .try_acquire_run_process_lease(session_context.session.id)?;
+        let Some(admission_id) = self
+            .store
+            .session_repo()
+            .admit_session_run(session_context.session.id)
+            .await?
+        else {
+            let current = self
+                .store
+                .session_repo()
+                .get_session(session_context.session.id)
                 .await?;
-        }
-        let mut renderer_sink = RendererSink {
-            renderer,
-            show_reasoning: request.show_reasoning,
+            return Err(AppRunError::Message(format!(
+                "session {} could not start because its current status is {}; only one run may be admitted per session",
+                current.id,
+                current.status.key()
+            )));
         };
-        let recorder = NativeHarnessRecorder::start_harness_only(
-            &self.store,
-            Some(session_context.session.id),
-            self.workspace.root.clone(),
-        )?;
-        let protocol_turn_id = recorder.protocol_turn_id();
-        let mut harness_sink = HarnessRecordingSink::new(recorder, &mut renderer_sink);
-        let mut sink = ProtocolRecordingSink::new(
-            self.store.protocol_event_store(),
-            Some(session_context.session.id),
-            protocol_turn_id,
-            &mut harness_sink,
-        )
-        .with_runtime_event_publisher(self.session_event_hub.publisher());
-        sink.emit(crate::session::RunEvent::SessionStarted {
-            session_id: session_context.session.id,
-            title: session_context.session.title.clone(),
-        })?;
-
-        let user_message_id = if prepared.prompt.trim().is_empty() {
-            let runtime_input = self.runtime_input_view(session_context.session.id).await?;
-            latest_user_message_id_from_history_items(&runtime_input.history_items).ok_or_else(
-                || {
-                    AppRunError::Message(
-                        "cannot resume a session without a prompt or prior user message"
-                            .to_string(),
-                    )
-                },
-            )?
-        } else {
-            let thread_op = build_user_thread_op(
-                protocol_turn_id,
-                &session_context,
-                &effective_config,
-                &prepared,
-                &image_parts,
-                request.editor_context.clone(),
-            );
-            let ThreadOp::UserTurn(user_turn) = &thread_op else {
-                return Err(AppRunError::Message(
-                    "run submission did not produce a user turn".to_string(),
-                ));
+        let session_id = session_context.session.id;
+        let protocol_turn_id = crate::protocol::TurnId::new();
+        let heartbeat_stop = CancellationToken::new();
+        let heartbeat_repo = self.store.session_repo();
+        let heartbeat_admission_id = admission_id.clone();
+        let heartbeat_task = spawn_run_admission_heartbeat(
+            session_id,
+            admission_id.clone(),
+            request.cancel.clone(),
+            heartbeat_stop.clone(),
+            Duration::from_millis(RUN_ADMISSION_HEARTBEAT_INTERVAL_MS),
+            move || {
+                let repo = heartbeat_repo.clone();
+                let admission_id = heartbeat_admission_id.clone();
+                async move {
+                    repo.renew_admitted_run_lease(session_id, &admission_id, protocol_turn_id)
+                        .await
+                }
+            },
+        );
+        let admitted_result: Result<RunSummary, AppRunError> = async {
+            let mut active_run = self
+                .store
+                .active_runs()
+                .try_start(session_id, request.cancel.clone())?;
+            if let Some(GoalSlashCommand::SetObjective(objective)) = slash_goal_command {
+                self.set_goal_from_slash(session_id, &objective, renderer)
+                    .await?;
+            }
+            let mut renderer_sink = RendererSink {
+                renderer,
+                show_reasoning: request.show_reasoning,
             };
-            if !user_turn.is_dispatchable() {
+            let recorder = NativeHarnessRecorder::start_harness_only_for_turn(
+                &self.store,
+                Some(session_id),
+                self.workspace.root.clone(),
+                protocol_turn_id,
+            )?;
+            active_run.set_turn_id(protocol_turn_id)?;
+            let mut harness_sink = HarnessRecordingSink::new(recorder, &mut renderer_sink);
+            let mut sink = ProtocolRecordingSink::new(
+                self.store.protocol_event_store(),
+                Some(session_id),
+                protocol_turn_id,
+                &mut harness_sink,
+            )
+            .with_admission_id(admission_id.clone())
+            .with_runtime_event_publisher(self.session_event_hub.publisher());
+            sink.emit(crate::session::RunEvent::SessionStarted {
+                session_id,
+                title: session_context.session.title.clone(),
+            })?;
+
+            let user_message_id = if prepared.prompt.trim().is_empty() {
+                let runtime_input = self.runtime_input_view(session_id).await?;
+                latest_user_message_id_from_history_items(&runtime_input.history_items).ok_or_else(
+                    || {
+                        AppRunError::Message(
+                            "cannot resume a session without a prompt or prior user message"
+                                .to_string(),
+                        )
+                    },
+                )?
+            } else {
+                let thread_op = build_user_thread_op(
+                    protocol_turn_id,
+                    &session_context,
+                    &effective_config,
+                    &prepared,
+                    &image_parts,
+                    request.editor_context.clone(),
+                );
+                let ThreadOp::UserTurn(user_turn) = &thread_op else {
+                    return Err(AppRunError::Message(
+                        "run submission did not produce a user turn".to_string(),
+                    ));
+                };
+                if !user_turn.is_dispatchable() {
+                    return Err(AppRunError::Message(format!(
+                        "configured model `{}` cannot dispatch this user turn",
+                        effective_config.model.model
+                    )));
+                }
+                let user_message = self
+                    .session_service
+                    .store_user_thread_op_with_protocol_bundle(
+                        &session_context,
+                        &admission_id,
+                        user_turn,
+                        Some(effective_config.model.model.clone()),
+                        prepared.initial_state.clone(),
+                        protocol_turn_id,
+                        sink.reserve_sequence_no(),
+                    )
+                    .await?;
+                sink.emit_pre_recorded(crate::session::RunEvent::UserTurnStored {
+                    session_id,
+                    message_id: user_message.id,
+                    turn: Box::new(user_turn.clone()),
+                })?;
+                sink.emit(crate::session::RunEvent::UserMessageStored {
+                    message_id: user_message.id,
+                })?;
+                user_message.id
+            };
+
+            if !self
+                .store
+                .session_repo()
+                .activate_admitted_turn(session_id, &admission_id, protocol_turn_id)
+                .await?
+            {
                 return Err(AppRunError::Message(format!(
-                    "configured model `{}` cannot dispatch this user turn",
-                    effective_config.model.model
+                    "run admission {admission_id} no longer owns session {session_id} while publishing its active turn"
                 )));
             }
-            let user_message = self
-                .session_service
-                .store_user_thread_op_with_protocol_bundle(
-                    &session_context,
-                    user_turn,
-                    Some(effective_config.model.model.clone()),
-                    prepared.initial_state.clone(),
-                    protocol_turn_id,
-                    sink.reserve_sequence_no(),
+
+            let runtime_input = self.runtime_input_view(session_id).await?;
+            let state = self.session_service.load_state(session_id).await?;
+            let summary = self
+                .agent_loop
+                .run(
+                    AgentRunRequest {
+                        session: session_context,
+                        admission_id: admission_id.clone(),
+                        user_message_id,
+                        protocol_turn_id,
+                        runtime_input,
+                        state,
+                        config: effective_config.clone(),
+                        model,
+                        cancel: request.cancel.clone(),
+                        live_config: request.live_config.clone(),
+                        steer_rx: active_run.take_steer_receiver(),
+                    },
+                    prompt,
+                    &mut sink,
                 )
                 .await?;
-            sink.emit_pre_recorded(crate::session::RunEvent::UserTurnStored {
-                session_id: session_context.session.id,
-                message_id: user_message.id,
-                turn: Box::new(user_turn.clone()),
-            })?;
-            sink.emit(crate::session::RunEvent::UserMessageStored {
-                message_id: user_message.id,
-            })?;
-            if should_generate_session_title {
-                if let Ok(title) = generate_session_title(
-                    &effective_config,
-                    &prepared.prompt,
-                    request.cancel.clone(),
-                )
-                .await
-                {
-                    if !is_placeholder_session_title(&title) {
-                        let title_event = crate::session::RunEvent::SessionTitleUpdated {
-                            session_id: session_context.session.id,
-                            title: title.clone(),
-                        };
-                        if self
-                            .store
-                            .session_repo()
-                            .update_session_title_with_protocol_event(
-                                session_context.session.id,
-                                &title,
-                                &title_event,
-                                protocol_turn_id,
-                                Some(sink.reserve_sequence_no()),
-                            )
-                            .await
-                            .is_ok()
-                        {
-                            sink.emit_pre_recorded(title_event)?;
-                        }
-                    }
-                }
+            drop(sink);
+            renderer.finish(&summary)?;
+            drop(active_run);
+            if should_generate_session_title
+                && let Some(title) = derive_session_title(&prepared.prompt)
+            {
+                let _ = self
+                    .session_service
+                    .update_session_title(session_id, title)
+                    .await;
             }
-            user_message.id
-        };
-
-        let runtime_input = self.runtime_input_view(session_context.session.id).await?;
-        let state = self
-            .session_service
-            .load_state(session_context.session.id)
-            .await?;
-        let session_id = session_context.session.id;
-        let summary = match self
-            .agent_loop
-            .run(
-                AgentRunRequest {
-                    session: session_context,
-                    user_message_id,
-                    protocol_turn_id,
-                    runtime_input,
-                    state,
-                    config: effective_config,
-                    model,
-                    cancel: request.cancel.clone(),
-                    live_config: request.live_config.clone(),
-                },
-                prompt,
-                &mut sink,
-            )
-            .await
-        {
-            Ok(summary) => summary,
+            Ok(summary)
+        }
+        .await;
+        heartbeat_stop.cancel();
+        let heartbeat_result = match heartbeat_task.await {
+            Ok(result) => result,
             Err(error) => {
-                let current = self.store.session_repo().get_session(session_id).await?;
-                if current.status == SessionStatus::Running {
-                    if request.cancel.is_cancelled() {
-                        let event = crate::session::RunEvent::SessionInterrupted {
-                            session_id,
-                            reason: "run cancelled by user".to_string(),
-                        };
-                        self.store
-                            .session_repo()
-                            .set_status_with_protocol_event(
-                                session_id,
-                                SessionStatus::Cancelled,
-                                &event,
-                                protocol_turn_id,
-                                Some(sink.reserve_sequence_no()),
-                            )
-                            .await?;
-                        sink.emit_pre_recorded(event)?;
-                    } else {
-                        let event = crate::session::RunEvent::SessionFailed {
-                            session_id,
-                            message: error.to_string(),
-                        };
-                        self.store
-                            .session_repo()
-                            .set_status_with_protocol_event(
-                                session_id,
-                                SessionStatus::Failed,
-                                &event,
-                                protocol_turn_id,
-                                Some(sink.reserve_sequence_no()),
-                            )
-                            .await?;
-                        sink.emit_pre_recorded(event)?;
-                    }
-                }
-                return Err(error.into());
+                request.cancel.cancel();
+                Err(crate::error::StorageError::Message(format!(
+                    "run admission heartbeat task failed: {error}"
+                )))
             }
         };
-        drop(sink);
-        renderer.finish(&summary)?;
-        Ok(summary)
+        let result = finish_admitted_run(
+            &self.store,
+            session_id,
+            &admission_id,
+            protocol_turn_id,
+            request.cancel.is_cancelled(),
+            admitted_result,
+            heartbeat_result,
+        )
+        .await;
+        drop(process_run_lease);
+        result
     }
 
     async fn should_start_idle_goal_continuation(
@@ -595,17 +662,37 @@ impl RunService {
         &self,
         selector: &SessionSelector,
     ) -> Result<Option<SessionRecord>, AppRunError> {
-        match selector {
-            SessionSelector::New => Ok(None),
-            SessionSelector::ById(session_id) => Ok(Some(
-                self.store.session_repo().get_session(*session_id).await?,
-            )),
-            SessionSelector::Latest => Ok(self
-                .store
-                .session_repo()
-                .latest_session(self.workspace.project_id)
-                .await?),
+        Ok(self
+            .session_service
+            .resolve_session_for_workspace(selector, &self.workspace)
+            .await?)
+    }
+
+    async fn hydrate_configured_model_from_provider(
+        &self,
+        config: &mut crate::config::ResolvedConfig,
+        require_vision: bool,
+    ) -> Result<(), AppRunError> {
+        let configured_model = config.model.model.trim().to_string();
+        if configured_model.is_empty() {
+            return Err(AppRunError::Message(
+                "configured model is empty".to_string(),
+            ));
         }
+        let key = format!(
+            "{}:{require_vision}",
+            serde_json::to_string(&config.model)
+                .map_err(|error| AppRunError::Message(error.to_string()))?
+        );
+        let report = self
+            .provider_probe_cache
+            .get_or_probe(key, || {
+                check_model_availability(config, None, None, require_vision)
+            })
+            .await;
+        apply_model_availability_report_to_config(&mut config.model, &report)
+            .map_err(|error| AppRunError::Message(error.to_string()))?;
+        Ok(())
     }
 
     async fn execute_session_list(
@@ -715,8 +802,8 @@ impl RunService {
         Ok(RunSummary {
             session_id: request.session_id,
             assistant_message_id: None,
-            status: SessionStatus::Completed,
-            finish_reason: None,
+            status: SessionStatus::Cancelled,
+            finish_reason: Some(crate::session::FinishReason::Cancelled),
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1223,13 +1310,14 @@ impl RunService {
         source_label: Option<String>,
         _renderer: &mut dyn EventRenderer,
     ) -> Result<RunSummary, AppRunError> {
-        let (active_turn_id, _next_sequence_no) = self
+        let active_turn_id = self
             .store
-            .protocol_event_store()
-            .latest_turn_position_for_session(request.session_id)?
+            .session_repo()
+            .active_turn_for_session(request.session_id)
+            .await?
             .ok_or_else(|| {
                 AppRunError::Message(format!(
-                    "session {} has no active turn to steer",
+                    "session {} has no published active turn to steer",
                     request.session_id
                 ))
             })?;
@@ -1281,6 +1369,184 @@ impl RunService {
             metrics: Default::default(),
         })
     }
+}
+
+fn spawn_run_admission_heartbeat<Renew, RenewFuture>(
+    session_id: crate::session::SessionId,
+    admission_id: String,
+    run_cancel: CancellationToken,
+    heartbeat_stop: CancellationToken,
+    heartbeat_interval: Duration,
+    renew: Renew,
+) -> tokio::task::JoinHandle<Result<(), crate::error::StorageError>>
+where
+    Renew: FnMut() -> RenewFuture + Send + 'static,
+    RenewFuture: Future<Output = Result<RunAdmissionLeaseRenewalOutcome, crate::error::StorageError>>
+        + Send
+        + 'static,
+{
+    let cancel_on_failure = run_cancel.clone();
+    tokio::spawn(async move {
+        let heartbeat = maintain_run_admission_lease(
+            session_id,
+            admission_id.clone(),
+            heartbeat_stop,
+            heartbeat_interval,
+            renew,
+        );
+        match AssertUnwindSafe(heartbeat).catch_unwind().await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                cancel_on_failure.cancel();
+                Err(error)
+            }
+            Err(payload) => {
+                cancel_on_failure.cancel();
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                Err(crate::error::StorageError::Message(format!(
+                    "run admission heartbeat panicked for session {session_id} admission {admission_id}: {message}"
+                )))
+            }
+        }
+    })
+}
+
+async fn maintain_run_admission_lease<Renew, RenewFuture>(
+    session_id: crate::session::SessionId,
+    admission_id: String,
+    heartbeat_stop: CancellationToken,
+    heartbeat_interval: Duration,
+    mut renew: Renew,
+) -> Result<(), crate::error::StorageError>
+where
+    Renew: FnMut() -> RenewFuture,
+    RenewFuture:
+        Future<Output = Result<RunAdmissionLeaseRenewalOutcome, crate::error::StorageError>>,
+{
+    loop {
+        tokio::select! {
+            biased;
+            _ = heartbeat_stop.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(heartbeat_interval) => {
+                match renew().await? {
+                    RunAdmissionLeaseRenewalOutcome::Renewed => {}
+                    RunAdmissionLeaseRenewalOutcome::GracefulTerminal => return Ok(()),
+                    RunAdmissionLeaseRenewalOutcome::SupersededOrExpired => {
+                        return Err(crate::error::StorageError::Message(format!(
+                        "run admission {admission_id} lost its lease for session {session_id}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn finish_admitted_run(
+    store: &StoreBundle,
+    session_id: crate::session::SessionId,
+    admission_id: &str,
+    protocol_turn_id: crate::protocol::TurnId,
+    cancellation_requested: bool,
+    admitted_result: Result<RunSummary, AppRunError>,
+    heartbeat_result: Result<(), crate::error::StorageError>,
+) -> Result<RunSummary, AppRunError> {
+    let heartbeat_failed = heartbeat_result.is_err();
+    let admitted_result = match heartbeat_result {
+        Ok(()) => admitted_result,
+        Err(heartbeat_error) => match admitted_result {
+            Ok(summary) => match store
+                .session_repo()
+                .corroborated_terminal_status_for_turn(session_id, protocol_turn_id)
+                .await
+            {
+                Ok(Some(SessionStatus::Completed)) => {
+                    // The exact turn's durable session/protocol commit is authoritative. The
+                    // heartbeat failure remains diagnostic and must not reverse completed work.
+                    Ok(summary)
+                }
+                Ok(_) => Err(AppRunError::Storage(heartbeat_error)),
+                Err(authority_error) => Err(AppRunError::Message(format!(
+                    "run admission heartbeat failed: {heartbeat_error}; additionally failed to verify durable terminal truth: {authority_error}"
+                ))),
+            },
+            Err(run_error) => Err(AppRunError::Message(format!(
+                "{run_error}; additionally the run admission heartbeat failed: {heartbeat_error}"
+            ))),
+        },
+    };
+    let settled = settle_admitted_run_result(
+        store,
+        session_id,
+        admission_id,
+        protocol_turn_id,
+        cancellation_requested && !heartbeat_failed,
+        admitted_result,
+    )
+    .await;
+    let released = store
+        .session_repo()
+        .release_stopped_run_admission(session_id, admission_id)
+        .await;
+    match (settled, released) {
+        (result, Ok(_)) => result,
+        (Ok(_), Err(release_error)) => Err(AppRunError::Storage(release_error)),
+        (Err(run_error), Err(release_error)) => Err(AppRunError::Message(format!(
+            "{run_error}; additionally failed to release run admission {admission_id}: {release_error}"
+        ))),
+    }
+}
+
+async fn settle_admitted_run_result(
+    store: &StoreBundle,
+    session_id: crate::session::SessionId,
+    admission_id: &str,
+    protocol_turn_id: crate::protocol::TurnId,
+    cancelled: bool,
+    result: Result<RunSummary, AppRunError>,
+) -> Result<RunSummary, AppRunError> {
+    let Err(error) = result else {
+        return result;
+    };
+    let (status, event) = if cancelled {
+        (
+            SessionStatus::Cancelled,
+            crate::session::RunEvent::SessionInterrupted {
+                session_id,
+                reason: "run cancelled by user".to_string(),
+            },
+        )
+    } else {
+        (
+            SessionStatus::Failed,
+            crate::session::RunEvent::SessionFailed {
+                session_id,
+                message: error.to_string(),
+            },
+        )
+    };
+    let repo = store.session_repo();
+    let terminalized = repo
+        .terminalize_admitted_session_with_protocol_event(
+            session_id,
+            admission_id,
+            status,
+            &event,
+            protocol_turn_id,
+            None,
+        )
+        .await
+        .map_err(|cleanup_error| {
+            AppRunError::Message(format!(
+                "{error}; additionally failed to settle admitted run {admission_id}: {cleanup_error}"
+            ))
+        })?;
+    let _ = terminalized;
+    Err(error)
 }
 
 async fn account_goal_before_external_mutation(
@@ -1516,23 +1782,6 @@ fn build_user_thread_op(
             images,
         ),
     })
-}
-
-async fn hydrate_configured_model_from_provider(
-    config: &mut crate::config::ResolvedConfig,
-    require_vision: bool,
-) -> Result<(), AppRunError> {
-    let configured_model = config.model.model.trim().to_string();
-    if configured_model.is_empty() {
-        return Err(AppRunError::Message(
-            "configured model is empty".to_string(),
-        ));
-    }
-
-    let report = check_model_availability(config, None, None, require_vision).await;
-    apply_model_availability_report_to_config(&mut config.model, &report)
-        .map_err(|error| AppRunError::Message(error.to_string()))?;
-    Ok(())
 }
 
 fn load_image_attachments(
@@ -1882,7 +2131,192 @@ impl<'a> RunEventSink for RendererSink<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::session::ThreadGoalStatus;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use camino::Utf8PathBuf;
+
+    use crate::config::ProviderMetadataMode;
+    use crate::llm::{ModelAvailabilityReport, ModelAvailabilityStatus};
+    use crate::session::{
+        NewSession, ProjectId, ProjectRepository, SessionRepository, ThreadGoalStatus,
+    };
+    use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+
+    fn probe_report(model: &str) -> ModelAvailabilityReport {
+        ModelAvailabilityReport {
+            gate: "model_availability".to_string(),
+            status: ModelAvailabilityStatus::Pass,
+            generated_by: "test".to_string(),
+            model: model.to_string(),
+            base_url: "http://local".to_string(),
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            v1_present: true,
+            native_present: false,
+            require_vision: false,
+            vision_capable: false,
+            vision_probe_passed: false,
+            vision_probes: Vec::new(),
+            tool_use_capable: Some(true),
+            capability_overrides: Vec::new(),
+            tool_call_probe_passed: true,
+            tool_call_probes: Vec::new(),
+            reasoning_capable: Some(false),
+            context: Some(8192),
+            max_output_tokens: Some(1024),
+            max_parallel_predictions: Some(1),
+            matched_model: None,
+            v1_models: vec![model.to_string()],
+            native_models: Vec::new(),
+            openai_error: None,
+            native_error: None,
+            checked_at_ms: 1,
+        }
+    }
+
+    async fn heartbeat_active_turn_fixture(
+        title: &str,
+    ) -> (
+        StoreBundle,
+        crate::session::SessionId,
+        String,
+        crate::protocol::TurnId,
+        crate::session::MessageRecord,
+    ) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir: data_dir.clone(),
+        };
+        let sqlite = SqliteStore::open(&paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "test", "none")
+            .await
+            .expect("project");
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: title.to_string(),
+                cwd: data_dir,
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("session");
+        let admission_id = store
+            .session_repo()
+            .admit_session_run(session.id)
+            .await
+            .expect("admission")
+            .expect("admitted");
+        let turn_id = crate::protocol::TurnId::new();
+        assert!(
+            store
+                .session_repo()
+                .activate_admitted_turn(session.id, &admission_id, turn_id)
+                .await
+                .expect("activate turn")
+        );
+        let (assistant, _) = store
+            .session_repo()
+            .append_assistant_message_with_protocol_start(
+                crate::session::NewMessage {
+                    session_id: session.id,
+                    parent_message_id: None,
+                    role: crate::session::MessageRole::Assistant,
+                    metadata: crate::session::MessageMetadata::Assistant(
+                        crate::session::AssistantMessageMeta {
+                            model: "model".to_string(),
+                            base_url: "http://localhost:1234".to_string(),
+                            finish_reason: None,
+                            token_usage: None,
+                            summary: false,
+                        },
+                    ),
+                },
+                &admission_id,
+                turn_id,
+                None,
+                "model".to_string(),
+            )
+            .await
+            .expect("assistant");
+        (store, session.id, admission_id, turn_id, assistant)
+    }
+
+    fn successful_run_summary(session_id: crate::session::SessionId) -> crate::session::RunSummary {
+        crate::session::RunSummary {
+            session_id,
+            assistant_message_id: None,
+            status: crate::session::SessionStatus::Completed,
+            finish_reason: Some(crate::session::FinishReason::Stop),
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        }
+    }
+
+    async fn commit_completed_turn(
+        store: &StoreBundle,
+        session_id: crate::session::SessionId,
+        admission_id: &str,
+        turn_id: crate::protocol::TurnId,
+        assistant: &crate::session::MessageRecord,
+    ) -> crate::storage::session_repo::AdmittedTerminalCommit {
+        store
+            .session_repo()
+            .update_admitted_message_metadata_and_status_with_protocol_event(
+                session_id,
+                admission_id,
+                assistant.id,
+                &crate::session::MessageMetadata::Assistant(crate::session::AssistantMessageMeta {
+                    model: "model".to_string(),
+                    base_url: "http://localhost:1234".to_string(),
+                    finish_reason: Some(crate::session::FinishReason::Stop),
+                    token_usage: None,
+                    summary: false,
+                }),
+                crate::session::SessionStatus::Completed,
+                &crate::session::RunEvent::SessionCompleted {
+                    session_id,
+                    finish_reason: Some(crate::session::FinishReason::Stop),
+                },
+                turn_id,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("terminal commit")
+    }
+
+    async fn panicking_heartbeat_renewal() -> Result<
+        crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome,
+        crate::error::StorageError,
+    > {
+        panic!("injected heartbeat panic")
+    }
+
+    async fn gated_panicking_heartbeat_renewal(
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Result<
+        crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome,
+        crate::error::StorageError,
+    > {
+        entered.notify_one();
+        release.notified().await;
+        panic!("injected gated heartbeat panic")
+    }
 
     #[test]
     fn session_model_parameters_override_runtime_config() {
@@ -1958,5 +2392,516 @@ mod tests {
         assert!(!super::allows_goal_idle_continuation_after_run("/goal").unwrap());
         assert!(!super::allows_goal_idle_continuation_after_run("/goal clear").unwrap());
         assert!(!super::allows_goal_idle_continuation_after_run("/goal pause").unwrap());
+    }
+
+    #[tokio::test]
+    async fn provider_probe_cache_reuses_identity_and_invalidates_on_key_change() {
+        let cache = super::ProviderProbeCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let calls = Arc::clone(&calls);
+            cache
+                .get_or_probe("provider-a".to_string(), move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    probe_report("model-a")
+                })
+                .await;
+        }
+        let changed_calls = Arc::clone(&calls);
+        cache
+            .get_or_probe("provider-b".to_string(), move || async move {
+                changed_calls.fetch_add(1, Ordering::SeqCst);
+                probe_report("model-b")
+            })
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn every_post_admission_setup_error_settles_the_owned_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir: data_dir.clone(),
+        };
+        let sqlite = SqliteStore::open(&paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "test", "none")
+            .await
+            .expect("project");
+
+        for setup_stage in [
+            "active run registration",
+            "goal setup",
+            "harness recorder setup",
+            "active turn registration",
+            "canonical turn setup",
+        ] {
+            let session = store
+                .session_repo()
+                .create_session(NewSession {
+                    project_id,
+                    title: setup_stage.to_string(),
+                    cwd: data_dir.clone(),
+                    model: "model".to_string(),
+                    base_url: "http://localhost:1234".to_string(),
+                    access_mode: crate::config::AccessMode::Default,
+                })
+                .await
+                .expect("session");
+            let admission_id = store
+                .session_repo()
+                .admit_session_run(session.id)
+                .await
+                .expect("admission")
+                .expect("admitted");
+            let failure = super::settle_admitted_run_result(
+                &store,
+                session.id,
+                &admission_id,
+                crate::protocol::TurnId::new(),
+                false,
+                Err(crate::error::AppRunError::Message(format!(
+                    "{setup_stage} failed"
+                ))),
+            )
+            .await
+            .expect_err("setup failure returned");
+
+            assert!(failure.to_string().contains(setup_stage));
+            assert_eq!(
+                store
+                    .session_repo()
+                    .get_session(session.id)
+                    .await
+                    .expect("settled session")
+                    .status,
+                crate::session::SessionStatus::Failed
+            );
+            assert!(
+                store
+                    .session_repo()
+                    .admit_session_run(session.id)
+                    .await
+                    .expect("readmission")
+                    .is_some(),
+                "{setup_stage} must release durable admission ownership"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn background_heartbeat_extends_the_admission_while_the_run_is_waiting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir: data_dir.clone(),
+        };
+        let sqlite = SqliteStore::open(&paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "test", "none")
+            .await
+            .expect("project");
+        let session = store
+            .session_repo()
+            .create_session(crate::session::NewSession {
+                project_id,
+                title: "heartbeat".to_string(),
+                cwd: data_dir,
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("session");
+        let admitted_at_ms = crate::runtime::SystemClock::now_ms();
+        let admission_id = store
+            .session_repo()
+            .admit_session_run_at(session.id, admitted_at_ms, 3_000)
+            .await
+            .expect("admission")
+            .expect("admitted");
+        let turn_id = crate::protocol::TurnId::new();
+        assert!(
+            store
+                .session_repo()
+                .activate_admitted_turn(session.id, &admission_id, turn_id)
+                .await
+                .expect("activate turn")
+        );
+
+        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let heartbeat_stop = tokio_util::sync::CancellationToken::new();
+        let heartbeat_repo = store.session_repo();
+        let heartbeat_admission_id = admission_id.clone();
+        let heartbeat_task = super::spawn_run_admission_heartbeat(
+            session.id,
+            admission_id,
+            run_cancel.clone(),
+            heartbeat_stop.clone(),
+            std::time::Duration::from_millis(5),
+            move || {
+                let repo = heartbeat_repo.clone();
+                let admission_id = heartbeat_admission_id.clone();
+                async move {
+                    repo.renew_admitted_run_lease(session.id, &admission_id, turn_id)
+                        .await
+                }
+            },
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if store
+                    .session_repo()
+                    .has_fresh_run_admission_at(session.id, admitted_at_ms + 5_000)
+                    .await
+                    .expect("fresh admission")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background heartbeat did not extend the lease");
+        assert!(!run_cancel.is_cancelled());
+        heartbeat_stop.cancel();
+        heartbeat_task
+            .await
+            .expect("heartbeat task")
+            .expect("heartbeat result");
+    }
+
+    #[tokio::test]
+    async fn terminal_commit_wins_the_heartbeat_barrier_without_reversing_success() {
+        let (store, session_id, admission_id, turn_id, assistant) =
+            heartbeat_active_turn_fixture("terminal heartbeat barrier").await;
+        let renewal_entered = Arc::new(tokio::sync::Notify::new());
+        let allow_renewal = Arc::new(tokio::sync::Notify::new());
+        let heartbeat_repo = store.session_repo();
+        let heartbeat_admission_id = admission_id.clone();
+        let heartbeat_renewal_entered = Arc::clone(&renewal_entered);
+        let heartbeat_allow_renewal = Arc::clone(&allow_renewal);
+        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let heartbeat_task = super::spawn_run_admission_heartbeat(
+            session_id,
+            admission_id.clone(),
+            run_cancel.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            std::time::Duration::from_millis(1),
+            move || {
+                let repo = heartbeat_repo.clone();
+                let admission_id = heartbeat_admission_id.clone();
+                let renewal_entered = Arc::clone(&heartbeat_renewal_entered);
+                let allow_renewal = Arc::clone(&heartbeat_allow_renewal);
+                async move {
+                    renewal_entered.notify_one();
+                    allow_renewal.notified().await;
+                    repo.renew_admitted_run_lease(session_id, &admission_id, turn_id)
+                        .await
+                }
+            },
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            renewal_entered.notified(),
+        )
+        .await
+        .expect("heartbeat did not reach the terminal barrier");
+
+        assert_eq!(
+            store
+                .session_repo()
+                .update_admitted_message_metadata_and_status_with_protocol_event(
+                    session_id,
+                    &admission_id,
+                    assistant.id,
+                    &crate::session::MessageMetadata::Assistant(
+                        crate::session::AssistantMessageMeta {
+                            model: "model".to_string(),
+                            base_url: "http://localhost:1234".to_string(),
+                            finish_reason: Some(crate::session::FinishReason::Stop),
+                            token_usage: None,
+                            summary: false,
+                        },
+                    ),
+                    crate::session::SessionStatus::Completed,
+                    &crate::session::RunEvent::SessionCompleted {
+                        session_id,
+                        finish_reason: Some(crate::session::FinishReason::Stop),
+                    },
+                    turn_id,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("terminal commit"),
+            crate::storage::session_repo::AdmittedTerminalCommit::Applied
+        );
+        allow_renewal.notify_one();
+        let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
+        assert!(!run_cancel.is_cancelled());
+        let completed = super::finish_admitted_run(
+            &store,
+            session_id,
+            &admission_id,
+            turn_id,
+            run_cancel.is_cancelled(),
+            Ok(successful_run_summary(session_id)),
+            heartbeat_result,
+        )
+        .await
+        .expect("graceful heartbeat must not reverse terminal success");
+        assert_eq!(completed.status, crate::session::SessionStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn completed_commit_after_heartbeat_error_remains_the_durable_authority() {
+        let (store, session_id, admission_id, turn_id, assistant) =
+            heartbeat_active_turn_fixture("heartbeat error before completed commit").await;
+        let renewal_entered = Arc::new(tokio::sync::Notify::new());
+        let release_error = Arc::new(tokio::sync::Notify::new());
+        let heartbeat_renewal_entered = Arc::clone(&renewal_entered);
+        let heartbeat_release_error = Arc::clone(&release_error);
+        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let heartbeat_task = super::spawn_run_admission_heartbeat(
+            session_id,
+            admission_id.clone(),
+            run_cancel.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            std::time::Duration::from_millis(1),
+            move || {
+                let renewal_entered = Arc::clone(&heartbeat_renewal_entered);
+                let release_error = Arc::clone(&heartbeat_release_error);
+                async move {
+                    renewal_entered.notify_one();
+                    release_error.notified().await;
+                    Err(crate::error::StorageError::Message(
+                        "heartbeat failed immediately before completion".to_string(),
+                    ))
+                }
+            },
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            renewal_entered.notified(),
+        )
+        .await
+        .expect("heartbeat did not reach the error barrier");
+        release_error.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), run_cancel.cancelled())
+            .await
+            .expect("heartbeat error did not cancel the run");
+        let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
+
+        assert_eq!(
+            commit_completed_turn(&store, session_id, &admission_id, turn_id, &assistant).await,
+            crate::storage::session_repo::AdmittedTerminalCommit::Applied
+        );
+        assert_eq!(
+            store
+                .session_repo()
+                .corroborated_terminal_status_for_turn(session_id, turn_id)
+                .await
+                .expect("durable terminal truth"),
+            Some(crate::session::SessionStatus::Completed)
+        );
+        let completed = super::finish_admitted_run(
+            &store,
+            session_id,
+            &admission_id,
+            turn_id,
+            run_cancel.is_cancelled(),
+            Ok(successful_run_summary(session_id)),
+            heartbeat_result,
+        )
+        .await
+        .expect("durable completion must override the heartbeat diagnostic");
+        assert_eq!(completed.status, crate::session::SessionStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn completed_commit_before_heartbeat_panic_remains_the_durable_authority() {
+        let (store, session_id, admission_id, turn_id, assistant) =
+            heartbeat_active_turn_fixture("completed commit before heartbeat panic").await;
+        let renewal_entered = Arc::new(tokio::sync::Notify::new());
+        let release_panic = Arc::new(tokio::sync::Notify::new());
+        let heartbeat_renewal_entered = Arc::clone(&renewal_entered);
+        let heartbeat_release_panic = Arc::clone(&release_panic);
+        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let heartbeat_task = super::spawn_run_admission_heartbeat(
+            session_id,
+            admission_id.clone(),
+            run_cancel.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            std::time::Duration::from_millis(1),
+            move || {
+                gated_panicking_heartbeat_renewal(
+                    Arc::clone(&heartbeat_renewal_entered),
+                    Arc::clone(&heartbeat_release_panic),
+                )
+            },
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            renewal_entered.notified(),
+        )
+        .await
+        .expect("heartbeat did not reach the panic barrier");
+        assert_eq!(
+            commit_completed_turn(&store, session_id, &admission_id, turn_id, &assistant).await,
+            crate::storage::session_repo::AdmittedTerminalCommit::Applied
+        );
+        release_panic.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), run_cancel.cancelled())
+            .await
+            .expect("heartbeat panic did not cancel the run");
+        let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
+
+        let completed = super::finish_admitted_run(
+            &store,
+            session_id,
+            &admission_id,
+            turn_id,
+            run_cancel.is_cancelled(),
+            Ok(successful_run_summary(session_id)),
+            heartbeat_result,
+        )
+        .await
+        .expect("durable completion must override the heartbeat panic diagnostic");
+        assert_eq!(completed.status, crate::session::SessionStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_error_finished_before_terminal_commit_settles_as_failure() {
+        let (store, session_id, admission_id, turn_id, assistant) =
+            heartbeat_active_turn_fixture("heartbeat storage error").await;
+        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let heartbeat_task = super::spawn_run_admission_heartbeat(
+            session_id,
+            admission_id.clone(),
+            run_cancel.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            std::time::Duration::from_millis(1),
+            || {
+                std::future::ready(Err(crate::error::StorageError::Message(
+                    "injected heartbeat storage error".to_string(),
+                )))
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), run_cancel.cancelled())
+            .await
+            .expect("storage failure did not cancel the run");
+        let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
+        let failure = super::finish_admitted_run(
+            &store,
+            session_id,
+            &admission_id,
+            turn_id,
+            run_cancel.is_cancelled(),
+            Ok(successful_run_summary(session_id)),
+            heartbeat_result,
+        )
+        .await
+        .expect_err("heartbeat storage failure must fail the run");
+
+        assert!(
+            failure
+                .to_string()
+                .contains("injected heartbeat storage error")
+        );
+        assert_eq!(
+            store
+                .session_repo()
+                .get_session(session_id)
+                .await
+                .expect("settled session")
+                .status,
+            crate::session::SessionStatus::Failed
+        );
+        assert_eq!(
+            store
+                .session_repo()
+                .corroborated_terminal_status_for_turn(session_id, turn_id)
+                .await
+                .expect("failed terminal truth"),
+            Some(crate::session::SessionStatus::Failed)
+        );
+        assert_eq!(
+            commit_completed_turn(&store, session_id, &admission_id, turn_id, &assistant).await,
+            crate::storage::session_repo::AdmittedTerminalCommit::NotOwned
+        );
+        assert!(
+            store
+                .session_repo()
+                .admit_session_run(session_id)
+                .await
+                .expect("readmission")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_panic_cancels_and_still_settles_and_releases() {
+        let (store, session_id, admission_id, turn_id, _) =
+            heartbeat_active_turn_fixture("heartbeat panic").await;
+        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let heartbeat_task = super::spawn_run_admission_heartbeat(
+            session_id,
+            admission_id.clone(),
+            run_cancel.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            std::time::Duration::from_millis(1),
+            panicking_heartbeat_renewal,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), run_cancel.cancelled())
+            .await
+            .expect("heartbeat panic did not cancel the run");
+        let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
+        let failure = super::finish_admitted_run(
+            &store,
+            session_id,
+            &admission_id,
+            turn_id,
+            run_cancel.is_cancelled(),
+            Ok(successful_run_summary(session_id)),
+            heartbeat_result,
+        )
+        .await
+        .expect_err("heartbeat panic must fail the run");
+
+        assert!(failure.to_string().contains("injected heartbeat panic"));
+        assert_eq!(
+            store
+                .session_repo()
+                .get_session(session_id)
+                .await
+                .expect("settled session")
+                .status,
+            crate::session::SessionStatus::Failed
+        );
+        assert!(
+            store
+                .session_repo()
+                .admit_session_run(session_id)
+                .await
+                .expect("readmission")
+                .is_some()
+        );
     }
 }

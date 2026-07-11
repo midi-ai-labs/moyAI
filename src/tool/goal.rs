@@ -99,6 +99,7 @@ impl Tool for CreateGoalTool {
         let objective = input.objective.trim().to_string();
         validate_thread_goal_objective(&objective).map_err(ToolError::Message)?;
         validate_token_budget(input.token_budget)?;
+        ctx.run_mutation_fence.assert_owned().await?;
         let goal = ctx
             .services
             .store
@@ -153,8 +154,10 @@ impl Tool for UpdateGoalTool {
             ));
         }
         let repo = ctx.services.store.session_repo();
+        ctx.run_mutation_fence.assert_owned().await?;
         repo.account_thread_goal_usage(ctx.session.session.id, 0)
             .await?;
+        ctx.run_mutation_fence.assert_owned().await?;
         let goal = repo
             .update_thread_goal(ctx.session.session.id, None, Some(input.status), None)
             .await?;

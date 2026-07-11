@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read as _;
 use std::process::ExitStatus;
 use std::process::Stdio;
 
@@ -10,7 +11,6 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
@@ -22,7 +22,7 @@ use crate::error::ToolError;
 use crate::session::ChangeRepository;
 use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
-use crate::tool::truncate::clip_text_with_ellipsis;
+use crate::tool::truncate::{BoundedPipeOutput, clip_text_with_ellipsis, read_pipe_bounded};
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
 use crate::workspace::{AccessKind, PathGuard, is_protected_workspace_authority_path};
 
@@ -37,6 +37,13 @@ pub struct ShellInput {
 
 #[derive(Debug, Default)]
 pub struct ShellTool;
+
+const DEFAULT_SHELL_SNAPSHOT_LIMITS: SnapshotLimits = SnapshotLimits {
+    max_walk_entries: 20_000,
+    max_files: 10_000,
+    max_total_bytes: 64 * 1024 * 1024,
+    max_file_bytes: 8 * 1024 * 1024,
+};
 
 #[async_trait(?Send)]
 impl Tool for ShellTool {
@@ -63,7 +70,7 @@ impl Tool for ShellTool {
                     },
                     "workdir": {
                         "type": "string",
-                        "description": "Optional working directory, preferably relative to the workspace root."
+                        "description": "Optional working directory, preferably relative to the workspace root. Use the narrowest directory that contains the command targets; shell change snapshots are bounded to this scope and explicit absolute targets."
                     },
                     "timeout_ms": {
                         "type": "integer",
@@ -117,16 +124,60 @@ impl Tool for ShellTool {
             .timeout_ms
             .unwrap_or(ctx.config.shell.default_timeout_ms)
             .min(ctx.config.shell.max_timeout_ms);
-        let before = snapshot_workspace(ctx.workspace)?;
+        let snapshot_plan = shell_snapshot_plan(ctx.workspace, &guarded, &input.command);
+        let before = match snapshot_workspace(
+            ctx.workspace,
+            &snapshot_plan,
+            DEFAULT_SHELL_SNAPSHOT_LIMITS,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(ShellSnapshotError::Limit(message)) => {
+                return shell_snapshot_limit_result(
+                    &ctx,
+                    &description,
+                    &input.command,
+                    &snapshot_plan,
+                    DEFAULT_SHELL_SNAPSHOT_LIMITS,
+                    &message,
+                    SnapshotLimitPhase::BeforeExecution,
+                    None,
+                );
+            }
+            Err(ShellSnapshotError::Other(error)) => return Err(error),
+        };
+        ctx.run_mutation_fence.assert_owned().await?;
         let output = execute_shell_command(
             &ctx.config.shell,
             &guarded.absolute,
             &input.command,
             timeout_ms,
+            ctx.config.tool_output.max_bytes.max(1),
             ctx.cancel.clone(),
         )
         .await?;
-        let after = snapshot_workspace(ctx.workspace)?;
+        let after = match snapshot_workspace(
+            ctx.workspace,
+            &snapshot_plan,
+            DEFAULT_SHELL_SNAPSHOT_LIMITS,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(ShellSnapshotError::Limit(message)) => {
+                ctx.services
+                    .edit_safety
+                    .invalidate_roots(ctx.session.session.id, &snapshot_plan.scopes)?;
+                return shell_snapshot_limit_result(
+                    &ctx,
+                    &description,
+                    &input.command,
+                    &snapshot_plan,
+                    DEFAULT_SHELL_SNAPSHOT_LIMITS,
+                    &message,
+                    SnapshotLimitPhase::AfterExecution,
+                    Some(&output),
+                );
+            }
+            Err(ShellSnapshotError::Other(error)) => return Err(error),
+        };
         let shell_changes = build_shell_changes(&ctx, before, after)?;
         let baseline_snapshot = snapshot_and_sync_shell_change_set(
             &ctx.services.edit_safety,
@@ -134,6 +185,9 @@ impl Tool for ShellTool {
             &shell_changes,
         )?;
         let changes = shell_changes.changes;
+        // A cancelled process can already have changed files. The per-session process lock remains
+        // held while this tool finishes, so record the observed evidence even after cancellation;
+        // an active-only mutation fence here would discard the audit trail for real side effects.
         let change_ids = match ctx
             .services
             .store
@@ -166,6 +220,7 @@ impl Tool for ShellTool {
             &output.stderr,
             output.exit_code,
             output.timed_out,
+            output.cancelled,
         );
         let preview = ctx.services.truncator.preview(
             merged_output,
@@ -179,18 +234,27 @@ impl Tool for ShellTool {
             metadata: json!({
                 "exit_code": output.exit_code,
                 "timeout": output.timed_out,
+                "cancelled": output.cancelled,
+                "stdout_capture_truncated": output.stdout_truncated,
+                "stderr_capture_truncated": output.stderr_truncated,
+                "snapshot_owner": snapshot_plan.owner_root,
+                "snapshot_scopes": snapshot_plan.scopes,
+                "snapshot_limits": DEFAULT_SHELL_SNAPSHOT_LIMITS.metadata(),
                 "truncated": preview.truncated,
                 "changed_files": change_ids,
-                "success": output.exit_code == Some(0) && !output.timed_out,
-                "progress_effect": if output.exit_code == Some(0) && !output.timed_out { "made_progress" } else { "blocked" },
+                "success": output.exit_code == Some(0) && !output.timed_out && !output.cancelled,
+                "progress_effect": if output.exit_code == Some(0) && !output.timed_out && !output.cancelled { "made_progress" } else { "blocked" },
                 "shell_output_projection": {
                     "command": input.command.clone(),
                     "stdout_present": !output.stdout.trim().is_empty(),
                     "stderr_present": !output.stderr.trim().is_empty(),
                     "exit_code": output.exit_code,
                     "timeout": output.timed_out,
+                    "cancelled": output.cancelled,
+                    "stdout_capture_truncated": output.stdout_truncated,
+                    "stderr_capture_truncated": output.stderr_truncated,
                     "command_text_encoding_review": encoding_review.metadata(),
-                    "retry_guidance": if output.exit_code == Some(0) && !output.timed_out {
+                    "retry_guidance": if output.exit_code == Some(0) && !output.timed_out && !output.cancelled {
                         "command_succeeded"
                     } else {
                         "review_stdout_stderr_and_retry_corrected_command_when_the_command_was_malformed"
@@ -198,24 +262,28 @@ impl Tool for ShellTool {
                 },
                 "tool_feedback_envelope": {
                     "kind": "shell_execution_result",
-                    "success": output.exit_code == Some(0) && !output.timed_out,
-                    "progress_effect": if output.exit_code == Some(0) && !output.timed_out { "made_progress" } else { "blocked" },
+                    "success": output.exit_code == Some(0) && !output.timed_out && !output.cancelled,
+                    "progress_effect": if output.exit_code == Some(0) && !output.timed_out && !output.cancelled { "made_progress" } else { "blocked" },
                     "submitted_command": input.command.clone(),
                     "exit_code": output.exit_code,
                     "timeout": output.timed_out,
+                    "cancelled": output.cancelled,
+                    "stdout_capture_truncated": output.stdout_truncated,
+                    "stderr_capture_truncated": output.stderr_truncated,
                     "stdout_present": !output.stdout.trim().is_empty(),
                     "stderr_present": !output.stderr.trim().is_empty(),
                     "command_text_encoding_review": encoding_review.metadata(),
-                    "next_action_guidance": if output.exit_code == Some(0) && !output.timed_out {
+                    "next_action_guidance": if output.exit_code == Some(0) && !output.timed_out && !output.cancelled {
                         serde_json::Value::Null
                     } else {
                         serde_json::Value::String("If the command was malformed, inspect stdout/stderr, correct the command, and retry once with the native shell syntax. Do not stop solely because one shell command failed.".to_string())
                     },
                     "result_hash": crate::harness::artifact::hash_bytes(format!(
-                        "shell|{}|{:?}|{}|{}",
+                        "shell|{}|{:?}|{}|{}|{}",
                         input.command.clone(),
                         output.exit_code,
                         output.timed_out,
+                        output.cancelled,
                         output.stderr
                     ).as_bytes())
                 }
@@ -340,6 +408,7 @@ fn format_shell_output_for_display(
     stderr: &str,
     exit_code: Option<i32>,
     timed_out: bool,
+    cancelled: bool,
 ) -> String {
     let mut sections = Vec::new();
     sections.push(format!("Command: {}", command.trim()));
@@ -348,7 +417,13 @@ fn format_shell_output_for_display(
         exit_code
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
-        if timed_out { " (timeout)" } else { "" }
+        if timed_out {
+            " (timeout)"
+        } else if cancelled {
+            " (cancelled)"
+        } else {
+            ""
+        }
     ));
     sections.push(format!(
         "Stdout:\n{}",
@@ -366,13 +441,129 @@ fn format_shell_output_for_display(
             stderr.trim_end()
         }
     ));
-    if exit_code != Some(0) || timed_out {
+    if exit_code != Some(0) || timed_out || cancelled {
         sections.push(
             "Recovery: inspect the stdout/stderr above. If the command was malformed, retry with a corrected native-shell command instead of stopping after this single failure."
                 .to_string(),
         );
     }
     sections.join("\n\n")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotLimitPhase {
+    BeforeExecution,
+    AfterExecution,
+}
+
+impl SnapshotLimitPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeExecution => "before_execution",
+            Self::AfterExecution => "after_execution",
+        }
+    }
+
+    fn side_effects_applied(self) -> bool {
+        matches!(self, Self::AfterExecution)
+    }
+}
+
+fn shell_snapshot_limit_result(
+    ctx: &ToolContext<'_>,
+    description: &str,
+    command: &str,
+    plan: &ShellSnapshotPlan,
+    limits: SnapshotLimits,
+    diagnostic: &str,
+    phase: SnapshotLimitPhase,
+    output: Option<&CommandOutput>,
+) -> Result<ToolResult, ToolError> {
+    let mut display = if phase.side_effects_applied() {
+        format!(
+            "Shell command completed, but change evidence could not be completed within the bounded snapshot. Changes may have occurred, and edit baselines under the snapshot scopes were invalidated.\n\n{diagnostic}"
+        )
+    } else {
+        format!("Shell command was not executed.\n\n{diagnostic}")
+    };
+    if let Some(output) = output {
+        display.push_str("\n\n");
+        display.push_str(&format_shell_output_for_display(
+            command,
+            &output.stdout,
+            &output.stderr,
+            output.exit_code,
+            output.timed_out,
+            output.cancelled,
+        ));
+    }
+    let preview = ctx.services.truncator.preview(
+        display,
+        &ctx.config.tool_output,
+        &ctx.services.storage_paths,
+    )?;
+    let metadata = shell_snapshot_limit_metadata(phase, plan, limits, diagnostic, output);
+
+    Ok(ToolResult {
+        title: format!("Blocked: {description}"),
+        output_text: preview.preview_text,
+        metadata: merge_json_objects(
+            metadata,
+            json!({
+                "truncated": preview.truncated,
+            }),
+        ),
+        truncated_output_path: preview.truncated_output_path,
+        recorded_changes: Vec::new(),
+        change_summaries: Vec::new(),
+    })
+}
+
+fn shell_snapshot_limit_metadata(
+    phase: SnapshotLimitPhase,
+    plan: &ShellSnapshotPlan,
+    limits: SnapshotLimits,
+    diagnostic: &str,
+    output: Option<&CommandOutput>,
+) -> serde_json::Value {
+    let exit_code = output.and_then(|value| value.exit_code);
+    let timed_out = output.is_some_and(|value| value.timed_out);
+    let cancelled = output.is_some_and(|value| value.cancelled);
+    let stdout_present = output.is_some_and(|value| !value.stdout.trim().is_empty());
+    let stderr_present = output.is_some_and(|value| !value.stderr.trim().is_empty());
+    json!({
+        "exit_code": exit_code,
+        "timeout": timed_out,
+        "cancelled": cancelled,
+        "changed_files": [],
+        "success": false,
+        "progress_effect": "blocked",
+        "snapshot_blocked": true,
+        "snapshot_phase": phase.as_str(),
+        "snapshot_owner": plan.owner_root,
+        "snapshot_scopes": plan.scopes,
+        "snapshot_limits": limits.metadata(),
+        "blocked_reason": diagnostic,
+        "tool_feedback_envelope": {
+            "kind": "shell_snapshot_limit",
+            "success": false,
+            "progress_effect": "blocked",
+            "side_effects_applied": phase.side_effects_applied(),
+            "snapshot_phase": phase.as_str(),
+            "stdout_present": stdout_present,
+            "stderr_present": stderr_present,
+            "required_next_action": "retry_with_narrower_workdir_or_explicit_target_paths",
+        }
+    })
+}
+
+fn merge_json_objects(mut base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    base
 }
 
 fn starts_with_linux_diagnostic(command: &str) -> bool {
@@ -700,6 +891,9 @@ struct CommandOutput {
     stderr: String,
     exit_code: Option<i32>,
     timed_out: bool,
+    cancelled: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
 }
 
 async fn execute_shell_command(
@@ -707,6 +901,7 @@ async fn execute_shell_command(
     workdir: &Utf8Path,
     command_text: &str,
     timeout_ms: u64,
+    max_output_bytes: usize,
     cancel: CancellationToken,
 ) -> Result<CommandOutput, ToolError> {
     let family = shell.family.unwrap_or(if cfg!(windows) {
@@ -751,61 +946,77 @@ async fn execute_shell_command(
         .stderr
         .take()
         .ok_or_else(|| ToolError::Message("stderr pipe was not captured".to_string()))?;
-    let stdout_task = tokio::spawn(async move { read_pipe(stdout).await });
-    let stderr_task = tokio::spawn(async move { read_pipe(stderr).await });
+    let stdout_task = tokio::spawn(read_pipe_bounded(stdout, max_output_bytes));
+    let stderr_task = tokio::spawn(read_pipe_bounded(stderr, max_output_bytes));
 
-    let (status, timed_out) = tokio::select! {
+    let (status, timed_out, cancelled, execution_error) = tokio::select! {
         _ = cancel.cancelled() => {
-                let _ = terminate_shell_child(&mut child, pid, shell.hide_windows).await;
-                return Err(ToolError::Message("shell command cancelled by user".to_string()));
+                match terminate_shell_child(&mut child, pid, shell.hide_windows).await {
+                    Ok(status) => (Some(status), false, true, None),
+                    Err(error) => (None, false, true, Some(error.to_string())),
+                }
             }
         result = timeout(Duration::from_millis(timeout_ms), child.wait()) => match result {
-            Ok(result) => (result?, false),
+            Ok(result) => (Some(result?), false, false, None),
             Err(_) => {
-                let status = terminate_shell_child(&mut child, pid, shell.hide_windows).await?;
-                (status, true)
+                match terminate_shell_child(&mut child, pid, shell.hide_windows).await {
+                    Ok(status) => (Some(status), true, false, None),
+                    Err(error) => (None, true, false, Some(error.to_string())),
+                }
             }
         }
     };
 
-    cleanup_shell_process_tree_after_parent_exit(pid, shell.hide_windows).await?;
+    let cleanup_error = cleanup_shell_process_tree_after_parent_exit(pid, shell.hide_windows)
+        .await
+        .err()
+        .map(|error| error.to_string());
 
-    let stdout = decode_shell_bytes_for_display(&join_pipe(stdout_task, "stdout").await?);
-    let stderr_bytes = join_pipe(stderr_task, "stderr").await?;
-    let stderr = if timed_out {
-        if stderr_bytes.is_empty() {
-            "command timed out".to_string()
-        } else {
-            format!(
-                "{}\ncommand timed out",
-                decode_shell_bytes_for_display(&stderr_bytes)
-            )
+    let stdout_capture = join_pipe(stdout_task, "stdout").await?;
+    let stderr_capture = join_pipe(stderr_task, "stderr").await?;
+    let stdout = captured_shell_text(stdout_capture.bytes.as_slice(), stdout_capture.truncated);
+    let mut stderr = captured_shell_text(stderr_capture.bytes.as_slice(), stderr_capture.truncated);
+    for message in [
+        timed_out.then_some("command timed out"),
+        cancelled.then_some("command cancelled by user"),
+        execution_error.as_deref(),
+        cleanup_error.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !stderr.is_empty() {
+            stderr.push('\n');
         }
-    } else {
-        decode_shell_bytes_for_display(&stderr_bytes)
-    };
+        stderr.push_str(message);
+    }
 
     Ok(CommandOutput {
         stdout,
         stderr,
-        exit_code: status.code(),
+        exit_code: status.and_then(|value| value.code()),
         timed_out,
+        cancelled,
+        stdout_truncated: stdout_capture.truncated,
+        stderr_truncated: stderr_capture.truncated,
     })
 }
 
-async fn read_pipe<T>(mut pipe: T) -> Result<Vec<u8>, std::io::Error>
-where
-    T: tokio::io::AsyncRead + Unpin,
-{
-    let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes).await?;
-    Ok(bytes)
+fn captured_shell_text(bytes: &[u8], truncated: bool) -> String {
+    let mut text = decode_shell_bytes_for_display(bytes);
+    if truncated {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("[shell stream capture truncated]");
+    }
+    text
 }
 
 async fn join_pipe(
-    task: JoinHandle<Result<Vec<u8>, std::io::Error>>,
+    task: JoinHandle<Result<BoundedPipeOutput, std::io::Error>>,
     label: &str,
-) -> Result<Vec<u8>, ToolError> {
+) -> Result<BoundedPipeOutput, ToolError> {
     task.await
         .map_err(|error| {
             ToolError::Message(format!("failed to join shell {label} reader task: {error}"))
@@ -822,30 +1033,14 @@ fn apply_shell_environment(command: &mut Command, shell: &crate::config::ShellCo
     }
     let injected = platform_bootstrap_env(&captured);
 
-    #[cfg(windows)]
-    {
-        for key in &shell.env_allowlist {
-            if let Some(value) = captured.get(key) {
-                command.env(key, value);
-            }
-        }
-        for (key, value) in injected {
+    command.env_clear();
+    for key in &shell.env_allowlist {
+        if let Some(value) = captured.get(key) {
             command.env(key, value);
         }
     }
-
-    #[cfg(not(windows))]
-    command.env_clear();
-    #[cfg(not(windows))]
-    {
-        for key in &shell.env_allowlist {
-            if let Some(value) = captured.get(key) {
-                command.env(key, value);
-            }
-        }
-        for (key, value) in injected {
-            command.env(key, value);
-        }
+    for (key, value) in injected {
+        command.env(key, value);
     }
 }
 
@@ -1257,57 +1452,255 @@ fn command_mentions_protected_target(
         .any(|path| is_protected_workspace_authority_path(&workspace.root, &path))
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct SnapshotEntry {
-    bytes: Option<Vec<u8>>,
-    text: Option<String>,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct ShellSnapshotPlan {
+    owner_root: Utf8PathBuf,
+    scopes: Vec<Utf8PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotLimits {
+    max_walk_entries: usize,
+    max_files: usize,
+    max_total_bytes: u64,
+    max_file_bytes: u64,
+}
+
+impl SnapshotLimits {
+    fn metadata(self) -> serde_json::Value {
+        json!({
+            "max_walk_entries": self.max_walk_entries,
+            "max_files": self.max_files,
+            "max_total_bytes": self.max_total_bytes,
+            "max_file_bytes": self.max_file_bytes,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct SnapshotBudget {
+    walk_entries: usize,
+    files: usize,
+    total_bytes: u64,
+}
+
+#[derive(Debug)]
+enum ShellSnapshotError {
+    Limit(String),
+    Other(ToolError),
+}
+
+impl std::fmt::Display for ShellSnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Limit(message) => formatter.write_str(message),
+            Self::Other(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl From<ToolError> for ShellSnapshotError {
+    fn from(error: ToolError) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<std::io::Error> for ShellSnapshotError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Other(ToolError::from(error))
+    }
+}
+
+impl From<crate::error::WorkspaceError> for ShellSnapshotError {
+    fn from(error: crate::error::WorkspaceError) -> Self {
+        Self::Other(ToolError::from(error))
+    }
+}
+
+fn shell_snapshot_owner(
+    workspace: &crate::workspace::Workspace,
+    guarded_workdir: &crate::workspace::GuardedPath,
+) -> Utf8PathBuf {
+    if guarded_workdir.inside_workspace {
+        return workspace.root.clone();
+    }
+
+    workspace
+        .path_policy
+        .additional_write_roots
+        .iter()
+        .filter(|root| guarded_workdir.absolute.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()
+        .unwrap_or_else(|| guarded_workdir.absolute.clone())
+}
+
+fn shell_snapshot_plan(
+    workspace: &crate::workspace::Workspace,
+    guarded_workdir: &crate::workspace::GuardedPath,
+    command: &str,
+) -> ShellSnapshotPlan {
+    let owner_root = shell_snapshot_owner(workspace, guarded_workdir);
+    let mut scopes = vec![guarded_workdir.absolute.clone()];
+    scopes.extend(extract_absolute_paths(command));
+    if command.contains("..") {
+        scopes.push(owner_root.clone());
+    }
+    ShellSnapshotPlan {
+        owner_root,
+        scopes: normalize_snapshot_scopes(scopes),
+    }
+}
+
+fn normalize_snapshot_scopes(mut scopes: Vec<Utf8PathBuf>) -> Vec<Utf8PathBuf> {
+    scopes.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    scopes.dedup();
+    let mut normalized = Vec::<Utf8PathBuf>::new();
+    for scope in scopes {
+        if normalized.iter().any(|owner| scope.starts_with(owner)) {
+            continue;
+        }
+        normalized.push(scope);
+    }
+    normalized
 }
 
 fn snapshot_workspace(
     workspace: &crate::workspace::Workspace,
-) -> Result<HashMap<Utf8PathBuf, SnapshotEntry>, ToolError> {
+    plan: &ShellSnapshotPlan,
+    limits: SnapshotLimits,
+) -> Result<HashMap<Utf8PathBuf, SnapshotEntry>, ShellSnapshotError> {
     let ignore = workspace.ignore.compile()?;
-    let mut builder = WalkBuilder::new(&workspace.root);
-    builder.hidden(false);
-    builder.git_ignore(workspace.ignore.use_gitignore);
     let mut snapshot = HashMap::new();
+    let mut budget = SnapshotBudget::default();
 
-    for entry in builder.build() {
-        let entry = entry.map_err(|error| ToolError::Message(error.to_string()))?;
-        if !entry
-            .file_type()
-            .map(|value| value.is_file())
-            .unwrap_or(false)
-        {
+    for scope in &plan.scopes {
+        if scope.is_file() {
+            snapshot_file(
+                workspace,
+                &ignore,
+                scope,
+                scope.parent().unwrap_or(scope),
+                plan,
+                limits,
+                &mut budget,
+                &mut snapshot,
+            )?;
             continue;
         }
-        let path = Utf8PathBuf::from_path_buf(entry.path().to_path_buf())
-            .map_err(|_| ToolError::Message("path is not valid UTF-8".to_string()))?;
-        if workspace
-            .protected_paths
-            .iter()
-            .any(|value| path.starts_with(value))
-        {
+        if !scope.is_dir() {
             continue;
         }
-        if workspace
-            .ignore
-            .matches_compiled(&ignore, &workspace.root, &path)
-        {
-            continue;
+        let mut builder = WalkBuilder::new(scope);
+        builder.hidden(false);
+        builder.git_ignore(workspace.ignore.use_gitignore);
+        for entry in builder.build() {
+            budget.walk_entries = budget.walk_entries.saturating_add(1);
+            if budget.walk_entries > limits.max_walk_entries {
+                return Err(snapshot_limit_error(plan, limits, "walk entry limit"));
+            }
+            let entry = entry.map_err(|error| ToolError::Message(error.to_string()))?;
+            if !entry
+                .file_type()
+                .map(|value| value.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let path = Utf8PathBuf::from_path_buf(entry.path().to_path_buf())
+                .map_err(|_| ToolError::Message("path is not valid UTF-8".to_string()))?;
+            snapshot_file(
+                workspace,
+                &ignore,
+                &path,
+                scope,
+                plan,
+                limits,
+                &mut budget,
+                &mut snapshot,
+            )?;
         }
-        let bytes = fs::read(&path)?;
-        let text = String::from_utf8(bytes.clone()).ok();
-        snapshot.insert(
-            path,
-            SnapshotEntry {
-                bytes: Some(bytes),
-                text,
-            },
-        );
     }
 
     Ok(snapshot)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn snapshot_file(
+    workspace: &crate::workspace::Workspace,
+    ignore: &globset::GlobSet,
+    path: &Utf8Path,
+    scope_root: &Utf8Path,
+    plan: &ShellSnapshotPlan,
+    limits: SnapshotLimits,
+    budget: &mut SnapshotBudget,
+    snapshot: &mut HashMap<Utf8PathBuf, SnapshotEntry>,
+) -> Result<(), ShellSnapshotError> {
+    if snapshot.contains_key(path)
+        || workspace
+            .protected_paths
+            .iter()
+            .any(|value| path.starts_with(value))
+        || workspace.ignore.matches_compiled(ignore, scope_root, path)
+    {
+        return Ok(());
+    }
+
+    if budget.files >= limits.max_files {
+        return Err(snapshot_limit_error(plan, limits, "file count limit"));
+    }
+    let metadata = fs::metadata(path)?;
+    let size_bytes = metadata.len();
+    if size_bytes > limits.max_file_bytes {
+        return Err(snapshot_limit_error(plan, limits, "single file byte limit"));
+    }
+    if budget.total_bytes.saturating_add(size_bytes) > limits.max_total_bytes {
+        return Err(snapshot_limit_error(plan, limits, "total byte limit"));
+    }
+
+    let remaining_total = limits.max_total_bytes.saturating_sub(budget.total_bytes);
+    let read_limit = limits.max_file_bytes.min(remaining_total);
+    let mut bytes = Vec::with_capacity((size_bytes.min(read_limit)) as usize);
+    fs::File::open(path)?
+        .take(read_limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > read_limit {
+        return Err(snapshot_limit_error(
+            plan,
+            limits,
+            "file grew beyond byte limit while snapshotting",
+        ));
+    }
+
+    budget.files += 1;
+    budget.total_bytes = budget.total_bytes.saturating_add(bytes.len() as u64);
+    snapshot.insert(path.to_path_buf(), SnapshotEntry { bytes });
+    Ok(())
+}
+
+fn snapshot_limit_error(
+    plan: &ShellSnapshotPlan,
+    limits: SnapshotLimits,
+    reason: &str,
+) -> ShellSnapshotError {
+    ShellSnapshotError::Limit(format!(
+        "shell change snapshot exceeded its bounded scope ({reason}) for owner `{}`. Use a narrower `workdir` or a command with explicit target paths. Limits: {} walk entries, {} files, {} total bytes, {} bytes per file.",
+        plan.owner_root,
+        limits.max_walk_entries,
+        limits.max_files,
+        limits.max_total_bytes,
+        limits.max_file_bytes,
+    ))
 }
 
 struct ShellChangeSet {
@@ -1412,12 +1805,8 @@ fn build_shell_changes(
         if after_entry.is_some() {
             current_paths.push(path.clone());
         }
-        let before_text = before_entry
-            .and_then(|entry| entry.text.clone())
-            .unwrap_or_else(|| "<<binary>>".to_string());
-        let after_text = after_entry
-            .and_then(|entry| entry.text.clone())
-            .unwrap_or_else(|| "<<binary>>".to_string());
+        let before_text = before_entry.map(snapshot_entry_text).unwrap_or_default();
+        let after_text = after_entry.map(snapshot_entry_text).unwrap_or_default();
         let change = ctx.services.change_tracker.build_change(
             ctx.tool_call_id,
             before_entry
@@ -1438,6 +1827,10 @@ fn build_shell_changes(
         removed_paths,
         current_paths,
     })
+}
+
+fn snapshot_entry_text(entry: &SnapshotEntry) -> String {
+    String::from_utf8(entry.bytes.clone()).unwrap_or_else(|_| "<<binary>>".to_string())
 }
 
 pub fn command_text_encoding_contract_fixture_passes() -> bool {
@@ -1547,9 +1940,16 @@ pub fn external_connection_shell_review_fixture_passes() -> bool {
 }
 
 pub fn shell_output_projection_fixture_passes() -> bool {
-    let output =
-        format_shell_output_for_display("Get-Process", "powershell  123", "", Some(0), false);
-    let failed = format_shell_output_for_display("uv add ということ", "", "error", Some(1), false);
+    let output = format_shell_output_for_display(
+        "Get-Process",
+        "powershell  123",
+        "",
+        Some(0),
+        false,
+        false,
+    );
+    let failed =
+        format_shell_output_for_display("uv add ということ", "", "error", Some(1), false, false);
     output.contains("Command: Get-Process")
         && output.contains("Stdout:\npowershell  123")
         && output.contains("Stderr:\n(empty)")
@@ -1559,6 +1959,11 @@ pub fn shell_output_projection_fixture_passes() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use camino::Utf8PathBuf;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::config::ResolvedConfig;
+    use crate::workspace::{AccessKind, PathGuard, WorkspaceDiscovery};
 
     #[test]
     fn command_text_encoding_contract_reviews_text_io_commands() {
@@ -1586,5 +1991,293 @@ mod tests {
                 super::ShellTerminationStep::WaitForParent,
             ]
         );
+    }
+
+    #[test]
+    fn external_write_root_owns_shell_snapshot() {
+        let workspace_temp = tempfile::tempdir().expect("workspace tempdir");
+        let external_temp = tempfile::tempdir().expect("external tempdir");
+        let workspace_root = Utf8PathBuf::from_path_buf(workspace_temp.path().to_path_buf())
+            .expect("utf8 workspace");
+        let external_root = Utf8PathBuf::from_path_buf(external_temp.path().to_path_buf())
+            .expect("utf8 external root");
+        let workdir = external_root.join("nested");
+        std::fs::create_dir_all(&workdir).expect("create external workdir");
+        let mut config = ResolvedConfig::default();
+        config.permissions.additional_write_roots = vec![external_root.clone()];
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+            .expect("discover workspace");
+        let guarded = PathGuard::require_path(&workspace, &workdir, AccessKind::Shell)
+            .expect("admit external workdir");
+
+        assert_eq!(
+            super::shell_snapshot_owner(&workspace, &guarded),
+            external_root
+        );
+        let plan = super::shell_snapshot_plan(&workspace, &guarded, "Get-Date");
+        assert_eq!(plan.owner_root, external_root);
+        assert_eq!(plan.scopes, vec![workdir]);
+    }
+
+    #[test]
+    fn shell_snapshot_scans_workdir_without_walking_large_workspace_siblings() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let workdir = root.join("focused");
+        let sibling = root.join("large-sibling");
+        std::fs::create_dir_all(&workdir).expect("create focused workdir");
+        std::fs::create_dir_all(&sibling).expect("create sibling");
+        std::fs::write(workdir.join("tracked.txt"), "tracked").expect("write tracked file");
+        for index in 0..20 {
+            std::fs::write(sibling.join(format!("ignored-{index}.txt")), "ignored")
+                .expect("write sibling fixture");
+        }
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+        let guarded = PathGuard::require_path(&workspace, &workdir, AccessKind::Shell)
+            .expect("admit workdir");
+        let plan = super::shell_snapshot_plan(&workspace, &guarded, "Get-Date");
+        let limits = super::SnapshotLimits {
+            max_walk_entries: 3,
+            max_files: 2,
+            max_total_bytes: 1_024,
+            max_file_bytes: 1_024,
+        };
+
+        let snapshot =
+            super::snapshot_workspace(&workspace, &plan, limits).expect("bounded snapshot");
+
+        assert_eq!(plan.owner_root, root);
+        assert_eq!(plan.scopes, vec![workdir.clone()]);
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot.contains_key(&workdir.join("tracked.txt")));
+    }
+
+    #[test]
+    fn shell_snapshot_rejects_oversized_scope_before_command_execution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        for index in 0..3 {
+            std::fs::write(root.join(format!("file-{index}.txt")), "content")
+                .expect("write fixture");
+        }
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+        let guarded =
+            PathGuard::require_path(&workspace, &root, AccessKind::Shell).expect("admit workdir");
+        let plan = super::shell_snapshot_plan(&workspace, &guarded, "Get-Date");
+        let limits = super::SnapshotLimits {
+            max_walk_entries: 10,
+            max_files: 2,
+            max_total_bytes: 1_024,
+            max_file_bytes: 1_024,
+        };
+
+        let error = super::snapshot_workspace(&workspace, &plan, limits)
+            .expect_err("oversized scope must fail before shell execution");
+
+        assert!(error.to_string().contains("bounded scope"));
+        assert!(error.to_string().contains("narrower `workdir`"));
+        let metadata = super::shell_snapshot_limit_metadata(
+            super::SnapshotLimitPhase::BeforeExecution,
+            &plan,
+            limits,
+            &error.to_string(),
+            None,
+        );
+        assert_eq!(metadata["success"].as_bool(), Some(false));
+        assert_eq!(metadata["progress_effect"].as_str(), Some("blocked"));
+        assert_eq!(
+            metadata["snapshot_phase"].as_str(),
+            Some("before_execution")
+        );
+        assert_eq!(
+            metadata["tool_feedback_envelope"]["side_effects_applied"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn parent_relative_command_expands_snapshot_to_owner_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let workdir = root.join("nested");
+        std::fs::create_dir_all(&workdir).expect("create workdir");
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+        let guarded = PathGuard::require_path(&workspace, &workdir, AccessKind::Shell)
+            .expect("admit workdir");
+
+        let plan =
+            super::shell_snapshot_plan(&workspace, &guarded, "Set-Content ../outside.txt value");
+
+        assert_eq!(plan.scopes, vec![root]);
+    }
+
+    #[test]
+    fn post_execution_snapshot_limit_reports_blocked_possible_side_effects() {
+        let plan = super::ShellSnapshotPlan {
+            owner_root: Utf8PathBuf::from("C:/workspace"),
+            scopes: vec![Utf8PathBuf::from("C:/workspace/focused")],
+        };
+        let limits = super::SnapshotLimits {
+            max_walk_entries: 10,
+            max_files: 2,
+            max_total_bytes: 1_024,
+            max_file_bytes: 1_024,
+        };
+        let output = super::CommandOutput {
+            stdout: "created files".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            timed_out: false,
+            cancelled: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+
+        let metadata = super::shell_snapshot_limit_metadata(
+            super::SnapshotLimitPhase::AfterExecution,
+            &plan,
+            limits,
+            "file count limit",
+            Some(&output),
+        );
+
+        assert_eq!(metadata["success"].as_bool(), Some(false));
+        assert_eq!(metadata["snapshot_phase"].as_str(), Some("after_execution"));
+        assert_eq!(
+            metadata["tool_feedback_envelope"]["side_effects_applied"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            metadata["tool_feedback_envelope"]["stdout_present"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_shell_returns_output_so_after_snapshot_can_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+        let guarded =
+            PathGuard::require_path(&workspace, &root, AccessKind::Shell).expect("admit workdir");
+        let plan = super::shell_snapshot_plan(&workspace, &guarded, cancelled_write_command());
+        let before =
+            super::snapshot_workspace(&workspace, &plan, super::DEFAULT_SHELL_SNAPSHOT_LIMITS)
+                .expect("before snapshot");
+        let changed_path = root.join("cancelled.txt");
+        let cancel = CancellationToken::new();
+        let cancel_after_change = cancel.clone();
+        let watched_path = changed_path.clone();
+        let canceller = tokio::spawn(async move {
+            for _ in 0..300 {
+                if watched_path.exists() {
+                    cancel_after_change.cancel();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            cancel_after_change.cancel();
+        });
+
+        let output = super::execute_shell_command(
+            &config.shell,
+            &root,
+            cancelled_write_command(),
+            5_000,
+            1_024,
+            cancel,
+        )
+        .await
+        .expect("cancel is a reportable shell outcome");
+        canceller.await.expect("join canceller");
+        let after =
+            super::snapshot_workspace(&workspace, &plan, super::DEFAULT_SHELL_SNAPSHOT_LIMITS)
+                .expect("after snapshot");
+
+        assert!(output.cancelled);
+        assert!(!before.contains_key(&changed_path));
+        assert!(after.contains_key(&changed_path));
+    }
+
+    #[tokio::test]
+    async fn shell_stream_capture_is_bounded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+
+        let output = super::execute_shell_command(
+            &config.shell,
+            &root,
+            large_output_command(),
+            5_000,
+            32,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("run bounded shell capture");
+
+        assert!(output.stdout_truncated);
+        assert!(output.stdout.starts_with("xxxxxxxx"));
+        assert!(output.stdout.ends_with("[shell stream capture truncated]"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_environment_is_allowlist_only() {
+        let config = ResolvedConfig::default();
+        let system_root = std::env::var("SystemRoot").expect("SystemRoot");
+        let executable =
+            Utf8PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let mut command = tokio::process::Command::new(executable);
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$secret=[Environment]::GetEnvironmentVariable('MOYAI_FORBIDDEN_TEST'); $system=[Environment]::GetEnvironmentVariable('SystemRoot'); [Console]::Out.Write(\"$secret|$system\")",
+        ]);
+        command.env("MOYAI_FORBIDDEN_TEST", "secret");
+
+        super::apply_shell_environment(&mut command, &config.shell);
+        let output = command
+            .output()
+            .await
+            .expect("run filtered environment child");
+        let stdout = String::from_utf8(output.stdout).expect("utf8 output");
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.starts_with('|'));
+        assert!(stdout[1..].eq_ignore_ascii_case(std::env::var("SystemRoot").unwrap().as_str()));
+    }
+
+    #[cfg(windows)]
+    fn cancelled_write_command() -> &'static str {
+        "Set-Content -LiteralPath cancelled.txt -Value changed -Encoding UTF8; Start-Sleep -Seconds 5"
+    }
+
+    #[cfg(not(windows))]
+    fn cancelled_write_command() -> &'static str {
+        "printf changed > cancelled.txt; sleep 5"
+    }
+
+    #[cfg(windows)]
+    fn large_output_command() -> &'static str {
+        "[Console]::Out.Write(('x' * 2048))"
+    }
+
+    #[cfg(not(windows))]
+    fn large_output_command() -> &'static str {
+        "yes x | head -c 2048 | tr -d '\\n'"
     }
 }

@@ -29,7 +29,7 @@ impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::Read,
-            description: "Read a UTF-8 text file with line numbers. Directories, binary files, large files, checkpoints, and structured documents are redirected to safer workflows.",
+            description: "Read a UTF-8 text file with line numbers. Directories, binary files, large files, checkpoints, and structured documents are redirected to safer workflows. A write baseline is recorded only when one read shows every line from the beginning and its tool output is not truncated.",
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],
@@ -69,6 +69,7 @@ impl Tool for ReadTool {
                     "path": guarded.absolute,
                     "blocked_reason": "directory",
                     "suggested_tools": ["inspect_directory", "list"],
+                    "edit_baseline": EditBaselineDecision::not_recorded("not_read_inline").metadata(),
                 }),
             ));
         }
@@ -145,6 +146,7 @@ impl Tool for ReadTool {
             ));
         }
 
+        let content_sha256 = crate::harness::artifact::hash_bytes(&bytes);
         let text = String::from_utf8(bytes).map_err(|error| {
             ToolError::Message(format!(
                 "file is not valid UTF-8 text after guard checks: {error}"
@@ -167,19 +169,24 @@ impl Tool for ReadTool {
             &ctx.services.storage_paths,
         )?;
 
+        let baseline = edit_baseline_decision(offset, slice.len(), lines.len(), preview.truncated);
+
         let mtime_ms = metadata
             .modified()
             .ok()
             .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
             .map(|value| value.as_millis() as i64);
-        ctx.services.edit_safety.record_read(
+        record_edit_baseline_if_eligible(
+            &ctx.services.edit_safety,
             ctx.session.session.id,
             crate::edit::FileReadStamp {
                 path: guarded.absolute.clone(),
                 read_at_ms: SystemClock::now_ms(),
                 mtime_ms,
                 size_bytes: Some(size_bytes),
+                content_sha256: Some(content_sha256),
             },
+            baseline,
         )?;
 
         let instruction_sources = find_instruction_sources(&guarded.absolute, &ctx.workspace.root);
@@ -193,6 +200,7 @@ impl Tool for ReadTool {
                 "end_line": (offset - 1) + slice.len(),
                 "total_lines": lines.len(),
                 "truncated": preview.truncated,
+                "edit_baseline": baseline.metadata(),
                 "instruction_sources": instruction_sources,
             }),
             truncated_output_path: preview.truncated_output_path,
@@ -214,6 +222,7 @@ fn read_blocked_result(
         "path": path,
         "size_bytes": size_bytes,
         "blocked_reason": blocked_reason,
+        "edit_baseline": EditBaselineDecision::not_recorded("not_read_inline").metadata(),
     });
     if let (Some(target), Some(extra)) = (metadata.as_object_mut(), extra_metadata.as_object()) {
         for (key, value) in extra {
@@ -225,6 +234,62 @@ fn read_blocked_result(
         &format!("`{path}` was not read inline.\n{message}"),
         metadata,
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditBaselineDecision {
+    recorded: bool,
+    reason: &'static str,
+}
+
+impl EditBaselineDecision {
+    const fn recorded() -> Self {
+        Self {
+            recorded: true,
+            reason: "complete_visible_file",
+        }
+    }
+
+    const fn not_recorded(reason: &'static str) -> Self {
+        Self {
+            recorded: false,
+            reason,
+        }
+    }
+
+    fn metadata(self) -> serde_json::Value {
+        json!({
+            "recorded": self.recorded,
+            "reason": self.reason,
+        })
+    }
+}
+
+fn edit_baseline_decision(
+    start_line: usize,
+    visible_line_count: usize,
+    total_lines: usize,
+    preview_truncated: bool,
+) -> EditBaselineDecision {
+    if start_line != 1 || visible_line_count != total_lines {
+        return EditBaselineDecision::not_recorded("partial_line_range");
+    }
+    if preview_truncated {
+        return EditBaselineDecision::not_recorded("preview_truncated");
+    }
+    EditBaselineDecision::recorded()
+}
+
+fn record_edit_baseline_if_eligible(
+    edit_safety: &crate::edit::EditSafety,
+    session_id: crate::session::SessionId,
+    stamp: crate::edit::FileReadStamp,
+    decision: EditBaselineDecision,
+) -> Result<(), crate::error::EditError> {
+    if decision.recorded {
+        edit_safety.record_read(session_id, stamp)?;
+    }
+    Ok(())
 }
 
 fn corrective_result(title: &str, output_text: &str, metadata: serde_json::Value) -> ToolResult {
@@ -268,4 +333,103 @@ fn find_instruction_sources(path: &camino::Utf8Path, root: &camino::Utf8Path) ->
         current = dir.parent();
     }
     sources
+}
+
+#[cfg(test)]
+mod tests {
+    use camino::Utf8PathBuf;
+
+    use crate::edit::{EditSafety, FileReadStamp, read_file_with_identity};
+    use crate::session::SessionId;
+
+    use super::{edit_baseline_decision, record_edit_baseline_if_eligible};
+
+    fn stamp_for(path: &camino::Utf8Path) -> (FileReadStamp, crate::edit::FileContentIdentity) {
+        let (_, identity) = read_file_with_identity(path).expect("read identity");
+        (
+            FileReadStamp {
+                path: path.to_path_buf(),
+                read_at_ms: 0,
+                mtime_ms: identity.mtime_ms,
+                size_bytes: Some(identity.size_bytes),
+                content_sha256: Some(identity.content_sha256.clone()),
+            },
+            identity,
+        )
+    }
+
+    #[test]
+    fn partial_read_does_not_grant_write_baseline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("partial.txt")).expect("utf8 path");
+        std::fs::write(&path, "one\ntwo\nthree\n").expect("seed file");
+        let safety = EditSafety::default();
+        let session_id = SessionId::new();
+        let (stamp, identity) = stamp_for(&path);
+        let decision = edit_baseline_decision(2, 1, 3, false);
+
+        record_edit_baseline_if_eligible(&safety, session_id, stamp, decision)
+            .expect("apply baseline decision");
+
+        assert!(!decision.recorded);
+        assert_eq!(decision.reason, "partial_line_range");
+        assert!(safety.get_stamp(session_id, &path).is_none());
+        assert!(
+            safety
+                .assert_fresh_write(session_id, &path, &identity)
+                .expect_err("write after partial read must be rejected")
+                .to_string()
+                .contains("was not read in this session")
+        );
+    }
+
+    #[test]
+    fn preview_truncated_read_does_not_grant_write_baseline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(temp.path().join("truncated.txt")).expect("utf8 path");
+        std::fs::write(&path, "one\ntwo\nthree\n").expect("seed file");
+        let safety = EditSafety::default();
+        let session_id = SessionId::new();
+        let (stamp, identity) = stamp_for(&path);
+        let decision = edit_baseline_decision(1, 3, 3, true);
+
+        record_edit_baseline_if_eligible(&safety, session_id, stamp, decision)
+            .expect("apply baseline decision");
+
+        assert!(!decision.recorded);
+        assert_eq!(decision.reason, "preview_truncated");
+        assert!(safety.get_stamp(session_id, &path).is_none());
+        assert!(
+            safety
+                .assert_fresh_write(session_id, &path, &identity)
+                .expect_err("write after preview-truncated read must be rejected")
+                .to_string()
+                .contains("was not read in this session")
+        );
+    }
+
+    #[test]
+    fn complete_visible_read_grants_write_baseline_and_reports_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("complete.txt")).expect("utf8 path");
+        std::fs::write(&path, "one\ntwo\n").expect("seed file");
+        let safety = EditSafety::default();
+        let session_id = SessionId::new();
+        let (stamp, identity) = stamp_for(&path);
+        let decision = edit_baseline_decision(1, 2, 2, false);
+
+        record_edit_baseline_if_eligible(&safety, session_id, stamp, decision)
+            .expect("record complete baseline");
+
+        assert!(decision.recorded);
+        assert_eq!(decision.metadata()["recorded"].as_bool(), Some(true));
+        assert_eq!(
+            decision.metadata()["reason"].as_str(),
+            Some("complete_visible_file")
+        );
+        safety
+            .assert_fresh_write(session_id, &path, &identity)
+            .expect("complete visible read permits fresh write");
+    }
 }

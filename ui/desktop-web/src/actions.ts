@@ -1,5 +1,18 @@
 import { command } from "./api";
-import type { DesktopWebState, ProjectRow, SessionRow } from "./types";
+import {
+  beginConfigMutation,
+  finishConfigMutation,
+  type ConfigValueInput,
+} from "./config_mutation";
+import { finishLocalDecision } from "./decision_state";
+import {
+  navigationIsIdle,
+  sessionMemoryActions,
+  sessionActionIndex,
+  sessionRowActionAvailable,
+} from "./navigation_state";
+import { rowMutationArgs } from "./row_target";
+import type { ConfigMutationTarget, DesktopWebState, ProjectRow, SessionRow } from "./types";
 import { setArtifactPaneCollapsed, type UiLocalState } from "./ui_state";
 
 export type ActionMenu = "file" | "edit" | "view" | "help";
@@ -21,9 +34,12 @@ export interface ActionContext {
   setCurrentState: (state: DesktopWebState) => void;
   render: (state: DesktopWebState) => void;
   mutate: (name: string, args?: Record<string, unknown>) => Promise<void>;
+  recoverCommandConflict: (error: unknown) => boolean;
   renderError: (message: string) => void;
   flushProviderInputMutations: () => Promise<void>;
-  flushConfigInputMutations: () => Promise<boolean>;
+  prepareConfigMutation: (target: ConfigMutationTarget) => ConfigValueInput[] | null;
+  submitPermissionDecision: (allow: boolean) => Promise<void>;
+  setWindowMaximized: (maximized: boolean) => void;
 }
 
 export interface ActionDefinition {
@@ -32,7 +48,7 @@ export interface ActionDefinition {
   shortcut?: string;
   menu?: ActionMenu;
   palette?: boolean;
-  enabled?: (state: DesktopWebState) => boolean;
+  enabled?: (state: DesktopWebState, payload: ActionPayload) => boolean;
   run: (state: DesktopWebState, context: ActionContext, payload: ActionPayload) => void | Promise<void>;
 }
 
@@ -40,16 +56,127 @@ function always(): boolean {
   return true;
 }
 
+async function runWithoutRender(name: string, context: ActionContext): Promise<void> {
+  context.setCurrentState(await command<DesktopWebState>(name));
+}
+
 function selectedSessionAvailable(state: DesktopWebState): boolean {
-  return state.selected_session_index >= 0;
+  return state.selected_session_index >= 0 && state.session_rows[state.selected_session_index] !== undefined;
+}
+
+function selectedArtifactAvailable(state: DesktopWebState): boolean {
+  return state.selected_artifact_index >= 0
+    && state.artifact_rows[state.selected_artifact_index] !== undefined;
 }
 
 function targetSessionIndex(state: DesktopWebState, payload: ActionPayload): number {
-  return payload.index >= 0 ? payload.index : state.selected_session_index;
+  return sessionActionIndex(state.selected_session_index, payload.index);
 }
 
-function selectedSessionNotBusy(state: DesktopWebState): boolean {
-  return selectedSessionAvailable(state) && !state.busy;
+function targetSessionAvailable(state: DesktopWebState, payload: ActionPayload): boolean {
+  const index = targetSessionIndex(state, payload);
+  return sessionRowActionAvailable(
+    state.session_rows.length,
+    state.selected_session_index,
+    payload.index,
+  ) && state.session_rows[index] !== undefined;
+}
+
+function targetSessionNotBusy(state: DesktopWebState, payload: ActionPayload): boolean {
+  return targetSessionAvailable(state, payload) && navigationIsIdle(state);
+}
+
+function targetSessionRow(state: DesktopWebState, payload: ActionPayload): SessionRow | undefined {
+  return state.session_rows[targetSessionIndex(state, payload)];
+}
+
+function targetSessionActive(state: DesktopWebState, payload: ActionPayload): boolean {
+  return targetSessionNotBusy(state, payload) && targetSessionRow(state, payload)?.loaded_status === "active";
+}
+
+function targetSessionInactive(state: DesktopWebState, payload: ActionPayload): boolean {
+  return targetSessionNotBusy(state, payload) && targetSessionRow(state, payload)?.loaded_status !== "active";
+}
+
+function targetSessionArchiveable(state: DesktopWebState, payload: ActionPayload): boolean {
+  const row = targetSessionRow(state, payload);
+  return targetSessionInactive(state, payload) && row?.archived === false;
+}
+
+function targetSessionRestorable(state: DesktopWebState, payload: ActionPayload): boolean {
+  const row = targetSessionRow(state, payload);
+  return targetSessionNotBusy(state, payload) && row?.archived === true;
+}
+
+function targetSessionMemoryEnabled(state: DesktopWebState, payload: ActionPayload): boolean {
+  const row = targetSessionRow(state, payload);
+  return targetSessionNotBusy(state, payload)
+    && Boolean(row && sessionMemoryActions(row.loaded_status, row.memory_mode).disable);
+}
+
+function targetSessionMemoryDisabled(state: DesktopWebState, payload: ActionPayload): boolean {
+  const row = targetSessionRow(state, payload);
+  return targetSessionNotBusy(state, payload)
+    && Boolean(row && sessionMemoryActions(row.loaded_status, row.memory_mode).enable);
+}
+
+function targetQuickChatDeleteAvailable(state: DesktopWebState, payload: ActionPayload): boolean {
+  const row = state.chat_session_rows[payload.index];
+  return Boolean(row) && row.loaded_status !== "active" && navigationIsIdle(state);
+}
+
+async function runConfigMutation(
+  name: "apply_session_config" | "save_global_config",
+  context: ActionContext,
+): Promise<void> {
+  const current = context.getCurrentState();
+  if (!current) return;
+  const values = context.prepareConfigMutation(current.config_target);
+  if (!values) return;
+  const request = beginConfigMutation(context.uiState, current.config_target);
+  if (current) context.render(current);
+  let state: DesktopWebState;
+  let succeeded: boolean;
+  try {
+    [state, succeeded] = await command<[DesktopWebState, boolean]>(name, {
+      values,
+      expectedTarget: request.target,
+    });
+  } catch (error) {
+    const finished = finishConfigMutation(context.uiState, request, false, context.getCurrentState()?.config_target ?? null);
+    if (context.recoverCommandConflict(error)) return;
+    if (!finished) return;
+    const latest = context.getCurrentState();
+    if (latest) context.render(latest);
+    context.renderError(String(error));
+    return;
+  }
+  if (!finishConfigMutation(context.uiState, request, succeeded, context.getCurrentState()?.config_target ?? null)) return;
+  context.setCurrentState(state);
+  context.render(state);
+}
+
+async function runSessionRowMutation(
+  name: string,
+  state: DesktopWebState,
+  context: ActionContext,
+  payload: ActionPayload,
+): Promise<void> {
+  const index = targetSessionIndex(state, payload);
+  const args = rowMutationArgs(state, index, state.session_rows[index]?.session_id);
+  if (args) await context.mutate(name, args);
+}
+
+async function runTurnPageMutation(
+  name: "load_previous_turn_page" | "load_next_turn_page",
+  state: DesktopWebState,
+  context: ActionContext,
+): Promise<void> {
+  const index = state.selected_session_index;
+  const args = rowMutationArgs(state, index, state.session_rows[index]?.session_id);
+  if (args) {
+    await context.mutate(name, { ...args, expectedOffset: state.turn_page_offset });
+  }
 }
 
 function canSubmit(state: DesktopWebState): boolean {
@@ -90,7 +217,7 @@ export const ACTIONS: ActionDefinition[] = [
     shortcut: "Ctrl+N",
     menu: "file",
     palette: true,
-    enabled: always,
+    enabled: navigationIsIdle,
     run: (_state, context) => context.mutate("new_chat"),
   },
   {
@@ -131,7 +258,7 @@ export const ACTIONS: ActionDefinition[] = [
     label: "プロジェクトを追加",
     menu: "file",
     palette: true,
-    enabled: always,
+    enabled: navigationIsIdle,
     run: (_state, context) => context.mutate("create_project_from_picker"),
   },
   {
@@ -140,13 +267,13 @@ export const ACTIONS: ActionDefinition[] = [
     menu: "file",
     palette: true,
     enabled: always,
-    run: (_state, context) => context.mutate("open_workspace_folder"),
+    run: (_state, context) => runWithoutRender("open_workspace_folder", context),
   },
   {
     id: "show-workspace-picker",
     label: "ワークスペースを切り替え",
     palette: true,
-    enabled: (state) => !state.busy,
+    enabled: navigationIsIdle,
     run: (_state, context) => context.mutate("show_workspace_picker"),
   },
   {
@@ -161,7 +288,7 @@ export const ACTIONS: ActionDefinition[] = [
     id: "review-uncommitted",
     label: "未コミット差分をレビュー",
     palette: true,
-    enabled: (state) => !state.busy && state.draft_prompt.trim().length > 0,
+    enabled: (state) => !state.busy && !state.navigation_loading && state.draft_prompt.trim().length > 0,
     run: (_state, context) => context.mutate("review_uncommitted"),
   },
   {
@@ -185,117 +312,103 @@ export const ACTIONS: ActionDefinition[] = [
     label: "表示中 Transcript を Markdown 保存",
     shortcut: "F9",
     palette: true,
-    enabled: (state) => state.history_export_enabled,
-    run: (_state, context) => context.mutate("export_transcript_markdown"),
+    enabled: (state) => state.history_export_enabled && navigationIsIdle(state),
+    run: (state, context, payload) => runSessionRowMutation("export_transcript_markdown", state, context, payload),
   },
   {
     id: "export-history",
     label: "選択セッション履歴を Markdown 保存",
     palette: true,
-    enabled: selectedSessionAvailable,
-    run: (_state, context) => context.mutate("export_history_markdown"),
+    enabled: (state) => selectedSessionAvailable(state) && navigationIsIdle(state),
+    run: (state, context, payload) => runSessionRowMutation("export_history_markdown", state, context, payload),
   },
   {
     id: "rejoin-session",
     label: "実行中セッションに再参加",
     palette: true,
-    enabled: selectedSessionAvailable,
-    run: (state, context, payload) => context.mutate("rejoin_session", { index: targetSessionIndex(state, payload) }),
+    enabled: targetSessionActive,
+    run: (state, context, payload) => runSessionRowMutation("rejoin_session", state, context, payload),
   },
   {
     id: "archive-session",
     label: "セッションをアーカイブ",
     palette: true,
-    enabled: selectedSessionNotBusy,
+    enabled: targetSessionArchiveable,
     run: (state, context, payload) => requestLocalArchiveState("archive_session", targetSessionIndex(state, payload), state, context),
   },
   {
     id: "unarchive-session",
     label: "セッションを復元",
     palette: true,
-    enabled: selectedSessionNotBusy,
+    enabled: targetSessionRestorable,
     run: (state, context, payload) => requestLocalArchiveState("unarchive_session", targetSessionIndex(state, payload), state, context),
   },
   {
     id: "rollback-session",
     label: "最新 turn を戻す",
     palette: true,
-    enabled: selectedSessionNotBusy,
+    enabled: targetSessionInactive,
     run: (state, context, payload) => requestLocalRollback(targetSessionIndex(state, payload), state, context),
   },
   {
     id: "fork-session",
     label: "セッションを fork",
     palette: true,
-    enabled: selectedSessionNotBusy,
-    run: (state, context, payload) => context.mutate("fork_session", { index: targetSessionIndex(state, payload) }),
-  },
-  {
-    id: "compact-session",
-    label: "セッション履歴を compact",
-    palette: true,
-    enabled: selectedSessionNotBusy,
-    run: (state, context, payload) => context.mutate("compact_session", { index: targetSessionIndex(state, payload) }),
+    enabled: targetSessionInactive,
+    run: (state, context, payload) => runSessionRowMutation("fork_session", state, context, payload),
   },
   {
     id: "interrupt-session",
     label: "実行中セッションを interrupt",
     palette: true,
-    enabled: selectedSessionAvailable,
-    run: (state, context, payload) => context.mutate("interrupt_session", { index: targetSessionIndex(state, payload) }),
+    enabled: targetSessionActive,
+    run: (state, context, payload) => runSessionRowMutation("interrupt_session", state, context, payload),
   },
   {
     id: "enable-session-memory",
     label: "セッション memory を有効化",
     palette: true,
-    enabled: selectedSessionNotBusy,
-    run: (state, context, payload) => context.mutate("enable_session_memory", { index: targetSessionIndex(state, payload) }),
+    enabled: targetSessionMemoryDisabled,
+    run: (state, context, payload) => runSessionRowMutation("enable_session_memory", state, context, payload),
   },
   {
     id: "disable-session-memory",
     label: "セッション memory を無効化",
     palette: true,
-    enabled: selectedSessionNotBusy,
-    run: (state, context, payload) => context.mutate("disable_session_memory", { index: targetSessionIndex(state, payload) }),
-  },
-  {
-    id: "show-session-settings",
-    label: "セッション設定を開く",
-    palette: true,
-    enabled: selectedSessionAvailable,
-    run: (_state, context) => context.mutate("show_provider_editor"),
+    enabled: targetSessionMemoryEnabled,
+    run: (state, context, payload) => runSessionRowMutation("disable_session_memory", state, context, payload),
   },
   {
     id: "delete-session",
     label: "セッションを削除",
-    enabled: selectedSessionNotBusy,
+    enabled: targetSessionInactive,
     run: (state, context, payload) => requestLocalDelete("session", targetSessionIndex(state, payload), state, context),
   },
   {
     id: "delete-chat-session",
     label: "チャットを削除",
-    enabled: (state) => !state.busy,
+    enabled: targetQuickChatDeleteAvailable,
     run: (state, context, payload) => requestLocalDelete("chat_session", payload.index, state, context),
   },
   {
     id: "delete-project",
     label: "プロジェクトを削除",
-    enabled: (state) => !state.busy,
+    enabled: navigationIsIdle,
     run: (state, context, payload) => requestLocalDelete("project", payload.index, state, context),
   },
   {
     id: "load-previous-turn-page",
     label: "前の履歴ページ",
     palette: true,
-    enabled: (state) => !state.busy && state.turn_page_offset > 0,
-    run: (_state, context) => context.mutate("load_previous_turn_page"),
+    enabled: (state) => navigationIsIdle(state) && state.turn_page_offset > 0,
+    run: (state, context) => runTurnPageMutation("load_previous_turn_page", state, context),
   },
   {
     id: "load-next-turn-page",
     label: "次の履歴ページ",
     palette: true,
-    enabled: (state) => !state.busy && state.turn_page_has_more,
-    run: (_state, context) => context.mutate("load_next_turn_page"),
+    enabled: (state) => navigationIsIdle(state) && state.turn_page_has_more,
+    run: (state, context) => runTurnPageMutation("load_next_turn_page", state, context),
   },
   {
     id: "toggle-artifact-pane",
@@ -311,8 +424,12 @@ export const ACTIONS: ActionDefinition[] = [
     id: "open-artifact-folder",
     label: "アーティファクトフォルダーを開く",
     palette: true,
-    enabled: always,
-    run: (_state, context) => context.mutate("open_artifact_folder"),
+    enabled: (state) => selectedArtifactAvailable(state) && navigationIsIdle(state),
+    run: (state, context) => {
+      const index = state.selected_artifact_index;
+      const args = rowMutationArgs(state, index, state.artifact_rows[index]?.path);
+      return args ? context.mutate("open_artifact_folder", args) : undefined;
+    },
   },
   {
     id: "load-provider-models",
@@ -346,25 +463,17 @@ export const ACTIONS: ActionDefinition[] = [
   },
   {
     id: "apply-session-config",
-    label: "設定を UI セッションに適用",
+    label: "編集中の設定を UI セッションに適用",
     palette: true,
     enabled: always,
-    run: async (_state, context) => {
-      if (!(await context.flushConfigInputMutations())) return;
-      context.uiState.configDirty = false;
-      await context.mutate("apply_session_config");
-    },
+    run: (_state, context) => runConfigMutation("apply_session_config", context),
   },
   {
     id: "save-global-config",
-    label: "設定ファイルに保存",
+    label: "編集中の設定を設定ファイルに保存",
     palette: true,
     enabled: always,
-    run: async (_state, context) => {
-      if (!(await context.flushConfigInputMutations())) return;
-      context.uiState.configDirty = false;
-      await context.mutate("save_global_config");
-    },
+    run: (_state, context) => runConfigMutation("save_global_config", context),
   },
   {
     id: "set-provider-mode",
@@ -376,34 +485,33 @@ export const ACTIONS: ActionDefinition[] = [
     id: "select-provider-model",
     label: "Provider model 選択",
     enabled: always,
-    run: (_state, context, payload) => context.mutate("select_provider_model", { index: payload.index }),
-  },
-  {
-    id: "select-config",
-    label: "設定項目選択",
-    enabled: always,
-    run: (_state, context, payload) => {
-      context.uiState.configDirty = false;
-      return context.mutate("set_config_selection", { index: payload.index });
+    run: (state, context, payload) => {
+      const args = rowMutationArgs(state, payload.index, state.provider_model_ids[payload.index]);
+      return args ? context.mutate("select_provider_model", args) : undefined;
     },
   },
   {
     id: "switch-workspace",
     label: "ワークスペース切替",
     palette: true,
-    enabled: (state) => !state.busy,
+    enabled: navigationIsIdle,
     run: (_state, context) => context.mutate("switch_workspace"),
   },
   { id: "browse-workspace", label: "ワークスペース参照", palette: true, enabled: always, run: (_state, context) => context.mutate("browse_workspace") },
   { id: "open-typed-path", label: "入力パスを開く", palette: true, enabled: always, run: (_state, context) => context.mutate("open_typed_path") },
-  { id: "open-global-config-folder", label: "設定フォルダーを開く", palette: true, enabled: always, run: (_state, context) => context.mutate("open_global_config_folder") },
+  { id: "open-global-config-folder", label: "設定フォルダーを開く", palette: true, enabled: always, run: (_state, context) => runWithoutRender("open_global_config_folder", context) },
   { id: "set-image", label: "画像を添付", palette: true, enabled: (state) => state.image_input_enabled, run: (_state, context) => context.mutate("attach_image") },
   { id: "browse-image", label: "画像を参照", palette: true, enabled: (state) => state.image_input_enabled, run: (_state, context) => context.mutate("browse_image") },
   { id: "clear-images", label: "添付を解除", palette: true, enabled: (state) => state.attached_images.length > 0, run: (_state, context) => context.mutate("clear_images") },
-  { id: "allow", label: "確認を許可", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.mutate("answer_permission", { allow: true }) },
-  { id: "deny", label: "確認を拒否", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.mutate("answer_permission", { allow: false }) },
+  { id: "allow", label: "確認を許可", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision(true) },
+  { id: "deny", label: "確認を拒否", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision(false) },
   { id: "minimize-window", label: "最小化", enabled: always, run: () => command("minimize_window") },
-  { id: "toggle-maximize-window", label: "最大化", enabled: always, run: () => command("toggle_maximize_window") },
+  {
+    id: "toggle-maximize-window",
+    label: "最大化／元のサイズに戻す",
+    enabled: always,
+    run: async (_state, context) => context.setWindowMaximized(await command<boolean>("toggle_maximize_window")),
+  },
   { id: "close-window", label: "閉じる", enabled: always, run: (_state, context) => command("hide_to_tray").catch(() => context.desktopWindow.hide()) },
 ];
 
@@ -413,8 +521,14 @@ export function actionById(id: string): ActionDefinition | undefined {
   return ACTION_BY_ID.get(id);
 }
 
-export function actionEnabled(action: ActionDefinition, state: DesktopWebState): boolean {
-  return action.enabled ? action.enabled(state) : true;
+const NO_ACTION_PAYLOAD: ActionPayload = { index: -1, value: "" };
+
+export function actionEnabled(
+  action: ActionDefinition,
+  state: DesktopWebState,
+  payload: ActionPayload = NO_ACTION_PAYLOAD,
+): boolean {
+  return action.enabled ? action.enabled(state, payload) : true;
 }
 
 export function menuActions(menu: ActionMenu, state: DesktopWebState): ActionDefinition[] {
@@ -425,13 +539,20 @@ export function shortcutActions(): ActionDefinition[] {
   return ACTIONS.filter((action) => action.shortcut);
 }
 
-export function paletteActions(state: DesktopWebState): ActionDefinition[] {
+export function paletteActions(
+  state: DesktopWebState,
+  configDraftAvailable = false,
+): ActionDefinition[] {
   const query = state.local_search_text.trim().toLowerCase();
   return ACTIONS.filter((action) => action.palette)
     .filter((action) => {
       if (!query) return true;
       return action.label.toLowerCase().includes(query) || action.id.toLowerCase().includes(query);
     })
+    .filter((action) =>
+      configDraftAvailable
+      || (action.id !== "apply-session-config" && action.id !== "save-global-config")
+    )
     .filter((action) => actionEnabled(action, state));
 }
 
@@ -445,7 +566,7 @@ export async function dispatchRegisteredAction(
   if (!action) {
     return false;
   }
-  if (!actionEnabled(action, state)) {
+  if (!actionEnabled(action, state, payload)) {
     return true;
   }
   await action.run(state, context, payload);
@@ -458,14 +579,18 @@ function requestLocalArchiveState(
   state: DesktopWebState,
   context: ActionContext,
 ): void {
-  if (state.busy) return;
+  if (!navigationIsIdle(state)) return;
   const row = state.session_rows[index];
   if (!row) return;
+  const target = rowMutationArgs(state, index, row.session_id);
+  if (!target) return;
+  finishLocalDecision(context.uiState);
   context.uiState.pendingLocalConfirmation = {
     kind,
     index,
     title: row.label,
     detail: row.session_id,
+    expectedTarget: target.expectedTarget,
   };
   context.render(state);
 }
@@ -476,28 +601,37 @@ function requestLocalDelete(
   state: DesktopWebState,
   context: ActionContext,
 ): void {
-  if (state.busy) return;
+  if (!navigationIsIdle(state)) return;
   const row =
     kind === "project" ? state.project_rows[index] : kind === "chat_session" ? state.chat_session_rows[index] : state.session_rows[index];
   if (!row) return;
+  const rowId = kind === "project" ? (row as ProjectRow).project_id : (row as SessionRow).session_id;
+  const target = rowMutationArgs(state, index, rowId);
+  if (!target) return;
+  finishLocalDecision(context.uiState);
   context.uiState.pendingLocalConfirmation = {
     kind,
     index,
     title: row.label,
     detail: kind === "project" ? (row as ProjectRow).path : (row as SessionRow).session_id,
+    expectedTarget: target.expectedTarget,
   };
   context.render(state);
 }
 
 function requestLocalRollback(index: number, state: DesktopWebState, context: ActionContext): void {
-  if (state.busy) return;
+  if (!navigationIsIdle(state)) return;
   const row = state.session_rows[index];
   if (!row || row.loaded_status === "active") return;
+  const target = rowMutationArgs(state, index, row.session_id);
+  if (!target) return;
+  finishLocalDecision(context.uiState);
   context.uiState.pendingLocalConfirmation = {
     kind: "rollback_session",
     index,
     title: row.label,
     detail: row.session_id,
+    expectedTarget: target.expectedTarget,
   };
   context.render(state);
 }

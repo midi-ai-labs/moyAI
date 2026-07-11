@@ -1,5 +1,7 @@
 use std::fs;
 
+use tokio::io::{AsyncRead, AsyncReadExt};
+
 use crate::config::ToolOutputConfig;
 use crate::error::ToolError;
 use crate::storage::StoragePaths;
@@ -7,6 +9,38 @@ use crate::tool::TruncatedToolOutput;
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolTruncator;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundedPipeOutput {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+pub(crate) async fn read_pipe_bounded<T>(
+    mut pipe: T,
+    max_bytes: usize,
+) -> Result<BoundedPipeOutput, std::io::Error>
+where
+    T: AsyncRead + Unpin,
+{
+    let mut stored = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut truncated = false;
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = pipe.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(stored.len());
+        let retained = remaining.min(read);
+        stored.extend_from_slice(&chunk[..retained]);
+        truncated |= retained < read;
+    }
+    Ok(BoundedPipeOutput {
+        bytes: stored,
+        truncated,
+    })
+}
 
 impl ToolTruncator {
     pub fn preview(
@@ -89,4 +123,28 @@ pub fn clip_text_with_ellipsis(text: &str, max_bytes: usize) -> String {
         .to_string();
     clipped.push_str("...");
     clipped
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt as _;
+
+    #[tokio::test]
+    async fn bounded_pipe_reader_drains_without_retaining_excess_output() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let write = tokio::spawn(async move {
+            writer
+                .write_all(b"0123456789")
+                .await
+                .expect("write fixture");
+        });
+
+        let output = super::read_pipe_bounded(reader, 4)
+            .await
+            .expect("read bounded output");
+        write.await.expect("join fixture writer");
+
+        assert_eq!(output.bytes, b"0123");
+        assert!(output.truncated);
+    }
 }

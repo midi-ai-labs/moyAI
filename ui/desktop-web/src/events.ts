@@ -1,35 +1,78 @@
 import { command } from "./api";
 import { dispatchRegisteredAction, type ActionContext } from "./actions";
-import type { DesktopWebState } from "./types";
+import {
+  beginConfigMutation,
+  configMutationPending,
+  configMutationValues,
+  finishConfigMutation,
+  reconcileConfigDraftTarget,
+  type ConfigValueInput,
+  updateConfigDraftValue,
+} from "./config_mutation";
+import { beginLocalDecision, failLocalDecision, finishLocalDecision } from "./decision_state";
+import { isRegularModalOverlay, modalIsOpen, nextDialogFocusIndex } from "./modal_state";
+import { configCommitEnabled, navigationIsIdle } from "./navigation_state";
+import { rowMutationArgs } from "./row_target";
+import { TitlebarDragGesture, windowControlKeyboardActivation } from "./titlebar_interaction";
+import type { ConfigMutationTarget, DesktopWebState, RowMutationTarget } from "./types";
 import type { UiLocalState } from "./ui_state";
 import { goalSlashCommandHint, validateConfigInput } from "./utils";
 
 let pendingOpacityPreviewPercent: number | null = null;
 let opacityPreviewFrame: number | null = null;
 let opacityPreviewInFlight = false;
+let delegatedEventsInstalled = false;
 const TEXT_MUTATION_DEBOUNCE_MS = 180;
 const MIN_WINDOW_OPACITY_PERCENT = 50;
 const MAX_WINDOW_OPACITY_PERCENT = 100;
 
 type SettingsControl = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
 
-interface ConfigValueInput {
-  index: number;
-  text: string;
-}
-
 interface PendingTextMutation {
   name: string;
   args: Record<string, unknown> | null;
   timer: number | null;
   inFlight: Promise<void> | null;
+  renderResult: boolean;
 }
 
 const pendingTextMutations = new Map<string, PendingTextMutation>();
+const titlebarDragGesture = new TitlebarDragGesture();
+
+export function textMutationPending(key: string): boolean {
+  const entry = pendingTextMutations.get(key);
+  return Boolean(entry && (entry.timer !== null || entry.inFlight !== null || entry.args !== null));
+}
 
 export function installGlobalKeyboardShortcuts(context: ActionContext): void {
   document.addEventListener("keydown", (event) => {
+    if (event.isComposing || event.keyCode === 229) return;
     const currentState = context.getCurrentState();
+    if (
+      currentState &&
+      modalIsOpen(currentState, context.uiState.pendingLocalConfirmation !== null)
+    ) {
+      if (event.key === "Tab") {
+        trapDialogFocus(event);
+      } else if (event.key === "Escape" && currentState.confirmation_visible) {
+        event.preventDefault();
+        if (event.repeat) return;
+        void dispatchRegisteredAction("deny", currentState, context, { index: -1, value: "" });
+      } else if (event.key === "Escape" && context.uiState.pendingLocalConfirmation) {
+        event.preventDefault();
+        if (!context.uiState.localConfirmationDecisionPending) {
+          context.uiState.pendingLocalConfirmation = null;
+          context.uiState.localConfirmationDecisionError = "";
+          context.render(currentState);
+        }
+      } else if (event.key === "Escape" && isRegularModalOverlay(currentState.overlay)) {
+        event.preventDefault();
+        if (!startupSetupRequired(currentState)) void context.mutate("close_overlay");
+      } else if (event.ctrlKey || event.metaKey || event.altKey || /^F\d+$/.test(event.key)) {
+        event.preventDefault();
+      }
+      return;
+    }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
       event.preventDefault();
       if (currentState) void dispatchRegisteredAction("show-command-palette", currentState, context, { index: -1, value: "" });
@@ -46,6 +89,10 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
       event.preventDefault();
       void dispatchRegisteredAction("toggle-access", currentState, context, { index: -1, value: "" });
     }
+    if (event.key === "F9" && currentState) {
+      event.preventDefault();
+      void dispatchRegisteredAction("export-transcript", currentState, context, { index: -1, value: "" });
+    }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "i" && currentState) {
       event.preventDefault();
       void dispatchRegisteredAction("toggle-session-archived-search", currentState, context, { index: -1, value: "" });
@@ -59,14 +106,7 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
 }
 
 export function wireEvents(state: DesktopWebState, context: ActionContext): void {
-  document.querySelectorAll<HTMLElement>('[data-action="close-window"]').forEach((node) => {
-    node.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0) return;
-      event.preventDefault();
-      event.stopPropagation();
-      void command("hide_to_tray").catch(() => context.desktopWindow.hide());
-    });
-  });
+  installDelegatedActionEvents(context);
   const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
   if (prompt) {
     resizePromptComposer(prompt);
@@ -78,16 +118,18 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
     const currentState = context.getCurrentState();
     if (currentState) {
       currentState.draft_prompt = text;
-      currentState.can_submit = text.trim().length > 0 && !currentState.busy;
-      currentState.enhance_enabled = text.trim().length > 0 && !currentState.busy;
+      currentState.can_submit = text.trim().length > 0 && !currentState.busy && !currentState.navigation_loading;
+      currentState.enhance_enabled = text.trim().length > 0 && !currentState.busy && !currentState.navigation_loading;
       updateGoalCommandHint(text);
       const send = document.querySelector<HTMLButtonElement>('[data-action="send"]');
       if (send) send.disabled = !currentState.can_submit;
       const enhance = document.querySelector<HTMLButtonElement>('[data-action="enhance-prompt"]');
       if (enhance) {
         enhance.disabled = !currentState.enhance_enabled;
-        const title = currentState.busy
-          ? "実行中はEnhanceできません"
+        const title = currentState.navigation_loading
+          ? "画面の切り替え完了後にEnhanceできます"
+          : currentState.busy
+            ? "実行中はEnhanceできません"
           : text.trim().length === 0
             ? "依頼文を入力してください"
             : "Enhance";
@@ -129,8 +171,8 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
   const settingsControls = collectSettingsControls();
   settingsControls.forEach((control) => {
     const update = () => {
-      updateSettingsControlDraft(control, context);
-      markConfigDirty(context.uiState);
+      if (!updateSettingsControlDraft(control, context)) return;
+      updateDirtyBadges(context.uiState);
       validateSettingsForm(context.uiState, false);
     };
     control.addEventListener("input", update);
@@ -146,11 +188,31 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
       .then(context.setCurrentState)
       .catch((error) => context.renderError(String(error)));
   });
-  document.querySelector<HTMLInputElement>("#local-search")?.addEventListener("input", (event) => {
-    void context.mutate("set_local_search", { text: (event.currentTarget as HTMLInputElement).value });
+  const localSearch = document.querySelector<HTMLInputElement>("#local-search");
+  const updateLocalSearch = (input: HTMLInputElement, commit: boolean) => {
+    const text = input.value;
+    const currentState = context.getCurrentState();
+    if (currentState) currentState.local_search_text = text;
+    if (commit) scheduleTextMutation("local-search", "set_local_search", { text }, context, true);
+  };
+  localSearch?.addEventListener("input", (event) => {
+    updateLocalSearch(event.currentTarget as HTMLInputElement, !(event as InputEvent).isComposing);
   });
-  document.querySelector<HTMLInputElement>("#session-search")?.addEventListener("input", (event) => {
-    void context.mutate("set_session_search", { text: (event.currentTarget as HTMLInputElement).value });
+  localSearch?.addEventListener("compositionend", (event) => {
+    updateLocalSearch(event.currentTarget as HTMLInputElement, true);
+  });
+  const sessionSearch = document.querySelector<HTMLInputElement>("#session-search");
+  const updateSessionSearch = (input: HTMLInputElement, commit: boolean) => {
+    const text = input.value;
+    const currentState = context.getCurrentState();
+    if (currentState) currentState.session_search_text = text;
+    if (commit) scheduleTextMutation("session-search", "set_session_search", { text }, context, true);
+  };
+  sessionSearch?.addEventListener("input", (event) => {
+    updateSessionSearch(event.currentTarget as HTMLInputElement, !(event as InputEvent).isComposing);
+  });
+  sessionSearch?.addEventListener("compositionend", (event) => {
+    updateSessionSearch(event.currentTarget as HTMLInputElement, true);
   });
   document.querySelector<HTMLTextAreaElement>("#review-draft")?.addEventListener("input", (event) => {
     void command<DesktopWebState>("set_review_draft", {
@@ -168,29 +230,112 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
       percent: clampOpacityPercent(Number((event.currentTarget as HTMLInputElement).value)),
     });
   });
-  document.querySelectorAll<HTMLElement>("[data-action]").forEach((node) => {
-    node.addEventListener("click", (event) => {
-      if (
-        (event.target as HTMLElement).closest("[data-modal]") &&
-        (node.classList.contains("modal-backdrop") || node.classList.contains("menu-scrim"))
-      ) {
-        return;
-      }
-      const action = node.dataset.action ?? "";
-      const index = Number(node.dataset.index ?? "-1");
-      const value = node.dataset.mode ?? "";
-      void dispatchAction(action, index, value, state, context);
-    });
-  });
-  document.querySelectorAll<HTMLElement>("[data-drag-region], [data-tauri-drag-region]").forEach((node) => {
-    node.addEventListener("mousedown", (event) => {
-      if (event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
-      event.preventDefault();
-      event.stopPropagation();
-      void command("start_window_drag").catch(() => context.desktopWindow.startDragging());
-    });
-  });
   focusOverlayPrimary(state, context.uiState);
+}
+
+function installDelegatedActionEvents(context: ActionContext): void {
+  if (delegatedEventsInstalled) return;
+  delegatedEventsInstalled = true;
+  document.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const node = target.closest<HTMLElement>("[data-action]");
+    if (!node || (node instanceof HTMLButtonElement && node.disabled)) return;
+    if (
+      target.closest("[data-modal]") &&
+      (node.classList.contains("modal-backdrop") || node.classList.contains("menu-scrim"))
+    ) {
+      return;
+    }
+    const currentState = context.getCurrentState();
+    if (!currentState) return;
+    const action = node.dataset.action ?? "";
+    const index = Number(node.dataset.index ?? "-1");
+    const value = node.dataset.mode ?? "";
+    void dispatchAction(action, index, value, currentState, context).catch((error) => context.renderError(String(error)));
+  });
+  document.addEventListener("pointerdown", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    titlebarDragGesture.pointerDown(titlebarPointerSample(event, target));
+  });
+  document.addEventListener("pointermove", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    if (!titlebarDragGesture.pointerMove(titlebarPointerSample(event, target))) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void command("start_window_drag").catch(() => context.desktopWindow.startDragging());
+  });
+  document.addEventListener("pointerup", (event) => titlebarDragGesture.pointerUp(event.pointerId));
+  document.addEventListener("pointercancel", () => titlebarDragGesture.cancel());
+  window.addEventListener("blur", () => titlebarDragGesture.cancel());
+  document.addEventListener("dblclick", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    if (
+      !titlebarDragGesture.doubleClick({
+        button: event.button,
+        inDragRegion: target.closest("[data-drag-region]") !== null,
+        inWindowControl: target.closest("[data-window-control]") !== null,
+      })
+    ) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const currentState = context.getCurrentState();
+    if (currentState) {
+      void dispatchRegisteredAction("toggle-maximize-window", currentState, context, { index: -1, value: "" }).catch((error) =>
+        context.renderError(String(error)),
+      );
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const control = target.closest<HTMLElement>("button[data-window-control]");
+    if (!control || !windowControlKeyboardActivation(event.key, event.repeat)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const currentState = context.getCurrentState();
+    const action = control.dataset.action ?? "";
+    if (currentState && action) {
+      void dispatchRegisteredAction(action, currentState, context, { index: -1, value: "" }).catch((error) =>
+        context.renderError(String(error)),
+      );
+    }
+  });
+}
+
+function titlebarPointerSample(event: PointerEvent, target: Element) {
+  return {
+    pointerId: event.pointerId,
+    button: event.button,
+    buttons: event.buttons,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    inDragRegion: target.closest("[data-drag-region]") !== null,
+    inWindowControl: target.closest("[data-window-control]") !== null,
+  };
+}
+
+function trapDialogFocus(event: KeyboardEvent): void {
+  const dialog = document.querySelector<HTMLElement>(".modal[role='dialog'], .modal[role='alertdialog']");
+  if (!dialog) return;
+  const focusable = Array.from(
+    dialog.querySelectorAll<HTMLElement>(
+      "button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex='-1'])",
+    ),
+  ).filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
+  event.preventDefault();
+  if (focusable.length === 0) {
+    (dialog.querySelector<HTMLElement>(".permission-decision-status") ?? dialog).focus();
+    return;
+  }
+  const currentIndex = focusable.indexOf(document.activeElement as HTMLElement);
+  const nextIndex = nextDialogFocusIndex(currentIndex, focusable.length, event.shiftKey);
+  focusable[nextIndex]?.focus();
 }
 
 function resizePromptComposer(prompt: HTMLTextAreaElement): void {
@@ -221,11 +366,18 @@ function updateGoalCommandHint(text: string): void {
   if (helpNode) helpNode.textContent = hint ?? "";
 }
 
-function scheduleTextMutation(key: string, name: string, args: Record<string, unknown>, context: ActionContext): void {
+function scheduleTextMutation(
+  key: string,
+  name: string,
+  args: Record<string, unknown>,
+  context: ActionContext,
+  renderResult = false,
+): void {
   const existing = pendingTextMutations.get(key);
-  const entry = existing ?? { name, args: null, timer: null, inFlight: null };
+  const entry = existing ?? { name, args: null, timer: null, inFlight: null, renderResult };
   entry.name = name;
   entry.args = args;
+  entry.renderResult = renderResult;
   if (entry.timer !== null) window.clearTimeout(entry.timer);
   entry.timer = window.setTimeout(() => {
     entry.timer = null;
@@ -249,10 +401,14 @@ async function flushTextMutation(key: string, context: ActionContext): Promise<v
   }
   const name = entry.name;
   const args = entry.args;
+  const renderResult = entry.renderResult;
   entry.args = null;
   entry.inFlight = command<DesktopWebState>(name, args)
     .then((state) => {
-      if (entry.args === null) context.setCurrentState(state);
+      if (entry.args === null) {
+        context.setCurrentState(state);
+        if (renderResult) context.render(state);
+      }
     })
     .catch((error) => context.renderError(String(error)))
     .finally(() => {
@@ -274,35 +430,23 @@ export async function flushProviderInputMutations(context: ActionContext): Promi
   ]);
 }
 
-export async function flushConfigInputMutations(context: ActionContext): Promise<boolean> {
-  const values = collectSettingsFormValues();
-  if (values.length > 0) {
-    if (!validateSettingsForm(context.uiState, true)) return false;
-    try {
-      const nextState = await command<DesktopWebState>("set_config_values", { values });
-      context.setCurrentState(nextState);
-      return true;
-    } catch (error) {
-      context.renderError(String(error));
-      return false;
-    }
-  }
-  await flushTextMutation("config-value", context);
-  return true;
+export function prepareConfigMutation(
+  context: ActionContext,
+  target: ConfigMutationTarget,
+): ConfigValueInput[] | null {
+  reconcileConfigDraftTarget(context.uiState, target);
+  const currentState = context.getCurrentState();
+  if (!currentState) return null;
+  const values = configMutationValues(context.uiState, target)
+    ?? (currentState.overlay === "config"
+      ? currentState.config_fields.map((field) => ({ key: field.key, text: field.value }))
+      : null);
+  if (!values || !validateConfigValues(values, true)) return null;
+  return values;
 }
 
 function collectSettingsControls(): SettingsControl[] {
   return Array.from(document.querySelectorAll<SettingsControl>(".settings-control"));
-}
-
-function collectSettingsFormValues(): ConfigValueInput[] {
-  const valuesByIndex = new Map<number, ConfigValueInput>();
-  for (const control of collectSettingsControls()) {
-    const index = Number(control.dataset.configIndex ?? "-1");
-    if (!Number.isInteger(index) || index < 0) continue;
-    valuesByIndex.set(index, { index, text: settingsControlValue(control) });
-  }
-  return Array.from(valuesByIndex.values());
 }
 
 function settingsControlValue(control: SettingsControl): string {
@@ -312,22 +456,26 @@ function settingsControlValue(control: SettingsControl): string {
   return control.value;
 }
 
-function updateSettingsControlDraft(control: SettingsControl, context: ActionContext): void {
-  const index = Number(control.dataset.configIndex ?? "-1");
-  if (!Number.isInteger(index) || index < 0) return;
+function updateSettingsControlDraft(control: SettingsControl, context: ActionContext): boolean {
   const currentState = context.getCurrentState();
   const text = settingsControlValue(control);
-  if (!currentState || !currentState.config_fields[index]) return;
+  const key = control.dataset.configKey ?? "";
+  if (!currentState || !key) return false;
+  const index = currentState.config_fields.findIndex((field) => field.key === key);
+  if (index < 0) return false;
+  updateConfigDraftValue(
+    context.uiState,
+    currentState.config_target,
+    currentState.config_fields.map((field) => ({ key: field.key, text: field.value })),
+    key,
+    text,
+  );
   currentState.config_fields[index].value = text;
   if (index === currentState.selected_config_index) {
     currentState.config_value_text = text;
-    currentState.config_field_title = control.dataset.configKey ?? currentState.config_field_title;
+    currentState.config_field_title = key;
   }
-}
-
-function markConfigDirty(uiState: UiLocalState): void {
-  uiState.configDirty = true;
-  updateDirtyBadges(uiState);
+  return true;
 }
 
 function validateSettingsForm(uiState: UiLocalState, focusInvalid: boolean): boolean {
@@ -357,10 +505,38 @@ function validateSettingsForm(uiState: UiLocalState, focusInvalid: boolean): boo
   return true;
 }
 
+function validateConfigValues(values: ConfigValueInput[], focusInvalid: boolean): boolean {
+  for (const value of values) {
+    const result = validateConfigInput(value.key, value.text);
+    if (result.ok) continue;
+    if (focusInvalid) {
+      document.querySelector<SettingsControl>(
+        `[data-config-key="${CSS.escape(value.key)}"]`,
+      )?.focus();
+    }
+    return false;
+  }
+  return true;
+}
+
 function updateDirtyBadges(uiState: UiLocalState): void {
   document.querySelectorAll<HTMLElement>(".dirty-badge").forEach((node) => {
     node.classList.toggle("visible", uiState.configDirty);
   });
+  const setupRequired = document.querySelector(".settings-modal.setup-modal") !== null;
+  const commitEnabled = configCommitEnabled(
+    setupRequired,
+    uiState.configDirty,
+    configMutationPending(uiState),
+  );
+  document
+    .querySelectorAll<HTMLButtonElement>(
+      ".settings-modal [data-action='apply-session-config'], .settings-modal [data-action='save-global-config']",
+    )
+    .forEach((button) => {
+      button.disabled = !commitEnabled;
+      button.setAttribute("aria-disabled", String(!commitEnabled));
+    });
 }
 
 function scheduleOpacityPreview(percent: number, context: ActionContext): void {
@@ -397,151 +573,197 @@ async function flushOpacityPreview(context: ActionContext): Promise<void> {
 
 async function dispatchAction(action: string, index: number, value: string, state: DesktopWebState, context: ActionContext): Promise<void> {
   if (await dispatchRegisteredAction(action, state, context, { index, value })) return;
-  if (action === "minimize-window") void context.desktopWindow.minimize();
-  if (action === "toggle-maximize-window") void context.desktopWindow.toggleMaximize();
-  if (action === "close-window") void command("hide_to_tray").catch(() => context.desktopWindow.hide());
-  if (action === "send" && state.can_submit) void context.mutate("submit_prompt");
-  if (action === "toggle-attachment-tray") {
-    context.uiState.attachmentTrayOpen = !context.uiState.attachmentTrayOpen;
-    return context.render(state);
+  switch (action) {
+    case "toggle-attachment-tray":
+      context.uiState.attachmentTrayOpen = !context.uiState.attachmentTrayOpen;
+      context.render(state);
+      return;
+    case "new-project-session":
+      if (!navigationIsIdle(state)) return;
+      await runIndexedMutation("new_project_session", index, state.project_rows[index]?.project_id, state, context);
+      return;
+    case "project":
+      if (!navigationIsIdle(state)) return;
+      await runIndexedMutation("select_project", index, state.project_rows[index]?.project_id, state, context);
+      return;
+    case "session":
+      if (!navigationIsIdle(state)) return;
+      await runIndexedMutation("select_session", index, state.session_rows[index]?.session_id, state, context);
+      return;
+    case "chat-session":
+      if (!navigationIsIdle(state)) return;
+      await runIndexedMutation("select_chat_session", index, state.chat_session_rows[index]?.session_id, state, context);
+      return;
+    case "cancel-local-confirm":
+      if (context.uiState.localConfirmationDecisionPending) return;
+      context.uiState.pendingLocalConfirmation = null;
+      finishLocalDecision(context.uiState);
+      context.render(state);
+      return;
+    case "confirm-local-delete":
+      await confirmLocalDelete(context);
+      return;
+    case "confirm-local-archive-state":
+      await confirmLocalArchiveState(context);
+      return;
+    case "confirm-local-rollback":
+      await confirmLocalRollback(context);
+      return;
+    case "artifact":
+      await runIndexedMutation("select_artifact", index, state.artifact_rows[index]?.path, state, context);
+      return;
+    case "remove-image":
+      await runIndexedMutation("remove_image", index, state.attached_images[index], state, context);
+      return;
+    case "send-review-enhanced":
+      await context.mutate("send_prompt_review", { enhanced: true });
+      return;
+    case "send-review-raw":
+      await context.mutate("send_prompt_review", { enhanced: false });
+      return;
+    case "cancel-review":
+      await context.mutate("cancel_prompt_review");
+      return;
+    case "show-file-menu":
+      await context.mutate("show_file_menu");
+      return;
+    case "show-edit-menu":
+      await context.mutate("show_edit_menu");
+      return;
+    case "show-view-menu":
+      await context.mutate("show_view_menu");
+      return;
+    case "show-help-menu":
+      await context.mutate("show_help_menu");
+      return;
+    case "close-overlay":
+      if (startupSetupRequired(state)) return;
+      await context.mutate("close_overlay");
+      return;
+    case "import-config-toml":
+      {
+        const request = beginConfigMutation(context.uiState, state.config_target);
+        context.render(state);
+        let nextState: DesktopWebState;
+        let imported: boolean;
+        try {
+          [nextState, imported] = await command<[DesktopWebState, boolean]>("import_global_config_toml", {
+            expectedTarget: request.target,
+          });
+        } catch (error) {
+          const finished = finishConfigMutation(context.uiState, request, false, context.getCurrentState()?.config_target ?? null);
+          if (context.recoverCommandConflict(error)) return;
+          if (!finished) return;
+          const latest = context.getCurrentState();
+          if (latest) context.render(latest);
+          context.renderError(String(error));
+          return;
+        }
+        if (!finishConfigMutation(context.uiState, request, imported, context.getCurrentState()?.config_target ?? null)) return;
+        context.setCurrentState(nextState);
+        context.render(nextState);
+      }
+      return;
+    case "insert-command":
+      await runIndexedMutation("insert_command", index, state.command_rows[index]?.path, state, context);
+      return;
+    default:
+      return;
   }
-  if (action === "toggle-artifact-pane") return;
-  if (action === "cancel-run" && (state.busy || state.confirmation_visible)) void context.mutate("cancel_run");
-  if (action === "refresh") void context.mutate("refresh_desktop");
-  if (action === "load-previous-turn-page") void context.mutate("load_previous_turn_page");
-  if (action === "load-next-turn-page") void context.mutate("load_next_turn_page");
-  if (action === "new-chat") void context.mutate("new_chat");
-  if (action === "new-project-session") void context.mutate("new_project_session", { index });
-  if (action === "project") void context.mutate("select_project", { index });
-  if (action === "session") void context.mutate("select_session", { index });
-  if (action === "rejoin-session") void context.mutate("rejoin_session", { index });
-  if (action === "chat-session") void context.mutate("select_chat_session", { index });
-  if (action === "toggle-session-archived-search") {
-    void context.mutate("set_session_search_include_archived", { includeArchived: !state.session_search_include_archived });
-  }
-  if (action === "cancel-local-confirm") {
-    context.uiState.pendingLocalConfirmation = null;
-    return context.render(state);
-  }
-  if (action === "confirm-local-delete") return confirmLocalDelete(context);
-  if (action === "confirm-local-archive-state") return confirmLocalArchiveState(context);
-  if (action === "confirm-local-rollback") return confirmLocalRollback(context);
-  if (action === "artifact") void context.mutate("select_artifact", { index });
-  if (action === "export-transcript" && state.history_export_enabled) void context.mutate("export_transcript_markdown");
-  if (action === "export-history") void context.mutate("export_history_markdown");
-  if (action === "set-image") void context.mutate("attach_image");
-  if (action === "browse-image") void context.mutate("browse_image");
-  if (action === "clear-images") void context.mutate("clear_images");
-  if (action === "remove-image") void context.mutate("remove_image", { index });
-  if (action === "enhance-prompt") void context.mutate("enhance_prompt");
-  if (action === "send-review-enhanced") void context.mutate("send_prompt_review", { enhanced: true });
-  if (action === "send-review-raw") void context.mutate("send_prompt_review", { enhanced: false });
-  if (action === "cancel-review") void context.mutate("cancel_prompt_review");
-  if (action === "show-file-menu") void context.mutate("show_file_menu");
-  if (action === "show-edit-menu") void context.mutate("show_edit_menu");
-  if (action === "show-view-menu") void context.mutate("show_view_menu");
-  if (action === "show-help-menu") void context.mutate("show_help_menu");
-  if (action === "create-project-from-picker") void context.mutate("create_project_from_picker");
-  if (action === "show-provider") void context.mutate("show_provider_editor");
-  if (action === "show-config") void context.mutate("show_config_editor");
-  if (action === "show-command-palette") void context.mutate("show_command_palette");
-  if (action === "show-shortcuts") void context.mutate("show_shortcuts");
-  if (action === "close-overlay") {
-    if (startupSetupRequired(state)) return;
-    context.uiState.configDirty = false;
-    void context.mutate("close_overlay");
-  }
-  if (action === "switch-workspace") void context.mutate("switch_workspace");
-  if (action === "browse-workspace") void context.mutate("browse_workspace");
-  if (action === "open-workspace-folder") void context.mutate("open_workspace_folder");
-  if (action === "open-global-config-folder") void context.mutate("open_global_config_folder");
-  if (action === "import-config-toml") void context.mutate("import_global_config_toml");
-  if (action === "open-typed-path") void context.mutate("open_typed_path");
-  if (action === "open-artifact-folder") void context.mutate("open_artifact_folder");
-  if (action === "load-provider-models") {
-    await flushProviderInputMutations(context);
-    void context.mutate("load_provider_models");
-  }
-  if (action === "set-provider-mode") {
-    void context.mutate("set_provider_metadata_mode", { mode: value });
-  }
-  if (action === "select-provider-model") void context.mutate("select_provider_model", { index });
-  if (action === "apply-provider-session") {
-    await flushProviderInputMutations(context);
-    void context.mutate("apply_provider_session");
-  }
-  if (action === "save-provider-global") {
-    await flushProviderInputMutations(context);
-    void context.mutate("save_provider_global");
-  }
-  if (action === "select-config") {
-    context.uiState.configDirty = false;
-    void context.mutate("set_config_selection", { index });
-  }
-  if (action === "apply-session-config") {
-    if (await flushConfigInputMutations(context)) {
-      submitConfigAction("apply_session_config", state, context);
-    }
-  }
-  if (action === "save-global-config") {
-    if (await flushConfigInputMutations(context)) {
-      submitConfigAction("save_global_config", state, context);
-    }
-  }
-  if (action === "toggle-access") void context.mutate("toggle_access_mode");
-  if (action === "insert-command") void context.mutate("insert_command", { index });
-  if (action === "allow") void context.mutate("answer_permission", { allow: true });
-  if (action === "deny") void context.mutate("answer_permission", { allow: false });
 }
 
 function startupSetupRequired(state: DesktopWebState): boolean {
   return state.startup.initial_setup_required && state.startup.action_overlay === state.overlay;
 }
 
-function confirmLocalDelete(context: ActionContext): void {
+async function confirmLocalDelete(context: ActionContext): Promise<void> {
   const pending = context.uiState.pendingLocalConfirmation;
-  if (!pending) {
+  if (!pending || context.uiState.localConfirmationDecisionPending) {
     return;
   }
-  context.uiState.pendingLocalConfirmation = null;
   if (pending.kind === "project") {
-    void context.mutate("delete_project", { index: pending.index });
+    await runLocalConfirmationMutation(context, "delete_project", pending.index, pending.expectedTarget);
   } else if (pending.kind === "chat_session") {
-    void context.mutate("delete_chat_session", { index: pending.index });
+    await runLocalConfirmationMutation(context, "delete_chat_session", pending.index, pending.expectedTarget);
   } else {
-    void context.mutate("delete_session", { index: pending.index });
+    await runLocalConfirmationMutation(context, "delete_session", pending.index, pending.expectedTarget);
   }
 }
 
-function confirmLocalArchiveState(context: ActionContext): void {
+async function confirmLocalArchiveState(context: ActionContext): Promise<void> {
   const pending = context.uiState.pendingLocalConfirmation;
-  if (!pending || (pending.kind !== "archive_session" && pending.kind !== "unarchive_session")) {
+  if (
+    !pending ||
+    context.uiState.localConfirmationDecisionPending ||
+    (pending.kind !== "archive_session" && pending.kind !== "unarchive_session")
+  ) {
     return;
   }
-  context.uiState.pendingLocalConfirmation = null;
-  void context.mutate(pending.kind === "archive_session" ? "archive_session" : "unarchive_session", { index: pending.index });
+  await runLocalConfirmationMutation(
+    context,
+    pending.kind === "archive_session" ? "archive_session" : "unarchive_session",
+    pending.index,
+    pending.expectedTarget,
+  );
 }
 
-function confirmLocalRollback(context: ActionContext): void {
+async function confirmLocalRollback(context: ActionContext): Promise<void> {
   const pending = context.uiState.pendingLocalConfirmation;
-  if (!pending || pending.kind !== "rollback_session") {
+  if (!pending || context.uiState.localConfirmationDecisionPending || pending.kind !== "rollback_session") {
     return;
   }
-  context.uiState.pendingLocalConfirmation = null;
-  void context.mutate("rollback_session", { index: pending.index });
+  await runLocalConfirmationMutation(context, "rollback_session", pending.index, pending.expectedTarget);
 }
 
-function submitConfigAction(commandName: string, _state: DesktopWebState, context: ActionContext): void {
-  if (!validateSettingsForm(context.uiState, true)) return;
-  context.uiState.configDirty = false;
-  updateDirtyBadges(context.uiState);
-  void context.mutate(commandName);
+async function runLocalConfirmationMutation(
+  context: ActionContext,
+  name: string,
+  index: number,
+  expectedTarget: RowMutationTarget,
+): Promise<void> {
+  if (!beginLocalDecision(context.uiState, context.uiState.pendingLocalConfirmation !== null)) return;
+  const state = context.getCurrentState();
+  if (state) context.render(state);
+  try {
+    const nextState = await command<DesktopWebState>(name, { index, expectedTarget });
+    finishLocalDecision(context.uiState);
+    context.uiState.pendingLocalConfirmation = null;
+    context.render(nextState);
+  } catch (error) {
+    if (context.recoverCommandConflict(error)) return;
+    failLocalDecision(context.uiState, "処理を開始できませんでした。もう一度お試しください。");
+    const latest = context.getCurrentState();
+    if (latest) context.render(latest);
+    context.renderError(String(error));
+  }
+}
+
+async function runIndexedMutation(
+  name: string,
+  index: number,
+  rowId: string | null | undefined,
+  state: DesktopWebState,
+  context: ActionContext,
+): Promise<void> {
+  const args = rowMutationArgs(state, index, rowId);
+  if (args) await context.mutate(name, args);
 }
 
 function focusOverlayPrimary(state: DesktopWebState, uiState: UiLocalState): void {
-  const overlayKey = uiState.pendingLocalConfirmation ? "local-confirm" : state.confirmation_visible ? "permission" : state.overlay;
-  if (overlayKey === uiState.lastFocusedOverlay) {
+  const overlayKey = state.confirmation_visible ? "permission" : uiState.pendingLocalConfirmation ? "local-confirm" : state.overlay;
+  const active = document.activeElement;
+  const activeModal = document.querySelector<HTMLElement>(".modal[role='dialog'], .modal[role='alertdialog'], .modal[data-modal]");
+  if (
+    active instanceof HTMLElement &&
+    active !== document.body &&
+    active !== document.documentElement &&
+    (overlayKey === "none" || activeModal?.contains(active))
+  ) {
+    uiState.lastFocusedOverlay = overlayKey;
     return;
+  }
+  if (overlayKey === uiState.lastFocusedOverlay) {
+    if (active && active !== document.body && active !== document.documentElement) return;
   }
   uiState.lastFocusedOverlay = overlayKey;
   const selector =
@@ -556,12 +778,19 @@ function focusOverlayPrimary(state: DesktopWebState, uiState: UiLocalState): voi
             : overlayKey === "prompt_review"
               ? "#review-draft"
               : overlayKey === "permission" || overlayKey === "local-confirm"
-                ? ".modal-actions button"
-                : "";
+                ? ".modal-actions button:not(:disabled), .permission-decision-status"
+                : isRegularModalOverlay(overlayKey)
+                  ? ".modal button:not(:disabled), .modal[role='dialog']"
+                  : "";
   if (!selector) {
     return;
   }
   requestAnimationFrame(() => {
-    document.querySelector<HTMLElement>(selector)?.focus();
+    const target = document.querySelector<HTMLElement>(selector);
+    target?.focus();
+    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+      const end = target.value.length;
+      target.setSelectionRange(end, end);
+    }
   });
 }

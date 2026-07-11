@@ -6,7 +6,9 @@ use crate::session::{
 use crate::tool::PermissionRequest;
 use crate::tui::state::{AppState, RunStatus};
 
-use super::async_ops::{DesktopAsyncOperationKind, DesktopAsyncOperationRegistry};
+use super::async_ops::{
+    DesktopAsyncOperationId, DesktopAsyncOperationKind, DesktopAsyncOperationRegistry,
+};
 use super::composer_state::DesktopComposerState;
 use super::models::{DesktopSessionDetail, DesktopSnapshot};
 use super::navigation::{DesktopNavigationState, NavigationRequestId, NavigationTarget};
@@ -50,6 +52,7 @@ pub struct DesktopState {
     pub navigation: DesktopNavigationState,
     pub view: DesktopViewState,
     pub startup: DesktopStartupState,
+    pub permission_request_id: Option<u64>,
 }
 
 impl DesktopState {
@@ -64,6 +67,7 @@ impl DesktopState {
             navigation: DesktopNavigationState::default(),
             view: DesktopViewState::default(),
             startup: DesktopStartupState::ready(),
+            permission_request_id: None,
         }
         .with_provider_fields()
     }
@@ -198,7 +202,9 @@ impl DesktopState {
     }
 
     pub fn selected_index(&self) -> i32 {
-        if self.snapshot.session_rows.is_empty() {
+        if self.snapshot.session_rows.is_empty()
+            || self.snapshot.selected_session_index >= self.snapshot.session_rows.len()
+        {
             -1
         } else {
             self.snapshot.selected_session_index as i32
@@ -298,6 +304,34 @@ impl DesktopState {
                 .is_pending(DesktopAsyncOperationKind::SessionLoad)
     }
 
+    pub fn can_begin_navigation(&self) -> bool {
+        !self.is_busy() && !self.background_mutation_pending() && !self.navigation_loading()
+    }
+
+    pub fn begin_snapshot_refresh(&mut self) {
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::SnapshotRefresh);
+    }
+
+    pub fn finish_snapshot_refresh(&mut self) {
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::SnapshotRefresh);
+    }
+
+    pub fn begin_turn_page_load(&mut self) {
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::TurnPageLoad);
+    }
+
+    pub fn finish_turn_page_load(&mut self) {
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::TurnPageLoad);
+    }
+
     pub fn mark_post_run_refresh_pending(&mut self) {
         self.view
             .async_operations
@@ -328,16 +362,17 @@ impl DesktopState {
             .is_pending(DesktopAsyncOperationKind::TerminalRunRefresh)
     }
 
-    pub fn begin_session_delete_mutation(&mut self) {
+    pub fn begin_session_delete_mutation(&mut self) -> DesktopAsyncOperationId {
         self.view
             .async_operations
-            .begin(DesktopAsyncOperationKind::SessionDelete);
+            .begin(DesktopAsyncOperationKind::SessionDelete)
     }
 
-    pub fn finish_session_delete_mutation(&mut self) {
-        self.view
-            .async_operations
-            .finish_one_kind(DesktopAsyncOperationKind::SessionDelete);
+    pub fn finish_session_delete_mutation(
+        &mut self,
+        operation_id: DesktopAsyncOperationId,
+    ) -> bool {
+        self.view.async_operations.finish(operation_id)
     }
 
     pub fn begin_session_archive_mutation(&mut self) {
@@ -376,16 +411,14 @@ impl DesktopState {
             .finish_one_kind(DesktopAsyncOperationKind::SessionMaintenance);
     }
 
-    pub fn begin_session_search(&mut self) {
+    pub fn begin_session_search(&mut self) -> DesktopAsyncOperationId {
         self.view
             .async_operations
-            .begin_unique(DesktopAsyncOperationKind::SessionSearch);
+            .begin(DesktopAsyncOperationKind::SessionSearch)
     }
 
-    pub fn finish_session_search(&mut self) {
-        self.view
-            .async_operations
-            .finish_kind(DesktopAsyncOperationKind::SessionSearch);
+    pub fn finish_session_search(&mut self, operation_id: DesktopAsyncOperationId) -> bool {
+        self.view.async_operations.finish(operation_id)
     }
 
     pub fn begin_project_delete_mutation(&mut self) {
@@ -627,27 +660,6 @@ impl DesktopState {
         self.composer.image_attachment_input = input;
     }
 
-    pub fn attach_image_from_input(&mut self) {
-        let trimmed = self.composer.image_attachment_input.trim();
-        if trimmed.is_empty() {
-            self.set_status_message("Enter an image path before attaching.");
-            return;
-        }
-        let path = camino::Utf8PathBuf::from(trimmed);
-        if self
-            .composer
-            .image_attachment_paths
-            .iter()
-            .any(|existing| existing == &path)
-        {
-            self.set_status_message("Image is already attached.");
-            return;
-        }
-        self.composer.image_attachment_paths.push(path);
-        self.composer.image_attachment_input.clear();
-        self.set_status_message("Image attached to the next prompt.");
-    }
-
     pub fn attach_image_path(&mut self, path: camino::Utf8PathBuf) {
         if self
             .composer
@@ -705,7 +717,15 @@ impl DesktopState {
     }
 
     pub fn set_provider_metadata_mode_input(&mut self, mode: ProviderMetadataMode) {
+        let changed = self.provider_config.provider_metadata_mode_input != mode;
         self.provider_config.provider_metadata_mode_input = mode;
+        if changed {
+            self.provider_config.provider_loading = false;
+            self.provider_config.provider_loaded_base_url = None;
+            self.view
+                .async_operations
+                .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
+        }
         self.provider_config.provider_status_text = match mode {
             ProviderMetadataMode::LmStudioNativeRequired => {
                 "Provider mode: LM Studio native metadata is required.".to_string()
@@ -851,16 +871,19 @@ impl DesktopState {
         }
     }
 
-    pub fn set_permission(&mut self, request: &PermissionRequest) {
+    pub fn set_permission(&mut self, request_id: u64, request: &PermissionRequest) {
+        self.permission_request_id = Some(request_id);
         self.app_state.set_permission(request);
     }
 
     pub fn clear_permission(&mut self) {
+        self.permission_request_id = None;
         self.app_state.clear_permission();
     }
 
     pub fn mark_run_cancellation_requested(&mut self, reason: &str, status_message: &str) {
         self.app_state.run_status = RunStatus::Cancelled;
+        self.permission_request_id = None;
         self.app_state.permission = None;
         self.app_state.status_message = Some(status_message.to_string());
         self.app_state.progress.status = "Cancelled".to_string();
@@ -944,8 +967,8 @@ impl DesktopState {
     }
 
     pub fn start_new_chat(&mut self) {
-        if self.is_busy() {
-            self.set_status_message("new chat cannot start while a run is active");
+        if !self.can_begin_navigation() {
+            self.set_status_message("new chat cannot start while another operation is active");
             return;
         }
         self.snapshot.selected_session_index = self.snapshot.session_rows.len();
@@ -1084,11 +1107,29 @@ impl DesktopState {
         }
     }
 
-    pub fn set_config_values(&mut self, values: Vec<(usize, String)>) {
-        for (index, value) in values {
-            if let Some(field) = self.provider_config.config_editor.fields.get_mut(index) {
-                field.value = value;
+    pub fn set_config_values_by_key(
+        &mut self,
+        values: Vec<(String, String)>,
+    ) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut updates = Vec::with_capacity(values.len());
+        for (key, value) in values {
+            if !seen.insert(key.clone()) {
+                return Err(format!("duplicate config field key: {key}"));
             }
+            let index = self
+                .provider_config
+                .config_editor
+                .fields
+                .iter()
+                .position(|field| field.key.label() == key)
+                .ok_or_else(|| format!("unknown config field key: {key}"))?;
+            updates.push((index, value));
+        }
+        for (index, value) in updates {
+            let field = &mut self.provider_config.config_editor.fields[index];
+            field.dirty |= field.value != value;
+            field.value = value;
         }
         self.provider_config.config_value_text = self
             .provider_config
@@ -1096,6 +1137,7 @@ impl DesktopState {
             .selected_field()
             .value
             .clone();
+        Ok(())
     }
 
     pub fn begin_provider_model_load(&mut self, normalized_base_url: String) {
@@ -1285,11 +1327,13 @@ impl DesktopState {
     }
 
     pub fn can_submit_prompt(&self) -> bool {
-        !self.is_busy() && !self.composer.draft_prompt.trim().is_empty()
+        !self.is_busy()
+            && !self.navigation_loading()
+            && !self.composer.draft_prompt.trim().is_empty()
     }
 
     pub fn can_open_session(&self) -> bool {
-        !self.is_busy() && self.selected_session_id().is_some()
+        self.can_begin_navigation() && self.selected_session_id().is_some()
     }
 
     pub fn can_delete_session(&self) -> bool {
@@ -1301,7 +1345,14 @@ impl DesktopState {
     }
 
     pub fn can_export_history(&self) -> bool {
-        !self.is_busy() && self.selected_session_id().is_some()
+        !self.is_busy()
+            && !self.navigation_loading()
+            && !self.background_mutation_pending()
+            && !self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::HistoryExport)
+            && self.selected_session_id().is_some()
     }
 
     pub fn can_apply_provider_selection(&self) -> bool {
@@ -1712,6 +1763,7 @@ mod tests {
 
         assert_eq!(state.selected_session_id(), None);
         assert_eq!(state.snapshot.selected_session_index, 1);
+        assert_eq!(state.selected_index(), -1);
         assert_eq!(state.current_session_label(), "新規チャット");
     }
 
@@ -1826,15 +1878,19 @@ mod tests {
     fn navigation_loading_tracks_workspace_and_session_loads() {
         let session_id = SessionId::new();
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        state.set_draft_prompt("wait for navigation".to_string());
 
         assert!(!state.navigation_loading());
+        assert!(state.can_submit_prompt());
 
         let workspace_request =
             state.begin_workspace_load(camino::Utf8PathBuf::from("C:/workspace"), None);
         assert!(state.navigation_loading());
+        assert!(!state.can_submit_prompt());
         assert!(state.is_current_navigation(workspace_request));
         state.finish_navigation(workspace_request);
         assert!(!state.navigation_loading());
+        assert!(state.can_submit_prompt());
 
         let session_request = state.begin_session_load(session_id);
         assert!(state.navigation_loading());
@@ -1901,7 +1957,45 @@ mod tests {
             state.snapshot.session_rows[0].label,
             format!("docx/xlsx要約 [完了] {short_id}")
         );
+        assert_eq!(
+            state.snapshot.session_rows[0].loaded_status,
+            crate::session::LoadedSessionStatus::Idle
+        );
         assert!(!state.selected_session_title().contains("[実行中]"));
+    }
+
+    #[test]
+    fn history_export_admission_rejects_repeat_navigation_and_background_mutation() {
+        let session_id = SessionId::new();
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    "exportable",
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+
+        assert!(state.can_export_history());
+        state.begin_history_export();
+        assert!(
+            !state.can_export_history(),
+            "repeated export is not admitted"
+        );
+        state.finish_history_export();
+        assert!(state.can_export_history());
+
+        let navigation = state.begin_session_load(session_id);
+        assert!(!state.can_export_history());
+        assert!(state.finish_navigation(navigation));
+
+        let delete = state.begin_session_delete_mutation();
+        assert!(!state.can_export_history());
+        assert!(state.finish_session_delete_mutation(delete));
+        assert!(state.can_export_history());
     }
 
     #[test]
@@ -1923,11 +2017,11 @@ mod tests {
 
         assert!(!state.background_mutation_pending());
 
-        state.begin_session_delete_mutation();
+        let session_delete_id = state.begin_session_delete_mutation();
         state.begin_project_delete_mutation();
         assert!(state.background_mutation_pending());
 
-        state.finish_session_delete_mutation();
+        assert!(state.finish_session_delete_mutation(session_delete_id));
         assert!(state.background_mutation_pending());
 
         state.finish_project_delete_mutation();
@@ -1935,6 +2029,51 @@ mod tests {
 
         state.finish_project_delete_mutation();
         assert!(!state.background_mutation_pending());
+    }
+
+    #[test]
+    fn navigation_admission_rejects_run_background_mutation_and_navigation() {
+        let session_id = SessionId::new();
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+
+        assert!(state.can_begin_navigation());
+
+        state.app_state.run_status = RunStatus::Running;
+        assert!(!state.can_begin_navigation());
+
+        state.app_state.run_status = RunStatus::Completed;
+        let session_delete_id = state.begin_session_delete_mutation();
+        assert!(!state.can_begin_navigation());
+        assert!(state.finish_session_delete_mutation(session_delete_id));
+
+        let request_id = state.begin_session_load(session_id);
+        assert!(!state.can_begin_navigation());
+        assert!(state.finish_navigation(request_id));
+        assert!(state.can_begin_navigation());
+    }
+
+    #[test]
+    fn snapshot_and_turn_page_operations_keep_async_polling_alive() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+
+        state.begin_snapshot_refresh();
+        assert!(state.async_polling_required());
+        assert!(
+            state
+                .pending_async_operation_keys()
+                .contains(&"snapshot_refresh".to_string())
+        );
+        state.finish_snapshot_refresh();
+
+        state.begin_turn_page_load();
+        assert!(state.async_polling_required());
+        assert!(
+            state
+                .pending_async_operation_keys()
+                .contains(&"turn_page_load".to_string())
+        );
+        state.finish_turn_page_load();
+        assert!(!state.async_polling_required());
     }
 
     #[test]
@@ -2005,6 +2144,55 @@ mod tests {
                 .pending_async_operation_keys()
                 .contains(&"prompt_enhance".to_string())
         );
+    }
+
+    #[test]
+    fn config_values_use_stable_keys_and_reject_invalid_batch_atomically() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        let original_model = state
+            .provider_config
+            .config_editor
+            .fields
+            .iter()
+            .find(|field| field.key.label() == "model.model")
+            .expect("model field")
+            .value
+            .clone();
+
+        let error = state
+            .set_config_values_by_key(vec![
+                ("model.model".to_string(), "changed-model".to_string()),
+                ("unknown.field".to_string(), "invalid".to_string()),
+            ])
+            .expect_err("unknown field must reject the full batch");
+        assert!(error.contains("unknown config field key"));
+        assert_eq!(
+            state
+                .provider_config
+                .config_editor
+                .fields
+                .iter()
+                .find(|field| field.key.label() == "model.model")
+                .expect("model field")
+                .value,
+            original_model
+        );
+
+        state
+            .set_config_values_by_key(vec![(
+                "model.model".to_string(),
+                "changed-model".to_string(),
+            )])
+            .expect("known stable key");
+        let model = state
+            .provider_config
+            .config_editor
+            .fields
+            .iter()
+            .find(|field| field.key.label() == "model.model")
+            .expect("model field");
+        assert_eq!(model.value, "changed-model");
+        assert!(model.dirty);
     }
 
     #[test]

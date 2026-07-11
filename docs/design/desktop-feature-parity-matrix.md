@@ -1,5 +1,7 @@
 # Desktop Feature Parity Matrix（R6） - 2026-06-13
 
+> **Status: historical release-scope snapshot (non-normative).** R6 priority and implementation directions below are complete or superseded and are not current task admission or backlog. Resolve current Desktop behavior from the current Rust/TypeScript code, tests, saved state, and direct GUI evidence.
+
 ## 1. 判定基準
 
 - **露出あり**: Desktop GUI から直接実行でき、結果が同一画面で確認できる。

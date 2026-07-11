@@ -86,6 +86,7 @@ impl ReplayService {
     }
 
     pub fn replay_with_evidence(input: ReplayRunInput) -> Result<ReplayExecution, RuntimeError> {
+        validate_replay_input(&input)?;
         match input.mode {
             ReplayMode::StoredArtifact => replay_stored_artifact(input),
             ReplayMode::TypedEventLog => replay_typed_event_log(input),
@@ -103,14 +104,28 @@ impl ReplayService {
 fn replay_stored_artifact(input: ReplayRunInput) -> Result<ReplayExecution, RuntimeError> {
     let snapshot =
         stored_artifact::synthesize_from_artifact_root(&input.artifact_root, &input.scenario_id)?;
-    evaluate_replay(
-        snapshot.run_id,
-        &input.scenario_id,
-        &snapshot.artifact_root,
-        snapshot.events,
-        snapshot.artifacts,
-        snapshot.contracts,
-    )
+    let gate_result = crate::harness::QualityGateResult::blocked(
+        gate::GateKind::Schema,
+        FailureOwner::HarnessCapture,
+        "stored-artifact import cannot prove runtime events; use a typed event log for a pass verdict",
+    );
+    Ok(ReplayExecution {
+        report: ReplayReport {
+            schema_version: "replay.report.v1".to_string(),
+            run_id: snapshot.run_id,
+            status: ReplayStatus::Blocked,
+            primary_owner: Some(FailureOwner::HarnessCapture),
+            summary: "replay is blocked by missing typed runtime evidence".to_string(),
+            gate_results: vec![gate_result],
+            restart_point: Some("capture_typed_runtime_events".to_string()),
+            next_actions: vec![
+                "replay a typed event log captured by the native runtime".to_string(),
+            ],
+        },
+        events: snapshot.events,
+        artifacts: snapshot.artifacts,
+        contracts: snapshot.contracts,
+    })
 }
 
 fn replay_typed_event_log(input: ReplayRunInput) -> Result<ReplayExecution, RuntimeError> {
@@ -118,6 +133,9 @@ fn replay_typed_event_log(input: ReplayRunInput) -> Result<ReplayExecution, Runt
         RuntimeError::Message("typed-event-log replay requires --event-log".to_string())
     })?;
     let events: Vec<HarnessEvent> = read_json_file(event_log)?;
+    let event_run_id = events.first().map(|event| event.run_id).ok_or_else(|| {
+        RuntimeError::Message("typed-event-log replay requires at least one event".to_string())
+    })?;
     let artifacts: Vec<ArtifactManifest> = match input.artifact_manifest.as_ref() {
         Some(path) => read_json_file(path)?,
         None => Vec::new(),
@@ -126,17 +144,30 @@ fn replay_typed_event_log(input: ReplayRunInput) -> Result<ReplayExecution, Runt
         Some(path) => read_json_file(path)?,
         None => Vec::new(),
     };
-    let run_id = input
+    if input
         .run_id
-        .or_else(|| events.first().map(|event| event.run_id))
-        .unwrap_or_else(HarnessRunId::new);
+        .is_some_and(|requested| requested != event_run_id)
+    {
+        return Err(RuntimeError::Message(format!(
+            "requested replay run_id does not match event stream run_id `{event_run_id}`"
+        )));
+    }
+    if artifacts
+        .iter()
+        .any(|artifact| artifact.run_id != event_run_id)
+    {
+        return Err(RuntimeError::Message(
+            "artifact manifest contains a run_id that does not match the event stream".to_string(),
+        ));
+    }
     evaluate_replay(
-        run_id,
+        event_run_id,
         &input.scenario_id,
         &input.artifact_root,
         events,
         artifacts,
         contracts,
+        &input.profile,
     )
 }
 
@@ -147,17 +178,28 @@ fn evaluate_replay(
     events: Vec<HarnessEvent>,
     artifacts: Vec<ArtifactManifest>,
     contracts: Vec<ContractRecord>,
+    profile: &ReplayProfile,
 ) -> Result<ReplayExecution, RuntimeError> {
     let mut gate_results = Vec::new();
     let schema = gate::schema::evaluate(&events, &artifacts, &contracts);
     let schema_status = schema.result.status;
     gate_results.push(schema.result);
     if schema_status == GateStatus::Pass {
-        gate_results.push(gate::state_transition::evaluate(&events).result);
-        gate_results.push(gate::tool_dispatch::evaluate(&events).result);
-        gate_results.push(gate::artifact::evaluate(artifact_root, &artifacts).result);
-        gate_results.push(gate::scenario::evaluate(scenario_id, &artifacts, &contracts).result);
-        gate_results.push(gate::e2e::not_applicable().result);
+        for gate_kind in &profile.gates {
+            let result = match gate_kind {
+                gate::GateKind::Schema => continue,
+                gate::GateKind::StateTransition => gate::state_transition::evaluate(&events).result,
+                gate::GateKind::ToolDispatch => gate::tool_dispatch::evaluate(&events).result,
+                gate::GateKind::Artifact => {
+                    gate::artifact::evaluate(artifact_root, &artifacts).result
+                }
+                gate::GateKind::Scenario => {
+                    gate::scenario::evaluate(scenario_id, &artifacts, &contracts).result
+                }
+                gate::GateKind::E2E => gate::e2e::not_applicable().result,
+            };
+            gate_results.push(result);
+        }
     }
     let status = if gate_results
         .iter()
@@ -206,6 +248,37 @@ fn evaluate_replay(
     })
 }
 
+fn validate_replay_input(input: &ReplayRunInput) -> Result<(), RuntimeError> {
+    if input.schema_version != "replay.run_input.v1" {
+        return Err(RuntimeError::Message(format!(
+            "unsupported replay input schema `{}`",
+            input.schema_version
+        )));
+    }
+    if input.profile.gates.is_empty() {
+        return Err(RuntimeError::Message(
+            "replay profile must select at least one gate".to_string(),
+        ));
+    }
+    if input.profile.provider_replay {
+        return Err(RuntimeError::Message(
+            "provider replay is not implemented; disable provider_replay".to_string(),
+        ));
+    }
+    if input.profile.shell_reexecution {
+        return Err(RuntimeError::Message(
+            "shell reexecution is not implemented; disable shell_reexecution".to_string(),
+        ));
+    }
+    if input.profile.contract_override_policy != "recorded_versions" {
+        return Err(RuntimeError::Message(format!(
+            "unsupported contract override policy `{}`",
+            input.profile.contract_override_policy
+        )));
+    }
+    Ok(())
+}
+
 fn read_json_file<T>(path: &camino::Utf8Path) -> Result<T, RuntimeError>
 where
     T: serde::de::DeserializeOwned,
@@ -226,4 +299,74 @@ pub fn write_report(report: &ReplayReport, output: &camino::Utf8Path) -> Result<
     std::fs::write(output.as_std_path(), json)
         .map_err(|error| RuntimeError::Message(error.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored_input(root: Utf8PathBuf) -> ReplayRunInput {
+        ReplayRunInput {
+            schema_version: "replay.run_input.v1".to_string(),
+            run_id: None,
+            mode: ReplayMode::StoredArtifact,
+            scenario_id: "case1".to_string(),
+            artifact_root: root,
+            event_log: None,
+            artifact_manifest: None,
+            contract_registry: None,
+            profile: ReplayProfile::default(),
+        }
+    }
+
+    #[test]
+    fn arbitrary_stored_files_cannot_pass_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("junk.txt"), "not evidence").expect("junk");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+
+        let execution = ReplayService::replay_with_evidence(stored_input(root)).expect("replay");
+
+        assert_eq!(execution.report.status, ReplayStatus::Blocked);
+        assert!(
+            execution
+                .report
+                .gate_results
+                .iter()
+                .any(|result| result.status == GateStatus::Blocked)
+        );
+    }
+
+    #[test]
+    fn stored_artifacts_cannot_pass_with_a_reduced_gate_profile() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("junk.txt"), "not evidence").expect("junk");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let mut input = stored_input(root);
+        input.profile.gates = vec![gate::GateKind::Schema];
+
+        let execution = ReplayService::replay_with_evidence(input).expect("replay");
+
+        assert_eq!(execution.report.status, ReplayStatus::Blocked);
+        assert!(execution.report.gate_results.iter().any(|result| {
+            result.status == GateStatus::Blocked
+                && result.summary.contains("cannot prove runtime events")
+        }));
+    }
+
+    #[test]
+    fn unsupported_replay_profile_capabilities_fail_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let mut input = stored_input(root);
+        input.profile.provider_replay = true;
+
+        let error = ReplayService::replay_with_evidence(input).expect_err("unsupported profile");
+
+        assert!(
+            error
+                .to_string()
+                .contains("provider replay is not implemented")
+        );
+    }
 }

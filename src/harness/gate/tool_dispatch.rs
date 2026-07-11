@@ -9,6 +9,8 @@ pub fn evaluate(events: &[HarnessEvent]) -> GateEvaluation {
                 | HarnessEventKind::ToolDispatchRequested
                 | HarnessEventKind::ToolExecuted
                 | HarnessEventKind::ToolDispatchDenied
+                | HarnessEventKind::PermissionRequested
+                | HarnessEventKind::PermissionResolved
         )
     });
     let result = if has_tool_or_model {

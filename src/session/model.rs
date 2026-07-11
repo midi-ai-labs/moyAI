@@ -46,6 +46,12 @@ pub enum SessionMemoryMode {
     Disabled,
 }
 
+impl Default for SessionMemoryMode {
+    fn default() -> Self {
+        Self::Enabled
+    }
+}
+
 impl SessionMemoryMode {
     pub fn key(self) -> &'static str {
         match self {
@@ -1104,6 +1110,10 @@ impl LoadedSessionStatus {
 pub struct LoadedSessionSummary {
     pub session: SessionRecord,
     pub loaded_status: LoadedSessionStatus,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub memory_mode: SessionMemoryMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

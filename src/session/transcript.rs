@@ -37,7 +37,7 @@ pub fn transcript_from_history_items(session: &SessionRecord, items: &[HistoryIt
     let mut messages = Vec::new();
     for item in items {
         let role = history_item_role(&item.payload);
-        let message_id = MessageId::new();
+        let message_id = MessageId::from_stable_input(&format!("history-message:{}", item.id));
         let parts = history_item_parts(message_id, &item.payload);
         if parts.is_empty() {
             continue;
@@ -274,7 +274,7 @@ fn part_record(
     payload: MessagePart,
 ) -> PartRecord {
     PartRecord {
-        id: PartId::new(),
+        id: PartId::from_stable_input(&format!("history-part:{message_id}:{sequence_no}")),
         message_id,
         sequence_no,
         kind,
@@ -380,6 +380,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn transcript_projection_ids_are_stable_for_canonical_history_identity() {
+        let session = test_session();
+        let item = history_diagnostics(
+            &session,
+            TurnId::new(),
+            1,
+            100,
+            Some(context_window_status(2_100)),
+        );
+
+        let first = transcript_from_history_items(&session, std::slice::from_ref(&item));
+        let second = transcript_from_history_items(&session, std::slice::from_ref(&item));
+        let other_item = history_diagnostics(
+            &session,
+            TurnId::new(),
+            1,
+            100,
+            Some(context_window_status(2_100)),
+        );
+        let other = transcript_from_history_items(&session, std::slice::from_ref(&other_item));
+
+        assert_eq!(first.messages[0].record.id, second.messages[0].record.id);
+        assert_eq!(
+            first.messages[0].parts[0].id,
+            second.messages[0].parts[0].id
+        );
+        assert_eq!(
+            first.messages[0].parts[0].message_id,
+            first.messages[0].record.id
+        );
+        assert_ne!(first.messages[0].record.id, other.messages[0].record.id);
+        assert_ne!(first.messages[0].parts[0].id, other.messages[0].parts[0].id);
     }
 
     fn transcript_with_diagnostics(diagnostics: Vec<RequestDiagnosticsPart>) -> Transcript {

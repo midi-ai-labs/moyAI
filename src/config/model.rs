@@ -150,26 +150,6 @@ pub struct SessionConfig {
     pub auto_resume_last: bool,
     pub max_steps_per_turn: usize,
     pub overflow_margin_tokens: usize,
-    pub auto_compact_enabled: bool,
-    pub auto_compact_keep_recent: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentConfig {
-    pub duplicate_success_abort_threshold: usize,
-    pub repetitive_text_line_threshold: usize,
-    pub readonly_stall_threshold_implementation: usize,
-    pub readonly_stall_threshold_general: usize,
-    pub verification_repair_grace_steps: usize,
-    pub verification_failure_attempt_limit: usize,
-    pub verification_failure_repair_read_budget: usize,
-    pub staged_task_documentation_finish_grace_steps: usize,
-    pub staged_task_discovery_redirect_repeat_threshold: usize,
-    pub staged_task_authoring_read_limit: u64,
-    pub staged_task_authoring_successful_read_budget_after_progress: usize,
-    pub staged_task_audit_repair_read_budget: usize,
-    pub staged_task_audit_repair_rewrite_escalation_threshold: usize,
-    pub staged_task_recovery_stall_threshold: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,7 +253,6 @@ pub struct LoggingConfig {
 pub struct ResolvedConfig {
     pub model: ModelConfig,
     pub session: SessionConfig,
-    pub agent: AgentConfig,
     pub permissions: PermissionsConfig,
     pub shell: ShellConfig,
     pub format: FormatConfig,
@@ -368,24 +347,6 @@ impl Default for ResolvedConfig {
                 auto_resume_last: false,
                 max_steps_per_turn: 128,
                 overflow_margin_tokens: 1_024,
-                auto_compact_enabled: true,
-                auto_compact_keep_recent: 40,
-            },
-            agent: AgentConfig {
-                duplicate_success_abort_threshold: 6,
-                repetitive_text_line_threshold: 6,
-                readonly_stall_threshold_implementation: 3,
-                readonly_stall_threshold_general: 4,
-                verification_repair_grace_steps: 4,
-                verification_failure_attempt_limit: 4,
-                verification_failure_repair_read_budget: 2,
-                staged_task_documentation_finish_grace_steps: 128,
-                staged_task_discovery_redirect_repeat_threshold: 2,
-                staged_task_authoring_read_limit: 160,
-                staged_task_authoring_successful_read_budget_after_progress: 3,
-                staged_task_audit_repair_read_budget: 3,
-                staged_task_audit_repair_rewrite_escalation_threshold: 2,
-                staged_task_recovery_stall_threshold: 3,
             },
             permissions: PermissionsConfig {
                 access_mode: AccessMode::Default,
@@ -535,8 +496,6 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
             auto_resume_last: None,
             max_steps_per_turn: Some(config.session.max_steps_per_turn),
             overflow_margin_tokens: None,
-            auto_compact_enabled: Some(config.session.auto_compact_enabled),
-            auto_compact_keep_recent: Some(config.session.auto_compact_keep_recent),
         }),
         inspection: Some(PartialInspectionConfig {
             default_max_depth: Some(config.inspection.default_max_depth),
@@ -568,7 +527,6 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
             additional_read_roots: Some(config.permissions.additional_read_roots.clone()),
             additional_write_roots: Some(config.permissions.additional_write_roots.clone()),
         }),
-        agent: None,
         shell: Some(PartialShellConfig {
             program: config.shell.program.clone().map(Some),
             family: config.shell.family.map(Some),
@@ -589,7 +547,6 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
 pub struct PartialResolvedConfig {
     pub model: Option<PartialModelConfig>,
     pub session: Option<PartialSessionConfig>,
-    pub agent: Option<PartialAgentConfig>,
     pub permissions: Option<PartialPermissionsConfig>,
     pub shell: Option<PartialShellConfig>,
     pub format: Option<PartialFormatConfig>,
@@ -640,26 +597,6 @@ pub struct PartialSessionConfig {
     pub auto_resume_last: Option<bool>,
     pub max_steps_per_turn: Option<usize>,
     pub overflow_margin_tokens: Option<usize>,
-    pub auto_compact_enabled: Option<bool>,
-    pub auto_compact_keep_recent: Option<usize>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct PartialAgentConfig {
-    pub duplicate_success_abort_threshold: Option<usize>,
-    pub repetitive_text_line_threshold: Option<usize>,
-    pub readonly_stall_threshold_implementation: Option<usize>,
-    pub readonly_stall_threshold_general: Option<usize>,
-    pub verification_repair_grace_steps: Option<usize>,
-    pub verification_failure_attempt_limit: Option<usize>,
-    pub verification_failure_repair_read_budget: Option<usize>,
-    pub staged_task_documentation_finish_grace_steps: Option<usize>,
-    pub staged_task_discovery_redirect_repeat_threshold: Option<usize>,
-    pub staged_task_authoring_read_limit: Option<u64>,
-    pub staged_task_authoring_successful_read_budget_after_progress: Option<usize>,
-    pub staged_task_audit_repair_read_budget: Option<usize>,
-    pub staged_task_audit_repair_rewrite_escalation_threshold: Option<usize>,
-    pub staged_task_recovery_stall_threshold: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

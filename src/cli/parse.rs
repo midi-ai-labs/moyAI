@@ -499,20 +499,10 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                     output_mode: args.output_mode,
                 }))
             }
-            SessionCommand::Compact(args) => {
-                if args.keep_recent == 0 {
-                    return Err(CliUsageError::Message(
-                        "session compact --keep-recent must be greater than zero".to_string(),
-                    ));
-                }
-                Ok(CliCommand::SessionCompact(SessionCompactArgs {
-                    session_id: args.session_id.parse().map_err(|error| {
-                        CliUsageError::Message(format!("invalid session id: {error}"))
-                    })?,
-                    keep_recent: args.keep_recent,
-                    output_mode: args.output_mode,
-                }))
-            }
+            SessionCommand::Compact(_) => Err(CliUsageError::Message(
+                "semantic session compaction is unavailable; history was left unchanged. Start a new session, reduce attached context, or split the task instead"
+                    .to_string(),
+            )),
             SessionCommand::Memory(args) => {
                 let requested_mode = args
                     .mode
@@ -890,6 +880,7 @@ enum SessionCommand {
     Settings(SessionSettingsCommand),
     Title(SessionTitleCommand),
     Interrupt(SessionInterruptCommand),
+    #[command(about = "Unavailable: semantic compaction is not implemented; history is preserved")]
     Compact(SessionCompactCommand),
     Memory(SessionMemoryCommand),
     Goal {

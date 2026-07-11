@@ -9,16 +9,20 @@ use super::{VcsKind, Workspace};
 
 pub fn uncommitted_review_scope(workspace: &Workspace) -> Result<ReviewScope, WorkspaceError> {
     ensure_git_workspace(workspace)?;
-    let status = run_git(
+    let status = run_git_bytes(
         workspace,
-        &["status", "--porcelain", "--untracked-files=all"],
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     )?;
-    let changed_files = parse_status_paths(&status);
+    let status_entries = parse_status_entries(&status)?;
+    let changed_files = status_entries
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
     let staged = run_git(workspace, &["diff", "--shortstat", "--cached", "HEAD"])?;
     let unstaged = run_git(workspace, &["diff", "--shortstat"])?;
-    let untracked = status
-        .lines()
-        .filter(|line| line.trim_start().starts_with("??"))
+    let untracked = status_entries
+        .iter()
+        .filter(|(code, _)| code == "??")
         .count();
     let mut summary_lines = Vec::new();
     if !staged.trim().is_empty() {
@@ -47,15 +51,25 @@ pub fn branch_review_scope(
     base_ref: &str,
 ) -> Result<ReviewScope, WorkspaceError> {
     ensure_git_workspace(workspace)?;
+    run_git(
+        workspace,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{base_ref}^{{commit}}"),
+        ],
+    )?;
     let diff_range = format!("{base_ref}...HEAD");
-    let names = run_git(workspace, &["diff", "--name-only", &diff_range])?;
-    let summary = run_git(workspace, &["diff", "--shortstat", &diff_range])?;
-    let changed_files = names
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(Utf8PathBuf::from)
-        .collect::<Vec<_>>();
+    let names = run_git_bytes(
+        workspace,
+        &["diff", "--name-only", "-z", "--end-of-options", &diff_range],
+    )?;
+    let summary = run_git(
+        workspace,
+        &["diff", "--shortstat", "--end-of-options", &diff_range],
+    )?;
+    let changed_files = parse_nul_paths(&names)?;
     Ok(ReviewScope {
         mode: ReviewScopeMode::Branch,
         base_ref: Some(base_ref.to_string()),
@@ -84,6 +98,16 @@ fn current_head_label(workspace: &Workspace) -> Result<String, WorkspaceError> {
 }
 
 fn run_git(workspace: &Workspace, args: &[&str]) -> Result<String, WorkspaceError> {
+    let output = run_git_bytes(workspace, args)?;
+    String::from_utf8(output).map_err(|error| {
+        WorkspaceError::Message(format!(
+            "git {} returned non-UTF-8 output: {error}",
+            args.join(" ")
+        ))
+    })
+}
+
+fn run_git_bytes(workspace: &Workspace, args: &[&str]) -> Result<Vec<u8>, WorkspaceError> {
     let output = Command::new("git")
         .args(args)
         .current_dir(workspace.root.as_std_path())
@@ -105,28 +129,80 @@ fn run_git(workspace: &Workspace, args: &[&str]) -> Result<String, WorkspaceErro
             }
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(output.stdout)
 }
 
-fn parse_status_paths(status: &str) -> Vec<Utf8PathBuf> {
-    let mut paths = status
-        .lines()
-        .filter_map(|line| {
-            if line.trim().is_empty() || line.len() < 4 {
-                return None;
-            }
-            let path = line[3..].trim();
-            if path.is_empty() {
-                return None;
-            }
-            Some(Utf8PathBuf::from(
-                path.rsplit_once(" -> ")
-                    .map(|(_, after)| after)
-                    .unwrap_or(path),
-            ))
+fn parse_status_entries(status: &[u8]) -> Result<Vec<(String, Utf8PathBuf)>, WorkspaceError> {
+    let records = status.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < records.len() {
+        let record = records[index];
+        if record.is_empty() {
+            index += 1;
+            continue;
+        }
+        if record.len() < 4 || record[2] != b' ' {
+            return Err(WorkspaceError::Message(
+                "git status returned an invalid porcelain record".to_string(),
+            ));
+        }
+        let code = std::str::from_utf8(&record[..2])
+            .map_err(|error| WorkspaceError::Message(format!("invalid git status code: {error}")))?
+            .to_string();
+        let path = std::str::from_utf8(&record[3..]).map_err(|error| {
+            WorkspaceError::Message(format!("git status path is not valid UTF-8: {error}"))
+        })?;
+        if !path.is_empty() {
+            entries.push((code.clone(), Utf8PathBuf::from(path)));
+        }
+        index += 1;
+        if code
+            .as_bytes()
+            .iter()
+            .any(|code| matches!(*code, b'R' | b'C'))
+        {
+            index += 1;
+        }
+    }
+    entries.sort_by(|left, right| left.1.cmp(&right.1));
+    entries.dedup_by(|left, right| left.1 == right.1);
+    Ok(entries)
+}
+
+fn parse_nul_paths(bytes: &[u8]) -> Result<Vec<Utf8PathBuf>, WorkspaceError> {
+    let mut paths = bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            std::str::from_utf8(record)
+                .map(Utf8PathBuf::from)
+                .map_err(|error| {
+                    WorkspaceError::Message(format!("git path is not valid UTF-8: {error}"))
+                })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     paths.sort();
     paths.dedup();
-    paths
+    Ok(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn porcelain_z_parser_preserves_utf8_and_rename_destination() {
+        let input = " M src/日本語.rs\0R  src/new name.rs\0src/old name.rs\0?? odd -> name.txt\0";
+
+        let entries = parse_status_entries(input.as_bytes()).expect("status entries");
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(_, path)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["odd -> name.txt", "src/new name.rs", "src/日本語.rs"]
+        );
+    }
 }

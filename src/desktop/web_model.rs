@@ -46,7 +46,16 @@ pub struct DesktopConfigFieldProjection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopConfigMutationTargetProjection {
+    pub workspace_path: String,
+    pub session_id: Option<String>,
+    pub config_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopWebState {
+    pub projection_revision: String,
     pub workspace_path: String,
     pub provider_label: String,
     pub model_label: String,
@@ -66,6 +75,7 @@ pub struct DesktopWebState {
     pub token_meter_title: String,
     pub token_meter_level: String,
     pub confirmation_visible: bool,
+    pub confirmation_id: Option<u64>,
     pub confirmation_text: String,
     pub confirmation: Option<DesktopPermissionProjection>,
     pub startup: DesktopStartupProjection,
@@ -107,6 +117,7 @@ pub struct DesktopWebState {
     pub provider_context_window: String,
     pub provider_max_output_tokens: String,
     pub provider_models: Vec<String>,
+    pub provider_model_ids: Vec<String>,
     pub provider_selected_index: i32,
     pub provider_status_text: String,
     pub provider_selected_model_summary: Vec<String>,
@@ -118,6 +129,7 @@ pub struct DesktopWebState {
     pub config_field_title: String,
     pub config_value_text: String,
     pub config_feedback_text: String,
+    pub config_target: DesktopConfigMutationTargetProjection,
     pub workspace_input: String,
     pub review_raw_text: String,
     pub review_draft_text: String,
@@ -182,6 +194,7 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         state.provider_config.effective_config.model.context_window,
     );
     DesktopWebState {
+        projection_revision: "0".to_string(),
         workspace_path: state.snapshot.workspace_path.clone(),
         provider_label: state.snapshot.provider_label.clone(),
         model_label: state.snapshot.model_label.clone(),
@@ -208,6 +221,7 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         token_meter_title: token_meter.title,
         token_meter_level: token_meter.level,
         confirmation_visible: detail.confirmation_visible,
+        confirmation_id: state.permission_request_id,
         confirmation_text: detail.confirmation_text,
         confirmation: state.app_state.permission.as_ref().map(|permission| {
             DesktopPermissionProjection {
@@ -268,6 +282,7 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
             .provider_max_output_tokens_input
             .clone(),
         provider_models: provider_model_labels(state),
+        provider_model_ids: state.provider_config.provider_models.clone(),
         provider_selected_index: state.provider_config.provider_selected_index,
         provider_status_text: provider_feedback_text(state),
         provider_selected_model_summary: provider_selected_model_summary(state),
@@ -302,21 +317,30 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
             .unwrap_or_else(|| {
                 config_feedback_text(state.provider_config.config_editor.selected_field().key)
             }),
+        config_target: DesktopConfigMutationTargetProjection {
+            workspace_path: state.snapshot.workspace_path.clone(),
+            session_id: state
+                .selected_session_id()
+                .map(|session_id| session_id.to_string()),
+            config_generation: state.provider_config.config_generation,
+        },
         workspace_input: state.workspace_input.clone(),
         review_raw_text,
         review_draft_text: state.composer.review_draft_text.clone(),
         review_status_text,
-        send_enhanced_enabled,
-        send_raw_enabled,
+        send_enhanced_enabled: send_enhanced_enabled && !state.navigation_loading(),
+        send_raw_enabled: send_raw_enabled && !state.navigation_loading(),
         history_export_enabled: state.can_export_history(),
-        enhance_enabled: !state.is_busy() && !state.composer.draft_prompt.trim().is_empty(),
+        enhance_enabled: !state.is_busy()
+            && !state.navigation_loading()
+            && !state.composer.draft_prompt.trim().is_empty(),
         image_input_enabled,
         window_opacity_percent: state.view.window_opacity_percent,
     }
 }
 
 fn desktop_image_input_delegates_capability_to_runtime(state: &DesktopState) -> bool {
-    !state.is_busy()
+    !state.is_busy() && !state.navigation_loading()
 }
 
 fn startup_projection(state: &DesktopState) -> DesktopStartupProjection {

@@ -100,32 +100,47 @@ impl Tool for McpCallTool {
                 endpoint,
                 tools,
             } => {
+                let visible_tools = tools
+                    .iter()
+                    .take(ctx.config.tool_output.max_results)
+                    .collect::<Vec<_>>();
                 let output_text = if tools.is_empty() {
                     format!(
                         "MCP server `{server_id}` returned no tools. Check the server configuration or route allowlist before retrying."
                     )
                 } else {
                     let mut lines = vec![format!("MCP tools for `{server_id}`:")];
-                    for tool in &tools {
+                    for tool in &visible_tools {
                         let description = tool.description.as_deref().unwrap_or("no description");
                         lines.push(format!("- {}: {}", tool.name, description));
                     }
+                    if visible_tools.len() < tools.len() {
+                        lines.push(format!(
+                            "[{} additional tools omitted by output limit]",
+                            tools.len() - visible_tools.len()
+                        ));
+                    }
                     lines.join("\n")
                 };
+                let truncated = ctx.services.truncator.preview(
+                    output_text,
+                    &ctx.config.tool_output,
+                    &ctx.services.storage_paths,
+                )?;
                 Ok(ToolResult {
                     title: format!("Listed MCP tools from {server_id}"),
-                    output_text,
+                    output_text: truncated.preview_text,
                     metadata: json!({
                         "server_id": server_id,
                         "endpoint": endpoint,
                         "tool_count": tools.len(),
-                        "tools": tools.iter().map(|tool| json!({
+                        "tools": visible_tools.iter().map(|tool| json!({
                             "name": tool.name.clone(),
                             "description": tool.description.clone(),
                             "input_schema": tool.input_schema.clone(),
                         })).collect::<Vec<_>>(),
                     }),
-                    truncated_output_path: None,
+                    truncated_output_path: truncated.truncated_output_path,
                     recorded_changes: Vec::new(),
                     change_summaries: Vec::new(),
                 })
@@ -136,19 +151,33 @@ impl Tool for McpCallTool {
                 tool_name,
                 output_text,
                 raw_result,
-            } => Ok(ToolResult {
-                title: format!("Called MCP tool {server_id}:{tool_name}"),
-                output_text,
-                metadata: json!({
-                    "server_id": server_id,
-                    "endpoint": endpoint,
-                    "tool_name": tool_name,
-                    "raw_result": raw_result,
-                }),
-                truncated_output_path: None,
-                recorded_changes: Vec::new(),
-                change_summaries: Vec::new(),
-            }),
+            } => {
+                let truncated = ctx.services.truncator.preview(
+                    output_text,
+                    &ctx.config.tool_output,
+                    &ctx.services.storage_paths,
+                )?;
+                let raw_json = serde_json::to_string(&raw_result)?;
+                let raw_result_preview = crate::tool::truncate::clip_text_with_ellipsis(
+                    &raw_json,
+                    ctx.config.tool_output.max_bytes,
+                );
+                Ok(ToolResult {
+                    title: format!("Called MCP tool {server_id}:{tool_name}"),
+                    output_text: truncated.preview_text,
+                    metadata: json!({
+                        "server_id": server_id,
+                        "endpoint": endpoint,
+                        "tool_name": tool_name,
+                        "raw_result_bytes": raw_json.len(),
+                        "raw_result_sha256": crate::harness::artifact::hash_bytes(raw_json.as_bytes()),
+                        "raw_result_preview": raw_result_preview,
+                    }),
+                    truncated_output_path: truncated.truncated_output_path,
+                    recorded_changes: Vec::new(),
+                    change_summaries: Vec::new(),
+                })
+            }
         }
     }
 }

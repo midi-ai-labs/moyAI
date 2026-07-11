@@ -1,10 +1,11 @@
 param(
-  [string]$Version = "0.6.2",
+  [string]$Version = "0.6.3",
   [string]$Target = "windows-x86_64",
   [string]$OutputRoot = "",
   [string]$ManualGuiStResultsPath = "",
   [switch]$SkipManualGuiStGate,
-  [switch]$SkipBuild
+  [switch]$SkipBuild,
+  [switch]$AllowDirtySource
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,6 +55,15 @@ function Get-CargoPackageVersion {
   throw "Cargo.toml package version was not found"
 }
 
+function Test-ExactMarkerLine([string]$Content, [string]$ExpectedLine) {
+  foreach ($line in ($Content -split "`r?`n")) {
+    if ($line.Trim() -ceq $ExpectedLine) {
+      return $true
+    }
+  }
+  return $false
+}
+
 function Get-RelativePathForRelease([string]$BasePath, [string]$FullPath) {
   $base = [System.IO.Path]::GetFullPath($BasePath).TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar
   $target = [System.IO.Path]::GetFullPath($FullPath)
@@ -99,6 +109,22 @@ $zipShaPath = Assert-ReleaseOutputPath $OutputRoot "$zipPath.sha256" "release ch
 
 Push-Location $repoRoot
 try {
+  $commit = (git rev-parse HEAD).Trim()
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($commit)) {
+    throw "failed to resolve the release source commit"
+  }
+  $sourceStatus = @(git status --porcelain --untracked-files=all)
+  if ($LASTEXITCODE -ne 0) {
+    throw "failed to inspect the release source worktree"
+  }
+  $sourceClean = $sourceStatus.Count -eq 0
+  if (-not $sourceClean -and -not $AllowDirtySource) {
+    throw "release source worktree is dirty. Commit the intended source first, or use -AllowDirtySource only for an unpublished diagnostic package."
+  }
+  if (-not $sourceClean) {
+    Write-Warning "Packaging a dirty source tree. The manifest will record source_clean=false; do not publish this package."
+  }
+
   $cargoVersion = Get-CargoPackageVersion
   if ($cargoVersion -ne $Version) {
     throw "Cargo.toml version is $cargoVersion, expected $Version"
@@ -115,6 +141,7 @@ try {
   }
 
   $manualGuiStResultsResolved = $null
+  $manualGuiStResultsSha256 = $null
   if ($SkipManualGuiStGate) {
     Write-Warning "Skipping GUI manual ST release gate. Do not use this for published releases."
   } else {
@@ -126,20 +153,60 @@ try {
       throw "GUI manual ST results file not found: $manualGuiStResultsResolved"
     }
     $manualGuiStResultsContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $manualGuiStResultsResolved
-    if (-not $manualGuiStResultsContent.Contains("Manual ST Gate: PASS")) {
+    if (-not (Test-ExactMarkerLine $manualGuiStResultsContent "Manual ST Gate: PASS")) {
       throw "GUI manual ST results file must contain 'Manual ST Gate: PASS': $manualGuiStResultsResolved"
+    }
+    if (-not (Test-ExactMarkerLine $manualGuiStResultsContent "Release Version: $Version")) {
+      throw "GUI manual ST results file must contain the exact release identity 'Release Version: $Version': $manualGuiStResultsResolved"
+    }
+    if (-not (Test-ExactMarkerLine $manualGuiStResultsContent "Git Commit: $commit")) {
+      throw "GUI manual ST results file must contain the exact source identity 'Git Commit: $commit': $manualGuiStResultsResolved"
+    }
+    $manualGuiStResultsSha256 = (Get-FileHash -LiteralPath $manualGuiStResultsResolved -Algorithm SHA256).Hash.ToLowerInvariant()
+  }
+
+  $desktopDist = Join-Path $repoRoot "ui\desktop-web\dist"
+  $buildIdentityPath = Join-Path $desktopDist "build-identity.json"
+  if (-not $SkipBuild) {
+    npm run build:desktop-web
+    if ($LASTEXITCODE -ne 0) {
+      throw "Desktop web release build failed with exit code $LASTEXITCODE"
+    }
+    cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
+    if ($LASTEXITCODE -ne 0) {
+      throw "Rust release build failed with exit code $LASTEXITCODE"
     }
   }
 
+  $postBuildCommit = (git rev-parse HEAD).Trim()
+  if ($LASTEXITCODE -ne 0 -or $postBuildCommit -ne $commit) {
+    throw "release source commit changed while building: started=$commit current=$postBuildCommit"
+  }
+  $postBuildStatus = @(git status --porcelain --untracked-files=all)
+  if ($LASTEXITCODE -ne 0) {
+    throw "failed to re-inspect the release source worktree after build"
+  }
+  $postBuildClean = $postBuildStatus.Count -eq 0
+  $sourceClean = $sourceClean -and $postBuildClean
+  if (-not $sourceClean -and -not $AllowDirtySource) {
+    throw "release build changed the source worktree. Restore or commit the generated changes before packaging."
+  }
+
   if (-not $SkipBuild) {
-    npm run build:desktop-web
-    cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
+    $buildIdentity = [ordered]@{
+      version = $Version
+      git_commit = $commit
+      source_clean = $sourceClean
+      built_at_utc = [DateTime]::UtcNow.ToString("o")
+    }
+    Write-Utf8File $buildIdentityPath ($buildIdentity | ConvertTo-Json -Depth 4)
+  } elseif (-not (Test-Path -LiteralPath $buildIdentityPath -PathType Leaf)) {
+    throw "-SkipBuild requires an existing Desktop build identity: $buildIdentityPath"
   }
 
   $cliExe = Join-Path $repoRoot "target\release\moyai.exe"
   $desktopExe = Join-Path $repoRoot "target\release\moyai-desktop.exe"
   $cleanupExe = Join-Path $repoRoot "target\release\moyai-cleanup.exe"
-  $desktopDist = Join-Path $repoRoot "ui\desktop-web\dist"
   if (-not (Test-Path -LiteralPath $cliExe -PathType Leaf)) {
     throw "release CLI binary not found: $cliExe"
   }
@@ -151,6 +218,18 @@ try {
   }
   if (-not (Test-Path -LiteralPath $desktopDist -PathType Container)) {
     throw "Desktop web asset directory not found: $desktopDist"
+  }
+  $buildIdentity = Get-Content -Raw -Encoding UTF8 -LiteralPath $buildIdentityPath | ConvertFrom-Json
+  if ($buildIdentity.version -ne $Version -or $buildIdentity.git_commit -ne $commit) {
+    throw "Desktop build identity does not match release source/version: $buildIdentityPath"
+  }
+  if (-not $AllowDirtySource -and $buildIdentity.source_clean -ne $true) {
+    throw "Desktop build identity was produced from a dirty source tree: $buildIdentityPath"
+  }
+  $cliVersionOutput = (& $cliExe --version 2>&1 | Out-String).Trim()
+  $expectedCliVersionOutput = "moyai $Version"
+  if ($LASTEXITCODE -ne 0 -or $cliVersionOutput -ne $expectedCliVersionOutput) {
+    throw "release CLI binary version does not match exact expected output '$expectedCliVersionOutput': $cliVersionOutput"
   }
 
   Remove-ReleaseOutputDirectory $OutputRoot $releaseRoot "release directory"
@@ -209,17 +288,17 @@ This release module contains the Windows CLI and Tauri Desktop binaries.
 
 ## Highlights
 
-- Thin rebuilt agent core with short Markdown prompt, plain tool results, and minimal guard surface.
+- Thin agent core with a short Markdown prompt, plain tool results, and a small state surface.
 - Desktop GUI, CLI, and TUI entrypoints over the same Rust core.
 - Local-first LM Studio / OpenAI-compatible endpoint configuration.
 - Workspace file editing, patching, search, directory inspection, shell execution, session history, and Markdown export.
 - Codex-compatible goal runtime with `/goal`, goal tools, request-local steering, status accounting, and bounded idle continuation.
 - Codex 2026-07 context handling updates: workspace world-state context, local instruction discovery, local `SKILL.md` snapshot reuse, and the `current_time` tool.
-- Automatic context compaction when estimated context window usage approaches the configured limit.
+- Non-destructive context-limit handling that preserves canonical history instead of generating lossy count-only summaries.
 - Desktop token meter showing approximate `used / max` context tokens, including session reopen restoration from recorded diagnostics.
 - Desktop UX hardening for quick chat, live access-mode changes, hidden shell windows, composer autosize, and window controls.
 - Vision attachment path verified through Desktop GUI with provider request diagnostics recording `image_count`.
-- v0.6.2 fixes canonical cross-turn history ordering for transcript projection and Markdown export.
+- v{0} contains the fixes and verification recorded in this package's manual GUI ST artifact.
 - Published release packages are gated by a visible Desktop GUI manual ST results artifact.
 
 ## Quick Start
@@ -254,12 +333,20 @@ To reset moyAI to its first-run state, close all moyAI windows and run `bin/moya
   $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
   Write-Utf8File $zipShaPath "$zipHash  $(Split-Path -Leaf $zipPath)"
 
-  $commit = (git rev-parse HEAD).Trim()
   $manifest = [ordered]@{
     name = $releaseName
     version = $Version
     target = $Target
     git_commit = $commit
+    source_clean = $sourceClean
+    cli_version_output = $cliVersionOutput
+    desktop_build_identity = [ordered]@{
+      path = "ui/desktop-web/dist/build-identity.json"
+      version = $buildIdentity.version
+      git_commit = $buildIdentity.git_commit
+      source_clean = $buildIdentity.source_clean
+      built_at_utc = $buildIdentity.built_at_utc
+    }
     built_at_utc = [DateTime]::UtcNow.ToString("o")
     artifacts = [ordered]@{
       directory = $releaseRoot
@@ -271,6 +358,7 @@ To reset moyAI to its first-run state, close all moyAI windows and run `bin/moya
       manual_gui_st = [ordered]@{
         required = -not $SkipManualGuiStGate
         results_file = if ($manualGuiStResultsResolved) { $manualGuiStResultsResolved } else { $null }
+        results_sha256 = $manualGuiStResultsSha256
         package_copy = if ($manualGuiStResultsResolved) { "docs/release/manual-gui-st-results.md" } else { $null }
       }
     }

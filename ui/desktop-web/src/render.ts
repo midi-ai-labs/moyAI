@@ -2,6 +2,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { actionById, menuActions, paletteActions, shortcutActions, type ActionDefinition, type ActionMenu } from "./actions";
 import { icon } from "./icons";
 import { renderMarkdown } from "./markdown";
+import { configCommitEnabled, navigationIsIdle, quickChatDeleteAction, sessionRowCapabilities } from "./navigation_state";
 import type { ConfigFieldProjection, DesktopWebState, FileChangeRow, ProjectRow, SessionRow, TranscriptRow } from "./types";
 import { displayAccessLabel, escapeHtml, fileName, goalSlashCommandHint, humanizeError, shortenPath } from "./utils";
 
@@ -14,11 +15,13 @@ interface RenderContext {
   artifactPaneCollapsed: boolean;
   attachmentTrayOpen: boolean;
   configDirty: boolean;
+  configMutationPending: boolean;
 }
 
 let artifactPaneCollapsed = false;
 let attachmentTrayOpen = false;
 let configDirty = false;
+let configMutationInFlight = false;
 
 const TYPED_CONFIG_KEYS = new Set([
   "model.base_url",
@@ -55,6 +58,7 @@ export function setRenderContext(context: RenderContext): void {
   artifactPaneCollapsed = context.artifactPaneCollapsed;
   attachmentTrayOpen = context.attachmentTrayOpen;
   configDirty = context.configDirty;
+  configMutationInFlight = context.configMutationPending;
 }
 
 export function renderStartupSplash(state: DesktopWebState, elapsedMs: number, minVisibleMs: number): string {
@@ -102,7 +106,8 @@ function startupCheckMark(status: string): string {
   return "…";
 }
 
-export function renderTitlebar(): string {
+export function renderTitlebar(maximized = false): string {
+  const maximizeLabel = maximized ? "元のサイズに戻す" : "最大化";
   return `
     <header class="app-titlebar">
       <div class="titlebar-left">
@@ -116,9 +121,9 @@ export function renderTitlebar(): string {
       </div>
       <div class="titlebar-drag" data-drag-region></div>
       <div class="titlebar-controls">
-        <button data-action="minimize-window" title="最小化" aria-label="最小化">−</button>
-        <button data-action="toggle-maximize-window" title="最大化" aria-label="最大化">□</button>
-        <button data-action="close-window" title="閉じる" aria-label="閉じる">×</button>
+        <button type="button" data-window-control data-action="minimize-window" title="最小化" aria-label="最小化"><span class="window-control-icon minimize-icon" aria-hidden="true"></span></button>
+        <button type="button" data-window-control data-action="toggle-maximize-window" title="${maximizeLabel}" aria-label="${maximizeLabel}" aria-pressed="${maximized}"><span class="window-control-icon maximize-icon ${maximized ? "restore" : ""}" aria-hidden="true"></span></button>
+        <button type="button" data-window-control data-action="close-window" title="閉じる" aria-label="閉じる"><span class="window-control-icon close-icon" aria-hidden="true"></span></button>
       </div>
     </header>
   `;
@@ -126,7 +131,12 @@ export function renderTitlebar(): string {
 
 function renderProjectRowWithSessions(state: DesktopWebState, row: ProjectRow, index: number): string {
   const selected = index === state.selected_project_index;
-  const projectRow = renderProjectRow(row, selected, index);
+  const projectRow = renderProjectRow(
+    row,
+    selected,
+    index,
+    !navigationIsIdle(state),
+  );
   if (!selected) {
     return projectRow;
   }
@@ -134,15 +144,16 @@ function renderProjectRowWithSessions(state: DesktopWebState, row: ProjectRow, i
   return `${projectRow}${sessionRows}`;
 }
 
-function renderProjectRow(row: ProjectRow, selected: boolean, index: number): string {
+function renderProjectRow(row: ProjectRow, selected: boolean, index: number, actionsDisabled: boolean): string {
+  const disabled = actionsDisabled ? ' disabled aria-disabled="true"' : "";
   return `
     <div class="nav-row-wrap project-row ${selected ? "selected" : ""}">
-      <button class="nav-row" data-action="project" data-index="${index}">
+      <button class="nav-row" data-action="project" data-index="${index}"${disabled}>
         <span class="nav-title">${escapeHtml(row.label)}</span>
         <small>${escapeHtml(row.path)}</small>
       </button>
-      <button class="row-action add-session" data-action="new-project-session" data-index="${index}" title="このプロジェクトで新しい開発チャット" aria-label="このプロジェクトで新しい開発チャット">${icon("plus")}</button>
-      <button class="row-action danger" data-action="delete-project" data-index="${index}" title="削除" aria-label="削除">${icon("x")}</button>
+      <button class="row-action add-session" data-action="new-project-session" data-index="${index}" title="このプロジェクトで新しい開発チャット" aria-label="このプロジェクトで新しい開発チャット"${disabled}>${icon("plus")}</button>
+      <button class="row-action danger" data-action="delete-project" data-index="${index}" title="削除" aria-label="削除"${disabled}>${icon("x")}</button>
     </div>
   `;
 }
@@ -151,28 +162,35 @@ function renderProjectSessionRows(state: DesktopWebState): string {
   if (state.selected_project_index < 0) {
     return "";
   }
+  const searchDisabled = !navigationIsIdle(state)
+    ? ' disabled aria-disabled="true"'
+    : "";
   const search = `
     <div class="session-search">
-      <input id="session-search" value="${escapeHtml(state.session_search_text)}" placeholder="セッション検索" aria-label="セッション検索" />
-      <button class="${state.session_search_include_archived ? "selected" : ""}" data-action="toggle-session-archived-search" title="アーカイブ済みを含める" aria-label="アーカイブ済みを含める">${icon("archive")}</button>
+      <input id="session-search" value="${escapeHtml(state.session_search_text)}" placeholder="セッション検索" aria-label="セッション検索"${searchDisabled} />
+      <button class="${state.session_search_include_archived ? "selected" : ""}" data-action="toggle-session-archived-search" title="アーカイブ済みを含める" aria-label="アーカイブ済みを含める"${searchDisabled}>${icon("archive")}</button>
     </div>
   `;
-  const archiveAction = state.session_search_include_archived ? "unarchive-session" : "archive-session";
   const rows = state.session_rows
-    .map((row, index) =>
-      renderNavRow(
+    .map((row, index) => {
+      const capabilities = sessionRowCapabilities(
+        row.loaded_status,
+        row.archived,
+      );
+      return renderNavRow(
         row.label,
         sessionRowSubtitle(row, "開発チャット"),
         index === state.selected_session_index,
         "session",
         index,
-        row.loaded_status === "active" ? "rejoin-session" : "",
-        archiveAction,
-        row.loaded_status === "active" ? "" : "rollback-session",
-        "delete-session",
-        state.busy && index === state.selected_session_index
-      )
-    )
+        capabilities.rejoinAction,
+        capabilities.secondaryAction,
+        capabilities.rollbackAction,
+        capabilities.deleteAction,
+        state.busy && index === state.selected_session_index,
+        !navigationIsIdle(state)
+      );
+    })
     .join("");
   const activeFallback = rows.length === 0 ? renderActiveProjectSessionPlaceholder(state) : "";
   return rows.length > 0 || activeFallback.length > 0 || state.session_search_text.trim().length > 0
@@ -227,9 +245,10 @@ function renderChatRows(state: DesktopWebState): string {
         index,
         "",
         "",
-        row.loaded_status === "active" ? "" : "rollback-session",
-        "delete-chat-session",
-        state.selected_project_index < 0 && state.busy && row.session_id === selectedChatSessionId
+        "",
+        quickChatDeleteAction(row.loaded_status),
+        state.selected_project_index < 0 && state.busy && row.session_id === selectedChatSessionId,
+        !navigationIsIdle(state)
       )
     )
     .join("");
@@ -255,6 +274,7 @@ function sessionRowSubtitle(row: SessionRow, fallback: string): string {
 
 export function renderSidebar(state: DesktopWebState): string {
   const chatRunning = state.selected_project_index < 0 && state.busy;
+  const navigationDisabled = !navigationIsIdle(state);
   return `
     <aside class="sidebar">
       <div class="window-actions">
@@ -266,7 +286,7 @@ export function renderSidebar(state: DesktopWebState): string {
       </button>
       <div class="rail-section row-heading">
         <span>プロジェクト</span>
-        <button class="tiny-button icon-only" data-action="create-project-from-picker" title="プロジェクトを作成" aria-label="プロジェクトを作成">${icon("folder-plus")}</button>
+        <button class="tiny-button icon-only" data-action="create-project-from-picker" title="プロジェクトを作成" aria-label="プロジェクトを作成" ${navigationDisabled ? "disabled" : ""}>${icon("folder-plus")}</button>
       </div>
       <div class="row-list project-list">
         ${state.project_rows
@@ -275,7 +295,7 @@ export function renderSidebar(state: DesktopWebState): string {
       </div>
       <div class="rail-section row-heading">
         <span class="section-label">チャット${chatRunning ? '<span class="busy-spinner small" title="実行中"></span>' : ""}</span>
-        <button class="tiny-button icon-only" data-action="new-chat" title="新しい通常チャット" aria-label="新しい通常チャット">${icon("plus")}</button>
+        <button class="tiny-button icon-only" data-action="new-chat" title="新しい通常チャット" aria-label="新しい通常チャット" ${navigationDisabled ? "disabled" : ""}>${icon("plus")}</button>
       </div>
       <div class="row-list chat-list">${renderChatRows(state)}</div>
       <button class="settings" data-action="show-config" title="設定"><span class="rail-icon">${icon("settings")}</span><span>設定</span></button>
@@ -286,13 +306,14 @@ export function renderSidebar(state: DesktopWebState): string {
 export function renderTopbar(state: DesktopWebState): string {
   const workspaceLabel = state.selected_project_index >= 0 ? shortenPath(state.workspace_path) : "プロジェクトなし";
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
-  const exportDisabled = !state.history_export_enabled;
+  const exportDisabled = !state.history_export_enabled || !navigationIsIdle(state);
   const exportTitle = exportDisabled ? "保存できる表示中の履歴がありません" : "表示中の履歴をMarkdown保存";
   const turnPageVisible = state.turn_page_total > state.turn_page_limit && state.turn_page_limit > 0;
   const turnPageStart = state.turn_page_total === 0 ? 0 : state.turn_page_offset + 1;
   const turnPageEnd = Math.min(state.turn_page_total, state.turn_page_offset + state.turn_page_limit);
-  const previousDisabled = state.turn_page_offset === 0 || state.busy;
-  const nextDisabled = !state.turn_page_has_more || state.busy;
+  const navigationBlocked = !navigationIsIdle(state);
+  const previousDisabled = state.turn_page_offset === 0 || navigationBlocked;
+  const nextDisabled = !state.turn_page_has_more || navigationBlocked;
   return `
     <header class="topbar">
       <div class="title-row">
@@ -302,7 +323,7 @@ export function renderTopbar(state: DesktopWebState): string {
             <span>${escapeHtml(state.status_message)}</span>
             ${
               state.status_detail.trim().length > 0
-                ? `<details>
+                ? `<details data-details-key="status-detail">
                     <summary>詳細</summary>
                     <pre>${escapeHtml(state.status_detail)}</pre>
                   </details>`
@@ -448,7 +469,7 @@ function renderWorkSummaryCard(row: TranscriptRow): string {
             ? `<h2>${escapeHtml(row.title)}</h2><div class="markdown-body work-summary-visible">${renderMarkdown(visibleSummary)}</div>`
             : ""
         }
-        <details ${open}>
+        <details data-details-key="work-summary:${escapeHtml(`${row.step}:${row.kind}:${row.title}`)}" ${open}>
           <summary>
             <span>${escapeHtml(visibleSummary.length > 0 ? "作業履歴" : row.title)}</span>
             <small>${escapeHtml(statusText)}</small>
@@ -492,15 +513,27 @@ function removeMarkdownSections(body: string, headings: string[]): string {
 
 export function renderComposer(state: DesktopWebState): string {
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
-  const sendTitle = state.busy ? "実行中は送信できません" : state.draft_prompt.trim().length === 0 ? "依頼文を入力してください" : "送信";
-  const enhanceTitle = state.busy ? "実行中はEnhanceできません" : state.draft_prompt.trim().length === 0 ? "依頼文を入力してください" : "Enhance";
+  const sendTitle = state.navigation_loading
+    ? "画面の切り替え完了後に送信できます"
+    : state.busy
+      ? "実行中は送信できません"
+      : state.draft_prompt.trim().length === 0
+        ? "依頼文を入力してください"
+        : "送信";
+  const enhanceTitle = state.navigation_loading
+    ? "画面の切り替え完了後にEnhanceできます"
+    : state.busy
+      ? "実行中はEnhanceできません"
+      : state.draft_prompt.trim().length === 0
+        ? "依頼文を入力してください"
+        : "Enhance";
   const controlsVisible = attachmentTrayOpen || state.image_input.trim().length > 0;
   const trayVisible = controlsVisible || state.attached_images.length > 0;
   const goalHint = goalSlashCommandHint(state.draft_prompt);
   return `
     <section class="composer ${goalHint ? "goal-command" : ""}">
       ${trayVisible ? renderAttachmentTray(state, controlsVisible) : ""}
-      <textarea id="prompt" placeholder="moyAI に依頼する" aria-describedby="goal-command-hint">${escapeHtml(state.draft_prompt)}</textarea>
+      <textarea id="prompt" placeholder="moyAI に依頼する" aria-describedby="goal-command-hint" ${state.navigation_loading ? "disabled" : ""}>${escapeHtml(state.draft_prompt)}</textarea>
       <div class="goal-command-hint" id="goal-command-hint" ${goalHint ? "" : "hidden"}>
         <span class="goal-command-badge">/goal</span>
         <span data-goal-command-help>${escapeHtml(goalHint ?? "")}</span>
@@ -590,6 +623,13 @@ export function renderArtifactPane(state: DesktopWebState): string {
     `;
   }
   const hasPreview = state.artifact_preview_available;
+  const artifactNavigationBlocked = !navigationIsIdle(state);
+  const artifactFolderDisabled = state.selected_artifact_index < 0
+    || state.artifact_rows[state.selected_artifact_index] === undefined
+    || artifactNavigationBlocked;
+  const artifactFolderDisabledAttrs = artifactFolderDisabled
+    ? ` disabled aria-disabled="true" title="${artifactNavigationBlocked ? "画面の切り替え完了後に開けます" : "アーティファクトを選択してください"}"`
+    : ' title="アーティファクトのフォルダーを開く"';
   const hasActivity = state.busy && (state.progress_text.trim().length > 0 || state.tool_status_text.trim().length > 0);
   return `
     <aside class="artifact-pane">
@@ -597,7 +637,7 @@ export function renderArtifactPane(state: DesktopWebState): string {
         <strong>アーティファクト</strong>
         <div class="pane-actions">
           <button class="pin" data-action="toggle-artifact-pane" title="アーティファクトを折りたたむ" aria-label="アーティファクトを折りたたむ">${icon("x")}</button>
-          <button class="pin" data-action="open-artifact-folder" title="アーティファクトのフォルダーを開く" aria-label="アーティファクトのフォルダーを開く">${icon("folder")}</button>
+          <button class="pin" data-action="open-artifact-folder"${artifactFolderDisabledAttrs} aria-label="アーティファクトのフォルダーを開く">${icon("folder")}</button>
         </div>
       </div>
       <div class="artifact-list">
@@ -608,7 +648,7 @@ export function renderArtifactPane(state: DesktopWebState): string {
                 .map(
                   (row, index) => `
                     <button class="artifact-row ${index === state.selected_artifact_index ? "selected" : ""}"
-                      data-action="artifact" data-index="${index}">
+                      data-action="artifact" data-index="${index}" ${artifactNavigationBlocked ? 'disabled aria-disabled="true"' : ""}>
                       <span class="file-icon">▣</span>
                       <span><b>${escapeHtml(row.label)}</b><small>${escapeHtml(row.path)}</small></span>
                     </button>`
@@ -621,7 +661,7 @@ export function renderArtifactPane(state: DesktopWebState): string {
           ? `<div class="preview">
               <div class="preview-tabs">
                 <span>プレビュー</span>
-                <button data-action="open-artifact-folder">開く</button>
+                <button data-action="open-artifact-folder" ${artifactFolderDisabled ? "disabled aria-disabled=\"true\"" : ""}>開く</button>
               </div>
               <pre>${escapeHtml(state.artifact_preview_text)}</pre>
             </div>`
@@ -677,9 +717,9 @@ function renderProviderOverlay(state: DesktopWebState): string {
   ] as const;
   return `
     <div class="modal-backdrop">
-      <section class="modal wide ${setupRequired ? "setup-modal" : ""}" data-modal>
+      <section class="modal wide ${setupRequired ? "setup-modal" : ""}" data-modal role="dialog" aria-modal="true" aria-labelledby="provider-dialog-title" tabindex="-1">
         <div class="modal-header">
-          <h2>${setupRequired ? "初期設定" : "LLM URL"}</h2>
+          <h2 id="provider-dialog-title">${setupRequired ? "初期設定" : "LLM URL"}</h2>
           ${setupRequired ? "" : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
         </div>
         ${setupRequired ? `<p class="setup-message">${escapeHtml(state.startup.message)} ${escapeHtml(state.startup.detail)}</p>` : ""}
@@ -710,7 +750,7 @@ function renderProviderOverlay(state: DesktopWebState): string {
           <button data-action="load-provider-models" ${state.provider_loading ? "disabled" : ""}>${state.provider_loading ? "読込中" : "モデル読込"}</button>
           <button data-action="apply-provider-session" ${state.provider_apply_enabled ? "" : "disabled"}>UIセッションに適用</button>
           <button data-action="save-provider-global" ${state.provider_apply_enabled ? "" : "disabled"}>設定ファイルに保存</button>
-          ${setupRequired ? `<button data-action="import-config-toml">config.tomlをImport</button>` : ""}
+          ${setupRequired ? `<button data-action="import-config-toml" ${configMutationInFlight ? "disabled" : ""}>config.tomlをImport</button>` : ""}
         </div>
         <div class="select-list">
           ${state.provider_models
@@ -722,7 +762,7 @@ function renderProviderOverlay(state: DesktopWebState): string {
             )
             .join("")}
         </div>
-        <details class="provider-details">
+        <details class="provider-details" data-details-key="provider-model-details">
           <summary>モデル詳細</summary>
           <div class="provider-summary">
             ${selectedSummary
@@ -738,7 +778,7 @@ function renderProviderOverlay(state: DesktopWebState): string {
           <p>${escapeHtml(providerStatus.hint)}</p>
           ${
             providerStatus.details.trim().length > 0
-              ? `<details><summary>技術詳細</summary><pre>${escapeHtml(providerStatus.details)}</pre></details>`
+              ? `<details data-details-key="provider-status-details"><summary>技術詳細</summary><pre>${escapeHtml(providerStatus.details)}</pre></details>`
               : ""
           }
         </div>
@@ -781,19 +821,24 @@ function providerStatusView(message: string): { kind: string; title: string; hin
 function renderConfigOverlay(state: DesktopWebState): string {
   const setupRequired = startupSetupRequired(state);
   const title = setupRequired ? "初期設定" : "Preferences";
+  const configCommitDisabled = !configCommitEnabled(
+    setupRequired,
+    configDirty,
+    configMutationInFlight,
+  );
   return `
     <div class="modal-backdrop">
-      <section class="modal settings-modal ${setupRequired ? "setup-modal" : ""}" data-modal>
+      <section class="modal settings-modal ${setupRequired ? "setup-modal" : ""}" data-modal role="dialog" aria-modal="true" aria-labelledby="config-dialog-title" tabindex="-1">
         <div class="settings-header">
           <div>
-            <h2>${escapeHtml(title)}</h2>
+            <h2 id="config-dialog-title">${escapeHtml(title)}</h2>
             <p>${setupRequired ? "起動に必要な設定を確認します。" : "永続設定を編集します。セッションだけの変更は LLM URL または上部チップから行います。"}</p>
           </div>
           <div class="settings-header-actions">
             <span class="dirty-badge ${configDirty ? "visible" : ""}">変更あり</span>
-            <button data-action="apply-session-config">UIセッションに適用</button>
-            <button data-action="save-global-config">設定ファイルに保存</button>
-            ${setupRequired ? `<button data-action="import-config-toml">config.tomlをImport</button>` : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
+            <button data-action="apply-session-config" ${configCommitDisabled ? "disabled" : ""}>UIセッションに適用</button>
+            <button data-action="save-global-config" ${configCommitDisabled ? "disabled" : ""}>設定ファイルに保存</button>
+            ${setupRequired ? `<button data-action="import-config-toml" ${configMutationInFlight ? "disabled" : ""}>config.tomlをImport</button>` : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
           </div>
         </div>
         ${setupRequired ? `<p class="setup-message">${escapeHtml(state.startup.message)} ${escapeHtml(state.startup.detail)}</p>` : ""}
@@ -897,7 +942,7 @@ function renderConfigOverlay(state: DesktopWebState): string {
               ${renderConfigToggleField(state, "inspection.include_hidden_by_default", "Hidden files を inspection に含める")}
             </section>
             <section id="settings-advanced" class="settings-section">
-              <details>
+              <details data-details-key="settings-advanced-fields">
                 <summary>Advanced raw fields</summary>
                 <div class="settings-raw-grid">
                   ${state.config_fields
@@ -996,8 +1041,8 @@ function startupSetupRequired(state: DesktopWebState): boolean {
 function renderWorkspaceOverlay(state: DesktopWebState): string {
   return `
     <div class="modal-backdrop" data-action="close-overlay">
-      <section class="modal wide" data-modal>
-        <h2>ワークスペース</h2>
+      <section class="modal wide" data-modal role="dialog" aria-modal="true" aria-labelledby="workspace-dialog-title" tabindex="-1">
+        <h2 id="workspace-dialog-title">ワークスペース</h2>
         <label class="field-label">パス</label>
         <input id="workspace-input" value="${escapeHtml(state.workspace_input)}" />
         <div class="split-actions">
@@ -1014,8 +1059,8 @@ function renderWorkspaceOverlay(state: DesktopWebState): string {
 function renderPromptReviewOverlay(state: DesktopWebState): string {
   return `
     <div class="modal-backdrop" data-action="close-overlay">
-      <section class="modal wide" data-modal>
-        <h2>Enhance</h2>
+      <section class="modal wide" data-modal role="dialog" aria-modal="true" aria-labelledby="prompt-review-dialog-title" tabindex="-1">
+        <h2 id="prompt-review-dialog-title">Enhance</h2>
         <div class="review-grid">
           <pre>${escapeHtml(state.review_raw_text)}</pre>
           <textarea id="review-draft">${escapeHtml(state.review_draft_text)}</textarea>
@@ -1032,11 +1077,11 @@ function renderPromptReviewOverlay(state: DesktopWebState): string {
 }
 
 function renderCommandPalette(state: DesktopWebState): string {
-  const actions = paletteActions(state);
+  const actions = paletteActions(state, configDirty && !configMutationInFlight);
   return `
     <div class="modal-backdrop" data-action="close-overlay">
-      <section class="modal command" data-modal>
-        <h2>コマンドパレット</h2>
+      <section class="modal command" data-modal role="dialog" aria-modal="true" aria-labelledby="command-palette-dialog-title" tabindex="-1">
+        <h2 id="command-palette-dialog-title">コマンドパレット</h2>
         <input id="local-search" value="${escapeHtml(state.local_search_text)}" placeholder="アクション、セッション、/コマンドを検索" />
         <pre class="feedback">${escapeHtml(state.local_search_results_text)}</pre>
         <div class="select-list compact">
@@ -1094,8 +1139,8 @@ function renderMenuPopover(menu: ActionMenu, items: ActionDefinition[], extra = 
 function renderMenuOverlay(title: string, items: Array<[string, string]>): string {
   return `
     <div class="modal-backdrop" data-action="close-overlay">
-      <section class="modal side" data-modal>
-        <h2>${escapeHtml(title)}</h2>
+      <section class="modal side" data-modal role="dialog" aria-modal="true" aria-labelledby="shortcuts-dialog-title" tabindex="-1">
+        <h2 id="shortcuts-dialog-title">${escapeHtml(title)}</h2>
         <div class="select-list">
           ${items.map(([action, label]) => `<button data-action="${action}">${escapeHtml(label)}</button>`).join("")}
         </div>
@@ -1111,38 +1156,48 @@ function renderNavRow(
   kind: string,
   index: number,
   rejoinAction: string,
-  archiveAction: string,
+  secondaryAction: string,
   rollbackAction: string,
   deleteAction: string,
-  running = false
+  running = false,
+  mutationDisabled = false
 ): string {
-  const actionClass = `${rejoinAction ? "has-rejoin" : ""} ${archiveAction ? "has-archive" : ""} ${rollbackAction ? "has-rollback" : ""}`.trim();
+  const actionClass = `${rejoinAction ? "has-rejoin" : ""} ${secondaryAction ? "has-archive" : ""} ${rollbackAction ? "has-rollback" : ""}`.trim();
   const rejoinLabel = actionLabel(rejoinAction, "実行中セッションに再参加");
-  const archiveLabel = actionLabel(archiveAction, archiveAction === "unarchive-session" ? "復元" : "アーカイブ");
+  const secondaryLabel = actionLabel(
+    secondaryAction,
+    secondaryAction === "interrupt-session"
+      ? "実行中セッションを interrupt"
+      : secondaryAction === "unarchive-session"
+        ? "復元"
+        : "アーカイブ",
+  );
+  const secondaryIcon = secondaryAction === "interrupt-session" ? "square" : "archive";
   const rollbackLabel = actionLabel(rollbackAction, "最新turnを戻す");
   const deleteLabel = actionLabel(deleteAction, "削除");
+  const disabled = mutationDisabled ? ' disabled aria-disabled="true"' : "";
   return `
     <div class="nav-row-wrap ${actionClass} ${selected ? "selected" : ""}">
-      <button class="nav-row" data-action="${kind}" data-index="${index}">
+      <button class="nav-row" data-action="${kind}" data-index="${index}"${disabled}>
         <span class="nav-title">${running ? '<span class="busy-spinner" title="実行中"></span>' : ""}<span>${escapeHtml(label)}</span></span>
         <small>${escapeHtml(detail)}</small>
       </button>
       ${
         rejoinAction
-          ? `<button class="row-action row-rejoin" data-action="${rejoinAction}" data-index="${index}" title="${escapeHtml(rejoinLabel)}" aria-label="${escapeHtml(rejoinLabel)}">${icon("refresh")}</button>`
+          ? `<button class="row-action row-rejoin" data-action="${rejoinAction}" data-index="${index}" title="${escapeHtml(rejoinLabel)}" aria-label="${escapeHtml(rejoinLabel)}"${disabled}>${icon("refresh")}</button>`
           : ""
       }
       ${
-        archiveAction
-          ? `<button class="row-action row-archive" data-action="${archiveAction}" data-index="${index}" title="${escapeHtml(archiveLabel)}" aria-label="${escapeHtml(archiveLabel)}">${icon("archive")}</button>`
+        secondaryAction
+          ? `<button class="row-action ${secondaryAction === "interrupt-session" ? "row-interrupt" : "row-archive"}" data-action="${secondaryAction}" data-index="${index}" title="${escapeHtml(secondaryLabel)}" aria-label="${escapeHtml(secondaryLabel)}"${disabled}>${icon(secondaryIcon)}</button>`
           : ""
       }
       ${
         rollbackAction
-          ? `<button class="row-action row-rollback" data-action="${rollbackAction}" data-index="${index}" title="${escapeHtml(rollbackLabel)}" aria-label="${escapeHtml(rollbackLabel)}">${icon("undo")}</button>`
+          ? `<button class="row-action row-rollback" data-action="${rollbackAction}" data-index="${index}" title="${escapeHtml(rollbackLabel)}" aria-label="${escapeHtml(rollbackLabel)}"${disabled}>${icon("undo")}</button>`
           : ""
       }
-      <button class="row-delete" data-action="${deleteAction}" data-index="${index}" title="${escapeHtml(deleteLabel)}" aria-label="${escapeHtml(deleteLabel)}">${icon("x")}</button>
+      ${deleteAction ? `<button class="row-delete" data-action="${deleteAction}" data-index="${index}" title="${escapeHtml(deleteLabel)}" aria-label="${escapeHtml(deleteLabel)}"${disabled}>${icon("x")}</button>` : ""}
     </div>
   `;
 }

@@ -1,10 +1,14 @@
+use std::collections::HashMap;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DesktopAsyncOperationKind {
     AgentRun,
+    SnapshotRefresh,
     StartupReadinessCheck,
     ProviderModelCatalogLoad,
     WorkspaceLoad,
     SessionLoad,
+    TurnPageLoad,
     TerminalRunRefresh,
     CurrentTodoRefresh,
     HistoryExport,
@@ -21,10 +25,12 @@ impl DesktopAsyncOperationKind {
     pub fn key(self) -> &'static str {
         match self {
             Self::AgentRun => "agent_run",
+            Self::SnapshotRefresh => "snapshot_refresh",
             Self::StartupReadinessCheck => "startup_readiness_check",
             Self::ProviderModelCatalogLoad => "provider_model_catalog_load",
             Self::WorkspaceLoad => "workspace_load",
             Self::SessionLoad => "session_load",
+            Self::TurnPageLoad => "turn_page_load",
             Self::TerminalRunRefresh => "terminal_run_refresh",
             Self::CurrentTodoRefresh => "current_todo_refresh",
             Self::HistoryExport => "history_export",
@@ -49,6 +55,107 @@ pub struct DesktopAsyncOperationId(u64);
 impl DesktopAsyncOperationId {
     pub fn get(self) -> u64 {
         self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionSearchRequestId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LatestRequestId(u64);
+
+#[derive(Debug, Clone)]
+pub struct LatestRequestTracker<T> {
+    next_id: u64,
+    latest: Option<(LatestRequestId, T)>,
+}
+
+impl<T> Default for LatestRequestTracker<T> {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            latest: None,
+        }
+    }
+}
+
+impl<T: PartialEq> LatestRequestTracker<T> {
+    pub fn begin(&mut self, target: T) -> LatestRequestId {
+        let request_id = LatestRequestId(self.next_id);
+        self.next_id = self.next_id.saturating_add(1).max(1);
+        self.latest = Some((request_id, target));
+        request_id
+    }
+
+    pub fn finish_if_current(&mut self, request_id: LatestRequestId, target: &T) -> bool {
+        if self
+            .latest
+            .as_ref()
+            .is_some_and(|(latest_id, latest_target)| {
+                *latest_id == request_id && latest_target == target
+            })
+        {
+            self.latest = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.latest = None;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSearchCompletion {
+    pub operation_id: DesktopAsyncOperationId,
+    pub is_latest: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSearchRequestTracker {
+    next_id: u64,
+    latest: Option<SessionSearchRequestId>,
+    pending: HashMap<SessionSearchRequestId, DesktopAsyncOperationId>,
+}
+
+impl Default for SessionSearchRequestTracker {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            latest: None,
+            pending: HashMap::new(),
+        }
+    }
+}
+
+impl SessionSearchRequestTracker {
+    pub fn begin(&mut self, operation_id: DesktopAsyncOperationId) -> SessionSearchRequestId {
+        let request_id = SessionSearchRequestId(self.next_id);
+        self.next_id = self.next_id.saturating_add(1).max(1);
+        self.latest = Some(request_id);
+        self.pending.insert(request_id, operation_id);
+        request_id
+    }
+
+    pub fn finish(
+        &mut self,
+        request_id: SessionSearchRequestId,
+    ) -> Option<SessionSearchCompletion> {
+        let operation_id = self.pending.remove(&request_id)?;
+        Some(SessionSearchCompletion {
+            operation_id,
+            is_latest: self.latest == Some(request_id),
+        })
+    }
+
+    pub fn clear(&mut self) -> Vec<DesktopAsyncOperationId> {
+        self.latest = None;
+        self.pending
+            .drain()
+            .map(|(_, operation_id)| operation_id)
+            .collect()
     }
 }
 
@@ -165,5 +272,53 @@ mod tests {
             1
         );
         assert!(!registry.is_pending(DesktopAsyncOperationKind::SessionDelete));
+
+        let first_search = registry.begin_unique(DesktopAsyncOperationKind::SessionSearch);
+        let latest_search = registry.begin_unique(DesktopAsyncOperationKind::SessionSearch);
+        assert!(!registry.finish(first_search));
+        assert!(registry.is_pending(DesktopAsyncOperationKind::SessionSearch));
+        assert!(registry.finish(latest_search));
+        assert!(!registry.is_pending(DesktopAsyncOperationKind::SessionSearch));
+    }
+
+    #[test]
+    fn session_search_tracker_keeps_all_work_counted_and_only_applies_newest() {
+        let mut registry = DesktopAsyncOperationRegistry::default();
+        let mut tracker = SessionSearchRequestTracker::default();
+        let first = tracker.begin(registry.begin(DesktopAsyncOperationKind::SessionSearch));
+        let latest = tracker.begin(registry.begin(DesktopAsyncOperationKind::SessionSearch));
+
+        let latest_completion = tracker.finish(latest).expect("latest request is pending");
+        assert!(latest_completion.is_latest);
+        assert!(registry.finish(latest_completion.operation_id));
+        assert!(registry.is_pending(DesktopAsyncOperationKind::SessionSearch));
+
+        let stale_completion = tracker.finish(first).expect("first request is pending");
+        assert!(!stale_completion.is_latest);
+        assert!(registry.finish(stale_completion.operation_id));
+        assert!(!registry.is_pending(DesktopAsyncOperationKind::SessionSearch));
+
+        let abandoned = tracker.begin(registry.begin(DesktopAsyncOperationKind::SessionSearch));
+        for operation_id in tracker.clear() {
+            assert!(registry.finish(operation_id));
+        }
+        assert_eq!(tracker.finish(abandoned), None);
+        assert!(!registry.is_pending(DesktopAsyncOperationKind::SessionSearch));
+    }
+
+    #[test]
+    fn latest_request_tracker_rejects_stale_generation_and_wrong_target() {
+        let mut tracker = LatestRequestTracker::default();
+        let first = tracker.begin("workspace-a".to_string());
+        let latest = tracker.begin("workspace-b".to_string());
+
+        assert!(!tracker.finish_if_current(first, &"workspace-a".to_string()));
+        assert!(!tracker.finish_if_current(latest, &"workspace-a".to_string()));
+        assert!(tracker.finish_if_current(latest, &"workspace-b".to_string()));
+        assert!(!tracker.finish_if_current(latest, &"workspace-b".to_string()));
+
+        let abandoned = tracker.begin("workspace-a".to_string());
+        tracker.clear();
+        assert!(!tracker.finish_if_current(abandoned, &"workspace-a".to_string()));
     }
 }

@@ -10,13 +10,28 @@ pub fn evaluate(
     artifacts: &[ArtifactManifest],
     contracts: &[ContractRecord],
 ) -> GateEvaluation {
-    let result = if let Some(result) = event_stream_identity_violation(events) {
+    let result = if events.is_empty() {
+        QualityGateResult::blocked(
+            GateKind::Schema,
+            FailureOwner::HarnessCapture,
+            "event stream is empty",
+        )
+    } else if let Some(result) = event_stream_identity_violation(events) {
         result
     } else if events.iter().any(|event| event.sequence_no < 0) {
         QualityGateResult::fail(
             GateKind::Schema,
             FailureOwner::HarnessCapture,
             "event stream contains negative sequence numbers",
+        )
+    } else if artifacts
+        .iter()
+        .any(|artifact| artifact.run_id != events[0].run_id)
+    {
+        QualityGateResult::fail(
+            GateKind::Schema,
+            FailureOwner::HarnessCapture,
+            "artifact manifest contains a run_id outside the event stream",
         )
     } else if artifacts
         .iter()

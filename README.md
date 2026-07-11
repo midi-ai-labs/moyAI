@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.2"><img alt="Release" src="https://img.shields.io/badge/release-v0.6.2-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.3"><img alt="Release" src="https://img.shields.io/badge/release-v0.6.3-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.ja.md">日本語 README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.2">Download release</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.3">Download release</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -53,7 +53,7 @@ moyAI is designed around those constraints:
 | Evidence-oriented | Keeps transcript, file changes, tool output, and session history inspectable. |
 | GUI and terminal | Offers Desktop, CLI, and TUI entrypoints over the same Rust core. |
 | Closed-network friendly | Release builds run without npm, Rust toolchain, internet, or a dev server on the target machine. |
-| No self-bootstrap | The agent does not run dependency installs, runtime downloads, package-manager setup, external URL fetches, or external git fetches. It asks the user to prepare missing environments outside moyAI. |
+| No implicit bootstrap | moyAI does not automatically install dependencies, download runtimes, set up package managers, or fetch external repositories. A user-requested shell command can still access the network when the active permission policy allows or confirms it. |
 
 ## Highlights
 
@@ -72,7 +72,7 @@ moyAI is designed around those constraints:
 
 The current beta release is available here:
 
-[**moyAI v0.6.2 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.2)
+[**moyAI v0.6.3 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.3)
 
 The Windows release zip includes:
 
@@ -109,7 +109,7 @@ cargo build
 Desktop release build:
 
 ```bash
-npm install
+npm ci
 npm run build:desktop-web
 cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 ```
@@ -185,8 +185,9 @@ The same mode is also the provider profile boundary for tool-choice serializatio
 availability gates. LM Studio mode keeps named tool requests provider-portable by sending
 `tool_choice = "required"` and gates on `required` / strong `auto` tool-call probes; OpenAI-compatible
 mode sends OpenAI named function `tool_choice` objects and requires the named probe to pass.
-Saved profile examples live under `../docs/testing/provider-profiles/` and can be selected with
-`MOYAI_CONFIG_PATH` without overwriting each other.
+A saved LM Studio lab-profile example lives under `docs/testing/provider-profiles/`. It is not a
+product default: copy it to an isolated config, update the endpoint/model for the current environment,
+and select it with `MOYAI_CONFIG_PATH` without overwriting the user-wide config.
 The Tauri Desktop `LLM URL` overlay exposes the same mode switch beside the provider URL and model list.
 It also owns `context_window` and `max_output_tokens` inputs so vLLM/vLLM-MLX limits can be managed
 inside moyAI instead of relying on shell environment variables. Current vLLM-MLX `/health` and
@@ -223,12 +224,14 @@ This keeps project behavior local to the repository and avoids depending on an e
 Useful local checks:
 
 ```bash
-cargo fmt --all --check
-cargo check
-cargo test --lib
-cargo test --tests
-cargo run --bin moyai -- preflight run
+cargo fmt --all -- --check
+cargo check --all-features
+cargo test -- --test-threads=1
+npm run test:desktop-web
+npm run build:desktop-web
 ```
+
+Desktop interaction changes also require operating the actual Tauri window and saving screenshot evidence under `../project_sandbox/<task>/`; a build and startup check alone do not prove UI behavior.
 
 Published release packages must also pass a visible Desktop GUI manual ST before upload.
 Record the result in a UTF-8 Markdown artifact containing `Manual ST Gate: PASS`, then pass that

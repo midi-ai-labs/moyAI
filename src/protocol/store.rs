@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::error::StorageError;
@@ -9,7 +9,9 @@ use crate::protocol::{
     HistoryItem, HistoryItemId, HistoryItemPayload, RuntimeEvent, RuntimeEventId, RuntimeEventMsg,
     TurnId, TurnItem, TurnItemId, TurnItemPayload,
 };
+use crate::runtime::SystemClock;
 use crate::session::SessionId;
+use crate::storage::session_repo::normalize_run_lease_now_ms;
 
 pub trait ProtocolEventStore {
     fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<(), StorageError>;
@@ -74,18 +76,91 @@ pub struct SqliteProtocolEventStore {
     connection: Arc<Mutex<Connection>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StoredProtocolEventBundle {
+    pub runtime_event: RuntimeEvent,
+    pub history_item: Option<HistoryItem>,
+}
+
 impl SqliteProtocolEventStore {
     pub fn new(connection: Arc<Mutex<Connection>>) -> Self {
         Self { connection }
+    }
+
+    pub(crate) fn append_event_bundle_allocating(
+        &self,
+        event: &RuntimeEvent,
+        history_item: Option<&HistoryItem>,
+        turn_item: Option<&TurnItem>,
+    ) -> Result<StoredProtocolEventBundle, StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored =
+            insert_event_bundle_in_transaction(&transaction, event, history_item, turn_item)?;
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    pub(crate) fn append_admitted_event_bundle_allocating(
+        &self,
+        admission_id: &str,
+        event: &RuntimeEvent,
+        history_item: Option<&HistoryItem>,
+        turn_item: Option<&TurnItem>,
+    ) -> Result<Option<StoredProtocolEventBundle>, StorageError> {
+        self.append_admitted_event_bundle_allocating_at(
+            admission_id,
+            event,
+            history_item,
+            turn_item,
+            SystemClock::now_ms(),
+        )
+    }
+
+    pub(crate) fn append_admitted_event_bundle_allocating_at(
+        &self,
+        admission_id: &str,
+        event: &RuntimeEvent,
+        history_item: Option<&HistoryItem>,
+        turn_item: Option<&TurnItem>,
+        now_ms: i64,
+    ) -> Result<Option<StoredProtocolEventBundle>, StorageError> {
+        let now = normalize_run_lease_now_ms(now_ms);
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owned = transaction
+            .query_row(
+                "SELECT 1
+                 FROM sessions
+                 WHERE id = ?1
+                   AND active_run_id = ?2
+                   AND (active_turn_id IS NULL OR active_turn_id = ?3)
+                   AND active_run_lease_expires_at_ms > ?4
+                   AND status IN ('running', 'awaiting_user')",
+                params![
+                    event.session_id.to_string(),
+                    admission_id,
+                    event.turn_id.to_string(),
+                    now
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !owned {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let stored =
+            insert_event_bundle_in_transaction(&transaction, event, history_item, turn_item)?;
+        transaction.commit()?;
+        Ok(Some(stored))
     }
 }
 
 impl ProtocolEventStore for SqliteProtocolEventStore {
     fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<(), StorageError> {
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        insert_runtime_event(&transaction, event)?;
-        transaction.commit()?;
+        self.append_event_bundle_allocating(event, None, None)?;
         Ok(())
     }
 
@@ -95,17 +170,7 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         history_item: Option<&HistoryItem>,
         turn_item: Option<&TurnItem>,
     ) -> Result<(), StorageError> {
-        validate_event_bundle_coherence(event, history_item, turn_item)?;
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        insert_runtime_event(&transaction, event)?;
-        if let Some(history_item) = history_item {
-            insert_history_item(&transaction, history_item)?;
-        }
-        if let Some(turn_item) = turn_item {
-            insert_turn_item(&transaction, turn_item)?;
-        }
-        transaction.commit()?;
+        self.append_event_bundle_allocating(event, history_item, turn_item)?;
         Ok(())
     }
 
@@ -184,8 +249,16 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
 
     fn append_history_item(&self, item: &HistoryItem) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        insert_history_item(&transaction, item)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let sequence_no = claim_protocol_sequence_in_transaction(
+            &transaction,
+            item.session_id,
+            item.turn_id,
+            item.sequence_no,
+        )?;
+        let mut stored_item = item.clone();
+        stored_item.sequence_no = sequence_no;
+        insert_history_item(&transaction, &stored_item)?;
         transaction.commit()?;
         Ok(())
     }
@@ -197,9 +270,19 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
     ) -> Result<(), StorageError> {
         validate_history_turn_bundle_coherence(history_item, turn_item)?;
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        insert_history_item(&transaction, history_item)?;
-        insert_turn_item(&transaction, turn_item)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let sequence_no = claim_protocol_sequence_in_transaction(
+            &transaction,
+            history_item.session_id,
+            history_item.turn_id,
+            history_item.sequence_no.max(turn_item.sequence_no),
+        )?;
+        let mut stored_history_item = history_item.clone();
+        stored_history_item.sequence_no = sequence_no;
+        let mut stored_turn_item = turn_item.clone();
+        stored_turn_item.sequence_no = sequence_no;
+        insert_history_item(&transaction, &stored_history_item)?;
+        insert_turn_item(&transaction, &stored_turn_item)?;
         transaction.commit()?;
         Ok(())
     }
@@ -247,43 +330,21 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         session_id: SessionId,
     ) -> Result<Vec<HistoryItem>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let mut statement = connection.prepare(
-            "SELECT history.id, history.turn_id, history.sequence_no, history.payload_json, history.created_at_ms
-             FROM protocol_history_items AS history
-             LEFT JOIN protocol_item_append_order AS append_order
-               ON append_order.source_kind = 'history_item'
-              AND append_order.source_id = history.id
-             WHERE history.session_id = ?1
-             ORDER BY COALESCE(append_order.append_position, history.rowid) ASC",
-        )?;
-        let rows = statement.query_map(params![session_id.to_string()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?;
-        let mut items = Vec::new();
-        for row in rows {
-            let (id, turn_id, sequence_no, payload_json, created_at_ms) = row?;
-            items.push(HistoryItem {
-                id: parse_protocol_id::<HistoryItemId>(&id, "history item")?,
-                session_id,
-                turn_id: parse_protocol_id::<TurnId>(&turn_id, "history item turn")?,
-                sequence_no,
-                created_at_ms,
-                payload: serde_json::from_str::<HistoryItemPayload>(&payload_json)?,
-            });
-        }
-        Ok(items)
+        list_history_items_for_session_from_connection(&connection, session_id)
     }
 
     fn append_turn_item(&self, item: &TurnItem) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        insert_turn_item(&transaction, item)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let sequence_no = claim_protocol_sequence_in_transaction(
+            &transaction,
+            item.session_id,
+            item.turn_id,
+            item.sequence_no,
+        )?;
+        let mut stored_item = item.clone();
+        stored_item.sequence_no = sequence_no;
+        insert_turn_item(&transaction, &stored_item)?;
         transaction.commit()?;
         Ok(())
     }
@@ -333,36 +394,7 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         session_id: SessionId,
     ) -> Result<Vec<TurnItem>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let mut statement = connection.prepare(
-            "SELECT id, turn_id, source_item_id, sequence_no, payload_json
-             FROM protocol_turn_items
-             WHERE session_id = ?1
-             ORDER BY rowid ASC",
-        )?;
-        let rows = statement.query_map(params![session_id.to_string()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
-        let mut items = Vec::new();
-        for row in rows {
-            let (id, turn_id, source_item_id, sequence_no, payload_json) = row?;
-            items.push(TurnItem {
-                id: parse_protocol_id::<TurnItemId>(&id, "turn item")?,
-                session_id,
-                turn_id: parse_protocol_id::<TurnId>(&turn_id, "turn item turn")?,
-                source_item_id: source_item_id
-                    .map(|id| parse_protocol_id::<HistoryItemId>(&id, "turn item source"))
-                    .transpose()?,
-                sequence_no,
-                payload: serde_json::from_str::<TurnItemPayload>(&payload_json)?,
-            });
-        }
-        Ok(items)
+        list_turn_items_for_session_from_connection(&connection, session_id)
     }
 
     fn latest_turn_position_for_session(
@@ -384,7 +416,7 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
             ));
         }
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let turn_ids =
             latest_protocol_turn_ids_in_transaction(&transaction, session_id, num_turns)?;
         if turn_ids.len() < num_turns {
@@ -410,6 +442,10 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
                 "DELETE FROM protocol_item_append_order WHERE session_id = ?1 AND turn_id = ?2",
                 params![session_id.to_string(), turn_id.to_string()],
             )?;
+            transaction.execute(
+                "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
         }
         transaction.commit()?;
         Ok(turn_ids)
@@ -425,17 +461,47 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
                 "cannot fork canonical items into the same session".to_string(),
             ));
         }
-        let source_history = self.list_history_items_for_session(source_session_id)?;
-        let source_turns = self.list_turn_items_for_session(source_session_id)?;
-        let mut history_id_map = HashMap::new();
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let target_has_protocol_data = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM protocol_runtime_events WHERE session_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM protocol_history_items WHERE session_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM protocol_turn_items WHERE session_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM protocol_item_append_order WHERE session_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM protocol_turn_sequence_allocators WHERE session_id = ?1
+             )",
+            params![target_session_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if target_has_protocol_data {
+            return Err(StorageError::Message(format!(
+                "cannot fork canonical items into non-empty target session {target_session_id}"
+            )));
+        }
+        let source_history =
+            list_history_items_for_session_from_connection(&transaction, source_session_id)?;
+        let source_turns =
+            list_turn_items_for_session_from_connection(&transaction, source_session_id)?;
+        let history_id_map = source_history
+            .iter()
+            .map(|item| (item.id, HistoryItemId::new()))
+            .collect::<HashMap<_, _>>();
         let mut forked_history = Vec::with_capacity(source_history.len());
         for item in source_history {
-            let new_id = HistoryItemId::new();
-            history_id_map.insert(item.id, new_id);
+            let new_id = history_id_map[&item.id];
             forked_history.push(HistoryItem {
                 id: new_id,
                 session_id: target_session_id,
-                payload: fork_history_payload_for_session(item.payload, target_session_id),
+                payload: fork_history_payload_for_session(
+                    item.payload,
+                    target_session_id,
+                    &history_id_map,
+                )?,
                 ..item
             });
         }
@@ -459,23 +525,128 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
                 ..item
             });
         }
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
         for item in &forked_history {
             insert_history_item(&transaction, item)?;
         }
         for item in &forked_turns {
             insert_turn_item(&transaction, item)?;
         }
+        let mut next_sequence_by_turn = HashMap::<TurnId, i64>::new();
+        for (turn_id, sequence_no) in forked_history
+            .iter()
+            .map(|item| (item.turn_id, item.sequence_no))
+            .chain(
+                forked_turns
+                    .iter()
+                    .map(|item| (item.turn_id, item.sequence_no)),
+            )
+        {
+            let next_sequence_no = sequence_no.max(-1).saturating_add(1);
+            next_sequence_by_turn
+                .entry(turn_id)
+                .and_modify(|current| *current = (*current).max(next_sequence_no))
+                .or_insert(next_sequence_no);
+        }
+        for (turn_id, next_sequence_no) in next_sequence_by_turn {
+            transaction.execute(
+                "INSERT INTO protocol_turn_sequence_allocators
+                     (session_id, turn_id, next_sequence_no)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id, turn_id) DO UPDATE SET
+                     next_sequence_no = MAX(
+                         protocol_turn_sequence_allocators.next_sequence_no,
+                         excluded.next_sequence_no
+                     )",
+                params![
+                    target_session_id.to_string(),
+                    turn_id.to_string(),
+                    next_sequence_no
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok((forked_history.len(), forked_turns.len()))
     }
 }
 
+fn list_history_items_for_session_from_connection(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Vec<HistoryItem>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT history.id, history.turn_id, history.sequence_no, history.payload_json, history.created_at_ms
+         FROM protocol_history_items AS history
+         LEFT JOIN protocol_item_append_order AS append_order
+           ON append_order.source_kind = 'history_item'
+          AND append_order.source_id = history.id
+         WHERE history.session_id = ?1
+         ORDER BY COALESCE(append_order.append_position, history.rowid) ASC",
+    )?;
+    let rows = statement.query_map(params![session_id.to_string()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (id, turn_id, sequence_no, payload_json, created_at_ms) = row?;
+        items.push(HistoryItem {
+            id: parse_protocol_id::<HistoryItemId>(&id, "history item")?,
+            session_id,
+            turn_id: parse_protocol_id::<TurnId>(&turn_id, "history item turn")?,
+            sequence_no,
+            created_at_ms,
+            payload: serde_json::from_str::<HistoryItemPayload>(&payload_json)?,
+        });
+    }
+    Ok(items)
+}
+
+fn list_turn_items_for_session_from_connection(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Vec<TurnItem>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, turn_id, source_item_id, sequence_no, payload_json
+         FROM protocol_turn_items
+         WHERE session_id = ?1
+         ORDER BY rowid ASC",
+    )?;
+    let rows = statement.query_map(params![session_id.to_string()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (id, turn_id, source_item_id, sequence_no, payload_json) = row?;
+        items.push(TurnItem {
+            id: parse_protocol_id::<TurnItemId>(&id, "turn item")?,
+            session_id,
+            turn_id: parse_protocol_id::<TurnId>(&turn_id, "turn item turn")?,
+            source_item_id: source_item_id
+                .map(|id| parse_protocol_id::<HistoryItemId>(&id, "turn item source"))
+                .transpose()?,
+            sequence_no,
+            payload: serde_json::from_str::<TurnItemPayload>(&payload_json)?,
+        });
+    }
+    Ok(items)
+}
+
 fn fork_history_payload_for_session(
     payload: HistoryItemPayload,
     target_session_id: SessionId,
-) -> HistoryItemPayload {
+    history_id_map: &HashMap<HistoryItemId, HistoryItemId>,
+) -> Result<HistoryItemPayload, StorageError> {
     match payload {
         HistoryItemPayload::UserTurn {
             message_id,
@@ -483,7 +654,7 @@ fn fork_history_payload_for_session(
             prompt_dispatch,
             editor_context,
             turn_context,
-        } => HistoryItemPayload::UserTurn {
+        } => Ok(HistoryItemPayload::UserTurn {
             message_id,
             content,
             prompt_dispatch,
@@ -492,13 +663,36 @@ fn fork_history_payload_for_session(
                 context.session_id = target_session_id;
                 Box::new(*context)
             }),
-        },
+        }),
         HistoryItemPayload::ControlEnvelope { mut envelope } => {
             envelope.session_id = target_session_id;
             envelope.context.session_id = target_session_id;
-            HistoryItemPayload::ControlEnvelope { envelope }
+            Ok(HistoryItemPayload::ControlEnvelope { envelope })
         }
-        other => other,
+        HistoryItemPayload::Compaction {
+            mode,
+            summary,
+            replacement_item_ids,
+            continuation,
+        } => {
+            let replacement_item_ids = replacement_item_ids
+                .into_iter()
+                .map(|source_id| {
+                    history_id_map.get(&source_id).copied().ok_or_else(|| {
+                        StorageError::Message(format!(
+                            "cannot fork compaction reference; source history item {source_id} was not copied"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(HistoryItemPayload::Compaction {
+                mode,
+                summary,
+                replacement_item_ids,
+                continuation,
+            })
+        }
+        other => Ok(other),
     }
 }
 
@@ -529,7 +723,7 @@ fn latest_protocol_turn_ids_in_transaction(
     Ok(turn_ids)
 }
 
-fn latest_turn_position_for_session(
+pub(crate) fn latest_turn_position_for_session(
     connection: &Connection,
     session_id: SessionId,
 ) -> Result<Option<(TurnId, i64)>, StorageError> {
@@ -638,16 +832,74 @@ pub(crate) fn insert_event_bundle_in_transaction(
     event: &RuntimeEvent,
     history_item: Option<&HistoryItem>,
     turn_item: Option<&TurnItem>,
-) -> Result<(), StorageError> {
+) -> Result<StoredProtocolEventBundle, StorageError> {
     validate_event_bundle_coherence(event, history_item, turn_item)?;
-    insert_runtime_event(transaction, event)?;
-    if let Some(history_item) = history_item {
+    let sequence_no = claim_protocol_sequence_in_transaction(
+        transaction,
+        event.session_id,
+        event.turn_id,
+        event.sequence_no,
+    )?;
+    let mut runtime_event = event.clone();
+    runtime_event.sequence_no = sequence_no;
+    let history_item = history_item.map(|item| {
+        let mut item = item.clone();
+        item.sequence_no = sequence_no;
+        item
+    });
+    let turn_item = turn_item.map(|item| {
+        let mut item = item.clone();
+        item.sequence_no = sequence_no;
+        item
+    });
+    insert_runtime_event(transaction, &runtime_event)?;
+    if let Some(history_item) = &history_item {
         insert_history_item(transaction, history_item)?;
     }
-    if let Some(turn_item) = turn_item {
+    if let Some(turn_item) = &turn_item {
         insert_turn_item(transaction, turn_item)?;
     }
-    Ok(())
+    Ok(StoredProtocolEventBundle {
+        runtime_event,
+        history_item,
+    })
+}
+
+fn claim_protocol_sequence_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    turn_id: TurnId,
+    requested_sequence_no: i64,
+) -> Result<i64, StorageError> {
+    let stored_max = transaction.query_row(
+        "SELECT MAX(sequence_no)
+         FROM (
+             SELECT sequence_no FROM protocol_runtime_events WHERE session_id = ?1 AND turn_id = ?2
+             UNION ALL
+             SELECT sequence_no FROM protocol_history_items WHERE session_id = ?1 AND turn_id = ?2
+             UNION ALL
+             SELECT sequence_no FROM protocol_turn_items WHERE session_id = ?1 AND turn_id = ?2
+         )",
+        params![session_id.to_string(), turn_id.to_string()],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    let sequence_floor = requested_sequence_no
+        .max(0)
+        .max(stored_max.unwrap_or(-1).saturating_add(1));
+    let claimed = transaction.query_row(
+        "INSERT INTO protocol_turn_sequence_allocators
+             (session_id, turn_id, next_sequence_no)
+         VALUES (?1, ?2, ?3 + 1)
+         ON CONFLICT(session_id, turn_id) DO UPDATE SET
+             next_sequence_no = MAX(
+                 protocol_turn_sequence_allocators.next_sequence_no,
+                 excluded.next_sequence_no - 1
+             ) + 1
+         RETURNING next_sequence_no - 1",
+        params![session_id.to_string(), turn_id.to_string(), sequence_floor],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(claimed)
 }
 
 fn validate_event_bundle_coherence(
@@ -834,7 +1086,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::time::Duration;
 
     use rusqlite::Connection;
 
@@ -865,6 +1118,270 @@ mod tests {
             listed.iter().map(|item| item.id).collect::<Vec<_>>(),
             vec![older.id, newer.id]
         );
+    }
+
+    #[test]
+    fn fork_remaps_compaction_replacement_history_ids() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let source_session_id = SessionId::new();
+        let target_session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let replaced = history_message(source_session_id, turn_id, 0, 100, "old detail");
+        let compaction = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: source_session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 200,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Manual,
+                summary: "old detail summary".to_string(),
+                replacement_item_ids: vec![replaced.id],
+                continuation: None,
+            },
+        };
+        store.append_history_item(&replaced).expect("replaced item");
+        store
+            .append_history_item(&compaction)
+            .expect("compaction item");
+
+        let copied = store
+            .fork_canonical_items(source_session_id, target_session_id)
+            .expect("fork canonical items");
+        let forked = store
+            .list_history_items_for_session(target_session_id)
+            .expect("forked history");
+
+        assert_eq!(copied, (2, 0));
+        assert_ne!(forked[0].id, replaced.id);
+        let HistoryItemPayload::Compaction {
+            replacement_item_ids,
+            ..
+        } = &forked[1].payload
+        else {
+            panic!("second forked item should be compaction");
+        };
+        assert_eq!(replacement_item_ids.as_slice(), &[forked[0].id]);
+        assert!(!replacement_item_ids.contains(&replaced.id));
+    }
+
+    #[test]
+    fn concurrent_event_appends_claim_distinct_database_sequences() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let database_path = temp.path().join("protocol.sqlite3");
+        let open_store = |path: &std::path::Path| {
+            let connection = Connection::open(path).expect("database");
+            connection
+                .busy_timeout(Duration::from_secs(5))
+                .expect("busy timeout");
+            crate::storage::migration::run(&connection).expect("migrations");
+            SqliteProtocolEventStore::new(Arc::new(Mutex::new(connection)))
+        };
+        let first_store = open_store(&database_path);
+        let second_store = open_store(&database_path);
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let first_event = warning_event(session_id, turn_id, 0, "first");
+        let second_event = warning_event(session_id, turn_id, 0, "second");
+        let expected_ids = [first_event.id, second_event.id];
+        let barrier = Arc::new(Barrier::new(3));
+
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store
+                .append_event_bundle_allocating(&first_event, None, None)
+                .expect("first append")
+                .runtime_event
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_store
+                .append_event_bundle_allocating(&second_event, None, None)
+                .expect("second append")
+                .runtime_event
+        });
+        barrier.wait();
+        let stored = [
+            first.join().expect("first worker"),
+            second.join().expect("second worker"),
+        ];
+        let mut sequence_numbers = stored
+            .iter()
+            .map(|event| event.sequence_no)
+            .collect::<Vec<_>>();
+        sequence_numbers.sort_unstable();
+        assert_eq!(sequence_numbers, vec![0, 1]);
+        assert!(
+            expected_ids
+                .iter()
+                .all(|expected| stored.iter().any(|event| event.id == *expected))
+        );
+
+        let final_store = open_store(&database_path);
+        let persisted = final_store
+            .list_runtime_events(session_id, turn_id)
+            .expect("persisted events");
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|event| event.sequence_no)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(
+            expected_ids
+                .iter()
+                .all(|expected| persisted.iter().any(|event| event.id == *expected))
+        );
+    }
+
+    #[test]
+    fn direct_append_apis_share_one_turn_allocator() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let history = history_message(session_id, turn_id, 0, 1, "history");
+        let turn = TurnItem {
+            id: TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 0,
+            payload: TurnItemPayload::AgentMessage {
+                text: "turn".to_string(),
+            },
+        };
+        let event = warning_event(session_id, turn_id, 0, "runtime");
+
+        store.append_history_item(&history).expect("history append");
+        store.append_turn_item(&turn).expect("turn append");
+        store.append_runtime_event(&event).expect("event append");
+
+        assert_eq!(
+            store
+                .list_history_items(session_id, turn_id)
+                .expect("history")[0]
+                .sequence_no,
+            0
+        );
+        assert_eq!(
+            store.list_turn_items(session_id, turn_id).expect("turns")[0].sequence_no,
+            1
+        );
+        assert_eq!(
+            store
+                .list_runtime_events(session_id, turn_id)
+                .expect("events")[0]
+                .sequence_no,
+            2
+        );
+    }
+
+    #[test]
+    fn rollback_removes_turn_allocator_state() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        store
+            .append_runtime_event(&warning_event(session_id, turn_id, 0, "rollback"))
+            .expect("event append");
+
+        assert_eq!(
+            store
+                .rollback_latest_turns(session_id, 1)
+                .expect("rollback"),
+            vec![turn_id]
+        );
+        let allocator_rows = connection
+            .lock()
+            .expect("sqlite mutex")
+            .query_row(
+                "SELECT COUNT(*) FROM protocol_turn_sequence_allocators
+                 WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("allocator count");
+        assert_eq!(allocator_rows, 0);
+    }
+
+    #[test]
+    fn fork_seeds_allocator_after_copied_maximum_sequence() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let source_session_id = SessionId::new();
+        let target_session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        store
+            .append_history_item(&history_message(
+                source_session_id,
+                turn_id,
+                29,
+                1,
+                "source",
+            ))
+            .expect("source append");
+        store
+            .fork_canonical_items(source_session_id, target_session_id)
+            .expect("fork");
+        store
+            .append_runtime_event(&warning_event(target_session_id, turn_id, 0, "after fork"))
+            .expect("post-fork append");
+
+        assert_eq!(
+            store
+                .list_runtime_events(target_session_id, turn_id)
+                .expect("events")[0]
+                .sequence_no,
+            30
+        );
+    }
+
+    fn warning_event(
+        session_id: SessionId,
+        turn_id: TurnId,
+        sequence_no: i64,
+        message: &str,
+    ) -> RuntimeEvent {
+        RuntimeEvent {
+            id: RuntimeEventId::new(),
+            session_id,
+            turn_id,
+            sequence_no,
+            created_at_ms: 1,
+            msg: RuntimeEventMsg::Warning {
+                message: message.to_string(),
+            },
+        }
     }
 
     fn history_message(

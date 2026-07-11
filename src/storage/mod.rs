@@ -2,6 +2,7 @@ use camino::Utf8PathBuf;
 use directories_next::ProjectDirs;
 
 use crate::error::StorageError;
+use crate::runtime::{ActiveRunRegistry, RunProcessLease};
 
 pub mod change_repo;
 pub mod migration;
@@ -50,11 +51,26 @@ impl StoragePaths {
 #[derive(Clone)]
 pub struct StoreBundle {
     store: SqliteStore,
+    active_runs: ActiveRunRegistry,
 }
 
 impl StoreBundle {
     pub fn new(store: SqliteStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            active_runs: ActiveRunRegistry::default(),
+        }
+    }
+
+    pub fn active_runs(&self) -> &ActiveRunRegistry {
+        &self.active_runs
+    }
+
+    pub fn try_acquire_run_process_lease(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Result<RunProcessLease, StorageError> {
+        RunProcessLease::try_acquire(&self.store.paths().data_dir, session_id)
     }
 
     pub fn session_repo(&self) -> SqliteSessionRepository {

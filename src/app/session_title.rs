@@ -1,70 +1,8 @@
-use tokio_util::sync::CancellationToken;
-
-use crate::config::ResolvedConfig;
-use crate::error::LlmError;
-use crate::llm::{
-    ChatRequest, ConfigModelCatalog, LlmClient, LlmEvent, LlmEventSink, ModelCatalog, ModelMessage,
-    OpenAiCompatClient,
-};
-
 pub const NEW_SESSION_PLACEHOLDER_TITLE: &str = "新規チャット";
 pub const GENERATED_SESSION_TITLE_MAX_CHARS: usize = 20;
 
-const SESSION_TITLE_SYSTEM_PROMPT: &str = "You create a concise chat title from the user's first request.\n\
-Return only one title, with no quotes, no markdown, no explanation, and no trailing punctuation.\n\
-Use the same language as the user request unless a proper noun or file name should stay unchanged.\n\
-The title must be at most 20 Japanese characters or 20 visible characters.";
-
-pub async fn generate_session_title(
-    config: &ResolvedConfig,
-    first_prompt: &str,
-    cancel: CancellationToken,
-) -> Result<String, LlmError> {
-    let api_key = config
-        .model
-        .api_key_env
-        .as_ref()
-        .and_then(|value| std::env::var(value).ok());
-    let client = OpenAiCompatClient::new(
-        config.model.connect_timeout_ms,
-        config.model.request_timeout_ms,
-        config.model.max_retries,
-        api_key,
-    )?;
-    let model = ConfigModelCatalog::new(config.clone()).resolve(None)?;
-    let mut sink = SessionTitleSink::default();
-    client
-        .stream_chat(
-            ChatRequest {
-                model,
-                base_url: config.model.base_url.clone(),
-                system_prompt: SESSION_TITLE_SYSTEM_PROMPT.to_string(),
-                messages: vec![ModelMessage::User {
-                    content: first_prompt.to_string(),
-                }],
-                tools: Vec::new(),
-                tool_choice: None,
-                parallel_tool_calls: false,
-                timeout_ms: config.model.request_timeout_ms,
-                stream_idle_timeout_ms: config.model.stream_idle_timeout_ms,
-                stream_max_retries: config.model.stream_max_retries,
-                extra_headers: config.model.extra_headers.clone(),
-                temperature: Some(0.2),
-                top_p: config.model.top_p,
-                top_k: config.model.top_k,
-                presence_penalty: config.model.presence_penalty,
-                frequency_penalty: config.model.frequency_penalty,
-                seed: config.model.seed,
-                stop_sequences: config.model.stop_sequences.clone(),
-                extra_body: config.model.extra_body_json.clone(),
-            },
-            cancel,
-            &mut sink,
-        )
-        .await?;
-    sanitize_generated_session_title(&sink.output).ok_or_else(|| {
-        LlmError::Message("session title generator returned an empty title".to_string())
-    })
+pub fn derive_session_title(first_prompt: &str) -> Option<String> {
+    sanitize_generated_session_title(first_prompt)
 }
 
 pub fn sanitize_generated_session_title(raw: &str) -> Option<String> {
@@ -130,32 +68,18 @@ pub fn sanitize_generated_session_title(raw: &str) -> Option<String> {
 }
 
 pub fn is_placeholder_session_title(title: &str) -> bool {
-    title.trim() == NEW_SESSION_PLACEHOLDER_TITLE
-}
-
-#[derive(Default)]
-struct SessionTitleSink {
-    output: String,
-}
-
-impl LlmEventSink for SessionTitleSink {
-    fn push(&mut self, event: LlmEvent) -> Result<(), LlmError> {
-        match event {
-            LlmEvent::TextDelta(delta) => {
-                self.output.push_str(&delta);
-            }
-            LlmEvent::ReasoningDelta(_) => {}
-            LlmEvent::ToolCallStart { .. }
-            | LlmEvent::ToolCallArgsDelta { .. }
-            | LlmEvent::Finished { .. } => {}
-        }
-        Ok(())
-    }
+    matches!(
+        title.trim(),
+        NEW_SESSION_PLACEHOLDER_TITLE | "New Session" | "New Chat"
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GENERATED_SESSION_TITLE_MAX_CHARS, sanitize_generated_session_title};
+    use super::{
+        GENERATED_SESSION_TITLE_MAX_CHARS, derive_session_title, is_placeholder_session_title,
+        sanitize_generated_session_title,
+    };
 
     #[test]
     fn sanitize_generated_session_title_strips_wrappers_and_prefixes() {
@@ -178,5 +102,17 @@ mod tests {
         .expect("title");
         assert!(title.chars().count() <= GENERATED_SESSION_TITLE_MAX_CHARS);
         assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn local_title_derivation_is_immediate_and_placeholder_aware() {
+        assert_eq!(
+            derive_session_title("README を確認して要点をまとめる。\n追加行").as_deref(),
+            Some("README を確認して要点をまとめる")
+        );
+        assert!(is_placeholder_session_title("新規チャット"));
+        assert!(is_placeholder_session_title("New Session"));
+        assert!(is_placeholder_session_title("New Chat"));
+        assert!(!is_placeholder_session_title("Explicit title"));
     }
 }

@@ -8,10 +8,9 @@ use crate::desktop::models::{
 use crate::error::AppRunError;
 use crate::harness::ReplayReport;
 use crate::session::{
-    ChangeKind, ProjectId, ProjectRecord, SessionId, SessionRecord, SessionStateSnapshot,
-    SessionStatus, TodoItem, TodoStatus, ToolCallStatus, Transcript,
+    ChangeKind, LoadedSessionSummary, ProjectId, ProjectRecord, SessionId, SessionRecord,
+    SessionStateSnapshot, SessionStatus, TodoItem, TodoStatus, ToolCallStatus, Transcript,
 };
-use crate::tui::query::recent_sessions;
 use crate::tui::state::{AppState, RunStatus, TranscriptKind};
 
 use super::artifact_projection::{
@@ -42,21 +41,37 @@ pub async fn load_snapshot_for_selection(
     app: &App,
     selected_session_id: Option<SessionId>,
 ) -> Result<DesktopSnapshot, AppRunError> {
-    let sessions = recent_sessions(&app.session_service, app.workspace.project_id, 20).await?;
+    let loaded = app
+        .session_service
+        .loaded_sessions(app.workspace.project_id, 20, false)
+        .await?;
+    let sessions = loaded
+        .sessions
+        .iter()
+        .map(|summary| summary.session.clone())
+        .collect::<Vec<_>>();
     let selected_session_index = select_session_index(
         &sessions,
         selected_session_id,
         Some(app.workspace.project_id),
         false,
     )?;
-    build_snapshot(app, sessions, selected_session_index).await
+    build_snapshot(app, loaded.sessions, selected_session_index).await
 }
 
 pub async fn load_snapshot_continue_last(app: &App) -> Result<DesktopSnapshot, AppRunError> {
-    let sessions = recent_sessions(&app.session_service, app.workspace.project_id, 20).await?;
+    let loaded = app
+        .session_service
+        .loaded_sessions(app.workspace.project_id, 20, false)
+        .await?;
+    let sessions = loaded
+        .sessions
+        .iter()
+        .map(|summary| summary.session.clone())
+        .collect::<Vec<_>>();
     let selected_session_index =
         select_session_index(&sessions, None, Some(app.workspace.project_id), true)?;
-    build_snapshot(app, sessions, selected_session_index).await
+    build_snapshot(app, loaded.sessions, selected_session_index).await
 }
 
 pub async fn load_snapshot_for_session_search(
@@ -66,24 +81,15 @@ pub async fn load_snapshot_for_session_search(
     selected_session_id: Option<SessionId>,
 ) -> Result<DesktopSnapshot, AppRunError> {
     let query = query.trim();
-    if query.is_empty() {
-        let sessions = app
-            .session_service
-            .list_sessions_with_archived(app.workspace.project_id, 50, include_archived)
-            .await?;
-        let selected_session_index = select_session_index(
-            &sessions,
-            selected_session_id,
-            Some(app.workspace.project_id),
-            false,
-        )
-        .unwrap_or(0);
-        return build_snapshot(app, sessions, selected_session_index).await;
-    }
-    let sessions = app
+    let loaded = app
         .session_service
-        .search_sessions(app.workspace.project_id, query, 50, include_archived)
+        .search_loaded_sessions(app.workspace.project_id, query, 50, include_archived)
         .await?;
+    let sessions = loaded
+        .sessions
+        .iter()
+        .map(|summary| summary.session.clone())
+        .collect::<Vec<_>>();
     let selected_session_index = select_session_index(
         &sessions,
         selected_session_id,
@@ -91,7 +97,7 @@ pub async fn load_snapshot_for_session_search(
         false,
     )
     .unwrap_or(0);
-    build_snapshot(app, sessions, selected_session_index).await
+    build_snapshot(app, loaded.sessions, selected_session_index).await
 }
 
 pub async fn load_session_detail(
@@ -149,7 +155,7 @@ fn latest_turn_page_offset(total: usize, limit: usize) -> usize {
 
 async fn build_snapshot(
     app: &App,
-    sessions: Vec<SessionRecord>,
+    sessions: Vec<LoadedSessionSummary>,
     selected_session_index: usize,
 ) -> Result<DesktopSnapshot, AppRunError> {
     let mut session_rows = Vec::with_capacity(sessions.len());
@@ -163,8 +169,8 @@ async fn build_snapshot(
         &hidden_roots,
     );
     let chat_session_rows = build_quick_chat_session_rows(app, &projects).await?;
-    for session in &sessions {
-        session_rows.push(build_session_row(app, session).await?);
+    for summary in &sessions {
+        session_rows.push(DesktopSessionRow::from_loaded_summary(summary));
     }
     Ok(DesktopSnapshot {
         workspace_path: app.workspace.root.to_string(),
@@ -207,23 +213,15 @@ async fn build_quick_chat_session_rows(
             project_id
         }
     };
-    let sessions = recent_sessions(&app.session_service, project_id, 20).await?;
-    let mut rows = Vec::with_capacity(sessions.len());
-    for session in &sessions {
-        rows.push(build_session_row(app, session).await?);
-    }
-    Ok(rows)
-}
-
-async fn build_session_row(
-    app: &App,
-    session: &SessionRecord,
-) -> Result<DesktopSessionRow, AppRunError> {
-    let summary = app
+    let sessions = app
         .session_service
-        .loaded_session_summary(session.clone())
+        .loaded_sessions(project_id, 20, false)
         .await?;
-    Ok(DesktopSessionRow::from_loaded_summary(&summary))
+    Ok(sessions
+        .sessions
+        .iter()
+        .map(DesktopSessionRow::from_loaded_summary)
+        .collect())
 }
 
 fn build_project_rows(
