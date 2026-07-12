@@ -13,7 +13,7 @@ use super::composer_state::DesktopComposerState;
 use super::models::{DesktopSessionDetail, DesktopSnapshot};
 use super::navigation::{DesktopNavigationState, NavigationRequestId, NavigationTarget};
 use super::open_session::OpenSessionView;
-use super::provider_config_state::DesktopProviderConfigState;
+use super::provider_config_state::{DesktopProviderConfigState, DesktopProviderStatusKind};
 use super::query::build_session_detail_from_app_state_with_session;
 use super::startup::DesktopStartupState;
 use super::view_state::DesktopViewState;
@@ -57,11 +57,12 @@ pub struct DesktopState {
 
 impl DesktopState {
     pub fn new(snapshot: DesktopSnapshot, effective_config: ResolvedConfig) -> Self {
+        let composer = DesktopComposerState::for_owner(snapshot.workspace_path.clone(), None);
         Self {
             snapshot,
             app_state: AppState::default(),
             open_session: None,
-            composer: DesktopComposerState::default(),
+            composer,
             workspace_input: String::new(),
             provider_config: DesktopProviderConfigState::new(effective_config),
             navigation: DesktopNavigationState::default(),
@@ -102,31 +103,10 @@ impl DesktopState {
         self.apply_startup_overlay();
     }
 
-    pub fn begin_startup_provider_model_load(&mut self, base_url: &str) {
-        if self.startup.status == super::startup::DesktopStartupStatus::Ready {
-            return;
-        }
-        self.startup.begin_provider_availability(
-            base_url,
-            &self.provider_config.effective_config.model.model,
-        );
-        self.sync_startup_readiness_operation();
-        self.apply_startup_overlay();
-    }
-
     pub fn fail_startup_provider_model_load(&mut self, message: impl Into<String>) {
         self.startup.fail_provider_availability(message);
         self.sync_startup_readiness_operation();
         self.apply_startup_overlay();
-    }
-
-    pub fn begin_startup_docling_check(&mut self) -> bool {
-        let should_probe = self
-            .startup
-            .begin_docling_check(&self.provider_config.effective_config);
-        self.sync_startup_readiness_operation();
-        self.apply_startup_overlay();
-        should_probe
     }
 
     pub fn finish_startup_docling_check(&mut self, base_url: &str) {
@@ -139,6 +119,35 @@ impl DesktopState {
         self.startup.fail_docling_check(message);
         self.sync_startup_readiness_operation();
         self.apply_startup_overlay();
+    }
+
+    pub fn retarget_startup_readiness_for_config_change(&mut self) -> bool {
+        if self.startup.status == super::startup::DesktopStartupStatus::Ready {
+            return false;
+        }
+        self.startup.begin_provider_availability(
+            &self.provider_config.effective_config.model.base_url,
+            &self.provider_config.effective_config.model.model,
+        );
+        self.startup
+            .begin_docling_check(&self.provider_config.effective_config);
+        self.sync_startup_readiness_operation();
+        self.apply_startup_overlay();
+        true
+    }
+
+    pub fn startup_provider_readiness_pending(&self) -> bool {
+        self.startup.checks.iter().any(|check| {
+            check.key == "provider"
+                && check.status == super::startup::DesktopStartupCheckStatus::Pending
+        })
+    }
+
+    pub fn startup_docling_readiness_pending(&self) -> bool {
+        self.startup.checks.iter().any(|check| {
+            check.key == "docling"
+                && check.status == super::startup::DesktopStartupCheckStatus::Pending
+        })
     }
 
     pub fn replace_snapshot(&mut self, mut snapshot: DesktopSnapshot) {
@@ -159,6 +168,27 @@ impl DesktopState {
         }
         self.snapshot = snapshot;
         self.clamp_artifact_selection();
+    }
+
+    pub fn replace_snapshot_preserving_current_owner(&mut self, mut snapshot: DesktopSnapshot) {
+        if let Some(current_session_id) = self.app_state.current_session_id
+            && !snapshot
+                .session_rows
+                .iter()
+                .any(|row| row.session_id == current_session_id)
+            && let Some(current_row) = self
+                .snapshot
+                .session_rows
+                .iter()
+                .find(|row| row.session_id == current_session_id)
+                .cloned()
+        {
+            snapshot.session_rows.insert(0, current_row);
+            if let Some(detail) = self.snapshot.detail_for(current_session_id).cloned() {
+                snapshot.replace_detail(detail);
+            }
+        }
+        self.replace_snapshot(snapshot);
     }
 
     pub fn select_session(&mut self, index: usize) {
@@ -213,6 +243,46 @@ impl DesktopState {
 
     pub fn selected_session_id(&self) -> Option<SessionId> {
         self.snapshot.selected_session_id()
+    }
+
+    pub fn rebind_composer_owner(&mut self, session_id: Option<SessionId>) -> bool {
+        let changed = self
+            .composer
+            .rebind_owner(&self.snapshot.workspace_path, session_id);
+        if changed && self.app_state.prompt_review.is_some() {
+            self.cancel_prompt_review();
+        }
+        changed
+    }
+
+    pub fn adopt_composer_owner(&mut self, session_id: Option<SessionId>) {
+        self.composer
+            .adopt_owner(&self.snapshot.workspace_path, session_id);
+    }
+
+    pub fn bind_composer_to_loaded_session(&mut self, session_id: SessionId) {
+        let adopts_created_session = self.app_state.current_session_id == Some(session_id)
+            && self
+                .composer
+                .is_owned_by(&self.snapshot.workspace_path, None);
+        if adopts_created_session {
+            self.adopt_composer_owner(Some(session_id));
+        } else {
+            self.rebind_composer_owner(Some(session_id));
+        }
+    }
+
+    pub fn restore_selected_session_to_current_owner(&mut self) {
+        let Some(current_session_id) = self.app_state.current_session_id else {
+            self.snapshot.selected_session_index = self.snapshot.session_rows.len();
+            return;
+        };
+        self.snapshot.selected_session_index = self
+            .snapshot
+            .session_rows
+            .iter()
+            .position(|row| row.session_id == current_session_id)
+            .unwrap_or(self.snapshot.session_rows.len());
     }
 
     pub fn begin_workspace_load(
@@ -375,40 +445,43 @@ impl DesktopState {
         self.view.async_operations.finish(operation_id)
     }
 
-    pub fn begin_session_archive_mutation(&mut self) {
+    pub fn begin_session_archive_mutation(&mut self) -> DesktopAsyncOperationId {
         self.view
             .async_operations
-            .begin(DesktopAsyncOperationKind::SessionArchive);
+            .begin(DesktopAsyncOperationKind::SessionArchive)
     }
 
-    pub fn finish_session_archive_mutation(&mut self) {
-        self.view
-            .async_operations
-            .finish_one_kind(DesktopAsyncOperationKind::SessionArchive);
+    pub fn finish_session_archive_mutation(
+        &mut self,
+        operation_id: DesktopAsyncOperationId,
+    ) -> bool {
+        self.view.async_operations.finish(operation_id)
     }
 
-    pub fn begin_session_rollback_mutation(&mut self) {
+    pub fn begin_session_rollback_mutation(&mut self) -> DesktopAsyncOperationId {
         self.view
             .async_operations
-            .begin(DesktopAsyncOperationKind::SessionRollback);
+            .begin(DesktopAsyncOperationKind::SessionRollback)
     }
 
-    pub fn finish_session_rollback_mutation(&mut self) {
-        self.view
-            .async_operations
-            .finish_one_kind(DesktopAsyncOperationKind::SessionRollback);
+    pub fn finish_session_rollback_mutation(
+        &mut self,
+        operation_id: DesktopAsyncOperationId,
+    ) -> bool {
+        self.view.async_operations.finish(operation_id)
     }
 
-    pub fn begin_session_maintenance_mutation(&mut self) {
+    pub fn begin_session_maintenance_mutation(&mut self) -> DesktopAsyncOperationId {
         self.view
             .async_operations
-            .begin(DesktopAsyncOperationKind::SessionMaintenance);
+            .begin(DesktopAsyncOperationKind::SessionMaintenance)
     }
 
-    pub fn finish_session_maintenance_mutation(&mut self) {
-        self.view
-            .async_operations
-            .finish_one_kind(DesktopAsyncOperationKind::SessionMaintenance);
+    pub fn finish_session_maintenance_mutation(
+        &mut self,
+        operation_id: DesktopAsyncOperationId,
+    ) -> bool {
+        self.view.async_operations.finish(operation_id)
     }
 
     pub fn begin_session_search(&mut self) -> DesktopAsyncOperationId {
@@ -421,16 +494,17 @@ impl DesktopState {
         self.view.async_operations.finish(operation_id)
     }
 
-    pub fn begin_project_delete_mutation(&mut self) {
+    pub fn begin_project_delete_mutation(&mut self) -> DesktopAsyncOperationId {
         self.view
             .async_operations
-            .begin(DesktopAsyncOperationKind::ProjectDelete);
+            .begin(DesktopAsyncOperationKind::ProjectDelete)
     }
 
-    pub fn finish_project_delete_mutation(&mut self) {
-        self.view
-            .async_operations
-            .finish_one_kind(DesktopAsyncOperationKind::ProjectDelete);
+    pub fn finish_project_delete_mutation(
+        &mut self,
+        operation_id: DesktopAsyncOperationId,
+    ) -> bool {
+        self.view.async_operations.finish(operation_id)
     }
 
     pub fn background_mutation_pending(&self) -> bool {
@@ -470,13 +544,13 @@ impl DesktopState {
     pub fn begin_current_todo_refresh(&mut self) {
         self.view
             .async_operations
-            .begin(DesktopAsyncOperationKind::CurrentTodoRefresh);
+            .begin_unique(DesktopAsyncOperationKind::CurrentTodoRefresh);
     }
 
     pub fn finish_current_todo_refresh(&mut self) {
         self.view
             .async_operations
-            .finish_one_kind(DesktopAsyncOperationKind::CurrentTodoRefresh);
+            .finish_kind(DesktopAsyncOperationKind::CurrentTodoRefresh);
     }
 
     pub fn async_polling_required(&self) -> bool {
@@ -652,10 +726,6 @@ impl DesktopState {
         }
     }
 
-    pub fn set_draft_prompt(&mut self, prompt: String) {
-        self.composer.draft_prompt = prompt;
-    }
-
     pub fn set_image_attachment_input(&mut self, input: String) {
         self.composer.image_attachment_input = input;
     }
@@ -702,50 +772,47 @@ impl DesktopState {
         self.workspace_input = input;
     }
 
-    pub fn set_provider_base_url_input(&mut self, input: String) {
-        let normalized = normalize_provider_base_url(&input);
-        self.provider_config.provider_base_url_input = input;
-        self.provider_config.provider_loading = false;
-        self.view
-            .async_operations
-            .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
-        if self.provider_config.provider_loaded_base_url.as_deref() != Some(normalized.as_str()) {
-            self.provider_config.provider_loaded_base_url = None;
+    pub fn accept_provider_action_input(
+        &mut self,
+        base_url: String,
+        metadata_mode: ProviderMetadataMode,
+        context_window: String,
+        max_output_tokens: String,
+        selected_model_id: String,
+    ) -> bool {
+        let normalized = normalize_provider_base_url(&base_url);
+        let current_target_base_url = if self.provider_config.provider_loading {
+            Some(normalize_provider_base_url(
+                &self.provider_config.provider_base_url_input,
+            ))
+        } else {
+            self.provider_config.provider_loaded_base_url.clone()
+        };
+        let target_changed = current_target_base_url.as_deref() != Some(normalized.as_str())
+            || self.provider_config.provider_metadata_mode_input != metadata_mode;
+        self.provider_config.provider_base_url_input = base_url;
+        self.provider_config.provider_metadata_mode_input = metadata_mode;
+        self.provider_config.provider_context_window_input = context_window;
+        self.provider_config.provider_max_output_tokens_input = max_output_tokens;
+        self.provider_config.provider_selected_model_id_input = selected_model_id.clone();
+        if let Some(index) = self
+            .provider_config
+            .provider_models
+            .iter()
+            .position(|model| model == &selected_model_id)
+        {
+            self.provider_config.provider_selected_index = index as i32;
+        } else {
+            self.provider_config.provider_selected_index = -1;
         }
-        self.provider_config.provider_status_text =
-            "Load the model list for this provider.".to_string();
-    }
-
-    pub fn set_provider_metadata_mode_input(&mut self, mode: ProviderMetadataMode) {
-        let changed = self.provider_config.provider_metadata_mode_input != mode;
-        self.provider_config.provider_metadata_mode_input = mode;
-        if changed {
+        if target_changed {
             self.provider_config.provider_loading = false;
             self.provider_config.provider_loaded_base_url = None;
             self.view
                 .async_operations
                 .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         }
-        self.provider_config.provider_status_text = match mode {
-            ProviderMetadataMode::LmStudioNativeRequired => {
-                "Provider mode: LM Studio native metadata is required.".to_string()
-            }
-            ProviderMetadataMode::OpenAiCompatibleOnly => {
-                "Provider mode: OpenAI-compatible /v1 metadata only.".to_string()
-            }
-        };
-    }
-
-    pub fn set_provider_context_window_input(&mut self, text: String) {
-        self.provider_config.provider_context_window_input = text;
-        self.provider_config.provider_status_text =
-            "Context window override will be applied with provider settings.".to_string();
-    }
-
-    pub fn set_provider_max_output_tokens_input(&mut self, text: String) {
-        self.provider_config.provider_max_output_tokens_input = text;
-        self.provider_config.provider_status_text =
-            "Max output tokens override will be applied with provider settings.".to_string();
+        target_changed
     }
 
     pub fn load_open_session(
@@ -760,6 +827,7 @@ impl DesktopState {
         turn_page_total: usize,
         turn_page_has_more: bool,
     ) {
+        self.bind_composer_to_loaded_session(session.id);
         let open_session = OpenSessionView::from_loaded(
             session,
             transcript,
@@ -938,6 +1006,10 @@ impl DesktopState {
             .is_some_and(|review| review.request_id == request_id);
         if active {
             self.cancel_prompt_review();
+        } else if self.app_state.prompt_review.is_none() {
+            self.view
+                .async_operations
+                .finish_kind(DesktopAsyncOperationKind::PromptEnhance);
         }
         active
     }
@@ -972,9 +1044,9 @@ impl DesktopState {
             return;
         }
         self.snapshot.selected_session_index = self.snapshot.session_rows.len();
+        self.rebind_composer_owner(None);
         self.app_state = AppState::default();
         self.open_session = None;
-        self.composer.clear_request_inputs();
         self.view.artifact_selected_index = 0;
         self.view.overlay = DesktopOverlay::None;
         self.set_status_message("new chat ready");
@@ -1015,6 +1087,8 @@ impl DesktopState {
             .model
             .max_output_tokens
             .to_string();
+        self.provider_config.provider_selected_model_id_input =
+            self.provider_config.effective_config.model.model.clone();
         self.provider_config.provider_models = ensure_current_model(
             self.provider_config.provider_models.clone(),
             &self.provider_config.effective_config.model.model,
@@ -1030,10 +1104,6 @@ impl DesktopState {
             .position(|model| model == &self.provider_config.effective_config.model.model)
             .map(|index| index as i32)
             .unwrap_or(-1);
-        if self.provider_config.provider_status_text.is_empty() {
-            self.provider_config.provider_status_text =
-                "Load the model list for this provider.".to_string();
-        }
         self.view.startup_overlay_forced = false;
         self.view.overlay = DesktopOverlay::ProviderEditor;
     }
@@ -1068,6 +1138,10 @@ impl DesktopState {
             self.set_status_message(
                 "初期設定が必要です。保存または config.toml Import で設定を完了してください。",
             );
+            return;
+        }
+        if self.view.overlay == DesktopOverlay::PromptReview {
+            self.cancel_prompt_review();
             return;
         }
         self.view.startup_overlay_forced = false;
@@ -1141,15 +1215,18 @@ impl DesktopState {
     }
 
     pub fn begin_provider_model_load(&mut self, normalized_base_url: String) {
-        self.begin_startup_provider_model_load(&normalized_base_url);
         self.provider_config.provider_base_url_input = normalized_base_url;
         self.provider_config.provider_loading = true;
         self.view
             .async_operations
             .begin_unique(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.provider_loaded_base_url = None;
-        self.provider_config.provider_status_text =
-            "Loading models in the background...".to_string();
+        self.provider_config.set_status(
+            DesktopProviderStatusKind::Loading,
+            "Provider 状態",
+            "詳細は必要な場合だけ展開してください。",
+            "Loading models in the background...",
+        );
     }
 
     pub fn finish_provider_model_load(&mut self, infos: Vec<ProviderModelInfo>) {
@@ -1160,11 +1237,21 @@ impl DesktopState {
             ensure_current_model(models, &self.provider_config.effective_config.model.model);
         self.provider_config.provider_model_infos =
             ensure_current_model_infos(infos, &self.provider_config.effective_config);
+        let desired_model_id = self
+            .provider_config
+            .provider_selected_model_id_input
+            .clone();
         self.provider_config.provider_selected_index = self
             .provider_config
             .provider_models
             .iter()
-            .position(|model| model == &self.provider_config.effective_config.model.model)
+            .position(|model| model == &desired_model_id)
+            .or_else(|| {
+                self.provider_config
+                    .provider_models
+                    .iter()
+                    .position(|model| model == &self.provider_config.effective_config.model.model)
+            })
             .map(|index| index as i32)
             .unwrap_or(-1);
         self.provider_config.provider_loaded_base_url = Some(normalized_base_url);
@@ -1172,15 +1259,22 @@ impl DesktopState {
         self.view
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
-        self.provider_config.provider_status_text = format!(
-            "Loaded {} models. {}",
-            self.provider_config.provider_models.len(),
-            self.selected_provider_model_info()
-                .map(provider_model_summary)
-                .unwrap_or_default()
-        )
-        .trim()
-        .to_string();
+        let details = self
+            .selected_provider_model_info()
+            .map(provider_model_summary)
+            .unwrap_or_default();
+        self.provider_config.set_status(
+            DesktopProviderStatusKind::Success,
+            "Provider 設定を読み込みました",
+            "選択したモデルとBase URLをセッションまたは設定ファイルへ適用できます。",
+            format!(
+                "Loaded {} models. {}",
+                self.provider_config.provider_models.len(),
+                details
+            )
+            .trim()
+            .to_string(),
+        );
     }
 
     pub fn fail_provider_model_load(&mut self, message: impl Into<String>) {
@@ -1189,7 +1283,30 @@ impl DesktopState {
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.provider_loaded_base_url = None;
-        self.provider_config.provider_status_text = message.into();
+        let message = message.into();
+        let lower = message.to_ascii_lowercase();
+        let (title, hint) = if lower.contains("error sending request")
+            || lower.contains("connection refused")
+            || lower.contains("failed to connect")
+        {
+            (
+                "LLM provider に接続できません",
+                "LM Studio が起動しているか、Base URL が http://127.0.0.1:1234 のように到達可能なURLになっているか確認してください。",
+            )
+        } else if lower.contains("model") && (lower.contains("not found") || lower.contains("404"))
+        {
+            (
+                "指定したモデルが見つかりません",
+                "Provider設定でモデル一覧を読み込み、現在ロード済みのモデルを選択してください。",
+            )
+        } else {
+            (
+                "処理に失敗しました",
+                "設定と対象ワークスペースを確認してください。原因の切り分けには技術詳細を参照してください。",
+            )
+        };
+        self.provider_config
+            .set_status(DesktopProviderStatusKind::Error, title, hint, message);
         self.provider_config.provider_models = ensure_current_model(
             self.provider_config.provider_models.clone(),
             &self.provider_config.effective_config.model.model,
@@ -1201,22 +1318,31 @@ impl DesktopState {
         }
     }
 
-    pub fn set_provider_model_selection(&mut self, index: i32) {
-        if index >= 0 && (index as usize) < self.provider_config.provider_models.len() {
-            self.provider_config.provider_selected_index = index;
-        }
+    pub fn cancel_provider_model_load(&mut self) {
+        self.provider_config.provider_loading = false;
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
+        self.provider_config.set_status(
+            DesktopProviderStatusKind::Idle,
+            "Provider 設定を確認できます",
+            "Base URL、mode、model を選択してセッションへ適用できます。",
+            "",
+        );
     }
 
-    pub fn set_provider_model_value(&mut self, value: &str) {
-        let id = value.split("  [").next().unwrap_or(value).trim();
-        if let Some(index) = self
-            .provider_config
-            .provider_models
-            .iter()
-            .position(|item| item == id)
-        {
-            self.provider_config.provider_selected_index = index as i32;
-        }
+    pub fn prompt_enhance_pending(&self) -> bool {
+        self.view
+            .async_operations
+            .is_pending(DesktopAsyncOperationKind::PromptEnhance)
+    }
+
+    pub fn provider_model_load_pending(&self) -> bool {
+        self.provider_config.provider_loading
+            || self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::ProviderModelCatalogLoad)
     }
 
     pub fn selected_provider_model(&self) -> Option<&str> {
@@ -1326,12 +1452,6 @@ impl DesktopState {
         )
     }
 
-    pub fn can_submit_prompt(&self) -> bool {
-        !self.is_busy()
-            && !self.navigation_loading()
-            && !self.composer.draft_prompt.trim().is_empty()
-    }
-
     pub fn can_open_session(&self) -> bool {
         self.can_begin_navigation() && self.selected_session_id().is_some()
     }
@@ -1365,6 +1485,7 @@ impl DesktopState {
                 .is_empty()
             && self.selected_provider_model().is_some()
             && !normalized.is_empty()
+            && self.provider_config.provider_loaded_base_url.as_deref() == Some(normalized.as_str())
     }
 
     fn with_provider_fields(mut self) -> Self {
@@ -1387,9 +1508,7 @@ impl DesktopState {
             .model
             .max_output_tokens
             .to_string();
-        self.provider_config.provider_loaded_base_url = Some(normalize_provider_base_url(
-            &self.provider_config.effective_config.model.base_url,
-        ));
+        self.provider_config.provider_loaded_base_url = None;
         self
     }
 
@@ -1438,7 +1557,7 @@ pub(crate) fn initial_provider_model_infos(config: &ResolvedConfig) -> Vec<Provi
     ensure_current_model_infos(Vec::new(), config)
 }
 
-fn ensure_current_model(mut models: Vec<String>, current_model: &str) -> Vec<String> {
+pub(crate) fn ensure_current_model(mut models: Vec<String>, current_model: &str) -> Vec<String> {
     let current_model = current_model.trim();
     if !current_model.is_empty() && !models.iter().any(|model| model == current_model) {
         models.insert(0, current_model.to_string());
@@ -1446,7 +1565,7 @@ fn ensure_current_model(mut models: Vec<String>, current_model: &str) -> Vec<Str
     models
 }
 
-fn ensure_current_model_infos(
+pub(crate) fn ensure_current_model_infos(
     mut infos: Vec<ProviderModelInfo>,
     config: &ResolvedConfig,
 ) -> Vec<ProviderModelInfo> {
@@ -1768,7 +1887,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_forced_provider_overlay_closes_when_provider_check_passes() {
+    fn explicit_provider_catalog_does_not_complete_startup_readiness() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = "http://127.0.0.1:1234".to_string();
         config.model.model = "qwen/qwen3.6-35b-a3b".to_string();
@@ -1784,7 +1903,13 @@ mod tests {
         state.begin_provider_model_load(config.model.base_url.clone());
         assert_eq!(
             state.startup.status,
-            super::super::startup::DesktopStartupStatus::Loading
+            super::super::startup::DesktopStartupStatus::RequiresProvider
+        );
+        state.finish_provider_model_load(initial_provider_model_infos(&config));
+        assert!(state.can_apply_provider_selection());
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::RequiresProvider
         );
         assert_eq!(state.view.overlay, DesktopOverlay::ProviderEditor);
 
@@ -1796,6 +1921,73 @@ mod tests {
         );
         assert_eq!(state.view.overlay, DesktopOverlay::None);
         assert!(!state.view.startup_overlay_forced);
+    }
+
+    #[test]
+    fn provider_apply_requires_catalog_evidence_and_preserves_selected_metadata() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = "http://127.0.0.1:1234".to_string();
+        config.model.model = "catalog-model".to_string();
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
+        assert!(!state.can_apply_provider_selection());
+
+        let mut catalog_info = provider_info_from_config(&config);
+        catalog_info.context_window = Some(262_144);
+        catalog_info.source = "provider_catalog".to_string();
+        state.begin_provider_model_load(config.model.base_url.clone());
+        state.finish_provider_model_load(vec![catalog_info]);
+        assert!(state.can_apply_provider_selection());
+
+        let mut same_target = config.clone();
+        same_target.model.context_window = 65_536;
+        state.reset_effective_config(same_target);
+        let retained = state
+            .selected_provider_model_info()
+            .expect("selected provider metadata");
+        assert_eq!(retained.source, "provider_catalog");
+        assert_eq!(retained.context_window, Some(262_144));
+        assert!(state.can_apply_provider_selection());
+
+        let mut changed_target = config;
+        changed_target.model.base_url = "http://127.0.0.1:5678".to_string();
+        state.reset_effective_config(changed_target);
+        assert!(!state.can_apply_provider_selection());
+        assert_eq!(state.provider_config.provider_loaded_base_url, None);
+    }
+
+    #[test]
+    fn startup_config_retarget_is_pending_without_catalog_and_ready_is_terminal() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = "http://127.0.0.1:1234".to_string();
+        config.model.model = "model-a".to_string();
+        config.docling.enabled = false;
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
+        state.begin_startup(true, None, camino::Utf8Path::new("C:/workspace"));
+        state.fail_startup_provider_model_load("provider failed");
+
+        config.model.model = "model-b".to_string();
+        state.reset_effective_config(config.clone());
+        assert!(state.retarget_startup_readiness_for_config_change());
+        assert!(state.startup_provider_readiness_pending());
+        assert!(!state.provider_model_load_pending());
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::Loading
+        );
+
+        state.finish_startup_provider_model_load(&passing_model_report(&config));
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::Ready
+        );
+        let mut later_edit = config;
+        later_edit.model.model = "model-c".to_string();
+        state.reset_effective_config(later_edit);
+        assert!(!state.retarget_startup_readiness_for_config_change());
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::Ready
+        );
     }
 
     #[test]
@@ -1878,19 +2070,14 @@ mod tests {
     fn navigation_loading_tracks_workspace_and_session_loads() {
         let session_id = SessionId::new();
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
-        state.set_draft_prompt("wait for navigation".to_string());
-
         assert!(!state.navigation_loading());
-        assert!(state.can_submit_prompt());
 
         let workspace_request =
             state.begin_workspace_load(camino::Utf8PathBuf::from("C:/workspace"), None);
         assert!(state.navigation_loading());
-        assert!(!state.can_submit_prompt());
         assert!(state.is_current_navigation(workspace_request));
         state.finish_navigation(workspace_request);
         assert!(!state.navigation_loading());
-        assert!(state.can_submit_prompt());
 
         let session_request = state.begin_session_load(session_id);
         assert!(state.navigation_loading());
@@ -1902,6 +2089,34 @@ mod tests {
         assert!(state.navigation_loading());
         assert!(state.finish_navigation(newer_request));
         assert!(!state.navigation_loading());
+    }
+
+    #[test]
+    fn composer_attachments_clear_only_when_the_durable_owner_changes() {
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        let attachment = camino::Utf8PathBuf::from("C:/workspace/owned-by-a.png");
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+
+        state
+            .composer
+            .image_attachment_paths
+            .push(attachment.clone());
+        state.app_state.current_session_id = Some(session_a);
+        state.bind_composer_to_loaded_session(session_a);
+        assert_eq!(
+            state.composer.image_attachment_paths,
+            vec![attachment.clone()],
+            "the first durable session adopts the unowned new-chat draft"
+        );
+        assert!(!state.rebind_composer_owner(Some(session_a)));
+        assert_eq!(
+            state.composer.image_attachment_paths,
+            vec![attachment.clone()]
+        );
+
+        assert!(state.rebind_composer_owner(Some(session_b)));
+        assert!(state.composer.image_attachment_paths.is_empty());
     }
 
     #[test]
@@ -2018,16 +2233,16 @@ mod tests {
         assert!(!state.background_mutation_pending());
 
         let session_delete_id = state.begin_session_delete_mutation();
-        state.begin_project_delete_mutation();
+        let project_delete_id = state.begin_project_delete_mutation();
         assert!(state.background_mutation_pending());
 
         assert!(state.finish_session_delete_mutation(session_delete_id));
         assert!(state.background_mutation_pending());
 
-        state.finish_project_delete_mutation();
+        assert!(state.finish_project_delete_mutation(project_delete_id));
         assert!(!state.background_mutation_pending());
 
-        state.finish_project_delete_mutation();
+        assert!(!state.finish_project_delete_mutation(project_delete_id));
         assert!(!state.background_mutation_pending());
     }
 
@@ -2123,6 +2338,7 @@ mod tests {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
 
         state.begin_prompt_enhance(1, "first");
+        assert!(state.prompt_enhance_pending());
         state.begin_prompt_enhance(2, "second");
 
         assert!(!state.finish_prompt_enhance(1, "old draft".to_string()));
@@ -2144,6 +2360,74 @@ mod tests {
                 .pending_async_operation_keys()
                 .contains(&"prompt_enhance".to_string())
         );
+        assert!(!state.prompt_enhance_pending());
+    }
+
+    #[test]
+    fn repeated_provider_input_preserves_pending_owner_and_target_change_invalidates_it() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = "http://127.0.0.1:1234".to_string();
+        config.model.model = "model-a".to_string();
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
+        state.begin_provider_model_load(config.model.base_url.clone());
+        assert!(state.provider_model_load_pending());
+
+        assert!(!state.accept_provider_action_input(
+            config.model.base_url.clone(),
+            config.model.provider_metadata_mode,
+            config.model.context_window.to_string(),
+            config.model.max_output_tokens.to_string(),
+            config.model.model.clone(),
+        ));
+        assert!(state.provider_model_load_pending());
+
+        assert!(state.accept_provider_action_input(
+            "http://127.0.0.1:5678".to_string(),
+            config.model.provider_metadata_mode,
+            config.model.context_window.to_string(),
+            config.model.max_output_tokens.to_string(),
+            config.model.model,
+        ));
+        assert!(!state.provider_model_load_pending());
+    }
+
+    #[test]
+    fn closing_prompt_review_is_terminal_and_late_result_cannot_reopen_it() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        state.begin_prompt_enhance(7, "draft me");
+        assert_eq!(state.view.overlay, DesktopOverlay::PromptReview);
+
+        state.hide_overlay();
+
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
+        assert!(state.app_state.prompt_review.is_none());
+        assert!(
+            !state
+                .pending_async_operation_keys()
+                .contains(&"prompt_enhance".to_string())
+        );
+        assert!(!state.finish_prompt_enhance(7, "late draft".to_string()));
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
+        assert!(state.app_state.prompt_review.is_none());
+    }
+
+    #[test]
+    fn closed_prompt_review_does_not_leak_async_owner_across_navigation() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        state.begin_prompt_enhance(9, "draft before navigation");
+        state.hide_overlay();
+        let session_id = SessionId::new();
+        let navigation_id = state.begin_session_load(session_id);
+
+        assert!(state.is_current_session_navigation(navigation_id, session_id));
+        assert!(!state.fail_prompt_enhance(9));
+        assert!(state.navigation_loading());
+        assert!(
+            !state
+                .pending_async_operation_keys()
+                .contains(&"prompt_enhance".to_string())
+        );
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
     }
 
     #[test]

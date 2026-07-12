@@ -87,6 +87,10 @@ impl AppBootstrap {
             .await?;
 
         let session_service = crate::session::SessionService::new(store.clone());
+        let agent_runtime = Arc::new(crate::app::AgentRuntime::new(
+            store.clone(),
+            session_service.clone(),
+        ));
         let tool_services = ToolServices {
             edit_safety: EditSafety::default(),
             formatter: Formatter::new(config.format.clone()),
@@ -118,7 +122,12 @@ impl AppBootstrap {
             session_service.clone(),
             agent_loop,
             session_event_hub.clone(),
+            agent_runtime.clone(),
         );
+        let run_service = Arc::new(run_service);
+        agent_runtime
+            .bind_run_service(Arc::downgrade(&run_service))
+            .map_err(AppBootstrapError::Message)?;
 
         Ok(App {
             config,

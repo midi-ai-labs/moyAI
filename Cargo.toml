@@ -21,6 +21,11 @@ tauri-desktop = [
 name = "moyai"
 path = "src/lib.rs"
 
+[[bin]]
+name = "moyai-desktop"
+path = "src/bin/moyai-desktop.rs"
+required-features = ["tauri-desktop"]
+
 [dependencies]
 async-trait = "0.1.89"
 base64 = "0.22.1"

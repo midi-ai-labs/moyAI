@@ -175,6 +175,16 @@ pub struct SessionRecord {
     pub completed_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSpawnEdge {
+    pub root_session_id: SessionId,
+    pub parent_session_id: SessionId,
+    pub child_session_id: SessionId,
+    pub agent_path: String,
+    pub task_name: String,
+    pub created_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionModelParameters {
     #[serde(default, skip_serializing_if = "Option::is_none")]

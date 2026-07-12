@@ -107,6 +107,31 @@ pub enum ProviderMetadataMode {
     OpenAiCompatibleOnly,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MultiAgentMode {
+    #[default]
+    ExplicitRequestOnly,
+    Proactive,
+}
+
+impl MultiAgentMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "explicit_request_only" | "explicit" => Some(Self::ExplicitRequestOnly),
+            "proactive" => Some(Self::Proactive),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitRequestOnly => "explicit_request_only",
+            Self::Proactive => "proactive",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormatterRule {
     pub glob: String,
@@ -150,6 +175,14 @@ pub struct SessionConfig {
     pub auto_resume_last: bool,
     pub max_steps_per_turn: usize,
     pub overflow_margin_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiAgentConfig {
+    pub enabled: bool,
+    pub mode: MultiAgentMode,
+    pub max_concurrent_agents: usize,
+    pub max_concurrent_model_requests: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +286,7 @@ pub struct LoggingConfig {
 pub struct ResolvedConfig {
     pub model: ModelConfig,
     pub session: SessionConfig,
+    pub multi_agent: MultiAgentConfig,
     pub permissions: PermissionsConfig,
     pub shell: ShellConfig,
     pub format: FormatConfig,
@@ -347,6 +381,12 @@ impl Default for ResolvedConfig {
                 auto_resume_last: false,
                 max_steps_per_turn: 128,
                 overflow_margin_tokens: 1_024,
+            },
+            multi_agent: MultiAgentConfig {
+                enabled: false,
+                mode: MultiAgentMode::ExplicitRequestOnly,
+                max_concurrent_agents: 4,
+                max_concurrent_model_requests: 1,
             },
             permissions: PermissionsConfig {
                 access_mode: AccessMode::Default,
@@ -497,6 +537,12 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
             max_steps_per_turn: Some(config.session.max_steps_per_turn),
             overflow_margin_tokens: None,
         }),
+        multi_agent: Some(PartialMultiAgentConfig {
+            enabled: Some(config.multi_agent.enabled),
+            mode: Some(config.multi_agent.mode),
+            max_concurrent_agents: Some(config.multi_agent.max_concurrent_agents),
+            max_concurrent_model_requests: Some(config.multi_agent.max_concurrent_model_requests),
+        }),
         inspection: Some(PartialInspectionConfig {
             default_max_depth: Some(config.inspection.default_max_depth),
             default_max_entries_per_dir: Some(config.inspection.default_max_entries_per_dir),
@@ -547,6 +593,7 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
 pub struct PartialResolvedConfig {
     pub model: Option<PartialModelConfig>,
     pub session: Option<PartialSessionConfig>,
+    pub multi_agent: Option<PartialMultiAgentConfig>,
     pub permissions: Option<PartialPermissionsConfig>,
     pub shell: Option<PartialShellConfig>,
     pub format: Option<PartialFormatConfig>,
@@ -597,6 +644,14 @@ pub struct PartialSessionConfig {
     pub auto_resume_last: Option<bool>,
     pub max_steps_per_turn: Option<usize>,
     pub overflow_margin_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PartialMultiAgentConfig {
+    pub enabled: Option<bool>,
+    pub mode: Option<MultiAgentMode>,
+    pub max_concurrent_agents: Option<usize>,
+    pub max_concurrent_model_requests: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

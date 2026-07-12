@@ -9,9 +9,6 @@ use moyai::cli::CliCommand;
 use moyai::cli::parse::DesktopArgs as CliDesktopArgs;
 use moyai::desktop::{self, DesktopArgs};
 
-#[cfg(not(feature = "tauri-desktop"))]
-const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
-
 #[derive(Debug, Parser)]
 #[command(
     name = "moyai-desktop",
@@ -38,27 +35,7 @@ fn main() -> ExitCode {
 }
 
 fn run_desktop_launcher() -> Result<(), (u8, String)> {
-    #[cfg(feature = "tauri-desktop")]
-    {
-        run_on_current_thread()
-    }
-    #[cfg(not(feature = "tauri-desktop"))]
-    {
-        run_with_large_stack()
-    }
-}
-
-#[cfg(not(feature = "tauri-desktop"))]
-fn run_with_large_stack() -> Result<(), (u8, String)> {
-    let join_handle = std::thread::Builder::new()
-        .name("moyai-desktop-worker".to_string())
-        .stack_size(WORKER_STACK_BYTES)
-        .spawn(run_on_current_thread)
-        .map_err(|error| (4, format!("failed to spawn desktop worker thread: {error}")))?;
-    match join_handle.join() {
-        Ok(result) => result,
-        Err(_) => Err((4, "desktop worker thread panicked".to_string())),
-    }
+    run_on_current_thread()
 }
 
 fn run_on_current_thread() -> Result<(), (u8, String)> {
@@ -75,6 +52,11 @@ fn run_on_current_thread() -> Result<(), (u8, String)> {
         .map(str::parse)
         .transpose()
         .map_err(|error| (2, format!("invalid session id: {error}")))?;
+    let Some(_desktop_instance) =
+        desktop::DesktopInstanceGuard::acquire_or_notify().map_err(|error| (4, error))?
+    else {
+        return Ok(());
+    };
     let command = CliCommand::Desktop(CliDesktopArgs {
         directory: args.directory.clone(),
         session_id,

@@ -37,6 +37,7 @@ pub struct ToolContext<'a> {
     pub run_mutation_fence: RunMutationFence,
     pub prompt: &'a mut dyn ConfirmationPrompt,
     pub services: &'a ToolServices,
+    pub agent: Option<&'a crate::app::AgentRunContext>,
 }
 
 #[derive(Clone)]
@@ -141,15 +142,27 @@ impl<'a> ToolContext<'a> {
             targets,
             outside_workspace,
             risks,
+            agent_path: self
+                .agent
+                .filter(|agent| agent.is_sub_agent())
+                .map(|agent| agent.path().to_string()),
+            agent_task_name: self
+                .agent
+                .filter(|agent| agent.is_sub_agent())
+                .map(|agent| agent.task_name().to_string()),
         };
 
         if access_mode_allows_permission(self.current_access_mode(), &request) {
             return Ok(());
         }
 
-        if self.prompt.confirm(&request).map_err(|error| {
-            ToolError::Message(format!("failed to prompt for permission: {error}"))
-        })? {
+        if self
+            .prompt
+            .confirm_with_cancel(&request, &self.cancel)
+            .map_err(|error| {
+                ToolError::Message(format!("failed to prompt for permission: {error}"))
+            })?
+        {
             Ok(())
         } else {
             Err(ToolError::Message("permission denied by user".to_string()))
@@ -276,6 +289,8 @@ mod tests {
             targets: vec![Utf8PathBuf::from("C:/workspace")],
             outside_workspace: false,
             risks,
+            agent_path: None,
+            agent_task_name: None,
         }
     }
 

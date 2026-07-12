@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -17,10 +18,10 @@ use crate::session::{
     MessagePart, MessageRecord, MessageRole, NewMessage, NewPart, NewSession, PartKind, PartRecord,
     ProcessPhase, ProjectId, RunEvent, SessionId, SessionMemoryMode, SessionMemoryModeUpdate,
     SessionModelParameters, SessionRecord, SessionRepository, SessionSettingsPatch,
-    SessionSettingsUpdate, SessionStateSnapshot, SessionStatus, SessionTitleUpdate, TaskRoute,
-    ThreadGoal, ThreadGoalStatus, TodoItem, TodoKind, TodoPriority, TodoStatus, ToolCallId,
-    ToolCallPart, ToolCallRecord, ToolCallStatus, ToolResultPart, Transcript, TranscriptMessage,
-    VerificationState, validate_thread_goal_objective,
+    SessionSettingsUpdate, SessionSpawnEdge, SessionStateSnapshot, SessionStatus,
+    SessionTitleUpdate, TaskRoute, ThreadGoal, ThreadGoalStatus, TodoItem, TodoKind, TodoPriority,
+    TodoStatus, ToolCallId, ToolCallPart, ToolCallRecord, ToolCallStatus, ToolResultPart,
+    Transcript, TranscriptMessage, VerificationState, validate_thread_goal_objective,
 };
 
 pub const RUN_ADMISSION_LEASE_DURATION_MS: i64 = 15_000;
@@ -64,6 +65,179 @@ impl AdmittedTerminalCommit {
 impl SqliteSessionRepository {
     pub fn new(connection: Arc<Mutex<Connection>>) -> Self {
         Self { connection }
+    }
+
+    pub async fn insert_session_spawn_edge(
+        &self,
+        root_session_id: SessionId,
+        parent_session_id: SessionId,
+        child_session_id: SessionId,
+        agent_path: &str,
+        task_name: &str,
+    ) -> Result<SessionSpawnEdge, StorageError> {
+        let edge = SessionSpawnEdge {
+            root_session_id,
+            parent_session_id,
+            child_session_id,
+            agent_path: agent_path.to_string(),
+            task_name: task_name.to_string(),
+            created_at_ms: SystemClock::now_ms(),
+        };
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO session_spawn_edges
+             (root_session_id, parent_session_id, child_session_id, agent_path, task_name, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                edge.root_session_id.to_string(),
+                edge.parent_session_id.to_string(),
+                edge.child_session_id.to_string(),
+                edge.agent_path,
+                edge.task_name,
+                edge.created_at_ms,
+            ],
+        )?;
+        Ok(edge)
+    }
+
+    pub async fn session_spawn_edge_for_child(
+        &self,
+        child_session_id: SessionId,
+    ) -> Result<Option<SessionSpawnEdge>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT root_session_id, parent_session_id, child_session_id,
+                        agent_path, task_name, created_at_ms
+                 FROM session_spawn_edges
+                 WHERE child_session_id = ?1",
+                params![child_session_id.to_string()],
+                session_spawn_edge_from_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    pub async fn list_session_spawn_edges(
+        &self,
+        root_session_id: SessionId,
+    ) -> Result<Vec<SessionSpawnEdge>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT root_session_id, parent_session_id, child_session_id,
+                    agent_path, task_name, created_at_ms
+             FROM session_spawn_edges
+             WHERE root_session_id = ?1
+             ORDER BY created_at_ms ASC, child_session_id ASC",
+        )?;
+        statement
+            .query_map(
+                params![root_session_id.to_string()],
+                session_spawn_edge_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub async fn list_direct_child_spawn_edges(
+        &self,
+        parent_session_id: SessionId,
+    ) -> Result<Vec<SessionSpawnEdge>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT root_session_id, parent_session_id, child_session_id,
+                    agent_path, task_name, created_at_ms
+             FROM session_spawn_edges
+             WHERE parent_session_id = ?1
+             ORDER BY created_at_ms ASC, child_session_id ASC",
+        )?;
+        statement
+            .query_map(
+                params![parent_session_id.to_string()],
+                session_spawn_edge_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub async fn list_running_sessions_for_recovery(
+        &self,
+    ) -> Result<Vec<SessionRecord>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id FROM sessions
+             WHERE status IN ('running', 'awaiting_user')
+             ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC",
+        )?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+        let mut sessions = Vec::with_capacity(ids.len());
+        for value in ids {
+            sessions.push(
+                self.get_session(
+                    value
+                        .parse::<SessionId>()
+                        .map_err(|error| StorageError::Message(error.to_string()))?,
+                )
+                .await?,
+            );
+        }
+        Ok(sessions)
+    }
+
+    pub async fn delete_session_tree(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionId>, StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            params![session_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !session_exists {
+            transaction.commit()?;
+            return Ok(Vec::new());
+        }
+        let mut statement = transaction.prepare(
+            "SELECT parent_session_id, child_session_id
+             FROM session_spawn_edges
+             ORDER BY created_at_ms ASC, child_session_id ASC",
+        )?;
+        let relationships = statement
+            .query_map([], |row| {
+                Ok((
+                    parse_session_id_column(row, 0)?,
+                    parse_session_id_column(row, 1)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let mut children = HashMap::<SessionId, Vec<SessionId>>::new();
+        for (parent_session_id, child_session_id) in relationships {
+            children
+                .entry(parent_session_id)
+                .or_default()
+                .push(child_session_id);
+        }
+        let mut deleted_session_ids = Vec::new();
+        collect_session_tree_postorder(
+            session_id,
+            &children,
+            &mut HashSet::new(),
+            &mut deleted_session_ids,
+        );
+
+        for deleted_session_id in &deleted_session_ids {
+            delete_session_rows(&transaction, *deleted_session_id)?;
+        }
+        transaction.commit()?;
+        Ok(deleted_session_ids)
     }
 
     pub async fn session_is_archived(&self, session_id: SessionId) -> Result<bool, StorageError> {
@@ -115,6 +289,10 @@ impl SqliteSessionRepository {
                     archived_at_ms IS NOT NULL, memory_mode
              FROM sessions
              WHERE project_id = ?1{archived_filter}
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
              LIMIT ?2"
         );
@@ -180,6 +358,10 @@ impl SqliteSessionRepository {
                     archived_at_ms IS NOT NULL, memory_mode
              FROM sessions
              WHERE project_id = ?1{archived_filter}
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )
                AND (
                    lower(title) LIKE ?2 ESCAPE '\\'
                    OR lower(cwd_path) LIKE ?2 ESCAPE '\\'
@@ -1706,6 +1888,55 @@ impl SqliteSessionRepository {
         protocol_turn_id: TurnId,
         protocol_sequence_no: Option<i64>,
     ) -> Result<bool, StorageError> {
+        self.terminalize_active_session_with_protocol_event_inner(
+            session_id,
+            status,
+            event,
+            protocol_turn_id,
+            protocol_sequence_no,
+            false,
+        )
+        .await
+    }
+
+    /// Recovers an active session after its process owner is known to be gone.
+    ///
+    /// The caller must hold the session process lease. Unlike an external stop,
+    /// orphan recovery clears the durable run admission in the same transaction
+    /// so the recovered session can be admitted again immediately.
+    pub async fn recover_orphaned_active_session_with_protocol_event(
+        &self,
+        session_id: SessionId,
+        status: SessionStatus,
+        event: &RunEvent,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        if status == SessionStatus::AwaitingUser {
+            return Err(StorageError::Message(
+                "orphan recovery requires a terminal status".to_string(),
+            ));
+        }
+        self.terminalize_active_session_with_protocol_event_inner(
+            session_id,
+            status,
+            event,
+            protocol_turn_id,
+            protocol_sequence_no,
+            true,
+        )
+        .await
+    }
+
+    async fn terminalize_active_session_with_protocol_event_inner(
+        &self,
+        session_id: SessionId,
+        status: SessionStatus,
+        event: &RunEvent,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+        clear_run_admission: bool,
+    ) -> Result<bool, StorageError> {
         let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let status_text = match status {
             SessionStatus::Completed => "completed",
@@ -1727,19 +1958,40 @@ impl SqliteSessionRepository {
                 .map(|(_, sequence_no)| sequence_no)
                 .unwrap_or(0),
         };
-        let terminalized = transaction.execute(
-            "UPDATE sessions
-             SET status = ?2, updated_at_ms = ?3, completed_at_ms = ?3
-             WHERE id = ?1
-               AND status IN ('running', 'awaiting_user')
-               AND (active_turn_id IS NULL OR active_turn_id = ?4)",
-            params![
-                session_id.to_string(),
-                status_text,
-                now,
-                protocol_turn_id.to_string()
-            ],
-        )? == 1;
+        let terminalized = if clear_run_admission {
+            transaction.execute(
+                "UPDATE sessions
+                 SET status = ?2,
+                     updated_at_ms = ?3,
+                     completed_at_ms = ?3,
+                     active_run_id = NULL,
+                     active_turn_id = NULL,
+                     active_run_lease_expires_at_ms = NULL
+                 WHERE id = ?1
+                   AND status IN ('running', 'awaiting_user')
+                   AND (active_turn_id IS NULL OR active_turn_id = ?4)",
+                params![
+                    session_id.to_string(),
+                    status_text,
+                    now,
+                    protocol_turn_id.to_string()
+                ],
+            )?
+        } else {
+            transaction.execute(
+                "UPDATE sessions
+                 SET status = ?2, updated_at_ms = ?3, completed_at_ms = ?3
+                 WHERE id = ?1
+                   AND status IN ('running', 'awaiting_user')
+                   AND (active_turn_id IS NULL OR active_turn_id = ?4)",
+                params![
+                    session_id.to_string(),
+                    status_text,
+                    now,
+                    protocol_turn_id.to_string()
+                ],
+            )?
+        } == 1;
         if terminalized {
             if status != SessionStatus::AwaitingUser {
                 fail_unfinished_tool_calls_in_connection(
@@ -2616,6 +2868,10 @@ impl SessionRepository for SqliteSessionRepository {
             .query_row(
                 "SELECT id FROM sessions
                  WHERE project_id = ?1 AND archived_at_ms IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM session_spawn_edges
+                       WHERE child_session_id = sessions.id
+                   )
                  ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
                  LIMIT 1",
                 params![project_id.to_string()],
@@ -2660,6 +2916,10 @@ impl SessionRepository for SqliteSessionRepository {
         let sql = format!(
             "SELECT id FROM sessions
              WHERE project_id = ?1{archived_filter}
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
              LIMIT ?2"
         );
@@ -2690,6 +2950,10 @@ impl SessionRepository for SqliteSessionRepository {
         let mut statement = connection.prepare(
             "SELECT id FROM sessions
              WHERE archived_at_ms IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
              LIMIT ?1",
         )?;
@@ -2732,6 +2996,10 @@ impl SessionRepository for SqliteSessionRepository {
         let sql = format!(
             "SELECT id FROM sessions
              WHERE project_id = ?1{archived_filter}
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )
                AND (
                    lower(title) LIKE ?2 ESCAPE '\\'
                    OR lower(cwd_path) LIKE ?2 ESCAPE '\\'
@@ -2926,87 +3194,7 @@ impl SessionRepository for SqliteSessionRepository {
     }
 
     async fn delete_session(&self, id: SessionId) -> Result<(), StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let tx = connection.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM harness_replay_reports
-             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM harness_gate_results
-             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM harness_contracts
-             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM harness_artifacts
-             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM harness_events
-             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM harness_runs WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM protocol_turn_items WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM protocol_history_items WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM protocol_runtime_events WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM protocol_item_append_order WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM file_changes WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM tool_calls WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM message_parts
-             WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM session_todos WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM session_state WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM sessions WHERE id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.commit()?;
+        self.delete_session_tree(id).await?;
         Ok(())
     }
 
@@ -3302,6 +3490,132 @@ impl SessionRepository for SqliteSessionRepository {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(todos)
     }
+}
+
+fn parse_session_id_column(
+    row: &rusqlite::Row<'_>,
+    column_index: usize,
+) -> rusqlite::Result<SessionId> {
+    row.get::<_, String>(column_index)?
+        .parse::<SessionId>()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column_index,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+}
+
+fn session_spawn_edge_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSpawnEdge> {
+    Ok(SessionSpawnEdge {
+        root_session_id: parse_session_id_column(row, 0)?,
+        parent_session_id: parse_session_id_column(row, 1)?,
+        child_session_id: parse_session_id_column(row, 2)?,
+        agent_path: row.get(3)?,
+        task_name: row.get(4)?,
+        created_at_ms: row.get(5)?,
+    })
+}
+
+fn collect_session_tree_postorder(
+    session_id: SessionId,
+    children: &HashMap<SessionId, Vec<SessionId>>,
+    visited: &mut HashSet<SessionId>,
+    result: &mut Vec<SessionId>,
+) {
+    if !visited.insert(session_id) {
+        return;
+    }
+    if let Some(child_session_ids) = children.get(&session_id) {
+        for child_session_id in child_session_ids {
+            collect_session_tree_postorder(*child_session_id, children, visited, result);
+        }
+    }
+    result.push(session_id);
+}
+
+fn delete_session_rows(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+) -> Result<(), StorageError> {
+    let session_id = session_id.to_string();
+    transaction.execute(
+        "DELETE FROM harness_replay_reports
+         WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM harness_gate_results
+         WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM harness_contracts
+         WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM harness_artifacts
+         WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM harness_events
+         WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM harness_runs WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM protocol_turn_items WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM protocol_history_items WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM protocol_runtime_events WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM protocol_item_append_order WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM file_changes WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM tool_calls WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM message_parts
+         WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM messages WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM session_todos WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM session_state WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+    Ok(())
 }
 
 fn parse_status(value: &str) -> SessionStatus {
@@ -3763,6 +4077,12 @@ fn parse_tool_name(value: &str) -> crate::tool::ToolName {
         "get_goal" => crate::tool::ToolName::GetGoal,
         "create_goal" => crate::tool::ToolName::CreateGoal,
         "update_goal" => crate::tool::ToolName::UpdateGoal,
+        "spawn_agent" => crate::tool::ToolName::SpawnAgent,
+        "send_message" => crate::tool::ToolName::SendMessage,
+        "followup_task" => crate::tool::ToolName::FollowupTask,
+        "wait_agent" => crate::tool::ToolName::WaitAgent,
+        "interrupt_agent" => crate::tool::ToolName::InterruptAgent,
+        "list_agents" => crate::tool::ToolName::ListAgents,
         "invalid" => crate::tool::ToolName::Invalid,
         _ => crate::tool::ToolName::Invalid,
     }
@@ -3786,6 +4106,12 @@ fn tool_name_text(value: crate::tool::ToolName) -> &'static str {
         crate::tool::ToolName::GetGoal => "get_goal",
         crate::tool::ToolName::CreateGoal => "create_goal",
         crate::tool::ToolName::UpdateGoal => "update_goal",
+        crate::tool::ToolName::SpawnAgent => "spawn_agent",
+        crate::tool::ToolName::SendMessage => "send_message",
+        crate::tool::ToolName::FollowupTask => "followup_task",
+        crate::tool::ToolName::WaitAgent => "wait_agent",
+        crate::tool::ToolName::InterruptAgent => "interrupt_agent",
+        crate::tool::ToolName::ListAgents => "list_agents",
         crate::tool::ToolName::Invalid => "invalid",
     }
 }
@@ -3979,6 +4305,17 @@ mod tests {
             .await
             .expect("session");
         (store, session.id)
+    }
+
+    fn session_draft_from(template: &SessionRecord, title: &str) -> NewSession {
+        NewSession {
+            project_id: template.project_id,
+            title: title.to_string(),
+            cwd: template.cwd.clone(),
+            model: template.model.clone(),
+            base_url: template.base_url.clone(),
+            access_mode: template.access_mode,
+        }
     }
 
     async fn active_turn_fixture() -> (StoreBundle, SessionId, String, TurnId, MessageRecord) {
@@ -4561,6 +4898,181 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, session_id);
+    }
+
+    #[tokio::test]
+    async fn spawn_edges_preserve_explicit_child_access_but_hide_children_from_discovery() {
+        let (store, root_session_id) = test_repo().await;
+        let repo = store.session_repo();
+        let root = repo
+            .get_session(root_session_id)
+            .await
+            .expect("root session");
+        let child = repo
+            .create_session(session_draft_from(&root, "child research"))
+            .await
+            .expect("child session");
+        let grandchild = repo
+            .create_session(session_draft_from(&root, "child nested review"))
+            .await
+            .expect("grandchild session");
+        repo.insert_session_spawn_edge(root.id, root.id, child.id, "/root/research", "research")
+            .await
+            .expect("child edge");
+        repo.insert_session_spawn_edge(
+            root.id,
+            child.id,
+            grandchild.id,
+            "/root/research/review",
+            "review",
+        )
+        .await
+        .expect("grandchild edge");
+
+        let tree = repo.list_session_spawn_edges(root.id).await.expect("tree");
+        assert_eq!(tree.len(), 2);
+        assert!(tree.iter().any(|edge| edge.child_session_id == child.id));
+        assert!(
+            tree.iter()
+                .any(|edge| edge.child_session_id == grandchild.id)
+        );
+        let direct_children = repo
+            .list_direct_child_spawn_edges(root.id)
+            .await
+            .expect("direct children");
+        assert_eq!(direct_children.len(), 1);
+        assert_eq!(direct_children[0].child_session_id, child.id);
+        assert_eq!(
+            repo.session_spawn_edge_for_child(grandchild.id)
+                .await
+                .expect("edge lookup")
+                .expect("grandchild edge")
+                .agent_path,
+            "/root/research/review"
+        );
+
+        assert_eq!(
+            repo.get_session(child.id).await.expect("explicit child").id,
+            child.id
+        );
+        assert_eq!(
+            repo.latest_session(root.project_id)
+                .await
+                .expect("latest")
+                .expect("root latest")
+                .id,
+            root.id
+        );
+        assert_eq!(
+            repo.list_sessions(root.project_id, 10)
+                .await
+                .expect("list")
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![root.id]
+        );
+        assert_eq!(
+            repo.list_recent_sessions(10)
+                .await
+                .expect("recent")
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![root.id]
+        );
+        assert!(
+            repo.search_sessions(root.project_id, "child", 10, true)
+                .await
+                .expect("search")
+                .is_empty()
+        );
+        assert_eq!(
+            repo.list_sessions_with_projection_state(root.project_id, 10, true)
+                .await
+                .expect("projected list")
+                .len(),
+            1
+        );
+        assert!(
+            repo.search_sessions_with_projection_state(root.project_id, "child", 10, true)
+                .await
+                .expect("projected search")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_tree_deletes_descendants_postorder_and_preserves_other_sessions() {
+        let (store, root_session_id) = test_repo().await;
+        let repo = store.session_repo();
+        let root = repo
+            .get_session(root_session_id)
+            .await
+            .expect("root session");
+        let child = repo
+            .create_session(session_draft_from(&root, "child"))
+            .await
+            .expect("child session");
+        let grandchild = repo
+            .create_session(session_draft_from(&root, "grandchild"))
+            .await
+            .expect("grandchild session");
+        let unrelated = repo
+            .create_session(session_draft_from(&root, "unrelated"))
+            .await
+            .expect("unrelated session");
+        repo.insert_session_spawn_edge(root.id, root.id, child.id, "/root/child", "child")
+            .await
+            .expect("child edge");
+        repo.insert_session_spawn_edge(
+            root.id,
+            child.id,
+            grandchild.id,
+            "/root/child/grandchild",
+            "grandchild",
+        )
+        .await
+        .expect("grandchild edge");
+
+        let deleted = repo
+            .delete_session_tree(root.id)
+            .await
+            .expect("delete tree");
+
+        assert_eq!(deleted, vec![grandchild.id, child.id, root.id]);
+        assert!(repo.get_session(root.id).await.is_err());
+        assert!(repo.get_session(child.id).await.is_err());
+        assert!(repo.get_session(grandchild.id).await.is_err());
+        assert_eq!(
+            repo.get_session(unrelated.id)
+                .await
+                .expect("unrelated remains")
+                .id,
+            unrelated.id
+        );
+        assert!(
+            repo.list_session_spawn_edges(root.id)
+                .await
+                .expect("empty tree")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn multi_agent_tool_names_round_trip_through_storage_text() {
+        let tools = [
+            crate::tool::ToolName::SpawnAgent,
+            crate::tool::ToolName::SendMessage,
+            crate::tool::ToolName::FollowupTask,
+            crate::tool::ToolName::WaitAgent,
+            crate::tool::ToolName::InterruptAgent,
+            crate::tool::ToolName::ListAgents,
+        ];
+
+        for tool in tools {
+            assert_eq!(parse_tool_name(tool_name_text(tool)), tool);
+        }
     }
 
     #[test]

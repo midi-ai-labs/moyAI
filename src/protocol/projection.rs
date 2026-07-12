@@ -4,10 +4,11 @@ use std::str::FromStr;
 
 use crate::protocol::{
     CandidateRepairId, CandidateRepairValidity, ContentPart, FileChangeEvidence, HistoryItem,
-    HistoryItemId, HistoryItemPayload, PermissionDecision, ProjectionId, RuntimeEvent,
-    RuntimeEventId, RuntimeEventMsg, SandboxDecision, SandboxProfile, ToolLifecycleEnvelope,
-    ToolLifecycleStatus, ToolProgressEffect, ToolProposalId, TurnId, TurnItem, TurnItemId,
-    TurnItemPayload, TurnTerminalStatus, VerificationRunResult,
+    HistoryItemId, HistoryItemPayload, InterAgentCommunication, PermissionDecision, ProjectionId,
+    RuntimeEvent, RuntimeEventId, RuntimeEventMsg, SandboxDecision, SandboxProfile,
+    SubAgentActivityKind, ToolLifecycleEnvelope, ToolLifecycleStatus, ToolProgressEffect,
+    ToolProposalId, TurnId, TurnItem, TurnItemId, TurnItemPayload, TurnTerminalStatus,
+    VerificationRunResult,
 };
 use crate::runtime::SystemClock;
 use crate::session::{RunEvent, SessionId};
@@ -45,6 +46,102 @@ pub fn project_protocol_run_event(
         history_item,
         turn_item,
     })
+}
+
+pub fn project_inter_agent_communication(
+    session_id: SessionId,
+    turn_id: TurnId,
+    sequence_no: i64,
+    communication: InterAgentCommunication,
+) -> ProtocolRunEventProjection {
+    let created_at_ms = SystemClock::now_ms();
+    let history_item = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no,
+        created_at_ms,
+        payload: HistoryItemPayload::InterAgentCommunication {
+            communication: communication.clone(),
+        },
+    };
+    let turn_item = TurnItem {
+        id: TurnItemId::new(),
+        session_id,
+        turn_id,
+        source_item_id: Some(history_item.id),
+        sequence_no,
+        payload: TurnItemPayload::InterAgentCommunication {
+            communication: communication.clone(),
+        },
+    };
+    ProtocolRunEventProjection {
+        runtime_event: RuntimeEvent {
+            id: RuntimeEventId::new(),
+            session_id,
+            turn_id,
+            sequence_no,
+            created_at_ms,
+            msg: RuntimeEventMsg::InterAgentCommunicationReceived { communication },
+        },
+        history_item: Some(history_item),
+        turn_item: Some(turn_item),
+    }
+}
+
+pub fn project_sub_agent_activity(
+    session_id: SessionId,
+    turn_id: TurnId,
+    sequence_no: i64,
+    activity_id: String,
+    agent_session_id: SessionId,
+    agent_path: String,
+    activity_kind: SubAgentActivityKind,
+) -> ProtocolRunEventProjection {
+    let created_at_ms = SystemClock::now_ms();
+    let history_item = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no,
+        created_at_ms,
+        payload: HistoryItemPayload::SubAgentActivity {
+            activity_id: activity_id.clone(),
+            agent_session_id,
+            agent_path: agent_path.clone(),
+            activity_kind,
+        },
+    };
+    let turn_item = TurnItem {
+        id: TurnItemId::new(),
+        session_id,
+        turn_id,
+        source_item_id: Some(history_item.id),
+        sequence_no,
+        payload: TurnItemPayload::SubAgentActivity {
+            activity_id: activity_id.clone(),
+            agent_session_id,
+            agent_path: agent_path.clone(),
+            activity_kind,
+        },
+    };
+    ProtocolRunEventProjection {
+        runtime_event: RuntimeEvent {
+            id: RuntimeEventId::new(),
+            session_id,
+            turn_id,
+            sequence_no,
+            created_at_ms,
+            msg: RuntimeEventMsg::SubAgentActivity {
+                activity_id,
+                agent_session_id,
+                agent_path,
+                activity_kind,
+            },
+        },
+        history_item: Some(history_item),
+        turn_item: Some(turn_item),
+    }
 }
 
 pub fn filechange_item_projection_preserves_call_id_fixture_passes() -> bool {
@@ -1251,6 +1348,15 @@ fn tool_name_from_token(token: &str) -> Option<crate::tool::ToolName> {
         "docling_convert" => Some(crate::tool::ToolName::DoclingConvert),
         "mcp_call" => Some(crate::tool::ToolName::McpCall),
         "todowrite" => Some(crate::tool::ToolName::TodoWrite),
+        "get_goal" => Some(crate::tool::ToolName::GetGoal),
+        "create_goal" => Some(crate::tool::ToolName::CreateGoal),
+        "update_goal" => Some(crate::tool::ToolName::UpdateGoal),
+        "spawn_agent" => Some(crate::tool::ToolName::SpawnAgent),
+        "send_message" => Some(crate::tool::ToolName::SendMessage),
+        "followup_task" => Some(crate::tool::ToolName::FollowupTask),
+        "wait_agent" => Some(crate::tool::ToolName::WaitAgent),
+        "interrupt_agent" => Some(crate::tool::ToolName::InterruptAgent),
+        "list_agents" => Some(crate::tool::ToolName::ListAgents),
         _ => None,
     }
 }
@@ -1296,7 +1402,10 @@ fn hash_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{HistoryItemPayload, RuntimeEventMsg, TurnTerminalStatus};
+    use crate::protocol::{
+        HistoryItemAuthorityRole, HistoryItemPayload, RuntimeEventMsg, TurnItemProjectionRole,
+        TurnTerminalStatus,
+    };
     use crate::session::{RunEvent, SessionId};
 
     #[test]
@@ -1332,6 +1441,77 @@ mod tests {
             }
             other => panic!("unexpected history item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn inter_agent_communication_projects_as_visible_assistant_output() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let communication = InterAgentCommunication {
+            author: "/root/reviewer".to_string(),
+            recipient: "/root".to_string(),
+            content: "review complete".to_string(),
+            trigger_turn: false,
+        };
+
+        let projection =
+            project_inter_agent_communication(session_id, turn_id, 7, communication.clone());
+        assert!(matches!(
+            &projection.runtime_event.msg,
+            RuntimeEventMsg::InterAgentCommunicationReceived { communication: stored }
+                if stored == &communication
+        ));
+        let history = projection.history_item.expect("history item");
+        assert_eq!(
+            history.payload.authority_role(),
+            HistoryItemAuthorityRole::AssistantOutput
+        );
+        let turn = projection.turn_item.expect("turn item");
+        assert_eq!(turn.source_item_id, Some(history.id));
+        assert_eq!(
+            turn.payload.projection_role(),
+            TurnItemProjectionRole::AssistantVisibleMessage
+        );
+    }
+
+    #[test]
+    fn sub_agent_activity_projects_as_runtime_control() {
+        let session_id = SessionId::new();
+        let agent_session_id = SessionId::new();
+        let turn_id = TurnId::new();
+
+        let projection = project_sub_agent_activity(
+            session_id,
+            turn_id,
+            8,
+            "activity-1".to_string(),
+            agent_session_id,
+            "/root/reviewer".to_string(),
+            SubAgentActivityKind::Started,
+        );
+        assert!(matches!(
+            &projection.runtime_event.msg,
+            RuntimeEventMsg::SubAgentActivity {
+                activity_id,
+                agent_session_id: stored_session_id,
+                agent_path,
+                activity_kind: SubAgentActivityKind::Started,
+            } if activity_id == "activity-1"
+                && stored_session_id == &agent_session_id
+                && agent_path == "/root/reviewer"
+        ));
+        let history = projection.history_item.expect("history item");
+        assert_eq!(
+            history.payload.authority_role(),
+            HistoryItemAuthorityRole::RuntimeControl
+        );
+        let turn = projection.turn_item.expect("turn item");
+        assert_eq!(turn.source_item_id, Some(history.id));
+        assert_eq!(
+            turn.payload.projection_role(),
+            TurnItemProjectionRole::RuntimeControl
+        );
+        assert!(turn.payload.is_internal_projection_only());
     }
 
     #[test]

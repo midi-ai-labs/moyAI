@@ -1,12 +1,11 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { command } from "./api";
+import { agentActivityRowsChanged } from "./agent_activity";
 import { commandConflictState } from "./command_error";
 import type { ActionContext } from "./actions";
 import {
-  flushProviderInputMutations,
   installGlobalKeyboardShortcuts,
   prepareConfigMutation,
-  textMutationPending,
   wireEvents,
 } from "./events";
 import {
@@ -25,13 +24,19 @@ import {
 } from "./render";
 import type { DesktopWebState } from "./types";
 import { createUiLocalState } from "./ui_state";
-import { PointerRenderGate } from "./pointer_render_gate";
+import {
+  InteractionLifecycle,
+  type InteractionRelease,
+  shouldBeginKeyboardInteraction,
+  shouldBeginPointerInteraction,
+} from "./interaction_lifecycle";
 import {
   appliedProjectionRevision,
   deferredProjectionCandidatePreferred,
   projectionUpdateAccepted,
 } from "./projection_state";
 import { modalIsOpen } from "./modal_state";
+import { autoRefreshAllowed } from "./polling_state";
 import {
   beginPermissionDecision,
   failPermissionDecision,
@@ -43,9 +48,23 @@ import { escapeHtml, humanizeError } from "./utils";
 import {
   configDraftAppliesTo,
   configMutationPending,
-  reconcileConfigDraftTarget,
 } from "./config_mutation";
 import { rowMutationTargetStillMatches } from "./row_target";
+import {
+  acknowledgeDraftMutation,
+  captureDraftMutation,
+  configDraftEditOpen,
+  configDraftCommitOpen,
+  configDraftDiscardOpen,
+  configOwnerMutationOpen,
+  type DraftMutationSnapshot,
+  mutationStartsRun,
+  mutationChangesConfigOwner,
+  operationInvalidatesComposer,
+  projectViewState,
+  reconcileUiDrafts,
+  rejectDraftMutation,
+} from "./view_state";
 import "./styles.css";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -60,6 +79,7 @@ let splashTimer: number | null = null;
 const splashStartedAt = performance.now();
 const SPLASH_MIN_VISIBLE_MS = 5000;
 const THREAD_END_THRESHOLD_PX = 96;
+const INTERACTION_INACTIVITY_RECOVERY_MS = 5 * 60_000;
 const uiState = createUiLocalState();
 
 interface StateUpdate {
@@ -68,9 +88,10 @@ interface StateUpdate {
   mutationName: string | null;
   scheduleNavigation: boolean;
   sequence: number;
+  draftSnapshot: DraftMutationSnapshot | null;
 }
 
-const pointerRenderGate = new PointerRenderGate<StateUpdate>((current, candidate) =>
+const interactionLifecycle = new InteractionLifecycle<StateUpdate>((current, candidate) =>
   deferredProjectionCandidatePreferred(
     current.state.projection_revision,
     candidate.state.projection_revision,
@@ -78,17 +99,10 @@ const pointerRenderGate = new PointerRenderGate<StateUpdate>((current, candidate
     candidate.sequence,
   ),
 );
-let compositionActive = false;
-let deferredCompositionUpdate: StateUpdate | null = null;
-let renderAfterPointerRelease = false;
-const keyboardInteractionCodes = new Set<string>();
-let deferredKeyboardUpdate: StateUpdate | null = null;
-let renderAfterKeyboardRelease = false;
 let nextStateSequence = 1;
 let lastAppliedStateSequence = 0;
 let lastAppliedProjectionRevision = "0";
-let pointerGateWatchdog: number | null = null;
-let keyboardGateWatchdog: number | null = null;
+let interactionWatchdog: number | null = null;
 const modalScrollReturnStack: ScrollSnapshot[][] = [];
 const modalDetailsReturnStack: DetailSnapshot[][] = [];
 const modalFocusReturnStack: Array<FocusSnapshot | null> = [];
@@ -100,13 +114,15 @@ const appRoot = app;
 const eventContext: ActionContext = {
   desktopWindow,
   uiState,
-  getCurrentState: () => currentState,
-  setCurrentState: (state: DesktopWebState) => acceptState(state, false),
-  render,
+  getProjection: () => currentState,
+  getViewState: () => currentState ? projectViewState(currentState, uiState) : null,
+  acceptProjection: (state: DesktopWebState, shouldRender = true) => acceptState(state, shouldRender),
+  rerender: () => {
+    if (currentState) acceptState(currentState, true);
+  },
   mutate,
   recoverCommandConflict,
-  renderError,
-  flushProviderInputMutations: async () => flushProviderInputMutations(eventContext),
+  reportError,
   prepareConfigMutation: (target) => prepareConfigMutation(eventContext, target),
   submitPermissionDecision,
   setWindowMaximized,
@@ -133,28 +149,43 @@ async function refresh(): Promise<void> {
   try {
     render(await command<DesktopWebState>("desktop_state"));
   } catch (error) {
-    renderError(String(error));
+    reportError(String(error));
   } finally {
     polling = false;
   }
 }
 
 async function mutate(name: string, args?: Record<string, unknown>): Promise<void> {
-  const invalidatesPrompt = operationInvalidatesComposerTray(name);
-  if (invalidatesPrompt) {
-    uiState.promptDraftPreservationBlocked = true;
-    uiState.promptInvalidationCommandPending = true;
+  const startsRun = mutationStartsRun(name);
+  const changesConfigOwner = mutationChangesConfigOwner(name);
+  if (startsRun && uiState.runStartMutationPending) return;
+  if (changesConfigOwner && !configOwnerMutationOpen(uiState)) return;
+  if (startsRun) {
+    uiState.runStartMutationPending = true;
+    if (currentState) acceptState(currentState, true);
   }
+  if (changesConfigOwner) {
+    uiState.externalConfigMutationPending = true;
+    if (currentState) acceptState(currentState, true);
+  }
+  const draftSnapshot = captureDraftMutation(uiState, name);
   try {
     const state = await command<DesktopWebState>(name, args);
-    if (invalidatesPrompt) uiState.promptInvalidationCommandPending = false;
-    acceptState(state, true, name, true);
+    acknowledgeDraftMutation(uiState, state, name, draftSnapshot);
+    acceptState(state, true, name, true, draftSnapshot);
+    if (currentState && currentState !== state) acceptState(currentState, true);
   } catch (error) {
-    if (invalidatesPrompt) {
-      uiState.promptDraftPreservationBlocked = false;
-      uiState.promptInvalidationCommandPending = false;
+    rejectDraftMutation(uiState, name, draftSnapshot);
+    if (!recoverCommandConflict(error)) reportError(String(error));
+  } finally {
+    if (startsRun) {
+      uiState.runStartMutationPending = false;
+      if (currentState) acceptState(currentState, true);
     }
-    if (!recoverCommandConflict(error)) renderError(String(error));
+    if (changesConfigOwner) {
+      uiState.externalConfigMutationPending = false;
+      if (currentState) acceptState(currentState, true);
+    }
   }
 }
 
@@ -174,6 +205,7 @@ function acceptState(
   shouldRender: boolean,
   mutationName: string | null = null,
   scheduleNavigation = false,
+  draftSnapshot: DraftMutationSnapshot | null = null,
 ): void {
   const stateChangeRequiresRender = currentState !== null && requiresRenderForStateChange(currentState, state);
   const update: StateUpdate = {
@@ -182,6 +214,7 @@ function acceptState(
     mutationName,
     scheduleNavigation,
     sequence: nextStateSequence++,
+    draftSnapshot,
   };
   applyStateUpdate(update);
 }
@@ -204,6 +237,10 @@ function requiresRenderForStateChange(previous: DesktopWebState, state: DesktopW
     previous.token_meter_label !== state.token_meter_label ||
     previous.confirmation_visible !== state.confirmation_visible ||
     previous.confirmation_id !== state.confirmation_id ||
+    previous.confirmation?.agent_path !== state.confirmation?.agent_path ||
+    previous.confirmation?.agent_task_name !== state.confirmation?.agent_task_name ||
+    previous.composer_commit_generation !== state.composer_commit_generation ||
+    previous.agent_tree_active !== state.agent_tree_active ||
     previous.async_polling_required !== state.async_polling_required ||
     previous.provider_loading !== state.provider_loading ||
     previous.navigation_loading !== state.navigation_loading ||
@@ -226,7 +263,10 @@ function requiresRenderForStateChange(previous: DesktopWebState, state: DesktopW
     previous.artifact_preview_text !== state.artifact_preview_text ||
     previous.provider_metadata_mode !== state.provider_metadata_mode ||
     previous.provider_selected_index !== state.provider_selected_index ||
-    previous.provider_status_text !== state.provider_status_text ||
+    previous.provider_status?.kind !== state.provider_status?.kind ||
+    previous.provider_status?.title !== state.provider_status?.title ||
+    previous.provider_status?.hint !== state.provider_status?.hint ||
+    previous.provider_status?.details !== state.provider_status?.details ||
     previous.provider_selected_model_summary.join("\u0000") !== state.provider_selected_model_summary.join("\u0000") ||
     previous.provider_model_ids.join("\u0000") !== state.provider_model_ids.join("\u0000") ||
     previous.provider_apply_enabled !== state.provider_apply_enabled ||
@@ -257,6 +297,7 @@ function requiresRenderForStateChange(previous: DesktopWebState, state: DesktopW
     ) ||
     keyedRowsChanged(previous.artifact_rows, state.artifact_rows, (row) => `${row.path}:${row.action}:${row.label}`) ||
     keyedRowsChanged(previous.file_change_rows, state.file_change_rows, (row) => `${row.path}:${row.action}:${row.summary}`) ||
+    agentActivityRowsChanged(previous.agent_activity_rows ?? [], state.agent_activity_rows ?? []) ||
     keyedRowsChanged(previous.provider_models, state.provider_models, (model) => model) ||
     keyedRowsChanged(previous.config_fields, state.config_fields, (field) => `${field.key}:${field.value}:${field.env_override ?? ""}`) ||
     keyedRowsChanged(previous.attached_images, state.attached_images, (imagePath) => imagePath)
@@ -265,21 +306,6 @@ function requiresRenderForStateChange(previous: DesktopWebState, state: DesktopW
 
 function keyedRowsChanged<T>(previous: T[], state: T[], key: (value: T) => string): boolean {
   return previous.length !== state.length || previous.some((value, index) => key(value) !== key(state[index]));
-}
-
-function preferredDeferredStateUpdate(
-  current: StateUpdate | null,
-  candidate: StateUpdate,
-): StateUpdate {
-  if (!current) return candidate;
-  return deferredProjectionCandidatePreferred(
-    current.state.projection_revision,
-    candidate.state.projection_revision,
-    current.sequence,
-    candidate.sequence,
-  )
-    ? candidate
-    : current;
 }
 
 function deferredStateUpdateStillAccepted(update: StateUpdate): boolean {
@@ -301,29 +327,9 @@ function applyStateUpdate(update: StateUpdate): void {
   ) {
     return;
   }
-  if (compositionActive) {
-    deferredCompositionUpdate = preferredDeferredStateUpdate(deferredCompositionUpdate, update);
-    return;
-  }
-  if (keyboardInteractionCodes.size > 0 && update.state === currentState) {
-    renderAfterKeyboardRelease ||= update.render;
-    return;
-  }
-  if (keyboardInteractionCodes.size > 0) {
-    deferredKeyboardUpdate = preferredDeferredStateUpdate(
-      deferredKeyboardUpdate,
-      { ...update, render: true },
-    );
-    return;
-  }
-  if (pointerRenderGate.active && update.state === currentState) {
-    renderAfterPointerRelease ||= update.render;
-    return;
-  }
-  if (pointerRenderGate.defer({ ...update, render: true })) {
-    return;
-  }
-  preserveUiDrafts(update.state, update.mutationName);
+  if (interactionLifecycle.defer({ ...update, render: true }, update.state === currentState, update.render)) return;
+  const previousProjection = currentState;
+  reconcileUiDrafts(uiState, previousProjection, update.state, update.draftSnapshot);
   currentState = update.state;
   lastAppliedStateSequence = update.sequence;
   lastAppliedProjectionRevision = appliedProjectionRevision(
@@ -331,7 +337,7 @@ function applyStateUpdate(update: StateUpdate): void {
     update.state.projection_revision,
   );
   if (update.render) {
-    renderCommitted(update.state, update.mutationName);
+    renderCommitted(projectViewState(update.state, uiState), update.mutationName);
   }
   if (update.scheduleNavigation) {
     scheduleNavigationRefresh(update.state);
@@ -381,13 +387,19 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
   const nextSessionKey = state.session_rows[state.selected_session_index]?.session_id ?? state.selected_session_title;
   const previousTranscriptCount = previous?.transcript_rows.length ?? 0;
   const previousChangeCount = previous?.file_change_rows.length ?? 0;
+  const previousAgentRows = previous?.agent_activity_rows ?? [];
+  const agentRows = state.agent_activity_rows ?? [];
   const sessionChanged = nextSessionKey !== previousSessionKey;
   const contentAdvanced = state.transcript_rows.length > previousTranscriptCount || state.file_change_rows.length > previousChangeCount;
+  const agentActivityAdvanced = previous
+    ? agentActivityRowsChanged(previousAgentRows, agentRows) || (!previous.agent_tree_active && state.agent_tree_active)
+    : agentRows.length > 0;
   const runCompleted = Boolean(previous?.busy && !state.busy) || isTerminalRunStatus(state.run_status_key);
-  const shouldRevealEnd = sessionChanged || (previousThreadWasNearEnd && (state.busy || contentAdvanced || runCompleted));
-  const previousArtifactCount = (previous?.artifact_rows.length ?? 0) + (previous?.file_change_rows.length ?? 0);
-  const artifactCount = state.artifact_rows.length + state.file_change_rows.length;
-  if (previous && artifactCount > 0 && previousArtifactCount === 0 && uiState.artifactPaneCollapsed) {
+  const shouldRevealEnd = sessionChanged
+    || (previousThreadWasNearEnd && (state.busy || state.agent_tree_active || contentAdvanced || agentActivityAdvanced || runCompleted));
+  const previousOutputCount = (previous?.artifact_rows.length ?? 0) + (previous?.file_change_rows.length ?? 0) + previousAgentRows.length;
+  const outputCount = state.artifact_rows.length + state.file_change_rows.length + agentRows.length;
+  if (previous && outputCount > 0 && previousOutputCount === 0 && uiState.artifactPaneCollapsed) {
     uiState.artifactPaneCollapsed = false;
     window.localStorage.setItem("moyai.artifactPaneCollapsed", "false");
   }
@@ -396,6 +408,10 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
     attachmentTrayOpen: uiState.attachmentTrayOpen,
     configDirty: configDraftAppliesTo(uiState, state.config_target),
     configMutationPending: configMutationPending(uiState),
+    configOwnerMutationOpen: configOwnerMutationOpen(uiState),
+    configDraftEditOpen: configDraftEditOpen(uiState),
+    configDraftDiscardOpen: configDraftDiscardOpen(uiState),
+    configDraftCommitOpen: configDraftCommitOpen(uiState, state.startup.initial_setup_required),
   });
   const preservedTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
   preservedTitlebar?.remove();
@@ -426,6 +442,7 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
     }
     ${state.confirmation_visible ? renderConfirmation(state) : ""}
     ${!state.confirmation_visible && !localConfirmationPending && state.overlay !== "none" ? renderOverlay(state) : ""}
+    ${backgroundInert ? "" : renderRecoverableError()}
   `;
   const nextTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
   if (preservedTitlebar && nextTitlebar) {
@@ -467,50 +484,6 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
     requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#prompt")?.focus());
   }
   focusPromptIfRequested(state);
-  if (
-    uiState.promptDraftPreservationBlocked &&
-    !uiState.promptInvalidationCommandPending &&
-    !state.navigation_loading
-  ) {
-    uiState.promptDraftPreservationBlocked = false;
-  }
-}
-
-function preserveUiDrafts(state: DesktopWebState, mutationName: string | null): void {
-  reconcileConfigDraftTarget(uiState, state.config_target);
-  const active = document.activeElement;
-  if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
-    if (
-      active.id === "prompt" &&
-      !uiState.promptDraftPreservationBlocked &&
-      !operationInvalidatesComposerTray(mutationName)
-    ) {
-      state.draft_prompt = active.value;
-    }
-    if (active.id === "image-input") state.image_input = active.value;
-    if (active.id === "provider-url") state.provider_base_url = active.value;
-    if (active.id === "provider-context-window") state.provider_context_window = active.value;
-    if (active.id === "provider-max-output-tokens") state.provider_max_output_tokens = active.value;
-    if (active.id === "workspace-input") state.workspace_input = active.value;
-    if (active.id === "local-search") state.local_search_text = active.value;
-    if (active.id === "session-search") state.session_search_text = active.value;
-    if (active.id === "review-draft") state.review_draft_text = active.value;
-  }
-  if (currentState) {
-    if (textMutationPending("provider-url")) state.provider_base_url = currentState.provider_base_url;
-    if (textMutationPending("provider-context-window")) state.provider_context_window = currentState.provider_context_window;
-    if (textMutationPending("provider-max-output-tokens")) {
-      state.provider_max_output_tokens = currentState.provider_max_output_tokens;
-    }
-    if (textMutationPending("local-search")) state.local_search_text = currentState.local_search_text;
-    if (textMutationPending("session-search")) state.session_search_text = currentState.session_search_text;
-  }
-  if (configDraftAppliesTo(uiState, state.config_target) && state.overlay === "config") {
-    for (const field of state.config_fields) {
-      field.value = uiState.configDraftValues.get(field.key) ?? field.value;
-    }
-    state.config_value_text = state.config_fields[state.selected_config_index]?.value ?? state.config_value_text;
-  }
 }
 
 function shouldShowSplash(state: DesktopWebState, elapsedMs: number): boolean {
@@ -535,7 +508,7 @@ function reconcileUiLocalState(previous: DesktopWebState | null, state: DesktopW
   const sessionChanged = previous !== null && nextSessionKey !== previousSessionKey;
   const imagesCleared = state.attached_images.length === 0 && state.image_input.trim().length === 0;
 
-  if (sessionChanged || operationInvalidatesComposerTray(mutationName)) {
+  if (sessionChanged || operationInvalidatesComposer(mutationName)) {
     uiState.attachmentTrayOpen = false;
   }
   if (mutationName === "new_chat" || mutationName === "new_project_session") {
@@ -580,22 +553,6 @@ function focusPromptIfRequested(state: DesktopWebState): void {
   });
 }
 
-function operationInvalidatesComposerTray(name: string | null): boolean {
-  if (
-    name === "submit_prompt" ||
-    name === "send_prompt_review" ||
-    name === "select_project" ||
-    name === "select_session" ||
-    name === "select_chat_session" ||
-    name === "new_chat" ||
-    name === "new_project_session" ||
-    name === "switch_workspace"
-  ) {
-    return true;
-  }
-  return false;
-}
-
 interface FocusSnapshot {
   selector: string;
   occurrence: number;
@@ -615,7 +572,7 @@ interface DetailSnapshot {
   open: boolean;
 }
 
-const STABLE_LIST_SCROLL_SELECTORS = [".project-list", ".chat-list", ".artifact-list"];
+const STABLE_LIST_SCROLL_SELECTORS = [".project-list", ".chat-list", ".artifact-list", ".sub-agent-list"];
 const MODAL_SCROLL_SELECTORS = [".modal", ".settings-content", ".settings-nav", ".select-list"];
 
 function captureFocusSnapshot(previous: DesktopWebState | null, state: DesktopWebState): FocusSnapshot | null {
@@ -630,12 +587,24 @@ function captureCurrentFocusSnapshot(): FocusSnapshot | null {
   if (!(active instanceof HTMLElement)) {
     return null;
   }
+  const parentDetailsKey = active.tagName === "SUMMARY"
+    ? active.closest<HTMLDetailsElement>("details[data-details-key]")?.dataset.detailsKey
+    : undefined;
+  const stableHref = active instanceof HTMLAnchorElement && active.getAttribute("href")?.startsWith("#")
+    ? active.getAttribute("href")
+    : null;
   const selector = active.id
     ? `#${CSS.escape(active.id)}`
     : active.dataset.configKey
       ? `[data-config-key="${CSS.escape(active.dataset.configKey)}"]`
+      : active.dataset.focusKey
+        ? `[data-focus-key="${CSS.escape(active.dataset.focusKey)}"]`
       : active.dataset.action
         ? `[data-action="${CSS.escape(active.dataset.action)}"]`
+      : parentDetailsKey
+        ? `details[data-details-key="${CSS.escape(parentDetailsKey)}"] > summary`
+      : stableHref
+        ? `.settings-nav a[href="${CSS.escape(stableHref)}"]`
       : "";
   if (!selector) return null;
   const occurrence = Array.from(document.querySelectorAll(selector)).indexOf(active);
@@ -748,127 +717,113 @@ function installPointerRenderGate(): void {
     "pointerdown",
     (event) => {
       const target = event.target;
-      if (event.button !== 0 || !(target instanceof Element)) return;
+      if (!(target instanceof Element) || !shouldBeginPointerInteraction(event.button, appRoot.contains(target))) return;
       const directOwner = target.closest<HTMLElement>(
         'input, textarea, select, summary, [contenteditable="true"]',
       );
       const action = target.closest<HTMLElement>("[data-action]");
       const owner = directOwner ?? action;
-      if (!owner || owner.matches(":disabled")) return;
-      if (
-        !directOwner &&
-        action &&
-        target.closest("[data-modal]") &&
-        (action.classList.contains("modal-backdrop") || action.classList.contains("menu-scrim"))
-      ) {
-        return;
+      if (!interactionLifecycle.beginPointer(event.pointerId)) return;
+      if (owner && !owner.matches(":disabled")) {
+        try {
+          owner.setPointerCapture(event.pointerId);
+        } catch {
+          // Text selection, native scrollbars, and synthetic pointer events may not support capture.
+        }
       }
-      if (!pointerRenderGate.begin(event.pointerId)) return;
-      try {
-        owner.setPointerCapture(event.pointerId);
-      } catch {
-        // Some synthetic and accessibility-generated pointer events cannot be captured.
-      }
-      if (pointerGateWatchdog !== null) window.clearTimeout(pointerGateWatchdog);
-      pointerGateWatchdog = window.setTimeout(() => releasePointerRenderGate(pointerRenderGate.cancel()), 30_000);
+      armInteractionWatchdog();
     },
     true,
   );
   document.addEventListener(
     "pointerup",
-    (event) => window.setTimeout(() => releasePointerRenderGate(pointerRenderGate.end(event.pointerId)), 0),
+    (event) => window.setTimeout(() => finishInteraction(interactionLifecycle.endPointer(event.pointerId)), 0),
     true,
   );
-  document.addEventListener("pointercancel", (event) => releasePointerRenderGate(pointerRenderGate.end(event.pointerId)), true);
+  document.addEventListener("pointermove", () => {
+    if (interactionLifecycle.active) armInteractionWatchdog();
+  }, true);
+  document.addEventListener("pointercancel", (event) => finishInteraction(interactionLifecycle.endPointer(event.pointerId)), true);
   document.addEventListener(
     "lostpointercapture",
-    (event) => window.setTimeout(() => releasePointerRenderGate(pointerRenderGate.end(event.pointerId)), 0),
+    (event) => window.setTimeout(() => finishInteraction(interactionLifecycle.endPointer(event.pointerId)), 0),
     true,
   );
-  window.addEventListener("blur", () => releasePointerRenderGate(pointerRenderGate.cancel()));
+  window.addEventListener("blur", cancelInteractionLifecycle);
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) releasePointerRenderGate(pointerRenderGate.cancel());
+    if (document.hidden) cancelInteractionLifecycle();
   });
 }
 
 function installKeyboardStateGate(): void {
-  const interactiveSelector = 'button, [data-action], input, textarea, select, summary, [contenteditable="true"]';
   document.addEventListener(
     "keydown",
     (event) => {
-      if (event.isComposing || event.code === "Unidentified") return;
       const target = event.target;
       if (!(target instanceof Element)) return;
-      const owner = target.closest<HTMLElement>(interactiveSelector);
-      if (!owner || owner.matches(":disabled")) return;
-      keyboardInteractionCodes.add(event.code);
-      if (keyboardGateWatchdog !== null) window.clearTimeout(keyboardGateWatchdog);
-      keyboardGateWatchdog = window.setTimeout(cancelKeyboardStateGate, 30_000);
+      const disabledOwner = target.closest<HTMLElement>(":disabled");
+      if (!shouldBeginKeyboardInteraction(
+        event.isComposing,
+        event.code,
+        appRoot.contains(target),
+        disabledOwner !== null,
+      )) return;
+      interactionLifecycle.beginKey(event.code);
+      armInteractionWatchdog();
     },
     true,
   );
   document.addEventListener(
     "keyup",
     (event) => {
-      keyboardInteractionCodes.delete(event.code);
-      if (keyboardInteractionCodes.size === 0) window.setTimeout(releaseKeyboardStateGate, 0);
+      window.setTimeout(() => finishInteraction(interactionLifecycle.endKey(event.code)), 0);
     },
     true,
   );
-  window.addEventListener("blur", cancelKeyboardStateGate);
+  window.addEventListener("blur", cancelInteractionLifecycle);
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) cancelKeyboardStateGate();
+    if (document.hidden) cancelInteractionLifecycle();
   });
-}
-
-function cancelKeyboardStateGate(): void {
-  keyboardInteractionCodes.clear();
-  releaseKeyboardStateGate();
-}
-
-function releaseKeyboardStateGate(): void {
-  if (keyboardInteractionCodes.size > 0) return;
-  if (keyboardGateWatchdog !== null) {
-    window.clearTimeout(keyboardGateWatchdog);
-    keyboardGateWatchdog = null;
-  }
-  const deferred = deferredKeyboardUpdate;
-  deferredKeyboardUpdate = null;
-  const shouldRenderCurrent = renderAfterKeyboardRelease;
-  renderAfterKeyboardRelease = false;
-  if (deferred && deferredStateUpdateStillAccepted(deferred)) {
-    applyStateUpdate({ ...deferred, render: deferred.render || shouldRenderCurrent });
-  } else if (shouldRenderCurrent && currentState) {
-    acceptState(currentState, true);
-  }
-}
-
-function releasePointerRenderGate(deferred: StateUpdate | null): void {
-  if (pointerRenderGate.active) return;
-  if (pointerGateWatchdog !== null) {
-    window.clearTimeout(pointerGateWatchdog);
-    pointerGateWatchdog = null;
-  }
-  const shouldRenderCurrent = renderAfterPointerRelease;
-  renderAfterPointerRelease = false;
-  if (deferred && deferredStateUpdateStillAccepted(deferred)) {
-    applyStateUpdate({ ...deferred, render: deferred.render || shouldRenderCurrent });
-  } else if (shouldRenderCurrent && currentState) {
-    acceptState(currentState, true);
-  }
 }
 
 function installCompositionStateGate(): void {
   document.addEventListener("compositionstart", () => {
-    compositionActive = true;
+    interactionLifecycle.beginComposition();
+    armInteractionWatchdog();
   }, true);
   document.addEventListener("compositionend", () => {
-    compositionActive = false;
-    const deferred = deferredCompositionUpdate;
-    deferredCompositionUpdate = null;
-    if (!deferred || !deferredStateUpdateStillAccepted(deferred)) return;
-    window.setTimeout(() => applyStateUpdate({ ...deferred, render: true }), 0);
+    window.setTimeout(() => finishInteraction(interactionLifecycle.endComposition()), 0);
   }, true);
+  document.addEventListener("compositionupdate", armInteractionWatchdog, true);
+  document.addEventListener("input", (event) => {
+    if ((event as InputEvent).isComposing) armInteractionWatchdog();
+  }, true);
+  window.addEventListener("blur", cancelInteractionLifecycle);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) cancelInteractionLifecycle();
+  });
+}
+
+function armInteractionWatchdog(): void {
+  if (interactionWatchdog !== null) window.clearTimeout(interactionWatchdog);
+  interactionWatchdog = window.setTimeout(cancelInteractionLifecycle, INTERACTION_INACTIVITY_RECOVERY_MS);
+}
+
+function cancelInteractionLifecycle(): void {
+  finishInteraction(interactionLifecycle.cancel());
+}
+
+function finishInteraction(release: InteractionRelease<StateUpdate> | null): void {
+  if (!release) return;
+  if (interactionWatchdog !== null) {
+    window.clearTimeout(interactionWatchdog);
+    interactionWatchdog = null;
+  }
+  if (release.deferred && deferredStateUpdateStillAccepted(release.deferred)) {
+    applyStateUpdate({ ...release.deferred, render: release.deferred.render || release.renderCurrent });
+  } else if (release.renderCurrent && currentState) {
+    acceptState(currentState, true);
+  }
 }
 
 async function submitPermissionDecision(allow: boolean): Promise<void> {
@@ -970,7 +925,7 @@ function restoreThreadPosition(thread: HTMLElement, scrollTop: number): void {
 }
 
 function shouldAutoRefresh(state: DesktopWebState): boolean {
-  return !state.confirmation_visible && (state.navigation_loading || !shouldDeferAutoRefresh());
+  return autoRefreshAllowed(state, shouldDeferAutoRefresh());
 }
 
 function scheduleNavigationRefresh(state: DesktopWebState): void {
@@ -985,11 +940,16 @@ function scheduleNavigationRefresh(state: DesktopWebState): void {
 }
 
 function shouldDeferAutoRefresh(): boolean {
-  return pointerRenderGate.active || compositionActive;
+  return interactionLifecycle.active;
 }
 
-function renderError(message: string): void {
+function reportError(message: string): void {
   const error = humanizeError(message);
+  if (currentState) {
+    uiState.recoverableError = error;
+    acceptState(currentState, true);
+    return;
+  }
   appRoot.innerHTML = `
     <div class="fatal">
       <h1>moyAI Desktop</h1>
@@ -1000,4 +960,18 @@ function renderError(message: string): void {
         <pre>${escapeHtml(error.details)}</pre>
       </details>
     </div>`;
+}
+
+function renderRecoverableError(): string {
+  const error = uiState.recoverableError;
+  if (!error) return "";
+  return `
+    <aside class="ui-error-notice" role="status" aria-live="polite">
+      <div>
+        <strong>${escapeHtml(error.title)}</strong>
+        <span>${escapeHtml(error.hint)}</span>
+        ${error.details.trim().length > 0 ? `<details data-details-key="recoverable-error-details"><summary data-focus-key="recoverable-error-summary">技術詳細</summary><pre>${escapeHtml(error.details)}</pre></details>` : ""}
+      </div>
+      <button class="icon-button" data-action="dismiss-ui-error" title="閉じる" aria-label="閉じる">×</button>
+    </aside>`;
 }

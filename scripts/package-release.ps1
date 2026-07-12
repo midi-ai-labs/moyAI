@@ -264,6 +264,14 @@ stream_idle_timeout_ms = 300000
 [permissions]
 access_mode = "auto_review"
 
+[multi_agent]
+enabled = false
+mode = "explicit_request_only"
+# This profile has one child level; only the root can spawn.
+# Root-inclusive number of simultaneously active agents. Completed agents remain available without consuming an active slot.
+max_concurrent_agents = 4
+max_concurrent_model_requests = 1
+
 [docling]
 enabled = false
 base_url = "http://127.0.0.1:8123"
@@ -291,6 +299,7 @@ This release module contains the Windows CLI and Tauri Desktop binaries.
 - Thin agent core with a short Markdown prompt, plain tool results, and a small state surface.
 - Desktop GUI, CLI, and TUI entrypoints over the same Rust core.
 - Local-first LM Studio / OpenAI-compatible endpoint configuration.
+- Optional root-scoped multi-agent collaboration with separate child sessions and visible Desktop activity.
 - Workspace file editing, patching, search, directory inspection, shell execution, session history, and Markdown export.
 - Codex-compatible goal runtime with `/goal`, goal tools, request-local steering, status accounting, and bounded idle continuation.
 - Codex 2026-07 context handling updates: workspace world-state context, local instruction discovery, local `SKILL.md` snapshot reuse, and the `current_time` tool.

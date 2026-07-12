@@ -102,6 +102,10 @@ impl<T: PartialEq> LatestRequestTracker<T> {
         }
     }
 
+    pub fn is_pending(&self) -> bool {
+        self.latest.is_some()
+    }
+
     pub fn clear(&mut self) {
         self.latest = None;
     }
@@ -309,12 +313,15 @@ mod tests {
     #[test]
     fn latest_request_tracker_rejects_stale_generation_and_wrong_target() {
         let mut tracker = LatestRequestTracker::default();
+        assert!(!tracker.is_pending());
         let first = tracker.begin("workspace-a".to_string());
         let latest = tracker.begin("workspace-b".to_string());
+        assert!(tracker.is_pending());
 
         assert!(!tracker.finish_if_current(first, &"workspace-a".to_string()));
         assert!(!tracker.finish_if_current(latest, &"workspace-a".to_string()));
         assert!(tracker.finish_if_current(latest, &"workspace-b".to_string()));
+        assert!(!tracker.is_pending());
         assert!(!tracker.finish_if_current(latest, &"workspace-b".to_string()));
 
         let abandoned = tracker.begin("workspace-a".to_string());

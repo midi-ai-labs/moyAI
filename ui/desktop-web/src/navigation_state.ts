@@ -1,11 +1,9 @@
 export interface NavigationAdmissionState {
-  busy: boolean;
-  background_mutation_pending: boolean;
-  navigation_loading: boolean;
+  navigation_admission_open: boolean;
 }
 
 export function navigationIsIdle(state: NavigationAdmissionState): boolean {
-  return !state.busy && !state.background_mutation_pending && !state.navigation_loading;
+  return state.navigation_admission_open;
 }
 
 export function sessionActionIndex(selectedIndex: number, payloadIndex: number): number {

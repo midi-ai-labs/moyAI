@@ -10,8 +10,9 @@ use crate::config::merge::apply_patch;
 use crate::config::model::{
     AccessMode, PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig,
     PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig,
-    PartialModelConfig, PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig,
-    PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig, ResolvedConfig,
+    PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig,
+    PartialSessionConfig, PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig,
+    ResolvedConfig,
 };
 use crate::error::ConfigError;
 
@@ -139,6 +140,12 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             max_steps_per_turn: Some(config.session.max_steps_per_turn),
             overflow_margin_tokens: Some(config.session.overflow_margin_tokens),
         }),
+        multi_agent: Some(PartialMultiAgentConfig {
+            enabled: Some(config.multi_agent.enabled),
+            mode: Some(config.multi_agent.mode),
+            max_concurrent_agents: Some(config.multi_agent.max_concurrent_agents),
+            max_concurrent_model_requests: Some(config.multi_agent.max_concurrent_model_requests),
+        }),
         permissions: Some(PartialPermissionsConfig {
             access_mode: Some(config.permissions.access_mode),
             additional_read_roots: Some(config.permissions.additional_read_roots.clone()),
@@ -214,6 +221,32 @@ fn env_patch() -> PartialResolvedConfig {
         if let Some(parsed) = parse_access_mode(&value) {
             patch.permissions.get_or_insert_default().access_mode = Some(parsed);
         }
+    }
+    if let Ok(value) = env::var("MOYAI_MULTI_AGENT_ENABLED")
+        && let Ok(parsed) = value.parse()
+    {
+        patch.multi_agent.get_or_insert_default().enabled = Some(parsed);
+    }
+    if let Ok(value) = env::var("MOYAI_MULTI_AGENT_MODE")
+        && let Some(parsed) = crate::config::MultiAgentMode::parse(&value)
+    {
+        patch.multi_agent.get_or_insert_default().mode = Some(parsed);
+    }
+    if let Ok(value) = env::var("MOYAI_MULTI_AGENT_MAX_AGENTS")
+        && let Ok(parsed) = value.parse::<usize>()
+    {
+        patch
+            .multi_agent
+            .get_or_insert_default()
+            .max_concurrent_agents = Some(parsed.max(1));
+    }
+    if let Ok(value) = env::var("MOYAI_MULTI_AGENT_MAX_MODEL_REQUESTS")
+        && let Ok(parsed) = value.parse::<usize>()
+    {
+        patch
+            .multi_agent
+            .get_or_insert_default()
+            .max_concurrent_model_requests = Some(parsed.max(1));
     }
     if let Ok(value) = env::var("MOYAI_SHELL_HIDE_WINDOWS") {
         if let Ok(parsed) = value.parse() {

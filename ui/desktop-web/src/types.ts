@@ -60,6 +60,27 @@ export interface FileChangeRow {
   summary: string;
 }
 
+export type AgentStatus =
+  | "pending_init"
+  | "running"
+  | "interrupted"
+  | "completed"
+  | "errored"
+  | "shutdown"
+  | "not_found";
+
+export interface AgentActivityRow {
+  agent_path: string;
+  session_id: RowId;
+  task_name: string;
+  task_preview: string;
+  status: AgentStatus;
+  current_activity: string;
+  result_preview: string;
+  started_order: number;
+  updated: boolean;
+}
+
 export type RunStatusKey = "idle" | "running" | "confirming" | "completed" | "awaiting_user" | "cancelled" | "failed";
 
 export interface PermissionProjection {
@@ -68,6 +89,8 @@ export interface PermissionProjection {
   targets: string[];
   outside_workspace: boolean;
   risks: string[];
+  agent_path?: string | null;
+  agent_task_name?: string | null;
 }
 
 export interface StartupCheckProjection {
@@ -91,12 +114,40 @@ export interface ConfigFieldProjection {
   key: string;
   value: string;
   env_override: string | null;
+  value_type: "string" | "boolean" | "integer" | "number" | "json" | "enum" | string;
+  required: boolean;
+  min_value: number | null;
+  max_value: number | null;
+  options: string[];
 }
 
 export interface ConfigMutationTarget {
   workspacePath: string;
   sessionId: string | null;
   configGeneration: number;
+}
+
+export interface AccessModeMutationTarget extends ConfigMutationTarget {
+  accessMode: "default" | "auto_review" | "full_access";
+  runtimeOwnerToken: string;
+  configOwnerMutationOpen: boolean;
+}
+
+export interface DraftActionTarget {
+  workspacePath: string;
+  sessionId: string | null;
+}
+
+export interface SessionSearchTarget {
+  workspacePath: string;
+  projectId: string | null;
+}
+
+export interface ProviderStatusProjection {
+  kind: "idle" | "loading" | "success" | "warning" | "error";
+  title: string;
+  hint: string;
+  details: string;
 }
 
 export interface RowMutationTarget {
@@ -112,6 +163,12 @@ export interface DesktopWebState {
   provider_label: string;
   model_label: string;
   access_label: string;
+  access_target: AccessModeMutationTarget;
+  access_mode_mutation_enabled: boolean;
+  config_owner_mutation_open: boolean;
+  config_draft_dirty: boolean;
+  config_draft_discard_enabled: boolean;
+  config_draft_commit_enabled: boolean;
   current_session_label: string;
   selected_session_title: string;
   status_message: string;
@@ -131,6 +188,8 @@ export interface DesktopWebState {
   confirmation_text: string;
   confirmation: PermissionProjection | null;
   startup: StartupProjection;
+  composer_commit_generation: string;
+  draft_target: DraftActionTarget;
   draft_prompt: string;
   image_input: string;
   attached_images: string[];
@@ -139,6 +198,7 @@ export interface DesktopWebState {
   async_polling_required: boolean;
   pending_async_operations: string[];
   navigation_loading: boolean;
+  navigation_admission_open: boolean;
   post_run_refresh_pending: boolean;
   background_mutation_pending: boolean;
   overlay: string;
@@ -161,17 +221,21 @@ export interface DesktopWebState {
   artifact_preview_text: string;
   file_change_rows: FileChangeRow[];
   file_change_summary_text: string;
+  agent_activity_rows: AgentActivityRow[];
+  agent_tree_active: boolean;
   local_search_text: string;
   local_search_results_text: string;
   command_rows: Array<{ name: string; label: string; path: string }>;
   provider_base_url: string;
   provider_metadata_mode: "lm_studio_native_required" | "openai_compatible_only";
+  provider_catalog_base_url: string | null;
+  provider_catalog_metadata_mode: "lm_studio_native_required" | "openai_compatible_only" | null;
   provider_context_window: string;
   provider_max_output_tokens: string;
   provider_models: string[];
   provider_model_ids: string[];
   provider_selected_index: number;
-  provider_status_text: string;
+  provider_status: ProviderStatusProjection;
   provider_selected_model_summary: string[];
   provider_loading: boolean;
   provider_apply_enabled: boolean;

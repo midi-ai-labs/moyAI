@@ -24,6 +24,12 @@ pub enum ToolName {
     GetGoal,
     CreateGoal,
     UpdateGoal,
+    SpawnAgent,
+    SendMessage,
+    FollowupTask,
+    WaitAgent,
+    InterruptAgent,
+    ListAgents,
     Invalid,
 }
 
@@ -48,6 +54,12 @@ impl std::fmt::Display for ToolName {
             ToolName::GetGoal => "get_goal",
             ToolName::CreateGoal => "create_goal",
             ToolName::UpdateGoal => "update_goal",
+            ToolName::SpawnAgent => "spawn_agent",
+            ToolName::SendMessage => "send_message",
+            ToolName::FollowupTask => "followup_task",
+            ToolName::WaitAgent => "wait_agent",
+            ToolName::InterruptAgent => "interrupt_agent",
+            ToolName::ListAgents => "list_agents",
             ToolName::Invalid => "invalid",
         };
         write!(f, "{value}")
@@ -87,6 +99,10 @@ pub struct PermissionRequest {
     pub targets: Vec<Utf8PathBuf>,
     pub outside_workspace: bool,
     pub risks: Vec<PermissionRisk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_task_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

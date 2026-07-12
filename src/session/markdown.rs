@@ -63,7 +63,8 @@ pub fn history_items_to_markdown(
             HistoryItemPayload::Message {
                 role: MessageRole::Assistant,
                 ..
-            } => {
+            }
+            | HistoryItemPayload::InterAgentCommunication { .. } => {
                 let mut body = String::new();
                 push_history_payload(&mut body, &item.payload);
                 events.push(MarkdownExportEvent::assistant(body));
@@ -483,6 +484,7 @@ fn push_history_item(output: &mut String, item: &HistoryItem) {
             MessageRole::User => "User",
             MessageRole::Assistant => "Assistant",
         }),
+        HistoryItemPayload::InterAgentCommunication { .. } => Some("Assistant"),
         _ => None,
     };
     if let Some(role) = role {
@@ -520,6 +522,8 @@ fn history_item_detail_title(item: &HistoryItem) -> &'static str {
         HistoryItemPayload::ApprovalDecision { .. } => "Approval Decision",
         HistoryItemPayload::RetryDecision { .. } => "Retry Decision",
         HistoryItemPayload::ControlEnvelope { .. } => "Control Envelope",
+        HistoryItemPayload::InterAgentCommunication { .. } => "Sub-agent Message",
+        HistoryItemPayload::SubAgentActivity { .. } => "Sub-agent Activity",
         HistoryItemPayload::Compaction { .. } => "Compaction",
         HistoryItemPayload::Error { .. } => "Error",
         HistoryItemPayload::UserTurn { .. }
@@ -721,6 +725,32 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
         }
         HistoryItemPayload::Message { content, .. } => {
             push_content_parts(output, content);
+        }
+        HistoryItemPayload::InterAgentCommunication { communication } => {
+            output.push_str("### Sub-agent Message\n\n");
+            push_metadata_line(output, "Author", &communication.author);
+            push_metadata_line(output, "Recipient", &communication.recipient);
+            push_metadata_line(
+                output,
+                "Trigger turn",
+                &communication.trigger_turn.to_string(),
+            );
+            output.push('\n');
+            output.push_str(&communication.content);
+            output.push_str("\n\n");
+        }
+        HistoryItemPayload::SubAgentActivity {
+            activity_id,
+            agent_session_id,
+            agent_path,
+            activity_kind,
+        } => {
+            output.push_str("### Sub-agent Activity\n\n");
+            push_metadata_line(output, "Activity ID", activity_id);
+            push_metadata_line(output, "Agent Session ID", &agent_session_id.to_string());
+            push_metadata_line(output, "Agent path", agent_path);
+            push_metadata_line(output, "Activity", &format!("{activity_kind:?}"));
+            output.push('\n');
         }
         HistoryItemPayload::Error { message, .. } => {
             output.push_str("### Error\n\n");
@@ -1181,7 +1211,9 @@ mod tests {
 
     use super::*;
     use crate::config::AccessMode;
-    use crate::protocol::{ContentPart, HistoryItemId, TurnId};
+    use crate::protocol::{
+        ContentPart, HistoryItemId, InterAgentCommunication, SubAgentActivityKind, TurnId,
+    };
     use crate::session::{
         ProjectId, SessionId, SessionModelParameters, SessionRecord, SessionStatus,
     };
@@ -1206,6 +1238,48 @@ mod tests {
             older_position < newer_position,
             "markdown export must preserve canonical input order"
         );
+    }
+
+    #[test]
+    fn history_markdown_renders_agent_message_and_activity_without_reasoning() {
+        let session = test_session();
+        let turn_id = TurnId::new();
+        let communication = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: session.id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 100,
+            payload: HistoryItemPayload::InterAgentCommunication {
+                communication: InterAgentCommunication {
+                    author: "/root/reviewer".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "review complete".to_string(),
+                    trigger_turn: false,
+                },
+            },
+        };
+        let activity = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: session.id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 101,
+            payload: HistoryItemPayload::SubAgentActivity {
+                activity_id: "activity-1".to_string(),
+                agent_session_id: SessionId::new(),
+                agent_path: "/root/reviewer".to_string(),
+                activity_kind: SubAgentActivityKind::Interacted,
+            },
+        };
+
+        let markdown = history_items_to_markdown(&session, &[communication, activity]);
+
+        assert!(markdown.contains("### Sub-agent Message"));
+        assert!(markdown.contains("review complete"));
+        assert!(markdown.contains("### Sub-agent Activity"));
+        assert!(markdown.contains("activity-1"));
+        assert!(!markdown.contains("### Reasoning"));
     }
 
     fn message_item(

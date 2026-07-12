@@ -6,10 +6,10 @@ use tempfile::NamedTempFile;
 
 use crate::config::loader::global_config_path;
 use crate::config::model::{
-    AccessMode, McpServerConfig, PartialDoclingConfig, PartialFileGuardConfig,
-    PartialInspectionConfig, PartialMcpConfig, PartialModelConfig, PartialPermissionsConfig,
-    PartialResolvedConfig, PartialSessionConfig, PartialShellConfig, PromptProfile,
-    ProviderMetadataMode, ResolvedConfig,
+    AccessMode, McpServerConfig, MultiAgentMode, PartialDoclingConfig, PartialFileGuardConfig,
+    PartialInspectionConfig, PartialMcpConfig, PartialModelConfig, PartialMultiAgentConfig,
+    PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig, PartialShellConfig,
+    PromptProfile, ProviderMetadataMode, ResolvedConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,10 @@ pub enum ConfigField {
     PromptProfile,
     ProviderMetadataMode,
     AccessMode,
+    MultiAgentEnabled,
+    MultiAgentMode,
+    MultiAgentMaxAgents,
+    MultiAgentMaxModelRequests,
     Temperature,
     TopP,
     TopK,
@@ -66,12 +70,16 @@ pub enum ConfigField {
 }
 
 impl ConfigField {
-    pub const ALL: [ConfigField; 43] = [
+    pub const ALL: [ConfigField; 47] = [
         ConfigField::BaseUrl,
         ConfigField::Model,
         ConfigField::PromptProfile,
         ConfigField::ProviderMetadataMode,
         ConfigField::AccessMode,
+        ConfigField::MultiAgentEnabled,
+        ConfigField::MultiAgentMode,
+        ConfigField::MultiAgentMaxAgents,
+        ConfigField::MultiAgentMaxModelRequests,
         ConfigField::Temperature,
         ConfigField::TopP,
         ConfigField::TopK,
@@ -119,6 +127,10 @@ impl ConfigField {
             ConfigField::PromptProfile => "model.prompt_profile",
             ConfigField::ProviderMetadataMode => "model.provider_metadata_mode",
             ConfigField::AccessMode => "permissions.access_mode",
+            ConfigField::MultiAgentEnabled => "multi_agent.enabled",
+            ConfigField::MultiAgentMode => "multi_agent.mode",
+            ConfigField::MultiAgentMaxAgents => "multi_agent.max_concurrent_agents",
+            ConfigField::MultiAgentMaxModelRequests => "multi_agent.max_concurrent_model_requests",
             ConfigField::Temperature => "model.temperature",
             ConfigField::TopP => "model.top_p",
             ConfigField::TopK => "model.top_k",
@@ -171,6 +183,10 @@ impl ConfigField {
             ConfigField::PromptProfile => Some("MOYAI_PROMPT_PROFILE"),
             ConfigField::ProviderMetadataMode => Some("MOYAI_PROVIDER_METADATA_MODE"),
             ConfigField::AccessMode => Some("MOYAI_ACCESS_MODE"),
+            ConfigField::MultiAgentEnabled => Some("MOYAI_MULTI_AGENT_ENABLED"),
+            ConfigField::MultiAgentMode => Some("MOYAI_MULTI_AGENT_MODE"),
+            ConfigField::MultiAgentMaxAgents => Some("MOYAI_MULTI_AGENT_MAX_AGENTS"),
+            ConfigField::MultiAgentMaxModelRequests => Some("MOYAI_MULTI_AGENT_MAX_MODEL_REQUESTS"),
             ConfigField::Temperature => Some("MOYAI_TEMPERATURE"),
             ConfigField::TopP => Some("MOYAI_TOP_P"),
             ConfigField::TopK => Some("MOYAI_TOP_K"),
@@ -403,6 +419,7 @@ fn parse_editor_patch_matching(
     let mut patch = PartialResolvedConfig::default();
     let mut model = PartialModelConfig::default();
     let mut permissions = PartialPermissionsConfig::default();
+    let mut multi_agent = PartialMultiAgentConfig::default();
     let mut session = PartialSessionConfig::default();
     let mut shell = PartialShellConfig::default();
     let mut inspection = PartialInspectionConfig::default();
@@ -435,6 +452,19 @@ fn parse_editor_patch_matching(
                     Some(value) => Some(parse_access_mode(&value)?),
                     None => None,
                 }
+            }
+            ConfigField::MultiAgentEnabled => multi_agent.enabled = parse_bool(text)?,
+            ConfigField::MultiAgentMode => {
+                multi_agent.mode = match parse_string(text) {
+                    Some(value) => Some(parse_multi_agent_mode(&value)?),
+                    None => None,
+                }
+            }
+            ConfigField::MultiAgentMaxAgents => {
+                multi_agent.max_concurrent_agents = parse_number(text)?
+            }
+            ConfigField::MultiAgentMaxModelRequests => {
+                multi_agent.max_concurrent_model_requests = parse_number(text)?
             }
             ConfigField::Temperature => model.temperature = parse_number(text)?,
             ConfigField::TopP => model.top_p = parse_number(text)?,
@@ -529,6 +559,7 @@ fn parse_editor_patch_matching(
 
     patch.model = Some(model);
     patch.permissions = Some(permissions);
+    patch.multi_agent = Some(multi_agent);
     patch.session = Some(session);
     patch.shell = Some(shell);
     patch.inspection = Some(inspection);
@@ -570,6 +601,11 @@ fn parse_access_mode(value: &str) -> Result<AccessMode, String> {
         "full_access" | "full-access" | "full" => Ok(AccessMode::FullAccess),
         other => Err(format!("unsupported access_mode `{other}`")),
     }
+}
+
+fn parse_multi_agent_mode(value: &str) -> Result<MultiAgentMode, String> {
+    MultiAgentMode::parse(&value.to_ascii_lowercase())
+        .ok_or_else(|| format!("unsupported multi_agent.mode `{value}`"))
 }
 
 fn parse_string(value: &str) -> Option<String> {
@@ -634,6 +670,12 @@ fn field_value(key: ConfigField, config: &ResolvedConfig) -> String {
             AccessMode::AutoReview => "auto_review".to_string(),
             AccessMode::FullAccess => "full_access".to_string(),
         },
+        ConfigField::MultiAgentEnabled => config.multi_agent.enabled.to_string(),
+        ConfigField::MultiAgentMode => config.multi_agent.mode.as_str().to_string(),
+        ConfigField::MultiAgentMaxAgents => config.multi_agent.max_concurrent_agents.to_string(),
+        ConfigField::MultiAgentMaxModelRequests => {
+            config.multi_agent.max_concurrent_model_requests.to_string()
+        }
         ConfigField::Temperature => config
             .model
             .temperature

@@ -1,19 +1,30 @@
-import { command } from "./api";
+import { command } from "./api.ts";
 import {
   beginConfigMutation,
+  configMutationPending,
+  discardConfigDraft,
   finishConfigMutation,
   type ConfigValueInput,
-} from "./config_mutation";
-import { finishLocalDecision } from "./decision_state";
+} from "./config_mutation.ts";
+import { finishLocalDecision } from "./decision_state.ts";
 import {
   navigationIsIdle,
   sessionMemoryActions,
   sessionActionIndex,
   sessionRowActionAvailable,
-} from "./navigation_state";
-import { rowMutationArgs } from "./row_target";
-import type { ConfigMutationTarget, DesktopWebState, ProjectRow, SessionRow } from "./types";
-import { setArtifactPaneCollapsed, type UiLocalState } from "./ui_state";
+} from "./navigation_state.ts";
+import { rowMutationArgs } from "./row_target.ts";
+import { runCanBeCancelled } from "./run_control.ts";
+import type { ConfigMutationTarget, DesktopWebState, ProjectRow, SessionRow } from "./types.ts";
+import { setArtifactPaneCollapsed, type UiLocalState } from "./ui_state.ts";
+import {
+  composerCapabilities,
+  configDraftCommitOpen,
+  configDraftDiscardOpen,
+  draftMutationTarget,
+  providerCapabilities,
+  providerDraftPayload,
+} from "./view_state.ts";
 
 export type ActionMenu = "file" | "edit" | "view" | "help";
 
@@ -30,13 +41,13 @@ export interface ActionContext {
     startDragging: () => Promise<void>;
   };
   uiState: UiLocalState;
-  getCurrentState: () => DesktopWebState | null;
-  setCurrentState: (state: DesktopWebState) => void;
-  render: (state: DesktopWebState) => void;
+  getProjection: () => DesktopWebState | null;
+  getViewState: () => DesktopWebState | null;
+  acceptProjection: (state: DesktopWebState, render?: boolean) => void;
+  rerender: () => void;
   mutate: (name: string, args?: Record<string, unknown>) => Promise<void>;
   recoverCommandConflict: (error: unknown) => boolean;
-  renderError: (message: string) => void;
-  flushProviderInputMutations: () => Promise<void>;
+  reportError: (message: string) => void;
   prepareConfigMutation: (target: ConfigMutationTarget) => ConfigValueInput[] | null;
   submitPermissionDecision: (allow: boolean) => Promise<void>;
   setWindowMaximized: (maximized: boolean) => void;
@@ -57,7 +68,7 @@ function always(): boolean {
 }
 
 async function runWithoutRender(name: string, context: ActionContext): Promise<void> {
-  context.setCurrentState(await command<DesktopWebState>(name));
+  context.acceptProjection(await command<DesktopWebState>(name), false);
 }
 
 function selectedSessionAvailable(state: DesktopWebState): boolean {
@@ -129,12 +140,14 @@ async function runConfigMutation(
   name: "apply_session_config" | "save_global_config",
   context: ActionContext,
 ): Promise<void> {
-  const current = context.getCurrentState();
+  if (configMutationPending(context.uiState)) return;
+  const current = context.getViewState();
   if (!current) return;
+  if (!configDraftCommitOpen(context.uiState, current.startup.initial_setup_required)) return;
   const values = context.prepareConfigMutation(current.config_target);
   if (!values) return;
   const request = beginConfigMutation(context.uiState, current.config_target);
-  if (current) context.render(current);
+  context.rerender();
   let state: DesktopWebState;
   let succeeded: boolean;
   try {
@@ -143,17 +156,15 @@ async function runConfigMutation(
       expectedTarget: request.target,
     });
   } catch (error) {
-    const finished = finishConfigMutation(context.uiState, request, false, context.getCurrentState()?.config_target ?? null);
+    const finished = finishConfigMutation(context.uiState, request, false, context.getViewState()?.config_target ?? null);
     if (context.recoverCommandConflict(error)) return;
     if (!finished) return;
-    const latest = context.getCurrentState();
-    if (latest) context.render(latest);
-    context.renderError(String(error));
+    context.rerender();
+    context.reportError(String(error));
     return;
   }
-  if (!finishConfigMutation(context.uiState, request, succeeded, context.getCurrentState()?.config_target ?? null)) return;
-  context.setCurrentState(state);
-  context.render(state);
+  if (!finishConfigMutation(context.uiState, request, succeeded, context.getViewState()?.config_target ?? null)) return;
+  context.acceptProjection(state);
 }
 
 async function runSessionRowMutation(
@@ -183,10 +194,6 @@ function canSubmit(state: DesktopWebState): boolean {
   return state.can_submit;
 }
 
-function canCancel(state: DesktopWebState): boolean {
-  return state.busy || state.confirmation_visible;
-}
-
 export const ACTIONS: ActionDefinition[] = [
   {
     id: "send",
@@ -194,13 +201,16 @@ export const ACTIONS: ActionDefinition[] = [
     shortcut: "Ctrl+Enter",
     palette: true,
     enabled: canSubmit,
-    run: (_state, context) => context.mutate("submit_prompt"),
+    run: (state, context) => context.mutate("submit_prompt", {
+      text: state.draft_prompt,
+      expectedTarget: draftMutationTarget(state),
+    }),
   },
   {
     id: "cancel-run",
     label: "実行停止",
     palette: true,
-    enabled: canCancel,
+    enabled: runCanBeCancelled,
     run: (_state, context) => context.mutate("cancel_run"),
   },
   {
@@ -282,30 +292,54 @@ export const ACTIONS: ActionDefinition[] = [
     menu: "edit",
     palette: true,
     enabled: (state) => state.enhance_enabled,
-    run: (_state, context) => context.mutate("enhance_prompt"),
+    run: (state, context) => context.mutate("enhance_prompt", {
+      text: state.draft_prompt,
+      expectedTarget: draftMutationTarget(state),
+    }),
   },
   {
     id: "review-uncommitted",
     label: "未コミット差分をレビュー",
     palette: true,
-    enabled: (state) => !state.busy && !state.navigation_loading && state.draft_prompt.trim().length > 0,
-    run: (_state, context) => context.mutate("review_uncommitted"),
+    enabled: (state) => composerCapabilities(state, state.draft_prompt).canReviewUncommitted,
+    run: (state, context) => context.mutate("review_uncommitted", {
+      text: state.draft_prompt,
+      expectedTarget: draftMutationTarget(state),
+    }),
   },
   {
     id: "toggle-access",
     label: "アクセスモード切替",
     shortcut: "F8",
     palette: true,
-    enabled: always,
-    run: (_state, context) => context.mutate("toggle_access_mode"),
+    enabled: (state) => state.access_mode_mutation_enabled,
+    run: (state, context) => context.mutate("toggle_access_mode", {
+      expectedTarget: state.access_target,
+    }),
+  },
+  {
+    id: "discard-config-draft",
+    label: "設定の変更を破棄",
+    enabled: (state) => state.config_draft_discard_enabled,
+    run: (_state, context) => {
+      if (!configDraftDiscardOpen(context.uiState)) return;
+      discardConfigDraft(context.uiState);
+      context.rerender();
+    },
   },
   {
     id: "toggle-session-archived-search",
     label: "アーカイブ済みを含める",
     shortcut: "Ctrl+I",
     palette: true,
-    enabled: always,
-    run: (state, context) => context.mutate("set_session_search_include_archived", { includeArchived: !state.session_search_include_archived }),
+    enabled: navigationIsIdle,
+    run: (state, context) => context.mutate("set_session_search_include_archived", {
+      includeArchived: !state.session_search_include_archived,
+      expectedTarget: {
+        workspacePath: state.workspace_path,
+        projectId: state.project_rows[state.selected_project_index]?.project_id ?? null,
+      },
+    }),
   },
   {
     id: "export-transcript",
@@ -319,7 +353,7 @@ export const ACTIONS: ActionDefinition[] = [
     id: "export-history",
     label: "選択セッション履歴を Markdown 保存",
     palette: true,
-    enabled: (state) => selectedSessionAvailable(state) && navigationIsIdle(state),
+    enabled: (state) => state.history_export_enabled && selectedSessionAvailable(state) && navigationIsIdle(state),
     run: (state, context, payload) => runSessionRowMutation("export_history_markdown", state, context, payload),
   },
   {
@@ -415,9 +449,9 @@ export const ACTIONS: ActionDefinition[] = [
     label: "アーティファクトペイン切替",
     palette: true,
     enabled: always,
-    run: (state, context) => {
+    run: (_state, context) => {
       setArtifactPaneCollapsed(context.uiState, !context.uiState.artifactPaneCollapsed);
-      context.render(state);
+      context.rerender();
     },
   },
   {
@@ -435,59 +469,79 @@ export const ACTIONS: ActionDefinition[] = [
     id: "load-provider-models",
     label: "Provider モデル読込",
     palette: true,
-    enabled: (state) => !state.provider_loading,
-    run: async (_state, context) => {
-      await context.flushProviderInputMutations();
-      await context.mutate("load_provider_models");
-    },
+    enabled: (state) => providerCapabilities(state).canLoadProviderModels,
+    run: (state, context) => context.mutate(
+      "load_provider_models",
+      providerDraftPayload(
+        context.uiState.drafts.provider,
+        state.config_target,
+        state.config_owner_mutation_open,
+      ),
+    ),
   },
   {
     id: "apply-provider-session",
     label: "Provider 設定を UI セッションに適用",
     palette: true,
     enabled: (state) => state.provider_apply_enabled,
-    run: async (_state, context) => {
-      await context.flushProviderInputMutations();
-      await context.mutate("apply_provider_session");
-    },
+    run: (state, context) => context.mutate(
+      "apply_provider_session",
+      providerDraftPayload(
+        context.uiState.drafts.provider,
+        state.config_target,
+        state.config_owner_mutation_open,
+      ),
+    ),
   },
   {
     id: "save-provider-global",
     label: "Provider 設定をファイルに保存",
     palette: true,
     enabled: (state) => state.provider_apply_enabled,
-    run: async (_state, context) => {
-      await context.flushProviderInputMutations();
-      await context.mutate("save_provider_global");
-    },
+    run: (state, context) => context.mutate(
+      "save_provider_global",
+      providerDraftPayload(
+        context.uiState.drafts.provider,
+        state.config_target,
+        state.config_owner_mutation_open,
+      ),
+    ),
   },
   {
     id: "apply-session-config",
     label: "編集中の設定を UI セッションに適用",
     palette: true,
-    enabled: always,
+    enabled: (state) => state.config_draft_commit_enabled,
     run: (_state, context) => runConfigMutation("apply_session_config", context),
   },
   {
     id: "save-global-config",
     label: "編集中の設定を設定ファイルに保存",
     palette: true,
-    enabled: always,
+    enabled: (state) => state.config_draft_commit_enabled,
     run: (_state, context) => runConfigMutation("save_global_config", context),
   },
   {
     id: "set-provider-mode",
     label: "Provider mode 切替",
     enabled: always,
-    run: (_state, context, payload) => context.mutate("set_provider_metadata_mode", { mode: payload.value }),
+    run: (_state, context, payload) => {
+      if (payload.value !== "lm_studio_native_required" && payload.value !== "openai_compatible_only") return;
+      context.uiState.drafts.provider.metadataMode = payload.value;
+      context.uiState.drafts.providerRevision += 1;
+      context.rerender();
+    },
   },
   {
     id: "select-provider-model",
     label: "Provider model 選択",
     enabled: always,
     run: (state, context, payload) => {
-      const args = rowMutationArgs(state, payload.index, state.provider_model_ids[payload.index]);
-      return args ? context.mutate("select_provider_model", args) : undefined;
+      const modelId = state.provider_model_ids[payload.index];
+      if (!modelId) return;
+      context.uiState.drafts.provider.selectedModelId = modelId;
+      context.uiState.drafts.providerRevision += 1;
+      context.rerender();
     },
   },
   {
@@ -495,14 +549,26 @@ export const ACTIONS: ActionDefinition[] = [
     label: "ワークスペース切替",
     palette: true,
     enabled: navigationIsIdle,
-    run: (_state, context) => context.mutate("switch_workspace"),
+    run: (state, context) => context.mutate("switch_workspace", {
+      text: state.workspace_input,
+      expectedTarget: draftMutationTarget(state),
+    }),
   },
-  { id: "browse-workspace", label: "ワークスペース参照", palette: true, enabled: always, run: (_state, context) => context.mutate("browse_workspace") },
-  { id: "open-typed-path", label: "入力パスを開く", palette: true, enabled: always, run: (_state, context) => context.mutate("open_typed_path") },
+  {
+    id: "browse-workspace",
+    label: "ワークスペース参照",
+    palette: true,
+    enabled: always,
+    run: (state, context) => context.mutate("browse_workspace", {
+      text: state.workspace_input,
+      expectedTarget: draftMutationTarget(state),
+    }),
+  },
+  { id: "open-typed-path", label: "入力パスを開く", palette: true, enabled: always, run: (state, context) => context.mutate("open_typed_path", { text: state.workspace_input, expectedTarget: draftMutationTarget(state) }) },
   { id: "open-global-config-folder", label: "設定フォルダーを開く", palette: true, enabled: always, run: (_state, context) => runWithoutRender("open_global_config_folder", context) },
-  { id: "set-image", label: "画像を添付", palette: true, enabled: (state) => state.image_input_enabled, run: (_state, context) => context.mutate("attach_image") },
-  { id: "browse-image", label: "画像を参照", palette: true, enabled: (state) => state.image_input_enabled, run: (_state, context) => context.mutate("browse_image") },
-  { id: "clear-images", label: "添付を解除", palette: true, enabled: (state) => state.attached_images.length > 0, run: (_state, context) => context.mutate("clear_images") },
+  { id: "set-image", label: "画像を添付", palette: true, enabled: (state) => state.image_input_enabled, run: (state, context) => context.mutate("attach_image", { text: state.image_input, expectedTarget: draftMutationTarget(state) }) },
+  { id: "browse-image", label: "画像を参照", palette: true, enabled: (state) => state.image_input_enabled, run: (state, context) => context.mutate("browse_image", { expectedTarget: draftMutationTarget(state) }) },
+  { id: "clear-images", label: "添付を解除", palette: true, enabled: (state) => state.attached_images.length > 0, run: (state, context) => context.mutate("clear_images", { expectedTarget: draftMutationTarget(state) }) },
   { id: "allow", label: "確認を許可", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision(true) },
   { id: "deny", label: "確認を拒否", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision(false) },
   { id: "minimize-window", label: "最小化", enabled: always, run: () => command("minimize_window") },
@@ -592,7 +658,7 @@ function requestLocalArchiveState(
     detail: row.session_id,
     expectedTarget: target.expectedTarget,
   };
-  context.render(state);
+  context.rerender();
 }
 
 function requestLocalDelete(
@@ -616,7 +682,7 @@ function requestLocalDelete(
     detail: kind === "project" ? (row as ProjectRow).path : (row as SessionRow).session_id,
     expectedTarget: target.expectedTarget,
   };
-  context.render(state);
+  context.rerender();
 }
 
 function requestLocalRollback(index: number, state: DesktopWebState, context: ActionContext): void {
@@ -633,5 +699,5 @@ function requestLocalRollback(index: number, state: DesktopWebState, context: Ac
     detail: row.session_id,
     expectedTarget: target.expectedTarget,
   };
-  context.render(state);
+  context.rerender();
 }

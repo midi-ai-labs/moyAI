@@ -6,7 +6,9 @@ use super::models::{
 };
 use super::startup::{DesktopStartupCheckStatus, DesktopStartupStatus};
 use super::state::{DesktopOverlay, DesktopState};
+use crate::app::AgentActivityRecord;
 use crate::config::{AccessMode, ProviderMetadataMode};
+use crate::runtime::AgentStatus;
 use crate::tui::config_editor::{ConfigField, ConfigFieldState};
 use crate::tui::state::{PromptReviewPhase, RunStatus};
 
@@ -17,6 +19,10 @@ pub struct DesktopPermissionProjection {
     pub targets: Vec<String>,
     pub outside_workspace: bool,
     pub risks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_task_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +49,100 @@ pub struct DesktopConfigFieldProjection {
     pub key: String,
     pub value: String,
     pub env_override: Option<String>,
+    pub value_type: String,
+    pub required: bool,
+    pub min_value: Option<f64>,
+    pub max_value: Option<f64>,
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DesktopProviderStatusProjection {
+    pub kind: String,
+    pub title: String,
+    pub hint: String,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DesktopAgentActivityRow {
+    pub agent_path: String,
+    pub session_id: String,
+    pub task_name: String,
+    pub task_preview: String,
+    pub status: String,
+    pub current_activity: String,
+    pub result_preview: String,
+    pub started_order: u64,
+    pub updated: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DesktopRuntimeProjection {
+    pub agent_activity_rows: Vec<DesktopAgentActivityRow>,
+    pub agent_tree_active: bool,
+    pub root_run_finalizing: bool,
+    pub root_run_generation: Option<u64>,
+    pub last_root_run_epoch: u64,
+    pub composer_commit_generation: u64,
+}
+
+impl DesktopRuntimeProjection {
+    fn blocks_new_request(&self) -> bool {
+        self.agent_tree_active || self.root_run_finalizing
+    }
+}
+
+pub(crate) fn access_runtime_owner_token(
+    root_run_generation: Option<u64>,
+    agent_tree_active: bool,
+    last_root_run_epoch: u64,
+) -> String {
+    if let Some(generation) = root_run_generation {
+        format!("root:{generation}")
+    } else if agent_tree_active {
+        format!("tree:{last_root_run_epoch}")
+    } else {
+        format!("idle:{last_root_run_epoch}")
+    }
+}
+
+pub(crate) fn access_runtime_allows_mutation(
+    root_run_generation: Option<u64>,
+    agent_tree_active: bool,
+) -> bool {
+    root_run_generation.is_some() || !agent_tree_active
+}
+
+pub(crate) fn navigation_admission_blocker(
+    busy: bool,
+    background_mutation_pending: bool,
+    navigation_loading: bool,
+    agent_tree_active: bool,
+    root_run_finalizing: bool,
+) -> Option<&'static str> {
+    if agent_tree_active {
+        Some("the current agent tree is active")
+    } else if root_run_finalizing {
+        Some("the current run is finalizing")
+    } else if busy {
+        Some("a run is active")
+    } else if background_mutation_pending {
+        Some("a background mutation is active")
+    } else if navigation_loading {
+        Some("navigation is already active")
+    } else {
+        None
+    }
+}
+
+fn composer_admission_is_open(
+    runtime: &DesktopRuntimeProjection,
+    busy: bool,
+    navigation_loading: bool,
+    background_mutation_pending: bool,
+) -> bool {
+    !busy && !navigation_loading && !background_mutation_pending && !runtime.blocks_new_request()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,12 +154,36 @@ pub struct DesktopConfigMutationTargetProjection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopAccessModeMutationTargetProjection {
+    pub workspace_path: String,
+    pub session_id: Option<String>,
+    pub config_generation: u64,
+    pub access_mode: AccessMode,
+    pub runtime_owner_token: String,
+    pub config_owner_mutation_open: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopDraftActionTargetProjection {
+    pub workspace_path: String,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopWebState {
     pub projection_revision: String,
     pub workspace_path: String,
     pub provider_label: String,
     pub model_label: String,
     pub access_label: String,
+    pub access_target: DesktopAccessModeMutationTargetProjection,
+    pub access_mode_mutation_enabled: bool,
+    pub config_owner_mutation_open: bool,
+    pub config_draft_dirty: bool,
+    pub config_draft_discard_enabled: bool,
+    pub config_draft_commit_enabled: bool,
     pub current_session_label: String,
     pub selected_session_title: String,
     pub status_message: String,
@@ -79,7 +203,9 @@ pub struct DesktopWebState {
     pub confirmation_text: String,
     pub confirmation: Option<DesktopPermissionProjection>,
     pub startup: DesktopStartupProjection,
+    pub composer_commit_generation: String,
     pub draft_prompt: String,
+    pub draft_target: DesktopDraftActionTargetProjection,
     pub image_input: String,
     pub attached_images: Vec<String>,
     pub can_submit: bool,
@@ -87,6 +213,7 @@ pub struct DesktopWebState {
     pub async_polling_required: bool,
     pub pending_async_operations: Vec<String>,
     pub navigation_loading: bool,
+    pub navigation_admission_open: bool,
     pub post_run_refresh_pending: bool,
     pub background_mutation_pending: bool,
     pub overlay: String,
@@ -109,17 +236,21 @@ pub struct DesktopWebState {
     pub artifact_preview_text: String,
     pub file_change_rows: Vec<DesktopFileChangeRow>,
     pub file_change_summary_text: String,
+    pub agent_activity_rows: Vec<DesktopAgentActivityRow>,
+    pub agent_tree_active: bool,
     pub local_search_text: String,
     pub local_search_results_text: String,
     pub command_rows: Vec<DesktopCommandRow>,
     pub provider_base_url: String,
     pub provider_metadata_mode: String,
+    pub provider_catalog_base_url: Option<String>,
+    pub provider_catalog_metadata_mode: Option<String>,
     pub provider_context_window: String,
     pub provider_max_output_tokens: String,
     pub provider_models: Vec<String>,
     pub provider_model_ids: Vec<String>,
     pub provider_selected_index: i32,
-    pub provider_status_text: String,
+    pub provider_status: DesktopProviderStatusProjection,
     pub provider_selected_model_summary: Vec<String>,
     pub provider_loading: bool,
     pub provider_apply_enabled: bool,
@@ -142,7 +273,10 @@ pub struct DesktopWebState {
     pub window_opacity_percent: i32,
 }
 
-pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
+pub(crate) fn desktop_web_state(
+    state: &DesktopState,
+    runtime: &DesktopRuntimeProjection,
+) -> DesktopWebState {
     let detail = state.selected_detail();
     let config_items = state
         .provider_config
@@ -176,6 +310,20 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
             )
         };
     let image_input_enabled = desktop_image_input_delegates_capability_to_runtime(state);
+    let composer_admission_open = composer_admission_is_open(
+        runtime,
+        state.is_busy(),
+        state.navigation_loading(),
+        state.background_mutation_pending(),
+    );
+    let navigation_admission_open = navigation_admission_blocker(
+        state.is_busy(),
+        state.background_mutation_pending(),
+        state.navigation_loading(),
+        runtime.agent_tree_active,
+        runtime.root_run_finalizing,
+    )
+    .is_none();
     let latest_tool_summary = detail
         .tool_status_text
         .lines()
@@ -196,8 +344,13 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
     DesktopWebState {
         projection_revision: "0".to_string(),
         workspace_path: state.snapshot.workspace_path.clone(),
-        provider_label: state.snapshot.provider_label.clone(),
-        model_label: state.snapshot.model_label.clone(),
+        provider_label: state
+            .provider_config
+            .effective_config
+            .model
+            .base_url
+            .clone(),
+        model_label: state.provider_config.effective_config.model.model.clone(),
         access_label: access_mode_key(
             state
                 .provider_config
@@ -206,6 +359,35 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
                 .access_mode,
         )
         .to_string(),
+        access_target: DesktopAccessModeMutationTargetProjection {
+            workspace_path: state.snapshot.workspace_path.clone(),
+            session_id: state
+                .app_state
+                .current_session_id
+                .map(|session_id| session_id.to_string()),
+            config_generation: state.provider_config.config_generation,
+            access_mode: state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            runtime_owner_token: access_runtime_owner_token(
+                runtime.root_run_generation,
+                runtime.agent_tree_active,
+                runtime.last_root_run_epoch,
+            ),
+            config_owner_mutation_open: true,
+        },
+        access_mode_mutation_enabled: !state.navigation_loading()
+            && !state.background_mutation_pending()
+            && access_runtime_allows_mutation(
+                runtime.root_run_generation,
+                runtime.agent_tree_active,
+            ),
+        config_owner_mutation_open: true,
+        config_draft_dirty: false,
+        config_draft_discard_enabled: false,
+        config_draft_commit_enabled: false,
         current_session_label: state.current_session_label(),
         selected_session_title: state.selected_session_title(),
         status_message,
@@ -230,10 +412,20 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
                 targets: permission.targets.clone(),
                 outside_workspace: permission.outside_workspace,
                 risks: permission.risks.clone(),
+                agent_path: permission.agent_path.clone(),
+                agent_task_name: permission.agent_task_name.clone(),
             }
         }),
         startup: startup_projection(state),
+        composer_commit_generation: runtime.composer_commit_generation.to_string(),
         draft_prompt: state.composer.draft_prompt.clone(),
+        draft_target: DesktopDraftActionTargetProjection {
+            workspace_path: state.snapshot.workspace_path.clone(),
+            session_id: state
+                .app_state
+                .current_session_id
+                .map(|session_id| session_id.to_string()),
+        },
         image_input: state.composer.image_attachment_input.clone(),
         attached_images: state
             .composer
@@ -241,11 +433,14 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
             .iter()
             .map(|path| path.to_string())
             .collect(),
-        can_submit: state.can_submit_prompt(),
+        can_submit: composer_admission_open,
         busy: state.is_busy(),
-        async_polling_required: state.async_polling_required(),
+        async_polling_required: state.async_polling_required()
+            || runtime.agent_tree_active
+            || runtime.root_run_finalizing,
         pending_async_operations: state.pending_async_operation_keys(),
         navigation_loading: state.navigation_loading(),
+        navigation_admission_open,
         post_run_refresh_pending: state.post_run_refresh_pending(),
         background_mutation_pending: state.background_mutation_pending(),
         overlay: overlay_key(state.view.overlay).to_string(),
@@ -268,6 +463,8 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         artifact_preview_text: state.selected_artifact_preview_text(),
         file_change_rows: detail.file_changes,
         file_change_summary_text: detail.file_change_summary_text,
+        agent_activity_rows: runtime.agent_activity_rows.clone(),
+        agent_tree_active: runtime.agent_tree_active,
         local_search_text: state.view.local_search_text.clone(),
         local_search_results_text: state.local_search_results_text(),
         command_rows: state.snapshot.command_rows.clone(),
@@ -276,6 +473,15 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
             state.provider_config.provider_metadata_mode_input,
         )
         .to_string(),
+        provider_catalog_base_url: state.provider_config.provider_loaded_base_url.clone(),
+        provider_catalog_metadata_mode: state
+            .provider_config
+            .provider_loaded_base_url
+            .as_ref()
+            .map(|_| {
+                provider_metadata_mode_key(state.provider_config.provider_metadata_mode_input)
+                    .to_string()
+            }),
         provider_context_window: state.provider_config.provider_context_window_input.clone(),
         provider_max_output_tokens: state
             .provider_config
@@ -284,7 +490,12 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         provider_models: provider_model_labels(state),
         provider_model_ids: state.provider_config.provider_models.clone(),
         provider_selected_index: state.provider_config.provider_selected_index,
-        provider_status_text: provider_feedback_text(state),
+        provider_status: DesktopProviderStatusProjection {
+            kind: state.provider_config.provider_status.kind.key().to_string(),
+            title: state.provider_config.provider_status.title.clone(),
+            hint: state.provider_config.provider_status.hint.clone(),
+            details: provider_status_details(state),
+        },
         provider_selected_model_summary: provider_selected_model_summary(state),
         provider_loading: state.provider_config.provider_loading,
         provider_apply_enabled: state.can_apply_provider_selection(),
@@ -293,11 +504,7 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
             .config_editor
             .fields
             .iter()
-            .map(|field| DesktopConfigFieldProjection {
-                key: field.key.label().to_string(),
-                value: field.value.clone(),
-                env_override: field.key.env_override().map(ToString::to_string),
-            })
+            .map(config_field_projection)
             .collect(),
         config_items,
         selected_config_index: state.provider_config.config_editor.selected as i32,
@@ -328,14 +535,140 @@ pub fn desktop_web_state(state: &DesktopState) -> DesktopWebState {
         review_raw_text,
         review_draft_text: state.composer.review_draft_text.clone(),
         review_status_text,
-        send_enhanced_enabled: send_enhanced_enabled && !state.navigation_loading(),
-        send_raw_enabled: send_raw_enabled && !state.navigation_loading(),
+        send_enhanced_enabled: send_enhanced_enabled && composer_admission_open,
+        send_raw_enabled: send_raw_enabled && composer_admission_open,
         history_export_enabled: state.can_export_history(),
-        enhance_enabled: !state.is_busy()
-            && !state.navigation_loading()
-            && !state.composer.draft_prompt.trim().is_empty(),
+        enhance_enabled: composer_admission_open,
         image_input_enabled,
         window_opacity_percent: state.view.window_opacity_percent,
+    }
+}
+
+fn config_field_projection(field: &ConfigFieldState) -> DesktopConfigFieldProjection {
+    let metadata = config_field_metadata(field.key);
+    DesktopConfigFieldProjection {
+        key: field.key.label().to_string(),
+        value: field.value.clone(),
+        env_override: field.key.env_override().map(ToString::to_string),
+        value_type: metadata.value_type.to_string(),
+        required: metadata.required,
+        min_value: metadata.min_value,
+        max_value: metadata.max_value,
+        options: metadata.options.iter().map(ToString::to_string).collect(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ConfigFieldMetadata {
+    value_type: &'static str,
+    required: bool,
+    min_value: Option<f64>,
+    max_value: Option<f64>,
+    options: &'static [&'static str],
+}
+
+fn config_field_metadata(field: ConfigField) -> ConfigFieldMetadata {
+    const NONE: &[&str] = &[];
+    const PROMPT_PROFILES: &[&str] = &["auto", "default", "qwen_coder"];
+    const PROVIDER_MODES: &[&str] = &["lm_studio_native_required", "openai_compatible_only"];
+    const ACCESS_MODES: &[&str] = &["default", "auto_review", "full_access"];
+    const MULTI_AGENT_MODES: &[&str] = &["explicit_request_only", "proactive"];
+
+    let (value_type, min_value, max_value, options) = match field {
+        ConfigField::PromptProfile => ("enum", None, None, PROMPT_PROFILES),
+        ConfigField::ProviderMetadataMode => ("enum", None, None, PROVIDER_MODES),
+        ConfigField::AccessMode => ("enum", None, None, ACCESS_MODES),
+        ConfigField::MultiAgentMode => ("enum", None, None, MULTI_AGENT_MODES),
+        ConfigField::MultiAgentEnabled
+        | ConfigField::SupportsTools
+        | ConfigField::SupportsReasoning
+        | ConfigField::SupportsImages
+        | ConfigField::ParallelToolCalls
+        | ConfigField::ShellHideWindows
+        | ConfigField::InspectionIncludeHiddenByDefault
+        | ConfigField::DoclingEnabled
+        | ConfigField::McpEnabled => ("boolean", None, None, NONE),
+        ConfigField::Temperature
+        | ConfigField::TopP
+        | ConfigField::PresencePenalty
+        | ConfigField::FrequencyPenalty => ("number", None, None, NONE),
+        ConfigField::ExtraHeadersJson
+        | ConfigField::ExtraBodyJson
+        | ConfigField::DoclingHeadersJson
+        | ConfigField::McpServersJson => ("json", None, None, NONE),
+        ConfigField::MultiAgentMaxAgents | ConfigField::MultiAgentMaxModelRequests => {
+            ("integer", Some(1.0), None, NONE)
+        }
+        ConfigField::TopK
+        | ConfigField::ContextWindow
+        | ConfigField::MaxOutputTokens
+        | ConfigField::MaxParallelPredictions => {
+            ("integer", Some(0.0), Some(u32::MAX as f64), NONE)
+        }
+        ConfigField::MaxRetries | ConfigField::StreamMaxRetries => {
+            ("integer", Some(0.0), Some(u8::MAX as f64), NONE)
+        }
+        ConfigField::SessionMaxStepsPerTurn
+        | ConfigField::InspectionDefaultMaxDepth
+        | ConfigField::InspectionDefaultMaxEntriesPerDir
+        | ConfigField::InspectionMaxExtensionsReported => ("integer", Some(0.0), None, NONE),
+        ConfigField::RequestTimeoutMs
+        | ConfigField::StreamIdleTimeoutMs
+        | ConfigField::ConnectTimeoutMs
+        | ConfigField::FileGuardMaxInlineReadBytes
+        | ConfigField::FileGuardLargeFileWarningBytes
+        | ConfigField::DoclingTimeoutMs => ("integer", Some(0.0), None, NONE),
+        ConfigField::Seed => ("integer", Some(0.0), None, NONE),
+        ConfigField::BaseUrl
+        | ConfigField::Model
+        | ConfigField::StopSequences
+        | ConfigField::FileGuardBlockedReadExtensions
+        | ConfigField::FileGuardStructuredDocumentExtensions
+        | ConfigField::DoclingBaseUrl
+        | ConfigField::DoclingApiKeyEnv => ("string", None, None, NONE),
+    };
+    ConfigFieldMetadata {
+        value_type,
+        required: false,
+        min_value,
+        max_value,
+        options,
+    }
+}
+
+pub(crate) fn agent_activity_projection(
+    records: Vec<AgentActivityRecord>,
+) -> (Vec<DesktopAgentActivityRow>, bool) {
+    let mut rows = records
+        .into_iter()
+        .map(|record| DesktopAgentActivityRow {
+            agent_path: record.agent_path,
+            session_id: record.session_id.to_string(),
+            task_name: record.task_name,
+            task_preview: record.task_preview,
+            status: agent_status_key(&record.status).to_string(),
+            current_activity: record.current_activity,
+            result_preview: record.result_preview,
+            started_order: record.started_order,
+            updated: record.updated,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.started_order);
+    let active = rows
+        .iter()
+        .any(|row| matches!(row.status.as_str(), "pending_init" | "running"));
+    (rows, active)
+}
+
+fn agent_status_key(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::PendingInit => "pending_init",
+        AgentStatus::Running => "running",
+        AgentStatus::Interrupted => "interrupted",
+        AgentStatus::Completed(_) => "completed",
+        AgentStatus::Errored(_) => "errored",
+        AgentStatus::Shutdown => "shutdown",
+        AgentStatus::NotFound => "not_found",
     }
 }
 
@@ -464,35 +797,6 @@ fn provider_model_labels(state: &DesktopState) -> Vec<String> {
         .collect()
 }
 
-fn provider_feedback_text(state: &DesktopState) -> String {
-    let mut text = state.provider_config.provider_status_text.clone();
-    if !text.is_empty() {
-        text.push('\n');
-    }
-    text.push_str(provider_metadata_mode_detail(
-        state.provider_config.provider_metadata_mode_input,
-    ));
-    if !text.is_empty() {
-        text.push('\n');
-    }
-    text.push_str(&format!(
-        "Managed request limits: context_window={}, max_output_tokens={}.",
-        state.provider_config.provider_context_window_input,
-        state.provider_config.provider_max_output_tokens_input
-    ));
-    if let Some(info) = state.selected_provider_model_info() {
-        let summary = super::state::provider_model_summary(info);
-        if !summary.is_empty() {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str("Selected: ");
-            text.push_str(&summary);
-        }
-    }
-    text
-}
-
 fn provider_metadata_mode_key(mode: ProviderMetadataMode) -> &'static str {
     match mode {
         ProviderMetadataMode::LmStudioNativeRequired => "lm_studio_native_required",
@@ -500,15 +804,29 @@ fn provider_metadata_mode_key(mode: ProviderMetadataMode) -> &'static str {
     }
 }
 
-fn provider_metadata_mode_detail(mode: ProviderMetadataMode) -> &'static str {
-    match mode {
+fn provider_status_details(state: &DesktopState) -> String {
+    let mode = match state.provider_config.provider_metadata_mode_input {
         ProviderMetadataMode::LmStudioNativeRequired => {
             "Provider mode: LM Studio native metadata required."
         }
         ProviderMetadataMode::OpenAiCompatibleOnly => {
             "Provider mode: OpenAI-compatible only. The language / no-thinking system policy is active."
         }
-    }
+    };
+    let limits = format!(
+        "Managed request limits: context_window={}, max_output_tokens={}.",
+        state.provider_config.provider_context_window_input,
+        state.provider_config.provider_max_output_tokens_input
+    );
+    [
+        state.provider_config.provider_status.details.as_str(),
+        mode,
+        limits.as_str(),
+    ]
+    .into_iter()
+    .filter(|line| !line.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 fn provider_selected_model_summary(state: &DesktopState) -> Vec<String> {
@@ -787,6 +1105,248 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_field_metadata_matches_rust_parser_shapes_and_bounds() {
+        let agents = config_field_metadata(ConfigField::MultiAgentMaxAgents);
+        assert_eq!(agents.value_type, "integer");
+        assert_eq!(agents.min_value, Some(1.0));
+
+        let context = config_field_metadata(ConfigField::ContextWindow);
+        assert_eq!(context.value_type, "integer");
+        assert_eq!(context.max_value, Some(u32::MAX as f64));
+
+        let retries = config_field_metadata(ConfigField::MaxRetries);
+        assert_eq!(retries.max_value, Some(u8::MAX as f64));
+
+        let temperature = config_field_metadata(ConfigField::Temperature);
+        assert_eq!(temperature.value_type, "number");
+
+        let mode = config_field_metadata(ConfigField::MultiAgentMode);
+        assert_eq!(mode.value_type, "enum");
+        assert_eq!(mode.options, &["explicit_request_only", "proactive"]);
+    }
+
+    #[test]
+    fn root_finalizing_and_agent_tree_close_the_authoritative_composer_gate() {
+        assert!(composer_admission_is_open(
+            &DesktopRuntimeProjection::default(),
+            false,
+            false,
+            false,
+        ));
+        assert!(!composer_admission_is_open(
+            &DesktopRuntimeProjection {
+                root_run_finalizing: true,
+                ..DesktopRuntimeProjection::default()
+            },
+            false,
+            false,
+            false,
+        ));
+        assert!(!composer_admission_is_open(
+            &DesktopRuntimeProjection {
+                agent_tree_active: true,
+                ..DesktopRuntimeProjection::default()
+            },
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn access_runtime_owner_distinguishes_queued_commands_across_the_tree_lifecycle() {
+        let lifecycle = [
+            (None, false, 7, "idle:7", true),
+            (Some(8), false, 8, "root:8", true),
+            (None, true, 8, "tree:8", false),
+            (None, false, 8, "idle:8", true),
+        ];
+        let mut tokens = std::collections::BTreeSet::new();
+        for (root, tree, epoch, expected_token, expected_enabled) in lifecycle {
+            let token = access_runtime_owner_token(root, tree, epoch);
+            assert_eq!(token, expected_token);
+            assert_eq!(access_runtime_allows_mutation(root, tree), expected_enabled);
+            assert!(
+                tokens.insert(token),
+                "each lifecycle boundary is a CAS barrier"
+            );
+        }
+    }
+
+    #[test]
+    fn root_finalizing_is_projected_as_closed_navigation_admission() {
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            crate::config::ResolvedConfig::default(),
+        );
+        assert!(
+            desktop_web_state(&state, &DesktopRuntimeProjection::default())
+                .navigation_admission_open
+        );
+        assert!(
+            !desktop_web_state(
+                &state,
+                &DesktopRuntimeProjection {
+                    root_run_finalizing: true,
+                    ..DesktopRuntimeProjection::default()
+                },
+            )
+            .navigation_admission_open
+        );
+        assert_eq!(
+            desktop_web_state(
+                &state,
+                &DesktopRuntimeProjection {
+                    composer_commit_generation: 42,
+                    root_run_generation: Some(u64::MAX),
+                    ..DesktopRuntimeProjection::default()
+                },
+            )
+            .composer_commit_generation,
+            "42"
+        );
+        assert_eq!(
+            desktop_web_state(
+                &state,
+                &DesktopRuntimeProjection {
+                    root_run_generation: Some(u64::MAX),
+                    ..DesktopRuntimeProjection::default()
+                },
+            )
+            .access_target
+            .runtime_owner_token,
+            "root:18446744073709551615",
+            "run generations cross the web boundary without JS number precision loss"
+        );
+        let operation_id = state.begin_project_delete_mutation();
+        assert!(
+            !desktop_web_state(&state, &DesktopRuntimeProjection::default())
+                .access_mode_mutation_enabled
+        );
+        assert!(state.finish_project_delete_mutation(operation_id));
+        let child_only = desktop_web_state(
+            &state,
+            &DesktopRuntimeProjection {
+                agent_tree_active: true,
+                last_root_run_epoch: 8,
+                ..DesktopRuntimeProjection::default()
+            },
+        );
+        assert!(!child_only.access_mode_mutation_enabled);
+        assert_eq!(child_only.access_target.runtime_owner_token, "tree:8");
+        let root_with_children = desktop_web_state(
+            &state,
+            &DesktopRuntimeProjection {
+                agent_tree_active: true,
+                root_run_generation: Some(8),
+                last_root_run_epoch: 8,
+                ..DesktopRuntimeProjection::default()
+            },
+        );
+        assert!(root_with_children.access_mode_mutation_enabled);
+        assert_eq!(
+            root_with_children.access_target.runtime_owner_token,
+            "root:8"
+        );
+
+        state.begin_prompt_enhance(1, "raw review");
+        assert!(state.finish_prompt_enhance(1, "edited review".to_string()));
+        let idle_review = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+        assert!(idle_review.send_enhanced_enabled);
+        assert!(idle_review.send_raw_enabled);
+        state.app_state.run_status = crate::tui::state::RunStatus::Running;
+        let running_review = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+        assert!(!running_review.send_enhanced_enabled);
+        assert!(!running_review.send_raw_enabled);
+    }
+
+    #[test]
+    fn agent_activity_projection_preserves_contract_and_spawn_order() {
+        let completed_session_id = crate::session::SessionId::new();
+        let running_session_id = crate::session::SessionId::new();
+        let (rows, active) = agent_activity_projection(vec![
+            AgentActivityRecord {
+                agent_path: "/root/review".to_string(),
+                session_id: completed_session_id,
+                task_name: "review".to_string(),
+                task_preview: "Review the implementation".to_string(),
+                status: AgentStatus::Completed(Some("reviewed".to_string())),
+                current_activity: String::new(),
+                result_preview: "reviewed".to_string(),
+                started_order: 2,
+                updated: true,
+            },
+            AgentActivityRecord {
+                agent_path: "/root/runtime".to_string(),
+                session_id: running_session_id,
+                task_name: "runtime".to_string(),
+                task_preview: "Implement runtime".to_string(),
+                status: AgentStatus::Running,
+                current_activity: "Running tests".to_string(),
+                result_preview: String::new(),
+                started_order: 1,
+                updated: false,
+            },
+        ]);
+
+        assert!(active);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].agent_path, "/root/runtime");
+        assert_eq!(rows[0].session_id, running_session_id.to_string());
+        assert_eq!(rows[0].status, "running");
+        assert_eq!(rows[1].agent_path, "/root/review");
+        assert_eq!(rows[1].session_id, completed_session_id.to_string());
+        assert_eq!(rows[1].status, "completed");
+        assert!(rows[1].updated);
+    }
+
+    #[test]
+    fn agent_status_projection_matches_desktop_web_union() {
+        let cases = [
+            (AgentStatus::PendingInit, "pending_init"),
+            (AgentStatus::Running, "running"),
+            (AgentStatus::Interrupted, "interrupted"),
+            (AgentStatus::Completed(None), "completed"),
+            (AgentStatus::Errored("failed".to_string()), "errored"),
+            (AgentStatus::Shutdown, "shutdown"),
+            (AgentStatus::NotFound, "not_found"),
+        ];
+
+        for (status, expected) in cases {
+            assert_eq!(agent_status_key(&status), expected);
+        }
+    }
+
+    #[test]
+    fn final_agent_rows_do_not_keep_async_polling_active() {
+        let (rows, active) = agent_activity_projection(vec![AgentActivityRecord {
+            agent_path: "/root/done".to_string(),
+            session_id: crate::session::SessionId::new(),
+            task_name: "done".to_string(),
+            task_preview: String::new(),
+            status: AgentStatus::Interrupted,
+            current_activity: String::new(),
+            result_preview: String::new(),
+            started_order: 1,
+            updated: false,
+        }]);
+
+        assert_eq!(rows[0].status, "interrupted");
+        assert!(!active);
+    }
 
     #[test]
     fn token_meter_projection_formats_estimated_usage() {

@@ -1,8 +1,8 @@
 use super::model::{
     PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig, PartialInspectionConfig,
     PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig, PartialModelConfig,
-    PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig, PartialShellConfig,
-    PartialToolOutputConfig, PartialWorkspaceConfig, ResolvedConfig,
+    PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig,
+    PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig, ResolvedConfig,
 };
 
 fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfig) {
@@ -101,6 +101,21 @@ fn apply_session(target: &mut crate::config::SessionConfig, patch: PartialSessio
     }
     if let Some(value) = patch.overflow_margin_tokens {
         target.overflow_margin_tokens = value;
+    }
+}
+
+fn apply_multi_agent(target: &mut crate::config::MultiAgentConfig, patch: PartialMultiAgentConfig) {
+    if let Some(value) = patch.enabled {
+        target.enabled = value;
+    }
+    if let Some(value) = patch.mode {
+        target.mode = value;
+    }
+    if let Some(value) = patch.max_concurrent_agents {
+        target.max_concurrent_agents = value.max(1);
+    }
+    if let Some(value) = patch.max_concurrent_model_requests {
+        target.max_concurrent_model_requests = value.max(1);
     }
 }
 
@@ -260,6 +275,9 @@ pub fn apply_patch(mut target: ResolvedConfig, patch: PartialResolvedConfig) -> 
     }
     if let Some(value) = patch.session {
         apply_session(&mut target.session, value);
+    }
+    if let Some(value) = patch.multi_agent {
+        apply_multi_agent(&mut target.multi_agent, value);
     }
     if let Some(value) = patch.permissions {
         apply_permissions(&mut target.permissions, value);

@@ -131,6 +131,19 @@ fn history_item_parts(message_id: MessageId, payload: &HistoryItemPayload) -> Ve
         HistoryItemPayload::Message { content, .. } => {
             append_content_parts(message_id, content, &mut parts);
         }
+        HistoryItemPayload::InterAgentCommunication { communication } => {
+            parts.push(part_record(
+                message_id,
+                1,
+                PartKind::Text,
+                MessagePart::Text(TextPart {
+                    text: format!(
+                        "Sub-agent message from {} to {}:\n\n{}",
+                        communication.author, communication.recipient, communication.content
+                    ),
+                }),
+            ));
+        }
         HistoryItemPayload::Error { .. } => {}
         HistoryItemPayload::Reasoning { text } => parts.push(part_record(
             message_id,
@@ -226,7 +239,8 @@ fn history_item_parts(message_id: MessageId, payload: &HistoryItemPayload) -> Ve
         | HistoryItemPayload::LifecycleGuard { .. }
         | HistoryItemPayload::ApprovalDecision { .. }
         | HistoryItemPayload::RetryDecision { .. }
-        | HistoryItemPayload::ControlEnvelope { .. } => {}
+        | HistoryItemPayload::ControlEnvelope { .. }
+        | HistoryItemPayload::SubAgentActivity { .. } => {}
         HistoryItemPayload::Compaction { summary, .. } => parts.push(part_record(
             message_id,
             1,
@@ -318,7 +332,7 @@ mod tests {
     use super::*;
     use crate::config::AccessMode;
     use crate::context::ContextWindowTokenStatus;
-    use crate::protocol::{HistoryItemId, TurnId};
+    use crate::protocol::{HistoryItemId, InterAgentCommunication, SubAgentActivityKind, TurnId};
     use crate::session::{
         ProjectId, RequestDiagnosticsPart, SessionId, SessionModelParameters, SessionStatus,
     };
@@ -415,6 +429,55 @@ mod tests {
         );
         assert_ne!(first.messages[0].record.id, other.messages[0].record.id);
         assert_ne!(first.messages[0].parts[0].id, other.messages[0].parts[0].id);
+    }
+
+    #[test]
+    fn inter_agent_messages_are_visible_without_materializing_activity_as_reasoning() {
+        let session = test_session();
+        let turn_id = TurnId::new();
+        let communication = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: session.id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 10,
+            payload: HistoryItemPayload::InterAgentCommunication {
+                communication: InterAgentCommunication {
+                    author: "/root/reviewer".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "review complete".to_string(),
+                    trigger_turn: false,
+                },
+            },
+        };
+        let activity = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: session.id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 11,
+            payload: HistoryItemPayload::SubAgentActivity {
+                activity_id: "activity-1".to_string(),
+                agent_session_id: SessionId::new(),
+                agent_path: "/root/reviewer".to_string(),
+                activity_kind: SubAgentActivityKind::Interacted,
+            },
+        };
+
+        let transcript = transcript_from_history_items(&session, &[communication, activity]);
+
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(transcript.messages[0].record.role, MessageRole::Assistant);
+        assert_eq!(
+            flatten_text_parts(&transcript),
+            vec!["Sub-agent message from /root/reviewer to /root:\n\nreview complete"]
+        );
+        assert!(
+            transcript.messages[0]
+                .parts
+                .iter()
+                .all(|part| !matches!(part.payload, MessagePart::Reasoning(_)))
+        );
     }
 
     fn transcript_with_diagnostics(diagnostics: Vec<RequestDiagnosticsPart>) -> Transcript {

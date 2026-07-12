@@ -2,7 +2,6 @@ import { command } from "./api";
 import { dispatchRegisteredAction, type ActionContext } from "./actions";
 import {
   beginConfigMutation,
-  configMutationPending,
   configMutationValues,
   finishConfigMutation,
   reconcileConfigDraftTarget,
@@ -11,12 +10,24 @@ import {
 } from "./config_mutation";
 import { beginLocalDecision, failLocalDecision, finishLocalDecision } from "./decision_state";
 import { isRegularModalOverlay, modalIsOpen, nextDialogFocusIndex } from "./modal_state";
-import { configCommitEnabled, navigationIsIdle } from "./navigation_state";
+import { globalShortcutAction } from "./keyboard_shortcut";
+import { navigationIsIdle } from "./navigation_state";
 import { rowMutationArgs } from "./row_target";
 import { TitlebarDragGesture, windowControlKeyboardActivation } from "./titlebar_interaction";
-import type { ConfigMutationTarget, DesktopWebState, RowMutationTarget } from "./types";
+import type { ConfigFieldProjection, ConfigMutationTarget, DesktopWebState, RowMutationTarget } from "./types";
 import type { UiLocalState } from "./ui_state";
 import { goalSlashCommandHint, validateConfigInput } from "./utils";
+import {
+  deriveUiCapabilities,
+  configDraftEditOpen,
+  configDraftCommitOpen,
+  configDraftDiscardOpen,
+  configOwnerMutationOpen,
+  draftMutationTarget,
+  localSearchOwner,
+  sessionSearchMutationTarget,
+  sessionSearchOwner,
+} from "./view_state";
 
 let pendingOpacityPreviewPercent: number | null = null;
 let opacityPreviewFrame: number | null = null;
@@ -34,20 +45,18 @@ interface PendingTextMutation {
   timer: number | null;
   inFlight: Promise<void> | null;
   renderResult: boolean;
+  target: string;
+  generation: number;
 }
 
 const pendingTextMutations = new Map<string, PendingTextMutation>();
+let nextTextMutationGeneration = 1;
 const titlebarDragGesture = new TitlebarDragGesture();
-
-export function textMutationPending(key: string): boolean {
-  const entry = pendingTextMutations.get(key);
-  return Boolean(entry && (entry.timer !== null || entry.inFlight !== null || entry.args !== null));
-}
 
 export function installGlobalKeyboardShortcuts(context: ActionContext): void {
   document.addEventListener("keydown", (event) => {
     if (event.isComposing || event.keyCode === 229) return;
-    const currentState = context.getCurrentState();
+    const currentState = context.getViewState();
     if (
       currentState &&
       modalIsOpen(currentState, context.uiState.pendingLocalConfirmation !== null)
@@ -63,7 +72,7 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
         if (!context.uiState.localConfirmationDecisionPending) {
           context.uiState.pendingLocalConfirmation = null;
           context.uiState.localConfirmationDecisionError = "";
-          context.render(currentState);
+          context.rerender();
         }
       } else if (event.key === "Escape" && isRegularModalOverlay(currentState.overlay)) {
         event.preventDefault();
@@ -73,29 +82,10 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
       }
       return;
     }
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+    const shortcutAction = globalShortcutAction(event);
+    if (shortcutAction && currentState) {
       event.preventDefault();
-      if (currentState) void dispatchRegisteredAction("show-command-palette", currentState, context, { index: -1, value: "" });
-    }
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
-      event.preventDefault();
-      if (currentState) void dispatchRegisteredAction("new-chat", currentState, context, { index: -1, value: "" });
-    }
-    if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && currentState?.can_submit) {
-      event.preventDefault();
-      void dispatchRegisteredAction("send", currentState, context, { index: -1, value: "" });
-    }
-    if (event.key === "F8" && currentState) {
-      event.preventDefault();
-      void dispatchRegisteredAction("toggle-access", currentState, context, { index: -1, value: "" });
-    }
-    if (event.key === "F9" && currentState) {
-      event.preventDefault();
-      void dispatchRegisteredAction("export-transcript", currentState, context, { index: -1, value: "" });
-    }
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "i" && currentState) {
-      event.preventDefault();
-      void dispatchRegisteredAction("toggle-session-archived-search", currentState, context, { index: -1, value: "" });
+      void dispatchRegisteredAction(shortcutAction, currentState, context, { index: -1, value: "" });
     }
     if (event.key === "Escape" && currentState && currentState.overlay !== "none") {
       event.preventDefault();
@@ -115,20 +105,22 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
     const prompt = event.currentTarget as HTMLTextAreaElement;
     const text = prompt.value;
     resizePromptComposer(prompt);
-    const currentState = context.getCurrentState();
-    if (currentState) {
-      currentState.draft_prompt = text;
-      currentState.can_submit = text.trim().length > 0 && !currentState.busy && !currentState.navigation_loading;
-      currentState.enhance_enabled = text.trim().length > 0 && !currentState.busy && !currentState.navigation_loading;
+    context.uiState.drafts.prompt = text;
+    context.uiState.drafts.composerRevision += 1;
+    const projection = context.getProjection();
+    if (projection) {
+      const capabilities = deriveUiCapabilities(projection, context.uiState);
       updateGoalCommandHint(text);
       const send = document.querySelector<HTMLButtonElement>('[data-action="send"]');
-      if (send) send.disabled = !currentState.can_submit;
+      if (send) send.disabled = !capabilities.canSubmit;
       const enhance = document.querySelector<HTMLButtonElement>('[data-action="enhance-prompt"]');
       if (enhance) {
-        enhance.disabled = !currentState.enhance_enabled;
-        const title = currentState.navigation_loading
+        enhance.disabled = !capabilities.canEnhance;
+        const title = projection.navigation_loading
           ? "画面の切り替え完了後にEnhanceできます"
-          : currentState.busy
+          : projection.agent_tree_active
+            ? "Sub Agentの完了または停止後にEnhanceできます"
+          : projection.busy
             ? "実行中はEnhanceできません"
           : text.trim().length === 0
             ? "依頼文を入力してください"
@@ -138,62 +130,55 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
       }
     }
     resizePromptComposer(prompt);
-    void command<DesktopWebState>("set_prompt", { text })
-      .then(context.setCurrentState)
-      .catch((error) => context.renderError(String(error)));
   });
   document.querySelector<HTMLInputElement>("#image-input")?.addEventListener("input", (event) => {
-    const text = (event.currentTarget as HTMLInputElement).value;
-    const currentState = context.getCurrentState();
-    if (currentState) currentState.image_input = text;
-    void command<DesktopWebState>("set_image_input", { text })
-      .then(context.setCurrentState)
-      .catch((error) => context.renderError(String(error)));
+    context.uiState.drafts.imageInput = (event.currentTarget as HTMLInputElement).value;
+    context.uiState.drafts.imageRevision += 1;
   });
   document.querySelector<HTMLInputElement>("#provider-url")?.addEventListener("input", (event) => {
-    const text = (event.currentTarget as HTMLInputElement).value;
-    const currentState = context.getCurrentState();
-    if (currentState) currentState.provider_base_url = text;
-    scheduleTextMutation("provider-url", "set_provider_base_url", { text }, context);
+    context.uiState.drafts.provider.baseUrl = (event.currentTarget as HTMLInputElement).value;
+    context.uiState.drafts.providerRevision += 1;
+    updateProviderActionButtons(context);
   });
   document.querySelector<HTMLInputElement>("#provider-context-window")?.addEventListener("input", (event) => {
-    const text = (event.currentTarget as HTMLInputElement).value;
-    const currentState = context.getCurrentState();
-    if (currentState) currentState.provider_context_window = text;
-    scheduleTextMutation("provider-context-window", "set_provider_context_window", { text }, context);
+    context.uiState.drafts.provider.contextWindow = (event.currentTarget as HTMLInputElement).value;
+    context.uiState.drafts.providerRevision += 1;
+    updateProviderActionButtons(context);
   });
   document.querySelector<HTMLInputElement>("#provider-max-output-tokens")?.addEventListener("input", (event) => {
-    const text = (event.currentTarget as HTMLInputElement).value;
-    const currentState = context.getCurrentState();
-    if (currentState) currentState.provider_max_output_tokens = text;
-    scheduleTextMutation("provider-max-output-tokens", "set_provider_max_output_tokens", { text }, context);
+    context.uiState.drafts.provider.maxOutputTokens = (event.currentTarget as HTMLInputElement).value;
+    context.uiState.drafts.providerRevision += 1;
+    updateProviderActionButtons(context);
   });
   const settingsControls = collectSettingsControls();
   settingsControls.forEach((control) => {
     const update = () => {
       if (!updateSettingsControlDraft(control, context)) return;
       updateDirtyBadges(context.uiState);
-      validateSettingsForm(context.uiState, false);
+      validateSettingsForm(context.uiState, state.config_fields, false);
     };
     control.addEventListener("input", update);
     control.addEventListener("change", update);
   });
   if (settingsControls.length > 0) {
-    validateSettingsForm(context.uiState, false);
+    validateSettingsForm(context.uiState, state.config_fields, false);
   }
   document.querySelector<HTMLInputElement>("#workspace-input")?.addEventListener("input", (event) => {
-    void command<DesktopWebState>("set_workspace_input", {
-      text: (event.currentTarget as HTMLInputElement).value,
-    })
-      .then(context.setCurrentState)
-      .catch((error) => context.renderError(String(error)));
+    context.uiState.drafts.workspaceInput = (event.currentTarget as HTMLInputElement).value;
+    context.uiState.drafts.workspaceRevision += 1;
   });
   const localSearch = document.querySelector<HTMLInputElement>("#local-search");
   const updateLocalSearch = (input: HTMLInputElement, commit: boolean) => {
     const text = input.value;
-    const currentState = context.getCurrentState();
-    if (currentState) currentState.local_search_text = text;
-    if (commit) scheduleTextMutation("local-search", "set_local_search", { text }, context, true);
+    context.uiState.drafts.localSearch = text;
+    if (commit) scheduleTextMutation(
+      "local-search",
+      "set_local_search",
+      { text, expectedTarget: draftMutationTarget(state) },
+      context,
+      localSearchOwner(state),
+      true,
+    );
   };
   localSearch?.addEventListener("input", (event) => {
     updateLocalSearch(event.currentTarget as HTMLInputElement, !(event as InputEvent).isComposing);
@@ -204,9 +189,15 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
   const sessionSearch = document.querySelector<HTMLInputElement>("#session-search");
   const updateSessionSearch = (input: HTMLInputElement, commit: boolean) => {
     const text = input.value;
-    const currentState = context.getCurrentState();
-    if (currentState) currentState.session_search_text = text;
-    if (commit) scheduleTextMutation("session-search", "set_session_search", { text }, context, true);
+    context.uiState.drafts.sessionSearch = text;
+    if (commit) scheduleTextMutation(
+      "session-search",
+      "set_session_search",
+      { text, expectedTarget: sessionSearchMutationTarget(state) },
+      context,
+      sessionSearchOwner(state),
+      true,
+    );
   };
   sessionSearch?.addEventListener("input", (event) => {
     updateSessionSearch(event.currentTarget as HTMLInputElement, !(event as InputEvent).isComposing);
@@ -215,11 +206,9 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
     updateSessionSearch(event.currentTarget as HTMLInputElement, true);
   });
   document.querySelector<HTMLTextAreaElement>("#review-draft")?.addEventListener("input", (event) => {
-    void command<DesktopWebState>("set_review_draft", {
-      text: (event.currentTarget as HTMLTextAreaElement).value,
-    })
-      .then(context.setCurrentState)
-      .catch((error) => context.renderError(String(error)));
+    context.uiState.drafts.reviewDraft = (event.currentTarget as HTMLTextAreaElement).value;
+    context.uiState.drafts.reviewRevision += 1;
+    updateReviewActionButtons(context);
   });
   const opacityInput = document.querySelector<HTMLInputElement>("#opacity-input");
   opacityInput?.addEventListener("input", (event) => {
@@ -247,12 +236,12 @@ function installDelegatedActionEvents(context: ActionContext): void {
     ) {
       return;
     }
-    const currentState = context.getCurrentState();
+    const currentState = context.getViewState();
     if (!currentState) return;
     const action = node.dataset.action ?? "";
     const index = Number(node.dataset.index ?? "-1");
     const value = node.dataset.mode ?? "";
-    void dispatchAction(action, index, value, currentState, context).catch((error) => context.renderError(String(error)));
+    void dispatchAction(action, index, value, currentState, context).catch((error) => context.reportError(String(error)));
   });
   document.addEventListener("pointerdown", (event) => {
     const target = event.target;
@@ -284,10 +273,10 @@ function installDelegatedActionEvents(context: ActionContext): void {
     }
     event.preventDefault();
     event.stopPropagation();
-    const currentState = context.getCurrentState();
+    const currentState = context.getViewState();
     if (currentState) {
       void dispatchRegisteredAction("toggle-maximize-window", currentState, context, { index: -1, value: "" }).catch((error) =>
-        context.renderError(String(error)),
+        context.reportError(String(error)),
       );
     }
   });
@@ -298,11 +287,11 @@ function installDelegatedActionEvents(context: ActionContext): void {
     if (!control || !windowControlKeyboardActivation(event.key, event.repeat)) return;
     event.preventDefault();
     event.stopPropagation();
-    const currentState = context.getCurrentState();
+    const currentState = context.getViewState();
     const action = control.dataset.action ?? "";
     if (currentState && action) {
       void dispatchRegisteredAction(action, currentState, context, { index: -1, value: "" }).catch((error) =>
-        context.renderError(String(error)),
+        context.reportError(String(error)),
       );
     }
   });
@@ -371,13 +360,24 @@ function scheduleTextMutation(
   name: string,
   args: Record<string, unknown>,
   context: ActionContext,
+  target: string,
   renderResult = false,
 ): void {
   const existing = pendingTextMutations.get(key);
-  const entry = existing ?? { name, args: null, timer: null, inFlight: null, renderResult };
+  const entry = existing ?? {
+    name,
+    args: null,
+    timer: null,
+    inFlight: null,
+    renderResult,
+    target,
+    generation: 0,
+  };
   entry.name = name;
   entry.args = args;
   entry.renderResult = renderResult;
+  entry.target = target;
+  entry.generation = nextTextMutationGeneration++;
   if (entry.timer !== null) window.clearTimeout(entry.timer);
   entry.timer = window.setTimeout(() => {
     entry.timer = null;
@@ -402,15 +402,18 @@ async function flushTextMutation(key: string, context: ActionContext): Promise<v
   const name = entry.name;
   const args = entry.args;
   const renderResult = entry.renderResult;
+  const target = entry.target;
+  const generation = entry.generation;
   entry.args = null;
   entry.inFlight = command<DesktopWebState>(name, args)
     .then((state) => {
-      if (entry.args === null) {
-        context.setCurrentState(state);
-        if (renderResult) context.render(state);
+      if (entry.args === null && entry.generation === generation && searchTargetStillMatches(key, target, context)) {
+        context.acceptProjection(state, renderResult);
       }
     })
-    .catch((error) => context.renderError(String(error)))
+    .catch((error) => {
+      if (!context.recoverCommandConflict(error)) context.reportError(String(error));
+    })
     .finally(() => {
       entry.inFlight = null;
     });
@@ -422,12 +425,35 @@ async function flushTextMutation(key: string, context: ActionContext): Promise<v
   }
 }
 
-export async function flushProviderInputMutations(context: ActionContext): Promise<void> {
-  await Promise.all([
-    flushTextMutation("provider-url", context),
-    flushTextMutation("provider-context-window", context),
-    flushTextMutation("provider-max-output-tokens", context),
-  ]);
+function searchTargetStillMatches(key: string, target: string, context: ActionContext): boolean {
+  const state = context.getProjection();
+  if (!state) return false;
+  return key === "session-search"
+    ? sessionSearchOwner(state) === target
+    : localSearchOwner(state) === target;
+}
+
+function updateProviderActionButtons(context: ActionContext): void {
+  const projection = context.getProjection();
+  if (!projection) return;
+  const capabilities = deriveUiCapabilities(projection, context.uiState);
+  const load = document.querySelector<HTMLButtonElement>('[data-action="load-provider-models"]');
+  if (load) load.disabled = !capabilities.canLoadProviderModels;
+  document
+    .querySelectorAll<HTMLButtonElement>('[data-action="apply-provider-session"], [data-action="save-provider-global"]')
+    .forEach((button) => {
+      button.disabled = !capabilities.canApplyProvider;
+    });
+}
+
+function updateReviewActionButtons(context: ActionContext): void {
+  const projection = context.getProjection();
+  if (!projection) return;
+  const capabilities = deriveUiCapabilities(projection, context.uiState);
+  const enhanced = document.querySelector<HTMLButtonElement>('[data-action="send-review-enhanced"]');
+  if (enhanced) enhanced.disabled = !capabilities.canSendEnhancedReview;
+  const raw = document.querySelector<HTMLButtonElement>('[data-action="send-review-raw"]');
+  if (raw) raw.disabled = !capabilities.canSendRawReview;
 }
 
 export function prepareConfigMutation(
@@ -435,13 +461,13 @@ export function prepareConfigMutation(
   target: ConfigMutationTarget,
 ): ConfigValueInput[] | null {
   reconcileConfigDraftTarget(context.uiState, target);
-  const currentState = context.getCurrentState();
+  const currentState = context.getViewState();
   if (!currentState) return null;
   const values = configMutationValues(context.uiState, target)
     ?? (currentState.overlay === "config"
       ? currentState.config_fields.map((field) => ({ key: field.key, text: field.value }))
       : null);
-  if (!values || !validateConfigValues(values, true)) return null;
+  if (!values || !validateConfigValues(values, currentState.config_fields, true)) return null;
   return values;
 }
 
@@ -457,7 +483,8 @@ function settingsControlValue(control: SettingsControl): string {
 }
 
 function updateSettingsControlDraft(control: SettingsControl, context: ActionContext): boolean {
-  const currentState = context.getCurrentState();
+  if (!configDraftEditOpen(context.uiState)) return false;
+  const currentState = context.getViewState();
   const text = settingsControlValue(control);
   const key = control.dataset.configKey ?? "";
   if (!currentState || !key) return false;
@@ -470,21 +497,22 @@ function updateSettingsControlDraft(control: SettingsControl, context: ActionCon
     key,
     text,
   );
-  currentState.config_fields[index].value = text;
-  if (index === currentState.selected_config_index) {
-    currentState.config_value_text = text;
-    currentState.config_field_title = key;
-  }
   return true;
 }
 
-function validateSettingsForm(uiState: UiLocalState, focusInvalid: boolean): boolean {
+function validateSettingsForm(
+  uiState: UiLocalState,
+  fields: ConfigFieldProjection[],
+  focusInvalid: boolean,
+): boolean {
   const controls = collectSettingsControls();
   const validation = document.querySelector<HTMLElement>("#settings-validation");
   for (const control of controls) {
     const key = control.dataset.configKey ?? "";
     if (!key) continue;
-    const result = validateConfigInput(key, settingsControlValue(control));
+    const field = fields.find((candidate) => candidate.key === key);
+    if (!field) continue;
+    const result = validateConfigInput(field, settingsControlValue(control));
     if (!result.ok) {
       if (validation) {
         validation.textContent = `${key}: ${result.message}`;
@@ -497,7 +525,9 @@ function validateSettingsForm(uiState: UiLocalState, focusInvalid: boolean): boo
     }
   }
   if (validation && controls.length > 0) {
-    validation.textContent = "入力形式は問題ありません。";
+    validation.textContent = uiState.configDirty
+      ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。"
+      : "入力形式は問題ありません。";
     validation.classList.toggle("ok", true);
     validation.classList.toggle("error", false);
   }
@@ -505,9 +535,15 @@ function validateSettingsForm(uiState: UiLocalState, focusInvalid: boolean): boo
   return true;
 }
 
-function validateConfigValues(values: ConfigValueInput[], focusInvalid: boolean): boolean {
+function validateConfigValues(
+  values: ConfigValueInput[],
+  fields: ConfigFieldProjection[],
+  focusInvalid: boolean,
+): boolean {
   for (const value of values) {
-    const result = validateConfigInput(value.key, value.text);
+    const field = fields.find((candidate) => candidate.key === value.key);
+    if (!field) return false;
+    const result = validateConfigInput(field, value.text);
     if (result.ok) continue;
     if (focusInvalid) {
       document.querySelector<SettingsControl>(
@@ -523,12 +559,15 @@ function updateDirtyBadges(uiState: UiLocalState): void {
   document.querySelectorAll<HTMLElement>(".dirty-badge").forEach((node) => {
     node.classList.toggle("visible", uiState.configDirty);
   });
+  document
+    .querySelectorAll<HTMLButtonElement>(".settings-modal [data-action='discard-config-draft']")
+    .forEach((button) => {
+      button.hidden = !uiState.configDirty;
+      button.disabled = !configDraftDiscardOpen(uiState);
+      button.setAttribute("aria-disabled", String(button.disabled));
+    });
   const setupRequired = document.querySelector(".settings-modal.setup-modal") !== null;
-  const commitEnabled = configCommitEnabled(
-    setupRequired,
-    uiState.configDirty,
-    configMutationPending(uiState),
-  );
+  const commitEnabled = configDraftCommitOpen(uiState, setupRequired);
   document
     .querySelectorAll<HTMLButtonElement>(
       ".settings-modal [data-action='apply-session-config'], .settings-modal [data-action='save-global-config']",
@@ -542,8 +581,6 @@ function updateDirtyBadges(uiState: UiLocalState): void {
 function scheduleOpacityPreview(percent: number, context: ActionContext): void {
   percent = clampOpacityPercent(percent);
   pendingOpacityPreviewPercent = percent;
-  const currentState = context.getCurrentState();
-  if (currentState) currentState.window_opacity_percent = percent;
   if (opacityPreviewFrame !== null) return;
   opacityPreviewFrame = window.requestAnimationFrame(() => {
     opacityPreviewFrame = null;
@@ -564,7 +601,7 @@ async function flushOpacityPreview(context: ActionContext): Promise<void> {
   try {
     await command<void>("preview_window_opacity", { percent });
   } catch (error) {
-    context.renderError(String(error));
+    context.reportError(String(error));
   } finally {
     opacityPreviewInFlight = false;
     if (pendingOpacityPreviewPercent !== null) void flushOpacityPreview(context);
@@ -576,7 +613,11 @@ async function dispatchAction(action: string, index: number, value: string, stat
   switch (action) {
     case "toggle-attachment-tray":
       context.uiState.attachmentTrayOpen = !context.uiState.attachmentTrayOpen;
-      context.render(state);
+      context.rerender();
+      return;
+    case "dismiss-ui-error":
+      context.uiState.recoverableError = null;
+      context.rerender();
       return;
     case "new-project-session":
       if (!navigationIsIdle(state)) return;
@@ -598,7 +639,7 @@ async function dispatchAction(action: string, index: number, value: string, stat
       if (context.uiState.localConfirmationDecisionPending) return;
       context.uiState.pendingLocalConfirmation = null;
       finishLocalDecision(context.uiState);
-      context.render(state);
+      context.rerender();
       return;
     case "confirm-local-delete":
       await confirmLocalDelete(context);
@@ -616,10 +657,20 @@ async function dispatchAction(action: string, index: number, value: string, stat
       await runIndexedMutation("remove_image", index, state.attached_images[index], state, context);
       return;
     case "send-review-enhanced":
-      await context.mutate("send_prompt_review", { enhanced: true });
+      if (!state.send_enhanced_enabled) return;
+      await context.mutate("send_prompt_review", {
+        enhanced: true,
+        text: state.review_draft_text,
+        expectedTarget: draftMutationTarget(state),
+      });
       return;
     case "send-review-raw":
-      await context.mutate("send_prompt_review", { enhanced: false });
+      if (!state.send_raw_enabled) return;
+      await context.mutate("send_prompt_review", {
+        enhanced: false,
+        text: state.review_draft_text,
+        expectedTarget: draftMutationTarget(state),
+      });
       return;
     case "cancel-review":
       await context.mutate("cancel_prompt_review");
@@ -642,26 +693,33 @@ async function dispatchAction(action: string, index: number, value: string, stat
       return;
     case "import-config-toml":
       {
-        const request = beginConfigMutation(context.uiState, state.config_target);
-        context.render(state);
-        let nextState: DesktopWebState;
-        let imported: boolean;
+        const ownerMutationOpen = configOwnerMutationOpen(context.uiState);
+        if (!ownerMutationOpen) return;
+        context.uiState.externalConfigMutationPending = true;
         try {
-          [nextState, imported] = await command<[DesktopWebState, boolean]>("import_global_config_toml", {
-            expectedTarget: request.target,
-          });
-        } catch (error) {
-          const finished = finishConfigMutation(context.uiState, request, false, context.getCurrentState()?.config_target ?? null);
-          if (context.recoverCommandConflict(error)) return;
-          if (!finished) return;
-          const latest = context.getCurrentState();
-          if (latest) context.render(latest);
-          context.renderError(String(error));
-          return;
+          context.rerender();
+          const request = beginConfigMutation(context.uiState, state.config_target);
+          let nextState: DesktopWebState;
+          let imported: boolean;
+          try {
+            [nextState, imported] = await command<[DesktopWebState, boolean]>("import_global_config_toml", {
+              expectedTarget: request.target,
+              configOwnerMutationOpen: ownerMutationOpen,
+            });
+          } catch (error) {
+            const finished = finishConfigMutation(context.uiState, request, false, context.getViewState()?.config_target ?? null);
+            if (context.recoverCommandConflict(error)) return;
+            if (!finished) return;
+            context.rerender();
+            context.reportError(String(error));
+            return;
+          }
+          if (!finishConfigMutation(context.uiState, request, imported, context.getViewState()?.config_target ?? null)) return;
+          context.acceptProjection(nextState);
+        } finally {
+          context.uiState.externalConfigMutationPending = false;
+          context.rerender();
         }
-        if (!finishConfigMutation(context.uiState, request, imported, context.getCurrentState()?.config_target ?? null)) return;
-        context.setCurrentState(nextState);
-        context.render(nextState);
       }
       return;
     case "insert-command":
@@ -722,19 +780,20 @@ async function runLocalConfirmationMutation(
   expectedTarget: RowMutationTarget,
 ): Promise<void> {
   if (!beginLocalDecision(context.uiState, context.uiState.pendingLocalConfirmation !== null)) return;
-  const state = context.getCurrentState();
-  if (state) context.render(state);
+  context.rerender();
   try {
     const nextState = await command<DesktopWebState>(name, { index, expectedTarget });
     finishLocalDecision(context.uiState);
     context.uiState.pendingLocalConfirmation = null;
-    context.render(nextState);
+    context.acceptProjection(nextState);
   } catch (error) {
-    if (context.recoverCommandConflict(error)) return;
     failLocalDecision(context.uiState, "処理を開始できませんでした。もう一度お試しください。");
-    const latest = context.getCurrentState();
-    if (latest) context.render(latest);
-    context.renderError(String(error));
+    if (context.recoverCommandConflict(error)) {
+      context.rerender();
+      return;
+    }
+    context.rerender();
+    context.reportError(String(error));
   }
 }
 
@@ -766,6 +825,7 @@ function focusOverlayPrimary(state: DesktopWebState, uiState: UiLocalState): voi
     if (active && active !== document.body && active !== document.documentElement) return;
   }
   uiState.lastFocusedOverlay = overlayKey;
+  const confirmationOverlay = overlayKey === "permission" || overlayKey === "local-confirm";
   const selector =
     overlayKey === "command_palette"
       ? "#local-search"
@@ -777,16 +837,20 @@ function focusOverlayPrimary(state: DesktopWebState, uiState: UiLocalState): voi
             ? "#workspace-input"
             : overlayKey === "prompt_review"
               ? "#review-draft"
-              : overlayKey === "permission" || overlayKey === "local-confirm"
-                ? ".modal-actions button:not(:disabled), .permission-decision-status"
+              : confirmationOverlay
+                ? ""
                 : isRegularModalOverlay(overlayKey)
                   ? ".modal button:not(:disabled), .modal[role='dialog']"
                   : "";
-  if (!selector) {
+  if (!selector && !confirmationOverlay) {
     return;
   }
   requestAnimationFrame(() => {
-    const target = document.querySelector<HTMLElement>(selector);
+    const target = confirmationOverlay
+      ? document.querySelector<HTMLElement>(".modal-actions button[autofocus]:not(:disabled)")
+        ?? document.querySelector<HTMLElement>(".modal-actions button:not(:disabled)")
+        ?? document.querySelector<HTMLElement>(".permission-decision-status")
+      : document.querySelector<HTMLElement>(selector);
     target?.focus();
     if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
       const end = target.value.length;

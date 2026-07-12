@@ -6,6 +6,7 @@ pub mod docling_convert;
 pub mod goal;
 pub mod inspect_directory;
 pub mod mcp_call;
+pub mod multi_agent;
 pub mod read;
 pub mod registry;
 pub mod search;

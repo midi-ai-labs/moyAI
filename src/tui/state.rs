@@ -95,6 +95,8 @@ pub struct PermissionOverlayView {
     pub targets: Vec<String>,
     pub outside_workspace: bool,
     pub risks: Vec<String>,
+    pub agent_path: Option<String>,
+    pub agent_task_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -625,6 +627,8 @@ impl AppState {
                 .iter()
                 .map(|risk| risk.label().to_string())
                 .collect(),
+            agent_path: request.agent_path.clone(),
+            agent_task_name: request.agent_task_name.clone(),
         });
         self.run_status = RunStatus::Confirming;
         self.progress.status = "Confirming".to_string();
@@ -634,7 +638,7 @@ impl AppState {
 
     pub fn clear_permission(&mut self) {
         self.permission = None;
-        if self.current_session_id.is_some() {
+        if self.current_session_id.is_some() && self.run_status == RunStatus::Confirming {
             self.run_status = RunStatus::Running;
             self.progress.status = "Running".to_string();
             self.progress.current_phase = "resumed".to_string();
@@ -925,6 +929,13 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
                 message_id: None,
                 tool_call_id: None,
             }),
+            TurnItemPayload::InterAgentCommunication { communication } => Some(TranscriptEntry {
+                kind: TranscriptKind::System,
+                title: format!("Sub Agent · {}", communication.author),
+                body: communication.content.clone(),
+                message_id: None,
+                tool_call_id: None,
+            }),
             TurnItemPayload::Reasoning { text } => Some(TranscriptEntry {
                 kind: TranscriptKind::Reasoning,
                 title: "Reasoning".to_string(),
@@ -933,6 +944,7 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
                 tool_call_id: None,
             }),
             TurnItemPayload::Plan { .. }
+            | TurnItemPayload::SubAgentActivity { .. }
             | TurnItemPayload::PromptDispatch { .. }
             | TurnItemPayload::State { .. }
             | TurnItemPayload::WorldState { .. }
@@ -1195,6 +1207,24 @@ mod tests {
     #[test]
     fn tui_session_search_state_is_explicit_discovery_metadata() {
         assert!(super::tui_session_search_state_is_explicit_discovery_metadata_fixture_passes());
+    }
+
+    #[test]
+    fn clearing_permission_resumes_only_a_confirming_run() {
+        let session_id = SessionId::new();
+        let mut state = AppState {
+            current_session_id: Some(session_id),
+            run_status: RunStatus::Completed,
+            ..AppState::default()
+        };
+
+        state.clear_permission();
+        assert_eq!(state.run_status, RunStatus::Completed);
+
+        state.run_status = RunStatus::Confirming;
+        state.clear_permission();
+        assert_eq!(state.run_status, RunStatus::Running);
+        assert_eq!(state.progress.current_phase, "resumed");
     }
 
     #[test]

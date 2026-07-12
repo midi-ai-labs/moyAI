@@ -1,5 +1,6 @@
-import type { DesktopWebState, RowMutationTarget } from "./types";
-import { escapeHtml } from "./utils";
+import type { DesktopWebState, RowMutationTarget } from "./types.ts";
+import { renderPermissionAgentIdentity } from "./render_agent_activity.ts";
+import { escapeHtml } from "./utils.ts";
 
 export type LocalConfirmation = {
   kind: "project" | "session" | "chat_session" | "archive_session" | "unarchive_session" | "rollback_session";
@@ -20,6 +21,8 @@ export function renderConfirmation(state: DesktopWebState): string {
   const targets = confirmation.targets.length > 0 ? confirmation.targets.join(", ") : "(なし)";
   const risks = confirmation.risks.length > 0 ? confirmation.risks.join(", ") : "なし";
   const details = confirmation.details.length > 0 ? confirmation.details.join("\n") : "なし";
+  const agentPath = state.confirmation?.agent_path?.trim() ?? "";
+  const agentTaskName = state.confirmation?.agent_task_name?.trim() ?? "";
   return `
     <div class="modal-backdrop">
       <section class="modal confirmation" role="alertdialog" aria-modal="true" aria-labelledby="permission-title" aria-describedby="permission-summary" tabindex="-1">
@@ -27,6 +30,7 @@ export function renderConfirmation(state: DesktopWebState): string {
         <div class="confirm-summary" id="permission-summary">${escapeHtml(confirmation.summary)}</div>
         <div class="confirm-command" aria-label="実行内容">${escapeHtml(details)}</div>
         <dl class="confirm-details">
+          ${agentPath ? `<dt>要求元</dt><dd>${renderPermissionAgentIdentity(agentPath, agentTaskName)}</dd>` : ""}
           <dt>対象</dt><dd>${escapeHtml(targets)}</dd>
           <dt>ワークスペース外</dt><dd>${escapeHtml(confirmation.outside_workspace ? "はい" : "いいえ")}</dd>
           <dt>リスク</dt><dd>${escapeHtml(risks)}</dd>

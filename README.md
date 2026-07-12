@@ -58,6 +58,7 @@ moyAI is designed around those constraints:
 ## Highlights
 
 - Tauri Desktop app with project chat, quick chat, transcript, artifacts, settings, and provider discovery.
+- One Desktop instance per user; launching it again restores the existing window.
 - CLI and TUI for terminal-centered workflows.
 - OpenAI-compatible local LLM connection with model availability checks.
 - LM Studio metadata discovery through `/v1/models` and `/api/v1/models`.
@@ -67,6 +68,7 @@ moyAI is designed around those constraints:
 - Optional Docling Serve and HTTP MCP integration for document-heavy workflows.
 - Local instructions from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md`, and local `SKILL.md` files.
 - Protocol-first session history with Markdown export and lightweight live-smoke artifacts.
+- Optional root-scoped multi-agent collaboration with separate child sessions and visible Desktop activity.
 
 ## Current Release
 
@@ -117,7 +119,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.6.2 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.6.3 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 By default, release artifacts are written outside the repository under `project_sandbox/releases/`.
@@ -152,6 +154,12 @@ num_ctx = 131072
 [permissions]
 access_mode = "auto_review"
 
+[multi_agent]
+enabled = false
+mode = "explicit_request_only"
+max_concurrent_agents = 4
+max_concurrent_model_requests = 1
+
 [docling]
 enabled = false
 base_url = "http://127.0.0.1:8123"
@@ -173,6 +181,10 @@ Common environment variables:
 - `MOYAI_CONTEXT_WINDOW`
 - `MOYAI_MAX_OUTPUT_TOKENS`
 - `MOYAI_SUPPORTS_IMAGES`
+- `MOYAI_MULTI_AGENT_ENABLED`
+- `MOYAI_MULTI_AGENT_MODE`
+- `MOYAI_MULTI_AGENT_MAX_AGENTS`
+- `MOYAI_MULTI_AGENT_MAX_MODEL_REQUESTS`
 - `MOYAI_DOCLING_ENABLED`
 - `MOYAI_MCP_ENABLED`
 
@@ -194,6 +206,33 @@ inside moyAI instead of relying on shell environment variables. Current vLLM-MLX
 `/v1/status` responses expose the hosted model name, but not the server startup `--max-tokens` /
 `--max-request-tokens` values, so moyAI auto-detects the model and keeps request limits as managed
 config unless a provider exposes those fields in `/v1/models`.
+
+## Multi-Agent Collaboration (Opt-in)
+
+Multi-agent collaboration is disabled by default. Set `[multi_agent].enabled = true` in Settings or
+the config file to expose these six tools to the model: `spawn_agent`, `send_message`,
+`followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents`.
+
+- `mode = "explicit_request_only"` delegates only when the user explicitly requests agents,
+  sub-agents, delegation, or parallel agent work. `mode = "proactive"` also lets the model delegate
+  bounded independent work when doing so materially improves quality or latency.
+- The first release fixes tree depth at one level: only the root may call `spawn_agent`, and a child
+  cannot spawn another Sub Agent.
+- `max_concurrent_agents` is the root-inclusive limit for simultaneously active agents. The default
+  `4` therefore allows the root plus up to three children to run at once. Completed agents remain
+  listed and available for follow-up work but no longer consume an active slot, so the parent may
+  spawn further bounded tasks sequentially.
+- `max_concurrent_model_requests = 1` keeps local-LLM model requests within the tree serialized by
+  default, while agents can still make progress independently around tool and review work. Raise it
+  only when the configured inference server can safely sustain parallel requests.
+- Each child is a separate durable session linked to its parent. Normal project/session lists keep
+  those implementation sessions hidden. `spawn_agent` accepts `fork_turns = "all"` (the default)
+  or `"none"`; `"all"` copies only user turns and visible assistant messages, not reasoning, tool
+  traffic, internal control items, or permission evidence.
+- Desktop shows spawn-ordered activity inline and in the Output / Sub Agent pane. Permission prompts
+  identify the requesting agent and are serialized. While any agent in the current tree is active,
+  new-chat, session, project, and workspace navigation is blocked. This keeps the current root task
+  selected and preserves permission and Stop routing; Stop cancels the whole tree.
 
 ## Startup Checks
 
