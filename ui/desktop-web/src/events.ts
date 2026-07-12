@@ -240,7 +240,24 @@ function installDelegatedActionEvents(context: ActionContext): void {
     if (!currentState) return;
     const action = node.dataset.action ?? "";
     const index = Number(node.dataset.index ?? "-1");
-    const value = node.dataset.mode ?? "";
+    const value = node.dataset.agentPath ?? node.dataset.mode ?? "";
+    void dispatchAction(action, index, value, currentState, context).catch((error) => context.reportError(String(error)));
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.repeat || (event.key !== "Enter" && event.key !== " ")) return;
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const node = target.closest<HTMLElement>(
+      '[data-action="show-agent-pane"], [data-action="show-output-pane"]',
+    );
+    if (!node || (node instanceof HTMLButtonElement && node.disabled)) return;
+    const currentState = context.getViewState();
+    if (!currentState) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const action = node.dataset.action ?? "";
+    const index = Number(node.dataset.index ?? "-1");
+    const value = node.dataset.agentPath ?? node.dataset.mode ?? "";
     void dispatchAction(action, index, value, currentState, context).catch((error) => context.reportError(String(error)));
   });
   document.addEventListener("pointerdown", (event) => {

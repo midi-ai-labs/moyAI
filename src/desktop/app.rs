@@ -36,7 +36,7 @@ use crate::session::{
     history_markdown_file_name,
 };
 use crate::tool::PermissionRequest;
-use crate::tui::config_editor::ConfigField;
+use crate::tui::config_editor::{ConfigEditorState, ConfigField};
 use crate::workspace::project::normalize_path;
 use tauri::Manager;
 use tempfile::NamedTempFile;
@@ -1399,6 +1399,78 @@ mod command_projection_owner_tests {
         let blocker = controller.state.begin_project_delete_mutation();
         assert!(!controller.set_session_memory_mode(session_a.id, SessionMemoryMode::Enabled,));
         assert!(controller.state.finish_project_delete_mutation(blocker));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_access_mode_persistence_keeps_every_runtime_owner_and_permission_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let initial_access_mode = controller.app.config.permissions.access_mode;
+        let live = LiveConfigOverrides::new(initial_access_mode);
+        let live_observer = live.clone();
+        controller
+            .run_lifecycle
+            .begin(1, CancellationToken::new(), live);
+        let request = test_permission("pending permission");
+        let (response, receiver) = mpsc::channel();
+        controller.pending_permission_request = Some(request.clone());
+        controller.pending_permission_request_id = Some(42);
+        controller.permission_response = Some(response);
+        controller.state.set_permission(42, &request);
+
+        assert!(!controller.toggle_access_mode_with_remember(|_| {
+            Err("simulated persistence failure".to_string())
+        }));
+
+        assert_eq!(
+            controller.app.config.permissions.access_mode,
+            initial_access_mode
+        );
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            initial_access_mode
+        );
+        assert_eq!(live_observer.access_mode(), initial_access_mode);
+        assert_eq!(controller.pending_permission_request_id, Some(42));
+        assert!(controller.pending_permission_request.is_some());
+        assert_eq!(controller.state.permission_request_id, Some(42));
+        assert!(controller.state.app_state.permission.is_some());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -3860,7 +3932,14 @@ impl DesktopController {
         self.access_mode_mutation_runtime_contract().1
     }
 
-    pub(crate) fn toggle_access_mode_session(&mut self) -> bool {
+    pub(crate) fn toggle_access_mode_remembered(&mut self) -> bool {
+        self.toggle_access_mode_with_remember(ConfigEditorState::remember_global_access_mode)
+    }
+
+    fn toggle_access_mode_with_remember(
+        &mut self,
+        remember: impl FnOnce(crate::config::AccessMode) -> Result<Utf8PathBuf, String>,
+    ) -> bool {
         if !self.access_mode_mutation_admission_open() {
             self.state.set_status_message(
                 "access mode cannot change while navigation or an owner mutation is active",
@@ -3874,6 +3953,16 @@ impl DesktopController {
             .permissions
             .access_mode
             .next();
+        let remembered_path = match remember(access_mode) {
+            Ok(path) => path,
+            Err(error) => {
+                self.state.set_status_message(format!(
+                    "access mode was not changed because the selection could not be remembered: {error}"
+                ));
+                return false;
+            }
+        };
+        self.app.config.permissions.access_mode = access_mode;
         self.state.provider_config.update_access_mode(access_mode);
         if let Some(live_config) = self.run_lifecycle.live_config() {
             live_config.set_access_mode(access_mode);
@@ -3903,8 +3992,9 @@ impl DesktopController {
             ""
         };
         self.state.set_status_message(format!(
-            "{scope} access mode set to {}{suffix}",
-            access_mode.label()
+            "{scope} access mode set to {} and remembered in {}{suffix}",
+            access_mode.label(),
+            remembered_path
         ));
         true
     }

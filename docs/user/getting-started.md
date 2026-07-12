@@ -58,9 +58,9 @@ TUI では実行中も `Ctrl+Enter` で現在 turn へ追加指示を送り、`C
 
 - `default`: workspace 外、network、delete/move などは確認する。
 - `auto_review`: より広い範囲を自動承認するが、外部接続や危険操作は確認する。
-- `full_access`: 強い権限で実行する。信頼できる workspace でのみ使う。
+- `full_access`: 強い権限で実行する。通常のworkspace内操作は自動承認するが、network・外部接続・workspace外・保護対象は引き続き確認する。信頼できるworkspaceでのみ使う。
 
-Desktop では topbar/composer 付近の access mode chip から切り替える。
+Desktopではtopbar/composer付近のaccess mode chipから切り替える。明示的に切り替えた値はglobal configの`permissions.access_mode`へ自動保存され、次回起動、別workspace、新規chatでも前回の選択を使う。`MOYAI_ACCESS_MODE`など、より優先度の高い明示overrideがある場合はその値が優先される。
 
 ## Confirmation
 
@@ -89,7 +89,7 @@ max_concurrent_model_requests = 1
 - agent 上限は同時 active 数で root を含む。既定値 `4` は root と child 最大 3 件の同時実行を許す。完了 agent は一覧と follow-up 用に保持するが active 枠は消費しない。
 - local LLM model request は tree 内で既定 1 本。inference server が並列処理できる場合だけ値を増やす。
 - child は通常 session list には出ない独立 session。context fork は user turn と表示対象 assistant message だけを引き継ぐ。
-- Desktop の本文内と Output / Sub Agent pane に activity が表示され、permission dialog には要求元 agent が表示される。Agent Tree 実行中は新規 chat / session / project / workspace navigation を禁止する。Stop は tree 全体を停止する。
+- Desktopはactiveなactivityを本文内のクリック可能なAgentチップ、terminal後を1件の履歴集約として表示する。本文またはOutputの集約表示をクリックすると、current root taskに紐づくread-onlyのSub Agent専用paneが開き、状態別一覧、task、current work、result、child session IDを確認できる。child sessionへ画面遷移はせず、狭いwindowでは右側drawerになる。permission dialogには要求元agentが表示される。Agent Tree実行中は新規chat / session / project / workspace navigationを禁止する。Stopはtree全体を停止する。
 
 ## 履歴と保存場所
 

@@ -63,7 +63,7 @@ moyAI is designed around those constraints:
 - OpenAI-compatible local LLM connection with model availability checks.
 - LM Studio metadata discovery through `/v1/models` and `/api/v1/models`.
 - Workspace search, directory inspection, guarded file reads, diff-based edits, and shell execution.
-- Permission presets: `default`, `auto_review`, and `full_access`.
+- Permission presets: `default`, `auto_review`, and `full_access`. Desktop remembers the selected preset for the next launch; `full_access` still confirms network, external-connection, out-of-workspace, and protected-authority actions.
 - Vision-capable model support for image attachments.
 - Optional Docling Serve and HTTP MCP integration for document-heavy workflows.
 - Local instructions from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md`, and local `SKILL.md` files.
@@ -229,10 +229,14 @@ the config file to expose these six tools to the model: `spawn_agent`, `send_mes
   those implementation sessions hidden. `spawn_agent` accepts `fork_turns = "all"` (the default)
   or `"none"`; `"all"` copies only user turns and visible assistant messages, not reasoning, tool
   traffic, internal control items, or permission evidence.
-- Desktop shows spawn-ordered activity inline and in the Output / Sub Agent pane. Permission prompts
-  identify the requesting agent and are serialized. While any agent in the current tree is active,
-  new-chat, session, project, and workspace navigation is blocked. This keeps the current root task
-  selected and preserves permission and Stop routing; Stop cancels the whole tree.
+- Desktop shows active work as clickable inline agent chips and collapses terminal activity into one
+  history summary. Activating that summary, or the compact summary in Output, opens a read-only
+  Sub Agent pane for the current root task with status groups, task, current work, result, and child
+  session ID. It does not navigate to the child session and becomes a right-side drawer in narrow
+  windows. Permission prompts identify the requesting agent and are serialized. While any agent in
+  the current tree is active, new-chat, session, project, and workspace navigation is blocked. This
+  keeps the current root task selected and preserves permission and Stop routing; Stop cancels the
+  whole tree.
 
 ## Startup Checks
 

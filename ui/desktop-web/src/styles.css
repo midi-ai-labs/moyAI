@@ -1212,6 +1212,43 @@ select:focus-visible,
   font-weight: 650;
 }
 
+.agent-inline-history {
+  padding-top: 8px;
+}
+
+.agent-history-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 36px;
+  padding: 4px 2px;
+  color: #cfd6df;
+  text-align: left;
+}
+
+.agent-history-trigger > span:first-child,
+.agent-history-trigger strong,
+.agent-history-trigger small {
+  display: block;
+  min-width: 0;
+}
+
+.agent-history-trigger strong {
+  font-size: 12px;
+}
+
+.agent-history-trigger small {
+  margin-top: 3px;
+  color: #838e9c;
+  font-size: 11px;
+}
+
+.agent-history-trigger:hover,
+.agent-history-trigger:focus-visible {
+  color: #fff;
+}
+
 .agent-update-summary {
   color: #9ca9b8;
   font-size: 12px;
@@ -1234,6 +1271,13 @@ select:focus-visible,
   border-radius: 8px;
   background: #20232a;
   color: #dbe1ea;
+  text-align: left;
+}
+
+.agent-chip:hover,
+.agent-chip:focus-visible {
+  border-color: color-mix(in srgb, var(--agent-accent) 60%, #343943);
+  background: #262a32;
 }
 
 .agent-chip.updated,
@@ -1313,6 +1357,15 @@ select:focus-visible,
   gap: 8px;
   align-items: center;
   min-width: 0;
+  width: 100%;
+  padding: 4px 6px;
+  border-radius: 7px;
+  text-align: left;
+}
+
+.agent-inline-current:hover,
+.agent-inline-current:focus-visible {
+  background: rgba(255, 255, 255, 0.035);
 }
 
 .agent-inline-current strong,
@@ -1751,6 +1804,96 @@ select:focus-visible,
   min-height: 0;
 }
 
+.output-agent-trigger {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  width: 100%;
+  min-height: 50px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #1c1c19;
+  text-align: left;
+}
+
+.output-agent-trigger:hover,
+.output-agent-trigger:focus-visible {
+  border-color: #484842;
+  background: #21211e;
+}
+
+.output-agent-symbols {
+  display: flex;
+  align-items: center;
+}
+
+.output-agent-symbols .agent-symbol {
+  width: 20px;
+  height: 20px;
+  margin-left: -5px;
+  border: 2px solid #1c1c19;
+  border-radius: 50%;
+  font-size: 11px;
+}
+
+.output-agent-symbols .agent-symbol:first-child {
+  margin-left: 0;
+}
+
+.output-agent-trigger-label,
+.output-agent-trigger-label strong,
+.output-agent-trigger-label small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.output-agent-trigger-label strong {
+  color: #dfe3e8;
+  font-size: 12px;
+}
+
+.output-agent-trigger-label small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.agent-inspector-pane {
+  gap: 9px;
+}
+
+.agent-pane-title {
+  display: grid;
+  grid-template-columns: minmax(56px, 1fr) auto minmax(56px, 1fr);
+  gap: 8px;
+}
+
+.agent-pane-title > .pin {
+  justify-self: end;
+}
+
+.agent-pane-back {
+  justify-self: start;
+  color: #aeb7c3;
+  font-size: 12px;
+}
+
+.agent-pane-back:hover,
+.agent-pane-back:focus-visible {
+  color: #fff;
+}
+
+.agent-inspector-summary {
+  padding: 0 6px;
+  color: #939eac;
+  font-size: 11px;
+}
+
 .output-section-heading {
   display: flex;
   align-items: center;
@@ -1781,12 +1924,43 @@ select:focus-visible,
   background: #1c1c19;
 }
 
+.agent-inspector-list {
+  flex: 1 1 auto;
+  max-height: none;
+}
+
+.sub-agent-group + .sub-agent-group {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.sub-agent-group > h3 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0;
+  padding: 10px 9px 5px;
+  color: #8e98a6;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.sub-agent-group > h3 small {
+  color: #6e7885;
+  font-size: 10px;
+}
+
 .sub-agent-detail {
   border-bottom: 1px solid rgba(255, 255, 255, 0.055);
 }
 
 .sub-agent-detail:last-child {
   border-bottom: 0;
+}
+
+.sub-agent-detail.selected {
+  background: rgba(141, 185, 255, 0.055);
+  box-shadow: inset 2px 0 0 var(--agent-accent);
 }
 
 .sub-agent-detail summary {
@@ -2844,6 +3018,16 @@ pre {
 
   .artifact-pane {
     display: none;
+  }
+
+  .artifact-pane.agent-inspector-pane {
+    position: fixed;
+    z-index: 70;
+    inset: var(--titlebar-height) 0 0 auto;
+    display: flex;
+    width: min(352px, calc(100vw - 24px));
+    border-left: 1px solid #35342f;
+    box-shadow: -18px 0 36px rgba(0, 0, 0, 0.32);
   }
 
   .thread {

@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::Write;
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use tempfile::NamedTempFile;
 
 use crate::config::loader::global_config_path;
@@ -323,6 +323,24 @@ impl ConfigEditorState {
             }
         }
     }
+
+    pub fn remember_global_access_mode(access_mode: AccessMode) -> Result<Utf8PathBuf, String> {
+        let path = global_config_path().map_err(|error| error.to_string())?;
+        save_access_mode(&path, access_mode)?;
+        Ok(path)
+    }
+}
+
+fn save_access_mode(path: &Utf8Path, access_mode: AccessMode) -> Result<(), String> {
+    let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+    let field = editor
+        .fields
+        .iter_mut()
+        .find(|field| field.key == ConfigField::AccessMode)
+        .ok_or_else(|| "permissions.access_mode is unavailable".to_string())?;
+    field.value = access_mode.as_str().to_string();
+    field.dirty = true;
+    save_config_sections(path, &editor)
 }
 
 fn save_config_sections(path: &Utf8Path, editor: &ConfigEditorState) -> Result<(), String> {
@@ -780,8 +798,10 @@ impl ValueExt for serde_json::Value {
 mod tests {
     use camino::Utf8PathBuf;
 
-    use super::{ConfigEditorState, ConfigField, parse_editor_patch, save_config_sections};
-    use crate::config::{ProviderMetadataMode, ResolvedConfig};
+    use super::{
+        ConfigEditorState, ConfigField, parse_editor_patch, save_access_mode, save_config_sections,
+    };
+    use crate::config::{AccessMode, ProviderMetadataMode, ResolvedConfig};
 
     #[test]
     fn config_editor_projects_provider_metadata_mode_patch() {
@@ -907,6 +927,32 @@ mod tests {
             std::fs::read_to_string(&path).expect("read config"),
             original
         );
+    }
+
+    #[test]
+    fn remembering_access_mode_updates_only_the_existing_permission_field() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        std::fs::write(
+            &path,
+            "[model]\nmodel = \"keep-model\"\n\n[permissions]\naccess_mode = \"default\"\n\n[future]\nflag = \"keep\"\n",
+        )
+        .expect("seed config");
+
+        for (mode, expected) in [
+            (AccessMode::AutoReview, "auto_review"),
+            (AccessMode::FullAccess, "full_access"),
+            (AccessMode::Default, "default"),
+        ] {
+            save_access_mode(&path, mode).expect("remember access mode");
+
+            let saved = std::fs::read_to_string(&path).expect("read saved config");
+            let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+            assert_eq!(saved["permissions"]["access_mode"].as_str(), Some(expected));
+            assert_eq!(saved["model"]["model"].as_str(), Some("keep-model"));
+            assert_eq!(saved["future"]["flag"].as_str(), Some("keep"));
+        }
     }
 
     #[test]

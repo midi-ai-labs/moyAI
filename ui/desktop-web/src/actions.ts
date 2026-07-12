@@ -16,7 +16,12 @@ import {
 import { rowMutationArgs } from "./row_target.ts";
 import { runCanBeCancelled } from "./run_control.ts";
 import type { ConfigMutationTarget, DesktopWebState, ProjectRow, SessionRow } from "./types.ts";
-import { setArtifactPaneCollapsed, type UiLocalState } from "./ui_state.ts";
+import {
+  openAgentPane,
+  setArtifactPaneCollapsed,
+  showOutputPane,
+  type UiLocalState,
+} from "./ui_state.ts";
 import {
   composerCapabilities,
   configDraftCommitOpen,
@@ -450,7 +455,28 @@ export const ACTIONS: ActionDefinition[] = [
     palette: true,
     enabled: always,
     run: (_state, context) => {
-      setArtifactPaneCollapsed(context.uiState, !context.uiState.artifactPaneCollapsed);
+      const collapsing = !context.uiState.artifactPaneCollapsed;
+      if (collapsing && context.uiState.artifactPaneMode === "agents") {
+        showOutputPane(context.uiState);
+      }
+      setArtifactPaneCollapsed(context.uiState, collapsing);
+      context.rerender();
+    },
+  },
+  {
+    id: "show-agent-pane",
+    label: "Sub Agent履歴を表示",
+    enabled: (state) => state.agent_activity_rows.length > 0,
+    run: (state, context, payload) => {
+      if (openAgentPane(context.uiState, state, payload.value)) context.rerender();
+    },
+  },
+  {
+    id: "show-output-pane",
+    label: "出力ペインに戻る",
+    enabled: always,
+    run: (_state, context) => {
+      showOutputPane(context.uiState);
       context.rerender();
     },
   },

@@ -3,10 +3,15 @@ import { actionById, menuActions, paletteActions, shortcutActions, type ActionDe
 import { icon } from "./icons.ts";
 import { renderMarkdown } from "./markdown.ts";
 import { navigationIsIdle, quickChatDeleteAction, sessionRowCapabilities } from "./navigation_state.ts";
-import { renderInlineAgentActivity, renderSubAgentSection } from "./render_agent_activity.ts";
+import {
+  renderAgentInspector,
+  renderInlineAgentActivity,
+  renderSubAgentSummaryTrigger,
+} from "./render_agent_activity.ts";
 import { agentActivitySummary } from "./agent_activity.ts";
 import { runCanBeCancelled, runSurfaceActive } from "./run_control.ts";
 import type { ConfigFieldProjection, DesktopWebState, FileChangeRow, ProjectRow, SessionRow, TranscriptRow } from "./types.ts";
+import type { ArtifactPaneMode } from "./ui_state.ts";
 import { displayAccessLabel, escapeHtml, fileName, goalSlashCommandHint, shortenPath } from "./utils.ts";
 import { providerCapabilities } from "./view_state.ts";
 
@@ -17,6 +22,8 @@ const splashLogoUrl = new URL("../../../logo/fabicon/android-chrome-512x512.png"
 
 interface RenderContext {
   artifactPaneCollapsed: boolean;
+  artifactPaneMode?: ArtifactPaneMode;
+  selectedAgentPath?: string | null;
   attachmentTrayOpen: boolean;
   configDirty: boolean;
   configMutationPending: boolean;
@@ -27,6 +34,8 @@ interface RenderContext {
 }
 
 let artifactPaneCollapsed = false;
+let artifactPaneMode: ArtifactPaneMode = "output";
+let selectedAgentPath: string | null = null;
 let attachmentTrayOpen = false;
 let configDirty = false;
 let configMutationInFlight = false;
@@ -72,6 +81,8 @@ const TYPED_CONFIG_KEYS = new Set([
 
 export function setRenderContext(context: RenderContext): void {
   artifactPaneCollapsed = context.artifactPaneCollapsed;
+  artifactPaneMode = context.artifactPaneMode ?? "output";
+  selectedAgentPath = context.selectedAgentPath ?? null;
   attachmentTrayOpen = context.attachmentTrayOpen;
   configDirty = context.configDirty;
   configMutationInFlight = context.configMutationPending;
@@ -398,7 +409,7 @@ export function renderRunStatusStrip(state: DesktopWebState): string {
 }
 
 export function renderThreadContent(state: DesktopWebState): string {
-  const agentActivity = renderInlineAgentActivity(state);
+  const agentActivity = renderInlineAgentActivity(state, artifactPaneMode === "agents");
   if ((state.thread_empty || state.selected_session_index < 0) && state.file_change_rows.length === 0) {
     return `${renderEmptyThread(state)}${agentActivity}`;
   }
@@ -657,6 +668,18 @@ export function renderArtifactPane(state: DesktopWebState): string {
       </aside>
     `;
   }
+  if (artifactPaneMode === "agents") {
+    return `
+      <aside id="sub-agent-inspector" class="artifact-pane agent-inspector-pane" data-pane-mode="sub-agents" aria-label="Sub Agent履歴">
+        <div class="pane-title agent-pane-title">
+          <button class="agent-pane-back" data-action="show-output-pane" aria-label="出力ペインに戻る">‹ <span>出力</span></button>
+          <strong>サブエージェント</strong>
+          <button class="pin" data-action="toggle-artifact-pane" title="Sub Agentペインを閉じる" aria-label="Sub Agentペインを閉じる">${icon("x")}</button>
+        </div>
+        ${renderAgentInspector(state, selectedAgentPath)}
+      </aside>
+    `;
+  }
   const hasPreview = state.artifact_preview_available;
   const artifactNavigationBlocked = !navigationIsIdle(state);
   const artifactFolderDisabled = state.selected_artifact_index < 0
@@ -667,15 +690,15 @@ export function renderArtifactPane(state: DesktopWebState): string {
     : ' title="アーティファクトのフォルダーを開く"';
   const hasActivity = state.busy && (state.progress_text.trim().length > 0 || state.tool_status_text.trim().length > 0);
   return `
-    <aside class="artifact-pane">
+    <aside class="artifact-pane" data-pane-mode="output">
       <div class="pane-title">
         <strong>出力</strong>
         <div class="pane-actions">
-          <button class="pin" data-action="toggle-artifact-pane" title="出力を折りたたむ" aria-label="出力を折りたたむ">${icon("x")}</button>
+          <button class="pin" data-action="toggle-artifact-pane" title="出力ペインを閉じる" aria-label="出力ペインを閉じる">${icon("x")}</button>
           <button class="pin" data-action="open-artifact-folder"${artifactFolderDisabledAttrs} aria-label="アーティファクトのフォルダーを開く">${icon("folder")}</button>
         </div>
       </div>
-      ${renderSubAgentSection(state)}
+      ${renderSubAgentSummaryTrigger(state)}
       <section class="output-file-section" aria-label="ファイル出力">
         <div class="output-section-heading">
           <strong>ファイル</strong>

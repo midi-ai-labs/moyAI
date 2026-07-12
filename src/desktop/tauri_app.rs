@@ -1884,7 +1884,7 @@ async fn toggle_access_mode(
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
         ensure_access_mode_mutation_target(controller, &expected_target)?;
-        if !controller.toggle_access_mode_session() {
+        if !controller.toggle_access_mode_remembered() {
             return Err(rejected_action(
                 controller,
                 "the access mode was not changed",

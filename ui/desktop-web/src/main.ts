@@ -23,7 +23,7 @@ import {
   setRenderContext,
 } from "./render";
 import type { DesktopWebState } from "./types";
-import { createUiLocalState } from "./ui_state";
+import { createUiLocalState, reconcileAgentPaneState } from "./ui_state";
 import {
   InteractionLifecycle,
   type InteractionRelease,
@@ -330,6 +330,7 @@ function applyStateUpdate(update: StateUpdate): void {
   if (interactionLifecycle.defer({ ...update, render: true }, update.state === currentState, update.render)) return;
   const previousProjection = currentState;
   reconcileUiDrafts(uiState, previousProjection, update.state, update.draftSnapshot);
+  reconcileAgentPaneState(uiState, update.state);
   currentState = update.state;
   lastAppliedStateSequence = update.sequence;
   lastAppliedProjectionRevision = appliedProjectionRevision(
@@ -405,6 +406,8 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
   }
   setRenderContext({
     artifactPaneCollapsed: uiState.artifactPaneCollapsed,
+    artifactPaneMode: uiState.artifactPaneMode,
+    selectedAgentPath: uiState.selectedAgentPath,
     attachmentTrayOpen: uiState.attachmentTrayOpen,
     configDirty: configDraftAppliesTo(uiState, state.config_target),
     configMutationPending: configMutationPending(uiState),
@@ -468,6 +471,7 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
   restoreDetailSnapshots(detailSnapshots);
   restoreFocusSnapshot(focusSnapshot);
   wireEvents(state, eventContext);
+  focusSelectedAgentAfterRender();
   if (state.confirmation_visible && uiState.permissionDecisionPending && uiState.permissionDecisionAllow !== null) {
     setPermissionDecisionPendingUi(uiState.permissionDecisionAllow);
   } else if (state.confirmation_visible && uiState.permissionDecisionError) {
@@ -484,6 +488,21 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
     requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#prompt")?.focus());
   }
   focusPromptIfRequested(state);
+}
+
+function focusSelectedAgentAfterRender(): void {
+  if (!uiState.focusSelectedAgentAfterRender || !uiState.selectedAgentPath) return;
+  const agentPath = uiState.selectedAgentPath;
+  uiState.focusSelectedAgentAfterRender = false;
+  requestAnimationFrame(() => {
+    const summary = document.querySelector<HTMLElement>(
+      `[data-focus-key="sub-agent-summary:${CSS.escape(agentPath)}"]`,
+    );
+    const detail = summary?.closest<HTMLDetailsElement>("details[data-details-key]");
+    if (detail) detail.open = true;
+    summary?.focus({ preventScroll: true });
+    summary?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  });
 }
 
 function shouldShowSplash(state: DesktopWebState, elapsedMs: number): boolean {
