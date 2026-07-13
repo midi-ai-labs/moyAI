@@ -16,18 +16,20 @@ use crate::protocol::{
     SubAgentActivityKind, TurnId, project_inter_agent_communication, project_sub_agent_activity,
 };
 use crate::runtime::{
-    AgentControl, AgentControlError, AgentExecutionLease, AgentMailboxMessage, AgentPath,
-    AgentSnapshot, AgentStatus,
+    AgentControl, AgentControlError, AgentExecutionLease, AgentMailDeliveryOutcome,
+    AgentMailboxMessage, AgentPath, AgentSnapshot, AgentStatus,
 };
 use crate::session::{
     CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionRead, CanonicalTurnPage,
     IdleTurnAdmission, LoadedSessionList, MessagePart, RunEvent, RunSummary, RunningSessionRejoin,
     SessionCompactResult, SessionContext, SessionId, SessionMemoryModeUpdate, SessionRecord,
-    SessionRepository, SessionSpawnEdge, SessionStartRequest, SessionStatus, ThreadGoalClearResult,
-    ThreadGoalGetResult, ThreadGoalSetResult, Transcript,
+    SessionRepository, SessionSettingsPatch, SessionSpawnEdge, SessionStartRequest, SessionStatus,
+    ThreadGoalClearResult, ThreadGoalGetResult, ThreadGoalSetResult, Transcript,
 };
 use crate::storage::StoreBundle;
 use crate::workspace::Workspace;
+
+const SUPPRESSED_MAIL_DELIVERY_ERROR: &str = "durable evidence was recorded, but the message was not delivered because the recipient became terminal or the agent tree was stopped";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +111,14 @@ impl AgentRunContext {
 
     pub(crate) fn tree_cancel_token(&self) -> CancellationToken {
         self.tree.control.tree_cancel_token()
+    }
+
+    fn effective_config(&self) -> ResolvedConfig {
+        let mut config = self.config.clone();
+        if let Some(live_config) = self.live_config.as_ref() {
+            live_config.apply_to(&mut config);
+        }
+        config
     }
 
     pub(crate) fn cancel_for_durable_terminal(&self) -> Result<(), String> {
@@ -481,7 +491,7 @@ impl AgentRuntime {
             live_config,
         };
         let control = tree.control.clone();
-        tokio::spawn(forward_external_cancel_until_quiescent(
+        tokio::spawn(forward_external_cancel_while_root_active(
             control,
             external_cancel,
         ));
@@ -611,10 +621,18 @@ impl AgentRuntime {
         cancelled: bool,
     ) {
         let tree = execution.context.tree.clone();
-        if cancelled || result.is_err() {
+        let durable_success = matches!(
+            result,
+            Ok(summary)
+                if matches!(
+                    summary.status,
+                    SessionStatus::Completed | SessionStatus::AwaitingUser
+                )
+        );
+        if !durable_success && (cancelled || result.is_err()) {
             tree.control.cancel_tree();
         }
-        let status = if cancelled {
+        let status = if cancelled && !durable_success {
             AgentStatus::Interrupted
         } else {
             match result {
@@ -741,6 +759,7 @@ impl AgentRuntime {
                 "agent `{child_path}` already exists; use followup_task to reuse it"
             ));
         }
+        let child_config = caller.effective_config();
         let child_session = self
             .session_service
             .start_or_resume(
@@ -748,9 +767,9 @@ impl AgentRuntime {
                     selector: crate::session::SessionSelector::New,
                     title: Some(task_name.to_string()),
                     cwd: caller.workspace.cwd.clone(),
-                    model: caller.config.model.model.clone(),
-                    base_url: caller.config.model.base_url.clone(),
-                    access_mode: caller.config.permissions.access_mode,
+                    model: child_config.model.model.clone(),
+                    base_url: child_config.model.base_url.clone(),
+                    access_mode: child_config.permissions.access_mode,
                 },
                 caller.workspace.clone(),
             )
@@ -812,7 +831,7 @@ impl AgentRuntime {
                 AgentNodeMetadata {
                     task_name: task_name.to_string(),
                     task_preview: message.clone(),
-                    config: caller.config.clone(),
+                    config: child_config.clone(),
                     workspace: caller.workspace.clone(),
                     live_config: caller.live_config.clone(),
                     updated: false,
@@ -836,7 +855,7 @@ impl AgentRuntime {
             tree: caller.tree.clone(),
             path: child_path.clone(),
             session_id: child_session_id,
-            config: caller.config.clone(),
+            config: child_config,
             workspace: caller.workspace.clone(),
             live_config: caller.live_config.clone(),
         };
@@ -898,28 +917,20 @@ impl AgentRuntime {
             content: message.clone(),
             trigger_turn,
         };
-        self.append_communication(recipient.session_id, communication)?;
         let mailbox_message = AgentMailboxMessage::new(
             caller.path.clone(),
             recipient_path.clone(),
             message,
             trigger_turn,
         );
-        let scheduled = if trigger_turn {
-            caller
-                .tree
-                .control
-                .enqueue_mail_and_schedule(mailbox_message)
-                .map(|(_, scheduled)| scheduled)
-                .map_err(agent_control_error)?
-        } else {
-            caller
-                .tree
-                .control
-                .enqueue_mail(mailbox_message)
-                .map_err(agent_control_error)?;
-            Vec::new()
-        };
+        let delivery = caller
+            .tree
+            .control
+            .enqueue_mail_after_durable_commit(mailbox_message, trigger_turn, || {
+                self.append_communication(recipient.session_id, communication)
+            })
+            .map_err(agent_control_error)?;
+        let scheduled = scheduled_mail_delivery(delivery)?;
         let _ = caller.tree.control.set_activity(
             &recipient_path,
             Some(format!("Message queued from {}", caller.path)),
@@ -1010,26 +1021,6 @@ impl AgentRuntime {
                 context.set_activity("Running assigned task");
                 let mut confirmation = context.confirmation_prompt();
                 let mut renderer = AgentEventRenderer;
-                let request = RunRequest {
-                    prompt,
-                    session_id: Some(context.session_id),
-                    continue_last: false,
-                    title: None,
-                    cwd: context.workspace.cwd.clone(),
-                    model: context.config.model.model.clone(),
-                    base_url: context.config.model.base_url.clone(),
-                    config_override: Some(full_effective_override(&context.config)),
-                    output_mode: OutputMode::Human,
-                    show_reasoning: false,
-                    prompt_dispatch: None,
-                    editor_context: None,
-                    review_request: None,
-                    image_paths: Vec::new(),
-                    cancel: lease.cancel_token(),
-                    live_config: context.live_config.clone(),
-                    agent_confirmation: Some(context.confirmation_prompt()),
-                    agent_context: Some(context.clone()),
-                };
                 let local = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -1051,7 +1042,34 @@ impl AgentRuntime {
                         return;
                     }
                 };
+                let run_context = context.clone();
+                let runtime_for_run = runtime.clone();
+                let cancel = lease.cancel_token();
                 let result = local.block_on(async move {
+                    let config = runtime_for_run
+                        .materialize_context_config_and_sync_session(&run_context)
+                        .await
+                        .map_err(AppRunError::Message)?;
+                    let request = RunRequest {
+                        prompt,
+                        session_id: Some(run_context.session_id),
+                        continue_last: false,
+                        title: None,
+                        cwd: run_context.workspace.cwd.clone(),
+                        model: config.model.model.clone(),
+                        base_url: config.model.base_url.clone(),
+                        config_override: Some(full_effective_override(&config)),
+                        output_mode: OutputMode::Human,
+                        show_reasoning: false,
+                        prompt_dispatch: None,
+                        editor_context: None,
+                        review_request: None,
+                        image_paths: Vec::new(),
+                        cancel,
+                        live_config: run_context.live_config.clone(),
+                        agent_confirmation: Some(run_context.confirmation_prompt()),
+                        agent_context: Some(run_context),
+                    };
                     run_service
                         .execute(AppCommand::Run(request), &mut renderer, &mut confirmation)
                         .await
@@ -1081,6 +1099,26 @@ impl AgentRuntime {
                 })
             }
         }
+    }
+
+    async fn materialize_context_config_and_sync_session(
+        &self,
+        context: &AgentRunContext,
+    ) -> Result<ResolvedConfig, String> {
+        let config = context.effective_config();
+        if context.is_sub_agent() {
+            self.session_service
+                .update_session_settings(
+                    context.session_id,
+                    SessionSettingsPatch {
+                        access_mode: Some(config.permissions.access_mode),
+                        ..SessionSettingsPatch::default()
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(config)
     }
 
     async fn finish_agent_turn(
@@ -1131,14 +1169,20 @@ impl AgentRuntime {
             content: content.clone(),
             trigger_turn: false,
         };
-        match self.append_communication(parent_session_id, communication) {
-            Ok(()) => {
-                let _ = context.tree.control.enqueue_mail(AgentMailboxMessage::new(
-                    context.path.clone(),
-                    parent,
-                    content,
-                    false,
-                ));
+        let mailbox_message =
+            AgentMailboxMessage::new(context.path.clone(), parent.clone(), content, false);
+        match context
+            .tree
+            .control
+            .enqueue_mail_after_durable_commit(mailbox_message, false, || {
+                self.append_communication(parent_session_id, communication)
+            }) {
+            Ok(AgentMailDeliveryOutcome::Enqueued { .. }) => {}
+            Ok(AgentMailDeliveryOutcome::Suppressed) => {
+                status = AgentStatus::Errored(
+                    "agent result was recorded durably, but delivery was suppressed because the recipient became terminal or the agent tree was stopped"
+                        .to_string(),
+                );
             }
             Err(error) => {
                 status = AgentStatus::Errored(format!(
@@ -1320,25 +1364,33 @@ async fn wait_for_control_quiescence(control: &AgentControl) -> Result<(), Agent
     }
 }
 
-async fn forward_external_cancel_until_quiescent(
+async fn forward_external_cancel_while_root_active(
     control: AgentControl,
     external_cancel: CancellationToken,
 ) {
-    let mut cancellation_forwarded = false;
+    let root = AgentPath::root();
     loop {
-        match control.is_quiescent() {
-            Ok(true) | Err(_) => return,
-            Ok(false) => {}
+        let root_active = control
+            .list_agents(Some(&root))
+            .ok()
+            .and_then(|agents| agents.into_iter().find(|agent| agent.path == root))
+            .is_some_and(|agent| agent.is_active);
+        if !root_active {
+            return;
         }
         let observed_generation = control.activity_generation();
-        match control.is_quiescent() {
-            Ok(true) | Err(_) => return,
-            Ok(false) => {}
+        let root_still_active = control
+            .list_agents(Some(&root))
+            .ok()
+            .and_then(|agents| agents.into_iter().find(|agent| agent.path == root))
+            .is_some_and(|agent| agent.is_active);
+        if !root_still_active {
+            return;
         }
         tokio::select! {
-            _ = external_cancel.cancelled(), if !cancellation_forwarded => {
-                control.cancel_tree();
-                cancellation_forwarded = true;
+            _ = external_cancel.cancelled() => {
+                let _ = control.cancel_agent(&root);
+                return;
             }
             result = control.wait_for_activity(observed_generation) => {
                 if result.is_err() {
@@ -1351,6 +1403,15 @@ async fn forward_external_cancel_until_quiescent(
 
 fn agent_control_error(error: AgentControlError) -> String {
     error.to_string()
+}
+
+fn scheduled_mail_delivery(
+    outcome: AgentMailDeliveryOutcome,
+) -> Result<Vec<AgentExecutionLease>, String> {
+    match outcome {
+        AgentMailDeliveryOutcome::Enqueued { scheduled, .. } => Ok(scheduled),
+        AgentMailDeliveryOutcome::Suppressed => Err(SUPPRESSED_MAIL_DELIVERY_ERROR.to_string()),
+    }
 }
 
 async fn load_durable_agent_children(

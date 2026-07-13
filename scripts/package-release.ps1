@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "0.6.3",
+  [string]$Version = "0.7.0",
   [string]$Target = "windows-x86_64",
   [string]$OutputRoot = "",
   [string]$ManualGuiStResultsPath = "",
@@ -299,7 +299,10 @@ This release module contains the Windows CLI and Tauri Desktop binaries.
 - Thin agent core with a short Markdown prompt, plain tool results, and a small state surface.
 - Desktop GUI, CLI, and TUI entrypoints over the same Rust core.
 - Local-first LM Studio / OpenAI-compatible endpoint configuration.
-- Optional root-scoped multi-agent collaboration with separate child sessions and visible Desktop activity.
+- Optional root-scoped multi-agent collaboration with separate child sessions, bounded delegation, tree-wide Stop, and a read-only Sub Agent inspector.
+- Desktop state ownership rebuilt around Rust semantic capabilities and frontend-local drafts while preserving the existing visual design.
+- Standard, Auto Review, and Full Access now form a monotonic permission policy, with durable global/root-session selection across Desktop and TUI.
+- Runtime and storage race hardening for terminal cancellation, provider readiness/cache, config persistence, session fork, and inter-agent delivery.
 - Workspace file editing, patching, search, directory inspection, shell execution, session history, and Markdown export.
 - Codex-compatible goal runtime with `/goal`, goal tools, request-local steering, status accounting, and bounded idle continuation.
 - Codex 2026-07 context handling updates: workspace world-state context, local instruction discovery, local `SKILL.md` snapshot reuse, and the `current_time` tool.

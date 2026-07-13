@@ -69,7 +69,7 @@ export interface UiLocalState {
   attachmentTrayOpen: boolean;
   permissionDecisionPending: boolean;
   permissionDecisionAllow: boolean | null;
-  permissionDecisionConfirmationId: number | null;
+  permissionDecisionConfirmationId: string | null;
   permissionDecisionError: string;
   localConfirmationDecisionPending: boolean;
   localConfirmationDecisionError: string;

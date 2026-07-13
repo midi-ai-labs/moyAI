@@ -9,7 +9,7 @@ import {
   shouldBeginPointerInteraction,
 } from "../src/interaction_lifecycle.ts";
 import { globalShortcutAction } from "../src/keyboard_shortcut.ts";
-import { autoRefreshAllowed } from "../src/polling_state.ts";
+import { autoRefreshAllowed, runtimePollingRequired } from "../src/polling_state.ts";
 import {
   renderArtifactPane,
   renderOverlay,
@@ -26,6 +26,7 @@ import {
   captureDraftMutation,
   configDraftEditOpen,
   deriveUiCapabilities,
+  mutationAdmissionOpen,
   projectViewState,
   reconcileUiDrafts,
   rejectDraftMutation,
@@ -169,6 +170,8 @@ test("all composer actions preserve the authoritative Rust admission gate", () =
 
   assert.equal(deriveUiCapabilities(state, ui).canSubmit, true);
   assert.equal(deriveUiCapabilities(state, ui).canEnhance, true);
+  assert.equal(mutationAdmissionOpen(ui, "submit_prompt"), true);
+  assert.equal(mutationAdmissionOpen(ui, "enhance_prompt"), true);
 
   const treeActive = projection({
     busy: false,
@@ -213,7 +216,45 @@ test("a run-start command is single-flight in local capability projection", () =
   assert.equal(capabilities.canReviewUncommitted, false);
   assert.equal(capabilities.canSendEnhancedReview, false);
   assert.equal(capabilities.canSendRawReview, false);
-  assert.equal(projectViewState(state, ui).background_mutation_pending, true);
+  assert.equal(mutationAdmissionOpen(ui, "enhance_prompt"), false);
+  const view = projectViewState(state, ui);
+  assert.equal(view.background_mutation_pending, true);
+  assert.equal(view.busy, true, "Stop is available before the Rust command response arrives");
+  assert.equal(actionById("cancel-run")?.enabled?.(view, { index: -1, value: "" }), true);
+});
+
+test("an external config owner mutation immediately rejects submit and review dispatch", () => {
+  const ui = createUiLocalState();
+  const state = projection();
+  reconcileUiDrafts(ui, null, state, null);
+  ui.drafts.prompt = "must wait for the access owner";
+  ui.drafts.reviewDraft = "review must wait too";
+  ui.externalConfigMutationPending = true;
+
+  const capabilities = deriveUiCapabilities(state, ui);
+  assert.equal(capabilities.canSubmit, false);
+  assert.equal(capabilities.canEnhance, false);
+  assert.equal(capabilities.canReviewUncommitted, false);
+  assert.equal(capabilities.canSendEnhancedReview, false);
+  assert.equal(capabilities.canSendRawReview, false);
+  for (const mutation of [
+    "submit_prompt",
+    "review_uncommitted",
+    "send_prompt_review",
+    "enhance_prompt",
+  ]) {
+    assert.equal(mutationAdmissionOpen(ui, mutation), false, mutation);
+  }
+  assert.equal(
+    mutationAdmissionOpen(ui, "cancel_run"),
+    true,
+    "Stop is independent from access/config persistence",
+  );
+  assert.equal(
+    mutationAdmissionOpen(ui, "desktop_state"),
+    true,
+    "polling remains available while the config owner settles",
+  );
 });
 
 test("draft ownership resets only when its durable target changes", () => {
@@ -524,6 +565,12 @@ test("permission visibility does not stop runtime polling", () => {
   assert.equal(autoRefreshAllowed({ navigation_loading: false, confirmation_visible: true }, false), true);
   assert.equal(autoRefreshAllowed({ navigation_loading: false, confirmation_visible: true }, true), false);
   assert.equal(autoRefreshAllowed({ navigation_loading: true, confirmation_visible: true }, true), true);
+});
+
+test("run admission polls for the Rust owner before the start command responds", () => {
+  assert.equal(runtimePollingRequired(false, false), false);
+  assert.equal(runtimePollingRequired(true, false), true);
+  assert.equal(runtimePollingRequired(false, true), true);
 });
 
 test("workspace browser submits its local draft with the authoritative draft owner", async () => {

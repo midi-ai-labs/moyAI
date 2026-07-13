@@ -2,11 +2,8 @@ use std::fs;
 
 use crate::error::SessionError;
 use crate::protocol::{
-    HistoryItem, HistoryItemId, HistoryItemPayload, ProtocolEventStore, RuntimeEvent,
-    RuntimeEventId, RuntimeEventMsg, SteerTurn, TurnId, TurnItem, TurnItemId, TurnItemPayload,
-    TurnTerminalStatus, UserTurn,
+    HistoryItem, HistoryItemPayload, ProtocolEventStore, SteerTurn, TurnId, TurnItem, UserTurn,
 };
-use crate::runtime::{Clock, SystemClock};
 use crate::session::{
     CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionRead, CanonicalTurnPage,
     IdleTurnAdmission, IdleTurnRejectionReason, LoadedSessionList, LoadedSessionStatus,
@@ -480,6 +477,41 @@ impl SessionService {
             .await?)
     }
 
+    pub async fn update_root_session_access_mode(
+        &self,
+        session_id: SessionId,
+        access_mode: crate::config::AccessMode,
+    ) -> Result<SessionSettingsUpdate, SessionError> {
+        for _ in 0..8 {
+            let current = self.store.session_repo().get_session(session_id).await?;
+            if let Some(update) = self
+                .compare_and_set_root_session_access_mode(
+                    session_id,
+                    current.access_mode,
+                    access_mode,
+                )
+                .await?
+            {
+                return Ok(update);
+            }
+        }
+        Err(SessionError::Message(format!(
+            "root session {session_id} access mode changed repeatedly; retry the operation"
+        )))
+    }
+
+    pub async fn compare_and_set_root_session_access_mode(
+        &self,
+        session_id: SessionId,
+        expected_access_mode: crate::config::AccessMode,
+        access_mode: crate::config::AccessMode,
+    ) -> Result<Option<SessionSettingsUpdate>, SessionError> {
+        let repository = self.store.session_repo();
+        Ok(repository
+            .compare_and_set_root_session_access_mode(session_id, expected_access_mode, access_mode)
+            .await?)
+    }
+
     pub async fn update_session_title(
         &self,
         session_id: SessionId,
@@ -565,130 +597,11 @@ impl SessionService {
         source_session_id: SessionId,
         title: Option<String>,
     ) -> Result<SessionForkResult, SessionError> {
-        let source = self
+        Ok(self
             .store
             .session_repo()
-            .get_session(source_session_id)
-            .await?;
-        let source_was_active = matches!(
-            source.status,
-            SessionStatus::Running | SessionStatus::AwaitingUser
-        );
-        let title = title
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.trim().to_string())
-            .unwrap_or_else(|| format!("Fork of {}", source.title));
-        let forked = self
-            .store
-            .session_repo()
-            .create_session(NewSession {
-                project_id: source.project_id,
-                title,
-                cwd: source.cwd.clone(),
-                model: source.model.clone(),
-                base_url: source.base_url.clone(),
-                access_mode: source.access_mode,
-            })
-            .await?;
-        if !source.model_parameters.is_empty() {
-            self.store
-                .session_repo()
-                .update_session_settings(
-                    forked.id,
-                    &SessionSettingsPatch {
-                        temperature: source.model_parameters.temperature,
-                        top_p: source.model_parameters.top_p,
-                        top_k: source.model_parameters.top_k,
-                        max_output_tokens: source.model_parameters.max_output_tokens,
-                        ..SessionSettingsPatch::default()
-                    },
-                )
-                .await?;
-        }
-        self.store
-            .session_repo()
-            .update_session_memory_mode(
-                forked.id,
-                self.store
-                    .session_repo()
-                    .get_session_memory_mode(source.id)
-                    .await?,
-            )
-            .await?;
-        let (copied_history_items, copied_turn_items) = self
-            .store
-            .protocol_event_store()
-            .fork_canonical_items(source.id, forked.id)
-            .map_err(|error| SessionError::Message(error.to_string()))?;
-        self.store
-            .session_repo()
-            .copy_session_state_and_todos(source.id, forked.id)
-            .await?;
-        if source_was_active {
-            self.append_interrupted_live_snapshot_marker(
-                forked.id,
-                "forked from active live session snapshot",
-            )
-            .await?;
-        }
-        let forked_session = self.store.session_repo().get_session(forked.id).await?;
-        Ok(SessionForkResult {
-            source_session: source,
-            forked_session,
-            copied_history_items,
-            copied_turn_items,
-            interrupted_live_snapshot: source_was_active,
-        })
-    }
-
-    async fn append_interrupted_live_snapshot_marker(
-        &self,
-        session_id: SessionId,
-        reason: &str,
-    ) -> Result<(), SessionError> {
-        let (turn_id, sequence_no) = self
-            .store
-            .protocol_event_store()
-            .latest_turn_position_for_session(session_id)?
-            .unwrap_or_else(|| (TurnId::new(), 0));
-        let now = SystemClock.now_ms();
-        let history_item = HistoryItem {
-            id: HistoryItemId::new(),
-            session_id,
-            turn_id,
-            sequence_no,
-            created_at_ms: now,
-            payload: HistoryItemPayload::Error {
-                message_id: None,
-                message: reason.to_string(),
-            },
-        };
-        let turn_item = TurnItem {
-            id: TurnItemId::new(),
-            session_id,
-            turn_id,
-            source_item_id: Some(history_item.id),
-            sequence_no,
-            payload: TurnItemPayload::Terminal {
-                status: TurnTerminalStatus::Interrupted,
-                summary: reason.to_string(),
-            },
-        };
-        let event = RuntimeEvent {
-            id: RuntimeEventId::new(),
-            session_id,
-            turn_id,
-            sequence_no,
-            created_at_ms: now,
-            msg: RuntimeEventMsg::TurnInterrupted {
-                reason: reason.to_string(),
-            },
-        };
-        self.store
-            .protocol_event_store()
-            .append_event_bundle(&event, Some(&history_item), Some(&turn_item))
-            .map_err(|error| SessionError::Message(error.to_string()))?;
-        Ok(())
+            .fork_session_snapshot(source_session_id, title)
+            .await?)
     }
 
     pub async fn compact_session(

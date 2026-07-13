@@ -29,6 +29,11 @@ const RUN_START_MUTATIONS = new Set([
   "send_prompt_review",
 ]);
 
+const RUN_OWNER_CONSUMER_MUTATIONS = new Set([
+  ...RUN_START_MUTATIONS,
+  "enhance_prompt",
+]);
+
 const EXTERNAL_CONFIG_OWNER_MUTATIONS = new Set([
   "toggle_access_mode",
   "apply_provider_session",
@@ -39,8 +44,24 @@ export function mutationStartsRun(mutationName: string): boolean {
   return RUN_START_MUTATIONS.has(mutationName);
 }
 
+export function mutationConsumesRunOwner(mutationName: string): boolean {
+  return RUN_OWNER_CONSUMER_MUTATIONS.has(mutationName);
+}
+
 export function mutationChangesConfigOwner(mutationName: string): boolean {
   return EXTERNAL_CONFIG_OWNER_MUTATIONS.has(mutationName);
+}
+
+export function runOwnerMutationOpen(
+  uiState: Pick<UiLocalState, "runStartMutationPending" | "externalConfigMutationPending">,
+): boolean {
+  return !uiState.runStartMutationPending && !uiState.externalConfigMutationPending;
+}
+
+export function mutationAdmissionOpen(uiState: UiLocalState, mutationName: string): boolean {
+  if (mutationConsumesRunOwner(mutationName)) return runOwnerMutationOpen(uiState);
+  if (mutationChangesConfigOwner(mutationName)) return configOwnerMutationOpen(uiState);
+  return true;
 }
 
 export interface UiCapabilities {
@@ -357,7 +378,8 @@ export function reconcileUiDrafts(
 
 export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalState): UiCapabilities {
   const composer = composerCapabilities(state, uiState.drafts.prompt);
-  if (uiState.runStartMutationPending) {
+  const runOwnerOpen = runOwnerMutationOpen(uiState);
+  if (!runOwnerOpen) {
     composer.canSubmit = false;
     composer.canEnhance = false;
     composer.canReviewUncommitted = false;
@@ -379,11 +401,11 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
   return {
     ...composer,
     canUseImageInput: state.image_input_enabled,
-    canSendEnhancedReview: !uiState.runStartMutationPending
+    canSendEnhancedReview: runOwnerOpen
       && state.send_enhanced_enabled
       && !state.navigation_loading
       && uiState.drafts.reviewDraft.trim().length > 0,
-    canSendRawReview: !uiState.runStartMutationPending
+    canSendRawReview: runOwnerOpen
       && state.send_raw_enabled
       && !state.navigation_loading,
     ...providerActions,
@@ -393,6 +415,7 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
 export function projectViewState(state: DesktopWebState, uiState: UiLocalState): DesktopWebState {
   const capabilities = deriveUiCapabilities(state, uiState);
   const configMutationOpen = configOwnerMutationOpen(uiState);
+  const runStartPending = uiState.runStartMutationPending;
   const providerIndex = state.provider_model_ids.indexOf(uiState.drafts.provider.selectedModelId);
   const configFields = state.config_fields.map((field) => ({
     ...field,
@@ -426,8 +449,10 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
     },
     access_mode_mutation_enabled: state.access_mode_mutation_enabled
       && configMutationOpen,
-    navigation_admission_open: state.navigation_admission_open && !uiState.runStartMutationPending,
-    background_mutation_pending: state.background_mutation_pending || uiState.runStartMutationPending,
+    navigation_admission_open: state.navigation_admission_open && !runStartPending,
+    background_mutation_pending: state.background_mutation_pending || runStartPending,
+    busy: state.busy || runStartPending,
+    async_polling_required: state.async_polling_required || runStartPending,
     can_submit: capabilities.canSubmit,
     enhance_enabled: capabilities.canEnhance,
     image_input_enabled: capabilities.canUseImageInput,

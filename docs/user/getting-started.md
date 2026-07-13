@@ -1,6 +1,6 @@
 # moyAI Getting Started
 
-2026-07-12 時点の v0.6.x 系 release 向け最小手順。正確な最新 version は release package と製品 README を確認する。
+2026-07-13 時点の v0.7.x 系 release 向け最小手順。正確な最新 version は release package と製品 README を確認する。
 
 ## 初回起動
 
@@ -56,11 +56,15 @@ TUI では実行中も `Ctrl+Enter` で現在 turn へ追加指示を送り、`C
 
 `access_mode` は shell / file operation の確認動作を切り替える。
 
-- `default`: workspace 外、network、delete/move などは確認する。
-- `auto_review`: より広い範囲を自動承認するが、外部接続や危険操作は確認する。
-- `full_access`: 強い権限で実行する。通常のworkspace内操作は自動承認するが、network・外部接続・workspace外・保護対象は引き続き確認する。信頼できるworkspaceでのみ使う。
+- `default`: 設定済み境界内のlist/search/readだけを自動承認する。編集、shell、設定済み境界外、network、delete/moveなどは確認する。
+- `auto_review`: 上記に加えてrisk-freeな設定済み境界内の編集を自動承認する。shell、外部接続、設定済み境界外、危険操作は確認する。
+- `full_access`: 強い権限で実行する。通常の設定済み境界内操作は自動承認するが、検出したnetwork・外部接続・設定済み境界外・保護対象は引き続き確認する。信頼できるworkspaceでのみ使う。
 
-Desktopではtopbar/composer付近のaccess mode chipから切り替える。明示的に切り替えた値はglobal configの`permissions.access_mode`へ自動保存され、次回起動、別workspace、新規chatでも前回の選択を使う。`MOYAI_ACCESS_MODE`など、より優先度の高い明示overrideがある場合はその値が優先される。
+permission reviewはtool requestとshell command中のliteral target/riskを分類する仕組みであり、OS filesystem sandboxではない。特にshellは現在のユーザー権限で動き、変数、式、子process内で動的に組み立てたpathをmoyAIが実行前に完全解決することはできない。境界の強制が必要な環境では`default`または`auto_review`を使い、shellを確認してから許可する。
+
+Desktopではtopbar/composer付近のaccess mode chipから切り替える。明示的に切り替えた値はglobal configの`permissions.access_mode`と、現在開いているroot sessionへ一貫して保存される。これにより、次回起動、別workspace、新規chatではglobal設定を使い、同じsessionをDesktopまたはTUIで再度開いた場合も同じ選択を使う。sessionを開いていない場合はglobal設定だけを保存する。`MOYAI_ACCESS_MODE`など、より優先度の高い明示overrideがある場合はその値が優先される。
+
+TUIでは、root sessionを開いた状態のF8とConfig EditorのF2（Apply Session）はaccess modeを現在のroot sessionへ保存し、再度開いたときも同じ選択を使う。sessionを開いていない状態のF8はglobal configへ保存する。明示的にchild agent sessionを開いた場合、そのchildからrootのaccess ownerを変更する操作は拒否される。
 
 ## Confirmation
 

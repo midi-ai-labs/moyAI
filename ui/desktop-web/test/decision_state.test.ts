@@ -15,32 +15,32 @@ test("permission decision dispatches once while pending and recovers after failu
   const owner = {
     permissionDecisionPending: false,
     permissionDecisionAllow: null as boolean | null,
-    permissionDecisionConfirmationId: null as number | null,
+    permissionDecisionConfirmationId: null as string | null,
     permissionDecisionError: "",
   };
   let dispatches = 0;
 
-  if (beginPermissionDecision(owner, 41, true)) dispatches += 1;
-  if (beginPermissionDecision(owner, 41, true)) dispatches += 1;
+  if (beginPermissionDecision(owner, "9007199254740993", true)) dispatches += 1;
+  if (beginPermissionDecision(owner, "9007199254740993", true)) dispatches += 1;
 
   assert.equal(dispatches, 1);
   assert.equal(owner.permissionDecisionPending, true);
-  assert.equal(owner.permissionDecisionConfirmationId, 41);
+  assert.equal(owner.permissionDecisionConfirmationId, "9007199254740993");
 
   failPermissionDecision(owner, "failed");
   assert.equal(owner.permissionDecisionPending, false);
   assert.equal(owner.permissionDecisionError, "failed");
-  assert.equal(beginPermissionDecision(owner, 41, false), true);
+  assert.equal(beginPermissionDecision(owner, "9007199254740993", false), true);
   finishPermissionDecision(owner);
   assert.equal(owner.permissionDecisionPending, false);
   assert.equal(owner.permissionDecisionAllow, null);
 });
 
 test("permission decision reconciles only its own confirmation id", () => {
-  assert.equal(permissionDecisionResponseAccepted(41, true, 41), false);
-  assert.equal(permissionDecisionResponseAccepted(41, false, null), true);
+  assert.equal(permissionDecisionResponseAccepted("9007199254740993", true, "9007199254740993"), false);
+  assert.equal(permissionDecisionResponseAccepted("9007199254740993", false, null), true);
   assert.equal(
-    permissionDecisionResponseAccepted(41, true, 42),
+    permissionDecisionResponseAccepted("9007199254740993", true, "9007199254740994"),
     true,
     "a newer confirmation must not be reported as failure of the completed decision",
   );

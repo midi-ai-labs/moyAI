@@ -46,7 +46,10 @@ pub use projection::{
 };
 pub use recording::ProtocolRecordingSink;
 pub use store::{ProtocolEventStore, SqliteProtocolEventStore};
-pub(crate) use store::{insert_event_bundle_in_transaction, latest_turn_position_for_session};
+pub(crate) use store::{
+    fork_canonical_items_in_transaction, insert_event_bundle_in_transaction,
+    latest_turn_position_for_session,
+};
 
 macro_rules! protocol_id {
     ($name:ident) => {

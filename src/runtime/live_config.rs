@@ -32,4 +32,24 @@ impl LiveConfigOverrides {
             .expect("live config override mutex poisoned")
             .access_mode = access_mode;
     }
+
+    pub fn apply_to(&self, config: &mut crate::config::ResolvedConfig) {
+        config.permissions.access_mode = self.access_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_access_mode_is_the_authority_when_materializing_a_run_config() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::Default;
+        let live = LiveConfigOverrides::new(AccessMode::FullAccess);
+
+        live.apply_to(&mut config);
+
+        assert_eq!(config.permissions.access_mode, AccessMode::FullAccess);
+    }
 }

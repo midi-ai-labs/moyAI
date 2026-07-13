@@ -477,6 +477,26 @@ impl DesktopState {
             .begin(DesktopAsyncOperationKind::SessionMaintenance)
     }
 
+    pub fn begin_access_mode_persistence(&mut self) -> DesktopAsyncOperationId {
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::AccessModePersistence)
+    }
+
+    pub fn finish_access_mode_persistence(
+        &mut self,
+        operation_id: DesktopAsyncOperationId,
+    ) -> bool {
+        self.view.async_operations.finish(operation_id)
+    }
+
+    pub fn access_mode_persistence_is_current(
+        &self,
+        operation_id: DesktopAsyncOperationId,
+    ) -> bool {
+        self.view.async_operations.contains(operation_id)
+    }
+
     pub fn finish_session_maintenance_mutation(
         &mut self,
         operation_id: DesktopAsyncOperationId,
@@ -527,6 +547,10 @@ impl DesktopState {
                 .view
                 .async_operations
                 .is_pending(DesktopAsyncOperationKind::SessionMaintenance)
+            || self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::AccessModePersistence)
     }
 
     pub fn begin_history_export(&mut self) {
@@ -827,6 +851,7 @@ impl DesktopState {
         turn_page_total: usize,
         turn_page_has_more: bool,
     ) {
+        self.provider_config.update_access_mode(session.access_mode);
         self.bind_composer_to_loaded_session(session.id);
         let open_session = OpenSessionView::from_loaded(
             session,

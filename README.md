@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.3"><img alt="Release" src="https://img.shields.io/badge/release-v0.6.3-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.7.0"><img alt="Release" src="https://img.shields.io/badge/release-v0.7.0-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.ja.md">日本語 README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.3">Download release</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.7.0">Download release</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -63,7 +63,7 @@ moyAI is designed around those constraints:
 - OpenAI-compatible local LLM connection with model availability checks.
 - LM Studio metadata discovery through `/v1/models` and `/api/v1/models`.
 - Workspace search, directory inspection, guarded file reads, diff-based edits, and shell execution.
-- Permission presets: `default`, `auto_review`, and `full_access`. Desktop remembers the selected preset for the next launch; `full_access` still confirms network, external-connection, out-of-workspace, and protected-authority actions.
+- Permission presets: `default`, `auto_review`, and `full_access`. Desktop remembers the selected preset globally for the next launch and also on the currently open root session. In TUI, F8 remembers the choice for the open root session, or globally when no session is open; child agent sessions cannot replace the root access owner. `full_access` still confirms detected network, external-connection, outside-configured-boundary, and protected-authority actions. Shell review is risk classification, not an OS filesystem sandbox, and commands run with the current user account.
 - Vision-capable model support for image attachments.
 - Optional Docling Serve and HTTP MCP integration for document-heavy workflows.
 - Local instructions from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md`, and local `SKILL.md` files.
@@ -74,7 +74,7 @@ moyAI is designed around those constraints:
 
 The current beta release is available here:
 
-[**moyAI v0.6.3 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.6.3)
+[**moyAI v0.7.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.7.0)
 
 The Windows release zip includes:
 
@@ -119,7 +119,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.6.3 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.7.0 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 By default, release artifacts are written outside the repository under `project_sandbox/releases/`.

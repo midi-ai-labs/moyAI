@@ -468,109 +468,13 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         }
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let target_has_protocol_data = transaction.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM protocol_runtime_events WHERE session_id = ?1
-                 UNION ALL
-                 SELECT 1 FROM protocol_history_items WHERE session_id = ?1
-                 UNION ALL
-                 SELECT 1 FROM protocol_turn_items WHERE session_id = ?1
-                 UNION ALL
-                 SELECT 1 FROM protocol_item_append_order WHERE session_id = ?1
-                 UNION ALL
-                 SELECT 1 FROM protocol_turn_sequence_allocators WHERE session_id = ?1
-             )",
-            params![target_session_id.to_string()],
-            |row| row.get::<_, bool>(0),
+        let copied = fork_canonical_items_in_transaction(
+            &transaction,
+            source_session_id,
+            target_session_id,
         )?;
-        if target_has_protocol_data {
-            return Err(StorageError::Message(format!(
-                "cannot fork canonical items into non-empty target session {target_session_id}"
-            )));
-        }
-        let source_history =
-            list_history_items_for_session_from_connection(&transaction, source_session_id)?;
-        let source_turns =
-            list_turn_items_for_session_from_connection(&transaction, source_session_id)?;
-        let history_id_map = source_history
-            .iter()
-            .map(|item| (item.id, HistoryItemId::new()))
-            .collect::<HashMap<_, _>>();
-        let mut forked_history = Vec::with_capacity(source_history.len());
-        for item in source_history {
-            let new_id = history_id_map[&item.id];
-            forked_history.push(HistoryItem {
-                id: new_id,
-                session_id: target_session_id,
-                payload: fork_history_payload_for_session(
-                    item.payload,
-                    target_session_id,
-                    &history_id_map,
-                )?,
-                ..item
-            });
-        }
-        let mut forked_turns = Vec::with_capacity(source_turns.len());
-        for item in source_turns {
-            let source_item_id = item
-                .source_item_id
-                .map(|source_id| {
-                    history_id_map.get(&source_id).copied().ok_or_else(|| {
-                        StorageError::Message(format!(
-                            "cannot fork turn item {}; source history item {} was not copied",
-                            item.id, source_id
-                        ))
-                    })
-                })
-                .transpose()?;
-            forked_turns.push(TurnItem {
-                id: TurnItemId::new(),
-                session_id: target_session_id,
-                source_item_id,
-                ..item
-            });
-        }
-        for item in &forked_history {
-            insert_history_item(&transaction, item)?;
-        }
-        for item in &forked_turns {
-            insert_turn_item(&transaction, item)?;
-        }
-        let mut next_sequence_by_turn = HashMap::<TurnId, i64>::new();
-        for (turn_id, sequence_no) in forked_history
-            .iter()
-            .map(|item| (item.turn_id, item.sequence_no))
-            .chain(
-                forked_turns
-                    .iter()
-                    .map(|item| (item.turn_id, item.sequence_no)),
-            )
-        {
-            let next_sequence_no = sequence_no.max(-1).saturating_add(1);
-            next_sequence_by_turn
-                .entry(turn_id)
-                .and_modify(|current| *current = (*current).max(next_sequence_no))
-                .or_insert(next_sequence_no);
-        }
-        for (turn_id, next_sequence_no) in next_sequence_by_turn {
-            transaction.execute(
-                "INSERT INTO protocol_turn_sequence_allocators
-                     (session_id, turn_id, next_sequence_no)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(session_id, turn_id) DO UPDATE SET
-                     next_sequence_no = MAX(
-                         protocol_turn_sequence_allocators.next_sequence_no,
-                         excluded.next_sequence_no
-                     )",
-                params![
-                    target_session_id.to_string(),
-                    turn_id.to_string(),
-                    next_sequence_no
-                ],
-            )?;
-        }
         transaction.commit()?;
-        Ok((forked_history.len(), forked_turns.len()))
+        Ok(copied)
     }
 
     fn fork_agent_context(
@@ -608,6 +512,100 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         transaction.commit()?;
         Ok(forked_history.len())
     }
+}
+
+pub(crate) fn fork_canonical_items_in_transaction(
+    transaction: &Transaction<'_>,
+    source_session_id: SessionId,
+    target_session_id: SessionId,
+) -> Result<(usize, usize), StorageError> {
+    if source_session_id == target_session_id {
+        return Err(StorageError::Message(
+            "cannot fork canonical items into the same session".to_string(),
+        ));
+    }
+    ensure_empty_protocol_target(transaction, target_session_id, "canonical items")?;
+    let source_history =
+        list_history_items_for_session_from_connection(transaction, source_session_id)?;
+    let source_turns = list_turn_items_for_session_from_connection(transaction, source_session_id)?;
+    let history_id_map = source_history
+        .iter()
+        .map(|item| (item.id, HistoryItemId::new()))
+        .collect::<HashMap<_, _>>();
+    let mut forked_history = Vec::with_capacity(source_history.len());
+    for item in source_history {
+        let new_id = history_id_map[&item.id];
+        forked_history.push(HistoryItem {
+            id: new_id,
+            session_id: target_session_id,
+            payload: fork_history_payload_for_session(
+                item.payload,
+                target_session_id,
+                &history_id_map,
+            )?,
+            ..item
+        });
+    }
+    let mut forked_turns = Vec::with_capacity(source_turns.len());
+    for item in source_turns {
+        let source_item_id = item
+            .source_item_id
+            .map(|source_id| {
+                history_id_map.get(&source_id).copied().ok_or_else(|| {
+                    StorageError::Message(format!(
+                        "cannot fork turn item {}; source history item {} was not copied",
+                        item.id, source_id
+                    ))
+                })
+            })
+            .transpose()?;
+        forked_turns.push(TurnItem {
+            id: TurnItemId::new(),
+            session_id: target_session_id,
+            source_item_id,
+            ..item
+        });
+    }
+    for item in &forked_history {
+        insert_history_item(transaction, item)?;
+    }
+    for item in &forked_turns {
+        insert_turn_item(transaction, item)?;
+    }
+    let mut next_sequence_by_turn = HashMap::<TurnId, i64>::new();
+    for (turn_id, sequence_no) in forked_history
+        .iter()
+        .map(|item| (item.turn_id, item.sequence_no))
+        .chain(
+            forked_turns
+                .iter()
+                .map(|item| (item.turn_id, item.sequence_no)),
+        )
+    {
+        let next_sequence_no = sequence_no.max(-1).saturating_add(1);
+        next_sequence_by_turn
+            .entry(turn_id)
+            .and_modify(|current| *current = (*current).max(next_sequence_no))
+            .or_insert(next_sequence_no);
+    }
+    for (turn_id, next_sequence_no) in next_sequence_by_turn {
+        transaction.execute(
+            "INSERT INTO protocol_turn_sequence_allocators
+                 (session_id, turn_id, next_sequence_no)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id, turn_id) DO UPDATE SET
+                 next_sequence_no = MAX(
+                     protocol_turn_sequence_allocators.next_sequence_no,
+                     excluded.next_sequence_no
+                 )",
+            params![
+                target_session_id.to_string(),
+                turn_id.to_string(),
+                next_sequence_no
+            ],
+        )?;
+    }
+    Ok((forked_history.len(), forked_turns.len()))
 }
 
 fn ensure_empty_protocol_target(

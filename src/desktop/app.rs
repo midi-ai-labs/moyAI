@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Component, Path};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -173,12 +173,145 @@ enum RuntimeMessage {
         request_id: NavigationRequestId,
         result: Result<WorkspaceLoadResult, String>,
     },
+    AccessModePersisted {
+        request_id: LatestRequestId,
+        target: AccessModePersistenceTarget,
+        phase: AccessModePersistencePhase,
+        worker: Arc<AccessModePersistenceWorker>,
+        result: Result<Utf8PathBuf, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SnapshotRequestTarget {
     workspace_root: Utf8PathBuf,
     selected_session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccessModePersistenceTarget {
+    operation_id: DesktopAsyncOperationId,
+    workspace_root: Utf8PathBuf,
+    session_id: Option<SessionId>,
+    config_generation: u64,
+    root_run_generation: Option<u64>,
+    runtime_owner_token: String,
+    old_global_access_mode: crate::config::AccessMode,
+    old_effective_access_mode: crate::config::AccessMode,
+    access_mode: crate::config::AccessMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessModePersistencePhase {
+    InitialOwners,
+    AdoptedSession { session_id: SessionId },
+}
+
+struct PendingAccessModeAdoption {
+    request_id: LatestRequestId,
+    target: AccessModePersistenceTarget,
+    remembered_path: Utf8PathBuf,
+    worker: Arc<AccessModePersistenceWorker>,
+}
+
+type CompareAndSetGlobalAccessMode = Box<
+    dyn FnMut(
+            crate::config::AccessMode,
+            crate::config::AccessMode,
+        ) -> Result<Option<Utf8PathBuf>, String>
+        + Send,
+>;
+type PersistRootSessionAccessMode =
+    Box<dyn FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String> + Send>;
+
+struct AccessModePersistenceWorker {
+    compare_and_set_global: Mutex<CompareAndSetGlobalAccessMode>,
+    persist_session: Mutex<Option<PersistRootSessionAccessMode>>,
+}
+
+impl AccessModePersistenceWorker {
+    fn new<CompareAndSetGlobal, PersistSession>(
+        compare_and_set_global: CompareAndSetGlobal,
+        persist_session: PersistSession,
+    ) -> Self
+    where
+        CompareAndSetGlobal: FnMut(
+                crate::config::AccessMode,
+                crate::config::AccessMode,
+            ) -> Result<Option<Utf8PathBuf>, String>
+            + Send
+            + 'static,
+        PersistSession:
+            FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String> + Send + 'static,
+    {
+        Self {
+            compare_and_set_global: Mutex::new(Box::new(compare_and_set_global)),
+            persist_session: Mutex::new(Some(Box::new(persist_session))),
+        }
+    }
+
+    fn persist_initial_owners(
+        &self,
+        target: &AccessModePersistenceTarget,
+    ) -> Result<Utf8PathBuf, String> {
+        persist_desktop_access_mode_owners(
+            target.old_global_access_mode,
+            target.access_mode,
+            target.session_id,
+            |expected, access_mode| self.compare_and_set_global(expected, access_mode),
+            |session_id, access_mode| self.persist_session(session_id, access_mode),
+        )
+    }
+
+    fn persist_adopted_session(
+        &self,
+        target: &AccessModePersistenceTarget,
+        session_id: SessionId,
+        remembered_path: Utf8PathBuf,
+    ) -> Result<Utf8PathBuf, String> {
+        if let Err(session_error) = self.persist_session(session_id, target.access_mode) {
+            return match self
+                .compare_and_set_global(target.access_mode, target.old_global_access_mode)
+            {
+                Ok(Some(_)) => Err(format!(
+                    "adopted session access mode update failed and the global field was restored: {session_error}"
+                )),
+                Ok(None) => Err(format!(
+                    "adopted session access mode update failed; the global field changed again and was not overwritten: {session_error}"
+                )),
+                Err(rollback_error) => Err(format!(
+                    "adopted session access mode update failed and global compensation failed: {session_error}; {rollback_error}"
+                )),
+            };
+        }
+        Ok(remembered_path)
+    }
+
+    fn compare_and_set_global(
+        &self,
+        expected: crate::config::AccessMode,
+        access_mode: crate::config::AccessMode,
+    ) -> Result<Option<Utf8PathBuf>, String> {
+        let mut compare_and_set = self
+            .compare_and_set_global
+            .lock()
+            .map_err(|_| "global access mode persistence lock was poisoned".to_string())?;
+        compare_and_set(expected, access_mode)
+    }
+
+    fn persist_session(
+        &self,
+        session_id: SessionId,
+        access_mode: crate::config::AccessMode,
+    ) -> Result<(), String> {
+        let persist_session = self
+            .persist_session
+            .lock()
+            .map_err(|_| "session access mode persistence lock was poisoned".to_string())?
+            .take()
+            .ok_or_else(|| "session access mode persistence was already consumed".to_string())?;
+        persist_session(session_id, access_mode)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +468,9 @@ impl RuntimeMessage {
             RuntimeMessage::HistoryExported { .. } => {
                 RuntimeMessageAsyncContract::BackgroundOperation
             }
+            RuntimeMessage::AccessModePersisted { .. } => {
+                RuntimeMessageAsyncContract::BackgroundOperation
+            }
             RuntimeMessage::WorkspaceSwitched { .. }
             | RuntimeMessage::WorkspaceSwitchedForNewProjectSession { .. } => {
                 RuntimeMessageAsyncContract::NavigationOperation
@@ -405,6 +541,63 @@ fn durable_agent_activity_retry_allowed(failures: u8) -> bool {
 
 fn next_config_generation(current: u64) -> u64 {
     current.saturating_add(1)
+}
+
+fn commit_effective_config(
+    state: &mut DesktopState,
+    run_lifecycle: &DesktopRunLifecycle,
+    config: ResolvedConfig,
+) {
+    let access_mode = config.permissions.access_mode;
+    state.reset_effective_config(config);
+    run_lifecycle.set_access_mode(access_mode);
+}
+
+fn desktop_run_config_override(config: &ResolvedConfig) -> PartialResolvedConfig {
+    full_effective_override(config)
+}
+
+fn persist_desktop_access_mode_owners<CompareAndSetGlobal, PersistSession>(
+    old_global_access_mode: crate::config::AccessMode,
+    access_mode: crate::config::AccessMode,
+    current_root_session_id: Option<SessionId>,
+    mut compare_and_set_global: CompareAndSetGlobal,
+    persist_session: PersistSession,
+) -> Result<Utf8PathBuf, String>
+where
+    CompareAndSetGlobal: FnMut(
+        crate::config::AccessMode,
+        crate::config::AccessMode,
+    ) -> Result<Option<Utf8PathBuf>, String>,
+    PersistSession: FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String>,
+{
+    let remembered_path = match compare_and_set_global(old_global_access_mode, access_mode) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return Err(
+                "global access mode changed before this update; reload configuration and try again"
+                    .to_string(),
+            );
+        }
+        Err(error) => return Err(format!("global access mode update failed: {error}")),
+    };
+    let Some(session_id) = current_root_session_id else {
+        return Ok(remembered_path);
+    };
+    if let Err(session_error) = persist_session(session_id, access_mode) {
+        return match compare_and_set_global(access_mode, old_global_access_mode) {
+            Ok(Some(_)) => Err(format!(
+                "session access mode update failed and the global field was restored: {session_error}"
+            )),
+            Ok(None) => Err(format!(
+                "session access mode update failed; the global field changed again and was not overwritten: {session_error}"
+            )),
+            Err(rollback_error) => Err(format!(
+                "session access mode update failed and global compensation failed: {session_error}; {rollback_error}"
+            )),
+        };
+    }
+    Ok(remembered_path)
 }
 
 fn session_search_result_can_apply(
@@ -563,6 +756,12 @@ impl DesktopRunLifecycle {
         self.root.as_ref().map(|run| &run.live_config)
     }
 
+    fn set_access_mode(&self, access_mode: crate::config::AccessMode) {
+        if let Some(live_config) = self.live_config() {
+            live_config.set_access_mode(access_mode);
+        }
+    }
+
     fn request_cancel(&mut self) -> bool {
         let Some(run) = self.root.as_mut() else {
             return false;
@@ -616,6 +815,52 @@ fn session_mutation_target_matches(
     project_id: ProjectId,
 ) -> bool {
     target.workspace_root == workspace_root && target.project_id == project_id
+}
+
+#[cfg(test)]
+fn access_mode_persistence_target_matches(
+    target: &AccessModePersistenceTarget,
+    workspace_root: &Utf8Path,
+    session_id: Option<SessionId>,
+    config_generation: u64,
+    runtime_owner_token: &str,
+) -> bool {
+    access_mode_persistence_target_relation(
+        target,
+        workspace_root,
+        session_id,
+        config_generation,
+        runtime_owner_token,
+    ) == AccessModePersistenceTargetRelation::Exact
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessModePersistenceTargetRelation {
+    Exact,
+    AdoptedSession(SessionId),
+    Stale,
+}
+
+fn access_mode_persistence_target_relation(
+    target: &AccessModePersistenceTarget,
+    workspace_root: &Utf8Path,
+    session_id: Option<SessionId>,
+    config_generation: u64,
+    runtime_owner_token: &str,
+) -> AccessModePersistenceTargetRelation {
+    if target.workspace_root != workspace_root
+        || target.config_generation != config_generation
+        || target.runtime_owner_token != runtime_owner_token
+    {
+        return AccessModePersistenceTargetRelation::Stale;
+    }
+    match (target.session_id, session_id) {
+        (target_session_id, current_session_id) if target_session_id == current_session_id => {
+            AccessModePersistenceTargetRelation::Exact
+        }
+        (None, Some(session_id)) => AccessModePersistenceTargetRelation::AdoptedSession(session_id),
+        _ => AccessModePersistenceTargetRelation::Stale,
+    }
 }
 
 fn project_delete_target_matches(
@@ -688,6 +933,11 @@ mod command_projection_owner_tests {
             crate::config::AccessMode::AutoReview,
             "the root and agent runtime share the live access override"
         );
+        lifecycle.set_access_mode(crate::config::AccessMode::FullAccess);
+        assert_eq!(
+            live_observer.access_mode(),
+            crate::config::AccessMode::FullAccess
+        );
 
         lifecycle.observe_terminal_event();
 
@@ -717,6 +967,1385 @@ mod command_projection_owner_tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn pre_admission_root_owns_cancellation_before_any_run_event() {
+        let cancel = CancellationToken::new();
+        let observer = cancel.clone();
+        let mut lifecycle = DesktopRunLifecycle::default();
+        lifecycle.begin(
+            12,
+            cancel,
+            LiveConfigOverrides::new(crate::config::AccessMode::Default),
+        );
+
+        assert_eq!(lifecycle.root_generation(), Some(12));
+        assert!(lifecycle.root_is_active());
+        assert!(!observer.is_cancelled());
+        assert!(lifecycle.request_cancel());
+        assert!(observer.is_cancelled());
+        assert!(lifecycle.root_is_finalizing());
+    }
+
+    #[test]
+    fn settings_effective_config_commit_updates_active_live_access_owner() {
+        let mut state = DesktopState::new(
+            DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            ResolvedConfig::default(),
+        );
+        let live = LiveConfigOverrides::new(crate::config::AccessMode::Default);
+        let mut lifecycle = DesktopRunLifecycle::default();
+        lifecycle.begin(1, CancellationToken::new(), live.clone());
+        let mut candidate = ResolvedConfig::default();
+        candidate.permissions.access_mode = crate::config::AccessMode::FullAccess;
+
+        commit_effective_config(&mut state, &lifecycle, candidate);
+
+        assert_eq!(
+            state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            crate::config::AccessMode::FullAccess
+        );
+        assert_eq!(live.access_mode(), crate::config::AccessMode::FullAccess);
+    }
+
+    #[test]
+    fn cancelled_desktop_run_does_not_emit_a_failure_notification() {
+        assert!(desktop_run_failure_notification_allowed(false));
+        assert!(!desktop_run_failure_notification_allowed(true));
+    }
+
+    #[test]
+    fn current_session_access_change_persists_global_then_session() {
+        let session_id = SessionId::new();
+        let remembered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let persisted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = persist_desktop_access_mode_owners(
+            crate::config::AccessMode::Default,
+            crate::config::AccessMode::FullAccess,
+            Some(session_id),
+            {
+                let remembered = remembered.clone();
+                move |expected, mode| {
+                    remembered
+                        .lock()
+                        .expect("remembered")
+                        .push((expected, mode));
+                    Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+                }
+            },
+            {
+                let persisted = persisted.clone();
+                move |owner, mode| {
+                    persisted.lock().expect("persisted").push((owner, mode));
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(Utf8PathBuf::from("C:/config.toml")));
+        assert_eq!(
+            *remembered.lock().expect("remembered"),
+            vec![(
+                crate::config::AccessMode::Default,
+                crate::config::AccessMode::FullAccess
+            )]
+        );
+        assert_eq!(
+            *persisted.lock().expect("persisted"),
+            vec![(session_id, crate::config::AccessMode::FullAccess)]
+        );
+    }
+
+    #[test]
+    fn no_session_access_change_persists_only_global_owner() {
+        let session_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = persist_desktop_access_mode_owners(
+            crate::config::AccessMode::Default,
+            crate::config::AccessMode::AutoReview,
+            None,
+            |expected, mode| {
+                assert_eq!(expected, crate::config::AccessMode::Default);
+                assert_eq!(mode, crate::config::AccessMode::AutoReview);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            {
+                let session_calls = session_calls.clone();
+                move |_, _| {
+                    session_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(Utf8PathBuf::from("C:/config.toml")));
+        assert_eq!(session_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn access_persistence_completion_requires_the_same_full_owner_target() {
+        let session_id = SessionId::new();
+        let target = AccessModePersistenceTarget {
+            operation_id: DesktopAsyncOperationId::from_test_value(1),
+            workspace_root: Utf8PathBuf::from("C:/workspace"),
+            session_id: Some(session_id),
+            config_generation: 7,
+            root_run_generation: Some(4),
+            runtime_owner_token: "root:4".to_string(),
+            old_global_access_mode: crate::config::AccessMode::Default,
+            old_effective_access_mode: crate::config::AccessMode::Default,
+            access_mode: crate::config::AccessMode::FullAccess,
+        };
+
+        assert!(access_mode_persistence_target_matches(
+            &target,
+            Utf8Path::new("C:/workspace"),
+            Some(session_id),
+            7,
+            "root:4",
+        ));
+        assert!(!access_mode_persistence_target_matches(
+            &target,
+            Utf8Path::new("C:/workspace"),
+            Some(SessionId::new()),
+            7,
+            "root:4",
+        ));
+        assert!(!access_mode_persistence_target_matches(
+            &target,
+            Utf8Path::new("C:/workspace"),
+            Some(session_id),
+            8,
+            "root:4",
+        ));
+        assert!(!access_mode_persistence_target_matches(
+            &target,
+            Utf8Path::new("C:/workspace"),
+            Some(session_id),
+            7,
+            "root:5",
+        ));
+
+        let pre_admission_target = AccessModePersistenceTarget {
+            session_id: None,
+            ..target
+        };
+        assert_eq!(
+            access_mode_persistence_target_relation(
+                &pre_admission_target,
+                Utf8Path::new("C:/workspace"),
+                Some(session_id),
+                7,
+                "root:4",
+            ),
+            AccessModePersistenceTargetRelation::AdoptedSession(session_id)
+        );
+        assert_eq!(
+            access_mode_persistence_target_relation(
+                &pre_admission_target,
+                Utf8Path::new("C:/workspace"),
+                Some(session_id),
+                8,
+                "root:4",
+            ),
+            AccessModePersistenceTargetRelation::Stale
+        );
+    }
+
+    #[test]
+    fn global_access_failure_does_not_touch_the_current_session() {
+        let session_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = persist_desktop_access_mode_owners(
+            crate::config::AccessMode::Default,
+            crate::config::AccessMode::FullAccess,
+            Some(SessionId::new()),
+            |_, _| Err("global failed".to_string()),
+            {
+                let session_calls = session_calls.clone();
+                move |_, _| {
+                    session_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err("global access mode update failed: global failed".to_string())
+        );
+        assert_eq!(session_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn session_access_failure_compensates_the_global_field() {
+        let remembered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = persist_desktop_access_mode_owners(
+            crate::config::AccessMode::Default,
+            crate::config::AccessMode::FullAccess,
+            Some(SessionId::new()),
+            {
+                let remembered = remembered.clone();
+                move |expected, mode| {
+                    remembered
+                        .lock()
+                        .expect("remembered")
+                        .push((expected, mode));
+                    Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+                }
+            },
+            |_, _| Err("session failed".to_string()),
+        );
+
+        assert_eq!(
+            result,
+            Err("session access mode update failed and the global field was restored: session failed"
+                .to_string())
+        );
+        assert_eq!(
+            *remembered.lock().expect("remembered"),
+            vec![
+                (
+                    crate::config::AccessMode::Default,
+                    crate::config::AccessMode::FullAccess
+                ),
+                (
+                    crate::config::AccessMode::FullAccess,
+                    crate::config::AccessMode::Default
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn adopted_session_access_failure_uses_the_same_cas_compensation() {
+        let remembered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = AccessModePersistenceWorker::new(
+            {
+                let remembered = remembered.clone();
+                move |expected, mode| {
+                    remembered
+                        .lock()
+                        .expect("remembered")
+                        .push((expected, mode));
+                    Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+                }
+            },
+            |_, _| Err("adopted session failed".to_string()),
+        );
+        let target = AccessModePersistenceTarget {
+            operation_id: DesktopAsyncOperationId::from_test_value(1),
+            workspace_root: Utf8PathBuf::from("C:/workspace"),
+            session_id: None,
+            config_generation: 1,
+            root_run_generation: Some(1),
+            runtime_owner_token: "root:1".to_string(),
+            old_global_access_mode: crate::config::AccessMode::Default,
+            old_effective_access_mode: crate::config::AccessMode::Default,
+            access_mode: crate::config::AccessMode::FullAccess,
+        };
+
+        let path = worker
+            .persist_initial_owners(&target)
+            .expect("global-only first phase");
+        let error = worker
+            .persist_adopted_session(&target, SessionId::new(), path)
+            .expect_err("adopted session failure");
+
+        assert!(error.contains("global field was restored"));
+        assert_eq!(
+            *remembered.lock().expect("remembered"),
+            vec![
+                (
+                    crate::config::AccessMode::Default,
+                    crate::config::AccessMode::FullAccess
+                ),
+                (
+                    crate::config::AccessMode::FullAccess,
+                    crate::config::AccessMode::Default
+                )
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_current_session_access_is_durable_for_tui_reopen_and_rejects_child_owner() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let initial_access_mode = crate::config::AccessMode::Default;
+        let args = DesktopArgs {
+            directory: Some(root.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let create_session = |title: &str| NewSession {
+            project_id: controller.app.workspace.project_id,
+            title: title.to_string(),
+            cwd: root.clone(),
+            model: controller.app.config.model.model.clone(),
+            base_url: controller.app.config.model.base_url.clone(),
+            access_mode: initial_access_mode,
+        };
+        let repository = controller.app.store.session_repo();
+        let root_session = repository
+            .create_session(create_session("root"))
+            .await
+            .expect("root session");
+        let child_session = repository
+            .create_session(create_session("child"))
+            .await
+            .expect("child session");
+        repository
+            .insert_session_spawn_edge(
+                root_session.id,
+                root_session.id,
+                child_session.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("child edge");
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        controller.state.app_state.current_session_id = Some(root_session.id);
+        let live = LiveConfigOverrides::new(initial_access_mode);
+        controller
+            .run_lifecycle
+            .begin(1, CancellationToken::new(), live.clone());
+        let expected_access_mode = initial_access_mode.next();
+        let session_service = controller.app.session_service.clone();
+        let persisted_service = session_service.clone();
+
+        assert!(controller.start_access_mode_persistence(
+            move |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, expected_access_mode);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            move |session_id, access_mode| {
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| error.to_string())?;
+                    runtime.block_on(async move {
+                        persisted_service
+                            .update_root_session_access_mode(session_id, access_mode)
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .join()
+                .map_err(|_| "session worker panicked".to_string())?
+            },
+        ));
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!controller.state.background_mutation_pending());
+
+        let reopened = session_service
+            .get_session(root_session.id)
+            .await
+            .expect("TUI durable reopen source");
+        assert_eq!(reopened.access_mode, expected_access_mode);
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            reopened.access_mode
+        );
+        assert_eq!(live.access_mode(), reopened.access_mode);
+        assert!(
+            session_service
+                .update_root_session_access_mode(child_session.id, expected_access_mode)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_admission_access_change_persists_the_same_root_session_adopted_before_completion()
+    {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let initial_access_mode = crate::config::AccessMode::Default;
+        let args = DesktopArgs {
+            directory: Some(root.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "adopted root".to_string(),
+                cwd: root,
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: initial_access_mode,
+            })
+            .await
+            .expect("session");
+        controller
+            .app
+            .store
+            .session_repo()
+            .admit_session_run(session.id)
+            .await
+            .expect("active root admission")
+            .expect("active root admitted");
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        let live = LiveConfigOverrides::new(initial_access_mode);
+        controller
+            .run_lifecycle
+            .begin(1, CancellationToken::new(), live.clone());
+        let expected_access_mode = initial_access_mode.next();
+        let persisted_service = controller.app.session_service.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        assert!(controller.start_access_mode_persistence(
+            move |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, expected_access_mode);
+                started_tx.send(()).expect("signal global worker");
+                release_rx.recv().expect("release global worker");
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            move |session_id, access_mode| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.block_on(async move {
+                    persisted_service
+                        .update_root_session_access_mode(session_id, access_mode)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+            },
+        ));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("global worker started");
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent {
+                run_generation: 1,
+                event: RunEvent::SessionStarted {
+                    session_id: session.id,
+                    title: session.title.clone(),
+                },
+            })
+            .expect("session adoption event");
+        controller.drain_runtime_messages();
+        assert_eq!(
+            controller.state.app_state.current_session_id,
+            Some(session.id)
+        );
+        release_tx.send(()).expect("release global worker");
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.state.background_mutation_pending());
+        assert_eq!(
+            controller
+                .app
+                .session_service
+                .get_session(session.id)
+                .await
+                .expect("durable adopted root")
+                .access_mode,
+            expected_access_mode
+        );
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            expected_access_mode
+        );
+        assert_eq!(live.access_mode(), expected_access_mode);
+
+        controller.next_root_run_generation = 2;
+        controller.run_lifecycle.finish_root();
+        let finished_root_target = AccessModePersistenceTarget {
+            operation_id: DesktopAsyncOperationId::from_test_value(99),
+            workspace_root: controller.app.workspace.root.clone(),
+            session_id: None,
+            config_generation: controller.state.provider_config.config_generation,
+            root_run_generation: Some(1),
+            runtime_owner_token: "root:1".to_string(),
+            old_global_access_mode: initial_access_mode,
+            old_effective_access_mode: initial_access_mode,
+            access_mode: expected_access_mode,
+        };
+        assert_eq!(
+            controller.access_mode_persistence_target_relation(&finished_root_target),
+            AccessModePersistenceTargetRelation::AdoptedSession(session.id),
+            "completion from the just-finished generation retains its exact admitted owner"
+        );
+        controller.next_root_run_generation = 3;
+        assert_eq!(
+            controller.access_mode_persistence_target_relation(&finished_root_target),
+            AccessModePersistenceTargetRelation::Stale,
+            "a newer root generation revokes the terminal completion grace"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_admission_access_change_waits_for_session_started_after_global_completion() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let initial_access_mode = crate::config::AccessMode::Default;
+        let args = DesktopArgs {
+            directory: Some(root.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "late adopted root".to_string(),
+                cwd: root,
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: initial_access_mode,
+            })
+            .await
+            .expect("session");
+        controller
+            .app
+            .store
+            .session_repo()
+            .admit_session_run(session.id)
+            .await
+            .expect("late active root admission")
+            .expect("late active root admitted");
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        let live = LiveConfigOverrides::new(initial_access_mode);
+        controller
+            .run_lifecycle
+            .begin(1, CancellationToken::new(), live.clone());
+        let expected_access_mode = initial_access_mode.next();
+        let persisted_service = controller.app.session_service.clone();
+
+        assert!(controller.start_access_mode_persistence(
+            move |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, expected_access_mode);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            move |session_id, access_mode| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.block_on(async move {
+                    persisted_service
+                        .update_root_session_access_mode(session_id, access_mode)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+            },
+        ));
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if controller.pending_access_mode_adoption.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(controller.pending_access_mode_adoption.is_some());
+        assert!(controller.state.background_mutation_pending());
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            initial_access_mode,
+            "the live owner is not committed until both durable owners succeed"
+        );
+        assert_eq!(live.access_mode(), initial_access_mode);
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent {
+                run_generation: 1,
+                event: RunEvent::SessionStarted {
+                    session_id: session.id,
+                    title: session.title.clone(),
+                },
+            })
+            .expect("late session adoption event");
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.state.background_mutation_pending());
+        assert!(controller.pending_access_mode_adoption.is_none());
+        assert_eq!(
+            controller
+                .app
+                .session_service
+                .get_session(session.id)
+                .await
+                .expect("durable late adopted root")
+                .access_mode,
+            expected_access_mode
+        );
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            expected_access_mode
+        );
+        assert_eq!(live.access_mode(), expected_access_mode);
+    }
+
+    async fn empty_access_test_controller() -> (tempfile::TempDir, Utf8PathBuf, DesktopController) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let args = DesktopArgs {
+            directory: Some(root.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        (temp, root, controller)
+    }
+
+    #[tokio::test]
+    async fn pending_access_adoption_without_session_started_settles_global_only_on_finished() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let initial_access_mode = crate::config::AccessMode::Default;
+        let expected_access_mode = initial_access_mode.next();
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        let live = LiveConfigOverrides::new(initial_access_mode);
+        controller
+            .run_lifecycle
+            .begin(1, CancellationToken::new(), live.clone());
+        let session_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(controller.start_access_mode_persistence(
+            move |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, expected_access_mode);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            {
+                let session_calls = session_calls.clone();
+                move |_, _| {
+                    session_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        ));
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if controller.pending_access_mode_adoption.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(controller.pending_access_mode_adoption.is_some());
+        assert!(controller.state.background_mutation_pending());
+        assert_eq!(live.access_mode(), initial_access_mode);
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: 1,
+                result: Err("failed before session admission".to_string()),
+            })
+            .expect("pre-admission worker finish");
+        controller.drain_runtime_messages();
+
+        assert!(controller.pending_access_mode_adoption.is_none());
+        assert!(!controller.state.background_mutation_pending());
+        assert_eq!(controller.state.app_state.current_session_id, None);
+        assert_eq!(session_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            controller.app.config.permissions.access_mode,
+            expected_access_mode
+        );
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            expected_access_mode
+        );
+        assert_eq!(live.access_mode(), expected_access_mode);
+    }
+
+    #[tokio::test]
+    async fn delayed_adopted_access_completion_is_discarded_after_next_root_generation_starts() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let reloaded_access_mode = controller.app.config.permissions.access_mode;
+        let initial_access_mode = [
+            crate::config::AccessMode::Default,
+            crate::config::AccessMode::AutoReview,
+            crate::config::AccessMode::FullAccess,
+        ]
+        .into_iter()
+        .find(|access_mode| access_mode.next() != reloaded_access_mode)
+        .expect("one transition differs from the reloaded access owner");
+        let expected_access_mode = initial_access_mode.next();
+        assert_ne!(expected_access_mode, reloaded_access_mode);
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "delayed adopted root".to_string(),
+                cwd: root,
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: initial_access_mode,
+            })
+            .await
+            .expect("session");
+        let session_id = session.id;
+        let session_title = session.title.clone();
+        controller.run_lifecycle.begin(
+            1,
+            CancellationToken::new(),
+            LiveConfigOverrides::new(initial_access_mode),
+        );
+        let (adopted_started_tx, adopted_started_rx) = mpsc::sync_channel(1);
+        let (release_adopted_tx, release_adopted_rx) = mpsc::sync_channel(1);
+
+        assert!(controller.start_access_mode_persistence(
+            move |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, expected_access_mode);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            move |persisted_session_id, access_mode| {
+                assert_eq!(persisted_session_id, session_id);
+                assert_eq!(access_mode, expected_access_mode);
+                adopted_started_tx.send(()).expect("adopted worker started");
+                release_adopted_rx.recv().expect("release adopted worker");
+                Ok(())
+            },
+        ));
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if controller.pending_access_mode_adoption.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let old_target = controller
+            .pending_access_mode_adoption
+            .as_ref()
+            .expect("pending adopted owner")
+            .target
+            .clone();
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent {
+                run_generation: 1,
+                event: RunEvent::SessionStarted {
+                    session_id,
+                    title: session_title,
+                },
+            })
+            .expect("session adoption event");
+        controller.drain_runtime_messages();
+        adopted_started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("adopted worker dispatch");
+        assert!(controller.pending_access_mode_adoption.is_none());
+        assert!(controller.state.background_mutation_pending());
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: 1,
+                result: Err("first root finished".to_string()),
+            })
+            .expect("first root finish");
+        controller.drain_runtime_messages();
+        assert!(!controller.run_lifecycle.root_is_active());
+
+        let next_live = LiveConfigOverrides::new(initial_access_mode);
+        controller
+            .run_lifecycle
+            .begin(2, CancellationToken::new(), next_live.clone());
+        controller.next_root_run_generation = 3;
+        assert_eq!(
+            controller.access_mode_persistence_target_relation(&old_target),
+            AccessModePersistenceTargetRelation::Stale
+        );
+
+        release_adopted_tx.send(()).expect("release adopted worker");
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.state.background_mutation_pending());
+        assert!(!controller.access_mode_persistence_requests.is_pending());
+        assert_eq!(controller.run_lifecycle.root_generation(), Some(2));
+        let current_access_mode = controller.app.config.permissions.access_mode;
+        assert_eq!(current_access_mode, reloaded_access_mode);
+        assert_ne!(current_access_mode, expected_access_mode);
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            current_access_mode
+        );
+        assert_eq!(next_live.access_mode(), current_access_mode);
+    }
+
+    #[tokio::test]
+    async fn desktop_reopen_uses_durable_session_access_for_run_config_and_new_chat_uses_global() {
+        use crate::protocol::ProtocolEventStore as _;
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let mut app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let global_access_mode = crate::config::AccessMode::Default;
+        let session_access_mode = crate::config::AccessMode::FullAccess;
+        app.config.permissions.access_mode = global_access_mode;
+        let session = app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: app.workspace.project_id,
+                title: "durable access".to_string(),
+                cwd: root.clone(),
+                model: app.config.model.model.clone(),
+                base_url: app.config.model.base_url.clone(),
+                access_mode: session_access_mode,
+            })
+            .await
+            .expect("session");
+        let turn_id = crate::protocol::TurnId::new();
+        app.store
+            .protocol_event_store()
+            .append_history_item(&crate::protocol::HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id: session.id,
+                turn_id,
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::Message {
+                    message_id: None,
+                    role: crate::session::MessageRole::User,
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: "reopen".to_string(),
+                    }],
+                },
+            })
+            .expect("history item");
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: Some(session.id),
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            session_access_mode
+        );
+        let run_config = apply_config_patch(
+            controller.app.config.clone(),
+            desktop_run_config_override(&controller.state.provider_config.effective_config),
+        );
+        assert_eq!(run_config.permissions.access_mode, session_access_mode);
+
+        controller.start_new_chat_with_global_access();
+        assert_eq!(controller.state.app_state.current_session_id, None);
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            global_access_mode
+        );
+    }
+
+    #[tokio::test]
+    async fn archiving_the_only_current_session_restores_global_access_for_the_new_chat() {
+        use crate::protocol::ProtocolEventStore as _;
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let mut app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let global_access_mode = crate::config::AccessMode::Default;
+        let session_access_mode = crate::config::AccessMode::FullAccess;
+        app.config.permissions.access_mode = global_access_mode;
+        let session = app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: app.workspace.project_id,
+                title: "only current session".to_string(),
+                cwd: root.clone(),
+                model: app.config.model.model.clone(),
+                base_url: app.config.model.base_url.clone(),
+                access_mode: session_access_mode,
+            })
+            .await
+            .expect("session");
+        app.store
+            .protocol_event_store()
+            .append_history_item(&crate::protocol::HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id: session.id,
+                turn_id: crate::protocol::TurnId::new(),
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::Message {
+                    message_id: None,
+                    role: crate::session::MessageRole::User,
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: "archive this session".to_string(),
+                    }],
+                },
+            })
+            .expect("history item");
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: Some(session.id),
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            session_access_mode
+        );
+
+        assert!(controller.archive_session(session.id, true));
+        let live = LiveConfigOverrides::new(session_access_mode);
+        controller
+            .run_lifecycle
+            .begin(41, CancellationToken::new(), live.clone());
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.state.background_mutation_pending());
+        assert_eq!(controller.state.app_state.current_session_id, None);
+        assert_eq!(controller.state.selected_session_id(), None);
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            global_access_mode
+        );
+        assert_eq!(live.access_mode(), global_access_mode);
+        let run_config = apply_config_patch(
+            controller.app.config.clone(),
+            desktop_run_config_override(&controller.state.provider_config.effective_config),
+        );
+        assert_eq!(run_config.permissions.access_mode, global_access_mode);
+    }
+
+    #[tokio::test]
+    async fn blocked_access_persistence_does_not_block_stop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let cancel = CancellationToken::new();
+        let cancel_observer = cancel.clone();
+        controller.run_lifecycle.begin(
+            1,
+            cancel,
+            LiveConfigOverrides::new(crate::config::AccessMode::Default),
+        );
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        assert!(controller.start_access_mode_persistence(
+            move |_, _| {
+                started_tx.send(()).expect("signal blocked persistence");
+                release_rx.recv().expect("release blocked persistence");
+                Err("simulated blocked global writer".to_string())
+            },
+            |_, _| Ok(()),
+        ));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("persistence worker started");
+
+        controller.cancel_active_run();
+        assert!(
+            cancel_observer.is_cancelled(),
+            "Stop must cancel the root before blocked persistence completes"
+        );
+        assert!(controller.state.background_mutation_pending());
+
+        release_tx.send(()).expect("release persistence");
+        for _ in 0..100 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!controller.state.background_mutation_pending());
+    }
+
+    #[tokio::test]
+    async fn blocked_access_persistence_rejects_submit_review_and_steer_admission() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        assert!(controller.start_access_mode_persistence(
+            move |_, _| {
+                started_tx.send(()).expect("signal blocked persistence");
+                release_rx.recv().expect("release blocked persistence");
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            |_, _| Ok(()),
+        ));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("persistence worker started");
+        assert!(controller.state.background_mutation_pending());
+
+        let initial_generation = controller.next_root_run_generation;
+        controller.state.composer.draft_prompt = "submit after access settles".to_string();
+        assert!(!controller.start_run("submit after access settles".to_string()));
+        assert!(!controller.start_review_uncommitted("review after access settles".to_string()));
+        controller
+            .state
+            .begin_prompt_enhance(11, "enhance before review");
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(11, "enhanced review draft".to_string())
+        );
+        assert!(!controller.send_prompt_review(true, "edited review draft".to_string()));
+        assert_eq!(
+            controller.state.composer.draft_prompt,
+            "submit after access settles"
+        );
+        assert_eq!(
+            controller.state.composer.review_draft_text,
+            "edited review draft"
+        );
+        assert_eq!(controller.next_root_run_generation, initial_generation);
+        assert!(!controller.run_lifecycle.root_is_active());
+
+        controller.run_lifecycle.begin(
+            77,
+            CancellationToken::new(),
+            LiveConfigOverrides::new(crate::config::AccessMode::Default),
+        );
+        assert!(!controller.start_run("steer after access settles".to_string()));
+        assert_eq!(controller.run_lifecycle.root_generation(), Some(77));
+        assert!(
+            controller
+                .state
+                .app_state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("owner mutation"))
+        );
+        controller.run_lifecycle.finish_root();
+
+        release_tx.send(()).expect("release persistence");
+        for _ in 0..100 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!controller.state.background_mutation_pending());
     }
 
     #[test]
@@ -1445,9 +3074,10 @@ mod command_projection_owner_tests {
         controller.permission_response = Some(response);
         controller.state.set_permission(42, &request);
 
-        assert!(!controller.toggle_access_mode_with_remember(|_| {
-            Err("simulated persistence failure".to_string())
-        }));
+        assert!(!controller.toggle_access_mode_with_persistence(
+            |_, _| Err("simulated persistence failure".to_string()),
+            |_, _| Ok(()),
+        ));
 
         assert_eq!(
             controller.app.config.permissions.access_mode,
@@ -1878,6 +3508,8 @@ pub(crate) struct DesktopController {
     provider_catalog_requests: LatestRequestTracker<ProviderCatalogRequestTarget>,
     startup_provider_requests: LatestRequestTracker<ProviderReadinessRequestTarget>,
     startup_docling_requests: LatestRequestTracker<DoclingRequestTarget>,
+    access_mode_persistence_requests: LatestRequestTracker<AccessModePersistenceTarget>,
+    pending_access_mode_adoption: Option<PendingAccessModeAdoption>,
     projection_revision: u64,
     loaded_agent_activity_records: Option<LoadedAgentActivityRecords>,
     durable_agent_activity_refresh_failures: u8,
@@ -2030,6 +3662,8 @@ impl DesktopController {
             provider_catalog_requests: LatestRequestTracker::default(),
             startup_provider_requests: LatestRequestTracker::default(),
             startup_docling_requests: LatestRequestTracker::default(),
+            access_mode_persistence_requests: LatestRequestTracker::default(),
+            pending_access_mode_adoption: None,
             projection_revision: 0,
             loaded_agent_activity_records,
             durable_agent_activity_refresh_failures: 0,
@@ -3432,12 +5066,12 @@ impl DesktopController {
         }
         self.invalidate_session_target_requests();
         let Some(root) = quick_chat_workspace_directory() else {
-            self.state.start_new_chat();
+            self.start_new_chat_with_global_access();
             self.persist_preferences();
             return true;
         };
         if self.is_quick_chat_workspace() {
-            self.state.start_new_chat();
+            self.start_new_chat_with_global_access();
             self.persist_preferences();
             return true;
         }
@@ -3475,7 +5109,7 @@ impl DesktopController {
         self.state.hide_overlay();
         if path == self.app.workspace.root {
             self.state.select_project(index);
-            self.state.start_new_chat();
+            self.start_new_chat_with_global_access();
             self.state.set_status_message("new development chat ready");
             self.persist_preferences();
             return true;
@@ -3822,8 +5456,21 @@ impl DesktopController {
         if catalog_was_pending {
             self.state.cancel_provider_model_load();
         }
-        self.state.reset_effective_config(config);
+        commit_effective_config(&mut self.state, &self.run_lifecycle, config);
         self.state.retarget_startup_readiness_for_config_change();
+    }
+
+    fn sync_loaded_session_access_mode(&self, access_mode: crate::config::AccessMode) {
+        self.run_lifecycle.set_access_mode(access_mode);
+    }
+
+    fn start_new_chat_with_global_access(&mut self) {
+        self.state.start_new_chat();
+        if self.state.app_state.current_session_id.is_none() {
+            let access_mode = self.app.config.permissions.access_mode;
+            self.state.provider_config.update_access_mode(access_mode);
+            self.run_lifecycle.set_access_mode(access_mode);
+        }
     }
 
     pub(crate) fn apply_provider_session(&mut self) -> bool {
@@ -3932,14 +5579,265 @@ impl DesktopController {
         self.access_mode_mutation_runtime_contract().1
     }
 
-    pub(crate) fn toggle_access_mode_remembered(&mut self) -> bool {
-        self.toggle_access_mode_with_remember(ConfigEditorState::remember_global_access_mode)
+    fn access_mode_persistence_target_relation(
+        &self,
+        target: &AccessModePersistenceTarget,
+    ) -> AccessModePersistenceTargetRelation {
+        let (runtime_owner_token, _) = self.access_mode_mutation_runtime_contract();
+        let relation = access_mode_persistence_target_relation(
+            target,
+            &self.app.workspace.root,
+            self.state.app_state.current_session_id,
+            self.state.provider_config.config_generation,
+            &runtime_owner_token,
+        );
+        if relation != AccessModePersistenceTargetRelation::Stale {
+            return relation;
+        }
+        self.access_mode_persistence_relation_after_root_finish(target)
     }
 
-    fn toggle_access_mode_with_remember(
+    fn access_mode_persistence_relation_after_root_finish(
+        &self,
+        target: &AccessModePersistenceTarget,
+    ) -> AccessModePersistenceTargetRelation {
+        let Some(root_run_generation) = target.root_run_generation else {
+            return AccessModePersistenceTargetRelation::Stale;
+        };
+        if target.workspace_root != self.app.workspace.root
+            || target.config_generation != self.state.provider_config.config_generation
+            || self.root_run_generation().is_some()
+            || self.last_root_run_epoch() != root_run_generation
+            || target.runtime_owner_token != format!("root:{root_run_generation}")
+        {
+            return AccessModePersistenceTargetRelation::Stale;
+        }
+        match (target.session_id, self.state.app_state.current_session_id) {
+            (target_session_id, current_session_id) if target_session_id == current_session_id => {
+                AccessModePersistenceTargetRelation::Exact
+            }
+            (None, Some(session_id)) => {
+                AccessModePersistenceTargetRelation::AdoptedSession(session_id)
+            }
+            _ => AccessModePersistenceTargetRelation::Stale,
+        }
+    }
+
+    pub(crate) fn toggle_access_mode_remembered(&mut self) -> bool {
+        let session_service = self.app.session_service.clone();
+        let expected_access_mode = self
+            .state
+            .provider_config
+            .effective_config
+            .permissions
+            .access_mode;
+        self.start_access_mode_persistence(
+            ConfigEditorState::compare_and_set_global_access_mode,
+            move |session_id, access_mode| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.block_on(async move {
+                    session_service
+                        .compare_and_set_root_session_access_mode(
+                            session_id,
+                            expected_access_mode,
+                            access_mode,
+                        )
+                        .await
+                        .and_then(|updated| {
+                            updated.map(|_| ()).ok_or_else(|| {
+                                crate::error::SessionError::Message(format!(
+                                    "session {session_id} access mode changed before this update"
+                                ))
+                            })
+                        })
+                        .map_err(|error| error.to_string())
+                })
+            },
+        )
+    }
+
+    fn start_access_mode_persistence<CompareAndSetGlobal, PersistSession>(
         &mut self,
-        remember: impl FnOnce(crate::config::AccessMode) -> Result<Utf8PathBuf, String>,
-    ) -> bool {
+        compare_and_set_global: CompareAndSetGlobal,
+        persist_session: PersistSession,
+    ) -> bool
+    where
+        CompareAndSetGlobal: FnMut(
+                crate::config::AccessMode,
+                crate::config::AccessMode,
+            ) -> Result<Option<Utf8PathBuf>, String>
+            + Send
+            + 'static,
+        PersistSession:
+            FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String> + Send + 'static,
+    {
+        if !self.access_mode_mutation_admission_open() {
+            self.state.set_status_message(
+                "access mode cannot change while navigation or an owner mutation is active",
+            );
+            return false;
+        }
+        let old_effective_access_mode = self
+            .state
+            .provider_config
+            .effective_config
+            .permissions
+            .access_mode;
+        let access_mode = old_effective_access_mode.next();
+        let (runtime_owner_token, _) = self.access_mode_mutation_runtime_contract();
+        let target = AccessModePersistenceTarget {
+            operation_id: self.state.begin_access_mode_persistence(),
+            workspace_root: self.app.workspace.root.clone(),
+            session_id: self.state.app_state.current_session_id,
+            config_generation: self.state.provider_config.config_generation,
+            root_run_generation: self.root_run_generation(),
+            runtime_owner_token,
+            old_global_access_mode: self.app.config.permissions.access_mode,
+            old_effective_access_mode,
+            access_mode,
+        };
+        let request_id = self.access_mode_persistence_requests.begin(target.clone());
+        let runtime_tx = self.runtime_tx.clone();
+        let worker_target = target.clone();
+        let worker = Arc::new(AccessModePersistenceWorker::new(
+            compare_and_set_global,
+            persist_session,
+        ));
+        let initial_worker = worker.clone();
+        std::thread::spawn(move || {
+            let result = initial_worker.persist_initial_owners(&worker_target);
+            let _ = runtime_tx.send(RuntimeMessage::AccessModePersisted {
+                request_id,
+                target: worker_target,
+                phase: AccessModePersistencePhase::InitialOwners,
+                worker: initial_worker,
+                result,
+            });
+        });
+        self.state
+            .set_status_message(if target.session_id.is_some() {
+                "saving access mode to global config and the current root session"
+            } else {
+                "saving access mode to global config"
+            });
+        true
+    }
+
+    fn spawn_adopted_session_access_persistence(
+        &self,
+        request_id: LatestRequestId,
+        target: AccessModePersistenceTarget,
+        session_id: SessionId,
+        remembered_path: Utf8PathBuf,
+        worker: Arc<AccessModePersistenceWorker>,
+    ) {
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let result = worker.persist_adopted_session(&target, session_id, remembered_path);
+            let _ = runtime_tx.send(RuntimeMessage::AccessModePersisted {
+                request_id,
+                target,
+                phase: AccessModePersistencePhase::AdoptedSession { session_id },
+                worker,
+                result,
+            });
+        });
+    }
+
+    fn resume_pending_access_mode_adoption(&mut self, session_id: SessionId) -> bool {
+        let Some(pending) = self.pending_access_mode_adoption.as_ref() else {
+            return false;
+        };
+        let request_id = pending.request_id;
+        let target = pending.target.clone();
+        let request_is_current = self
+            .access_mode_persistence_requests
+            .is_current(request_id, &target);
+        let operation_is_current = self
+            .state
+            .access_mode_persistence_is_current(target.operation_id);
+        let relation = self.access_mode_persistence_target_relation(&target);
+        if !request_is_current
+            || !operation_is_current
+            || relation != AccessModePersistenceTargetRelation::AdoptedSession(session_id)
+        {
+            let _ = self.pending_access_mode_adoption.take();
+            let _ = self
+                .access_mode_persistence_requests
+                .finish_if_current(request_id, &target);
+            let _ = self
+                .state
+                .finish_access_mode_persistence(target.operation_id);
+            let _ = self.reload_config();
+            self.state.set_status_message(
+                "access mode owner changed before session admission; current configuration was reloaded",
+            );
+            return false;
+        }
+        let pending = self
+            .pending_access_mode_adoption
+            .take()
+            .expect("pending access mode adoption checked above");
+        self.spawn_adopted_session_access_persistence(
+            pending.request_id,
+            pending.target,
+            session_id,
+            pending.remembered_path,
+            pending.worker,
+        );
+        self.state.set_status_message(
+            "global access mode saved; saving the admitted current root session",
+        );
+        true
+    }
+
+    fn settle_pending_access_mode_without_session(&mut self) {
+        let Some(pending) = self.pending_access_mode_adoption.take() else {
+            return;
+        };
+        let relation = self.access_mode_persistence_target_relation(&pending.target);
+        let request_is_current = self
+            .access_mode_persistence_requests
+            .finish_if_current(pending.request_id, &pending.target);
+        let operation_is_current = self
+            .state
+            .finish_access_mode_persistence(pending.target.operation_id);
+        let target_is_current = request_is_current
+            && operation_is_current
+            && relation == AccessModePersistenceTargetRelation::Exact;
+        if !target_is_current {
+            let _ = self.reload_config();
+            return;
+        }
+        self.app.config.permissions.access_mode = pending.target.access_mode;
+        self.state
+            .provider_config
+            .update_access_mode(pending.target.access_mode);
+        self.run_lifecycle
+            .set_access_mode(pending.target.access_mode);
+        self.state.set_status_message(format!(
+            "global config access mode set to {} and remembered in {}",
+            pending.target.access_mode.label(),
+            pending.remembered_path
+        ));
+    }
+
+    #[cfg(test)]
+    fn toggle_access_mode_with_persistence<CompareAndSetGlobal, PersistSession>(
+        &mut self,
+        compare_and_set_global: CompareAndSetGlobal,
+        persist_session: PersistSession,
+    ) -> bool
+    where
+        CompareAndSetGlobal: FnMut(
+            crate::config::AccessMode,
+            crate::config::AccessMode,
+        ) -> Result<Option<Utf8PathBuf>, String>,
+        PersistSession: FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String>,
+    {
         if !self.access_mode_mutation_admission_open() {
             self.state.set_status_message(
                 "access mode cannot change while navigation or an owner mutation is active",
@@ -3953,19 +5851,44 @@ impl DesktopController {
             .permissions
             .access_mode
             .next();
-        let remembered_path = match remember(access_mode) {
+        let old_global_access_mode = self.app.config.permissions.access_mode;
+        let current_root_session_id = self.state.app_state.current_session_id;
+        let remembered_path = match persist_desktop_access_mode_owners(
+            old_global_access_mode,
+            access_mode,
+            current_root_session_id,
+            compare_and_set_global,
+            persist_session,
+        ) {
             Ok(path) => path,
             Err(error) => {
+                let _ = self.reload_config();
                 self.state.set_status_message(format!(
-                    "access mode was not changed because the selection could not be remembered: {error}"
+                    "access mode was not changed; configuration was reloaded: {error}"
                 ));
                 return false;
             }
         };
+        if self.state.app_state.current_session_id != current_root_session_id {
+            self.state.set_status_message(
+                "access mode owner changed before commit; reload the current chat".to_string(),
+            );
+            return false;
+        }
         self.app.config.permissions.access_mode = access_mode;
         self.state.provider_config.update_access_mode(access_mode);
-        if let Some(live_config) = self.run_lifecycle.live_config() {
-            live_config.set_access_mode(access_mode);
+        self.run_lifecycle.set_access_mode(access_mode);
+        if let Some(session_id) = current_root_session_id {
+            for session in &mut self.state.app_state.sessions {
+                if session.id == session_id {
+                    session.access_mode = access_mode;
+                }
+            }
+            for summary in &mut self.state.app_state.loaded_sessions {
+                if summary.session.id == session_id {
+                    summary.session.access_mode = access_mode;
+                }
+            }
         }
         let auto_approved = self
             .pending_permission_request
@@ -3981,10 +5904,10 @@ impl DesktopController {
             self.pending_permission_request_id = None;
             self.state.clear_permission();
         }
-        let scope = if self.run_lifecycle.live_config().is_some() {
-            "active run"
+        let scope = if current_root_session_id.is_some() {
+            "global config and current root session"
         } else {
-            "UI session"
+            "global config"
         };
         let suffix = if auto_approved {
             "; pending confirmation approved"
@@ -4589,6 +6512,11 @@ impl DesktopController {
         review_request: Option<ReviewRequest>,
         cancel_prompt_review_on_commit: bool,
     ) -> bool {
+        if self.state.background_mutation_pending() {
+            self.state
+                .set_status_message("wait for the current owner mutation to finish before sending");
+            return false;
+        }
         if self.state.navigation_loading() {
             self.state
                 .set_status_message("wait for navigation to finish before starting a run");
@@ -4678,7 +6606,7 @@ impl DesktopController {
                 .model
                 .base_url
                 .clone(),
-            config_override: Some(full_effective_override(
+            config_override: Some(desktop_run_config_override(
                 &self.state.provider_config.effective_config,
             )),
             output_mode: OutputMode::Human,
@@ -4711,6 +6639,7 @@ impl DesktopController {
             .unwrap_or_else(|| self.state.current_session_label());
         std::thread::spawn(move || {
             let mut request = request;
+            let worker_cancel = request.cancel.clone();
             let mut renderer = DesktopRenderer {
                 tx: runtime_tx.clone(),
                 run_generation,
@@ -4727,22 +6656,32 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop worker runtime");
             runtime.block_on(async move {
-                if let Err(error) = run_service
+                let result = run_service
                     .execute(AppCommand::Run(request), &mut renderer, &mut prompt)
                     .await
-                {
-                    let error = error.to_string();
-                    let notification_body = run_error_notification_body(
-                        &notification_title,
-                        &crate::tui::state::RunStatus::Failed,
-                        &error,
-                    );
-                    send_windows_desktop_notification("moyAI", &notification_body);
-                    let _ = runtime_tx.send(RuntimeMessage::Finished {
-                        run_generation,
-                        result: Err(error),
-                    });
+                    .map_err(|error| error.to_string());
+                match &result {
+                    Ok(summary) if !renderer.notified_terminal => {
+                        let notification_body =
+                            run_completion_notification_body(&renderer.notification_title, summary);
+                        send_windows_desktop_notification("moyAI", &notification_body);
+                    }
+                    Err(error)
+                        if !renderer.notified_terminal
+                            && desktop_run_failure_notification_allowed(
+                                worker_cancel.is_cancelled(),
+                            ) =>
+                    {
+                        let notification_body = run_error_notification_body(
+                            &renderer.notification_title,
+                            &crate::tui::state::RunStatus::Failed,
+                            error,
+                        );
+                        send_windows_desktop_notification("moyAI", &notification_body);
+                    }
+                    _ => {}
                 }
+                publish_desktop_run_finished(&runtime_tx, run_generation, result);
             });
         });
         true
@@ -4865,6 +6804,7 @@ impl DesktopController {
                     return;
                 }
                 self.state.finish_navigation(request_id);
+                let access_mode = loaded.session.access_mode;
                 self.state.load_open_session(
                     &loaded.session,
                     &loaded.transcript,
@@ -4876,6 +6816,7 @@ impl DesktopController {
                     loaded.turn_page_total,
                     loaded.turn_page_has_more,
                 );
+                self.sync_loaded_session_access_mode(access_mode);
                 if let Some(records) = loaded.agent_activity_records {
                     self.loaded_agent_activity_records = Some((loaded.session.id, records));
                     self.durable_agent_activity_refresh_failures = 0;
@@ -4906,6 +6847,7 @@ impl DesktopController {
         }
         match result {
             Ok(loaded) => {
+                let access_mode = loaded.session.access_mode;
                 self.state.load_open_session(
                     &loaded.session,
                     &loaded.transcript,
@@ -4917,6 +6859,7 @@ impl DesktopController {
                     loaded.turn_page_total,
                     loaded.turn_page_has_more,
                 );
+                self.sync_loaded_session_access_mode(access_mode);
                 if let Some(records) = loaded.agent_activity_records {
                     self.loaded_agent_activity_records = Some((loaded.session.id, records));
                     self.durable_agent_activity_refresh_failures = 0;
@@ -4988,7 +6931,7 @@ impl DesktopController {
                     return;
                 }
                 self.replace_workspace_from_load(loaded);
-                self.state.start_new_chat();
+                self.start_new_chat_with_global_access();
                 self.state.set_status_message("new development chat ready");
             }
             Err(error) => {
@@ -5085,7 +7028,9 @@ impl DesktopController {
                     ) {
                         self.commit_pending_root_submission(run_generation);
                     }
-                    if self.run_lifecycle.cancellation_requested() && !run_event_is_terminal(&event)
+                    if self.run_lifecycle.cancellation_requested()
+                        && !run_event_is_terminal(&event)
+                        && !matches!(&event, RunEvent::SessionStarted { .. })
                     {
                         continue;
                     }
@@ -5104,6 +7049,9 @@ impl DesktopController {
                         self.run_lifecycle.observe_terminal_event();
                     }
                     self.state.apply_run_event(&event);
+                    if let RunEvent::SessionStarted { session_id, .. } = &event {
+                        self.resume_pending_access_mode_adoption(*session_id);
+                    }
                     if live_event_requires_canonical_refresh(&event)
                         && live_refresh_session_id == self.state.app_state.current_session_id
                     {
@@ -5143,6 +7091,9 @@ impl DesktopController {
                 } => {
                     if !self.run_lifecycle.owns(run_generation) {
                         continue;
+                    }
+                    if self.state.app_state.current_session_id.is_none() {
+                        self.settle_pending_access_mode_without_session();
                     }
                     match result {
                         Ok(summary) => {
@@ -5313,7 +7264,7 @@ impl DesktopController {
                                         request_id,
                                     );
                                 } else {
-                                    self.state.start_new_chat();
+                                    self.start_new_chat_with_global_access();
                                     self.state
                                         .set_status_message(format!("deleted chat {}", session_id));
                                 }
@@ -5366,7 +7317,7 @@ impl DesktopController {
                                         request_id,
                                     );
                                 } else {
-                                    self.state.start_new_chat();
+                                    self.start_new_chat_with_global_access();
                                     self.state.set_status_message(format!(
                                         "archived chat {}",
                                         session_id
@@ -5451,6 +7402,7 @@ impl DesktopController {
                                 && !self.session_load_is_blocked_by_active_run()
                             {
                                 let loaded = applied.loaded;
+                                let access_mode = loaded.session.access_mode;
                                 self.state.load_open_session(
                                     &loaded.session,
                                     &loaded.transcript,
@@ -5462,6 +7414,7 @@ impl DesktopController {
                                     loaded.turn_page_total,
                                     loaded.turn_page_has_more,
                                 );
+                                self.sync_loaded_session_access_mode(access_mode);
                                 if let Some(records) = loaded.agent_activity_records {
                                     self.loaded_agent_activity_records =
                                         Some((loaded.session.id, records));
@@ -5511,6 +7464,7 @@ impl DesktopController {
                     }
                     match result {
                         Ok(loaded) => {
+                            let access_mode = loaded.session.access_mode;
                             self.state.load_open_session(
                                 &loaded.session,
                                 &loaded.transcript,
@@ -5522,6 +7476,7 @@ impl DesktopController {
                                 loaded.turn_page_total,
                                 loaded.turn_page_has_more,
                             );
+                            self.sync_loaded_session_access_mode(access_mode);
                             if let Some(records) = loaded.agent_activity_records {
                                 self.loaded_agent_activity_records =
                                     Some((loaded.session.id, records));
@@ -5681,7 +7636,7 @@ impl DesktopController {
                                         request_id,
                                     );
                                 } else {
-                                    self.state.start_new_chat();
+                                    self.start_new_chat_with_global_access();
                                     self.state.set_status_message(format!(
                                         "deleted project {}",
                                         project_id
@@ -5812,6 +7767,155 @@ impl DesktopController {
                             .set_status_message(format!("history markdown export failed: {error}")),
                     }
                 }
+                RuntimeMessage::AccessModePersisted {
+                    request_id,
+                    target,
+                    phase,
+                    worker,
+                    result,
+                } => {
+                    if !self
+                        .access_mode_persistence_requests
+                        .is_current(request_id, &target)
+                        || !self
+                            .state
+                            .access_mode_persistence_is_current(target.operation_id)
+                    {
+                        continue;
+                    }
+                    let target_relation = self.access_mode_persistence_target_relation(&target);
+                    if let (
+                        AccessModePersistencePhase::InitialOwners,
+                        Ok(path),
+                        AccessModePersistenceTargetRelation::AdoptedSession(session_id),
+                    ) = (&phase, &result, target_relation)
+                    {
+                        self.spawn_adopted_session_access_persistence(
+                            request_id,
+                            target.clone(),
+                            session_id,
+                            path.clone(),
+                            worker,
+                        );
+                        self.state.set_status_message(
+                            "global access mode saved; saving the adopted current root session",
+                        );
+                        continue;
+                    }
+                    if matches!(phase, AccessModePersistencePhase::InitialOwners)
+                        && target_relation == AccessModePersistenceTargetRelation::Exact
+                        && target.session_id.is_none()
+                        && target.root_run_generation.is_some()
+                        && target.root_run_generation == self.root_run_generation()
+                    {
+                        if let Ok(path) = &result {
+                            self.pending_access_mode_adoption = Some(PendingAccessModeAdoption {
+                                request_id,
+                                target,
+                                remembered_path: path.clone(),
+                                worker,
+                            });
+                            self.state.set_status_message(
+                                "global access mode saved; waiting for current root session admission",
+                            );
+                            continue;
+                        }
+                    }
+                    let request_is_current = self
+                        .access_mode_persistence_requests
+                        .finish_if_current(request_id, &target);
+                    let operation_is_current = self
+                        .state
+                        .finish_access_mode_persistence(target.operation_id);
+                    if !request_is_current || !operation_is_current {
+                        continue;
+                    }
+                    let (target_is_current, committed_session_id) = match (phase, target_relation) {
+                        (
+                            AccessModePersistencePhase::InitialOwners,
+                            AccessModePersistenceTargetRelation::Exact,
+                        ) => (true, target.session_id),
+                        (
+                            AccessModePersistencePhase::AdoptedSession { session_id },
+                            AccessModePersistenceTargetRelation::AdoptedSession(current_session_id),
+                        ) if session_id == current_session_id => (true, Some(session_id)),
+                        _ => (false, None),
+                    };
+                    match result {
+                        Ok(path) if target_is_current => {
+                            self.app.config.permissions.access_mode = target.access_mode;
+                            self.state
+                                .provider_config
+                                .update_access_mode(target.access_mode);
+                            self.run_lifecycle.set_access_mode(target.access_mode);
+                            if let Some(session_id) = committed_session_id {
+                                for session in &mut self.state.app_state.sessions {
+                                    if session.id == session_id {
+                                        session.access_mode = target.access_mode;
+                                    }
+                                }
+                                for summary in &mut self.state.app_state.loaded_sessions {
+                                    if summary.session.id == session_id {
+                                        summary.session.access_mode = target.access_mode;
+                                    }
+                                }
+                            }
+                            let auto_approved = self
+                                .pending_permission_request
+                                .as_ref()
+                                .is_some_and(|request| {
+                                    crate::tool::context::access_mode_allows_permission(
+                                        target.access_mode,
+                                        request,
+                                    )
+                                });
+                            if auto_approved {
+                                if let Some(response) = self.permission_response.take() {
+                                    let _ = response.send(true);
+                                }
+                                self.pending_permission_request = None;
+                                self.pending_permission_request_id = None;
+                                self.state.clear_permission();
+                            }
+                            let scope = if committed_session_id.is_some() {
+                                "global config and current root session"
+                            } else {
+                                "global config"
+                            };
+                            let suffix = if auto_approved {
+                                "; pending confirmation approved"
+                            } else {
+                                ""
+                            };
+                            self.state.set_status_message(format!(
+                                "{scope} access mode set to {} and remembered in {}{suffix}",
+                                target.access_mode.label(),
+                                path
+                            ));
+                        }
+                        Ok(_) => {
+                            let _ = self.reload_config();
+                            self.state.set_status_message(
+                                "access mode was persisted for its original owner; current configuration was reloaded",
+                            );
+                        }
+                        Err(error) => {
+                            let _ = self.reload_config();
+                            if target_is_current
+                                && self.state.app_state.current_session_id.is_some()
+                            {
+                                self.state
+                                    .provider_config
+                                    .update_access_mode(target.old_effective_access_mode);
+                                self.run_lifecycle
+                                    .set_access_mode(target.old_effective_access_mode);
+                            }
+                            self.state.set_status_message(format!(
+                                "access mode was not changed; configuration was reloaded: {error}"
+                            ));
+                        }
+                    }
+                }
                 RuntimeMessage::WorkspaceSwitched { request_id, result } => {
                     self.apply_workspace_switched_message(request_id, result)
                 }
@@ -5822,6 +7926,21 @@ impl DesktopController {
         }
         changed
     }
+}
+
+fn desktop_run_failure_notification_allowed(cancelled: bool) -> bool {
+    !cancelled
+}
+
+fn publish_desktop_run_finished(
+    tx: &tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
+    run_generation: u64,
+    result: Result<RunSummary, String>,
+) {
+    let _ = tx.send(RuntimeMessage::Finished {
+        run_generation,
+        result,
+    });
 }
 
 fn resolve_pending_permission(
@@ -6594,15 +8713,17 @@ fn provider_catalog_probe_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        DoclingRequestTarget, HistoryExportRequestTarget, ProviderCatalogRequestTarget,
-        ProviderReadinessRequestTarget, RuntimeMessage, RuntimeMessageAsyncContract,
-        SessionRefreshRequestTarget, fallback_workspace_after_project_delete,
-        first_restorable_project_root, normalize_image_attachment_path, notification_session_title,
+        DesktopRenderer, DoclingRequestTarget, HistoryExportRequestTarget,
+        ProviderCatalogRequestTarget, ProviderReadinessRequestTarget, RuntimeMessage,
+        RuntimeMessageAsyncContract, SessionRefreshRequestTarget,
+        fallback_workspace_after_project_delete, first_restorable_project_root,
+        normalize_image_attachment_path, notification_session_title,
         open_transcript_rows_to_markdown, provider_catalog_probe_config,
-        resolve_pending_permission, run_completion_notification_body,
+        publish_desktop_run_finished, resolve_pending_permission, run_completion_notification_body,
         run_terminal_event_notification_body, transcript_markdown_file_name,
         unique_background_request_admission_open,
     };
+    use crate::cli::EventRenderer as _;
     use crate::config::{ProviderMetadataMode, ResolvedConfig};
     use crate::desktop::async_ops::LatestRequestTracker;
     use crate::desktop::models::DesktopTranscriptRowKind;
@@ -7058,6 +9179,42 @@ mod tests {
     }
 
     #[test]
+    fn desktop_renderer_defers_state_completion_until_worker_settlement() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = DesktopRenderer {
+            tx: tx.clone(),
+            run_generation: 12,
+            notification_title: "test".to_string(),
+            notified_terminal: false,
+        };
+        let summary = RunSummary {
+            session_id: crate::session::SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        };
+
+        renderer.finish(&summary).expect("renderer finish");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        publish_desktop_run_finished(&tx, 12, Ok(summary.clone()));
+        assert!(matches!(
+            rx.try_recv().expect("worker settlement"),
+            RuntimeMessage::Finished {
+                run_generation: 12,
+                result: Ok(received),
+            } if received.session_id == summary.session_id
+        ));
+    }
+
+    #[test]
     fn terminal_event_notification_body_uses_terminal_state() {
         let body = run_terminal_event_notification_body(
             "vision GUI",
@@ -7110,19 +9267,8 @@ impl EventRenderer for DesktopRenderer {
             .map_err(|error| CliRenderError::Message(error.to_string()))
     }
 
-    fn finish(&mut self, summary: &RunSummary) -> Result<(), CliRenderError> {
-        if !self.notified_terminal {
-            let notification_body =
-                run_completion_notification_body(&self.notification_title, summary);
-            send_windows_desktop_notification("moyAI", &notification_body);
-            self.notified_terminal = true;
-        }
-        self.tx
-            .send(RuntimeMessage::Finished {
-                run_generation: self.run_generation,
-                result: Ok(summary.clone()),
-            })
-            .map_err(|error| CliRenderError::Message(error.to_string()))
+    fn finish(&mut self, _summary: &RunSummary) -> Result<(), CliRenderError> {
+        Ok(())
     }
 
     fn render_session_list(&mut self, _sessions: &[SessionRecord]) -> Result<(), CliRenderError> {

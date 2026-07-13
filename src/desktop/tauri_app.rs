@@ -1884,10 +1884,21 @@ async fn toggle_access_mode(
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
         ensure_access_mode_mutation_target(controller, &expected_target)?;
+        let expected_session_id = expected_target.session_id.clone();
         if !controller.toggle_access_mode_remembered() {
             return Err(rejected_action(
                 controller,
                 "the access mode was not changed",
+            ));
+        }
+        let committed_session_id = controller
+            .state
+            .app_state
+            .current_session_id
+            .map(|session_id| session_id.to_string());
+        if committed_session_id != expected_session_id {
+            return Err(DesktopCommandConflict::new(
+                "the current root session changed before the access mode commit completed",
             ));
         }
         Ok(())
@@ -1956,12 +1967,19 @@ fn apply_windows_window_opacity(window: &tauri::WebviewWindow, percent: i32) -> 
 async fn answer_permission(
     controller: State<'_, SharedController>,
     allow: bool,
-    confirmation_id: u64,
+    confirmation_id: String,
 ) -> Result<DesktopWebState, String> {
+    let confirmation_id = parse_permission_confirmation_id(&confirmation_id)?;
     mutate_controller(controller, |controller| {
         controller.answer_permission(confirmation_id, allow);
     })
     .await
+}
+
+fn parse_permission_confirmation_id(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| "permission confirmation id must be an unsigned decimal integer".to_string())
 }
 
 #[cfg(test)]
@@ -2239,5 +2257,14 @@ mod tests {
         ] {
             assert!(validate_session_archive_loaded_status(status).is_ok());
         }
+    }
+
+    #[test]
+    fn permission_confirmation_id_parses_full_u64_decimal_range() {
+        assert_eq!(
+            parse_permission_confirmation_id("18446744073709551615"),
+            Ok(u64::MAX)
+        );
+        assert!(parse_permission_confirmation_id("9007199254740993.0").is_err());
     }
 }

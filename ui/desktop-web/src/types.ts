@@ -184,7 +184,7 @@ export interface DesktopWebState {
   token_meter_title: string;
   token_meter_level: "unknown" | "low" | "medium" | "high" | "critical" | string;
   confirmation_visible: boolean;
-  confirmation_id: number | null;
+  confirmation_id: string | null;
   confirmation_text: string;
   confirmation: PermissionProjection | null;
   startup: StartupProjection;

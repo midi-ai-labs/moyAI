@@ -1,9 +1,10 @@
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use directories_next::ProjectDirs;
+use fs2::FileExt;
 
 use crate::cli::RunArgs;
 use crate::config::merge::apply_patch;
@@ -17,6 +18,34 @@ use crate::config::model::{
 use crate::error::ConfigError;
 
 const GLOBAL_CONFIG_PATH_ENV: &str = "MOYAI_CONFIG_PATH";
+
+pub(crate) struct GlobalConfigWriteLease {
+    file: File,
+}
+
+impl Drop for GlobalConfigWriteLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+pub(crate) fn acquire_global_config_write_lease(
+    path: &Utf8Path,
+) -> Result<GlobalConfigWriteLease, ConfigError> {
+    let parent = path.parent().ok_or_else(|| {
+        ConfigError::Message(format!("config path `{path}` has no parent directory"))
+    })?;
+    fs::create_dir_all(parent)?;
+    let file_name = path.file_name().unwrap_or("config.toml");
+    let lock_path = path.with_file_name(format!("{file_name}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path.as_std_path())?;
+    file.lock_exclusive()?;
+    Ok(GlobalConfigWriteLease { file })
+}
 
 pub struct ConfigLoader;
 

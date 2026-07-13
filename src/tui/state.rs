@@ -630,20 +630,10 @@ impl AppState {
             agent_path: request.agent_path.clone(),
             agent_task_name: request.agent_task_name.clone(),
         });
-        self.run_status = RunStatus::Confirming;
-        self.progress.status = "Confirming".to_string();
-        self.progress.current_phase = "permission".to_string();
-        self.progress.active_step = request.summary.clone();
     }
 
     pub fn clear_permission(&mut self) {
         self.permission = None;
-        if self.current_session_id.is_some() && self.run_status == RunStatus::Confirming {
-            self.run_status = RunStatus::Running;
-            self.progress.status = "Running".to_string();
-            self.progress.current_phase = "resumed".to_string();
-            self.progress.active_step = "Permission response recorded".to_string();
-        }
     }
 
     pub fn push_local_user_prompt(&mut self, prompt: &str) {
@@ -1210,21 +1200,34 @@ mod tests {
     }
 
     #[test]
-    fn clearing_permission_resumes_only_a_confirming_run() {
+    fn permission_overlay_does_not_replace_the_root_run_lifecycle() {
         let session_id = SessionId::new();
+        let request = PermissionRequest {
+            access: crate::workspace::AccessKind::Shell,
+            summary: "child permission".to_string(),
+            details: Vec::new(),
+            targets: Vec::new(),
+            outside_workspace: false,
+            risks: Vec::new(),
+            agent_path: Some("/root/child".to_string()),
+            agent_task_name: Some("child".to_string()),
+        };
         let mut state = AppState {
             current_session_id: Some(session_id),
             run_status: RunStatus::Completed,
             ..AppState::default()
         };
 
+        state.set_permission(&request);
+        assert_eq!(state.run_status, RunStatus::Completed);
         state.clear_permission();
         assert_eq!(state.run_status, RunStatus::Completed);
 
-        state.run_status = RunStatus::Confirming;
+        state.run_status = RunStatus::Running;
+        state.set_permission(&request);
+        assert_eq!(state.run_status, RunStatus::Running);
         state.clear_permission();
         assert_eq!(state.run_status, RunStatus::Running);
-        assert_eq!(state.progress.current_phase, "resumed");
     }
 
     #[test]

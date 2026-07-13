@@ -272,6 +272,8 @@ pub enum AgentControlError {
     TreeCancelled,
     #[error("mailbox for agent `{0}` closed")]
     MailboxClosed(AgentPath),
+    #[error("durable mailbox commit failed: {0}")]
+    DurableMailboxCommit(String),
     #[error("agent control lock was poisoned")]
     LockPoisoned,
     #[error("agent `{0}` execution lease is stale")]
@@ -288,6 +290,7 @@ pub struct AgentControl {
 struct AgentControlInner {
     tree_cancel: CancellationToken,
     state: Mutex<AgentTreeState>,
+    mail_delivery: Mutex<()>,
     activity_tx: watch::Sender<u64>,
 }
 
@@ -306,6 +309,8 @@ struct AgentEntry {
     node_cancel: CancellationToken,
     mailbox: VecDeque<AgentMailboxMessage>,
     mailbox_generation: u64,
+    trigger_admission_epoch: u64,
+    trigger_purge_pending: u32,
     mailbox_activity_tx: watch::Sender<u64>,
 }
 
@@ -314,6 +319,15 @@ pub struct AgentExecutionLease {
     path: AgentPath,
     marker: Arc<()>,
     cancel: CancellationToken,
+}
+
+#[must_use]
+pub enum AgentMailDeliveryOutcome {
+    Enqueued {
+        generation: u64,
+        scheduled: Vec<AgentExecutionLease>,
+    },
+    Suppressed,
 }
 
 impl AgentControl {
@@ -345,6 +359,8 @@ impl AgentControl {
                 node_cancel: root_cancel,
                 mailbox: VecDeque::new(),
                 mailbox_generation: 0,
+                trigger_admission_epoch: 0,
+                trigger_purge_pending: 0,
                 mailbox_activity_tx,
             },
         );
@@ -355,6 +371,7 @@ impl AgentControl {
                     max_concurrent_agents,
                     agents,
                 }),
+                mail_delivery: Mutex::new(()),
                 activity_tx,
             }),
         };
@@ -413,6 +430,8 @@ impl AgentControl {
                 node_cancel: node_cancel.clone(),
                 mailbox: VecDeque::new(),
                 mailbox_generation: 0,
+                trigger_admission_epoch: 0,
+                trigger_purge_pending: 0,
                 mailbox_activity_tx,
             },
         );
@@ -535,6 +554,8 @@ impl AgentControl {
                 node_cancel,
                 mailbox: VecDeque::new(),
                 mailbox_generation: 0,
+                trigger_admission_epoch: 0,
+                trigger_purge_pending: 0,
                 mailbox_activity_tx,
             },
         );
@@ -630,46 +651,105 @@ impl AgentControl {
     }
 
     pub fn enqueue_mail(&self, message: AgentMailboxMessage) -> Result<u64, AgentControlError> {
-        let mut state = self.lock()?;
-        if !state.agents.contains_key(&message.author) {
-            return Err(AgentControlError::AgentNotFound(message.author));
+        let recipient = message.recipient.clone();
+        match self.enqueue_mail_after_durable_commit(message, false, || Ok(()))? {
+            AgentMailDeliveryOutcome::Enqueued { generation, .. } => Ok(generation),
+            AgentMailDeliveryOutcome::Suppressed => {
+                Err(AgentControlError::MailboxClosed(recipient))
+            }
         }
+    }
+
+    pub fn enqueue_mail_after_durable_commit(
+        &self,
+        message: AgentMailboxMessage,
+        schedule_triggered: bool,
+        durable_commit: impl FnOnce() -> Result<(), String>,
+    ) -> Result<AgentMailDeliveryOutcome, AgentControlError> {
+        let _delivery = self.lock_mail_delivery()?;
+        let (author_session_id, recipient_session_id, trigger_admission_epoch) = {
+            let state = self.lock()?;
+            if schedule_triggered && self.inner.tree_cancel.is_cancelled() {
+                return Err(AgentControlError::TreeCancelled);
+            }
+            let author = state
+                .agents
+                .get(&message.author)
+                .ok_or_else(|| AgentControlError::AgentNotFound(message.author.clone()))?;
+            let recipient = state
+                .agents
+                .get(&message.recipient)
+                .ok_or_else(|| AgentControlError::AgentNotFound(message.recipient.clone()))?;
+            if schedule_triggered && recipient.trigger_purge_pending > 0 {
+                return Err(AgentControlError::MailboxClosed(message.recipient.clone()));
+            }
+            (
+                author.session_id,
+                recipient.session_id,
+                recipient.trigger_admission_epoch,
+            )
+        };
+        durable_commit().map_err(AgentControlError::DurableMailboxCommit)?;
+        let mut state = self.lock()?;
+        if !state
+            .agents
+            .get(&message.author)
+            .is_some_and(|author| author.session_id == author_session_id)
+        {
+            return Err(AgentControlError::AgentNotFound(message.author.clone()));
+        }
+        let suppress_trigger = schedule_triggered
+            && (self.inner.tree_cancel.is_cancelled()
+                || !state
+                    .agents
+                    .get(&message.recipient)
+                    .is_some_and(|recipient| {
+                        recipient.session_id == recipient_session_id
+                            && recipient.trigger_admission_epoch == trigger_admission_epoch
+                            && recipient.trigger_purge_pending == 0
+                            && !matches!(recipient.status, AgentStatus::Shutdown)
+                    }));
         let recipient = state
             .agents
             .get_mut(&message.recipient)
             .ok_or_else(|| AgentControlError::AgentNotFound(message.recipient.clone()))?;
+        if recipient.session_id != recipient_session_id {
+            return Err(AgentControlError::AgentNotFound(message.recipient.clone()));
+        }
+        if suppress_trigger {
+            return Ok(AgentMailDeliveryOutcome::Suppressed);
+        }
         recipient.mailbox.push_back(message);
         recipient.mailbox_generation = recipient.mailbox_generation.wrapping_add(1);
         let generation = recipient.mailbox_generation;
         recipient.mailbox_activity_tx.send_replace(generation);
+        let scheduled = if schedule_triggered {
+            self.reserve_pending_triggered_executions_locked(&mut state)
+        } else {
+            Vec::new()
+        };
         drop(state);
         self.notify_activity();
-        Ok(generation)
+        Ok(AgentMailDeliveryOutcome::Enqueued {
+            generation,
+            scheduled,
+        })
     }
 
     pub fn enqueue_mail_and_schedule(
         &self,
         message: AgentMailboxMessage,
     ) -> Result<(u64, Vec<AgentExecutionLease>), AgentControlError> {
-        let mut state = self.lock()?;
-        if self.inner.tree_cancel.is_cancelled() {
-            return Err(AgentControlError::TreeCancelled);
+        let recipient = message.recipient.clone();
+        match self.enqueue_mail_after_durable_commit(message, true, || Ok(()))? {
+            AgentMailDeliveryOutcome::Enqueued {
+                generation,
+                scheduled,
+            } => Ok((generation, scheduled)),
+            AgentMailDeliveryOutcome::Suppressed => {
+                Err(AgentControlError::MailboxClosed(recipient))
+            }
         }
-        if !state.agents.contains_key(&message.author) {
-            return Err(AgentControlError::AgentNotFound(message.author));
-        }
-        let recipient = state
-            .agents
-            .get_mut(&message.recipient)
-            .ok_or_else(|| AgentControlError::AgentNotFound(message.recipient.clone()))?;
-        recipient.mailbox.push_back(message);
-        recipient.mailbox_generation = recipient.mailbox_generation.wrapping_add(1);
-        let generation = recipient.mailbox_generation;
-        recipient.mailbox_activity_tx.send_replace(generation);
-        let scheduled = self.reserve_pending_triggered_executions_locked(&mut state);
-        drop(state);
-        self.notify_activity();
-        Ok((generation, scheduled))
     }
 
     pub fn complete_execution(
@@ -708,6 +788,7 @@ impl AgentControl {
         if path.is_root() {
             return Err(AgentControlError::AgentHasChildren(path.clone()));
         }
+        let _delivery = self.lock_mail_delivery()?;
         let mut state = self.lock()?;
         if state
             .agents
@@ -859,14 +940,34 @@ impl AgentControl {
             return Ok(());
         }
 
+        let (terminal_session_id, terminal_epoch) = {
+            let mut state = self.lock()?;
+            let agent = state
+                .agents
+                .get_mut(path)
+                .ok_or_else(|| AgentControlError::AgentNotFound(path.clone()))?;
+            agent.node_cancel.cancel();
+            if agent.trigger_purge_pending == 0 {
+                agent.trigger_admission_epoch = agent.trigger_admission_epoch.wrapping_add(1);
+            }
+            agent.trigger_purge_pending = agent.trigger_purge_pending.saturating_add(1);
+            (agent.session_id, agent.trigger_admission_epoch)
+        };
+        self.notify_activity();
+
+        let _delivery = self.lock_mail_delivery()?;
         let mut state = self.lock()?;
-        let agent = state
-            .agents
-            .get_mut(path)
-            .ok_or_else(|| AgentControlError::AgentNotFound(path.clone()))?;
-        agent.node_cancel.cancel();
+        let Some(agent) = state.agents.get_mut(path) else {
+            return Ok(());
+        };
+        if agent.session_id != terminal_session_id
+            || agent.trigger_admission_epoch != terminal_epoch
+        {
+            return Ok(());
+        }
         let pending_before = agent.mailbox.len();
         agent.mailbox.retain(|message| !message.trigger_turn);
+        agent.trigger_purge_pending = agent.trigger_purge_pending.saturating_sub(1);
         if agent.mailbox.len() != pending_before {
             agent.mailbox_generation = agent.mailbox_generation.wrapping_add(1);
             agent
@@ -908,6 +1009,13 @@ impl AgentControl {
     fn lock(&self) -> Result<MutexGuard<'_, AgentTreeState>, AgentControlError> {
         self.inner
             .state
+            .lock()
+            .map_err(|_| AgentControlError::LockPoisoned)
+    }
+
+    fn lock_mail_delivery(&self) -> Result<MutexGuard<'_, ()>, AgentControlError> {
+        self.inner
+            .mail_delivery
             .lock()
             .map_err(|_| AgentControlError::LockPoisoned)
     }
@@ -1186,6 +1294,243 @@ mod tests {
     }
 
     #[test]
+    fn durable_mailbox_commit_is_validated_and_enqueued_as_one_control_operation() {
+        let (control, _root_execution) =
+            AgentControl::new(SessionId::new(), 2).expect("agent tree");
+        let root = AgentPath::root();
+        let (child, _child_execution) = control
+            .register_child(&root, "worker", SessionId::new(), None)
+            .expect("worker");
+
+        let error = match control.enqueue_mail_after_durable_commit(
+            AgentMailboxMessage::new(child.path.clone(), root.clone(), "not durable", false),
+            false,
+            || Err("injected sqlite failure".to_string()),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("failed durable commit must reject the mailbox write"),
+        };
+        assert!(matches!(
+            error,
+            AgentControlError::DurableMailboxCommit(message)
+                if message == "injected sqlite failure"
+        ));
+        let unchanged = control
+            .list_agents(Some(&root))
+            .expect("root snapshot")
+            .into_iter()
+            .next()
+            .expect("root");
+        assert_eq!(unchanged.mailbox_generation, 0);
+        assert_eq!(unchanged.pending_mail_count, 0);
+
+        let outcome = control
+            .enqueue_mail_after_durable_commit(
+                AgentMailboxMessage::new(child.path, root.clone(), "durable", false),
+                false,
+                || Ok(()),
+            )
+            .expect("durable mail");
+        let AgentMailDeliveryOutcome::Enqueued {
+            generation,
+            scheduled,
+        } = outcome
+        else {
+            panic!("ordinary durable mail must be enqueued");
+        };
+        assert_eq!(generation, 1);
+        assert!(scheduled.is_empty());
+        assert_eq!(
+            control
+                .drain_mailbox(&root)
+                .expect("mailbox")
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>(),
+            vec!["durable"]
+        );
+    }
+
+    #[test]
+    fn blocked_durable_commit_does_not_block_tree_list_or_cancel() {
+        let (control, _root_execution) =
+            AgentControl::new(SessionId::new(), 2).expect("agent tree");
+        let root = AgentPath::root();
+        let (child, _child_execution) = control
+            .register_child(&root, "worker", SessionId::new(), None)
+            .expect("worker");
+        let child_path = child.path.clone();
+        let (commit_entered_tx, commit_entered_rx) = std::sync::mpsc::channel();
+        let (release_commit_tx, release_commit_rx) = std::sync::mpsc::channel();
+        let sender_control = control.clone();
+        let sender_root = root.clone();
+        let sender = std::thread::spawn(move || {
+            sender_control.enqueue_mail_after_durable_commit(
+                AgentMailboxMessage::new(child_path, sender_root, "durable", false),
+                false,
+                || {
+                    commit_entered_tx.send(()).expect("commit entered signal");
+                    release_commit_rx.recv().expect("release durable commit");
+                    Ok(())
+                },
+            )
+        });
+        commit_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("durable commit entered");
+
+        let observer_control = control.clone();
+        let observer_root = root.clone();
+        let observer_child = child.path.clone();
+        let (observer_tx, observer_rx) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            let result = observer_control
+                .list_agents(Some(&observer_root))
+                .and_then(|agents| {
+                    if agents.len() != 2 {
+                        return Err(AgentControlError::AgentNotFound(observer_child.clone()));
+                    }
+                    observer_control.cancel_agent(&observer_child)
+                });
+            observer_tx.send(result).expect("observer result");
+        });
+        let observed = observer_rx.recv_timeout(std::time::Duration::from_secs(1));
+        release_commit_tx.send(()).expect("release commit");
+        let sender_result = sender.join().expect("sender thread");
+        observer.join().expect("observer thread");
+
+        observed
+            .expect("list/cancel must remain responsive while durable commit is blocked")
+            .expect("list/cancel result");
+        let _ = sender_result.expect("durable mail delivery");
+    }
+
+    #[test]
+    fn tree_stop_during_durable_commit_suppresses_the_committed_trigger() {
+        let (control, _root_execution) =
+            AgentControl::new(SessionId::new(), 2).expect("agent tree");
+        let root = AgentPath::root();
+        let (child, child_execution) = control
+            .register_child(&root, "worker", SessionId::new(), None)
+            .expect("worker");
+        drop(child_execution);
+        let (commit_entered_tx, commit_entered_rx) = std::sync::mpsc::channel();
+        let (release_commit_tx, release_commit_rx) = std::sync::mpsc::channel();
+        let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sender_committed = Arc::clone(&committed);
+        let sender_control = control.clone();
+        let sender_root = root.clone();
+        let child_path = child.path.clone();
+        let sender = std::thread::spawn(move || {
+            sender_control.enqueue_mail_after_durable_commit(
+                AgentMailboxMessage::new(sender_root, child_path, "follow-up", true),
+                true,
+                || {
+                    commit_entered_tx.send(()).expect("commit entered signal");
+                    release_commit_rx.recv().expect("release durable commit");
+                    sender_committed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+        });
+        commit_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("durable commit entered");
+
+        control.cancel_tree();
+        release_commit_tx.send(()).expect("release commit");
+        let outcome = sender
+            .join()
+            .expect("sender thread")
+            .expect("durable evidence remains committed");
+
+        assert!(committed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(outcome, AgentMailDeliveryOutcome::Suppressed));
+        assert!(
+            !control
+                .mailbox_has_trigger_turn(&child.path)
+                .expect("trigger state")
+        );
+        let child = control
+            .list_agents(Some(&child.path))
+            .expect("child snapshot")
+            .into_iter()
+            .next()
+            .expect("child");
+        assert_eq!(child.pending_mail_count, 0);
+        assert!(!child.is_active);
+    }
+
+    #[test]
+    fn durable_child_terminal_during_commit_suppresses_restart_and_trigger() {
+        let (control, _root_execution) =
+            AgentControl::new(SessionId::new(), 2).expect("agent tree");
+        let root = AgentPath::root();
+        let (child, child_execution) = control
+            .register_child(&root, "worker", SessionId::new(), None)
+            .expect("worker");
+        let child_cancel = child_execution.cancel_token();
+        drop(child_execution);
+        let (commit_entered_tx, commit_entered_rx) = std::sync::mpsc::channel();
+        let (release_commit_tx, release_commit_rx) = std::sync::mpsc::channel();
+        let sender_control = control.clone();
+        let sender_root = root.clone();
+        let sender_child = child.path.clone();
+        let sender = std::thread::spawn(move || {
+            sender_control.enqueue_mail_after_durable_commit(
+                AgentMailboxMessage::new(sender_root, sender_child, "follow-up", true),
+                true,
+                || {
+                    commit_entered_tx.send(()).expect("commit entered signal");
+                    release_commit_rx.recv().expect("release durable commit");
+                    Ok(())
+                },
+            )
+        });
+        commit_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("durable commit entered");
+        let terminal_control = control.clone();
+        let terminal_child = child.path.clone();
+        let terminal = std::thread::spawn(move || {
+            terminal_control.cancel_for_durable_terminal(&terminal_child)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !child_cancel.is_cancelled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "durable terminal cancellation must precede the mailbox purge reservation"
+            );
+            std::thread::yield_now();
+        }
+
+        release_commit_tx.send(()).expect("release commit");
+        let outcome = sender
+            .join()
+            .expect("sender thread")
+            .expect("durable evidence remains committed");
+        terminal
+            .join()
+            .expect("terminal thread")
+            .expect("durable terminal purge");
+
+        assert!(matches!(outcome, AgentMailDeliveryOutcome::Suppressed));
+        assert!(
+            !control
+                .mailbox_has_trigger_turn(&child.path)
+                .expect("trigger state")
+        );
+        let child = control
+            .list_agents(Some(&child.path))
+            .expect("child snapshot")
+            .into_iter()
+            .next()
+            .expect("child");
+        assert_eq!(child.pending_mail_count, 0);
+        assert!(!child.is_active);
+    }
+
+    #[test]
     fn node_tokens_can_be_refreshed_and_tree_cancellation_cascades() {
         let (control, root_execution) = AgentControl::new(SessionId::new(), 2).expect("agent tree");
         let root = AgentPath::root();
@@ -1260,6 +1605,182 @@ mod tests {
             .expect("durable root terminal");
         assert!(root_execution.cancel_token().is_cancelled());
         assert!(control.tree_cancel_token().is_cancelled());
+    }
+
+    #[test]
+    fn concurrent_durable_terminal_purges_converge_and_allow_later_followup() {
+        for terminal_status in [AgentStatus::Completed(None), AgentStatus::Interrupted] {
+            let (control, _root_execution) =
+                AgentControl::new(SessionId::new(), 2).expect("agent tree");
+            let root = AgentPath::root();
+            let (child, child_execution) = control
+                .register_child(&root, "worker", SessionId::new(), None)
+                .expect("worker");
+            control
+                .enqueue_mail(AgentMailboxMessage::new(
+                    root.clone(),
+                    child.path.clone(),
+                    "stale follow-up",
+                    true,
+                ))
+                .expect("stale trigger");
+
+            let delivery = control
+                .lock_mail_delivery()
+                .expect("hold delivery reservation");
+            let terminals = (0..2)
+                .map(|_| {
+                    let terminal_control = control.clone();
+                    let terminal_path = child.path.clone();
+                    std::thread::spawn(move || {
+                        terminal_control.cancel_for_durable_terminal(&terminal_path)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                let pending = control
+                    .lock()
+                    .expect("agent registry")
+                    .agents
+                    .get(&child.path)
+                    .expect("child entry")
+                    .trigger_purge_pending;
+                if pending == 2 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "both terminal requests must enter the shared purge epoch"
+                );
+                std::thread::yield_now();
+            }
+
+            drop(delivery);
+            for terminal in terminals {
+                terminal
+                    .join()
+                    .expect("terminal thread")
+                    .expect("durable terminal purge");
+            }
+            {
+                let state = control.lock().expect("converged agent registry");
+                let agent = state.agents.get(&child.path).expect("child entry");
+                assert_eq!(agent.trigger_purge_pending, 0);
+                assert!(!agent.mailbox.iter().any(|message| message.trigger_turn));
+            }
+
+            let scheduled_after_terminal = control
+                .complete_execution(child_execution, terminal_status.clone(), None)
+                .expect("complete terminal child execution");
+            assert!(scheduled_after_terminal.is_empty());
+            assert_eq!(
+                control.status(&child.path).expect("terminal child status"),
+                terminal_status
+            );
+
+            let outcome = control
+                .enqueue_mail_after_durable_commit(
+                    AgentMailboxMessage::new(root, child.path.clone(), "new follow-up", true),
+                    true,
+                    || Ok(()),
+                )
+                .expect("follow-up after converged purges");
+            let AgentMailDeliveryOutcome::Enqueued { scheduled, .. } = outcome else {
+                panic!("a later follow-up must be enqueued after all purges complete");
+            };
+            assert_eq!(scheduled.len(), 1);
+            assert!(
+                control
+                    .mailbox_has_trigger_turn(&child.path)
+                    .expect("new trigger")
+            );
+            drop(scheduled);
+        }
+    }
+
+    #[test]
+    fn durable_terminal_wait_does_not_purge_a_replacement_at_the_same_path() {
+        let (control, _root_execution) =
+            AgentControl::new(SessionId::new(), 2).expect("agent tree");
+        let root = AgentPath::root();
+        let old_session_id = SessionId::new();
+        let (child, child_execution) = control
+            .register_child(&root, "worker", old_session_id, None)
+            .expect("original worker");
+        let old_cancel = child_execution.cancel_token();
+        let delivery = control
+            .lock_mail_delivery()
+            .expect("hold delivery reservation");
+        let terminal_control = control.clone();
+        let terminal_path = child.path.clone();
+        let terminal = std::thread::spawn(move || {
+            terminal_control.cancel_for_durable_terminal(&terminal_path)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !old_cancel.is_cancelled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal cancellation must enter its first phase"
+            );
+            std::thread::yield_now();
+        }
+
+        {
+            let mut state = control.lock().expect("agent registry");
+            let removed = state
+                .agents
+                .remove(&child.path)
+                .expect("remove original worker during delivery wait");
+            assert_eq!(removed.session_id, old_session_id);
+        }
+        let replacement_session_id = SessionId::new();
+        let (replacement, replacement_execution) = control
+            .register_child(&root, "worker", replacement_session_id, None)
+            .expect("replacement worker");
+        {
+            let mut state = control.lock().expect("replacement registry");
+            let replacement_entry = state
+                .agents
+                .get_mut(&replacement.path)
+                .expect("replacement entry");
+            replacement_entry
+                .mailbox
+                .push_back(AgentMailboxMessage::new(
+                    root,
+                    replacement.path.clone(),
+                    "replacement trigger",
+                    true,
+                ));
+            replacement_entry.mailbox_generation =
+                replacement_entry.mailbox_generation.wrapping_add(1);
+            replacement_entry
+                .mailbox_activity_tx
+                .send_replace(replacement_entry.mailbox_generation);
+        }
+
+        drop(delivery);
+        terminal
+            .join()
+            .expect("terminal thread")
+            .expect("old terminal cancellation");
+
+        let retained = control
+            .list_agents(Some(&replacement.path))
+            .expect("replacement snapshot")
+            .into_iter()
+            .next()
+            .expect("replacement worker");
+        assert_eq!(retained.session_id, replacement_session_id);
+        assert_eq!(retained.pending_mail_count, 1);
+        assert!(
+            control
+                .mailbox_has_trigger_turn(&replacement.path)
+                .expect("replacement trigger")
+        );
+        assert!(!replacement_execution.cancel_token().is_cancelled());
+        drop(child_execution);
+        drop(replacement_execution);
     }
 
     #[test]

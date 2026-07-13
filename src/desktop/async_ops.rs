@@ -19,6 +19,7 @@ pub enum DesktopAsyncOperationKind {
     SessionMaintenance,
     SessionSearch,
     PromptEnhance,
+    AccessModePersistence,
 }
 
 impl DesktopAsyncOperationKind {
@@ -41,6 +42,7 @@ impl DesktopAsyncOperationKind {
             Self::SessionMaintenance => "session_maintenance",
             Self::SessionSearch => "session_search",
             Self::PromptEnhance => "prompt_enhance",
+            Self::AccessModePersistence => "access_mode_persistence",
         }
     }
 
@@ -55,6 +57,11 @@ pub struct DesktopAsyncOperationId(u64);
 impl DesktopAsyncOperationId {
     pub fn get(self) -> u64 {
         self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_value(value: u64) -> Self {
+        Self(value)
     }
 }
 
@@ -88,18 +95,20 @@ impl<T: PartialEq> LatestRequestTracker<T> {
     }
 
     pub fn finish_if_current(&mut self, request_id: LatestRequestId, target: &T) -> bool {
-        if self
-            .latest
-            .as_ref()
-            .is_some_and(|(latest_id, latest_target)| {
-                *latest_id == request_id && latest_target == target
-            })
-        {
+        if self.is_current(request_id, target) {
             self.latest = None;
             true
         } else {
             false
         }
+    }
+
+    pub fn is_current(&self, request_id: LatestRequestId, target: &T) -> bool {
+        self.latest
+            .as_ref()
+            .is_some_and(|(latest_id, latest_target)| {
+                *latest_id == request_id && latest_target == target
+            })
     }
 
     pub fn is_pending(&self) -> bool {
@@ -201,6 +210,10 @@ impl DesktopAsyncOperationRegistry {
         let before = self.active.len();
         self.active.retain(|operation| operation.id != id);
         before != self.active.len()
+    }
+
+    pub fn contains(&self, id: DesktopAsyncOperationId) -> bool {
+        self.active.iter().any(|operation| operation.id == id)
     }
 
     pub fn finish_one_kind(&mut self, kind: DesktopAsyncOperationKind) -> bool {

@@ -8,8 +8,8 @@ mod run_process_lease;
 
 pub use active_run::{ActiveRunLease, ActiveRunRegistry, ActiveSteerInput};
 pub use agent_control::{
-    AgentControl, AgentControlError, AgentExecutionLease, AgentMailboxMessage, AgentPath,
-    AgentSnapshot, AgentStatus, AgentTreeSnapshot,
+    AgentControl, AgentControlError, AgentExecutionLease, AgentMailDeliveryOutcome,
+    AgentMailboxMessage, AgentPath, AgentSnapshot, AgentStatus, AgentTreeSnapshot,
 };
 pub use cancel::build_cancel_token;
 pub use clock::{Clock, SystemClock};

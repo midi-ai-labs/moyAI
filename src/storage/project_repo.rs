@@ -163,6 +163,11 @@ impl ProjectRepository for SqliteProjectRepository {
             params![id.to_string()],
         )?;
         tx.execute(
+            "DELETE FROM protocol_turn_sequence_allocators
+             WHERE session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
+            params![id.to_string()],
+        )?;
+        tx.execute(
             "DELETE FROM file_changes
              WHERE session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
             params![id.to_string()],
@@ -209,4 +214,68 @@ impl ProjectRepository for SqliteProjectRepository {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use crate::config::AccessMode;
+    use crate::session::{NewSession, SessionRepository};
+    use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn delete_project_removes_protocol_turn_sequence_allocators() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8");
+        let paths = StoragePaths {
+            data_dir: data_dir.clone(),
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+        };
+        let sqlite = SqliteStore::open(&paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "project", "none")
+            .await
+            .expect("project");
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "session".to_string(),
+                cwd: data_dir,
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("session");
+        let repo = store.project_repo();
+        repo.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT INTO protocol_turn_sequence_allocators
+                 (session_id, turn_id, next_sequence_no) VALUES (?1, 'turn', 1)",
+                params![session.id.to_string()],
+            )
+            .expect("allocator");
+
+        repo.delete_project(project_id)
+            .await
+            .expect("delete project");
+
+        let allocator_count = repo
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM protocol_turn_sequence_allocators WHERE session_id = ?1",
+                params![session.id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("allocator count");
+        assert_eq!(allocator_count, 0);
+    }
+}

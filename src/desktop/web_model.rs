@@ -88,8 +88,16 @@ pub(crate) struct DesktopRuntimeProjection {
 }
 
 impl DesktopRuntimeProjection {
+    fn root_run_active(&self) -> bool {
+        self.root_run_generation.is_some()
+    }
+
     fn blocks_new_request(&self) -> bool {
-        self.agent_tree_active || self.root_run_finalizing
+        self.root_run_active() || self.root_run_finalizing || self.agent_tree_active
+    }
+
+    fn pre_admission_active(&self, state_busy: bool) -> bool {
+        self.root_run_active() && !self.root_run_finalizing && !state_busy
     }
 }
 
@@ -199,7 +207,7 @@ pub struct DesktopWebState {
     pub token_meter_title: String,
     pub token_meter_level: String,
     pub confirmation_visible: bool,
-    pub confirmation_id: Option<u64>,
+    pub confirmation_id: Option<String>,
     pub confirmation_text: String,
     pub confirmation: Option<DesktopPermissionProjection>,
     pub startup: DesktopStartupProjection,
@@ -277,6 +285,10 @@ pub(crate) fn desktop_web_state(
     state: &DesktopState,
     runtime: &DesktopRuntimeProjection,
 ) -> DesktopWebState {
+    let state_busy = state.is_busy();
+    let root_run_active = runtime.root_run_active();
+    let busy = state_busy || root_run_active;
+    let pre_admission_active = runtime.pre_admission_active(state_busy);
     let detail = state.selected_detail();
     let config_items = state
         .provider_config
@@ -309,15 +321,16 @@ pub(crate) fn desktop_web_state(
                 false,
             )
         };
-    let image_input_enabled = desktop_image_input_delegates_capability_to_runtime(state);
+    let image_input_enabled =
+        desktop_image_input_delegates_capability_to_runtime(state) && !root_run_active;
     let composer_admission_open = composer_admission_is_open(
         runtime,
-        state.is_busy(),
+        busy,
         state.navigation_loading(),
         state.background_mutation_pending(),
     );
     let navigation_admission_open = navigation_admission_blocker(
-        state.is_busy(),
+        busy,
         state.background_mutation_pending(),
         state.navigation_loading(),
         runtime.agent_tree_active,
@@ -331,12 +344,16 @@ pub(crate) fn desktop_web_state(
         .find(|line| !line.is_empty())
         .unwrap_or("ツール待機中")
         .to_string();
-    let (status_message, status_detail) = state
-        .app_state
-        .status_message
-        .as_deref()
-        .map(display_status_projection)
-        .unwrap_or_else(|| ("準備完了".to_string(), String::new()));
+    let (status_message, status_detail) = if pre_admission_active {
+        ("実行を開始しています…".to_string(), String::new())
+    } else {
+        state
+            .app_state
+            .status_message
+            .as_deref()
+            .map(display_status_projection)
+            .unwrap_or_else(|| ("準備完了".to_string(), String::new()))
+    };
     let token_meter = token_meter_projection(
         state.app_state.latest_context_window.as_ref(),
         state.provider_config.effective_config.model.context_window,
@@ -392,18 +409,39 @@ pub(crate) fn desktop_web_state(
         selected_session_title: state.selected_session_title(),
         status_message,
         status_detail,
-        run_status_key: run_status_key(state.app_state.run_status).to_string(),
-        run_status_text: state.current_run_status_text(),
-        run_phase: display_run_phase(&state.app_state.progress.current_phase),
-        run_active_step: display_run_step(&state.app_state.progress.active_step),
+        run_status_key: if pre_admission_active {
+            "running".to_string()
+        } else {
+            run_status_key(state.app_state.run_status).to_string()
+        },
+        run_status_text: if pre_admission_active {
+            "実行準備中".to_string()
+        } else {
+            state.current_run_status_text()
+        },
+        run_phase: if pre_admission_active {
+            "実行準備".to_string()
+        } else {
+            display_run_phase(&state.app_state.progress.current_phase)
+        },
+        run_active_step: if pre_admission_active {
+            "Providerとモデルの利用可否を確認しています".to_string()
+        } else {
+            display_run_step(&state.app_state.progress.active_step)
+        },
         latest_tool_summary: display_tool_summary(&latest_tool_summary),
-        progress_text: detail.progress_text,
+        progress_text: if pre_admission_active {
+            "実行準備中\nフェーズ: 実行準備\n手順: Providerとモデルの利用可否を確認しています"
+                .to_string()
+        } else {
+            detail.progress_text
+        },
         tool_status_text: detail.tool_status_text,
         token_meter_label: token_meter.label,
         token_meter_title: token_meter.title,
         token_meter_level: token_meter.level,
         confirmation_visible: detail.confirmation_visible,
-        confirmation_id: state.permission_request_id,
+        confirmation_id: state.permission_request_id.map(|id| id.to_string()),
         confirmation_text: detail.confirmation_text,
         confirmation: state.app_state.permission.as_ref().map(|permission| {
             DesktopPermissionProjection {
@@ -434,8 +472,9 @@ pub(crate) fn desktop_web_state(
             .map(|path| path.to_string())
             .collect(),
         can_submit: composer_admission_open,
-        busy: state.is_busy(),
+        busy,
         async_polling_required: state.async_polling_required()
+            || root_run_active
             || runtime.agent_tree_active
             || runtime.root_run_finalizing,
         pending_async_operations: state.pending_async_operation_keys(),
@@ -537,7 +576,7 @@ pub(crate) fn desktop_web_state(
         review_status_text,
         send_enhanced_enabled: send_enhanced_enabled && composer_admission_open,
         send_raw_enabled: send_raw_enabled && composer_admission_open,
-        history_export_enabled: state.can_export_history(),
+        history_export_enabled: state.can_export_history() && !root_run_active,
         enhance_enabled: composer_admission_open,
         image_input_enabled,
         window_opacity_percent: state.view.window_opacity_percent,
@@ -1271,6 +1310,50 @@ mod tests {
         let running_review = desktop_web_state(&state, &DesktopRuntimeProjection::default());
         assert!(!running_review.send_enhanced_enabled);
         assert!(!running_review.send_raw_enabled);
+    }
+
+    #[test]
+    fn pre_admission_root_is_projected_active_before_the_first_run_event() {
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            crate::config::ResolvedConfig::default(),
+        );
+        state.app_state.run_status = crate::tui::state::RunStatus::Completed;
+        state.app_state.status_message = Some("run completed".to_string());
+        state.app_state.progress.current_phase = "completed".to_string();
+        state.app_state.progress.active_step = "previous run completed".to_string();
+
+        let projection = desktop_web_state(
+            &state,
+            &DesktopRuntimeProjection {
+                root_run_generation: Some(9),
+                last_root_run_epoch: 9,
+                ..DesktopRuntimeProjection::default()
+            },
+        );
+
+        assert!(
+            projection.busy,
+            "Stop must be available during run admission"
+        );
+        assert_eq!(projection.run_status_key, "running");
+        assert_eq!(projection.run_status_text, "実行準備中");
+        assert_eq!(projection.run_phase, "実行準備");
+        assert!(!projection.can_submit);
+        assert!(!projection.navigation_admission_open);
+        assert!(projection.async_polling_required);
+        assert_eq!(projection.access_target.runtime_owner_token, "root:9");
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -58,6 +58,7 @@ const PROVIDER_PROBE_CACHE_TTL: Duration = Duration::from_secs(30);
 #[derive(Clone, Default)]
 struct ProviderProbeCache {
     entries: Arc<Mutex<HashMap<String, CachedProbeReport>>>,
+    probe_gates: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
 }
 
 struct CachedProbeReport {
@@ -71,12 +72,28 @@ impl ProviderProbeCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = ModelAvailabilityReport>,
     {
+        {
+            let mut entries = self.entries.lock().await;
+            entries.retain(|_, cached| cached.checked_at.elapsed() < PROVIDER_PROBE_CACHE_TTL);
+            if let Some(cached) = entries.get(&key) {
+                return cached.report.clone();
+            }
+        }
+        let probe_gate = self.probe_gate(&key).await;
+        let _probe_guard = probe_gate.lock().await;
+        {
+            let mut entries = self.entries.lock().await;
+            entries.retain(|_, cached| cached.checked_at.elapsed() < PROVIDER_PROBE_CACHE_TTL);
+            if let Some(cached) = entries.get(&key) {
+                return cached.report.clone();
+            }
+        }
+        let report = probe().await;
         let mut entries = self.entries.lock().await;
         entries.retain(|_, cached| cached.checked_at.elapsed() < PROVIDER_PROBE_CACHE_TTL);
         if let Some(cached) = entries.get(&key) {
             return cached.report.clone();
         }
-        let report = probe().await;
         entries.insert(
             key,
             CachedProbeReport {
@@ -85,6 +102,34 @@ impl ProviderProbeCache {
             },
         );
         report
+    }
+
+    async fn probe_gate(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.probe_gates.lock().await;
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(key.to_string(), Arc::downgrade(&gate));
+        gate
+    }
+
+    async fn get_or_probe_until_cancelled<F, Fut>(
+        &self,
+        key: String,
+        cancel: &CancellationToken,
+        probe: F,
+    ) -> Option<ModelAvailabilityReport>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ModelAvailabilityReport>,
+    {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            report = self.get_or_probe(key, probe) => Some(report),
+        }
     }
 }
 
@@ -377,8 +422,12 @@ impl RunService {
                 )
                 .await;
         }
-        self.hydrate_configured_model_from_provider(&mut effective_config, !image_parts.is_empty())
-            .await?;
+        self.hydrate_configured_model_from_provider(
+            &mut effective_config,
+            !image_parts.is_empty(),
+            &request.cancel,
+        )
+        .await?;
         let model = ConfigModelCatalog::new(effective_config.clone()).resolve(None)?;
         if !image_parts.is_empty() && !effective_config.model.supports_images {
             return Err(AppRunError::Message(format!(
@@ -817,6 +866,7 @@ impl RunService {
         &self,
         config: &mut crate::config::ResolvedConfig,
         require_vision: bool,
+        cancel: &CancellationToken,
     ) -> Result<(), AppRunError> {
         let configured_model = config.model.model.trim().to_string();
         if configured_model.is_empty() {
@@ -831,10 +881,15 @@ impl RunService {
         );
         let report = self
             .provider_probe_cache
-            .get_or_probe(key, || {
+            .get_or_probe_until_cancelled(key, cancel, || {
                 check_model_availability(config, None, None, require_vision)
             })
-            .await;
+            .await
+            .ok_or_else(|| {
+                AppRunError::Message(
+                    "run cancelled while checking provider and model readiness".to_string(),
+                )
+            })?;
         apply_model_availability_report_to_config(&mut config.model, &report)
             .map_err(|error| AppRunError::Message(error.to_string()))?;
         Ok(())
@@ -2629,6 +2684,124 @@ mod tests {
             .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_probe_cache_does_not_serialize_different_provider_keys() {
+        let cache = super::ProviderProbeCache::default();
+        let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first_cache = cache.clone();
+        let first = tokio::spawn(async move {
+            first_cache
+                .get_or_probe("provider-a".to_string(), move || async move {
+                    let _ = first_entered_tx.send(());
+                    let _ = release_first_rx.await;
+                    probe_report("model-a")
+                })
+                .await
+        });
+        first_entered_rx.await.expect("first probe entered");
+
+        let (second_entered_tx, second_entered_rx) = tokio::sync::oneshot::channel();
+        let second_cache = cache.clone();
+        let second = tokio::spawn(async move {
+            second_cache
+                .get_or_probe("provider-b".to_string(), move || async move {
+                    let _ = second_entered_tx.send(());
+                    probe_report("model-b")
+                })
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_entered_rx)
+            .await
+            .expect("an unrelated provider probe must not wait for the first network request")
+            .expect("second probe entered");
+        release_first_tx.send(()).expect("release first probe");
+        assert_eq!(first.await.expect("first probe task").model, "model-a");
+        assert_eq!(second.await.expect("second probe task").model, "model-b");
+    }
+
+    #[tokio::test]
+    async fn provider_probe_cache_single_flights_concurrent_misses_for_the_same_key() {
+        let cache = super::ProviderProbeCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first_cache = cache.clone();
+        let first_calls = Arc::clone(&calls);
+        let first = tokio::spawn(async move {
+            first_cache
+                .get_or_probe("provider-a".to_string(), move || async move {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    let _ = first_entered_tx.send(());
+                    let _ = release_first_rx.await;
+                    probe_report("model-a")
+                })
+                .await
+        });
+        first_entered_rx.await.expect("first probe entered");
+
+        let second_cache = cache.clone();
+        let second_calls = Arc::clone(&calls);
+        let second = tokio::spawn(async move {
+            second_cache
+                .get_or_probe("provider-a".to_string(), move || async move {
+                    second_calls.fetch_add(1, Ordering::SeqCst);
+                    probe_report("duplicate-model")
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a concurrent miss for the same key must wait for the in-flight probe"
+        );
+
+        release_first_tx.send(()).expect("release first probe");
+        assert_eq!(first.await.expect("first probe task").model, "model-a");
+        assert_eq!(second.await.expect("second probe task").model, "model-a");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_probe_cache_cancellation_drops_the_in_flight_readiness_probe() {
+        let cache = super::ProviderProbeCache::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let probe_cache = cache.clone();
+        let probe_cancel = cancel.clone();
+        let probe = tokio::spawn(async move {
+            probe_cache
+                .get_or_probe_until_cancelled(
+                    "provider-a".to_string(),
+                    &probe_cancel,
+                    move || async move {
+                        let _ = entered_tx.send(());
+                        std::future::pending::<ModelAvailabilityReport>().await
+                    },
+                )
+                .await
+        });
+        entered_rx.await.expect("readiness probe entered");
+
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), probe)
+                .await
+                .expect("cancelled readiness probe must stop promptly")
+                .expect("readiness probe task")
+                .is_none()
+        );
+
+        let report = cache
+            .get_or_probe("provider-a".to_string(), || async {
+                probe_report("model-after-cancel")
+            })
+            .await;
+        assert_eq!(report.model, "model-after-cancel");
     }
 
     #[tokio::test]

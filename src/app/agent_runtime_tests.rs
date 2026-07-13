@@ -23,7 +23,7 @@ use crate::protocol::{
     ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, ProtocolEventStore,
     SubAgentActivityKind, TurnId, project_protocol_run_event, project_sub_agent_activity,
 };
-use crate::runtime::{AgentStatus, SessionRuntimeEventHub, SystemClock};
+use crate::runtime::{AgentStatus, LiveConfigOverrides, SessionRuntimeEventHub, SystemClock};
 use crate::session::{
     FinishReason, MessageId, MessageRole, ProjectRepository, RunEvent, SessionSelector,
     SessionStartRequest, SessionStatus, ThreadGoalStatus, TokenUsage,
@@ -43,6 +43,16 @@ const CHILD_RESULT: &str = "child verified result";
 const ROOT_RESULT: &str = "integrated root result";
 const DETACHED_CHILD_ASSIGNMENT: &str = "Complete the detached goal subtask.";
 const DETACHED_CHILD_RESULT: &str = "detached child durable result";
+
+#[test]
+fn suppressed_mail_delivery_is_not_acknowledged_as_queued() {
+    let error = match scheduled_mail_delivery(AgentMailDeliveryOutcome::Suppressed) {
+        Err(error) => error,
+        Ok(_) => panic!("suppressed delivery must not return a successful queued result"),
+    };
+
+    assert_eq!(error, SUPPRESSED_MAIL_DELIVERY_ERROR);
+}
 
 #[derive(Default)]
 struct AllowPrompt;
@@ -99,6 +109,71 @@ async fn direct_runtime_fixture(
         session,
         config,
     )
+}
+
+#[tokio::test]
+async fn existing_child_followup_materializes_live_access_and_updates_durable_session() {
+    let (runtime, root_session, config) = direct_runtime_fixture("followup-live-access", 3).await;
+    let child_path = AgentPath::root().join("research").expect("child path");
+    let child = runtime
+        .session_service
+        .start_or_resume(
+            SessionStartRequest {
+                selector: SessionSelector::New,
+                title: Some("research".to_string()),
+                cwd: root_session.workspace.cwd.clone(),
+                model: config.model.model.clone(),
+                base_url: config.model.base_url.clone(),
+                access_mode: AccessMode::Default,
+            },
+            root_session.workspace.clone(),
+        )
+        .await
+        .expect("child session");
+    runtime
+        .store
+        .session_repo()
+        .insert_session_spawn_edge(
+            root_session.session.id,
+            root_session.session.id,
+            child.session.id,
+            child_path.as_str(),
+            "research",
+        )
+        .await
+        .expect("spawn edge");
+    let live = LiveConfigOverrides::new(AccessMode::Default);
+    let root = runtime
+        .begin_root(
+            &root_session,
+            config,
+            SharedConfirmationPrompt::new(AllowPrompt),
+            Some(live.clone()),
+            CancellationToken::new(),
+        )
+        .expect("root execution");
+    live.set_access_mode(AccessMode::FullAccess);
+    let child_context = runtime
+        .context_for_path(&root.context.tree, &child_path)
+        .expect("rehydrated child context");
+
+    let materialized = runtime
+        .materialize_context_config_and_sync_session(&child_context)
+        .await
+        .expect("materialized followup config");
+
+    assert_eq!(materialized.permissions.access_mode, AccessMode::FullAccess);
+    assert_eq!(
+        runtime
+            .store
+            .session_repo()
+            .get_session(child.session.id)
+            .await
+            .expect("durable child")
+            .access_mode,
+        AccessMode::FullAccess
+    );
+    drop(root);
 }
 
 #[tokio::test]
@@ -643,7 +718,7 @@ async fn sub_agent_spawn_is_rejected_before_session_or_tree_side_effects() {
 }
 
 #[tokio::test]
-async fn quiescence_wait_keeps_detached_child_and_external_cancel_bridge_alive() {
+async fn completed_root_detaches_its_run_cancel_from_active_children() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 tempdir");
     let storage_paths = StoragePaths {
@@ -738,9 +813,12 @@ async fn quiescence_wait_keeps_detached_child_and_external_cancel_bridge_alive()
         "root completion must not make a tree with a detached child quiescent"
     );
     external_cancel.cancel();
-    tokio::time::timeout(Duration::from_secs(1), child_cancel.cancelled())
-        .await
-        .expect("external cancellation reached detached child");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), child_cancel.cancelled())
+            .await
+            .is_err(),
+        "a late root-run cancellation must not reverse detached child work after root success"
+    );
     assert!(
         tokio::time::timeout(
             Duration::from_millis(30),
@@ -748,8 +826,12 @@ async fn quiescence_wait_keeps_detached_child_and_external_cancel_bridge_alive()
         )
         .await
         .is_err(),
-        "the cancellation bridge must wait for the cancelled child to release its execution"
+        "the detached child must continue to own its execution"
     );
+    assert!(runtime.cancel_tree_for_session(session.session.id));
+    tokio::time::timeout(Duration::from_secs(1), child_cancel.cancelled())
+        .await
+        .expect("explicit tree-wide cancellation reached detached child");
     tree.control
         .complete_execution(child_lease, AgentStatus::Interrupted, None)
         .expect("complete detached child");
@@ -814,6 +896,105 @@ async fn failed_root_cancels_detached_children_but_successful_root_does_not() {
             .expect("confirmation state")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn durable_root_success_wins_over_a_late_cancel_observation() {
+    let (runtime, session, config) = direct_runtime_fixture("late-root-cancel", 2).await;
+    let execution = runtime
+        .begin_root(
+            &session,
+            config,
+            SharedConfirmationPrompt::new(AllowPrompt),
+            None,
+            CancellationToken::new(),
+        )
+        .expect("root execution");
+    let tree = execution.context.tree.clone();
+    let (_, child_lease) = tree
+        .control
+        .register_child(
+            &AgentPath::root(),
+            "detached",
+            SessionId::new(),
+            Some("detached work".to_string()),
+        )
+        .expect("detached child");
+    let child_cancel = child_lease.cancel_token();
+
+    runtime.complete_root(
+        execution,
+        &Ok(RunSummary {
+            session_id: session.session.id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: Some(FinishReason::Stop),
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        }),
+        true,
+    );
+
+    assert!(!tree.control.tree_cancel_token().is_cancelled());
+    assert!(!child_cancel.is_cancelled());
+    assert!(matches!(
+        tree.control
+            .status(&AgentPath::root())
+            .expect("root status"),
+        AgentStatus::Completed(_)
+    ));
+    tree.control
+        .complete_execution(child_lease, AgentStatus::Completed(None), None)
+        .expect("complete detached child");
+}
+
+#[tokio::test]
+async fn active_root_cancel_cascades_only_after_the_root_run_settles() {
+    let (runtime, session, config) = direct_runtime_fixture("active-root-cancel", 2).await;
+    let external_cancel = CancellationToken::new();
+    let execution = runtime
+        .begin_root(
+            &session,
+            config,
+            SharedConfirmationPrompt::new(AllowPrompt),
+            None,
+            external_cancel.clone(),
+        )
+        .expect("root execution");
+    let tree = execution.context.tree.clone();
+    let root_cancel = execution.cancel_token();
+    let (_, child_lease) = tree
+        .control
+        .register_child(
+            &AgentPath::root(),
+            "detached",
+            SessionId::new(),
+            Some("detached work".to_string()),
+        )
+        .expect("detached child");
+    let child_cancel = child_lease.cancel_token();
+
+    external_cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(1), root_cancel.cancelled())
+        .await
+        .expect("external cancellation reached active root");
+    assert!(
+        !child_cancel.is_cancelled(),
+        "root-run cancellation must wait for the root terminal result before cascading"
+    );
+
+    runtime.complete_root(
+        execution,
+        &Err(AppRunError::Message("root cancelled".to_string())),
+        true,
+    );
+    assert!(tree.control.tree_cancel_token().is_cancelled());
+    assert!(child_cancel.is_cancelled());
+    tree.control
+        .complete_execution(child_lease, AgentStatus::Interrupted, None)
+        .expect("complete detached child");
 }
 
 #[tokio::test]

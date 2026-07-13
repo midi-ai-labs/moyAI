@@ -36,7 +36,7 @@ import {
   projectionUpdateAccepted,
 } from "./projection_state";
 import { modalIsOpen } from "./modal_state";
-import { autoRefreshAllowed } from "./polling_state";
+import { autoRefreshAllowed, runtimePollingRequired } from "./polling_state";
 import {
   beginPermissionDecision,
   failPermissionDecision,
@@ -58,8 +58,9 @@ import {
   configDraftDiscardOpen,
   configOwnerMutationOpen,
   type DraftMutationSnapshot,
-  mutationStartsRun,
+  mutationAdmissionOpen,
   mutationChangesConfigOwner,
+  mutationStartsRun,
   operationInvalidatesComposer,
   projectViewState,
   reconcileUiDrafts,
@@ -134,7 +135,11 @@ installCompositionStateGate();
 installWindowMaximizedSync();
 void refresh();
 window.setInterval(() => {
-  if (currentState?.async_polling_required && shouldAutoRefresh(currentState)) {
+  if (
+    currentState
+    && runtimePollingRequired(currentState.async_polling_required, uiState.runStartMutationPending)
+    && shouldAutoRefresh(currentState)
+  ) {
     void refresh();
   }
 }, 600);
@@ -158,11 +163,11 @@ async function refresh(): Promise<void> {
 async function mutate(name: string, args?: Record<string, unknown>): Promise<void> {
   const startsRun = mutationStartsRun(name);
   const changesConfigOwner = mutationChangesConfigOwner(name);
-  if (startsRun && uiState.runStartMutationPending) return;
-  if (changesConfigOwner && !configOwnerMutationOpen(uiState)) return;
+  if (!mutationAdmissionOpen(uiState, name)) return;
   if (startsRun) {
     uiState.runStartMutationPending = true;
     if (currentState) acceptState(currentState, true);
+    window.setTimeout(() => void refresh(), 0);
   }
   if (changesConfigOwner) {
     uiState.externalConfigMutationPending = true;
