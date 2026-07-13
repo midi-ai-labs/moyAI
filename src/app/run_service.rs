@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -58,6 +58,7 @@ const PROVIDER_PROBE_CACHE_TTL: Duration = Duration::from_secs(30);
 #[derive(Clone, Default)]
 struct ProviderProbeCache {
     entries: Arc<Mutex<HashMap<String, CachedProbeReport>>>,
+    probe_gates: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
 }
 
 struct CachedProbeReport {
@@ -71,12 +72,28 @@ impl ProviderProbeCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = ModelAvailabilityReport>,
     {
+        {
+            let mut entries = self.entries.lock().await;
+            entries.retain(|_, cached| cached.checked_at.elapsed() < PROVIDER_PROBE_CACHE_TTL);
+            if let Some(cached) = entries.get(&key) {
+                return cached.report.clone();
+            }
+        }
+        let probe_gate = self.probe_gate(&key).await;
+        let _probe_guard = probe_gate.lock().await;
+        {
+            let mut entries = self.entries.lock().await;
+            entries.retain(|_, cached| cached.checked_at.elapsed() < PROVIDER_PROBE_CACHE_TTL);
+            if let Some(cached) = entries.get(&key) {
+                return cached.report.clone();
+            }
+        }
+        let report = probe().await;
         let mut entries = self.entries.lock().await;
         entries.retain(|_, cached| cached.checked_at.elapsed() < PROVIDER_PROBE_CACHE_TTL);
         if let Some(cached) = entries.get(&key) {
             return cached.report.clone();
         }
-        let report = probe().await;
         entries.insert(
             key,
             CachedProbeReport {
@@ -85,6 +102,34 @@ impl ProviderProbeCache {
             },
         );
         report
+    }
+
+    async fn probe_gate(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.probe_gates.lock().await;
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(key.to_string(), Arc::downgrade(&gate));
+        gate
+    }
+
+    async fn get_or_probe_until_cancelled<F, Fut>(
+        &self,
+        key: String,
+        cancel: &CancellationToken,
+        probe: F,
+    ) -> Option<ModelAvailabilityReport>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ModelAvailabilityReport>,
+    {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            report = self.get_or_probe(key, probe) => Some(report),
+        }
     }
 }
 
@@ -97,6 +142,7 @@ pub struct RunService {
     agent_loop: AgentLoop,
     session_event_hub: SessionRuntimeEventHub,
     provider_probe_cache: ProviderProbeCache,
+    agent_runtime: Arc<crate::app::AgentRuntime>,
 }
 
 impl RunService {
@@ -107,6 +153,7 @@ impl RunService {
         session_service: crate::session::SessionService,
         agent_loop: AgentLoop,
         session_event_hub: SessionRuntimeEventHub,
+        agent_runtime: Arc<crate::app::AgentRuntime>,
     ) -> Self {
         Self {
             store,
@@ -116,7 +163,39 @@ impl RunService {
             agent_loop,
             session_event_hub,
             provider_probe_cache: ProviderProbeCache::default(),
+            agent_runtime,
         }
+    }
+
+    pub fn agent_activity_records(
+        &self,
+        root_session_id: crate::session::SessionId,
+    ) -> Vec<crate::app::AgentActivityRecord> {
+        self.agent_runtime.activity_records(root_session_id)
+    }
+
+    pub async fn durable_agent_activity_records(
+        &self,
+        root_session_id: crate::session::SessionId,
+    ) -> Result<Vec<crate::app::AgentActivityRecord>, AppRunError> {
+        self.agent_runtime
+            .durable_activity_records(root_session_id)
+            .await
+            .map_err(AppRunError::Message)
+    }
+
+    pub fn cancel_agent_tree(&self, session_id: crate::session::SessionId) -> bool {
+        self.agent_runtime.cancel_tree_for_session(session_id)
+    }
+
+    pub async fn wait_for_agent_tree_quiescence(
+        &self,
+        root_session_id: crate::session::SessionId,
+    ) -> Result<(), AppRunError> {
+        self.agent_runtime
+            .wait_for_tree_quiescence(root_session_id)
+            .await
+            .map_err(AppRunError::Message)
     }
 
     pub async fn execute(
@@ -222,6 +301,8 @@ impl RunService {
         }
 
         for _ in 0..MAX_GOAL_IDLE_CONTINUATIONS_PER_RUN {
+            self.wait_for_agent_tree_quiescence(summary.session_id)
+                .await?;
             if !self
                 .should_start_idle_goal_continuation(summary.session_id, &request.cancel)
                 .await?
@@ -245,6 +326,8 @@ impl RunService {
                 image_paths: Vec::new(),
                 cancel: request.cancel.clone(),
                 live_config: request.live_config.clone(),
+                agent_confirmation: request.agent_confirmation.clone(),
+                agent_context: request.agent_context.clone(),
             };
             summary = self
                 .execute_single_run(continuation_request, renderer, prompt)
@@ -339,8 +422,12 @@ impl RunService {
                 )
                 .await;
         }
-        self.hydrate_configured_model_from_provider(&mut effective_config, !image_parts.is_empty())
-            .await?;
+        self.hydrate_configured_model_from_provider(
+            &mut effective_config,
+            !image_parts.is_empty(),
+            &request.cancel,
+        )
+        .await?;
         let model = ConfigModelCatalog::new(effective_config.clone()).resolve(None)?;
         if !image_parts.is_empty() && !effective_config.model.supports_images {
             return Err(AppRunError::Message(format!(
@@ -363,6 +450,48 @@ impl RunService {
                 self.workspace.clone(),
             )
             .await?;
+        if request.agent_context.is_none() {
+            for edge in self
+                .store
+                .session_repo()
+                .list_session_spawn_edges(session_context.session.id)
+                .await?
+            {
+                if self.store.active_runs().is_active(edge.child_session_id)
+                    || self
+                        .store
+                        .session_repo()
+                        .has_fresh_run_admission(edge.child_session_id)
+                        .await?
+                {
+                    return Err(AppRunError::Message(format!(
+                        "session {} still has active sub-agent {}; wait for it to finish or cancel the agent tree before starting another root turn",
+                        session_context.session.id, edge.agent_path
+                    )));
+                }
+            }
+        }
+        let supplied_agent_context = request.agent_context.clone();
+        if let Some(context) = supplied_agent_context.as_ref() {
+            if context.session_id() != session_context.session.id {
+                return Err(AppRunError::Message(format!(
+                    "agent context session {} does not match requested session {}",
+                    context.session_id(),
+                    session_context.session.id
+                )));
+            }
+        }
+        let root_confirmation =
+            if supplied_agent_context.is_none() && effective_config.multi_agent.enabled {
+                Some(request.agent_confirmation.clone().ok_or_else(|| {
+                    AppRunError::Message(
+                        "multi-agent execution requires a shared permission confirmation channel"
+                            .to_string(),
+                    )
+                })?)
+            } else {
+                None
+            };
         let process_run_lease = self
             .store
             .try_acquire_run_process_lease(session_context.session.id)?;
@@ -385,21 +514,71 @@ impl RunService {
         };
         let session_id = session_context.session.id;
         let protocol_turn_id = crate::protocol::TurnId::new();
+        let mut root_agent_execution = None;
+        let agent_context = if let Some(context) = supplied_agent_context {
+            Some(context)
+        } else if let Some(confirmation) = root_confirmation {
+            let execution = match self.agent_runtime.begin_root(
+                &session_context,
+                effective_config.clone(),
+                confirmation,
+                request.live_config.clone(),
+                request.cancel.clone(),
+            ) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    let result = finish_admitted_run(
+                        &self.store,
+                        session_id,
+                        &admission_id,
+                        protocol_turn_id,
+                        request.cancel.is_cancelled(),
+                        Err(AppRunError::Message(error)),
+                        Ok(()),
+                    )
+                    .await;
+                    drop(process_run_lease);
+                    return result;
+                }
+            };
+            request.cancel = execution.cancel_token();
+            let context = execution.context.clone();
+            root_agent_execution = Some(execution);
+            Some(context)
+        } else {
+            None
+        };
         let heartbeat_stop = CancellationToken::new();
         let heartbeat_repo = self.store.session_repo();
         let heartbeat_admission_id = admission_id.clone();
+        let heartbeat_run_cancel = request.cancel.clone();
+        let heartbeat_agent_context = agent_context.clone();
+        let heartbeat_failure_cancel = agent_context
+            .as_ref()
+            .map(crate::app::AgentRunContext::tree_cancel_token)
+            .unwrap_or_else(|| request.cancel.clone());
         let heartbeat_task = spawn_run_admission_heartbeat(
             session_id,
             admission_id.clone(),
             request.cancel.clone(),
+            heartbeat_failure_cancel,
             heartbeat_stop.clone(),
             Duration::from_millis(RUN_ADMISSION_HEARTBEAT_INTERVAL_MS),
             move || {
                 let repo = heartbeat_repo.clone();
                 let admission_id = heartbeat_admission_id.clone();
+                let run_cancel = heartbeat_run_cancel.clone();
+                let agent_context = heartbeat_agent_context.clone();
                 async move {
-                    repo.renew_admitted_run_lease(session_id, &admission_id, protocol_turn_id)
-                        .await
+                    renew_admitted_run_lease_with_terminal_cancel(
+                        repo,
+                        session_id,
+                        admission_id,
+                        protocol_turn_id,
+                        run_cancel,
+                        agent_context,
+                    )
+                    .await
                 }
             },
         );
@@ -503,6 +682,13 @@ impl RunService {
 
             let runtime_input = self.runtime_input_view(session_id).await?;
             let state = self.session_service.load_state(session_id).await?;
+            let mut tree_confirmation = agent_context
+                .as_ref()
+                .map(crate::app::AgentRunContext::confirmation_prompt);
+            let active_prompt: &mut dyn ConfirmationPrompt = match tree_confirmation.as_mut() {
+                Some(confirmation) => confirmation,
+                None => prompt,
+            };
             let summary = self
                 .agent_loop
                 .run(
@@ -518,8 +704,12 @@ impl RunService {
                         cancel: request.cancel.clone(),
                         live_config: request.live_config.clone(),
                         steer_rx: active_run.take_steer_receiver(),
+                        is_sub_agent: agent_context
+                            .as_ref()
+                            .is_some_and(crate::app::AgentRunContext::is_sub_agent),
+                        agent_context: agent_context.clone(),
                     },
-                    prompt,
+                    active_prompt,
                     &mut sink,
                 )
                 .await?;
@@ -557,6 +747,10 @@ impl RunService {
             heartbeat_result,
         )
         .await;
+        if let Some(execution) = root_agent_execution.take() {
+            self.agent_runtime
+                .complete_root(execution, &result, request.cancel.is_cancelled());
+        }
         drop(process_run_lease);
         result
     }
@@ -672,6 +866,7 @@ impl RunService {
         &self,
         config: &mut crate::config::ResolvedConfig,
         require_vision: bool,
+        cancel: &CancellationToken,
     ) -> Result<(), AppRunError> {
         let configured_model = config.model.model.trim().to_string();
         if configured_model.is_empty() {
@@ -686,10 +881,15 @@ impl RunService {
         );
         let report = self
             .provider_probe_cache
-            .get_or_probe(key, || {
+            .get_or_probe_until_cancelled(key, cancel, || {
                 check_model_availability(config, None, None, require_vision)
             })
-            .await;
+            .await
+            .ok_or_else(|| {
+                AppRunError::Message(
+                    "run cancelled while checking provider and model readiness".to_string(),
+                )
+            })?;
         apply_model_availability_report_to_config(&mut config.model, &report)
             .map_err(|error| AppRunError::Message(error.to_string()))?;
         Ok(())
@@ -1371,47 +1571,115 @@ impl RunService {
     }
 }
 
+async fn renew_admitted_run_lease_with_terminal_cancel(
+    repo: crate::storage::SqliteSessionRepository,
+    session_id: crate::session::SessionId,
+    admission_id: String,
+    turn_id: crate::protocol::TurnId,
+    run_cancel: CancellationToken,
+    agent_context: Option<crate::app::AgentRunContext>,
+) -> Result<RunAdmissionLeaseRenewalOutcome, crate::error::StorageError> {
+    let outcome = repo
+        .renew_admitted_run_lease(session_id, &admission_id, turn_id)
+        .await?;
+    if outcome != RunAdmissionLeaseRenewalOutcome::GracefulTerminal {
+        return Ok(outcome);
+    }
+
+    let status = repo.get_session(session_id).await?.status;
+    let completed_by_this_turn = status == SessionStatus::Completed
+        && repo
+            .corroborated_terminal_status_for_turn(session_id, turn_id)
+            .await?
+            == Some(SessionStatus::Completed);
+    if !completed_by_this_turn {
+        run_cancel.cancel();
+        if let Some(agent_context) = agent_context {
+            let _ = agent_context.cancel_for_durable_terminal();
+        }
+    }
+    Ok(outcome)
+}
+
 fn spawn_run_admission_heartbeat<Renew, RenewFuture>(
     session_id: crate::session::SessionId,
     admission_id: String,
     run_cancel: CancellationToken,
+    failure_cancel: CancellationToken,
     heartbeat_stop: CancellationToken,
     heartbeat_interval: Duration,
     renew: Renew,
 ) -> tokio::task::JoinHandle<Result<(), crate::error::StorageError>>
 where
     Renew: FnMut() -> RenewFuture + Send + 'static,
-    RenewFuture: Future<Output = Result<RunAdmissionLeaseRenewalOutcome, crate::error::StorageError>>
-        + Send
-        + 'static,
+    RenewFuture:
+        Future<Output = Result<RunAdmissionLeaseRenewalOutcome, crate::error::StorageError>>,
 {
-    let cancel_on_failure = run_cancel.clone();
+    // Permission surfaces intentionally wait for a human through a synchronous confirmation
+    // boundary. Keep lease renewal off the foreground executor so a current-thread runtime can
+    // remain blocked for an arbitrary confirmation interval without forfeiting run ownership.
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let thread_admission_id = admission_id.clone();
+    let cancel_on_thread_failure = run_cancel.clone();
+    let tree_cancel_on_thread_failure = failure_cancel.clone();
+    let thread_spawn = std::thread::Builder::new()
+        .name("moyai-run-admission-heartbeat".to_string())
+        .spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(async move {
+                    let heartbeat = maintain_run_admission_lease(
+                        session_id,
+                        thread_admission_id.clone(),
+                        heartbeat_stop,
+                        heartbeat_interval,
+                        renew,
+                    );
+                    match AssertUnwindSafe(heartbeat).catch_unwind().await {
+                        Ok(result) => result,
+                        Err(payload) => {
+                            let message = payload
+                                .downcast_ref::<&str>()
+                                .map(|message| (*message).to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "non-string panic payload".to_string());
+                            Err(crate::error::StorageError::Message(format!(
+                                "run admission heartbeat panicked for session {session_id} admission {thread_admission_id}: {message}"
+                            )))
+                        }
+                    }
+                }),
+                Err(error) => Err(crate::error::StorageError::Message(format!(
+                    "failed to build run admission heartbeat runtime for session {session_id} admission {thread_admission_id}: {error}"
+                ))),
+            };
+            if result.is_err() {
+                cancel_on_thread_failure.cancel();
+                tree_cancel_on_thread_failure.cancel();
+            }
+            let _ = result_tx.send(result);
+        });
+
+    let thread_spawn_error = thread_spawn.err().map(|error| {
+        run_cancel.cancel();
+        failure_cancel.cancel();
+        crate::error::StorageError::Message(format!(
+            "failed to start run admission heartbeat thread for session {session_id} admission {admission_id}: {error}"
+        ))
+    });
     tokio::spawn(async move {
-        let heartbeat = maintain_run_admission_lease(
-            session_id,
-            admission_id.clone(),
-            heartbeat_stop,
-            heartbeat_interval,
-            renew,
-        );
-        match AssertUnwindSafe(heartbeat).catch_unwind().await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                cancel_on_failure.cancel();
-                Err(error)
-            }
-            Err(payload) => {
-                cancel_on_failure.cancel();
-                let message = payload
-                    .downcast_ref::<&str>()
-                    .map(|message| (*message).to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "non-string panic payload".to_string());
-                Err(crate::error::StorageError::Message(format!(
-                    "run admission heartbeat panicked for session {session_id} admission {admission_id}: {message}"
-                )))
-            }
+        if let Some(error) = thread_spawn_error {
+            return Err(error);
         }
+        result_rx.await.map_err(|_| {
+            run_cancel.cancel();
+            failure_cancel.cancel();
+            crate::error::StorageError::Message(format!(
+                "run admission heartbeat thread stopped without a result for session {session_id} admission {admission_id}"
+            ))
+        })?
     })
 }
 
@@ -2419,6 +2687,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_probe_cache_does_not_serialize_different_provider_keys() {
+        let cache = super::ProviderProbeCache::default();
+        let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first_cache = cache.clone();
+        let first = tokio::spawn(async move {
+            first_cache
+                .get_or_probe("provider-a".to_string(), move || async move {
+                    let _ = first_entered_tx.send(());
+                    let _ = release_first_rx.await;
+                    probe_report("model-a")
+                })
+                .await
+        });
+        first_entered_rx.await.expect("first probe entered");
+
+        let (second_entered_tx, second_entered_rx) = tokio::sync::oneshot::channel();
+        let second_cache = cache.clone();
+        let second = tokio::spawn(async move {
+            second_cache
+                .get_or_probe("provider-b".to_string(), move || async move {
+                    let _ = second_entered_tx.send(());
+                    probe_report("model-b")
+                })
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_entered_rx)
+            .await
+            .expect("an unrelated provider probe must not wait for the first network request")
+            .expect("second probe entered");
+        release_first_tx.send(()).expect("release first probe");
+        assert_eq!(first.await.expect("first probe task").model, "model-a");
+        assert_eq!(second.await.expect("second probe task").model, "model-b");
+    }
+
+    #[tokio::test]
+    async fn provider_probe_cache_single_flights_concurrent_misses_for_the_same_key() {
+        let cache = super::ProviderProbeCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first_cache = cache.clone();
+        let first_calls = Arc::clone(&calls);
+        let first = tokio::spawn(async move {
+            first_cache
+                .get_or_probe("provider-a".to_string(), move || async move {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    let _ = first_entered_tx.send(());
+                    let _ = release_first_rx.await;
+                    probe_report("model-a")
+                })
+                .await
+        });
+        first_entered_rx.await.expect("first probe entered");
+
+        let second_cache = cache.clone();
+        let second_calls = Arc::clone(&calls);
+        let second = tokio::spawn(async move {
+            second_cache
+                .get_or_probe("provider-a".to_string(), move || async move {
+                    second_calls.fetch_add(1, Ordering::SeqCst);
+                    probe_report("duplicate-model")
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a concurrent miss for the same key must wait for the in-flight probe"
+        );
+
+        release_first_tx.send(()).expect("release first probe");
+        assert_eq!(first.await.expect("first probe task").model, "model-a");
+        assert_eq!(second.await.expect("second probe task").model, "model-a");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_probe_cache_cancellation_drops_the_in_flight_readiness_probe() {
+        let cache = super::ProviderProbeCache::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let probe_cache = cache.clone();
+        let probe_cancel = cancel.clone();
+        let probe = tokio::spawn(async move {
+            probe_cache
+                .get_or_probe_until_cancelled(
+                    "provider-a".to_string(),
+                    &probe_cancel,
+                    move || async move {
+                        let _ = entered_tx.send(());
+                        std::future::pending::<ModelAvailabilityReport>().await
+                    },
+                )
+                .await
+        });
+        entered_rx.await.expect("readiness probe entered");
+
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), probe)
+                .await
+                .expect("cancelled readiness probe must stop promptly")
+                .expect("readiness probe task")
+                .is_none()
+        );
+
+        let report = cache
+            .get_or_probe("provider-a".to_string(), || async {
+                probe_report("model-after-cancel")
+            })
+            .await;
+        assert_eq!(report.model, "model-after-cancel");
+    }
+
+    #[tokio::test]
     async fn every_post_admission_setup_error_settles_the_owned_run() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
@@ -2551,6 +2937,7 @@ mod tests {
             session.id,
             admission_id,
             run_cancel.clone(),
+            run_cancel.clone(),
             heartbeat_stop.clone(),
             std::time::Duration::from_millis(5),
             move || {
@@ -2586,6 +2973,107 @@ mod tests {
             .expect("heartbeat result");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn heartbeat_progresses_while_foreground_runtime_is_synchronously_blocked() {
+        let renewal_count = Arc::new(AtomicUsize::new(0));
+        let heartbeat_renewal_count = Arc::clone(&renewal_count);
+        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let heartbeat_stop = tokio_util::sync::CancellationToken::new();
+        let heartbeat_task = super::spawn_run_admission_heartbeat(
+            crate::session::SessionId::new(),
+            "blocked-permission-admission".to_string(),
+            run_cancel.clone(),
+            run_cancel.clone(),
+            heartbeat_stop.clone(),
+            std::time::Duration::from_millis(5),
+            move || {
+                heartbeat_renewal_count.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(
+                    crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::Renewed,
+                ))
+            },
+        );
+
+        // Mirrors the synchronous human-confirmation boundary on a current-thread runtime.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        assert!(
+            renewal_count.load(Ordering::SeqCst) > 0,
+            "lease renewal must not depend on the foreground executor making progress"
+        );
+        assert!(!run_cancel.is_cancelled());
+        heartbeat_stop.cancel();
+        heartbeat_task
+            .await
+            .expect("heartbeat task")
+            .expect("heartbeat result");
+    }
+
+    #[tokio::test]
+    async fn durable_interrupt_cancels_a_foreground_permission_wait() {
+        let (store, session_id, admission_id, turn_id, _) =
+            heartbeat_active_turn_fixture("external interrupt heartbeat").await;
+        assert!(
+            store
+                .session_repo()
+                .terminalize_admitted_session_with_protocol_event(
+                    session_id,
+                    &admission_id,
+                    crate::session::SessionStatus::Cancelled,
+                    &crate::session::RunEvent::SessionInterrupted {
+                        session_id,
+                        reason: "external stop".to_string(),
+                    },
+                    turn_id,
+                    None,
+                )
+                .await
+                .expect("external interrupt")
+        );
+        let run_cancel = tokio_util::sync::CancellationToken::new();
+
+        assert_eq!(
+            super::renew_admitted_run_lease_with_terminal_cancel(
+                store.session_repo(),
+                session_id,
+                admission_id,
+                turn_id,
+                run_cancel.clone(),
+                None,
+            )
+            .await
+            .expect("terminal renewal"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::GracefulTerminal
+        );
+        assert!(run_cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn own_completed_turn_does_not_cancel_after_terminal_heartbeat_race() {
+        let (store, session_id, admission_id, turn_id, assistant) =
+            heartbeat_active_turn_fixture("own completed heartbeat").await;
+        assert_eq!(
+            commit_completed_turn(&store, session_id, &admission_id, turn_id, &assistant).await,
+            crate::storage::session_repo::AdmittedTerminalCommit::Applied
+        );
+        let run_cancel = tokio_util::sync::CancellationToken::new();
+
+        assert_eq!(
+            super::renew_admitted_run_lease_with_terminal_cancel(
+                store.session_repo(),
+                session_id,
+                admission_id,
+                turn_id,
+                run_cancel.clone(),
+                None,
+            )
+            .await
+            .expect("terminal renewal"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::GracefulTerminal
+        );
+        assert!(!run_cancel.is_cancelled());
+    }
+
     #[tokio::test]
     async fn terminal_commit_wins_the_heartbeat_barrier_without_reversing_success() {
         let (store, session_id, admission_id, turn_id, assistant) =
@@ -2600,6 +3088,7 @@ mod tests {
         let heartbeat_task = super::spawn_run_admission_heartbeat(
             session_id,
             admission_id.clone(),
+            run_cancel.clone(),
             run_cancel.clone(),
             tokio_util::sync::CancellationToken::new(),
             std::time::Duration::from_millis(1),
@@ -2683,6 +3172,7 @@ mod tests {
             session_id,
             admission_id.clone(),
             run_cancel.clone(),
+            run_cancel.clone(),
             tokio_util::sync::CancellationToken::new(),
             std::time::Duration::from_millis(1),
             move || {
@@ -2748,6 +3238,7 @@ mod tests {
             session_id,
             admission_id.clone(),
             run_cancel.clone(),
+            run_cancel.clone(),
             tokio_util::sync::CancellationToken::new(),
             std::time::Duration::from_millis(1),
             move || {
@@ -2795,6 +3286,7 @@ mod tests {
         let heartbeat_task = super::spawn_run_admission_heartbeat(
             session_id,
             admission_id.clone(),
+            run_cancel.clone(),
             run_cancel.clone(),
             tokio_util::sync::CancellationToken::new(),
             std::time::Duration::from_millis(1),
@@ -2864,6 +3356,7 @@ mod tests {
         let heartbeat_task = super::spawn_run_admission_heartbeat(
             session_id,
             admission_id.clone(),
+            run_cancel.clone(),
             run_cancel.clone(),
             tokio_util::sync::CancellationToken::new(),
             std::time::Duration::from_millis(1),

@@ -25,13 +25,13 @@ pub use model::{
     RunConfigSnapshot, RunEvent, RunMetrics, RunSummary, RunningSessionRejoin,
     SessionCompactResult, SessionContext, SessionForkResult, SessionMemoryMode,
     SessionMemoryModeUpdate, SessionModelParameters, SessionRecord, SessionRollbackResult,
-    SessionSelector, SessionSettingsPatch, SessionSettingsUpdate, SessionStartRequest,
-    SessionStatus, SessionTitleUpdate, TextPart, ThreadGoal, ThreadGoalClearResult,
-    ThreadGoalGetResult, ThreadGoalSetResult, ThreadGoalStatus, TokenUsage, ToolCallPart,
-    ToolCallRecord, ToolCallStatus, ToolNoProgressSignature, ToolResultPart, Transcript,
-    TranscriptMessage, TurnDecisionDiagnostic, TurnDecisionWarning, TurnDecisionWarningSeverity,
-    UserMessageMeta, VerificationFailureCluster, VerificationFailureEvidence,
-    validate_thread_goal_objective,
+    SessionSelector, SessionSettingsPatch, SessionSettingsUpdate, SessionSpawnEdge,
+    SessionStartRequest, SessionStatus, SessionTitleUpdate, TextPart, ThreadGoal,
+    ThreadGoalClearResult, ThreadGoalGetResult, ThreadGoalSetResult, ThreadGoalStatus, TokenUsage,
+    ToolCallPart, ToolCallRecord, ToolCallStatus, ToolNoProgressSignature, ToolResultPart,
+    Transcript, TranscriptMessage, TurnDecisionDiagnostic, TurnDecisionWarning,
+    TurnDecisionWarningSeverity, UserMessageMeta, VerificationFailureCluster,
+    VerificationFailureEvidence, validate_thread_goal_objective,
 };
 pub use repository::{ChangeRepository, ProjectRepository, SessionRepository};
 pub use service::SessionService;

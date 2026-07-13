@@ -43,13 +43,15 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
             mode: AccessMode::Default,
             id: "default".to_string(),
             label: "Default".to_string(),
-            summary: "Automatically allows low-risk in-workspace operations only.".to_string(),
-            auto_allowed: strings(&["workspace list/search/read", "risk-free workspace edits"]),
+            summary: "Automatically allows in-workspace list, search, and read operations only."
+                .to_string(),
+            auto_allowed: strings(&["workspace list/search/read"]),
             requires_review: vec![
+                "workspace edits",
                 "shell",
                 "destructive edits",
                 "workspace authority files",
-                "outside-workspace targets",
+                "detected outside configured boundary",
                 "network or external connections",
             ]
             .into_iter()
@@ -69,7 +71,7 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
                 "shell",
                 "destructive edits",
                 "workspace authority files",
-                "outside-workspace targets",
+                "detected outside configured boundary",
                 "network or external connections",
             ]
             .into_iter()
@@ -82,12 +84,12 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
             mode: AccessMode::FullAccess,
             id: "full_access".to_string(),
             label: "Full Access".to_string(),
-            summary: "Automatically allows configured-boundary operations except protected or external-risk actions."
+            summary: "Automatically allows ordinary configured-boundary operations. Shell review uses detected targets and risks; it is not an OS sandbox."
                 .to_string(),
             auto_allowed: strings(&["workspace list/search/read", "workspace edits", "shell"]),
             requires_review: vec![
                 "workspace authority files",
-                "outside configured boundary",
+                "detected outside configured boundary",
                 "network or external connections",
             ]
             .into_iter()
@@ -117,6 +119,37 @@ mod tests {
                 .selected_profile()
                 .map(|profile| profile.id.as_str()),
             Some("auto_review")
+        );
+    }
+
+    #[test]
+    fn permission_profile_catalog_describes_monotonic_authority() {
+        let profiles = super::builtin_permission_profiles();
+
+        assert_eq!(profiles[0].auto_allowed, vec!["workspace list/search/read"]);
+        assert_eq!(
+            profiles[1].auto_allowed,
+            vec!["workspace list/search/read", "non-risky workspace edits"]
+        );
+        assert_eq!(
+            profiles[2].auto_allowed,
+            vec!["workspace list/search/read", "workspace edits", "shell"]
+        );
+        assert_eq!(profiles[0].requires_review[0], "workspace edits");
+        assert_eq!(profiles[0].requires_review[1], "shell");
+        assert_eq!(profiles[1].requires_review[0], "shell");
+        assert!(
+            profiles[2]
+                .requires_review
+                .iter()
+                .any(|value| value == "network or external connections")
+        );
+        assert!(profiles[2].summary.contains("not an OS sandbox"));
+        assert!(
+            profiles[2]
+                .requires_review
+                .iter()
+                .any(|value| value == "detected outside configured boundary")
         );
     }
 }

@@ -48,8 +48,15 @@ const V28_SESSIONS_ACTIVE_TURN_ID: &str =
     include_str!("../../migrations/V28__sessions_active_turn_id.sql");
 const V29_SESSIONS_ACTIVE_RUN_LEASE: &str =
     include_str!("../../migrations/V29__sessions_active_run_lease.sql");
+const V30_SESSION_SPAWN_EDGES: &str = include_str!("../../migrations/V30__session_spawn_edges.sql");
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
+    run_through_v29(connection)?;
+    connection.execute_batch(V30_SESSION_SPAWN_EDGES)?;
+    Ok(())
+}
+
+fn run_through_v29(connection: &Connection) -> Result<(), StorageError> {
     run_through_v25(connection)?;
     if needs_sessions_active_run_id_migration(connection)? {
         connection.execute_batch(V26_SESSIONS_ACTIVE_RUN_ID)?;
@@ -343,6 +350,88 @@ fn needs_sessions_active_run_lease_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_creates_session_spawn_edges_on_a_fresh_database_and_is_idempotent() {
+        let connection = Connection::open_in_memory().expect("database");
+
+        run(&connection).expect("fresh migration");
+        run(&connection).expect("idempotent migration");
+
+        let mut statement = connection
+            .prepare("PRAGMA table_info(session_spawn_edges)")
+            .expect("spawn edge columns");
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("column rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("columns");
+        assert_eq!(
+            columns,
+            vec![
+                "root_session_id",
+                "parent_session_id",
+                "child_session_id",
+                "agent_path",
+                "task_name",
+                "created_at_ms",
+            ]
+        );
+    }
+
+    #[test]
+    fn session_spawn_edges_migrate_a_v29_database_without_changing_existing_sessions() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v29(&connection).expect("v29 schema");
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('project', 'C:/workspace', 'workspace', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES
+                 ('root', 'project', 'root', 'idle', 'C:/workspace', 'model', 'http://localhost', 1, 1, NULL),
+                 ('child', 'project', 'child', 'idle', 'C:/workspace', 'model', 'http://localhost', 2, 2, NULL);",
+            )
+            .expect("v29 fixture");
+        let table_before = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'session_spawn_edges'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("table before");
+        assert_eq!(table_before, 0);
+
+        run(&connection).expect("forward migration");
+        connection
+            .execute(
+                "INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id, agent_path, task_name, created_at_ms)
+                 VALUES ('root', 'root', 'child', '/root/child', 'child', 3)",
+                [],
+            )
+            .expect("spawn edge");
+
+        let sessions = connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("sessions");
+        let edges = connection
+            .query_row("SELECT COUNT(*) FROM session_spawn_edges", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("edges");
+        assert_eq!(sessions, 2);
+        assert_eq!(edges, 1);
+    }
 
     #[test]
     fn run_identity_turn_and_lease_migrate_v25_schema_and_are_idempotent() {

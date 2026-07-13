@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -7,20 +8,22 @@ use crate::config::AccessMode;
 use crate::error::StorageError;
 use crate::protocol::{
     HistoryItem, HistoryItemId, HistoryItemPayload, RuntimeEvent, RuntimeEventId, RuntimeEventMsg,
-    SteerTurn, ToolProgressEffect, TurnId, TurnItem, TurnItemId, TurnItemPayload, UserTurn,
-    VerificationRunResult, VerificationRunStatus, insert_event_bundle_in_transaction,
+    SteerTurn, ToolProgressEffect, TurnId, TurnItem, TurnItemId, TurnItemPayload,
+    TurnTerminalStatus, UserTurn, VerificationRunResult, VerificationRunStatus,
+    fork_canonical_items_in_transaction, insert_event_bundle_in_transaction,
     latest_turn_position_for_session, project_protocol_run_event,
 };
 use crate::runtime::{Clock, SystemClock};
 use crate::session::{
     CompletionState, DiffSummaryPart, FailureKind, FailureState, MessageId, MessageMetadata,
     MessagePart, MessageRecord, MessageRole, NewMessage, NewPart, NewSession, PartKind, PartRecord,
-    ProcessPhase, ProjectId, RunEvent, SessionId, SessionMemoryMode, SessionMemoryModeUpdate,
-    SessionModelParameters, SessionRecord, SessionRepository, SessionSettingsPatch,
-    SessionSettingsUpdate, SessionStateSnapshot, SessionStatus, SessionTitleUpdate, TaskRoute,
-    ThreadGoal, ThreadGoalStatus, TodoItem, TodoKind, TodoPriority, TodoStatus, ToolCallId,
-    ToolCallPart, ToolCallRecord, ToolCallStatus, ToolResultPart, Transcript, TranscriptMessage,
-    VerificationState, validate_thread_goal_objective,
+    ProcessPhase, ProjectId, RunEvent, SessionForkResult, SessionId, SessionMemoryMode,
+    SessionMemoryModeUpdate, SessionModelParameters, SessionRecord, SessionRepository,
+    SessionSettingsPatch, SessionSettingsUpdate, SessionSpawnEdge, SessionStateSnapshot,
+    SessionStatus, SessionTitleUpdate, TaskRoute, ThreadGoal, ThreadGoalStatus, TodoItem, TodoKind,
+    TodoPriority, TodoStatus, ToolCallId, ToolCallPart, ToolCallRecord, ToolCallStatus,
+    ToolResultPart, Transcript, TranscriptMessage, VerificationState,
+    validate_thread_goal_objective,
 };
 
 pub const RUN_ADMISSION_LEASE_DURATION_MS: i64 = 15_000;
@@ -64,6 +67,241 @@ impl AdmittedTerminalCommit {
 impl SqliteSessionRepository {
     pub fn new(connection: Arc<Mutex<Connection>>) -> Self {
         Self { connection }
+    }
+
+    pub async fn insert_session_spawn_edge(
+        &self,
+        root_session_id: SessionId,
+        parent_session_id: SessionId,
+        child_session_id: SessionId,
+        agent_path: &str,
+        task_name: &str,
+    ) -> Result<SessionSpawnEdge, StorageError> {
+        let edge = SessionSpawnEdge {
+            root_session_id,
+            parent_session_id,
+            child_session_id,
+            agent_path: agent_path.to_string(),
+            task_name: task_name.to_string(),
+            created_at_ms: SystemClock::now_ms(),
+        };
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO session_spawn_edges
+             (root_session_id, parent_session_id, child_session_id, agent_path, task_name, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                edge.root_session_id.to_string(),
+                edge.parent_session_id.to_string(),
+                edge.child_session_id.to_string(),
+                edge.agent_path,
+                edge.task_name,
+                edge.created_at_ms,
+            ],
+        )?;
+        Ok(edge)
+    }
+
+    pub async fn session_spawn_edge_for_child(
+        &self,
+        child_session_id: SessionId,
+    ) -> Result<Option<SessionSpawnEdge>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT root_session_id, parent_session_id, child_session_id,
+                        agent_path, task_name, created_at_ms
+                 FROM session_spawn_edges
+                 WHERE child_session_id = ?1",
+                params![child_session_id.to_string()],
+                session_spawn_edge_from_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    pub async fn list_session_spawn_edges(
+        &self,
+        root_session_id: SessionId,
+    ) -> Result<Vec<SessionSpawnEdge>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT root_session_id, parent_session_id, child_session_id,
+                    agent_path, task_name, created_at_ms
+             FROM session_spawn_edges
+             WHERE root_session_id = ?1
+             ORDER BY created_at_ms ASC, child_session_id ASC",
+        )?;
+        statement
+            .query_map(
+                params![root_session_id.to_string()],
+                session_spawn_edge_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub async fn list_direct_child_spawn_edges(
+        &self,
+        parent_session_id: SessionId,
+    ) -> Result<Vec<SessionSpawnEdge>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT root_session_id, parent_session_id, child_session_id,
+                    agent_path, task_name, created_at_ms
+             FROM session_spawn_edges
+             WHERE parent_session_id = ?1
+             ORDER BY created_at_ms ASC, child_session_id ASC",
+        )?;
+        statement
+            .query_map(
+                params![parent_session_id.to_string()],
+                session_spawn_edge_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub async fn compare_and_set_root_session_access_mode(
+        &self,
+        session_id: SessionId,
+        expected_access_mode: AccessMode,
+        access_mode: AccessMode,
+    ) -> Result<Option<SessionSettingsUpdate>, StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = session_record_from_connection(&transaction, session_id)?;
+        let is_child = transaction
+            .query_row(
+                "SELECT 1 FROM session_spawn_edges WHERE child_session_id = ?1",
+                params![session_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if is_child {
+            return Err(StorageError::Message(format!(
+                "session {session_id} is a child agent session; root access mode ownership was rejected"
+            )));
+        }
+        if current.access_mode != expected_access_mode {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        if current.access_mode == access_mode {
+            transaction.commit()?;
+            return Ok(Some(SessionSettingsUpdate {
+                session: current,
+                changed: false,
+            }));
+        }
+        let now = SystemClock::now_ms().max(current.updated_at_ms.saturating_add(1));
+        let updated = transaction.execute(
+            "UPDATE sessions
+             SET access_mode = ?3, updated_at_ms = ?4
+             WHERE id = ?1
+               AND access_mode = ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )",
+            params![
+                session_id.to_string(),
+                expected_access_mode.as_str(),
+                access_mode.as_str(),
+                now
+            ],
+        )?;
+        if updated != 1 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let session = session_record_from_connection(&transaction, session_id)?;
+        transaction.commit()?;
+        Ok(Some(SessionSettingsUpdate {
+            session,
+            changed: true,
+        }))
+    }
+
+    pub async fn list_running_sessions_for_recovery(
+        &self,
+    ) -> Result<Vec<SessionRecord>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id FROM sessions
+             WHERE status IN ('running', 'awaiting_user')
+             ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC",
+        )?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+        let mut sessions = Vec::with_capacity(ids.len());
+        for value in ids {
+            sessions.push(
+                self.get_session(
+                    value
+                        .parse::<SessionId>()
+                        .map_err(|error| StorageError::Message(error.to_string()))?,
+                )
+                .await?,
+            );
+        }
+        Ok(sessions)
+    }
+
+    pub async fn delete_session_tree(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SessionId>, StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            params![session_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !session_exists {
+            transaction.commit()?;
+            return Ok(Vec::new());
+        }
+        let mut statement = transaction.prepare(
+            "SELECT parent_session_id, child_session_id
+             FROM session_spawn_edges
+             ORDER BY created_at_ms ASC, child_session_id ASC",
+        )?;
+        let relationships = statement
+            .query_map([], |row| {
+                Ok((
+                    parse_session_id_column(row, 0)?,
+                    parse_session_id_column(row, 1)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let mut children = HashMap::<SessionId, Vec<SessionId>>::new();
+        for (parent_session_id, child_session_id) in relationships {
+            children
+                .entry(parent_session_id)
+                .or_default()
+                .push(child_session_id);
+        }
+        let mut deleted_session_ids = Vec::new();
+        collect_session_tree_postorder(
+            session_id,
+            &children,
+            &mut HashSet::new(),
+            &mut deleted_session_ids,
+        );
+
+        for deleted_session_id in &deleted_session_ids {
+            delete_session_rows(&transaction, *deleted_session_id)?;
+        }
+        transaction.commit()?;
+        Ok(deleted_session_ids)
     }
 
     pub async fn session_is_archived(&self, session_id: SessionId) -> Result<bool, StorageError> {
@@ -115,6 +353,10 @@ impl SqliteSessionRepository {
                     archived_at_ms IS NOT NULL, memory_mode
              FROM sessions
              WHERE project_id = ?1{archived_filter}
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
              LIMIT ?2"
         );
@@ -180,6 +422,10 @@ impl SqliteSessionRepository {
                     archived_at_ms IS NOT NULL, memory_mode
              FROM sessions
              WHERE project_id = ?1{archived_filter}
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )
                AND (
                    lower(title) LIKE ?2 ESCAPE '\\'
                    OR lower(cwd_path) LIKE ?2 ESCAPE '\\'
@@ -436,6 +682,116 @@ impl SqliteSessionRepository {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub async fn fork_session_snapshot(
+        &self,
+        source_session_id: SessionId,
+        title: Option<String>,
+    ) -> Result<SessionForkResult, StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let source = session_record_from_connection(&transaction, source_session_id)?;
+        let source_was_active = matches!(
+            source.status,
+            SessionStatus::Running | SessionStatus::AwaitingUser
+        );
+        let title = title
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_string())
+            .unwrap_or_else(|| format!("Fork of {}", source.title));
+        let target_session_id = SessionId::new();
+        let now = SystemClock::now_ms();
+        let inserted = transaction.execute(
+            "INSERT INTO sessions (
+                 id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                 memory_mode, model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms
+             )
+             SELECT ?2, project_id, ?3, 'idle', cwd_path, model_name, base_url, access_mode,
+                    memory_mode, model_parameters_json, ?4, ?4, NULL
+             FROM sessions WHERE id = ?1",
+            params![
+                source_session_id.to_string(),
+                target_session_id.to_string(),
+                title,
+                now
+            ],
+        )?;
+        if inserted != 1 {
+            return Err(StorageError::Message(format!(
+                "source session {source_session_id} disappeared while creating its fork"
+            )));
+        }
+
+        let copied_state = transaction.execute(
+            "INSERT INTO session_state (
+                 session_id, task_route, phase, review_scope_json, active_todo_id,
+                 active_targets_json, contract_refs_json, failure_kind, failure_summary,
+                 failure_tool_name, failure_targets_json, verification_todo_id,
+                 verification_commands_json, verification_failures_json,
+                 verification_evidence_summary, completion_closeout_ready,
+                 completion_open_work_count, completion_verification_pending,
+                 completion_route_contract_pending, completion_blocked_reason,
+                 completion_route_contract_summary, docs_route_state_json,
+                 implementation_handoff_json, verification_failure_cluster_json,
+                 verification_requirement_refs_json, token_accounting_json, updated_at_ms
+             )
+             SELECT ?2, task_route, phase, review_scope_json, active_todo_id,
+                    active_targets_json, contract_refs_json, failure_kind, failure_summary,
+                    failure_tool_name, failure_targets_json, verification_todo_id,
+                    verification_commands_json, verification_failures_json,
+                    verification_evidence_summary, completion_closeout_ready,
+                    completion_open_work_count, completion_verification_pending,
+                    completion_route_contract_pending, completion_blocked_reason,
+                    completion_route_contract_summary, docs_route_state_json,
+                    implementation_handoff_json, verification_failure_cluster_json,
+                    verification_requirement_refs_json, token_accounting_json, ?3
+             FROM session_state WHERE session_id = ?1",
+            params![
+                source_session_id.to_string(),
+                target_session_id.to_string(),
+                now
+            ],
+        )?;
+        if copied_state == 0 {
+            upsert_session_state_row(
+                &transaction,
+                target_session_id,
+                &SessionStateSnapshot::default(),
+                now,
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO session_todos (
+                 session_id, todo_id, position, content, kind, status, priority, targets_json,
+                 depends_on_json, success_criteria_json, blocked_by_json
+             )
+             SELECT ?2, todo_id, position, content, kind, status, priority, targets_json,
+                    depends_on_json, success_criteria_json, blocked_by_json
+             FROM session_todos WHERE session_id = ?1",
+            params![source_session_id.to_string(), target_session_id.to_string()],
+        )?;
+        let (copied_history_items, copied_turn_items) = fork_canonical_items_in_transaction(
+            &transaction,
+            source_session_id,
+            target_session_id,
+        )?;
+        if source_was_active {
+            append_interrupted_live_snapshot_marker_in_transaction(
+                &transaction,
+                target_session_id,
+                "forked from active live session snapshot",
+            )?;
+        }
+        let forked_session = session_record_from_connection(&transaction, target_session_id)?;
+        transaction.commit()?;
+        Ok(SessionForkResult {
+            source_session: source,
+            forked_session,
+            copied_history_items,
+            copied_turn_items,
+            interrupted_live_snapshot: source_was_active,
+        })
     }
 
     pub async fn get_session_memory_mode(
@@ -1706,6 +2062,55 @@ impl SqliteSessionRepository {
         protocol_turn_id: TurnId,
         protocol_sequence_no: Option<i64>,
     ) -> Result<bool, StorageError> {
+        self.terminalize_active_session_with_protocol_event_inner(
+            session_id,
+            status,
+            event,
+            protocol_turn_id,
+            protocol_sequence_no,
+            false,
+        )
+        .await
+    }
+
+    /// Recovers an active session after its process owner is known to be gone.
+    ///
+    /// The caller must hold the session process lease. Unlike an external stop,
+    /// orphan recovery clears the durable run admission in the same transaction
+    /// so the recovered session can be admitted again immediately.
+    pub async fn recover_orphaned_active_session_with_protocol_event(
+        &self,
+        session_id: SessionId,
+        status: SessionStatus,
+        event: &RunEvent,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        if status == SessionStatus::AwaitingUser {
+            return Err(StorageError::Message(
+                "orphan recovery requires a terminal status".to_string(),
+            ));
+        }
+        self.terminalize_active_session_with_protocol_event_inner(
+            session_id,
+            status,
+            event,
+            protocol_turn_id,
+            protocol_sequence_no,
+            true,
+        )
+        .await
+    }
+
+    async fn terminalize_active_session_with_protocol_event_inner(
+        &self,
+        session_id: SessionId,
+        status: SessionStatus,
+        event: &RunEvent,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+        clear_run_admission: bool,
+    ) -> Result<bool, StorageError> {
         let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let status_text = match status {
             SessionStatus::Completed => "completed",
@@ -1727,19 +2132,40 @@ impl SqliteSessionRepository {
                 .map(|(_, sequence_no)| sequence_no)
                 .unwrap_or(0),
         };
-        let terminalized = transaction.execute(
-            "UPDATE sessions
-             SET status = ?2, updated_at_ms = ?3, completed_at_ms = ?3
-             WHERE id = ?1
-               AND status IN ('running', 'awaiting_user')
-               AND (active_turn_id IS NULL OR active_turn_id = ?4)",
-            params![
-                session_id.to_string(),
-                status_text,
-                now,
-                protocol_turn_id.to_string()
-            ],
-        )? == 1;
+        let terminalized = if clear_run_admission {
+            transaction.execute(
+                "UPDATE sessions
+                 SET status = ?2,
+                     updated_at_ms = ?3,
+                     completed_at_ms = ?3,
+                     active_run_id = NULL,
+                     active_turn_id = NULL,
+                     active_run_lease_expires_at_ms = NULL
+                 WHERE id = ?1
+                   AND status IN ('running', 'awaiting_user')
+                   AND (active_turn_id IS NULL OR active_turn_id = ?4)",
+                params![
+                    session_id.to_string(),
+                    status_text,
+                    now,
+                    protocol_turn_id.to_string()
+                ],
+            )?
+        } else {
+            transaction.execute(
+                "UPDATE sessions
+                 SET status = ?2, updated_at_ms = ?3, completed_at_ms = ?3
+                 WHERE id = ?1
+                   AND status IN ('running', 'awaiting_user')
+                   AND (active_turn_id IS NULL OR active_turn_id = ?4)",
+                params![
+                    session_id.to_string(),
+                    status_text,
+                    now,
+                    protocol_turn_id.to_string()
+                ],
+            )?
+        } == 1;
         if terminalized {
             if status != SessionStatus::AwaitingUser {
                 fail_unfinished_tool_calls_in_connection(
@@ -2581,30 +3007,7 @@ impl SessionRepository for SqliteSessionRepository {
 
     async fn get_session(&self, id: SessionId) -> Result<SessionRecord, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.query_row(
-            "SELECT project_id, title, status, cwd_path, model_name, base_url, access_mode, model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms
-             FROM sessions WHERE id = ?1",
-            params![id.to_string()],
-            |row| {
-                Ok(SessionRecord {
-                    id,
-                    project_id: row
-                        .get::<_, String>(0)?
-                        .parse()
-                        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error)))?,
-                    title: row.get(1)?,
-                    status: parse_status(&row.get::<_, String>(2)?),
-                    cwd: row.get::<_, String>(3)?.into(),
-                    model: row.get(4)?,
-                    base_url: row.get(5)?,
-                    access_mode: parse_access_mode(&row.get::<_, String>(6)?),
-                    model_parameters: parse_session_model_parameters(&row.get::<_, String>(7)?, 7)?,
-                    created_at_ms: row.get(8)?,
-                    updated_at_ms: row.get(9)?,
-                    completed_at_ms: row.get(10)?,
-                })
-            },
-        ).map_err(StorageError::from)
+        session_record_from_connection(&connection, id)
     }
 
     async fn latest_session(
@@ -2616,6 +3019,10 @@ impl SessionRepository for SqliteSessionRepository {
             .query_row(
                 "SELECT id FROM sessions
                  WHERE project_id = ?1 AND archived_at_ms IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM session_spawn_edges
+                       WHERE child_session_id = sessions.id
+                   )
                  ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
                  LIMIT 1",
                 params![project_id.to_string()],
@@ -2660,6 +3067,10 @@ impl SessionRepository for SqliteSessionRepository {
         let sql = format!(
             "SELECT id FROM sessions
              WHERE project_id = ?1{archived_filter}
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
              LIMIT ?2"
         );
@@ -2690,6 +3101,10 @@ impl SessionRepository for SqliteSessionRepository {
         let mut statement = connection.prepare(
             "SELECT id FROM sessions
              WHERE archived_at_ms IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
              LIMIT ?1",
         )?;
@@ -2732,6 +3147,10 @@ impl SessionRepository for SqliteSessionRepository {
         let sql = format!(
             "SELECT id FROM sessions
              WHERE project_id = ?1{archived_filter}
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )
                AND (
                    lower(title) LIKE ?2 ESCAPE '\\'
                    OR lower(cwd_path) LIKE ?2 ESCAPE '\\'
@@ -2926,87 +3345,7 @@ impl SessionRepository for SqliteSessionRepository {
     }
 
     async fn delete_session(&self, id: SessionId) -> Result<(), StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let tx = connection.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM harness_replay_reports
-             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM harness_gate_results
-             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM harness_contracts
-             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM harness_artifacts
-             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM harness_events
-             WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM harness_runs WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM protocol_turn_items WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM protocol_history_items WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM protocol_runtime_events WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM protocol_item_append_order WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM file_changes WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM tool_calls WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM message_parts
-             WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM session_todos WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM session_state WHERE session_id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM sessions WHERE id = ?1",
-            params![id.to_string()],
-        )?;
-        tx.commit()?;
+        self.delete_session_tree(id).await?;
         Ok(())
     }
 
@@ -3302,6 +3641,212 @@ impl SessionRepository for SqliteSessionRepository {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(todos)
     }
+}
+
+fn parse_session_id_column(
+    row: &rusqlite::Row<'_>,
+    column_index: usize,
+) -> rusqlite::Result<SessionId> {
+    row.get::<_, String>(column_index)?
+        .parse::<SessionId>()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column_index,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+}
+
+fn session_record_from_connection(
+    connection: &Connection,
+    id: SessionId,
+) -> Result<SessionRecord, StorageError> {
+    connection
+        .query_row(
+            "SELECT project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms
+             FROM sessions WHERE id = ?1",
+            params![id.to_string()],
+            |row| {
+                Ok(SessionRecord {
+                    id,
+                    project_id: row.get::<_, String>(0)?.parse().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    title: row.get(1)?,
+                    status: parse_status(&row.get::<_, String>(2)?),
+                    cwd: row.get::<_, String>(3)?.into(),
+                    model: row.get(4)?,
+                    base_url: row.get(5)?,
+                    access_mode: parse_access_mode(&row.get::<_, String>(6)?),
+                    model_parameters: parse_session_model_parameters(&row.get::<_, String>(7)?, 7)?,
+                    created_at_ms: row.get(8)?,
+                    updated_at_ms: row.get(9)?,
+                    completed_at_ms: row.get(10)?,
+                })
+            },
+        )
+        .map_err(StorageError::from)
+}
+
+fn append_interrupted_live_snapshot_marker_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    reason: &str,
+) -> Result<(), StorageError> {
+    let (turn_id, sequence_no) = latest_turn_position_for_session(transaction, session_id)?
+        .unwrap_or_else(|| (TurnId::new(), 0));
+    let now = SystemClock::now_ms();
+    let history_item = HistoryItem {
+        id: HistoryItemId::new(),
+        session_id,
+        turn_id,
+        sequence_no,
+        created_at_ms: now,
+        payload: HistoryItemPayload::Error {
+            message_id: None,
+            message: reason.to_string(),
+        },
+    };
+    let turn_item = TurnItem {
+        id: TurnItemId::new(),
+        session_id,
+        turn_id,
+        source_item_id: Some(history_item.id),
+        sequence_no,
+        payload: TurnItemPayload::Terminal {
+            status: TurnTerminalStatus::Interrupted,
+            summary: reason.to_string(),
+        },
+    };
+    let event = RuntimeEvent {
+        id: RuntimeEventId::new(),
+        session_id,
+        turn_id,
+        sequence_no,
+        created_at_ms: now,
+        msg: RuntimeEventMsg::TurnInterrupted {
+            reason: reason.to_string(),
+        },
+    };
+    insert_event_bundle_in_transaction(transaction, &event, Some(&history_item), Some(&turn_item))?;
+    Ok(())
+}
+
+fn session_spawn_edge_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSpawnEdge> {
+    Ok(SessionSpawnEdge {
+        root_session_id: parse_session_id_column(row, 0)?,
+        parent_session_id: parse_session_id_column(row, 1)?,
+        child_session_id: parse_session_id_column(row, 2)?,
+        agent_path: row.get(3)?,
+        task_name: row.get(4)?,
+        created_at_ms: row.get(5)?,
+    })
+}
+
+fn collect_session_tree_postorder(
+    session_id: SessionId,
+    children: &HashMap<SessionId, Vec<SessionId>>,
+    visited: &mut HashSet<SessionId>,
+    result: &mut Vec<SessionId>,
+) {
+    if !visited.insert(session_id) {
+        return;
+    }
+    if let Some(child_session_ids) = children.get(&session_id) {
+        for child_session_id in child_session_ids {
+            collect_session_tree_postorder(*child_session_id, children, visited, result);
+        }
+    }
+    result.push(session_id);
+}
+
+fn delete_session_rows(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+) -> Result<(), StorageError> {
+    let session_id = session_id.to_string();
+    transaction.execute(
+        "DELETE FROM harness_replay_reports
+         WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM harness_gate_results
+         WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM harness_contracts
+         WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM harness_artifacts
+         WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM harness_events
+         WHERE run_id IN (SELECT id FROM harness_runs WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM harness_runs WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM protocol_turn_items WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM protocol_history_items WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM protocol_runtime_events WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM protocol_item_append_order WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM file_changes WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM tool_calls WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM message_parts
+         WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM messages WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM session_todos WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM session_state WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+    Ok(())
 }
 
 fn parse_status(value: &str) -> SessionStatus {
@@ -3763,6 +4308,12 @@ fn parse_tool_name(value: &str) -> crate::tool::ToolName {
         "get_goal" => crate::tool::ToolName::GetGoal,
         "create_goal" => crate::tool::ToolName::CreateGoal,
         "update_goal" => crate::tool::ToolName::UpdateGoal,
+        "spawn_agent" => crate::tool::ToolName::SpawnAgent,
+        "send_message" => crate::tool::ToolName::SendMessage,
+        "followup_task" => crate::tool::ToolName::FollowupTask,
+        "wait_agent" => crate::tool::ToolName::WaitAgent,
+        "interrupt_agent" => crate::tool::ToolName::InterruptAgent,
+        "list_agents" => crate::tool::ToolName::ListAgents,
         "invalid" => crate::tool::ToolName::Invalid,
         _ => crate::tool::ToolName::Invalid,
     }
@@ -3786,6 +4337,12 @@ fn tool_name_text(value: crate::tool::ToolName) -> &'static str {
         crate::tool::ToolName::GetGoal => "get_goal",
         crate::tool::ToolName::CreateGoal => "create_goal",
         crate::tool::ToolName::UpdateGoal => "update_goal",
+        crate::tool::ToolName::SpawnAgent => "spawn_agent",
+        crate::tool::ToolName::SendMessage => "send_message",
+        crate::tool::ToolName::FollowupTask => "followup_task",
+        crate::tool::ToolName::WaitAgent => "wait_agent",
+        crate::tool::ToolName::InterruptAgent => "interrupt_agent",
+        crate::tool::ToolName::ListAgents => "list_agents",
         crate::tool::ToolName::Invalid => "invalid",
     }
 }
@@ -3979,6 +4536,17 @@ mod tests {
             .await
             .expect("session");
         (store, session.id)
+    }
+
+    fn session_draft_from(template: &SessionRecord, title: &str) -> NewSession {
+        NewSession {
+            project_id: template.project_id,
+            title: title.to_string(),
+            cwd: template.cwd.clone(),
+            model: template.model.clone(),
+            base_url: template.base_url.clone(),
+            access_mode: template.access_mode,
+        }
     }
 
     async fn active_turn_fixture() -> (StoreBundle, SessionId, String, TurnId, MessageRecord) {
@@ -4561,6 +5129,181 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, session_id);
+    }
+
+    #[tokio::test]
+    async fn spawn_edges_preserve_explicit_child_access_but_hide_children_from_discovery() {
+        let (store, root_session_id) = test_repo().await;
+        let repo = store.session_repo();
+        let root = repo
+            .get_session(root_session_id)
+            .await
+            .expect("root session");
+        let child = repo
+            .create_session(session_draft_from(&root, "child research"))
+            .await
+            .expect("child session");
+        let grandchild = repo
+            .create_session(session_draft_from(&root, "child nested review"))
+            .await
+            .expect("grandchild session");
+        repo.insert_session_spawn_edge(root.id, root.id, child.id, "/root/research", "research")
+            .await
+            .expect("child edge");
+        repo.insert_session_spawn_edge(
+            root.id,
+            child.id,
+            grandchild.id,
+            "/root/research/review",
+            "review",
+        )
+        .await
+        .expect("grandchild edge");
+
+        let tree = repo.list_session_spawn_edges(root.id).await.expect("tree");
+        assert_eq!(tree.len(), 2);
+        assert!(tree.iter().any(|edge| edge.child_session_id == child.id));
+        assert!(
+            tree.iter()
+                .any(|edge| edge.child_session_id == grandchild.id)
+        );
+        let direct_children = repo
+            .list_direct_child_spawn_edges(root.id)
+            .await
+            .expect("direct children");
+        assert_eq!(direct_children.len(), 1);
+        assert_eq!(direct_children[0].child_session_id, child.id);
+        assert_eq!(
+            repo.session_spawn_edge_for_child(grandchild.id)
+                .await
+                .expect("edge lookup")
+                .expect("grandchild edge")
+                .agent_path,
+            "/root/research/review"
+        );
+
+        assert_eq!(
+            repo.get_session(child.id).await.expect("explicit child").id,
+            child.id
+        );
+        assert_eq!(
+            repo.latest_session(root.project_id)
+                .await
+                .expect("latest")
+                .expect("root latest")
+                .id,
+            root.id
+        );
+        assert_eq!(
+            repo.list_sessions(root.project_id, 10)
+                .await
+                .expect("list")
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![root.id]
+        );
+        assert_eq!(
+            repo.list_recent_sessions(10)
+                .await
+                .expect("recent")
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![root.id]
+        );
+        assert!(
+            repo.search_sessions(root.project_id, "child", 10, true)
+                .await
+                .expect("search")
+                .is_empty()
+        );
+        assert_eq!(
+            repo.list_sessions_with_projection_state(root.project_id, 10, true)
+                .await
+                .expect("projected list")
+                .len(),
+            1
+        );
+        assert!(
+            repo.search_sessions_with_projection_state(root.project_id, "child", 10, true)
+                .await
+                .expect("projected search")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_tree_deletes_descendants_postorder_and_preserves_other_sessions() {
+        let (store, root_session_id) = test_repo().await;
+        let repo = store.session_repo();
+        let root = repo
+            .get_session(root_session_id)
+            .await
+            .expect("root session");
+        let child = repo
+            .create_session(session_draft_from(&root, "child"))
+            .await
+            .expect("child session");
+        let grandchild = repo
+            .create_session(session_draft_from(&root, "grandchild"))
+            .await
+            .expect("grandchild session");
+        let unrelated = repo
+            .create_session(session_draft_from(&root, "unrelated"))
+            .await
+            .expect("unrelated session");
+        repo.insert_session_spawn_edge(root.id, root.id, child.id, "/root/child", "child")
+            .await
+            .expect("child edge");
+        repo.insert_session_spawn_edge(
+            root.id,
+            child.id,
+            grandchild.id,
+            "/root/child/grandchild",
+            "grandchild",
+        )
+        .await
+        .expect("grandchild edge");
+
+        let deleted = repo
+            .delete_session_tree(root.id)
+            .await
+            .expect("delete tree");
+
+        assert_eq!(deleted, vec![grandchild.id, child.id, root.id]);
+        assert!(repo.get_session(root.id).await.is_err());
+        assert!(repo.get_session(child.id).await.is_err());
+        assert!(repo.get_session(grandchild.id).await.is_err());
+        assert_eq!(
+            repo.get_session(unrelated.id)
+                .await
+                .expect("unrelated remains")
+                .id,
+            unrelated.id
+        );
+        assert!(
+            repo.list_session_spawn_edges(root.id)
+                .await
+                .expect("empty tree")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn multi_agent_tool_names_round_trip_through_storage_text() {
+        let tools = [
+            crate::tool::ToolName::SpawnAgent,
+            crate::tool::ToolName::SendMessage,
+            crate::tool::ToolName::FollowupTask,
+            crate::tool::ToolName::WaitAgent,
+            crate::tool::ToolName::InterruptAgent,
+            crate::tool::ToolName::ListAgents,
+        ];
+
+        for tool in tools {
+            assert_eq!(parse_tool_name(tool_name_text(tool)), tool);
+        }
     }
 
     #[test]
@@ -5768,6 +6511,319 @@ mod tests {
         assert_eq!(
             repo.get_session(session_id).await.expect("session").status,
             SessionStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_snapshot_rolls_back_the_target_when_a_late_copy_step_fails() {
+        let (store, source_session_id) = test_repo().await;
+        let repo = store.session_repo();
+        repo.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute_batch(&format!(
+                "CREATE TRIGGER abort_fork_state
+                 BEFORE INSERT ON session_state
+                 WHEN NEW.session_id <> '{}'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected fork state failure');
+                 END;",
+                source_session_id
+            ))
+            .expect("failure trigger");
+
+        let error = repo
+            .fork_session_snapshot(source_session_id, Some("atomic fork".to_string()))
+            .await
+            .expect_err("late fork failure must abort the transaction");
+
+        assert!(error.to_string().contains("injected fork state failure"));
+        let session_count = repo
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("session count");
+        assert_eq!(session_count, 1, "the target session must not leak");
+    }
+
+    #[tokio::test]
+    async fn fork_snapshot_rolls_back_when_the_final_active_marker_fails() {
+        let (store, source_session_id) = test_repo().await;
+        let repo = store.session_repo();
+        repo.admit_session_run(source_session_id)
+            .await
+            .expect("admit source")
+            .expect("source admission");
+        store
+            .protocol_event_store()
+            .append_history_item(&HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: source_session_id,
+                turn_id: TurnId::new(),
+                sequence_no: 0,
+                created_at_ms: 1,
+                payload: HistoryItemPayload::Message {
+                    message_id: None,
+                    role: MessageRole::User,
+                    content: vec![ContentPart::Text {
+                        text: "copy before final marker".to_string(),
+                    }],
+                },
+            })
+            .expect("source history");
+        repo.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute_batch(&format!(
+                "CREATE TRIGGER abort_fork_terminal_marker
+                 BEFORE INSERT ON protocol_runtime_events
+                 WHEN NEW.session_id <> '{}'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected final marker failure');
+                 END;",
+                source_session_id
+            ))
+            .expect("marker failure trigger");
+
+        let error = repo
+            .fork_session_snapshot(source_session_id, Some("active fork".to_string()))
+            .await
+            .expect_err("final marker failure must abort the entire fork");
+
+        assert!(error.to_string().contains("injected final marker failure"));
+        let connection = repo.connection.lock().expect("sqlite mutex poisoned");
+        let session_count = connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("session count");
+        let leaked_history = connection
+            .query_row(
+                "SELECT COUNT(*) FROM protocol_history_items WHERE session_id <> ?1",
+                params![source_session_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("leaked history count");
+        let leaked_allocators = connection
+            .query_row(
+                "SELECT COUNT(*) FROM protocol_turn_sequence_allocators WHERE session_id <> ?1",
+                params![source_session_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("leaked allocator count");
+        assert_eq!(session_count, 1, "the target session must roll back");
+        assert_eq!(leaked_history, 0, "copied history must roll back");
+        assert_eq!(leaked_allocators, 0, "fork allocators must roll back");
+    }
+
+    #[tokio::test]
+    async fn fork_snapshot_copies_session_settings_memory_and_protocol_together() {
+        let (store, source_session_id) = test_repo().await;
+        let repo = store.session_repo();
+        repo.update_session_settings(
+            source_session_id,
+            &SessionSettingsPatch {
+                temperature: Some(0.25),
+                max_output_tokens: Some(2048),
+                ..SessionSettingsPatch::default()
+            },
+        )
+        .await
+        .expect("source settings");
+        repo.update_session_memory_mode(source_session_id, SessionMemoryMode::Disabled)
+            .await
+            .expect("source memory mode");
+        let turn_id = TurnId::new();
+        store
+            .protocol_event_store()
+            .append_history_item(&HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: source_session_id,
+                turn_id,
+                sequence_no: 0,
+                created_at_ms: 1,
+                payload: HistoryItemPayload::Message {
+                    message_id: None,
+                    role: MessageRole::User,
+                    content: vec![ContentPart::Text {
+                        text: "snapshot source".to_string(),
+                    }],
+                },
+            })
+            .expect("source history");
+
+        let fork = repo
+            .fork_session_snapshot(source_session_id, Some("snapshot fork".to_string()))
+            .await
+            .expect("fork snapshot");
+
+        assert_eq!(fork.forked_session.title, "snapshot fork");
+        assert_eq!(fork.forked_session.status, SessionStatus::Idle);
+        assert_eq!(fork.forked_session.model_parameters.temperature, Some(0.25));
+        assert_eq!(
+            fork.forked_session.model_parameters.max_output_tokens,
+            Some(2048)
+        );
+        assert_eq!(
+            repo.get_session_memory_mode(fork.forked_session.id)
+                .await
+                .expect("fork memory mode"),
+            SessionMemoryMode::Disabled
+        );
+        assert_eq!(fork.copied_history_items, 1);
+        assert_eq!(fork.copied_turn_items, 0);
+        assert_eq!(
+            store
+                .protocol_event_store()
+                .list_history_items_for_session(fork.forked_session.id)
+                .expect("fork history")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn active_root_access_cas_preserves_run_and_unrelated_settings_and_rejects_stale_child() {
+        let (store, root_session_id) = test_repo().await;
+        let repo = store.session_repo();
+        let prepared = repo
+            .update_session_settings(
+                root_session_id,
+                &SessionSettingsPatch {
+                    model: Some("root-model".to_string()),
+                    base_url: Some("http://root-provider.invalid".to_string()),
+                    access_mode: Some(AccessMode::Default),
+                    temperature: Some(0.25),
+                    max_output_tokens: Some(2048),
+                    ..SessionSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("prepare root settings")
+            .session;
+        repo.update_session_memory_mode(root_session_id, SessionMemoryMode::Disabled)
+            .await
+            .expect("prepare root memory mode");
+        let admission_id = repo
+            .admit_session_run(root_session_id)
+            .await
+            .expect("admit root")
+            .expect("root admitted");
+
+        let update = repo
+            .compare_and_set_root_session_access_mode(
+                root_session_id,
+                AccessMode::Default,
+                AccessMode::FullAccess,
+            )
+            .await
+            .expect("active root access update")
+            .expect("expected access owner");
+        assert!(update.changed);
+        assert_eq!(update.session.status, SessionStatus::Running);
+        assert_eq!(update.session.access_mode, AccessMode::FullAccess);
+        assert_eq!(update.session.project_id, prepared.project_id);
+        assert_eq!(update.session.title, prepared.title);
+        assert_eq!(update.session.cwd, prepared.cwd);
+        assert_eq!(update.session.model, prepared.model);
+        assert_eq!(update.session.base_url, prepared.base_url);
+        assert_eq!(
+            update.session.model_parameters, prepared.model_parameters,
+            "the access-only boundary must not rewrite model settings"
+        );
+        assert_eq!(
+            repo.get_session_memory_mode(root_session_id)
+                .await
+                .expect("root memory mode"),
+            SessionMemoryMode::Disabled
+        );
+        assert!(
+            repo.has_fresh_run_admission(root_session_id)
+                .await
+                .expect("root admission retained")
+        );
+        assert_eq!(
+            repo.admitted_run_status_at(
+                root_session_id,
+                &admission_id,
+                TurnId::new(),
+                SystemClock::now_ms(),
+            )
+            .await
+            .expect("admission status before turn"),
+            None,
+            "a pre-turn admission remains owned but has no active turn identity"
+        );
+
+        assert!(
+            repo.compare_and_set_root_session_access_mode(
+                root_session_id,
+                AccessMode::Default,
+                AccessMode::AutoReview,
+            )
+            .await
+            .expect("stale access CAS")
+            .is_none(),
+            "a stale expected access owner must not overwrite the active root"
+        );
+        assert_eq!(
+            repo.get_session(root_session_id)
+                .await
+                .expect("root after stale CAS")
+                .access_mode,
+            AccessMode::FullAccess
+        );
+        assert!(
+            repo.update_session_settings(
+                root_session_id,
+                &SessionSettingsPatch {
+                    model: Some("forbidden-active-model-change".to_string()),
+                    ..SessionSettingsPatch::default()
+                },
+            )
+            .await
+            .is_err(),
+            "general settings remain forbidden while the root is active"
+        );
+
+        let child = repo
+            .create_session(NewSession {
+                project_id: prepared.project_id,
+                title: "child".to_string(),
+                cwd: prepared.cwd,
+                model: prepared.model,
+                base_url: prepared.base_url,
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("child session");
+        repo.insert_session_spawn_edge(
+            root_session_id,
+            root_session_id,
+            child.id,
+            "/root/child",
+            "child",
+        )
+        .await
+        .expect("child edge");
+        let child_error = repo
+            .compare_and_set_root_session_access_mode(
+                child.id,
+                AccessMode::Default,
+                AccessMode::FullAccess,
+            )
+            .await
+            .expect_err("child cannot impersonate the root access owner");
+        assert!(child_error.to_string().contains("child agent session"));
+        assert_eq!(
+            repo.get_session(child.id)
+                .await
+                .expect("unchanged child")
+                .access_mode,
+            AccessMode::Default
         );
     }
 }

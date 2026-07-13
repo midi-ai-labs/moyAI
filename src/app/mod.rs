@@ -1,8 +1,12 @@
+pub mod agent_runtime;
 pub mod bootstrap;
 pub mod command;
 pub mod run_service;
 pub mod session_title;
 
+pub use agent_runtime::{
+    AgentActivityRecord, AgentForkTurns, AgentRunContext, AgentRuntime, AgentWaitResult,
+};
 pub use bootstrap::AppBootstrap;
 pub use command::{
     App, AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionCompactRequest,

@@ -1,3 +1,5 @@
+import type { ConfigFieldProjection } from "./types.ts";
+
 export function fileName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
 }
@@ -11,12 +13,16 @@ export function lineValue(text: string, label: string): string {
   return line ? line.slice(prefix.length).trim() : "";
 }
 
-export function validateConfigInput(field: string, rawValue: string): { ok: boolean; message: string } {
+export function validateConfigInput(
+  field: ConfigFieldProjection,
+  rawValue: string,
+): { ok: boolean; message: string } {
   const value = rawValue.trim();
   if (value.length === 0) {
+    if (field.required) return { ok: false, message: "値を入力してください。" };
     return { ok: true, message: "空欄は継承または削除として扱います。" };
   }
-  if (field.endsWith("base_url")) {
+  if (field.key.endsWith("base_url")) {
     try {
       const url = new URL(value);
       if (url.protocol !== "http:" && url.protocol !== "https:") {
@@ -26,39 +32,40 @@ export function validateConfigInput(field: string, rawValue: string): { ok: bool
       return { ok: false, message: "URL として解釈できません。" };
     }
   }
-  if (field.endsWith("_json") || field.endsWith("servers_json")) {
+  if (field.value_type === "json") {
     try {
       JSON.parse(value);
     } catch (error) {
       return { ok: false, message: `JSON として解釈できません: ${String(error)}` };
     }
   }
-  if (
-    field.includes("enabled") ||
-    field.includes("supports_") ||
-    field.includes("include_hidden") ||
-    field.includes("hide_windows") ||
-    field.includes("parallel_tool_calls")
-  ) {
+  if (field.value_type === "boolean") {
     if (!["true", "false"].includes(value.toLowerCase())) {
       return { ok: false, message: "true または false を入力してください。" };
     }
   }
-  if (
-    field.includes("timeout_ms") ||
-    field.includes("retries") ||
-    field.includes("tokens") ||
-    field.includes("context_window") ||
-    field.includes("max_") ||
-    field.includes("top_k") ||
-    field.includes("seed")
-  ) {
-    if (!Number.isFinite(Number(value)) || Number(value) < 0) {
-      return { ok: false, message: "0 以上の数値を入力してください。" };
+  if (field.value_type === "integer") {
+    if (!/^[+-]?\d+$/.test(value) || !Number.isSafeInteger(Number(value))) {
+      return { ok: false, message: "整数を入力してください。" };
     }
   }
-  if (field === "permissions.access_mode" && !["default", "auto_review", "full_access"].includes(value)) {
-    return { ok: false, message: "default / auto_review / full_access のいずれかを入力してください。" };
+  if (field.value_type === "number") {
+    if (!Number.isFinite(Number(value))) {
+      return { ok: false, message: "有限の数値を入力してください。" };
+    }
+  }
+  if (field.value_type === "enum" && !field.options.includes(value)) {
+    return { ok: false, message: `${field.options.join(" / ")} のいずれかを入力してください。` };
+  }
+  if ((field.value_type === "integer" || field.value_type === "number") && field.min_value !== null) {
+    if (Number(value) < field.min_value) {
+      return { ok: false, message: `${field.min_value} 以上の数値を入力してください。` };
+    }
+  }
+  if ((field.value_type === "integer" || field.value_type === "number") && field.max_value !== null) {
+    if (Number(value) > field.max_value) {
+      return { ok: false, message: `${field.max_value} 以下の数値を入力してください。` };
+    }
   }
   return { ok: true, message: "入力形式は問題ありません。" };
 }

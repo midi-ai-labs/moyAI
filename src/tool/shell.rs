@@ -49,9 +49,9 @@ const DEFAULT_SHELL_SNAPSHOT_LIMITS: SnapshotLimits = SnapshotLimits {
 impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         let description = if cfg!(windows) {
-            "Run a shell command in the workspace. On Windows this tool executes PowerShell, so send raw PowerShell syntax only."
+            "Run a shell command with the current user account. On Windows this tool executes PowerShell, so send raw PowerShell syntax only. Permission review classifies detected literal targets and risks; it is not an OS filesystem sandbox."
         } else {
-            "Run a shell command in the workspace. On Unix this tool executes bash."
+            "Run a shell command with the current user account. On Unix this tool executes bash. Permission review classifies detected literal targets and risks; it is not an OS filesystem sandbox."
         };
         ToolSpec {
             name: ToolName::Shell,
@@ -103,14 +103,14 @@ impl Tool for ShellTool {
             return Ok(shell_contract_violation_result(&input.command, violation));
         }
         let outside_workspace = (!guarded.inside_workspace && !guarded.trusted_external)
-            || references_outside_workspace(ctx.workspace, &input.command);
+            || references_outside_workspace_from(ctx.workspace, &guarded.absolute, &input.command);
         let description = if input.description.trim().is_empty() {
             default_description(&input.command)
         } else {
             input.description.clone()
         };
         let encoding_review = command_text_encoding_review(&input.command, family);
-        let risks = shell_permission_risks(ctx.workspace, &input.command);
+        let risks = shell_permission_risks_from(ctx.workspace, &guarded.absolute, &input.command);
         ctx.confirm_if_needed_with_details(
             AccessKind::Shell,
             description.clone(),
@@ -1232,36 +1232,110 @@ fn shell_timeout_termination_plan() -> Vec<ShellTerminationStep> {
     ]
 }
 
+#[cfg(test)]
 fn references_outside_workspace(workspace: &crate::workspace::Workspace, command: &str) -> bool {
+    references_outside_workspace_from(workspace, &workspace.cwd, command)
+}
+
+fn references_outside_workspace_from(
+    workspace: &crate::workspace::Workspace,
+    workdir: &Utf8Path,
+    command: &str,
+) -> bool {
     if command.contains("..") {
         return true;
     }
 
-    extract_absolute_paths(command).into_iter().any(|path| {
-        !path.starts_with(&workspace.root)
-            && !workspace
-                .path_policy
-                .additional_write_roots
-                .iter()
-                .any(|root| path.starts_with(root))
-    })
+    extract_absolute_paths(workdir, command)
+        .into_iter()
+        .any(|path| {
+            !path.starts_with(&workspace.root)
+                && !workspace
+                    .path_policy
+                    .additional_write_roots
+                    .iter()
+                    .any(|root| path.starts_with(root))
+        })
 }
 
-fn extract_absolute_paths(command: &str) -> Vec<Utf8PathBuf> {
+fn extract_absolute_paths(workdir: &Utf8Path, command: &str) -> Vec<Utf8PathBuf> {
     let mut paths = Vec::new();
+    let mut quoted_path_ranges = Vec::new();
+    let quoted = Regex::new(r#""([^"]+)"|'([^']+)'"#).expect("quoted shell value regex");
+    for capture in quoted.captures_iter(command) {
+        let Some(candidate) = capture.get(1).or_else(|| capture.get(2)) else {
+            continue;
+        };
+        let resolved = if cfg!(windows) {
+            resolve_quoted_windows_path(workdir, candidate.as_str())
+        } else {
+            let path = Utf8PathBuf::from(candidate.as_str());
+            path.is_absolute().then_some(path)
+        };
+        if let Some(path) = resolved {
+            paths.push(path);
+            quoted_path_ranges.push(candidate.start()..candidate.end());
+        }
+    }
 
     if cfg!(windows) {
-        let regex = Regex::new(r#"(?i)[A-Z]:[\\/][^\s"'|;]+"#).expect("windows path regex");
-        for value in regex.find_iter(command).map(|capture| capture.as_str()) {
+        let regex =
+            Regex::new(r#"(?i)(?:[A-Z]:[\\/]|\\\\|//)[^\s"'|;,<>]+"#).expect("windows path regex");
+        for candidate in regex.find_iter(command) {
+            if quoted_path_ranges
+                .iter()
+                .any(|range| range.contains(&candidate.start()))
+            {
+                continue;
+            }
+            if shell_path_candidate_is_inside_uri(command, candidate.start(), candidate.end()) {
+                continue;
+            }
+            let value = candidate.as_str();
             let normalized = value.replace('/', "\\");
             let path = Utf8PathBuf::from(normalized);
             if path.is_absolute() {
                 paths.push(path);
             }
         }
+
+        let drive_relative =
+            Regex::new(r#"(?i)(?:^|[\s"'|;=,()<>\[\]{}])([A-Z]:[^\\/\s"'|;,<>][^\s"'|;,<>]*)"#)
+                .expect("windows drive-relative path regex");
+        for capture in drive_relative.captures_iter(command) {
+            let Some(candidate) = capture.get(1) else {
+                continue;
+            };
+            if quoted_path_ranges
+                .iter()
+                .any(|range| range.contains(&candidate.start()))
+            {
+                continue;
+            }
+            if shell_path_candidate_is_inside_uri(command, candidate.start(), candidate.end()) {
+                continue;
+            }
+            if let Some(path) = resolve_windows_drive_relative(workdir, candidate.as_str()) {
+                paths.push(path);
+            }
+        }
     } else {
-        let regex = Regex::new(r#"/[^\s"'|;]+"#).expect("unix path regex");
-        for value in regex.find_iter(command).map(|capture| capture.as_str()) {
+        let regex =
+            Regex::new(r#"(?:^|[\s"'|;=,()<>\[\]{}])(/[^\s"'|;,<>]+)"#).expect("unix path regex");
+        for capture in regex.captures_iter(command) {
+            let Some(candidate) = capture.get(1) else {
+                continue;
+            };
+            if quoted_path_ranges
+                .iter()
+                .any(|range| range.contains(&candidate.start()))
+            {
+                continue;
+            }
+            if shell_path_candidate_is_inside_uri(command, candidate.start(), candidate.end()) {
+                continue;
+            }
+            let value = candidate.as_str();
             let path = Utf8PathBuf::from(value);
             if path.is_absolute() {
                 paths.push(path);
@@ -1269,7 +1343,91 @@ fn extract_absolute_paths(command: &str) -> Vec<Utf8PathBuf> {
         }
     }
 
+    paths.sort();
+    paths.dedup();
     paths
+}
+
+fn resolve_quoted_windows_path(workdir: &Utf8Path, value: &str) -> Option<Utf8PathBuf> {
+    let normalized = value.replace('/', "\\");
+    let path = Utf8PathBuf::from(normalized);
+    if path.is_absolute() {
+        return Some(path);
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && !matches!(bytes[2], b'\\' | b'/')
+    {
+        return resolve_windows_drive_relative(workdir, value);
+    }
+    None
+}
+
+fn shell_path_candidate_is_inside_uri(command: &str, start: usize, end: usize) -> bool {
+    let token_start = command[..start]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '|' | ';' | ','))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let token_end = command[end..]
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '|' | ';' | ','))
+        .map(|index| end + index)
+        .unwrap_or(command.len());
+    let token = &command[token_start..token_end];
+    let candidate = &command[start..end];
+    let candidate_bytes = candidate.as_bytes();
+    let candidate_offset = start.saturating_sub(token_start);
+    let candidate_end = end.saturating_sub(token_start);
+    let marker_is_valid_scheme = |marker: usize| {
+        if marker > candidate_end {
+            return false;
+        }
+        let scheme_start = token[..marker]
+            .rfind(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '+' | '-' | '.'))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let scheme = &token[scheme_start..marker];
+        scheme.starts_with(|ch: char| ch.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    };
+    let valid_markers = token
+        .match_indices("://")
+        .map(|(marker, _)| marker)
+        .filter(|marker| marker_is_valid_scheme(*marker))
+        .collect::<Vec<_>>();
+    let windows_drive_with_forward_slashes = cfg!(windows)
+        && candidate_bytes.len() >= 3
+        && candidate_bytes[0].is_ascii_alphabetic()
+        && candidate_bytes[1] == b':'
+        && candidate_bytes[2] == b'/';
+    if windows_drive_with_forward_slashes {
+        let prior_uri = valid_markers
+            .iter()
+            .any(|marker| *marker < candidate_offset + 1);
+        let continues_longer_scheme =
+            candidate_offset > 0 && token.as_bytes()[candidate_offset - 1].is_ascii_alphanumeric();
+        if !prior_uri && !continues_longer_scheme {
+            return false;
+        }
+    }
+    !valid_markers.is_empty()
+}
+
+fn resolve_windows_drive_relative(workdir: &Utf8Path, drive_relative: &str) -> Option<Utf8PathBuf> {
+    let bytes = drive_relative.as_bytes();
+    if bytes.len() < 3 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let drive = &drive_relative[..2];
+    let relative = drive_relative[2..].replace('/', "\\");
+    let workdir_text = workdir.as_str();
+    if workdir_text.len() >= 2 && workdir_text[..2].eq_ignore_ascii_case(drive) {
+        return Some(workdir.join(relative));
+    }
+    Some(Utf8PathBuf::from(format!("{drive}\\{relative}")))
 }
 
 fn default_description(command: &str) -> String {
@@ -1290,30 +1448,54 @@ fn shell_permission_details(command: &str, workdir: &Utf8Path) -> Vec<String> {
     vec![
         format!("Command: {}", command.trim()),
         format!("Workdir: {}", workdir),
+        "Shell runs with the current user account; this review is risk classification, not an OS filesystem sandbox."
+            .to_string(),
     ]
 }
 
+#[cfg(test)]
 fn shell_permission_risks(
     workspace: &crate::workspace::Workspace,
     command: &str,
 ) -> Vec<PermissionRisk> {
+    shell_permission_risks_from(workspace, &workspace.cwd, command)
+}
+
+fn shell_permission_risks_from(
+    workspace: &crate::workspace::Workspace,
+    workdir: &Utf8Path,
+    command: &str,
+) -> Vec<PermissionRisk> {
     let mut risks = Vec::new();
+    let references_network_path = shell_references_network_path(workdir, command);
     if shell_has_delete_risk(command) {
         risks.push(PermissionRisk::DestructiveDelete);
     }
     if shell_has_move_risk(command) {
         risks.push(PermissionRisk::MoveOrRename);
     }
-    if shell_has_network_risk(command) {
+    if shell_has_network_risk(command) || references_network_path {
         risks.push(PermissionRisk::Network);
     }
-    if shell_requires_external_connection_review(command) {
+    if shell_requires_external_connection_review(command) || references_network_path {
         risks.push(PermissionRisk::ExternalConnection);
     }
-    if command_mentions_protected_target(workspace, command) {
+    if command_mentions_protected_target(workspace, workdir, command) {
         risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
     }
     risks
+}
+
+fn shell_references_network_path(workdir: &Utf8Path, command: &str) -> bool {
+    cfg!(windows)
+        && (is_windows_unc_path(workdir)
+            || extract_absolute_paths(workdir, command)
+                .iter()
+                .any(|path| is_windows_unc_path(path)))
+}
+
+fn is_windows_unc_path(path: &Utf8Path) -> bool {
+    path.as_str().replace('/', "\\").starts_with("\\\\")
 }
 
 fn shell_has_delete_risk(command: &str) -> bool {
@@ -1430,6 +1612,7 @@ fn command_tokens(command: &str) -> Vec<String> {
 
 fn command_mentions_protected_target(
     workspace: &crate::workspace::Workspace,
+    workdir: &Utf8Path,
     command: &str,
 ) -> bool {
     let lower = command.to_ascii_lowercase();
@@ -1447,7 +1630,7 @@ fn command_mentions_protected_target(
     {
         return true;
     }
-    extract_absolute_paths(command)
+    extract_absolute_paths(workdir, command)
         .into_iter()
         .any(|path| is_protected_workspace_authority_path(&workspace.root, &path))
 }
@@ -1547,7 +1730,7 @@ fn shell_snapshot_plan(
 ) -> ShellSnapshotPlan {
     let owner_root = shell_snapshot_owner(workspace, guarded_workdir);
     let mut scopes = vec![guarded_workdir.absolute.clone()];
-    scopes.extend(extract_absolute_paths(command));
+    scopes.extend(extract_absolute_paths(&guarded_workdir.absolute, command));
     if command.contains("..") {
         scopes.push(owner_root.clone());
     }
@@ -1978,6 +2161,276 @@ mod tests {
     #[test]
     fn shell_output_projection_includes_stdout_stderr_and_recovery() {
         assert!(super::shell_output_projection_fixture_passes());
+    }
+
+    #[test]
+    fn network_urls_are_not_classified_as_outside_workspace_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+
+        for command in [
+            "curl.exe http://127.0.0.1:18945/health",
+            "Invoke-WebRequest https://example.com/C:/artifact.json",
+            "Invoke-WebRequest 'https://example.com/download?file=C:/artifact.json'",
+        ] {
+            assert!(
+                !super::references_outside_workspace(&workspace, command),
+                "URL must not be projected as an outside-workspace file path: {command}"
+            );
+            let risks = super::shell_permission_risks(&workspace, command);
+            assert!(risks.contains(&crate::tool::PermissionRisk::Network));
+            assert!(risks.contains(&crate::tool::PermissionRisk::ExternalConnection));
+        }
+    }
+
+    #[test]
+    fn actual_absolute_path_outside_workspace_is_still_classified_as_outside() {
+        let workspace_temp = tempfile::tempdir().expect("workspace tempdir");
+        let outside_temp = tempfile::tempdir().expect("outside tempdir");
+        let root = Utf8PathBuf::from_path_buf(workspace_temp.path().to_path_buf())
+            .expect("utf8 workspace");
+        let outside = Utf8PathBuf::from_path_buf(outside_temp.path().join("outside.txt"))
+            .expect("utf8 outside");
+        let outside_with_spaces =
+            Utf8PathBuf::from_path_buf(outside_temp.path().join("folder with spaces/outside.txt"))
+                .expect("utf8 outside with spaces");
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+        let command = format!("Get-Content -LiteralPath '{}'", outside);
+
+        assert!(super::references_outside_workspace(&workspace, &command));
+        let quoted_with_spaces = format!("Get-Content -LiteralPath '{}'", outside_with_spaces);
+        assert!(super::references_outside_workspace(
+            &workspace,
+            &quoted_with_spaces
+        ));
+
+        let guarded = PathGuard::require_path(&workspace, &root, AccessKind::Shell)
+            .expect("admit workspace workdir");
+        let redirected = format!("Write-Output fixture >{}", outside);
+        assert!(super::references_outside_workspace(&workspace, &redirected));
+        let plan = super::shell_snapshot_plan(&workspace, &guarded, &redirected);
+        assert!(plan.scopes.contains(&outside));
+        let spaced_plan = super::shell_snapshot_plan(&workspace, &guarded, &quoted_with_spaces);
+        assert!(spaced_plan.scopes.contains(&outside_with_spaces));
+    }
+
+    #[test]
+    fn configured_external_write_root_is_not_classified_as_outside() {
+        let workspace_temp = tempfile::tempdir().expect("workspace tempdir");
+        let external_temp = tempfile::tempdir().expect("external tempdir");
+        let root = Utf8PathBuf::from_path_buf(workspace_temp.path().to_path_buf())
+            .expect("utf8 workspace");
+        let external_root = Utf8PathBuf::from_path_buf(external_temp.path().to_path_buf())
+            .expect("utf8 external root");
+        let target = external_root.join("folder with spaces/allowed.txt");
+        let mut config = ResolvedConfig::default();
+        config.permissions.additional_write_roots = vec![external_root];
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+        let command = format!("Set-Content -LiteralPath '{}' -Value allowed", target);
+
+        assert!(!super::references_outside_workspace(&workspace, &command));
+        let guarded = PathGuard::require_path(&workspace, &root, AccessKind::Shell)
+            .expect("admit workspace workdir");
+        let plan = super::shell_snapshot_plan(&workspace, &guarded, &command);
+        assert!(plan.scopes.contains(&target));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_paths_are_classified_as_outside_workspace_and_external_connections() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+        for command in [
+            r"Get-Content -LiteralPath \\server\share\artifact.txt",
+            r#"Get-Content -LiteralPath "\\server\share\artifact.txt""#,
+            r"Get-Content -LiteralPath //server/share/artifact.txt",
+        ] {
+            assert!(super::references_outside_workspace(&workspace, command));
+            assert!(
+                super::shell_permission_risks(&workspace, command)
+                    .contains(&crate::tool::PermissionRisk::ExternalConnection)
+            );
+            assert!(
+                super::shell_permission_risks(&workspace, command)
+                    .contains(&crate::tool::PermissionRisk::Network)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uri_and_windows_drive_ambiguity_cannot_hide_outside_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outside_temp = tempfile::tempdir().expect("outside tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let outside = Utf8PathBuf::from_path_buf(outside_temp.path().join("outside.txt"))
+            .expect("utf8 outside");
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+        let guarded = PathGuard::require_path(&workspace, &root, AccessKind::Shell)
+            .expect("admit workspace workdir");
+        let drive_root = Utf8PathBuf::from("C:/outside.txt");
+        let cases = [
+            ("Remove-Item C://outside.txt".to_string(), drive_root),
+            (format!("Remove-Item file://fixture,{}", outside), outside),
+        ];
+
+        for (command, expected_target) in cases {
+            let outside_workspace = super::references_outside_workspace(&workspace, &command);
+            let risks = super::shell_permission_risks(&workspace, &command);
+            let request = crate::tool::PermissionRequest {
+                access: AccessKind::Shell,
+                summary: command.clone(),
+                details: Vec::new(),
+                targets: vec![root.clone()],
+                outside_workspace,
+                risks,
+                agent_path: None,
+                agent_task_name: None,
+            };
+            let plan = super::shell_snapshot_plan(&workspace, &guarded, &command);
+
+            assert!(outside_workspace, "outside path was hidden: {command}");
+            assert!(!crate::tool::context::access_mode_allows_permission(
+                crate::config::AccessMode::FullAccess,
+                &request
+            ));
+            assert!(
+                plan.scopes.contains(&expected_target),
+                "snapshot scope omitted {expected_target} for {command}: {:?}",
+                plan.scopes
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_device_and_comma_paths_cannot_bypass_boundary_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outside_temp = tempfile::tempdir().expect("outside tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let outside = Utf8PathBuf::from_path_buf(outside_temp.path().join("outside.txt"))
+            .expect("utf8 outside");
+        let inside = root.join("inside.txt");
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+
+        for command in [
+            format!(r"Get-Item {},{}", inside, outside),
+            r"Get-Content -LiteralPath \\?\C:\outside.txt".to_string(),
+            r"Get-Content -LiteralPath \\.\C:\outside.txt".to_string(),
+        ] {
+            assert!(
+                super::references_outside_workspace(&workspace, &command),
+                "path form must remain outside the workspace boundary: {command}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workdir_drive_owns_drive_relative_path_resolution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let external_root = Utf8PathBuf::from("D:/allowed");
+        let workdir = external_root.join("nested");
+        let mut config = ResolvedConfig::default();
+        config.permissions.additional_write_roots = vec![external_root];
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+        let guarded = PathGuard::require_path(&workspace, &workdir, AccessKind::Shell)
+            .expect("admit configured external workdir");
+        let cases = [(
+            "Remove-Item E:outside.txt".to_string(),
+            Utf8PathBuf::from("E:/outside.txt"),
+        )];
+
+        for (command, expected_target) in cases {
+            let outside_workspace =
+                super::references_outside_workspace_from(&workspace, &guarded.absolute, &command);
+            let risks = super::shell_permission_risks_from(&workspace, &guarded.absolute, &command);
+            let request = crate::tool::PermissionRequest {
+                access: AccessKind::Shell,
+                summary: command.clone(),
+                details: Vec::new(),
+                targets: vec![guarded.absolute.clone()],
+                outside_workspace,
+                risks,
+                agent_path: None,
+                agent_task_name: None,
+            };
+            let plan = super::shell_snapshot_plan(&workspace, &guarded, &command);
+
+            assert!(outside_workspace, "outside path was hidden: {command}");
+            assert!(!crate::tool::context::access_mode_allows_permission(
+                crate::config::AccessMode::FullAccess,
+                &request
+            ));
+            assert!(
+                plan.scopes.contains(&expected_target),
+                "snapshot scope omitted {expected_target} for {command}: {:?}",
+                plan.scopes
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_slash_options_and_division_are_not_file_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+
+        for command in [
+            "cmd.exe /c dir",
+            "cmd.exe \"/c\" dir",
+            "robocopy source destination /e",
+            "Write-Output (10 / 2)",
+        ] {
+            assert!(
+                !super::references_outside_workspace(&workspace, command),
+                "slash option/operator must not be projected as a path: {command}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_workdir_requires_external_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("discover workspace");
+        let workdir = Utf8PathBuf::from(r"\\server\share\project");
+        let relative_risks =
+            super::shell_permission_risks_from(&workspace, &workdir, "Get-ChildItem .");
+        assert!(relative_risks.contains(&crate::tool::PermissionRisk::Network));
+        assert!(relative_risks.contains(&crate::tool::PermissionRisk::ExternalConnection));
+    }
+
+    #[test]
+    fn shell_confirmation_discloses_current_user_execution_boundary() {
+        let details =
+            super::shell_permission_details("Get-Date", camino::Utf8Path::new("C:/workspace"));
+
+        assert_eq!(details[0], "Command: Get-Date");
+        assert_eq!(details[1], "Workdir: C:/workspace");
+        assert!(details[2].contains("current user account"));
+        assert!(details[2].contains("not an OS filesystem sandbox"));
     }
 
     #[test]

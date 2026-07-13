@@ -1,7 +1,8 @@
 use std::fs;
 use std::io::{self, Stdout};
 use std::process::Command as ProcessCommand;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -15,16 +16,19 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use tokio_util::sync::CancellationToken;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionSteerRequest};
-use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode, TuiArgs};
+use crate::cli::{
+    ConfirmationPrompt, EventRenderer, OutputMode, SharedConfirmationPrompt, TuiArgs,
+};
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::full_effective_override;
 use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
-use crate::runtime::{SystemClock, build_cancel_token};
+use crate::runtime::{LiveConfigOverrides, SystemClock, build_cancel_token};
 use crate::session::markdown::{history_items_to_markdown, history_markdown_file_name};
 use crate::session::{
     EditorContext, LoadedSessionStatus, LoadedSessionSummary, PromptDispatchPart, RunEvent,
@@ -42,6 +46,66 @@ use super::state::{
 };
 
 type TerminalHandle = Terminal<CrosstermBackend<Stdout>>;
+
+struct TuiRootRun {
+    generation: u64,
+    cancel: CancellationToken,
+}
+
+#[derive(Default)]
+struct TuiRootRunLifecycle {
+    active: Option<TuiRootRun>,
+}
+
+impl TuiRootRunLifecycle {
+    fn begin(&mut self, generation: u64, cancel: CancellationToken) -> bool {
+        if self.active.is_some() {
+            return false;
+        }
+        self.active = Some(TuiRootRun { generation, cancel });
+        true
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    fn request_cancel(&self) -> bool {
+        let Some(active) = self.active.as_ref() else {
+            return false;
+        };
+        active.cancel.cancel();
+        true
+    }
+
+    fn finish(&mut self, generation: u64) -> Option<bool> {
+        if self
+            .active
+            .as_ref()
+            .is_none_or(|active| active.generation != generation)
+        {
+            return None;
+        }
+        self.active
+            .take()
+            .map(|active| active.cancel.is_cancelled())
+    }
+}
+
+fn commit_tui_effective_config(
+    effective_config: &mut ResolvedConfig,
+    live_config: &LiveConfigOverrides,
+    candidate: ResolvedConfig,
+    durable_access_ready: bool,
+) -> bool {
+    if !durable_access_ready {
+        return false;
+    }
+    let access_mode = candidate.permissions.access_mode;
+    *effective_config = candidate;
+    live_config.set_access_mode(access_mode);
+    true
+}
 
 pub async fn run(app: App, args: TuiArgs) -> Result<(), AppRunError> {
     let mut terminal = setup_terminal().map_err(|error| AppRunError::Message(error.to_string()))?;
@@ -81,9 +145,15 @@ struct TuiController {
     config_editor: ConfigEditorState,
     base_config: ResolvedConfig,
     effective_config: ResolvedConfig,
+    live_config: LiveConfigOverrides,
+    root_run_lifecycle: TuiRootRunLifecycle,
+    next_root_run_generation: u64,
     runtime_tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
     runtime_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeMessage>,
     permission_response: Option<mpsc::Sender<bool>>,
+    pending_permission_request: Option<PermissionRequest>,
+    pending_permission_request_id: Option<u64>,
+    next_permission_request_id: Arc<AtomicU64>,
     preview_entries: Vec<TranscriptEntry>,
     preview_todos: Vec<TodoItem>,
     preview_state: Option<SessionStateSnapshot>,
@@ -102,6 +172,7 @@ impl TuiController {
         let sessions = recent_sessions(&app.session_service, app.workspace.project_id, 20).await?;
         let base_config = app.config.clone();
         let effective_config = base_config.clone();
+        let live_config = LiveConfigOverrides::new(effective_config.permissions.access_mode);
         let mut controller = Self {
             app,
             state: AppState::default(),
@@ -111,9 +182,15 @@ impl TuiController {
             config_editor: ConfigEditorState::from_config(&effective_config),
             base_config,
             effective_config,
+            live_config,
+            root_run_lifecycle: TuiRootRunLifecycle::default(),
+            next_root_run_generation: 1,
             runtime_tx,
             runtime_rx,
             permission_response: None,
+            pending_permission_request: None,
+            pending_permission_request_id: None,
+            next_permission_request_id: Arc::new(AtomicU64::new(1)),
             preview_entries: Vec::new(),
             preview_todos: Vec::new(),
             preview_state: None,
@@ -154,10 +231,10 @@ impl TuiController {
             return Ok(());
         }
         if is_stop_key(key)
-            && matches!(
+            && (matches!(
                 self.state.run_status,
                 RunStatus::Running | RunStatus::Confirming
-            )
+            ) || self.agent_tree_active())
         {
             return self.stop_current_run().await;
         }
@@ -173,6 +250,11 @@ impl TuiController {
     }
 
     async fn handle_main_key(&mut self, key: KeyEvent) -> Result<(), AppRunError> {
+        if key_leaves_current_task(key, self.state.route)
+            && self.reject_agent_tree_navigation("the current task")
+        {
+            return Ok(());
+        }
         match key.code {
             KeyCode::Char('q')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -214,7 +296,7 @@ impl TuiController {
                 if self.state.run_status != RunStatus::Running
                     && self.state.run_status != RunStatus::Confirming =>
             {
-                self.toggle_access_mode();
+                self.toggle_access_mode().await?;
             }
             KeyCode::F(9)
                 if self.state.run_status != RunStatus::Running
@@ -326,8 +408,11 @@ impl TuiController {
         if !prompt.is_empty() {
             self.launch_run(prompt.clone(), PromptDispatchPart::raw(&prompt))
                 .await?;
-        } else if let Some(session) = self.state.selected_session() {
-            self.open_session(session.id).await?;
+        } else if let Some(session_id) = self.state.selected_session().map(|session| session.id) {
+            if self.reject_agent_tree_navigation("session") {
+                return Ok(());
+            }
+            self.open_session(session_id).await?;
         }
         Ok(())
     }
@@ -422,8 +507,24 @@ impl TuiController {
                     .config_editor
                     .build_session_override()
                     .map_err(AppRunError::Message)?;
-                self.effective_config = apply_config_patch(self.base_config.clone(), patch);
-                self.state.status_message = Some("applied session override".to_string());
+                let candidate = apply_config_patch(self.base_config.clone(), patch);
+                let durable_access_ready = self
+                    .persist_current_session_access_mode(candidate.permissions.access_mode)
+                    .await;
+                if !commit_tui_effective_config(
+                    &mut self.effective_config,
+                    &self.live_config,
+                    candidate,
+                    durable_access_ready,
+                ) {
+                    return Ok(());
+                }
+                self.state.status_message = Some(if self.state.current_session_id.is_some() {
+                    "applied session override and remembered access mode for this session"
+                        .to_string()
+                } else {
+                    "applied temporary session override".to_string()
+                });
             }
             KeyCode::F(3) => {
                 let message = self
@@ -449,12 +550,17 @@ impl TuiController {
     }
 
     fn answer_permission(&mut self, allow: bool) -> Result<(), AppRunError> {
-        if let Some(response) = self.permission_response.take() {
-            response
-                .send(allow)
-                .map_err(|error| AppRunError::Message(error.to_string()))?;
-        }
+        let request_already_ended = self
+            .permission_response
+            .take()
+            .is_some_and(|response| response.send(allow).is_err());
+        self.pending_permission_request = None;
+        self.pending_permission_request_id = None;
         self.state.clear_permission();
+        if request_already_ended {
+            self.state.status_message =
+                Some("permission request already ended before the response".to_string());
+        }
         Ok(())
     }
 
@@ -462,10 +568,18 @@ impl TuiController {
         if self.state.permission.is_some() {
             self.answer_permission(false)?;
         }
+        let root_cancelled = self.root_run_lifecycle.request_cancel();
         let Some(session_id) = self.state.current_session_id else {
+            if root_cancelled {
+                self.state.run_status = RunStatus::Cancelled;
+                self.state.status_message =
+                    Some("stop requested before run admission completed".to_string());
+                return Ok(());
+            }
             self.state.status_message = Some("no active session to stop".to_string());
             return Ok(());
         };
+        let tree_cancelled = self.app.run_service.cancel_agent_tree(session_id);
         match self
             .app
             .session_service
@@ -477,23 +591,129 @@ impl TuiController {
                 self.state.status_message = Some("stop requested for active run".to_string());
             }
             Err(error) => {
-                self.state.status_message = Some(format!("failed to stop active run: {error}"));
+                if root_cancelled || tree_cancelled {
+                    self.state.run_status = RunStatus::Cancelled;
+                    self.state.status_message = Some("stopped the active agent tree".to_string());
+                } else {
+                    self.state.status_message = Some(format!("failed to stop active run: {error}"));
+                }
             }
         }
         Ok(())
     }
 
-    fn toggle_access_mode(&mut self) {
-        self.effective_config.permissions.access_mode =
-            self.effective_config.permissions.access_mode.next();
-        self.config_editor = ConfigEditorState::from_config(&self.effective_config);
+    fn agent_tree_active(&self) -> bool {
+        self.root_run_lifecycle.is_active()
+            || self.state.current_session_id.is_some_and(|session_id| {
+                self.app
+                    .run_service
+                    .agent_activity_records(session_id)
+                    .iter()
+                    .any(|record| {
+                        matches!(
+                            record.status,
+                            crate::runtime::AgentStatus::PendingInit
+                                | crate::runtime::AgentStatus::Running
+                        )
+                    })
+            })
+    }
+
+    fn reject_agent_tree_navigation(&mut self, target: &str) -> bool {
+        if !self.agent_tree_active() {
+            return false;
+        }
         self.state.status_message = Some(format!(
-            "UI session access mode set to {}",
-            self.effective_config.permissions.access_mode.label()
+            "{target} cannot change while the agent tree is active; press Ctrl+X to stop it first"
         ));
+        true
+    }
+
+    async fn toggle_access_mode(&mut self) -> Result<(), AppRunError> {
+        let access_mode = self.effective_config.permissions.access_mode.next();
+        let session_access_owner = self.state.current_session_id.is_some();
+        if session_access_owner {
+            if !self.persist_current_session_access_mode(access_mode).await {
+                return Ok(());
+            }
+        } else if let Err(error) = ConfigEditorState::remember_global_access_mode(access_mode) {
+            self.state.status_message = Some(format!(
+                "access mode was not changed because it could not be remembered: {error}"
+            ));
+            return Ok(());
+        } else {
+            self.app.config.permissions.access_mode = access_mode;
+            self.base_config.permissions.access_mode = access_mode;
+        }
+        self.apply_access_mode_owner(access_mode);
+        self.state.status_message = Some(if session_access_owner {
+            format!(
+                "session access mode set to {} and remembered for this session",
+                access_mode.label()
+            )
+        } else {
+            format!(
+                "default access mode set to {} and remembered globally",
+                access_mode.label()
+            )
+        });
+        Ok(())
+    }
+
+    async fn persist_current_session_access_mode(
+        &mut self,
+        access_mode: crate::config::AccessMode,
+    ) -> bool {
+        let Some(session_id) = self.state.current_session_id else {
+            return true;
+        };
+        match self
+            .app
+            .session_service
+            .update_root_session_access_mode(session_id, access_mode)
+            .await
+        {
+            Ok(_) => {
+                for session in &mut self.state.sessions {
+                    if session.id == session_id {
+                        session.access_mode = access_mode;
+                    }
+                }
+                for summary in &mut self.state.loaded_sessions {
+                    if summary.session.id == session_id {
+                        summary.session.access_mode = access_mode;
+                    }
+                }
+                true
+            }
+            Err(error) => {
+                self.state.status_message = Some(format!(
+                    "access mode was not changed because session settings could not be saved: {error}"
+                ));
+                false
+            }
+        }
+    }
+
+    fn sync_live_access_mode(&self) {
+        self.live_config
+            .set_access_mode(self.effective_config.permissions.access_mode);
+    }
+
+    fn apply_access_mode_owner(&mut self, access_mode: crate::config::AccessMode) {
+        self.effective_config.permissions.access_mode = access_mode;
+        self.sync_live_access_mode();
+        self.config_editor = ConfigEditorState::from_config(&self.effective_config);
+    }
+
+    fn restore_global_access_mode_owner(&mut self) {
+        self.apply_access_mode_owner(self.base_config.permissions.access_mode);
     }
 
     fn open_workspace_picker(&mut self) {
+        if self.reject_agent_tree_navigation("workspace") {
+            return;
+        }
         self.workspace_picker = build_composer();
         self.workspace_picker
             .insert_str(self.app.workspace.cwd.as_str());
@@ -501,6 +721,10 @@ impl TuiController {
     }
 
     async fn submit_workspace_picker(&mut self) -> Result<(), AppRunError> {
+        if self.reject_agent_tree_navigation("workspace") {
+            self.state.modal = Modal::None;
+            return Ok(());
+        }
         let Some(requested) = self.resolve_workspace_picker_path() else {
             return Ok(());
         };
@@ -517,12 +741,16 @@ impl TuiController {
         self.app = app;
         self.base_config = self.app.config.clone();
         self.effective_config = self.base_config.clone();
+        self.live_config = LiveConfigOverrides::new(self.effective_config.permissions.access_mode);
+        self.root_run_lifecycle = TuiRootRunLifecycle::default();
         self.config_editor = ConfigEditorState::from_config(&self.effective_config);
         self.state = AppState::default();
         self.composer = build_composer();
         self.review_editor = build_composer();
         self.workspace_picker = build_composer();
         self.permission_response = None;
+        self.pending_permission_request = None;
+        self.pending_permission_request_id = None;
         self.preview_entries.clear();
         self.preview_todos.clear();
         self.refresh_sessions().await?;
@@ -587,6 +815,12 @@ impl TuiController {
         if raw_prompt.is_empty() {
             return Ok(());
         }
+        if self.agent_tree_active() {
+            self.state.status_message = Some(
+                "wait for the active agent tree to finish, or press Ctrl+X to stop it".to_string(),
+            );
+            return Ok(());
+        }
         let request_id = self.next_enhance_request_id;
         self.next_enhance_request_id += 1;
         self.state.begin_prompt_enhance(request_id, &raw_prompt);
@@ -642,6 +876,29 @@ impl TuiController {
                 .await?;
             return Ok(());
         }
+        if self.agent_tree_active() {
+            self.state.status_message = Some(
+                "wait for the active agent tree to finish, or press Ctrl+X to stop it".to_string(),
+            );
+            return Ok(());
+        }
+        let run_generation = self.next_root_run_generation;
+        let Some(next_generation) = run_generation.checked_add(1) else {
+            self.state.status_message =
+                Some("TUI run generation is exhausted; restart moyAI".to_string());
+            return Ok(());
+        };
+        let cancel = build_cancel_token();
+        if !self
+            .root_run_lifecycle
+            .begin(run_generation, cancel.clone())
+        {
+            self.state.status_message = Some(
+                "wait for the previous run to finish stopping before starting another".to_string(),
+            );
+            return Ok(());
+        }
+        self.next_root_run_generation = next_generation;
         let request = RunRequest {
             prompt: prompt.clone(),
             session_id: self.state.current_session_id,
@@ -657,32 +914,37 @@ impl TuiController {
             editor_context: Some(self.current_editor_context()),
             review_request,
             image_paths: Vec::new(),
-            cancel: build_cancel_token(),
-            live_config: None,
+            cancel,
+            live_config: Some(self.live_config.clone()),
+            agent_confirmation: None,
+            agent_context: None,
         };
         self.state.push_local_prompt_dispatch(&prompt_dispatch);
         self.composer = build_composer();
         self.review_editor = build_composer();
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
+        let next_permission_request_id = self.next_permission_request_id.clone();
         std::thread::spawn(move || {
+            let mut request = request;
             let mut renderer = TuiRenderer {
                 tx: runtime_tx.clone(),
             };
-            let mut prompt = TuiConfirmationPrompt {
+            let mut prompt = SharedConfirmationPrompt::new(TuiConfirmationPrompt {
                 tx: runtime_tx.clone(),
-            };
+                next_permission_request_id,
+            });
+            request.agent_confirmation = Some(prompt.clone());
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build tui worker runtime");
             runtime.block_on(async move {
-                if let Err(error) = run_service
+                let result = run_service
                     .execute(AppCommand::Run(request), &mut renderer, &mut prompt)
                     .await
-                {
-                    let _ = runtime_tx.send(RuntimeMessage::Finished(Err(error.to_string())));
-                }
+                    .map_err(|error| error.to_string());
+                publish_tui_run_finished(&runtime_tx, run_generation, result);
             });
         });
         Ok(())
@@ -704,6 +966,7 @@ impl TuiController {
         self.state.status_message = Some("stored steer input for the active turn".to_string());
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
+        let next_permission_request_id = self.next_permission_request_id.clone();
         let cwd = self.app.workspace.cwd.clone();
         std::thread::spawn(move || {
             let mut renderer = TuiRenderer {
@@ -711,6 +974,7 @@ impl TuiController {
             };
             let mut prompt_ui = TuiConfirmationPrompt {
                 tx: runtime_tx.clone(),
+                next_permission_request_id,
             };
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -803,22 +1067,58 @@ impl TuiController {
                         self.refresh_current_session_todos().await?;
                     }
                 }
-                RuntimeMessage::Finished(result) => match result {
-                    Ok(summary) => {
-                        self.state.set_summary(summary);
-                        self.refresh_sessions().await?;
-                        if let Some(session_id) = self.state.current_session_id {
-                            self.open_session(session_id).await?;
+                RuntimeMessage::Finished {
+                    run_generation,
+                    result,
+                } => {
+                    let Some(cancelled) = self.root_run_lifecycle.finish(run_generation) else {
+                        continue;
+                    };
+                    match result {
+                        Ok(summary) => {
+                            let child_permission = self
+                                .pending_permission_request
+                                .as_ref()
+                                .filter(|request| request.agent_path.is_some())
+                                .cloned();
+                            self.state.set_summary(summary);
+                            self.refresh_sessions().await?;
+                            if let Some(session_id) = self.state.current_session_id {
+                                self.open_session(session_id).await?;
+                            }
+                            if let Some(request) = child_permission {
+                                self.state.set_permission(&request);
+                            }
+                        }
+                        Err(message) => {
+                            self.state.run_status = tui_terminal_error_status(cancelled);
+                            self.state.status_message = Some(if cancelled {
+                                "run cancelled by user".to_string()
+                            } else {
+                                message
+                            });
                         }
                     }
-                    Err(message) => {
-                        self.state.run_status = RunStatus::Failed;
-                        self.state.status_message = Some(message);
-                    }
-                },
-                RuntimeMessage::Permission(request, response) => {
+                }
+                RuntimeMessage::Permission {
+                    confirmation_id,
+                    request,
+                    response,
+                } => {
                     self.permission_response = Some(response);
+                    self.pending_permission_request = Some(request.clone());
+                    self.pending_permission_request_id = Some(confirmation_id);
                     self.state.set_permission(&request);
+                }
+                RuntimeMessage::PermissionCancelled { confirmation_id } => {
+                    if clear_cancelled_tui_permission(
+                        &mut self.pending_permission_request,
+                        &mut self.pending_permission_request_id,
+                        &mut self.permission_response,
+                        confirmation_id,
+                    ) {
+                        self.state.clear_permission();
+                    }
                 }
                 RuntimeMessage::SteerStored(result) => match result {
                     Ok(()) => {
@@ -860,6 +1160,7 @@ impl TuiController {
 
     async fn open_session(&mut self, session_id: SessionId) -> Result<(), AppRunError> {
         let view = session_view(&self.app.session_service, session_id).await?;
+        self.apply_access_mode_owner(view.session.access_mode);
         self.state
             .load_turn_items(&view.session, &view.turn_items, view.state, view.todos);
         self.state.modal = Modal::None;
@@ -867,6 +1168,9 @@ impl TuiController {
     }
 
     async fn open_or_rejoin_selected_history_session(&mut self) -> Result<(), AppRunError> {
+        if self.reject_agent_tree_navigation("session") {
+            return Ok(());
+        }
         let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
             self.state.status_message = Some("select a session first".to_string());
             return Ok(());
@@ -882,6 +1186,9 @@ impl TuiController {
     }
 
     async fn rejoin_selected_session(&mut self) -> Result<(), AppRunError> {
+        if self.reject_agent_tree_navigation("session") {
+            return Ok(());
+        }
         let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
             self.state.status_message = Some("select a session first".to_string());
             return Ok(());
@@ -905,6 +1212,7 @@ impl TuiController {
             .rejoin_running_session(session_id, 0, 200, 0, 500)
             .await?;
         let todos = self.app.session_service.list_todos(session_id).await?;
+        self.apply_access_mode_owner(rejoin.read.session.access_mode);
         self.state.load_turn_items(
             &rejoin.read.session,
             &rejoin.read.turns.items,
@@ -957,6 +1265,9 @@ impl TuiController {
     }
 
     async fn archive_selected_session(&mut self, archived: bool) -> Result<(), AppRunError> {
+        if self.reject_agent_tree_navigation("session") {
+            return Ok(());
+        }
         let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
             self.state.status_message = Some("select a session first".to_string());
             return Ok(());
@@ -978,11 +1289,15 @@ impl TuiController {
             self.state.sidebar_todos.clear();
             self.state.session_state = None;
             self.state.run_status = RunStatus::Idle;
+            self.restore_global_access_mode_owner();
         }
         self.refresh_sessions().await
     }
 
     async fn rollback_selected_session(&mut self) -> Result<(), AppRunError> {
+        if self.reject_agent_tree_navigation("session") {
+            return Ok(());
+        }
         let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
             self.state.status_message = Some("select a session first".to_string());
             return Ok(());
@@ -1131,6 +1446,7 @@ impl TuiController {
         self.base_config = ConfigLoader::load(&self.app.workspace.root, None)
             .map_err(|error| AppRunError::Message(format!("failed to reload config: {error}")))?;
         self.effective_config = self.base_config.clone();
+        self.sync_live_access_mode();
         self.config_editor = ConfigEditorState::from_config(&self.effective_config);
         Ok(())
     }
@@ -1746,6 +2062,12 @@ impl TuiController {
                 Line::from(""),
                 Line::from("Details:"),
             ];
+            if let Some(identity) = tui_permission_agent_identity(
+                permission.agent_path.as_deref(),
+                permission.agent_task_name.as_deref(),
+            ) {
+                lines.insert(1, Line::from(format!("Requesting agent: {identity}")));
+            }
             if permission.details.is_empty() {
                 lines.push(Line::from("  (none)"));
             } else {
@@ -1800,8 +2122,18 @@ impl TuiController {
 #[derive(Debug)]
 enum RuntimeMessage {
     RunEvent(RunEvent),
-    Finished(Result<RunSummary, String>),
-    Permission(PermissionRequest, mpsc::Sender<bool>),
+    Finished {
+        run_generation: u64,
+        result: Result<RunSummary, String>,
+    },
+    Permission {
+        confirmation_id: u64,
+        request: PermissionRequest,
+        response: mpsc::Sender<bool>,
+    },
+    PermissionCancelled {
+        confirmation_id: u64,
+    },
     SteerStored(Result<(), String>),
     EnhanceFinished {
         request_id: u64,
@@ -1843,10 +2175,8 @@ impl EventRenderer for TuiRenderer {
             .map_err(|error| CliRenderError::Message(error.to_string()))
     }
 
-    fn finish(&mut self, summary: &RunSummary) -> Result<(), CliRenderError> {
-        self.tx
-            .send(RuntimeMessage::Finished(Ok(summary.clone())))
-            .map_err(|error| CliRenderError::Message(error.to_string()))
+    fn finish(&mut self, _summary: &RunSummary) -> Result<(), CliRenderError> {
+        Ok(())
     }
 
     fn render_session_list(&mut self, _sessions: &[SessionRecord]) -> Result<(), CliRenderError> {
@@ -1926,27 +2256,142 @@ impl EventRenderer for TuiRenderer {
     }
 }
 
+fn publish_tui_run_finished(
+    tx: &tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
+    run_generation: u64,
+    result: Result<RunSummary, String>,
+) {
+    let _ = tx.send(RuntimeMessage::Finished {
+        run_generation,
+        result,
+    });
+}
+
+fn tui_terminal_error_status(cancelled: bool) -> RunStatus {
+    if cancelled {
+        RunStatus::Cancelled
+    } else {
+        RunStatus::Failed
+    }
+}
+
 struct TuiConfirmationPrompt {
     tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
+    next_permission_request_id: Arc<AtomicU64>,
 }
 
 impl ConfirmationPrompt for TuiConfirmationPrompt {
     fn confirm(&mut self, request: &PermissionRequest) -> Result<bool, CliPromptError> {
+        self.confirm_with_cancel(request, &CancellationToken::new())
+    }
+
+    fn confirm_with_cancel(
+        &mut self,
+        request: &PermissionRequest,
+        cancel: &CancellationToken,
+    ) -> Result<bool, CliPromptError> {
+        if cancel.is_cancelled() {
+            return Ok(false);
+        }
         let (response_tx, response_rx) = mpsc::channel();
+        let confirmation_id = self
+            .next_permission_request_id
+            .fetch_add(1, Ordering::Relaxed);
         self.tx
-            .send(RuntimeMessage::Permission(request.clone(), response_tx))
+            .send(RuntimeMessage::Permission {
+                confirmation_id,
+                request: request.clone(),
+                response: response_tx,
+            })
             .map_err(|error| CliPromptError::Message(error.to_string()))?;
-        response_rx
-            .recv()
-            .map_err(|error| CliPromptError::Message(error.to_string()))
+        loop {
+            match response_rx.recv_timeout(Duration::from_millis(25)) {
+                Ok(allow) => return Ok(allow),
+                Err(mpsc::RecvTimeoutError::Timeout) if cancel.is_cancelled() => {
+                    let _ = self
+                        .tx
+                        .send(RuntimeMessage::PermissionCancelled { confirmation_id });
+                    return Ok(false);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(CliPromptError::Message(
+                        "TUI permission response channel disconnected".to_string(),
+                    ));
+                }
+            }
+        }
     }
 }
 
+fn tui_permission_agent_identity(
+    agent_path: Option<&str>,
+    agent_task_name: Option<&str>,
+) -> Option<String> {
+    let path = agent_path?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let task_name = agent_task_name.unwrap_or_default().trim();
+    Some(if task_name.is_empty() {
+        path.to_string()
+    } else {
+        format!("{task_name} ({path})")
+    })
+}
+
+fn clear_cancelled_tui_permission(
+    request: &mut Option<PermissionRequest>,
+    pending_confirmation_id: &mut Option<u64>,
+    response: &mut Option<mpsc::Sender<bool>>,
+    expected_confirmation_id: u64,
+) -> bool {
+    if *pending_confirmation_id != Some(expected_confirmation_id) {
+        return false;
+    }
+    *request = None;
+    *pending_confirmation_id = None;
+    *response = None;
+    true
+}
+
 fn setup_terminal() -> io::Result<TerminalHandle> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(stdout))
+    setup_terminal_resources(
+        enable_raw_mode,
+        || {
+            let mut stdout = io::stdout();
+            execute!(stdout, EnterAlternateScreen)
+        },
+        || Terminal::new(CrosstermBackend::new(io::stdout())),
+        || {
+            let mut stdout = io::stdout();
+            execute!(stdout, LeaveAlternateScreen)
+        },
+        disable_raw_mode,
+    )
+}
+
+fn setup_terminal_resources<T>(
+    enable_raw: impl FnOnce() -> io::Result<()>,
+    enter_alternate: impl FnOnce() -> io::Result<()>,
+    construct: impl FnOnce() -> io::Result<T>,
+    leave_alternate: impl FnOnce() -> io::Result<()>,
+    disable_raw: impl FnOnce() -> io::Result<()>,
+) -> io::Result<T> {
+    enable_raw()?;
+    if let Err(error) = enter_alternate() {
+        let _ = leave_alternate();
+        let _ = disable_raw();
+        return Err(error);
+    }
+    match construct() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let _ = leave_alternate();
+            let _ = disable_raw();
+            Err(error)
+        }
+    }
 }
 
 fn restore_terminal(terminal: &mut TerminalHandle) -> io::Result<()> {
@@ -1963,6 +2408,22 @@ fn build_composer() -> TextArea<'static> {
 
 fn is_stop_key(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn key_leaves_current_task(key: KeyEvent, route: Route) -> bool {
+    if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+    if matches!(key.code, KeyCode::F(1) | KeyCode::F(2) | KeyCode::F(4)) {
+        return true;
+    }
+    route == Route::History
+        && (matches!(key.code, KeyCode::Up | KeyCode::Down)
+            || (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL))
+            || matches!(
+                key.code,
+                KeyCode::Char('a') | KeyCode::Char('u') | KeyCode::Char('r') | KeyCode::Char('z')
+            ))
 }
 
 fn ctrl_enter_available(route: Route, status: RunStatus) -> bool {
@@ -2498,7 +2959,142 @@ fn event_requires_sidebar_refresh(event: &RunEvent) -> bool {
 
 #[cfg(test)]
 mod key_tests {
+    use camino::Utf8PathBuf;
+
     use super::*;
+
+    async fn tui_controller_with_session(
+        test_name: &str,
+    ) -> (tempfile::TempDir, TuiController, SessionId) {
+        use crate::session::{SessionSelector, SessionStartRequest};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir =
+            Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data root");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let session = app
+            .session_service
+            .start_or_resume(
+                SessionStartRequest {
+                    selector: SessionSelector::New,
+                    title: Some(test_name.to_string()),
+                    cwd: app.workspace.cwd.clone(),
+                    model: app.config.model.model.clone(),
+                    base_url: app.config.model.base_url.clone(),
+                    access_mode: crate::config::AccessMode::Default,
+                },
+                app.workspace.clone(),
+            )
+            .await
+            .expect("session");
+        let session_id = session.session.id;
+        let mut controller = TuiController::new(
+            app,
+            TuiArgs {
+                directory: Some(root),
+                session_id: None,
+                continue_last: false,
+            },
+        )
+        .await
+        .expect("controller");
+        controller.state.current_session_id = Some(session_id);
+        (temp, controller, session_id)
+    }
+
+    fn set_tui_access_mode_field(controller: &mut TuiController, value: &str) {
+        let field = controller
+            .config_editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == crate::tui::config_editor::ConfigField::AccessMode)
+            .expect("access mode field");
+        field.value = value.to_string();
+    }
+
+    fn tui_access_mode_field(controller: &TuiController) -> &str {
+        controller
+            .config_editor
+            .fields
+            .iter()
+            .find(|field| field.key == crate::tui::config_editor::ConfigField::AccessMode)
+            .expect("access mode field")
+            .value
+            .as_str()
+    }
+
+    fn tui_run_config(controller: &TuiController) -> ResolvedConfig {
+        apply_config_patch(
+            controller.base_config.clone(),
+            full_effective_override(&controller.effective_config),
+        )
+    }
+
+    fn append_tui_user_history(controller: &TuiController, session_id: SessionId, text: &str) {
+        use crate::protocol::ProtocolEventStore as _;
+
+        controller
+            .app
+            .store
+            .protocol_event_store()
+            .append_history_item(&crate::protocol::HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id,
+                turn_id: crate::protocol::TurnId::new(),
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::Message {
+                    message_id: None,
+                    role: crate::session::MessageRole::User,
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: text.to_string(),
+                    }],
+                },
+            })
+            .expect("TUI history item");
+    }
+
+    fn test_tui_permission(summary: &str) -> PermissionRequest {
+        PermissionRequest {
+            access: crate::workspace::AccessKind::Shell,
+            summary: summary.to_string(),
+            details: Vec::new(),
+            targets: vec![camino::Utf8PathBuf::from("C:/workspace")],
+            outside_workspace: false,
+            risks: Vec::new(),
+            agent_path: Some(format!("/root/{summary}")),
+            agent_task_name: Some(summary.to_string()),
+        }
+    }
+
+    fn recv_tui_runtime_message(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<RuntimeMessage>,
+    ) -> RuntimeMessage {
+        for _ in 0..200 {
+            match receiver.try_recv() {
+                Ok(message) => return message,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("TUI runtime channel disconnected")
+                }
+            }
+        }
+        panic!("timed out waiting for TUI runtime message")
+    }
 
     #[test]
     fn running_session_accepts_ctrl_enter_for_steer() {
@@ -2517,5 +3113,638 @@ mod key_tests {
             KeyCode::Char('x'),
             KeyModifiers::NONE,
         )));
+    }
+
+    #[test]
+    fn pending_tui_root_run_cancel_is_owned_until_matching_finish() {
+        let token = CancellationToken::new();
+        let mut lifecycle = TuiRootRunLifecycle::default();
+        assert!(lifecycle.begin(7, token.clone()));
+        assert!(lifecycle.is_active());
+
+        assert!(lifecycle.request_cancel());
+        assert!(token.is_cancelled());
+        assert!(
+            !lifecycle.begin(8, CancellationToken::new()),
+            "a cancelled run remains the owner until its matching finish"
+        );
+        assert_eq!(lifecycle.finish(6), None);
+        assert!(lifecycle.is_active());
+        assert_eq!(lifecycle.finish(7), Some(true));
+        assert!(!lifecycle.is_active());
+        assert!(!lifecycle.request_cancel());
+        assert_eq!(tui_terminal_error_status(true), RunStatus::Cancelled);
+        assert_eq!(tui_terminal_error_status(false), RunStatus::Failed);
+    }
+
+    #[test]
+    fn tui_renderer_defers_root_completion_until_worker_settlement() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TuiRenderer { tx: tx.clone() };
+        let summary = RunSummary {
+            session_id: SessionId::new(),
+            assistant_message_id: None,
+            status: crate::session::SessionStatus::Completed,
+            finish_reason: Some(crate::session::FinishReason::Stop),
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        };
+
+        renderer.finish(&summary).expect("renderer finish");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        publish_tui_run_finished(&tx, 9, Ok(summary.clone()));
+        assert!(matches!(
+            rx.try_recv().expect("worker settlement"),
+            RuntimeMessage::Finished {
+                run_generation: 9,
+                result: Ok(received),
+            } if received.session_id == summary.session_id
+        ));
+    }
+
+    #[test]
+    fn task_navigation_keys_are_classified_without_blocking_session_steer() {
+        assert!(key_leaves_current_task(
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+            Route::Session,
+        ));
+        assert!(key_leaves_current_task(
+            KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE),
+            Route::Session,
+        ));
+        assert!(key_leaves_current_task(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            Route::Session,
+        ));
+        assert!(key_leaves_current_task(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            Route::History,
+        ));
+        assert!(!key_leaves_current_task(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            Route::Session,
+        ));
+        assert!(!key_leaves_current_task(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            Route::Session,
+        ));
+    }
+
+    #[test]
+    fn tui_permission_identity_includes_task_name_and_agent_path() {
+        assert_eq!(
+            tui_permission_agent_identity(Some("/root/reviewer"), Some("reviewer")).as_deref(),
+            Some("reviewer (/root/reviewer)")
+        );
+        assert_eq!(
+            tui_permission_agent_identity(Some("/root/reviewer"), None).as_deref(),
+            Some("/root/reviewer")
+        );
+    }
+
+    #[test]
+    fn cancelled_tui_permission_clears_by_id_and_advances_broker() {
+        let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let broker = SharedConfirmationPrompt::new(TuiConfirmationPrompt {
+            tx: runtime_tx,
+            next_permission_request_id: Arc::new(AtomicU64::new(11)),
+        });
+
+        let first_cancel = CancellationToken::new();
+        let (first_done_tx, first_done_rx) = mpsc::sync_channel(1);
+        let mut first_prompt = broker.clone();
+        let first_wait_cancel = first_cancel.clone();
+        std::thread::spawn(move || {
+            let result =
+                first_prompt.confirm_with_cancel(&test_tui_permission("first"), &first_wait_cancel);
+            let _ = first_done_tx.send(result);
+        });
+        let (first_id, first_response) = match recv_tui_runtime_message(&mut runtime_rx) {
+            RuntimeMessage::Permission {
+                confirmation_id,
+                response,
+                ..
+            } => (confirmation_id, response),
+            _ => panic!("expected first TUI permission"),
+        };
+        first_cancel.cancel();
+        match recv_tui_runtime_message(&mut runtime_rx) {
+            RuntimeMessage::PermissionCancelled { confirmation_id } => {
+                assert_eq!(confirmation_id, first_id)
+            }
+            _ => panic!("expected TUI permission cancellation"),
+        }
+        assert!(
+            !first_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first TUI confirmation result")
+                .expect("first TUI confirmation")
+        );
+
+        let mut pending_request = Some(test_tui_permission("first"));
+        let mut pending_id = Some(first_id);
+        let mut pending_response = Some(first_response);
+        assert!(!clear_cancelled_tui_permission(
+            &mut pending_request,
+            &mut pending_id,
+            &mut pending_response,
+            first_id + 1,
+        ));
+        assert_eq!(pending_id, Some(first_id));
+        assert!(clear_cancelled_tui_permission(
+            &mut pending_request,
+            &mut pending_id,
+            &mut pending_response,
+            first_id,
+        ));
+
+        let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
+        let mut second_prompt = broker;
+        std::thread::spawn(move || {
+            let result = second_prompt.confirm(&test_tui_permission("second"));
+            let _ = second_done_tx.send(result);
+        });
+        let (second_id, second_response) = match recv_tui_runtime_message(&mut runtime_rx) {
+            RuntimeMessage::Permission {
+                confirmation_id,
+                response,
+                ..
+            } => (confirmation_id, response),
+            _ => panic!("expected second TUI permission"),
+        };
+        assert!(second_id > first_id);
+        second_response
+            .send(true)
+            .expect("answer second TUI permission");
+        assert!(
+            second_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second TUI confirmation result")
+                .expect("second TUI confirmation")
+        );
+    }
+
+    #[tokio::test]
+    async fn f2_session_apply_persists_access_before_committing_effective_and_live_state() {
+        use crate::session::SessionRepository as _;
+
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("f2-access-success").await;
+        set_tui_access_mode_field(&mut controller, "full_access");
+
+        controller
+            .handle_config_editor_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .await
+            .expect("F2 apply");
+
+        assert_eq!(
+            controller.effective_config.permissions.access_mode,
+            crate::config::AccessMode::FullAccess
+        );
+        assert_eq!(
+            controller.live_config.access_mode(),
+            crate::config::AccessMode::FullAccess
+        );
+        assert_eq!(
+            controller
+                .app
+                .store
+                .session_repo()
+                .get_session(session_id)
+                .await
+                .expect("durable session")
+                .access_mode,
+            crate::config::AccessMode::FullAccess
+        );
+
+        assert_eq!(
+            controller
+                .app
+                .session_service
+                .get_session(session_id)
+                .await
+                .expect("reopened durable session")
+                .access_mode,
+            crate::config::AccessMode::FullAccess,
+            "reopen reads the persisted session access mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn archiving_current_tui_session_restores_global_access_owner_for_the_next_run() {
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("archive-access-owner").await;
+        let global_access_mode = crate::config::AccessMode::Default;
+        let session_access_mode = crate::config::AccessMode::FullAccess;
+        controller.app.config.permissions.access_mode = global_access_mode;
+        controller.base_config.permissions.access_mode = global_access_mode;
+        controller.apply_access_mode_owner(global_access_mode);
+        controller
+            .app
+            .session_service
+            .update_root_session_access_mode(session_id, session_access_mode)
+            .await
+            .expect("session access owner");
+        append_tui_user_history(&controller, session_id, "archive current session");
+        controller
+            .open_session(session_id)
+            .await
+            .expect("open full-access session");
+        assert_eq!(
+            controller.effective_config.permissions.access_mode,
+            session_access_mode
+        );
+
+        controller
+            .archive_selected_session(true)
+            .await
+            .expect("archive current session");
+
+        assert_eq!(controller.state.current_session_id, None);
+        assert_eq!(
+            controller.effective_config.permissions.access_mode,
+            global_access_mode
+        );
+        assert_eq!(controller.live_config.access_mode(), global_access_mode);
+        assert_eq!(
+            tui_access_mode_field(&controller),
+            global_access_mode.as_str()
+        );
+        assert_eq!(
+            controller.base_config.permissions.access_mode,
+            global_access_mode
+        );
+        assert_eq!(
+            controller.app.config.permissions.access_mode,
+            global_access_mode
+        );
+        assert_eq!(
+            tui_run_config(&controller).permissions.access_mode,
+            global_access_mode
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_current_tui_archive_preserves_session_access_owner() {
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("archive-access-failure").await;
+        let global_access_mode = crate::config::AccessMode::Default;
+        let session_access_mode = crate::config::AccessMode::FullAccess;
+        controller.app.config.permissions.access_mode = global_access_mode;
+        controller.base_config.permissions.access_mode = global_access_mode;
+        controller
+            .app
+            .session_service
+            .update_root_session_access_mode(session_id, session_access_mode)
+            .await
+            .expect("session access owner");
+        append_tui_user_history(&controller, session_id, "archive must fail");
+        controller
+            .open_session(session_id)
+            .await
+            .expect("open full-access session");
+        controller
+            .app
+            .store
+            .session_repo()
+            .admit_session_run(session_id)
+            .await
+            .expect("active session admission")
+            .expect("active session admitted");
+
+        assert!(controller.archive_selected_session(true).await.is_err());
+
+        assert_eq!(controller.state.current_session_id, Some(session_id));
+        assert_eq!(
+            controller.effective_config.permissions.access_mode,
+            session_access_mode
+        );
+        assert_eq!(controller.live_config.access_mode(), session_access_mode);
+        assert_eq!(
+            tui_access_mode_field(&controller),
+            session_access_mode.as_str()
+        );
+        assert_eq!(
+            tui_run_config(&controller).permissions.access_mode,
+            session_access_mode
+        );
+        assert_eq!(
+            controller.base_config.permissions.access_mode,
+            global_access_mode
+        );
+    }
+
+    #[tokio::test]
+    async fn rejoining_another_active_tui_root_applies_its_durable_access_owner() {
+        use crate::protocol::ProtocolEventStore as _;
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, mut controller, session_a_id) =
+            tui_controller_with_session("rejoin-access-session-a").await;
+        let global_access_mode = crate::config::AccessMode::Default;
+        let session_a_access_mode = crate::config::AccessMode::FullAccess;
+        let session_b_access_mode = crate::config::AccessMode::AutoReview;
+        controller.app.config.permissions.access_mode = global_access_mode;
+        controller.base_config.permissions.access_mode = global_access_mode;
+        controller
+            .app
+            .session_service
+            .update_root_session_access_mode(session_a_id, session_a_access_mode)
+            .await
+            .expect("session A access owner");
+        append_tui_user_history(&controller, session_a_id, "session A context");
+        controller
+            .open_session(session_a_id)
+            .await
+            .expect("open session A");
+        let session_a = controller
+            .app
+            .session_service
+            .get_session(session_a_id)
+            .await
+            .expect("session A");
+        let repository = controller.app.store.session_repo();
+        let session_b = repository
+            .create_session(NewSession {
+                project_id: session_a.project_id,
+                title: "active session B".to_string(),
+                cwd: session_a.cwd,
+                model: session_a.model,
+                base_url: session_a.base_url,
+                access_mode: session_b_access_mode,
+            })
+            .await
+            .expect("session B");
+        let turn_id = crate::protocol::TurnId::new();
+        controller
+            .app
+            .store
+            .protocol_event_store()
+            .append_history_item(&crate::protocol::HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id: session_b.id,
+                turn_id,
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::Message {
+                    message_id: None,
+                    role: crate::session::MessageRole::User,
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: "active session B context".to_string(),
+                    }],
+                },
+            })
+            .expect("session B history");
+        let admission_id = repository
+            .admit_session_run(session_b.id)
+            .await
+            .expect("session B admission")
+            .expect("session B admitted");
+        assert!(
+            repository
+                .activate_admitted_turn(session_b.id, &admission_id, turn_id)
+                .await
+                .expect("activate session B turn")
+        );
+
+        controller
+            .rejoin_session(session_b.id)
+            .await
+            .expect("rejoin session B");
+
+        assert_eq!(controller.state.current_session_id, Some(session_b.id));
+        assert_eq!(
+            controller.effective_config.permissions.access_mode,
+            session_b_access_mode
+        );
+        assert_eq!(controller.live_config.access_mode(), session_b_access_mode);
+        assert_eq!(
+            tui_access_mode_field(&controller),
+            session_b_access_mode.as_str()
+        );
+        assert_eq!(
+            tui_run_config(&controller).permissions.access_mode,
+            session_b_access_mode
+        );
+        assert_eq!(
+            repository
+                .get_session(session_a_id)
+                .await
+                .expect("unchanged session A")
+                .access_mode,
+            session_a_access_mode
+        );
+        assert_eq!(
+            repository
+                .get_session(session_b.id)
+                .await
+                .expect("durable session B")
+                .access_mode,
+            session_b_access_mode
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_child_session_rejects_f2_and_f8_access_changes_without_live_drift() {
+        use crate::protocol::ProtocolEventStore as _;
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, controller, root_session_id) =
+            tui_controller_with_session("child-access-owner").await;
+        let root_session = controller
+            .app
+            .session_service
+            .get_session(root_session_id)
+            .await
+            .expect("root session");
+        let repository = controller.app.store.session_repo();
+        let child = repository
+            .create_session(NewSession {
+                project_id: root_session.project_id,
+                title: "child".to_string(),
+                cwd: root_session.cwd.clone(),
+                model: root_session.model.clone(),
+                base_url: root_session.base_url.clone(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("child session");
+        repository
+            .insert_session_spawn_edge(
+                root_session_id,
+                root_session_id,
+                child.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("child edge");
+        controller
+            .app
+            .store
+            .protocol_event_store()
+            .append_history_item(&crate::protocol::HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id: child.id,
+                turn_id: crate::protocol::TurnId::new(),
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::Message {
+                    message_id: None,
+                    role: crate::session::MessageRole::User,
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: "child context".to_string(),
+                    }],
+                },
+            })
+            .expect("child history");
+        let mut controller = TuiController::new(
+            controller.app.clone(),
+            TuiArgs {
+                directory: Some(root_session.cwd),
+                session_id: Some(child.id),
+                continue_last: false,
+            },
+        )
+        .await
+        .expect("explicit child controller");
+        set_tui_access_mode_field(&mut controller, "full_access");
+
+        controller
+            .handle_config_editor_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .await
+            .expect("F2 rejection");
+        assert_eq!(
+            controller.effective_config.permissions.access_mode,
+            crate::config::AccessMode::Default
+        );
+        assert_eq!(
+            controller.live_config.access_mode(),
+            crate::config::AccessMode::Default
+        );
+
+        controller.toggle_access_mode().await.expect("F8 rejection");
+        assert_eq!(
+            controller.effective_config.permissions.access_mode,
+            crate::config::AccessMode::Default
+        );
+        assert_eq!(
+            controller.live_config.access_mode(),
+            crate::config::AccessMode::Default
+        );
+        assert_eq!(
+            repository
+                .get_session(child.id)
+                .await
+                .expect("durable child")
+                .access_mode,
+            crate::config::AccessMode::Default
+        );
+        assert!(
+            controller
+                .state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("child agent session"))
+        );
+    }
+
+    #[test]
+    fn f2_session_apply_keeps_effective_and_live_state_when_persistence_fails() {
+        let mut effective = ResolvedConfig::default();
+        effective.permissions.access_mode = crate::config::AccessMode::Default;
+        let live = LiveConfigOverrides::new(crate::config::AccessMode::Default);
+        let mut candidate = effective.clone();
+        candidate.permissions.access_mode = crate::config::AccessMode::FullAccess;
+
+        assert!(!commit_tui_effective_config(
+            &mut effective,
+            &live,
+            candidate,
+            false,
+        ));
+        assert_eq!(
+            effective.permissions.access_mode,
+            crate::config::AccessMode::Default
+        );
+        assert_eq!(live.access_mode(), crate::config::AccessMode::Default);
+    }
+
+    #[test]
+    fn terminal_setup_rolls_back_partial_resource_acquisition() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result: io::Result<()> = setup_terminal_resources(
+            || {
+                events.borrow_mut().push("enable_raw");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("enter_alt");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("construct");
+                Err(io::Error::other("construct failed"))
+            },
+            || {
+                events.borrow_mut().push("leave_alt");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("disable_raw");
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                "enable_raw",
+                "enter_alt",
+                "construct",
+                "leave_alt",
+                "disable_raw"
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_setup_rolls_back_when_entering_alternate_screen_fails() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result: io::Result<()> = setup_terminal_resources(
+            || {
+                events.borrow_mut().push("enable_raw");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("enter_alt");
+                Err(io::Error::other("enter failed"))
+            },
+            || {
+                events.borrow_mut().push("construct");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("leave_alt");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("disable_raw");
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            events.into_inner(),
+            vec!["enable_raw", "enter_alt", "leave_alt", "disable_raw"]
+        );
     }
 }

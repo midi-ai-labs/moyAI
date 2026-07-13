@@ -40,12 +40,16 @@ pub use legacy_control::{
 pub use projection::{
     ProtocolRunEventProjection, filechange_item_projection_preserves_call_id_fixture_passes,
     pending_tool_lifecycle_does_not_fabricate_blocked_action_fixture_passes,
-    project_protocol_run_event, project_turn_item_for_run_event,
+    project_inter_agent_communication, project_protocol_run_event, project_sub_agent_activity,
+    project_turn_item_for_run_event,
     tool_output_projection_preserves_blocked_action_fixture_passes,
 };
 pub use recording::ProtocolRecordingSink;
 pub use store::{ProtocolEventStore, SqliteProtocolEventStore};
-pub(crate) use store::{insert_event_bundle_in_transaction, latest_turn_position_for_session};
+pub(crate) use store::{
+    fork_canonical_items_in_transaction, insert_event_bundle_in_transaction,
+    latest_turn_position_for_session,
+};
 
 macro_rules! protocol_id {
     ($name:ident) => {
@@ -425,6 +429,22 @@ pub struct RuntimeEvent {
     pub msg: RuntimeEventMsg,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubAgentActivityKind {
+    Started,
+    Interacted,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterAgentCommunication {
+    pub author: String,
+    pub recipient: String,
+    pub content: String,
+    pub trigger_turn: bool,
+}
+
 impl RuntimeEvent {
     pub fn terminal_status(&self) -> Option<TurnTerminalStatus> {
         match &self.msg {
@@ -454,6 +474,15 @@ pub enum RuntimeEventMsg {
         item_count: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_user_message_id: Option<String>,
+    },
+    InterAgentCommunicationReceived {
+        communication: InterAgentCommunication,
+    },
+    SubAgentActivity {
+        activity_id: String,
+        agent_session_id: SessionId,
+        agent_path: String,
+        activity_kind: SubAgentActivityKind,
     },
     UserMessageStored {
         message_id: MessageId,
@@ -594,6 +623,15 @@ pub enum HistoryItemPayload {
         additional_context: BTreeMap<String, AdditionalContextEntry>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_user_message_id: Option<String>,
+    },
+    InterAgentCommunication {
+        communication: InterAgentCommunication,
+    },
+    SubAgentActivity {
+        activity_id: String,
+        agent_session_id: SessionId,
+        agent_path: String,
+        activity_kind: SubAgentActivityKind,
     },
     Message {
         message_id: Option<MessageId>,
@@ -739,7 +777,8 @@ impl HistoryItemPayload {
             Self::Message {
                 role: MessageRole::Assistant,
                 ..
-            } => HistoryItemAuthorityRole::AssistantOutput,
+            }
+            | Self::InterAgentCommunication { .. } => HistoryItemAuthorityRole::AssistantOutput,
             Self::Reasoning { .. } => HistoryItemAuthorityRole::ReasoningTrace,
             Self::Error { .. } => HistoryItemAuthorityRole::RuntimeError,
             Self::ToolCall { .. } => HistoryItemAuthorityRole::ToolCall,
@@ -750,6 +789,7 @@ impl HistoryItemPayload {
                 HistoryItemAuthorityRole::RuntimeDiagnostic
             }
             Self::Continuation { .. } => HistoryItemAuthorityRole::RuntimeControl,
+            Self::SubAgentActivity { .. } => HistoryItemAuthorityRole::RuntimeControl,
             Self::StateProjection { .. } => HistoryItemAuthorityRole::RuntimeProjection,
             Self::SessionState { .. } => HistoryItemAuthorityRole::StateCache,
             Self::ApprovalDecision { .. } => HistoryItemAuthorityRole::ApprovalEvidence,
@@ -766,6 +806,7 @@ impl HistoryItemPayload {
             Self::UserTurn { .. }
             | Self::SteerTurn { .. }
             | Self::Message { .. }
+            | Self::InterAgentCommunication { .. }
             | Self::ToolCall { .. }
             | Self::ToolOutput { .. } => true,
             Self::RejectedToolProposal { proposal } => {
@@ -1114,6 +1155,15 @@ pub enum TurnItemPayload {
     SteerMessage {
         text: String,
     },
+    InterAgentCommunication {
+        communication: InterAgentCommunication,
+    },
+    SubAgentActivity {
+        activity_id: String,
+        agent_session_id: SessionId,
+        agent_path: String,
+        activity_kind: SubAgentActivityKind,
+    },
     AgentMessage {
         text: String,
     },
@@ -1192,13 +1242,17 @@ impl TurnItemPayload {
             Self::UserMessage { .. } | Self::SteerMessage { .. } => {
                 TurnItemProjectionRole::UserVisibleMessage
             }
-            Self::AgentMessage { .. } => TurnItemProjectionRole::AssistantVisibleMessage,
+            Self::AgentMessage { .. } | Self::InterAgentCommunication { .. } => {
+                TurnItemProjectionRole::AssistantVisibleMessage
+            }
             Self::Reasoning { .. } => TurnItemProjectionRole::ReasoningTrace,
             Self::Plan { .. }
             | Self::PromptDispatch { .. }
             | Self::State { .. }
             | Self::WorldState { .. } => TurnItemProjectionRole::RuntimeProjection,
-            Self::LifecycleGuard { .. } => TurnItemProjectionRole::RuntimeControl,
+            Self::LifecycleGuard { .. } | Self::SubAgentActivity { .. } => {
+                TurnItemProjectionRole::RuntimeControl
+            }
             Self::ToolStatus { .. } => TurnItemProjectionRole::ToolLifecycleEvidence,
             Self::FileChange { .. } => TurnItemProjectionRole::FileEvidence,
             Self::ContextCompaction { .. } => TurnItemProjectionRole::MemoryContinuity,

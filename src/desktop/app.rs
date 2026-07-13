@@ -4,13 +4,16 @@ use std::io::Write;
 use std::path::{Component, Path};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::app::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
-use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionSteerRequest};
-use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode};
+use crate::app::{
+    AgentActivityRecord, App, AppBootstrap, AppCommand, ReviewRequest, RunRequest,
+    SessionSteerRequest,
+};
+use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode, SharedConfirmationPrompt};
 use crate::config::loader::global_config_path;
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::{PartialModelConfig, PartialResolvedConfig, full_effective_override};
@@ -22,7 +25,7 @@ use crate::llm::{
     check_model_availability, extra_body_with_num_ctx, fetch_provider_model_infos,
     normalize_provider_base_url,
 };
-use crate::runtime::{LiveConfigOverrides, SystemClock, build_cancel_token};
+use crate::runtime::{AgentStatus, LiveConfigOverrides, SystemClock, build_cancel_token};
 use crate::session::markdown::{
     MarkdownExportEvent, MarkdownMetadataLine, MarkdownTerminalStatus,
     render_codex_turn_block_markdown,
@@ -33,6 +36,7 @@ use crate::session::{
     history_markdown_file_name,
 };
 use crate::tool::PermissionRequest;
+use crate::tui::config_editor::{ConfigEditorState, ConfigField};
 use crate::workspace::project::normalize_path;
 use tauri::Manager;
 use tempfile::NamedTempFile;
@@ -43,7 +47,7 @@ use super::async_ops::{
     DesktopAsyncOperationId, LatestRequestId, LatestRequestTracker, SessionSearchRequestId,
     SessionSearchRequestTracker,
 };
-use super::models::DesktopTranscriptRow;
+use super::models::{DesktopSnapshot, DesktopTranscriptRow};
 use super::navigation::NavigationRequestId;
 use super::preferences::DesktopPreferences;
 use super::query::{
@@ -52,18 +56,32 @@ use super::query::{
     load_snapshot_for_session_search,
 };
 use super::state::DesktopState;
-use super::web_model::{DesktopWebState, desktop_web_state};
+use super::web_model::{
+    DesktopRuntimeProjection, DesktopWebState, access_runtime_allows_mutation,
+    access_runtime_owner_token, agent_activity_projection, desktop_web_state,
+    navigation_admission_blocker,
+};
 
 enum RuntimeMessage {
-    RunEvent(RunEvent),
-    Finished(Result<RunSummary, String>),
+    RunEvent {
+        run_generation: u64,
+        event: RunEvent,
+    },
+    Finished {
+        run_generation: u64,
+        result: Result<RunSummary, String>,
+    },
     Permission {
         confirmation_id: u64,
         request: PermissionRequest,
         response: mpsc::Sender<bool>,
     },
+    PermissionCancelled {
+        confirmation_id: u64,
+    },
     EnhanceFinished {
         request_id: u64,
+        target: DraftRequestTarget,
         result: Result<String, String>,
     },
     SnapshotLoaded {
@@ -72,9 +90,14 @@ enum RuntimeMessage {
         result: Result<super::models::DesktopSnapshot, String>,
     },
     SessionLoaded {
-        request_id: Option<NavigationRequestId>,
+        request_id: NavigationRequestId,
         session_id: SessionId,
         reason: SessionLoadReason,
+        result: Result<LoadedSession, String>,
+    },
+    CurrentSessionRefreshed {
+        request_id: LatestRequestId,
+        target: SessionRefreshRequestTarget,
         result: Result<LoadedSession, String>,
     },
     SessionDeleted {
@@ -82,16 +105,16 @@ enum RuntimeMessage {
         result: Result<super::models::DesktopSnapshot, String>,
     },
     SessionArchived {
-        session_id: SessionId,
+        target: SessionMutationRequestTarget,
         archived: bool,
         result: Result<super::models::DesktopSnapshot, String>,
     },
     SessionRolledBack {
-        session_id: SessionId,
+        target: SessionMutationRequestTarget,
         result: Result<DesktopRollbackLoaded, String>,
     },
     SessionOperationApplied {
-        session_id: SessionId,
+        target: SessionMutationRequestTarget,
         result: Result<DesktopSessionOperationLoaded, String>,
     },
     TurnPageLoaded {
@@ -104,29 +127,39 @@ enum RuntimeMessage {
         target: SessionRefreshRequestTarget,
         result: Result<LoadedSession, String>,
     },
+    DurableAgentActivityRefreshed {
+        request_id: LatestRequestId,
+        target: SessionRefreshRequestTarget,
+        result: Result<Vec<AgentActivityRecord>, String>,
+    },
     SessionSearchLoaded {
         request_id: SessionSearchRequestId,
         result: Result<super::models::DesktopSnapshot, String>,
     },
     ProjectDeleted {
-        project_id: ProjectId,
-        project_root: Utf8PathBuf,
+        target: ProjectDeleteRequestTarget,
         result: Result<WorkspaceLoadResult, String>,
     },
     CurrentTodosLoaded {
-        session_id: SessionId,
+        request_id: LatestRequestId,
+        target: SessionRefreshRequestTarget,
         result: Result<Vec<TodoItem>, String>,
     },
     ModelCatalogLoaded {
         request_id: LatestRequestId,
         target: ProviderCatalogRequestTarget,
-        result: Result<DesktopProviderModelLoad, String>,
+        result: Result<Vec<ProviderModelInfo>, String>,
+    },
+    StartupProviderChecked {
+        request_id: LatestRequestId,
+        target: ProviderReadinessRequestTarget,
+        report: ModelAvailabilityReport,
     },
     StartupDoclingChecked {
-        requested_base_url: String,
+        request_id: LatestRequestId,
+        target: DoclingRequestTarget,
         result: Result<(), String>,
     },
-    SteerStored(Result<(), String>),
     HistoryExported {
         request_id: LatestRequestId,
         target: HistoryExportRequestTarget,
@@ -140,18 +173,151 @@ enum RuntimeMessage {
         request_id: NavigationRequestId,
         result: Result<WorkspaceLoadResult, String>,
     },
-}
-
-#[derive(Debug, Clone)]
-struct DesktopProviderModelLoad {
-    models: Vec<ProviderModelInfo>,
-    availability_report: ModelAvailabilityReport,
+    AccessModePersisted {
+        request_id: LatestRequestId,
+        target: AccessModePersistenceTarget,
+        phase: AccessModePersistencePhase,
+        worker: Arc<AccessModePersistenceWorker>,
+        result: Result<Utf8PathBuf, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SnapshotRequestTarget {
     workspace_root: Utf8PathBuf,
     selected_session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccessModePersistenceTarget {
+    operation_id: DesktopAsyncOperationId,
+    workspace_root: Utf8PathBuf,
+    session_id: Option<SessionId>,
+    config_generation: u64,
+    root_run_generation: Option<u64>,
+    runtime_owner_token: String,
+    old_global_access_mode: crate::config::AccessMode,
+    old_effective_access_mode: crate::config::AccessMode,
+    access_mode: crate::config::AccessMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessModePersistencePhase {
+    InitialOwners,
+    AdoptedSession { session_id: SessionId },
+}
+
+struct PendingAccessModeAdoption {
+    request_id: LatestRequestId,
+    target: AccessModePersistenceTarget,
+    remembered_path: Utf8PathBuf,
+    worker: Arc<AccessModePersistenceWorker>,
+}
+
+type CompareAndSetGlobalAccessMode = Box<
+    dyn FnMut(
+            crate::config::AccessMode,
+            crate::config::AccessMode,
+        ) -> Result<Option<Utf8PathBuf>, String>
+        + Send,
+>;
+type PersistRootSessionAccessMode =
+    Box<dyn FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String> + Send>;
+
+struct AccessModePersistenceWorker {
+    compare_and_set_global: Mutex<CompareAndSetGlobalAccessMode>,
+    persist_session: Mutex<Option<PersistRootSessionAccessMode>>,
+}
+
+impl AccessModePersistenceWorker {
+    fn new<CompareAndSetGlobal, PersistSession>(
+        compare_and_set_global: CompareAndSetGlobal,
+        persist_session: PersistSession,
+    ) -> Self
+    where
+        CompareAndSetGlobal: FnMut(
+                crate::config::AccessMode,
+                crate::config::AccessMode,
+            ) -> Result<Option<Utf8PathBuf>, String>
+            + Send
+            + 'static,
+        PersistSession:
+            FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String> + Send + 'static,
+    {
+        Self {
+            compare_and_set_global: Mutex::new(Box::new(compare_and_set_global)),
+            persist_session: Mutex::new(Some(Box::new(persist_session))),
+        }
+    }
+
+    fn persist_initial_owners(
+        &self,
+        target: &AccessModePersistenceTarget,
+    ) -> Result<Utf8PathBuf, String> {
+        persist_desktop_access_mode_owners(
+            target.old_global_access_mode,
+            target.access_mode,
+            target.session_id,
+            |expected, access_mode| self.compare_and_set_global(expected, access_mode),
+            |session_id, access_mode| self.persist_session(session_id, access_mode),
+        )
+    }
+
+    fn persist_adopted_session(
+        &self,
+        target: &AccessModePersistenceTarget,
+        session_id: SessionId,
+        remembered_path: Utf8PathBuf,
+    ) -> Result<Utf8PathBuf, String> {
+        if let Err(session_error) = self.persist_session(session_id, target.access_mode) {
+            return match self
+                .compare_and_set_global(target.access_mode, target.old_global_access_mode)
+            {
+                Ok(Some(_)) => Err(format!(
+                    "adopted session access mode update failed and the global field was restored: {session_error}"
+                )),
+                Ok(None) => Err(format!(
+                    "adopted session access mode update failed; the global field changed again and was not overwritten: {session_error}"
+                )),
+                Err(rollback_error) => Err(format!(
+                    "adopted session access mode update failed and global compensation failed: {session_error}; {rollback_error}"
+                )),
+            };
+        }
+        Ok(remembered_path)
+    }
+
+    fn compare_and_set_global(
+        &self,
+        expected: crate::config::AccessMode,
+        access_mode: crate::config::AccessMode,
+    ) -> Result<Option<Utf8PathBuf>, String> {
+        let mut compare_and_set = self
+            .compare_and_set_global
+            .lock()
+            .map_err(|_| "global access mode persistence lock was poisoned".to_string())?;
+        compare_and_set(expected, access_mode)
+    }
+
+    fn persist_session(
+        &self,
+        session_id: SessionId,
+        access_mode: crate::config::AccessMode,
+    ) -> Result<(), String> {
+        let persist_session = self
+            .persist_session
+            .lock()
+            .map_err(|_| "session access mode persistence lock was poisoned".to_string())?
+            .take()
+            .ok_or_else(|| "session access mode persistence was already consumed".to_string())?;
+        persist_session(session_id, access_mode)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DraftRequestTarget {
+    workspace_root: Utf8PathBuf,
+    session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +343,23 @@ struct SessionDeleteRequestTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionMutationRequestTarget {
+    workspace_root: Utf8PathBuf,
+    project_id: ProjectId,
+    session_id: SessionId,
+    operation_id: DesktopAsyncOperationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectDeleteRequestTarget {
+    workspace_root: Utf8PathBuf,
+    owner_project_id: ProjectId,
+    project_id: ProjectId,
+    project_root: Utf8PathBuf,
+    operation_id: DesktopAsyncOperationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HistoryExportRequestTarget {
     workspace_root: Utf8PathBuf,
     session_id: SessionId,
@@ -186,6 +369,27 @@ struct HistoryExportRequestTarget {
 struct ProviderCatalogRequestTarget {
     base_url: String,
     metadata_mode: ProviderMetadataMode,
+    config_generation: u64,
+    selected_model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderReadinessRequestTarget {
+    base_url: String,
+    model_id: String,
+    metadata_mode: ProviderMetadataMode,
+    supports_tools: bool,
+    supports_reasoning: bool,
+    supports_images: bool,
+    parallel_tool_calls: bool,
+    max_parallel_predictions: u32,
+    config_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoclingRequestTarget {
+    base_url: String,
+    config_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,12 +403,21 @@ enum RuntimeMessageAsyncContract {
     StatusOnlyOperation,
 }
 
+fn unique_background_request_admission_open(
+    request_owner_pending: bool,
+    state_owner_pending: bool,
+) -> bool {
+    !request_owner_pending && !state_owner_pending
+}
+
 impl RuntimeMessage {
     fn async_contract(&self) -> RuntimeMessageAsyncContract {
         match self {
-            RuntimeMessage::RunEvent(_) => RuntimeMessageAsyncContract::RunStream,
-            RuntimeMessage::Finished(_) => RuntimeMessageAsyncContract::TerminalRun,
-            RuntimeMessage::Permission { .. } => RuntimeMessageAsyncContract::ModalDecision,
+            RuntimeMessage::RunEvent { .. } => RuntimeMessageAsyncContract::RunStream,
+            RuntimeMessage::Finished { .. } => RuntimeMessageAsyncContract::TerminalRun,
+            RuntimeMessage::Permission { .. } | RuntimeMessage::PermissionCancelled { .. } => {
+                RuntimeMessageAsyncContract::ModalDecision
+            }
             RuntimeMessage::EnhanceFinished { .. } => {
                 RuntimeMessageAsyncContract::BackgroundOperation
             }
@@ -213,6 +426,9 @@ impl RuntimeMessage {
             }
             RuntimeMessage::SessionLoaded { .. } => {
                 RuntimeMessageAsyncContract::NavigationOperation
+            }
+            RuntimeMessage::CurrentSessionRefreshed { .. } => {
+                RuntimeMessageAsyncContract::BackgroundOperation
             }
             RuntimeMessage::SessionDeleted { .. } => {
                 RuntimeMessageAsyncContract::BackgroundOperation
@@ -229,7 +445,10 @@ impl RuntimeMessage {
             RuntimeMessage::TurnPageLoaded { .. } => {
                 RuntimeMessageAsyncContract::NavigationOperation
             }
-            RuntimeMessage::LiveSessionRefreshed { .. } => RuntimeMessageAsyncContract::RunStream,
+            RuntimeMessage::LiveSessionRefreshed { .. }
+            | RuntimeMessage::DurableAgentActivityRefreshed { .. } => {
+                RuntimeMessageAsyncContract::RunStream
+            }
             RuntimeMessage::SessionSearchLoaded { .. } => {
                 RuntimeMessageAsyncContract::NavigationOperation
             }
@@ -239,14 +458,17 @@ impl RuntimeMessage {
             RuntimeMessage::CurrentTodosLoaded { .. } => {
                 RuntimeMessageAsyncContract::BackgroundOperation
             }
-            RuntimeMessage::ModelCatalogLoaded { .. } => {
+            RuntimeMessage::ModelCatalogLoaded { .. }
+            | RuntimeMessage::StartupProviderChecked { .. } => {
                 RuntimeMessageAsyncContract::ProviderOperation
             }
             RuntimeMessage::StartupDoclingChecked { .. } => {
                 RuntimeMessageAsyncContract::ProviderOperation
             }
-            RuntimeMessage::SteerStored(_) => RuntimeMessageAsyncContract::BackgroundOperation,
             RuntimeMessage::HistoryExported { .. } => {
+                RuntimeMessageAsyncContract::BackgroundOperation
+            }
+            RuntimeMessage::AccessModePersisted { .. } => {
                 RuntimeMessageAsyncContract::BackgroundOperation
             }
             RuntimeMessage::WorkspaceSwitched { .. }
@@ -261,7 +483,6 @@ impl RuntimeMessage {
 enum SessionLoadReason {
     UserSelection,
     RunningRejoin,
-    CurrentRefresh,
 }
 
 struct LoadedSession {
@@ -274,6 +495,169 @@ struct LoadedSession {
     turn_page_limit: usize,
     turn_page_total: usize,
     turn_page_has_more: bool,
+    agent_activity_records: Option<Vec<AgentActivityRecord>>,
+}
+
+type LoadedAgentActivityRecords = (SessionId, Vec<AgentActivityRecord>);
+
+fn activity_records_for_projection(
+    root_session_id: SessionId,
+    live_records: Vec<AgentActivityRecord>,
+    loaded_records: Option<&LoadedAgentActivityRecords>,
+) -> Vec<AgentActivityRecord> {
+    if !live_records.is_empty() {
+        return live_records;
+    }
+    loaded_records
+        .filter(|(session_id, _)| *session_id == root_session_id)
+        .map(|(_, records)| records.clone())
+        .unwrap_or_default()
+}
+
+fn agent_activity_records_are_active(records: &[AgentActivityRecord]) -> bool {
+    records.iter().any(|record| {
+        matches!(
+            &record.status,
+            AgentStatus::PendingInit | AgentStatus::Running
+        )
+    })
+}
+
+fn durable_agent_activity_refresh_required(
+    live_records: &[AgentActivityRecord],
+    projected_records: &[AgentActivityRecord],
+    refresh_pending: bool,
+    terminal_refresh_pending: bool,
+) -> bool {
+    live_records.is_empty()
+        && agent_activity_records_are_active(projected_records)
+        && !refresh_pending
+        && !terminal_refresh_pending
+}
+
+fn durable_agent_activity_retry_allowed(failures: u8) -> bool {
+    failures < 3
+}
+
+fn next_config_generation(current: u64) -> u64 {
+    current.saturating_add(1)
+}
+
+fn commit_effective_config(
+    state: &mut DesktopState,
+    run_lifecycle: &DesktopRunLifecycle,
+    config: ResolvedConfig,
+) {
+    let access_mode = config.permissions.access_mode;
+    state.reset_effective_config(config);
+    run_lifecycle.set_access_mode(access_mode);
+}
+
+fn desktop_run_config_override(config: &ResolvedConfig) -> PartialResolvedConfig {
+    full_effective_override(config)
+}
+
+fn persist_desktop_access_mode_owners<CompareAndSetGlobal, PersistSession>(
+    old_global_access_mode: crate::config::AccessMode,
+    access_mode: crate::config::AccessMode,
+    current_root_session_id: Option<SessionId>,
+    mut compare_and_set_global: CompareAndSetGlobal,
+    persist_session: PersistSession,
+) -> Result<Utf8PathBuf, String>
+where
+    CompareAndSetGlobal: FnMut(
+        crate::config::AccessMode,
+        crate::config::AccessMode,
+    ) -> Result<Option<Utf8PathBuf>, String>,
+    PersistSession: FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String>,
+{
+    let remembered_path = match compare_and_set_global(old_global_access_mode, access_mode) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return Err(
+                "global access mode changed before this update; reload configuration and try again"
+                    .to_string(),
+            );
+        }
+        Err(error) => return Err(format!("global access mode update failed: {error}")),
+    };
+    let Some(session_id) = current_root_session_id else {
+        return Ok(remembered_path);
+    };
+    if let Err(session_error) = persist_session(session_id, access_mode) {
+        return match compare_and_set_global(access_mode, old_global_access_mode) {
+            Ok(Some(_)) => Err(format!(
+                "session access mode update failed and the global field was restored: {session_error}"
+            )),
+            Ok(None) => Err(format!(
+                "session access mode update failed; the global field changed again and was not overwritten: {session_error}"
+            )),
+            Err(rollback_error) => Err(format!(
+                "session access mode update failed and global compensation failed: {session_error}; {rollback_error}"
+            )),
+        };
+    }
+    Ok(remembered_path)
+}
+
+fn session_search_result_can_apply(
+    is_latest: bool,
+    root_run_active: bool,
+    agent_tree_active: bool,
+) -> bool {
+    is_latest && !root_run_active && !agent_tree_active
+}
+
+fn apply_session_search_result(
+    state: &mut DesktopState,
+    is_latest: bool,
+    root_run_active: bool,
+    agent_tree_active: bool,
+    result: Result<DesktopSnapshot, String>,
+) -> bool {
+    if !session_search_result_can_apply(is_latest, root_run_active, agent_tree_active) {
+        return false;
+    }
+    match result {
+        Ok(snapshot) => state.replace_snapshot_preserving_current_owner(snapshot),
+        Err(error) => state.set_status_message(format!("session search failed: {error}")),
+    }
+    true
+}
+
+fn finish_steer_submission(
+    state: &mut DesktopState,
+    prompt_dispatch: &crate::session::PromptDispatchPart,
+    image_paths: &[Utf8PathBuf],
+    result: Result<(), String>,
+) -> bool {
+    match result {
+        Ok(()) => {
+            state.push_local_prompt_dispatch(prompt_dispatch);
+            state
+                .composer
+                .image_attachment_paths
+                .retain(|path| !image_paths.contains(path));
+            state.set_status_message("追加入力を実行中の turn に保存しました。");
+            true
+        }
+        Err(error) => {
+            state.set_status_message(format!("追加入力の保存に失敗しました: {error}"));
+            false
+        }
+    }
+}
+
+fn finish_durable_agent_activity_refresh_request(
+    tracker: &mut LatestRequestTracker<SessionRefreshRequestTarget>,
+    request_id: LatestRequestId,
+    target: &SessionRefreshRequestTarget,
+    workspace_root: &Utf8Path,
+    current_session_id: Option<SessionId>,
+) -> bool {
+    tracker.finish_if_current(request_id, target)
+        && target.workspace_root == workspace_root
+        && current_session_id == Some(target.session_id)
 }
 
 #[derive(Clone)]
@@ -292,6 +676,110 @@ struct DesktopSessionOperationLoaded {
     snapshot: super::models::DesktopSnapshot,
     loaded: LoadedSession,
     message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopRootRunPhase {
+    Running,
+    Finalizing,
+}
+
+struct DesktopRootRun {
+    generation: u64,
+    cancel: CancellationToken,
+    live_config: LiveConfigOverrides,
+    phase: DesktopRootRunPhase,
+}
+
+struct PendingRootSubmission {
+    run_generation: u64,
+    owner_workspace_path: Utf8PathBuf,
+    owner_session_id: Option<SessionId>,
+    prompt_dispatch: crate::session::PromptDispatchPart,
+    image_paths: Vec<Utf8PathBuf>,
+    cancel_prompt_review_on_commit: bool,
+}
+
+#[derive(Default)]
+struct DesktopRunLifecycle {
+    root: Option<DesktopRootRun>,
+}
+
+impl DesktopRunLifecycle {
+    fn begin(
+        &mut self,
+        generation: u64,
+        cancel: CancellationToken,
+        live_config: LiveConfigOverrides,
+    ) {
+        self.root = Some(DesktopRootRun {
+            generation,
+            cancel,
+            live_config,
+            phase: DesktopRootRunPhase::Running,
+        });
+    }
+
+    fn root_is_active(&self) -> bool {
+        self.root.is_some()
+    }
+
+    fn root_generation(&self) -> Option<u64> {
+        self.root.as_ref().map(|run| run.generation)
+    }
+
+    fn owns(&self, generation: u64) -> bool {
+        self.root
+            .as_ref()
+            .is_some_and(|run| run.generation == generation)
+    }
+
+    fn root_is_finalizing(&self) -> bool {
+        self.root
+            .as_ref()
+            .is_some_and(|run| run.phase == DesktopRootRunPhase::Finalizing)
+    }
+
+    fn can_steer_root(&self) -> bool {
+        self.root
+            .as_ref()
+            .is_some_and(|run| run.phase == DesktopRootRunPhase::Running)
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.root
+            .as_ref()
+            .is_some_and(|run| run.cancel.is_cancelled())
+    }
+
+    fn live_config(&self) -> Option<&LiveConfigOverrides> {
+        self.root.as_ref().map(|run| &run.live_config)
+    }
+
+    fn set_access_mode(&self, access_mode: crate::config::AccessMode) {
+        if let Some(live_config) = self.live_config() {
+            live_config.set_access_mode(access_mode);
+        }
+    }
+
+    fn request_cancel(&mut self) -> bool {
+        let Some(run) = self.root.as_mut() else {
+            return false;
+        };
+        run.cancel.cancel();
+        run.phase = DesktopRootRunPhase::Finalizing;
+        true
+    }
+
+    fn observe_terminal_event(&mut self) {
+        if let Some(run) = self.root.as_mut() {
+            run.phase = DesktopRootRunPhase::Finalizing;
+        }
+    }
+
+    fn finish_root(&mut self) {
+        self.root = None;
+    }
 }
 
 fn advance_projection_revision(revision: &mut u64) -> Result<u64, String> {
@@ -321,6 +809,68 @@ fn session_delete_target_matches(
     target.workspace_root == workspace_root && target.project_id == project_id
 }
 
+fn session_mutation_target_matches(
+    target: &SessionMutationRequestTarget,
+    workspace_root: &Utf8Path,
+    project_id: ProjectId,
+) -> bool {
+    target.workspace_root == workspace_root && target.project_id == project_id
+}
+
+#[cfg(test)]
+fn access_mode_persistence_target_matches(
+    target: &AccessModePersistenceTarget,
+    workspace_root: &Utf8Path,
+    session_id: Option<SessionId>,
+    config_generation: u64,
+    runtime_owner_token: &str,
+) -> bool {
+    access_mode_persistence_target_relation(
+        target,
+        workspace_root,
+        session_id,
+        config_generation,
+        runtime_owner_token,
+    ) == AccessModePersistenceTargetRelation::Exact
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessModePersistenceTargetRelation {
+    Exact,
+    AdoptedSession(SessionId),
+    Stale,
+}
+
+fn access_mode_persistence_target_relation(
+    target: &AccessModePersistenceTarget,
+    workspace_root: &Utf8Path,
+    session_id: Option<SessionId>,
+    config_generation: u64,
+    runtime_owner_token: &str,
+) -> AccessModePersistenceTargetRelation {
+    if target.workspace_root != workspace_root
+        || target.config_generation != config_generation
+        || target.runtime_owner_token != runtime_owner_token
+    {
+        return AccessModePersistenceTargetRelation::Stale;
+    }
+    match (target.session_id, session_id) {
+        (target_session_id, current_session_id) if target_session_id == current_session_id => {
+            AccessModePersistenceTargetRelation::Exact
+        }
+        (None, Some(session_id)) => AccessModePersistenceTargetRelation::AdoptedSession(session_id),
+        _ => AccessModePersistenceTargetRelation::Stale,
+    }
+}
+
+fn project_delete_target_matches(
+    target: &ProjectDeleteRequestTarget,
+    workspace_root: &Utf8Path,
+    owner_project_id: ProjectId,
+) -> bool {
+    target.workspace_root == workspace_root && target.owner_project_id == owner_project_id
+}
+
 fn finish_session_delete_request(
     state: &mut DesktopState,
     target: &SessionDeleteRequestTarget,
@@ -336,17 +886,2448 @@ fn finish_history_export_request(
     request_id: LatestRequestId,
     target: &HistoryExportRequestTarget,
     workspace_root: &Utf8Path,
-    selected_session_id: Option<SessionId>,
 ) -> Option<bool> {
     if !tracker.finish_if_current(request_id, target) {
         return None;
     }
-    Some(target.workspace_root == workspace_root && selected_session_id == Some(target.session_id))
+    Some(target.workspace_root == workspace_root)
+}
+
+fn finish_navigation_failure(
+    state: &mut DesktopState,
+    request_id: NavigationRequestId,
+    error: impl Into<String>,
+) -> bool {
+    if !state.is_current_navigation(request_id) {
+        return false;
+    }
+    state.restore_selected_session_to_current_owner();
+    if !state.finish_navigation(request_id) {
+        return false;
+    }
+    state.set_status_message(error);
+    true
 }
 
 #[cfg(test)]
 mod command_projection_owner_tests {
     use super::*;
+
+    #[test]
+    fn terminal_event_moves_root_run_to_finalizing_without_admitting_steer() {
+        let cancel = CancellationToken::new();
+        let live = LiveConfigOverrides::new(crate::config::AccessMode::Default);
+        let live_observer = live.clone();
+        let mut lifecycle = DesktopRunLifecycle::default();
+        lifecycle.begin(7, cancel, live);
+        assert!(lifecycle.owns(7));
+        assert!(!lifecycle.owns(6));
+        assert_eq!(lifecycle.root_generation(), Some(7));
+        assert!(lifecycle.can_steer_root());
+        lifecycle
+            .live_config()
+            .expect("active root live config")
+            .set_access_mode(crate::config::AccessMode::AutoReview);
+        assert_eq!(
+            live_observer.access_mode(),
+            crate::config::AccessMode::AutoReview,
+            "the root and agent runtime share the live access override"
+        );
+        lifecycle.set_access_mode(crate::config::AccessMode::FullAccess);
+        assert_eq!(
+            live_observer.access_mode(),
+            crate::config::AccessMode::FullAccess
+        );
+
+        lifecycle.observe_terminal_event();
+
+        assert!(lifecycle.root_is_active());
+        assert!(lifecycle.root_is_finalizing());
+        assert!(!lifecycle.can_steer_root());
+        assert_eq!(
+            navigation_admission_blocker(
+                false,
+                false,
+                false,
+                false,
+                lifecycle.root_is_finalizing(),
+            ),
+            Some("the current run is finalizing")
+        );
+        lifecycle.finish_root();
+        assert!(!lifecycle.root_is_active());
+        assert_eq!(lifecycle.root_generation(), None);
+        assert_eq!(
+            navigation_admission_blocker(
+                false,
+                false,
+                false,
+                false,
+                lifecycle.root_is_finalizing(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pre_admission_root_owns_cancellation_before_any_run_event() {
+        let cancel = CancellationToken::new();
+        let observer = cancel.clone();
+        let mut lifecycle = DesktopRunLifecycle::default();
+        lifecycle.begin(
+            12,
+            cancel,
+            LiveConfigOverrides::new(crate::config::AccessMode::Default),
+        );
+
+        assert_eq!(lifecycle.root_generation(), Some(12));
+        assert!(lifecycle.root_is_active());
+        assert!(!observer.is_cancelled());
+        assert!(lifecycle.request_cancel());
+        assert!(observer.is_cancelled());
+        assert!(lifecycle.root_is_finalizing());
+    }
+
+    #[test]
+    fn settings_effective_config_commit_updates_active_live_access_owner() {
+        let mut state = DesktopState::new(
+            DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            ResolvedConfig::default(),
+        );
+        let live = LiveConfigOverrides::new(crate::config::AccessMode::Default);
+        let mut lifecycle = DesktopRunLifecycle::default();
+        lifecycle.begin(1, CancellationToken::new(), live.clone());
+        let mut candidate = ResolvedConfig::default();
+        candidate.permissions.access_mode = crate::config::AccessMode::FullAccess;
+
+        commit_effective_config(&mut state, &lifecycle, candidate);
+
+        assert_eq!(
+            state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            crate::config::AccessMode::FullAccess
+        );
+        assert_eq!(live.access_mode(), crate::config::AccessMode::FullAccess);
+    }
+
+    #[test]
+    fn cancelled_desktop_run_does_not_emit_a_failure_notification() {
+        assert!(desktop_run_failure_notification_allowed(false));
+        assert!(!desktop_run_failure_notification_allowed(true));
+    }
+
+    #[test]
+    fn current_session_access_change_persists_global_then_session() {
+        let session_id = SessionId::new();
+        let remembered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let persisted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = persist_desktop_access_mode_owners(
+            crate::config::AccessMode::Default,
+            crate::config::AccessMode::FullAccess,
+            Some(session_id),
+            {
+                let remembered = remembered.clone();
+                move |expected, mode| {
+                    remembered
+                        .lock()
+                        .expect("remembered")
+                        .push((expected, mode));
+                    Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+                }
+            },
+            {
+                let persisted = persisted.clone();
+                move |owner, mode| {
+                    persisted.lock().expect("persisted").push((owner, mode));
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(Utf8PathBuf::from("C:/config.toml")));
+        assert_eq!(
+            *remembered.lock().expect("remembered"),
+            vec![(
+                crate::config::AccessMode::Default,
+                crate::config::AccessMode::FullAccess
+            )]
+        );
+        assert_eq!(
+            *persisted.lock().expect("persisted"),
+            vec![(session_id, crate::config::AccessMode::FullAccess)]
+        );
+    }
+
+    #[test]
+    fn no_session_access_change_persists_only_global_owner() {
+        let session_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = persist_desktop_access_mode_owners(
+            crate::config::AccessMode::Default,
+            crate::config::AccessMode::AutoReview,
+            None,
+            |expected, mode| {
+                assert_eq!(expected, crate::config::AccessMode::Default);
+                assert_eq!(mode, crate::config::AccessMode::AutoReview);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            {
+                let session_calls = session_calls.clone();
+                move |_, _| {
+                    session_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(Utf8PathBuf::from("C:/config.toml")));
+        assert_eq!(session_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn access_persistence_completion_requires_the_same_full_owner_target() {
+        let session_id = SessionId::new();
+        let target = AccessModePersistenceTarget {
+            operation_id: DesktopAsyncOperationId::from_test_value(1),
+            workspace_root: Utf8PathBuf::from("C:/workspace"),
+            session_id: Some(session_id),
+            config_generation: 7,
+            root_run_generation: Some(4),
+            runtime_owner_token: "root:4".to_string(),
+            old_global_access_mode: crate::config::AccessMode::Default,
+            old_effective_access_mode: crate::config::AccessMode::Default,
+            access_mode: crate::config::AccessMode::FullAccess,
+        };
+
+        assert!(access_mode_persistence_target_matches(
+            &target,
+            Utf8Path::new("C:/workspace"),
+            Some(session_id),
+            7,
+            "root:4",
+        ));
+        assert!(!access_mode_persistence_target_matches(
+            &target,
+            Utf8Path::new("C:/workspace"),
+            Some(SessionId::new()),
+            7,
+            "root:4",
+        ));
+        assert!(!access_mode_persistence_target_matches(
+            &target,
+            Utf8Path::new("C:/workspace"),
+            Some(session_id),
+            8,
+            "root:4",
+        ));
+        assert!(!access_mode_persistence_target_matches(
+            &target,
+            Utf8Path::new("C:/workspace"),
+            Some(session_id),
+            7,
+            "root:5",
+        ));
+
+        let pre_admission_target = AccessModePersistenceTarget {
+            session_id: None,
+            ..target
+        };
+        assert_eq!(
+            access_mode_persistence_target_relation(
+                &pre_admission_target,
+                Utf8Path::new("C:/workspace"),
+                Some(session_id),
+                7,
+                "root:4",
+            ),
+            AccessModePersistenceTargetRelation::AdoptedSession(session_id)
+        );
+        assert_eq!(
+            access_mode_persistence_target_relation(
+                &pre_admission_target,
+                Utf8Path::new("C:/workspace"),
+                Some(session_id),
+                8,
+                "root:4",
+            ),
+            AccessModePersistenceTargetRelation::Stale
+        );
+    }
+
+    #[test]
+    fn global_access_failure_does_not_touch_the_current_session() {
+        let session_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = persist_desktop_access_mode_owners(
+            crate::config::AccessMode::Default,
+            crate::config::AccessMode::FullAccess,
+            Some(SessionId::new()),
+            |_, _| Err("global failed".to_string()),
+            {
+                let session_calls = session_calls.clone();
+                move |_, _| {
+                    session_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err("global access mode update failed: global failed".to_string())
+        );
+        assert_eq!(session_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn session_access_failure_compensates_the_global_field() {
+        let remembered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = persist_desktop_access_mode_owners(
+            crate::config::AccessMode::Default,
+            crate::config::AccessMode::FullAccess,
+            Some(SessionId::new()),
+            {
+                let remembered = remembered.clone();
+                move |expected, mode| {
+                    remembered
+                        .lock()
+                        .expect("remembered")
+                        .push((expected, mode));
+                    Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+                }
+            },
+            |_, _| Err("session failed".to_string()),
+        );
+
+        assert_eq!(
+            result,
+            Err("session access mode update failed and the global field was restored: session failed"
+                .to_string())
+        );
+        assert_eq!(
+            *remembered.lock().expect("remembered"),
+            vec![
+                (
+                    crate::config::AccessMode::Default,
+                    crate::config::AccessMode::FullAccess
+                ),
+                (
+                    crate::config::AccessMode::FullAccess,
+                    crate::config::AccessMode::Default
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn adopted_session_access_failure_uses_the_same_cas_compensation() {
+        let remembered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = AccessModePersistenceWorker::new(
+            {
+                let remembered = remembered.clone();
+                move |expected, mode| {
+                    remembered
+                        .lock()
+                        .expect("remembered")
+                        .push((expected, mode));
+                    Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+                }
+            },
+            |_, _| Err("adopted session failed".to_string()),
+        );
+        let target = AccessModePersistenceTarget {
+            operation_id: DesktopAsyncOperationId::from_test_value(1),
+            workspace_root: Utf8PathBuf::from("C:/workspace"),
+            session_id: None,
+            config_generation: 1,
+            root_run_generation: Some(1),
+            runtime_owner_token: "root:1".to_string(),
+            old_global_access_mode: crate::config::AccessMode::Default,
+            old_effective_access_mode: crate::config::AccessMode::Default,
+            access_mode: crate::config::AccessMode::FullAccess,
+        };
+
+        let path = worker
+            .persist_initial_owners(&target)
+            .expect("global-only first phase");
+        let error = worker
+            .persist_adopted_session(&target, SessionId::new(), path)
+            .expect_err("adopted session failure");
+
+        assert!(error.contains("global field was restored"));
+        assert_eq!(
+            *remembered.lock().expect("remembered"),
+            vec![
+                (
+                    crate::config::AccessMode::Default,
+                    crate::config::AccessMode::FullAccess
+                ),
+                (
+                    crate::config::AccessMode::FullAccess,
+                    crate::config::AccessMode::Default
+                )
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_current_session_access_is_durable_for_tui_reopen_and_rejects_child_owner() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let initial_access_mode = crate::config::AccessMode::Default;
+        let args = DesktopArgs {
+            directory: Some(root.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let create_session = |title: &str| NewSession {
+            project_id: controller.app.workspace.project_id,
+            title: title.to_string(),
+            cwd: root.clone(),
+            model: controller.app.config.model.model.clone(),
+            base_url: controller.app.config.model.base_url.clone(),
+            access_mode: initial_access_mode,
+        };
+        let repository = controller.app.store.session_repo();
+        let root_session = repository
+            .create_session(create_session("root"))
+            .await
+            .expect("root session");
+        let child_session = repository
+            .create_session(create_session("child"))
+            .await
+            .expect("child session");
+        repository
+            .insert_session_spawn_edge(
+                root_session.id,
+                root_session.id,
+                child_session.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("child edge");
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        controller.state.app_state.current_session_id = Some(root_session.id);
+        let live = LiveConfigOverrides::new(initial_access_mode);
+        controller
+            .run_lifecycle
+            .begin(1, CancellationToken::new(), live.clone());
+        let expected_access_mode = initial_access_mode.next();
+        let session_service = controller.app.session_service.clone();
+        let persisted_service = session_service.clone();
+
+        assert!(controller.start_access_mode_persistence(
+            move |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, expected_access_mode);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            move |session_id, access_mode| {
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| error.to_string())?;
+                    runtime.block_on(async move {
+                        persisted_service
+                            .update_root_session_access_mode(session_id, access_mode)
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .join()
+                .map_err(|_| "session worker panicked".to_string())?
+            },
+        ));
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!controller.state.background_mutation_pending());
+
+        let reopened = session_service
+            .get_session(root_session.id)
+            .await
+            .expect("TUI durable reopen source");
+        assert_eq!(reopened.access_mode, expected_access_mode);
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            reopened.access_mode
+        );
+        assert_eq!(live.access_mode(), reopened.access_mode);
+        assert!(
+            session_service
+                .update_root_session_access_mode(child_session.id, expected_access_mode)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_admission_access_change_persists_the_same_root_session_adopted_before_completion()
+    {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let initial_access_mode = crate::config::AccessMode::Default;
+        let args = DesktopArgs {
+            directory: Some(root.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "adopted root".to_string(),
+                cwd: root,
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: initial_access_mode,
+            })
+            .await
+            .expect("session");
+        controller
+            .app
+            .store
+            .session_repo()
+            .admit_session_run(session.id)
+            .await
+            .expect("active root admission")
+            .expect("active root admitted");
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        let live = LiveConfigOverrides::new(initial_access_mode);
+        controller
+            .run_lifecycle
+            .begin(1, CancellationToken::new(), live.clone());
+        let expected_access_mode = initial_access_mode.next();
+        let persisted_service = controller.app.session_service.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        assert!(controller.start_access_mode_persistence(
+            move |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, expected_access_mode);
+                started_tx.send(()).expect("signal global worker");
+                release_rx.recv().expect("release global worker");
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            move |session_id, access_mode| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.block_on(async move {
+                    persisted_service
+                        .update_root_session_access_mode(session_id, access_mode)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+            },
+        ));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("global worker started");
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent {
+                run_generation: 1,
+                event: RunEvent::SessionStarted {
+                    session_id: session.id,
+                    title: session.title.clone(),
+                },
+            })
+            .expect("session adoption event");
+        controller.drain_runtime_messages();
+        assert_eq!(
+            controller.state.app_state.current_session_id,
+            Some(session.id)
+        );
+        release_tx.send(()).expect("release global worker");
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.state.background_mutation_pending());
+        assert_eq!(
+            controller
+                .app
+                .session_service
+                .get_session(session.id)
+                .await
+                .expect("durable adopted root")
+                .access_mode,
+            expected_access_mode
+        );
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            expected_access_mode
+        );
+        assert_eq!(live.access_mode(), expected_access_mode);
+
+        controller.next_root_run_generation = 2;
+        controller.run_lifecycle.finish_root();
+        let finished_root_target = AccessModePersistenceTarget {
+            operation_id: DesktopAsyncOperationId::from_test_value(99),
+            workspace_root: controller.app.workspace.root.clone(),
+            session_id: None,
+            config_generation: controller.state.provider_config.config_generation,
+            root_run_generation: Some(1),
+            runtime_owner_token: "root:1".to_string(),
+            old_global_access_mode: initial_access_mode,
+            old_effective_access_mode: initial_access_mode,
+            access_mode: expected_access_mode,
+        };
+        assert_eq!(
+            controller.access_mode_persistence_target_relation(&finished_root_target),
+            AccessModePersistenceTargetRelation::AdoptedSession(session.id),
+            "completion from the just-finished generation retains its exact admitted owner"
+        );
+        controller.next_root_run_generation = 3;
+        assert_eq!(
+            controller.access_mode_persistence_target_relation(&finished_root_target),
+            AccessModePersistenceTargetRelation::Stale,
+            "a newer root generation revokes the terminal completion grace"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_admission_access_change_waits_for_session_started_after_global_completion() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let initial_access_mode = crate::config::AccessMode::Default;
+        let args = DesktopArgs {
+            directory: Some(root.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "late adopted root".to_string(),
+                cwd: root,
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: initial_access_mode,
+            })
+            .await
+            .expect("session");
+        controller
+            .app
+            .store
+            .session_repo()
+            .admit_session_run(session.id)
+            .await
+            .expect("late active root admission")
+            .expect("late active root admitted");
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        let live = LiveConfigOverrides::new(initial_access_mode);
+        controller
+            .run_lifecycle
+            .begin(1, CancellationToken::new(), live.clone());
+        let expected_access_mode = initial_access_mode.next();
+        let persisted_service = controller.app.session_service.clone();
+
+        assert!(controller.start_access_mode_persistence(
+            move |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, expected_access_mode);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            move |session_id, access_mode| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.block_on(async move {
+                    persisted_service
+                        .update_root_session_access_mode(session_id, access_mode)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+            },
+        ));
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if controller.pending_access_mode_adoption.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(controller.pending_access_mode_adoption.is_some());
+        assert!(controller.state.background_mutation_pending());
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            initial_access_mode,
+            "the live owner is not committed until both durable owners succeed"
+        );
+        assert_eq!(live.access_mode(), initial_access_mode);
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent {
+                run_generation: 1,
+                event: RunEvent::SessionStarted {
+                    session_id: session.id,
+                    title: session.title.clone(),
+                },
+            })
+            .expect("late session adoption event");
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.state.background_mutation_pending());
+        assert!(controller.pending_access_mode_adoption.is_none());
+        assert_eq!(
+            controller
+                .app
+                .session_service
+                .get_session(session.id)
+                .await
+                .expect("durable late adopted root")
+                .access_mode,
+            expected_access_mode
+        );
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            expected_access_mode
+        );
+        assert_eq!(live.access_mode(), expected_access_mode);
+    }
+
+    async fn empty_access_test_controller() -> (tempfile::TempDir, Utf8PathBuf, DesktopController) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let args = DesktopArgs {
+            directory: Some(root.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        (temp, root, controller)
+    }
+
+    #[tokio::test]
+    async fn pending_access_adoption_without_session_started_settles_global_only_on_finished() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let initial_access_mode = crate::config::AccessMode::Default;
+        let expected_access_mode = initial_access_mode.next();
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        let live = LiveConfigOverrides::new(initial_access_mode);
+        controller
+            .run_lifecycle
+            .begin(1, CancellationToken::new(), live.clone());
+        let session_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(controller.start_access_mode_persistence(
+            move |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, expected_access_mode);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            {
+                let session_calls = session_calls.clone();
+                move |_, _| {
+                    session_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        ));
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if controller.pending_access_mode_adoption.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(controller.pending_access_mode_adoption.is_some());
+        assert!(controller.state.background_mutation_pending());
+        assert_eq!(live.access_mode(), initial_access_mode);
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: 1,
+                result: Err("failed before session admission".to_string()),
+            })
+            .expect("pre-admission worker finish");
+        controller.drain_runtime_messages();
+
+        assert!(controller.pending_access_mode_adoption.is_none());
+        assert!(!controller.state.background_mutation_pending());
+        assert_eq!(controller.state.app_state.current_session_id, None);
+        assert_eq!(session_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            controller.app.config.permissions.access_mode,
+            expected_access_mode
+        );
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            expected_access_mode
+        );
+        assert_eq!(live.access_mode(), expected_access_mode);
+    }
+
+    #[tokio::test]
+    async fn delayed_adopted_access_completion_is_discarded_after_next_root_generation_starts() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let reloaded_access_mode = controller.app.config.permissions.access_mode;
+        let initial_access_mode = [
+            crate::config::AccessMode::Default,
+            crate::config::AccessMode::AutoReview,
+            crate::config::AccessMode::FullAccess,
+        ]
+        .into_iter()
+        .find(|access_mode| access_mode.next() != reloaded_access_mode)
+        .expect("one transition differs from the reloaded access owner");
+        let expected_access_mode = initial_access_mode.next();
+        assert_ne!(expected_access_mode, reloaded_access_mode);
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "delayed adopted root".to_string(),
+                cwd: root,
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: initial_access_mode,
+            })
+            .await
+            .expect("session");
+        let session_id = session.id;
+        let session_title = session.title.clone();
+        controller.run_lifecycle.begin(
+            1,
+            CancellationToken::new(),
+            LiveConfigOverrides::new(initial_access_mode),
+        );
+        let (adopted_started_tx, adopted_started_rx) = mpsc::sync_channel(1);
+        let (release_adopted_tx, release_adopted_rx) = mpsc::sync_channel(1);
+
+        assert!(controller.start_access_mode_persistence(
+            move |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, expected_access_mode);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            move |persisted_session_id, access_mode| {
+                assert_eq!(persisted_session_id, session_id);
+                assert_eq!(access_mode, expected_access_mode);
+                adopted_started_tx.send(()).expect("adopted worker started");
+                release_adopted_rx.recv().expect("release adopted worker");
+                Ok(())
+            },
+        ));
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if controller.pending_access_mode_adoption.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let old_target = controller
+            .pending_access_mode_adoption
+            .as_ref()
+            .expect("pending adopted owner")
+            .target
+            .clone();
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent {
+                run_generation: 1,
+                event: RunEvent::SessionStarted {
+                    session_id,
+                    title: session_title,
+                },
+            })
+            .expect("session adoption event");
+        controller.drain_runtime_messages();
+        adopted_started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("adopted worker dispatch");
+        assert!(controller.pending_access_mode_adoption.is_none());
+        assert!(controller.state.background_mutation_pending());
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: 1,
+                result: Err("first root finished".to_string()),
+            })
+            .expect("first root finish");
+        controller.drain_runtime_messages();
+        assert!(!controller.run_lifecycle.root_is_active());
+
+        let next_live = LiveConfigOverrides::new(initial_access_mode);
+        controller
+            .run_lifecycle
+            .begin(2, CancellationToken::new(), next_live.clone());
+        controller.next_root_run_generation = 3;
+        assert_eq!(
+            controller.access_mode_persistence_target_relation(&old_target),
+            AccessModePersistenceTargetRelation::Stale
+        );
+
+        release_adopted_tx.send(()).expect("release adopted worker");
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.state.background_mutation_pending());
+        assert!(!controller.access_mode_persistence_requests.is_pending());
+        assert_eq!(controller.run_lifecycle.root_generation(), Some(2));
+        let current_access_mode = controller.app.config.permissions.access_mode;
+        assert_eq!(current_access_mode, reloaded_access_mode);
+        assert_ne!(current_access_mode, expected_access_mode);
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            current_access_mode
+        );
+        assert_eq!(next_live.access_mode(), current_access_mode);
+    }
+
+    #[tokio::test]
+    async fn desktop_reopen_uses_durable_session_access_for_run_config_and_new_chat_uses_global() {
+        use crate::protocol::ProtocolEventStore as _;
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let mut app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let global_access_mode = crate::config::AccessMode::Default;
+        let session_access_mode = crate::config::AccessMode::FullAccess;
+        app.config.permissions.access_mode = global_access_mode;
+        let session = app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: app.workspace.project_id,
+                title: "durable access".to_string(),
+                cwd: root.clone(),
+                model: app.config.model.model.clone(),
+                base_url: app.config.model.base_url.clone(),
+                access_mode: session_access_mode,
+            })
+            .await
+            .expect("session");
+        let turn_id = crate::protocol::TurnId::new();
+        app.store
+            .protocol_event_store()
+            .append_history_item(&crate::protocol::HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id: session.id,
+                turn_id,
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::Message {
+                    message_id: None,
+                    role: crate::session::MessageRole::User,
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: "reopen".to_string(),
+                    }],
+                },
+            })
+            .expect("history item");
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: Some(session.id),
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            session_access_mode
+        );
+        let run_config = apply_config_patch(
+            controller.app.config.clone(),
+            desktop_run_config_override(&controller.state.provider_config.effective_config),
+        );
+        assert_eq!(run_config.permissions.access_mode, session_access_mode);
+
+        controller.start_new_chat_with_global_access();
+        assert_eq!(controller.state.app_state.current_session_id, None);
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            global_access_mode
+        );
+    }
+
+    #[tokio::test]
+    async fn archiving_the_only_current_session_restores_global_access_for_the_new_chat() {
+        use crate::protocol::ProtocolEventStore as _;
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let mut app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let global_access_mode = crate::config::AccessMode::Default;
+        let session_access_mode = crate::config::AccessMode::FullAccess;
+        app.config.permissions.access_mode = global_access_mode;
+        let session = app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: app.workspace.project_id,
+                title: "only current session".to_string(),
+                cwd: root.clone(),
+                model: app.config.model.model.clone(),
+                base_url: app.config.model.base_url.clone(),
+                access_mode: session_access_mode,
+            })
+            .await
+            .expect("session");
+        app.store
+            .protocol_event_store()
+            .append_history_item(&crate::protocol::HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id: session.id,
+                turn_id: crate::protocol::TurnId::new(),
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::Message {
+                    message_id: None,
+                    role: crate::session::MessageRole::User,
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: "archive this session".to_string(),
+                    }],
+                },
+            })
+            .expect("history item");
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: Some(session.id),
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            session_access_mode
+        );
+
+        assert!(controller.archive_session(session.id, true));
+        let live = LiveConfigOverrides::new(session_access_mode);
+        controller
+            .run_lifecycle
+            .begin(41, CancellationToken::new(), live.clone());
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.state.background_mutation_pending());
+        assert_eq!(controller.state.app_state.current_session_id, None);
+        assert_eq!(controller.state.selected_session_id(), None);
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            global_access_mode
+        );
+        assert_eq!(live.access_mode(), global_access_mode);
+        let run_config = apply_config_patch(
+            controller.app.config.clone(),
+            desktop_run_config_override(&controller.state.provider_config.effective_config),
+        );
+        assert_eq!(run_config.permissions.access_mode, global_access_mode);
+    }
+
+    #[tokio::test]
+    async fn blocked_access_persistence_does_not_block_stop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let cancel = CancellationToken::new();
+        let cancel_observer = cancel.clone();
+        controller.run_lifecycle.begin(
+            1,
+            cancel,
+            LiveConfigOverrides::new(crate::config::AccessMode::Default),
+        );
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        assert!(controller.start_access_mode_persistence(
+            move |_, _| {
+                started_tx.send(()).expect("signal blocked persistence");
+                release_rx.recv().expect("release blocked persistence");
+                Err("simulated blocked global writer".to_string())
+            },
+            |_, _| Ok(()),
+        ));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("persistence worker started");
+
+        controller.cancel_active_run();
+        assert!(
+            cancel_observer.is_cancelled(),
+            "Stop must cancel the root before blocked persistence completes"
+        );
+        assert!(controller.state.background_mutation_pending());
+
+        release_tx.send(()).expect("release persistence");
+        for _ in 0..100 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!controller.state.background_mutation_pending());
+    }
+
+    #[tokio::test]
+    async fn blocked_access_persistence_rejects_submit_review_and_steer_admission() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        assert!(controller.start_access_mode_persistence(
+            move |_, _| {
+                started_tx.send(()).expect("signal blocked persistence");
+                release_rx.recv().expect("release blocked persistence");
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            |_, _| Ok(()),
+        ));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("persistence worker started");
+        assert!(controller.state.background_mutation_pending());
+
+        let initial_generation = controller.next_root_run_generation;
+        controller.state.composer.draft_prompt = "submit after access settles".to_string();
+        assert!(!controller.start_run("submit after access settles".to_string()));
+        assert!(!controller.start_review_uncommitted("review after access settles".to_string()));
+        controller
+            .state
+            .begin_prompt_enhance(11, "enhance before review");
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(11, "enhanced review draft".to_string())
+        );
+        assert!(!controller.send_prompt_review(true, "edited review draft".to_string()));
+        assert_eq!(
+            controller.state.composer.draft_prompt,
+            "submit after access settles"
+        );
+        assert_eq!(
+            controller.state.composer.review_draft_text,
+            "edited review draft"
+        );
+        assert_eq!(controller.next_root_run_generation, initial_generation);
+        assert!(!controller.run_lifecycle.root_is_active());
+
+        controller.run_lifecycle.begin(
+            77,
+            CancellationToken::new(),
+            LiveConfigOverrides::new(crate::config::AccessMode::Default),
+        );
+        assert!(!controller.start_run("steer after access settles".to_string()));
+        assert_eq!(controller.run_lifecycle.root_generation(), Some(77));
+        assert!(
+            controller
+                .state
+                .app_state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("owner mutation"))
+        );
+        controller.run_lifecycle.finish_root();
+
+        release_tx.send(()).expect("release persistence");
+        for _ in 0..100 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!controller.state.background_mutation_pending());
+    }
+
+    #[test]
+    fn durable_activity_retry_is_bounded_and_config_generation_never_rewinds() {
+        assert!(durable_agent_activity_retry_allowed(0));
+        assert!(durable_agent_activity_retry_allowed(2));
+        assert!(!durable_agent_activity_retry_allowed(3));
+        assert!(!durable_agent_activity_retry_allowed(u8::MAX));
+
+        assert_eq!(next_config_generation(1), 2);
+        assert_eq!(next_config_generation(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn failed_steer_preserves_request_draft_and_attachments() {
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            ResolvedConfig::default(),
+        );
+        state.composer.draft_prompt = "keep this draft".to_string();
+        let image = Utf8PathBuf::from("C:/workspace/reference.png");
+        state.composer.image_attachment_paths.push(image.clone());
+
+        assert!(!finish_steer_submission(
+            &mut state,
+            &crate::session::PromptDispatchPart::raw("follow-up"),
+            std::slice::from_ref(&image),
+            Err("terminal session".to_string()),
+        ));
+        assert_eq!(state.composer.draft_prompt, "keep this draft");
+        assert_eq!(state.composer.image_attachment_paths, vec![image]);
+        assert!(
+            state
+                .app_state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("terminal session"))
+        );
+    }
+
+    fn agent_record(
+        session_id: SessionId,
+        agent_path: &str,
+        status: AgentStatus,
+        result_preview: &str,
+    ) -> AgentActivityRecord {
+        AgentActivityRecord {
+            agent_path: agent_path.to_string(),
+            session_id,
+            task_name: agent_path
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+            task_preview: format!("task for {agent_path}"),
+            status,
+            current_activity: String::new(),
+            result_preview: result_preview.to_string(),
+            started_order: 1,
+            updated: false,
+        }
+    }
+
+    fn test_permission(summary: &str) -> PermissionRequest {
+        PermissionRequest {
+            access: crate::workspace::AccessKind::Shell,
+            summary: summary.to_string(),
+            details: Vec::new(),
+            targets: vec![Utf8PathBuf::from("C:/workspace")],
+            outside_workspace: false,
+            risks: Vec::new(),
+            agent_path: Some(format!("/root/{summary}")),
+            agent_task_name: Some(summary.to_string()),
+        }
+    }
+
+    fn recv_runtime_message(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<RuntimeMessage>,
+    ) -> RuntimeMessage {
+        for _ in 0..200 {
+            match receiver.try_recv() {
+                Ok(message) => return message,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("desktop runtime channel disconnected")
+                }
+            }
+        }
+        panic!("timed out waiting for desktop runtime message")
+    }
+
+    #[test]
+    fn child_only_agent_activity_blocks_desktop_navigation() {
+        assert_eq!(
+            navigation_admission_blocker(false, false, false, false, false),
+            None
+        );
+        assert_eq!(
+            navigation_admission_blocker(false, false, false, true, false),
+            Some("the current agent tree is active")
+        );
+        assert_eq!(
+            navigation_admission_blocker(false, false, false, false, true),
+            Some("the current run is finalizing")
+        );
+    }
+
+    #[test]
+    fn session_search_started_while_idle_cannot_replace_root_after_run_or_tree_admission() {
+        fn snapshot(session_id: SessionId, title: &str) -> DesktopSnapshot {
+            DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: vec![super::super::models::DesktopSessionRow::from_parts(
+                    session_id,
+                    title,
+                    SessionStatus::Idle,
+                )],
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            }
+        }
+
+        let selected_root = SessionId::new();
+        let stale_search_root = SessionId::new();
+        let mut state = DesktopState::new(
+            snapshot(selected_root, "selected root"),
+            ResolvedConfig::default(),
+        );
+
+        assert!(!apply_session_search_result(
+            &mut state,
+            true,
+            true,
+            false,
+            Ok(snapshot(stale_search_root, "stale search result")),
+        ));
+        assert_eq!(state.selected_session_id(), Some(selected_root));
+
+        assert!(!apply_session_search_result(
+            &mut state,
+            true,
+            false,
+            true,
+            Ok(snapshot(stale_search_root, "stale tree result")),
+        ));
+        assert_eq!(state.selected_session_id(), Some(selected_root));
+        assert!(!session_search_result_can_apply(false, false, false));
+    }
+
+    fn navigation_owner_state() -> (DesktopState, SessionId, SessionId) {
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        let mut state = DesktopState::new(
+            DesktopSnapshot {
+                workspace_path: "C:/workspace-a".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: vec![
+                    super::super::models::DesktopProjectRow {
+                        project_id: ProjectId::new(),
+                        label: "project A".to_string(),
+                        path: "C:/workspace-a".to_string(),
+                    },
+                    super::super::models::DesktopProjectRow {
+                        project_id: ProjectId::new(),
+                        label: "project B".to_string(),
+                        path: "C:/workspace-b".to_string(),
+                    },
+                ],
+                selected_project_index: 0,
+                session_rows: vec![
+                    super::super::models::DesktopSessionRow::from_parts(
+                        session_a,
+                        "session A",
+                        SessionStatus::Idle,
+                    ),
+                    super::super::models::DesktopSessionRow::from_parts(
+                        session_b,
+                        "session B",
+                        SessionStatus::Idle,
+                    ),
+                ],
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            ResolvedConfig::default(),
+        );
+        state.app_state.current_session_id = Some(session_a);
+        state.rebind_composer_owner(Some(session_a));
+        state.composer.draft_prompt = "draft owned by A".to_string();
+        (state, session_a, session_b)
+    }
+
+    #[test]
+    fn failed_session_navigation_restores_selected_and_draft_owner_to_a() {
+        let (mut state, session_a, session_b) = navigation_owner_state();
+        let attachment = Utf8PathBuf::from("C:/workspace-a/attachment.png");
+        state
+            .composer
+            .image_attachment_paths
+            .push(attachment.clone());
+        state.select_session(1);
+        assert_eq!(state.selected_session_id(), Some(session_b));
+        let request_id = state.begin_session_load(session_b);
+
+        assert!(finish_navigation_failure(
+            &mut state,
+            request_id,
+            "session B failed to load",
+        ));
+
+        let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+        assert_eq!(state.selected_session_id(), Some(session_a));
+        assert!(projection.selected_session_title.starts_with("session A"));
+        assert_eq!(
+            projection.draft_target.session_id,
+            Some(session_a.to_string())
+        );
+        assert_eq!(projection.draft_prompt, "draft owned by A");
+        assert_eq!(state.composer.image_attachment_paths, vec![attachment]);
+        assert!(!projection.navigation_loading);
+    }
+
+    #[test]
+    fn failed_project_navigation_never_replaces_committed_workspace_owner() {
+        let (mut state, session_a, _) = navigation_owner_state();
+        let request_id = state.begin_workspace_load(Utf8PathBuf::from("C:/workspace-b"), None);
+
+        assert_eq!(state.snapshot.workspace_path, "C:/workspace-a");
+        assert_eq!(state.selected_project_path(), Some("C:/workspace-a"));
+        assert!(finish_navigation_failure(
+            &mut state,
+            request_id,
+            "project B failed to load",
+        ));
+
+        let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+        assert_eq!(projection.workspace_path, "C:/workspace-a");
+        assert_eq!(state.selected_project_path(), Some("C:/workspace-a"));
+        assert_eq!(state.selected_session_id(), Some(session_a));
+        assert_eq!(
+            projection.draft_target.session_id,
+            Some(session_a.to_string())
+        );
+        assert_eq!(projection.draft_prompt, "draft owned by A");
+        assert!(!projection.navigation_loading);
+    }
+
+    #[test]
+    fn non_selected_row_mutations_preserve_owner_a_on_success_and_failure() {
+        let (mut state, session_a, session_b) = navigation_owner_state();
+        let project_a = state.snapshot.project_rows[0].project_id;
+        let project_b = state.snapshot.project_rows[1].project_id;
+
+        let mut session_success = state.snapshot.clone();
+        session_success
+            .session_rows
+            .iter_mut()
+            .find(|row| row.session_id == session_b)
+            .expect("session B")
+            .archived = true;
+        session_success
+            .session_rows
+            .retain(|row| row.session_id != session_a);
+        let archive_id = state.begin_session_archive_mutation();
+        assert!(state.finish_session_archive_mutation(archive_id));
+        state.replace_snapshot_preserving_current_owner(session_success);
+        assert_eq!(state.selected_session_id(), Some(session_a));
+        assert_eq!(state.app_state.current_session_id, Some(session_a));
+
+        let maintenance_id = state.begin_session_maintenance_mutation();
+        assert!(state.finish_session_maintenance_mutation(maintenance_id));
+        state.set_status_message("session B mutation failed");
+        assert_eq!(state.selected_session_id(), Some(session_a));
+        assert_eq!(state.app_state.current_session_id, Some(session_a));
+
+        let mut project_success = state.snapshot.clone();
+        project_success
+            .project_rows
+            .retain(|row| row.project_id != project_b);
+        let delete_id = state.begin_project_delete_mutation();
+        assert!(state.finish_project_delete_mutation(delete_id));
+        state.replace_snapshot(project_success);
+        assert_eq!(state.selected_project_id(), Some(project_a));
+        assert_eq!(state.selected_session_id(), Some(session_a));
+        assert_eq!(state.app_state.current_session_id, Some(session_a));
+
+        let failed_delete_id = state.begin_project_delete_mutation();
+        assert!(state.finish_project_delete_mutation(failed_delete_id));
+        state.set_status_message("project B deletion failed");
+        let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+        assert_eq!(state.selected_project_id(), Some(project_a));
+        assert_eq!(state.selected_session_id(), Some(session_a));
+        assert_eq!(
+            projection.draft_target.session_id,
+            Some(session_a.to_string())
+        );
+        assert_eq!(projection.workspace_path, "C:/workspace-a");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controller_async_owner_and_durable_submission_contracts_are_lossless() {
+        use crate::session::{ProjectRepository as _, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let project_b_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("workspace-b")).expect("utf8 project B");
+        std::fs::create_dir_all(&project_b_root).expect("project B workspace");
+        let project_b = ProjectId::new();
+        app.store
+            .project_repo()
+            .upsert_project(project_b, &project_b_root, "project B", "none")
+            .await
+            .expect("project B");
+        let args = DesktopArgs {
+            directory: Some(root.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let repo = controller.app.store.session_repo();
+        let create = |title: &str| crate::session::NewSession {
+            project_id: controller.app.workspace.project_id,
+            title: title.to_string(),
+            cwd: root.clone(),
+            model: controller.app.config.model.model.clone(),
+            base_url: controller.app.config.model.base_url.clone(),
+            access_mode: controller.app.config.permissions.access_mode,
+        };
+        let session_a = repo.create_session(create("session A")).await.expect("A");
+        let session_b = repo.create_session(create("session B")).await.expect("B");
+        let snapshot = load_snapshot_for_selection(&controller.app, Some(session_a.id))
+            .await
+            .expect("snapshot");
+        controller.state.replace_snapshot(snapshot);
+        controller.state.app_state.current_session_id = Some(session_a.id);
+        controller.state.app_state.current_session_title = session_a.title.clone();
+        let stale_snapshot = controller.state.snapshot.clone();
+
+        let search_operation = controller.state.begin_session_search();
+        let search_request = controller.session_search_requests.begin(search_operation);
+        let snapshot_target = SnapshotRequestTarget {
+            workspace_root: root.clone(),
+            selected_session_id: Some(session_a.id),
+        };
+        let snapshot_request = controller.snapshot_requests.begin(snapshot_target.clone());
+        controller.state.begin_snapshot_refresh();
+
+        assert!(controller.archive_session(session_b.id, true));
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!controller.state.background_mutation_pending());
+        assert_eq!(
+            controller.state.app_state.current_session_id,
+            Some(session_a.id)
+        );
+        assert_eq!(controller.state.selected_session_id(), Some(session_a.id));
+        assert!(
+            !controller
+                .state
+                .snapshot
+                .session_rows
+                .iter()
+                .any(|row| row.session_id == session_b.id)
+        );
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::SessionSearchLoaded {
+                request_id: search_request,
+                result: Ok(stale_snapshot.clone()),
+            })
+            .expect("stale search");
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::SnapshotLoaded {
+                request_id: snapshot_request,
+                target: snapshot_target,
+                result: Ok(stale_snapshot),
+            })
+            .expect("stale snapshot");
+        controller.drain_runtime_messages();
+
+        assert_eq!(
+            controller.state.app_state.current_session_id,
+            Some(session_a.id)
+        );
+        assert_eq!(controller.state.selected_session_id(), Some(session_a.id));
+        assert!(
+            !controller
+                .state
+                .snapshot
+                .session_rows
+                .iter()
+                .any(|row| row.session_id == session_b.id)
+        );
+        assert!(
+            !controller
+                .state
+                .pending_async_operation_keys()
+                .iter()
+                .any(|key| key == "session_search" || key == "snapshot_refresh")
+        );
+
+        assert!(
+            controller
+                .state
+                .snapshot
+                .project_rows
+                .iter()
+                .any(|row| row.project_id == project_b)
+        );
+        assert!(controller.delete_project(project_b));
+        controller.app.config.model.model = "live-config-after-delete-dispatch".to_string();
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!controller.state.background_mutation_pending());
+        assert!(!controller.state.navigation_loading());
+        assert_eq!(controller.app.workspace.root, root);
+        assert_eq!(
+            controller.app.config.model.model,
+            "live-config-after-delete-dispatch"
+        );
+        assert_eq!(
+            controller.state.app_state.current_session_id,
+            Some(session_a.id)
+        );
+        assert_eq!(controller.state.selected_session_id(), Some(session_a.id));
+        assert!(
+            !controller
+                .state
+                .snapshot
+                .project_rows
+                .iter()
+                .any(|row| row.project_id == project_b)
+        );
+        assert!(
+            controller
+                .state
+                .app_state
+                .status_message
+                .as_deref()
+                .is_some_and(
+                    |message| message.contains("deleted project") && !message.contains("opening")
+                )
+        );
+
+        let retained_image = root.join("retained.png");
+        controller
+            .state
+            .composer
+            .image_attachment_paths
+            .push(retained_image.clone());
+        controller.state.begin_prompt_enhance(77, "raw review");
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(77, "edited review".to_string())
+        );
+        let failed_generation = 900;
+        controller.run_lifecycle.begin(
+            failed_generation,
+            CancellationToken::new(),
+            LiveConfigOverrides::new(crate::config::AccessMode::Default),
+        );
+        controller.state.begin_agent_run();
+        controller.pending_root_submission = Some(PendingRootSubmission {
+            run_generation: failed_generation,
+            owner_workspace_path: root.clone(),
+            owner_session_id: Some(session_a.id),
+            prompt_dispatch: crate::session::PromptDispatchPart::raw("retain on preflight error"),
+            image_paths: vec![retained_image.clone()],
+            cancel_prompt_review_on_commit: true,
+        });
+        assert!(
+            controller
+                .state
+                .selected_detail()
+                .transcript_rows
+                .iter()
+                .all(|row| row.row_kind != super::super::models::DesktopTranscriptRowKind::User)
+        );
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent {
+                run_generation: failed_generation,
+                event: RunEvent::SessionStarted {
+                    session_id: session_a.id,
+                    title: session_a.title.clone(),
+                },
+            })
+            .expect("session start before durable user turn");
+        controller.drain_runtime_messages();
+        assert_eq!(controller.composer_commit_generation, 0);
+        assert!(controller.pending_root_submission.is_some());
+        assert_eq!(controller.state.composer.review_draft_text, "edited review");
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: failed_generation,
+                result: Err("preflight rejected".to_string()),
+            })
+            .expect("preflight failure");
+        controller.drain_runtime_messages();
+        assert_eq!(controller.composer_commit_generation, 0);
+        assert_eq!(
+            controller.state.composer.image_attachment_paths,
+            vec![retained_image.clone()]
+        );
+        assert_eq!(
+            desktop_web_state(&controller.state, &DesktopRuntimeProjection::default())
+                .attached_images,
+            vec![retained_image.to_string()]
+        );
+        assert!(
+            controller
+                .state
+                .selected_detail()
+                .transcript_rows
+                .iter()
+                .all(|row| row.row_kind != super::super::models::DesktopTranscriptRowKind::User)
+        );
+        assert!(controller.pending_root_submission.is_none());
+        assert!(controller.state.app_state.prompt_review.is_some());
+        assert_eq!(controller.state.composer.review_draft_text, "edited review");
+        assert_eq!(
+            controller.state.view.overlay,
+            super::super::state::DesktopOverlay::PromptReview
+        );
+
+        let admitted_generation = failed_generation + 1;
+        controller.run_lifecycle.begin(
+            admitted_generation,
+            CancellationToken::new(),
+            LiveConfigOverrides::new(crate::config::AccessMode::Default),
+        );
+        controller.state.begin_agent_run();
+        controller.pending_root_submission = Some(PendingRootSubmission {
+            run_generation: admitted_generation,
+            owner_workspace_path: root.clone(),
+            owner_session_id: Some(session_a.id),
+            prompt_dispatch: crate::session::PromptDispatchPart::raw("commit after admission"),
+            image_paths: vec![retained_image.clone()],
+            cancel_prompt_review_on_commit: true,
+        });
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent {
+                run_generation: admitted_generation,
+                event: RunEvent::SessionStarted {
+                    session_id: session_a.id,
+                    title: session_a.title.clone(),
+                },
+            })
+            .expect("admission event");
+        controller.drain_runtime_messages();
+        assert_eq!(controller.composer_commit_generation, 0);
+        assert!(controller.pending_root_submission.is_some());
+        assert_eq!(
+            controller.state.composer.image_attachment_paths,
+            vec![retained_image.clone()]
+        );
+        assert!(controller.state.app_state.prompt_review.is_some());
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent {
+                run_generation: admitted_generation,
+                event: RunEvent::UserMessageStored {
+                    message_id: crate::session::MessageId::new(),
+                },
+            })
+            .expect("durable user message");
+        assert!(controller.run_lifecycle.request_cancel());
+        controller.drain_runtime_messages();
+        assert_eq!(controller.composer_commit_generation, 1);
+        assert!(controller.state.composer.image_attachment_paths.is_empty());
+        assert!(controller.pending_root_submission.is_none());
+        assert!(controller.state.app_state.prompt_review.is_none());
+        assert!(controller.state.composer.review_draft_text.is_empty());
+        assert_eq!(
+            controller.state.view.overlay,
+            super::super::state::DesktopOverlay::None
+        );
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: admitted_generation,
+                result: Err("test cleanup".to_string()),
+            })
+            .expect("cleanup");
+        controller.drain_runtime_messages();
+
+        let created_session_id = session_a.id;
+        let submitted_image = root.join("submitted-first-run.png");
+        let next_image = root.join("next-request.png");
+        controller.state.app_state.current_session_id = None;
+        controller.state.rebind_composer_owner(None);
+        controller.state.composer.image_attachment_paths =
+            vec![submitted_image.clone(), next_image.clone()];
+        controller.pending_root_submission = Some(PendingRootSubmission {
+            run_generation: 902,
+            owner_workspace_path: root.clone(),
+            owner_session_id: None,
+            prompt_dispatch: crate::session::PromptDispatchPart::raw("first run"),
+            image_paths: vec![submitted_image],
+            cancel_prompt_review_on_commit: false,
+        });
+        controller.state.app_state.current_session_id = Some(created_session_id);
+        assert!(controller.commit_pending_root_submission(902));
+        assert_eq!(controller.composer_commit_generation, 2);
+        assert_eq!(
+            controller.state.composer.image_attachment_paths,
+            vec![next_image.clone()]
+        );
+        controller
+            .state
+            .bind_composer_to_loaded_session(created_session_id);
+        assert_eq!(
+            controller.state.composer.image_attachment_paths,
+            vec![next_image.clone()]
+        );
+        assert_eq!(
+            controller.state.composer.image_attachment_paths,
+            vec![next_image]
+        );
+
+        let blocker = controller.state.begin_project_delete_mutation();
+        assert!(!controller.set_session_memory_mode(session_a.id, SessionMemoryMode::Enabled,));
+        assert!(controller.state.finish_project_delete_mutation(blocker));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_access_mode_persistence_keeps_every_runtime_owner_and_permission_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
+            .await
+            .expect("app");
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let initial_access_mode = controller.app.config.permissions.access_mode;
+        let live = LiveConfigOverrides::new(initial_access_mode);
+        let live_observer = live.clone();
+        controller
+            .run_lifecycle
+            .begin(1, CancellationToken::new(), live);
+        let request = test_permission("pending permission");
+        let (response, receiver) = mpsc::channel();
+        controller.pending_permission_request = Some(request.clone());
+        controller.pending_permission_request_id = Some(42);
+        controller.permission_response = Some(response);
+        controller.state.set_permission(42, &request);
+
+        assert!(!controller.toggle_access_mode_with_persistence(
+            |_, _| Err("simulated persistence failure".to_string()),
+            |_, _| Ok(()),
+        ));
+
+        assert_eq!(
+            controller.app.config.permissions.access_mode,
+            initial_access_mode
+        );
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            initial_access_mode
+        );
+        assert_eq!(live_observer.access_mode(), initial_access_mode);
+        assert_eq!(controller.pending_permission_request_id, Some(42));
+        assert!(controller.pending_permission_request.is_some());
+        assert_eq!(controller.state.permission_request_id, Some(42));
+        assert!(controller.state.app_state.permission.is_some());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn durable_activity_fallback_is_session_scoped_and_live_rows_win() {
+        let root_session_id = SessionId::new();
+        let other_session_id = SessionId::new();
+        let durable = (
+            root_session_id,
+            vec![
+                agent_record(
+                    SessionId::new(),
+                    "/root/research",
+                    AgentStatus::Completed(Some("research result".to_string())),
+                    "research result",
+                ),
+                agent_record(
+                    SessionId::new(),
+                    "/root/review",
+                    AgentStatus::Completed(Some("review result".to_string())),
+                    "review result",
+                ),
+                agent_record(
+                    SessionId::new(),
+                    "/root/tests",
+                    AgentStatus::Completed(Some("test result".to_string())),
+                    "test result",
+                ),
+            ],
+        );
+
+        let restored = activity_records_for_projection(root_session_id, Vec::new(), Some(&durable));
+        assert_eq!(restored.len(), 3);
+        assert_eq!(
+            restored
+                .iter()
+                .map(|record| record.agent_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/root/research", "/root/review", "/root/tests"]
+        );
+        assert!(restored.iter().all(|record| {
+            matches!(record.status, AgentStatus::Completed(Some(_)))
+                && !record.result_preview.is_empty()
+        }));
+        assert!(
+            activity_records_for_projection(other_session_id, Vec::new(), Some(&durable))
+                .is_empty()
+        );
+
+        let live = agent_record(SessionId::new(), "/root/live", AgentStatus::Running, "");
+        let selected =
+            activity_records_for_projection(root_session_id, vec![live.clone()], Some(&durable));
+        assert_eq!(selected, vec![live]);
+        assert!(agent_activity_projection(selected).1);
+    }
+
+    #[test]
+    fn durable_only_running_activity_is_active_and_requests_bounded_refresh() {
+        let root_session_id = SessionId::new();
+        let running = agent_record(SessionId::new(), "/root/research", AgentStatus::Running, "");
+        let durable = (root_session_id, vec![running]);
+        let live = Vec::new();
+        let projected =
+            activity_records_for_projection(root_session_id, live.clone(), Some(&durable));
+
+        assert!(agent_activity_records_are_active(&projected));
+        assert!(durable_agent_activity_refresh_required(
+            &live, &projected, false, false,
+        ));
+        assert!(!durable_agent_activity_refresh_required(
+            &live, &projected, true, false,
+        ));
+        assert!(!durable_agent_activity_refresh_required(
+            &live, &projected, false, true,
+        ));
+
+        let local_live = vec![agent_record(
+            SessionId::new(),
+            "/root/live",
+            AgentStatus::Running,
+            "",
+        )];
+        assert!(!durable_agent_activity_refresh_required(
+            &local_live,
+            &local_live,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn durable_activity_refresh_completion_is_latest_wins_and_session_scoped() {
+        let session_id = SessionId::new();
+        let target = SessionRefreshRequestTarget {
+            workspace_root: Utf8PathBuf::from("C:/workspace-a"),
+            session_id,
+        };
+        let mut tracker = LatestRequestTracker::default();
+        let stale_request = tracker.begin(target.clone());
+        let current_request = tracker.begin(target.clone());
+
+        assert!(!finish_durable_agent_activity_refresh_request(
+            &mut tracker,
+            stale_request,
+            &target,
+            Utf8Path::new("C:/workspace-a"),
+            Some(session_id),
+        ));
+        assert!(tracker.is_pending());
+        assert!(!finish_durable_agent_activity_refresh_request(
+            &mut tracker,
+            current_request,
+            &target,
+            Utf8Path::new("C:/workspace-b"),
+            Some(session_id),
+        ));
+        assert!(!tracker.is_pending());
+
+        let wrong_session_request = tracker.begin(target.clone());
+        assert!(!finish_durable_agent_activity_refresh_request(
+            &mut tracker,
+            wrong_session_request,
+            &target,
+            Utf8Path::new("C:/workspace-a"),
+            Some(SessionId::new()),
+        ));
+        assert!(!tracker.is_pending());
+
+        let accepted_request = tracker.begin(target.clone());
+        assert!(finish_durable_agent_activity_refresh_request(
+            &mut tracker,
+            accepted_request,
+            &target,
+            Utf8Path::new("C:/workspace-a"),
+            Some(session_id),
+        ));
+        assert!(!finish_durable_agent_activity_refresh_request(
+            &mut tracker,
+            accepted_request,
+            &target,
+            Utf8Path::new("C:/workspace-a"),
+            Some(session_id),
+        ));
+    }
+
+    #[test]
+    fn cancelled_active_permission_clears_by_id_and_advances_broker() {
+        let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let broker = SharedConfirmationPrompt::new(DesktopConfirmationPrompt {
+            tx: runtime_tx,
+            next_permission_request_id: Arc::new(AtomicU64::new(41)),
+        });
+
+        let first_cancel = CancellationToken::new();
+        let (first_done_tx, first_done_rx) = mpsc::sync_channel(1);
+        let mut first_prompt = broker.clone();
+        let first_wait_cancel = first_cancel.clone();
+        std::thread::spawn(move || {
+            let result =
+                first_prompt.confirm_with_cancel(&test_permission("first"), &first_wait_cancel);
+            let _ = first_done_tx.send(result);
+        });
+
+        let (first_id, first_response) = match recv_runtime_message(&mut runtime_rx) {
+            RuntimeMessage::Permission {
+                confirmation_id,
+                response,
+                ..
+            } => (confirmation_id, response),
+            _ => panic!("expected first desktop permission"),
+        };
+        first_cancel.cancel();
+        match recv_runtime_message(&mut runtime_rx) {
+            RuntimeMessage::PermissionCancelled { confirmation_id } => {
+                assert_eq!(confirmation_id, first_id)
+            }
+            _ => panic!("expected desktop permission cancellation"),
+        }
+        assert!(
+            !first_done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("first confirmation result")
+                .expect("first confirmation")
+        );
+
+        let mut pending_request = Some(test_permission("first"));
+        let mut pending_id = Some(first_id);
+        let mut pending_response = Some(first_response);
+        assert!(!clear_cancelled_permission(
+            &mut pending_request,
+            &mut pending_id,
+            &mut pending_response,
+            first_id + 1,
+        ));
+        assert_eq!(pending_id, Some(first_id));
+        assert!(clear_cancelled_permission(
+            &mut pending_request,
+            &mut pending_id,
+            &mut pending_response,
+            first_id,
+        ));
+        assert!(pending_id.is_none());
+
+        let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
+        let mut second_prompt = broker;
+        std::thread::spawn(move || {
+            let result = second_prompt.confirm(&test_permission("second"));
+            let _ = second_done_tx.send(result);
+        });
+        let (second_id, second_response) = match recv_runtime_message(&mut runtime_rx) {
+            RuntimeMessage::Permission {
+                confirmation_id,
+                response,
+                ..
+            } => (confirmation_id, response),
+            _ => panic!("expected second desktop permission"),
+        };
+        assert!(second_id > first_id);
+        second_response
+            .send(true)
+            .expect("answer second permission");
+        assert!(
+            second_done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("second confirmation result")
+                .expect("second confirmation")
+        );
+    }
 
     #[test]
     fn projection_revision_is_monotonic_at_the_command_owner() {
@@ -473,7 +3454,6 @@ mod command_projection_owner_tests {
                 stale_request,
                 &target,
                 Utf8Path::new("C:/workspace-a"),
-                Some(session_id),
             ),
             None,
             "an older completion cannot settle the latest export owner"
@@ -484,7 +3464,6 @@ mod command_projection_owner_tests {
                 current_request,
                 &target,
                 Utf8Path::new("C:/workspace-b"),
-                Some(session_id),
             ),
             Some(false),
             "a current request from the replaced workspace cannot update status"
@@ -495,7 +3474,6 @@ mod command_projection_owner_tests {
                 current_request,
                 &target,
                 Utf8Path::new("C:/workspace-a"),
-                Some(session_id),
             ),
             None,
             "the same completion is consumed at most once"
@@ -514,16 +3492,27 @@ pub(crate) struct DesktopController {
     pending_permission_request: Option<PermissionRequest>,
     pending_permission_request_id: Option<u64>,
     next_permission_request_id: Arc<AtomicU64>,
-    active_run_cancel: Option<CancellationToken>,
-    active_live_config: Option<LiveConfigOverrides>,
+    run_lifecycle: DesktopRunLifecycle,
+    pending_root_submission: Option<PendingRootSubmission>,
+    composer_commit_generation: u64,
+    next_root_run_generation: u64,
     next_enhance_request_id: u64,
     session_search_requests: SessionSearchRequestTracker,
     snapshot_requests: LatestRequestTracker<SnapshotRequestTarget>,
     turn_page_requests: LatestRequestTracker<SessionPageRequestTarget>,
     live_session_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
+    current_session_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
+    current_todo_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
+    durable_agent_activity_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
     history_export_requests: LatestRequestTracker<HistoryExportRequestTarget>,
     provider_catalog_requests: LatestRequestTracker<ProviderCatalogRequestTarget>,
+    startup_provider_requests: LatestRequestTracker<ProviderReadinessRequestTarget>,
+    startup_docling_requests: LatestRequestTracker<DoclingRequestTarget>,
+    access_mode_persistence_requests: LatestRequestTracker<AccessModePersistenceTarget>,
+    pending_access_mode_adoption: Option<PendingAccessModeAdoption>,
     projection_revision: u64,
+    loaded_agent_activity_records: Option<LoadedAgentActivityRecords>,
+    durable_agent_activity_refresh_failures: u8,
     attachment_asset_app: Option<tauri::AppHandle>,
     authorized_attachment_assets: BTreeSet<Utf8PathBuf>,
 }
@@ -626,29 +3615,25 @@ impl DesktopController {
         if let Some(opacity) = preferences.window_opacity_percent {
             state.set_window_opacity_percent(opacity);
         }
+        let mut loaded_agent_activity_records = None;
         if let Some(session_id) = args.session_id.or_else(|| state.selected_session_id()) {
-            let (
-                session,
-                transcript,
-                turn_items,
-                session_state,
-                todos,
-                turn_page_offset,
-                turn_page_limit,
-                turn_page_total,
-                turn_page_has_more,
-            ) = load_session_detail(&app, session_id).await?;
+            let detail = load_session_detail(&app, session_id).await?;
+            let activity_records = app
+                .run_service
+                .durable_agent_activity_records(session_id)
+                .await?;
             state.load_open_session(
-                &session,
-                &transcript,
-                &turn_items,
-                session_state,
-                todos,
-                turn_page_offset,
-                turn_page_limit,
-                turn_page_total,
-                turn_page_has_more,
+                &detail.session,
+                &detail.transcript,
+                &detail.turn_items,
+                detail.state,
+                detail.todos,
+                detail.turn_page_offset,
+                detail.turn_page_limit,
+                detail.turn_page_total,
+                detail.turn_page_has_more,
             );
+            loaded_agent_activity_records = Some((session_id, activity_records));
         }
         let mut controller = Self {
             app,
@@ -661,16 +3646,27 @@ impl DesktopController {
             pending_permission_request: None,
             pending_permission_request_id: None,
             next_permission_request_id: Arc::new(AtomicU64::new(1)),
-            active_run_cancel: None,
-            active_live_config: None,
+            run_lifecycle: DesktopRunLifecycle::default(),
+            pending_root_submission: None,
+            composer_commit_generation: 0,
+            next_root_run_generation: 1,
             next_enhance_request_id: 1,
             session_search_requests: SessionSearchRequestTracker::default(),
             snapshot_requests: LatestRequestTracker::default(),
             turn_page_requests: LatestRequestTracker::default(),
             live_session_refresh_requests: LatestRequestTracker::default(),
+            current_session_refresh_requests: LatestRequestTracker::default(),
+            current_todo_refresh_requests: LatestRequestTracker::default(),
+            durable_agent_activity_refresh_requests: LatestRequestTracker::default(),
             history_export_requests: LatestRequestTracker::default(),
             provider_catalog_requests: LatestRequestTracker::default(),
+            startup_provider_requests: LatestRequestTracker::default(),
+            startup_docling_requests: LatestRequestTracker::default(),
+            access_mode_persistence_requests: LatestRequestTracker::default(),
+            pending_access_mode_adoption: None,
             projection_revision: 0,
+            loaded_agent_activity_records,
+            durable_agent_activity_refresh_failures: 0,
             attachment_asset_app: None,
             authorized_attachment_assets: BTreeSet::new(),
         };
@@ -683,19 +3679,47 @@ impl DesktopController {
             .is_empty()
         {
             controller.load_provider_models();
-        } else {
-            controller
-                .state
-                .fail_startup_provider_model_load("LLM URL が未設定です。");
         }
-        controller.check_startup_docling();
+        controller.drive_startup_readiness();
         Ok(controller)
     }
 
     pub(crate) fn next_web_state(&mut self) -> Result<DesktopWebState, String> {
         self.reconcile_attachment_asset_authorizations()?;
         let revision = advance_projection_revision(&mut self.projection_revision)?;
-        let mut projection = desktop_web_state(&self.state);
+        let mut runtime_projection = DesktopRuntimeProjection {
+            root_run_finalizing: self.run_lifecycle.root_is_finalizing(),
+            root_run_generation: self.run_lifecycle.root_generation(),
+            last_root_run_epoch: self.last_root_run_epoch(),
+            composer_commit_generation: self.composer_commit_generation,
+            ..DesktopRuntimeProjection::default()
+        };
+        if let Some(root_session_id) = self.state.app_state.current_session_id {
+            let live_records = self.app.run_service.agent_activity_records(root_session_id);
+            let records = activity_records_for_projection(
+                root_session_id,
+                live_records.clone(),
+                self.loaded_agent_activity_records.as_ref(),
+            );
+            let refresh_durable_activity = durable_agent_activity_refresh_required(
+                &live_records,
+                &records,
+                self.durable_agent_activity_refresh_requests.is_pending(),
+                self.state.post_run_refresh_pending(),
+            ) && durable_agent_activity_retry_allowed(
+                self.durable_agent_activity_refresh_failures,
+            );
+            let (rows, tree_active) = agent_activity_projection(records);
+            runtime_projection.agent_activity_rows = rows;
+            runtime_projection.agent_tree_active = tree_active;
+            if tree_active {
+                self.invalidate_session_search_requests();
+            }
+            if refresh_durable_activity {
+                self.spawn_durable_agent_activity_refresh(root_session_id);
+            }
+        }
+        let mut projection = desktop_web_state(&self.state, &runtime_projection);
         projection.projection_revision = projection_revision_text(revision);
         Ok(projection)
     }
@@ -815,272 +3839,332 @@ impl DesktopController {
         });
     }
 
-    pub(crate) fn select_session_and_open(&mut self, index: usize) {
-        if self.select_session_if_admitted(index) {
-            self.open_selected_session();
-        }
-    }
-
-    pub(crate) fn select_project_and_open(&mut self, index: usize) {
-        if self.select_project_if_admitted(index) {
-            self.open_selected_project();
-        }
-    }
-
-    pub(crate) fn select_session_if_admitted(&mut self, index: usize) -> bool {
-        self.invalidate_session_target_requests();
+    pub(crate) fn select_session_and_open(&mut self, index: usize) -> bool {
         if !self.ensure_navigation_admission("session") {
             return false;
         }
-        if index >= self.state.snapshot.session_rows.len() {
-            self.state
-                .set_status_message("session selection is no longer available");
-            return false;
-        }
-        self.state.select_session(index);
-        true
-    }
-
-    pub(crate) fn select_project_if_admitted(&mut self, index: usize) -> bool {
-        self.invalidate_session_target_requests();
-        if !self.ensure_navigation_admission("project") {
-            return false;
-        }
-        if index >= self.state.snapshot.project_rows.len() {
-            self.state
-                .set_status_message("project selection is no longer available");
-            return false;
-        }
-        self.state.select_project(index);
-        true
-    }
-
-    pub(crate) fn open_selected_session(&mut self) {
-        if !self.ensure_navigation_admission("session") {
-            return;
-        }
-        if let Some(session_id) = self.state.selected_session_id() {
-            self.state
-                .set_status_message(format!("opening session {session_id}..."));
-            let request_id = self.state.begin_session_load(session_id);
-            self.spawn_session_load(
-                session_id,
-                SessionLoadReason::UserSelection,
-                Some(request_id),
-            );
-        }
-    }
-
-    pub(crate) fn rejoin_selected_session(&mut self) {
-        if self.state.is_busy() {
-            self.state.set_status_message(
-                "running session cannot be rejoined while a local run is active",
-            );
-            return;
-        }
-        let Some(session_id) = self.state.selected_session_id() else {
-            self.state
-                .set_status_message("select a running session before rejoining");
-            return;
-        };
-        let is_active_loaded = self
+        let Some(session_id) = self
             .state
             .snapshot
             .session_rows
-            .get(self.state.snapshot.selected_session_index)
-            .is_some_and(|row| row.loaded_status == LoadedSessionStatus::Active);
-        if !is_active_loaded {
+            .get(index)
+            .map(|row| row.session_id)
+        else {
             self.state
-                .set_status_message("selected session is not an active loaded session");
-            return;
-        }
+                .set_status_message("session selection is no longer available");
+            return false;
+        };
+        self.invalidate_session_target_requests();
         self.state
-            .set_status_message(format!("rejoining running session {session_id}..."));
+            .set_status_message(format!("opening session {session_id}..."));
         let request_id = self.state.begin_session_load(session_id);
-        self.spawn_session_rejoin(session_id, Some(request_id));
+        self.spawn_session_load(session_id, SessionLoadReason::UserSelection, request_id);
+        true
     }
 
-    pub(crate) fn open_selected_project(&mut self) {
+    pub(crate) fn select_project_and_open(&mut self, index: usize) -> bool {
         if !self.ensure_navigation_admission("project") {
-            return;
+            return false;
         }
-        let Some(path) = self.state.selected_project_path().map(Utf8PathBuf::from) else {
-            self.state.set_status_message("select a project first");
-            return;
+        let Some(path) = self
+            .state
+            .snapshot
+            .project_rows
+            .get(index)
+            .map(|row| Utf8PathBuf::from(&row.path))
+        else {
+            self.state
+                .set_status_message("project selection is no longer available");
+            return false;
         };
         if path == self.app.workspace.root {
-            return;
+            return true;
         }
+        self.invalidate_session_target_requests();
         self.state
             .set_status_message(format!("opening project {}...", path));
         let request_id = self.state.begin_workspace_load(path.clone(), None);
         self.spawn_workspace_load(path, request_id);
+        true
+    }
+
+    pub(crate) fn rejoin_session_if_admitted(&mut self, index: usize) -> bool {
+        if !self.ensure_navigation_admission("running session") {
+            return false;
+        }
+        let Some(row) = self.state.snapshot.session_rows.get(index) else {
+            self.state
+                .set_status_message("session selection is no longer available");
+            return false;
+        };
+        if row.loaded_status != LoadedSessionStatus::Active {
+            self.state
+                .set_status_message("selected session is not an active loaded session");
+            return false;
+        }
+        let session_id = row.session_id;
+        self.invalidate_session_target_requests();
+        self.state
+            .set_status_message(format!("rejoining running session {session_id}..."));
+        let request_id = self.state.begin_session_load(session_id);
+        self.spawn_session_rejoin(session_id, request_id);
+        true
     }
 
     fn ensure_navigation_admission(&mut self, target: &str) -> bool {
-        if self.state.can_begin_navigation() {
+        let agent_tree_active = self.current_agent_tree_active();
+        let Some(reason) = navigation_admission_blocker(
+            self.state.is_busy(),
+            self.state.background_mutation_pending(),
+            self.state.navigation_loading(),
+            agent_tree_active,
+            self.run_lifecycle.root_is_finalizing(),
+        ) else {
             return true;
-        }
-        let reason = if self.state.is_busy() {
-            "a run is active"
-        } else if self.state.background_mutation_pending() {
-            "a background mutation is active"
-        } else {
-            "navigation is already active"
         };
         self.state
             .set_status_message(format!("{target} cannot change while {reason}"));
         false
     }
 
+    fn current_agent_tree_active(&self) -> bool {
+        agent_activity_records_are_active(&self.current_agent_activity_records())
+    }
+
+    fn current_agent_activity_records(&self) -> Vec<AgentActivityRecord> {
+        let Some(session_id) = self.state.app_state.current_session_id else {
+            return Vec::new();
+        };
+        activity_records_for_projection(
+            session_id,
+            self.app.run_service.agent_activity_records(session_id),
+            self.loaded_agent_activity_records.as_ref(),
+        )
+    }
+
     fn invalidate_session_target_requests(&mut self) {
-        for operation_id in self.session_search_requests.clear() {
-            let _ = self.state.finish_session_search(operation_id);
-        }
+        self.invalidate_session_search_requests();
         self.snapshot_requests.clear();
         self.turn_page_requests.clear();
         self.live_session_refresh_requests.clear();
+        self.current_session_refresh_requests.clear();
+        self.current_todo_refresh_requests.clear();
+        self.durable_agent_activity_refresh_requests.clear();
         self.history_export_requests.clear();
         self.state.finish_snapshot_refresh();
         self.state.finish_turn_page_load();
+        self.state.finish_current_todo_refresh();
         self.state.finish_history_export();
     }
 
-    pub(crate) fn delete_selected_session(&mut self) {
-        self.invalidate_session_target_requests();
-        if !self.ensure_navigation_admission("chat deletion") {
-            return;
+    fn invalidate_session_search_requests(&mut self) {
+        for operation_id in self.session_search_requests.clear() {
+            let _ = self.state.finish_session_search(operation_id);
         }
-        let Some(session_id) = self.state.selected_session_id() else {
+    }
+
+    pub(crate) fn delete_session(&mut self, session_id: SessionId) -> bool {
+        if !self.ensure_navigation_admission("chat deletion") {
+            return false;
+        }
+        if !self
+            .state
+            .snapshot
+            .session_rows
+            .iter()
+            .any(|row| row.session_id == session_id)
+        {
             self.state
-                .set_status_message("select a chat before deleting");
-            return;
-        };
+                .set_status_message("chat deletion target is no longer available");
+            return false;
+        }
+        self.invalidate_session_target_requests();
         self.state
             .set_status_message(format!("deleting chat {}...", session_id));
         let operation_id = self.state.begin_session_delete_mutation();
         self.spawn_session_delete(session_id, operation_id);
+        true
     }
 
-    pub(crate) fn archive_selected_session(&mut self, archived: bool) {
-        if self.state.is_busy() {
-            self.state
-                .set_status_message("chat archive state cannot change while a run is active");
-            return;
+    pub(crate) fn archive_session(&mut self, session_id: SessionId, archived: bool) -> bool {
+        if !self.ensure_navigation_admission("chat archive state") {
+            return false;
         }
-        let Some(session_id) = self.state.selected_session_id() else {
+        if !self
+            .state
+            .snapshot
+            .session_rows
+            .iter()
+            .any(|row| row.session_id == session_id)
+        {
             self.state
-                .set_status_message("select a chat before changing archive state");
-            return;
-        };
+                .set_status_message("chat archive target is no longer available");
+            return false;
+        }
+        self.invalidate_session_target_requests();
         self.state.set_status_message(if archived {
             format!("archiving chat {}...", session_id)
         } else {
             format!("unarchiving chat {}...", session_id)
         });
-        self.state.begin_session_archive_mutation();
-        self.spawn_session_archive(
+        let operation_id = self.state.begin_session_archive_mutation();
+        let target = SessionMutationRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            project_id: self.app.workspace.project_id,
             session_id,
+            operation_id,
+        };
+        self.spawn_session_archive(
+            target,
             archived,
             self.state.view.session_search_text.clone(),
             self.state.view.session_search_include_archived,
         );
+        true
     }
 
-    pub(crate) fn rollback_selected_session(&mut self) {
-        if self.state.is_busy() {
-            self.state
-                .set_status_message("chat rollback cannot run while a local run is active");
-            return;
+    pub(crate) fn rollback_session(&mut self, session_id: SessionId) -> bool {
+        if !self.ensure_navigation_admission("chat rollback") {
+            return false;
         }
-        let Some(session_id) = self.state.selected_session_id() else {
-            self.state
-                .set_status_message("select a chat before rolling back history");
-            return;
-        };
-        let is_active_loaded = self
+        let Some(row) = self
             .state
             .snapshot
             .session_rows
-            .get(self.state.snapshot.selected_session_index)
-            .is_some_and(|row| row.loaded_status == LoadedSessionStatus::Active);
-        if is_active_loaded {
+            .iter()
+            .find(|row| row.session_id == session_id)
+        else {
+            self.state
+                .set_status_message("chat rollback target is no longer available");
+            return false;
+        };
+        if row.loaded_status == LoadedSessionStatus::Active {
             self.state
                 .set_status_message("running sessions cannot be rolled back");
-            return;
+            return false;
         }
+        self.invalidate_session_target_requests();
         self.state.set_status_message(format!(
             "rolling back latest turn in chat {}...",
             session_id
         ));
-        self.state.begin_session_rollback_mutation();
-        self.spawn_session_rollback(
+        let operation_id = self.state.begin_session_rollback_mutation();
+        let target = SessionMutationRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            project_id: self.app.workspace.project_id,
             session_id,
+            operation_id,
+        };
+        self.spawn_session_rollback(
+            target,
             self.state.view.session_search_text.clone(),
             self.state.view.session_search_include_archived,
         );
+        true
     }
 
-    pub(crate) fn fork_selected_session(&mut self) {
-        if self.state.is_busy() {
-            self.state
-                .set_status_message("chat fork cannot run while a local run is active");
-            return;
+    pub(crate) fn fork_session(&mut self, session_id: SessionId) -> bool {
+        if !self.ensure_navigation_admission("chat fork") {
+            return false;
         }
-        let Some(session_id) = self.state.selected_session_id() else {
+        let Some(row) = self
+            .state
+            .snapshot
+            .session_rows
+            .iter()
+            .find(|row| row.session_id == session_id)
+        else {
             self.state
-                .set_status_message("select a chat before forking");
-            return;
+                .set_status_message("chat fork target is no longer available");
+            return false;
         };
-        let title = format!("{} fork", self.state.selected_session_title());
+        let title = format!("{} fork", row.title);
+        self.invalidate_session_target_requests();
         self.state
             .set_status_message(format!("forking chat {}...", session_id));
-        self.state.begin_session_maintenance_mutation();
-        self.spawn_session_fork(session_id, Some(title));
+        let operation_id = self.state.begin_session_maintenance_mutation();
+        let target = SessionMutationRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            project_id: self.app.workspace.project_id,
+            session_id,
+            operation_id,
+        };
+        self.spawn_session_fork(target, Some(title));
+        true
     }
 
-    pub(crate) fn interrupt_selected_session(&mut self) {
-        let Some(session_id) = self.state.selected_session_id() else {
+    pub(crate) fn interrupt_session(&mut self, session_id: SessionId) -> bool {
+        if !self.ensure_navigation_admission("running chat interrupt") {
+            return false;
+        }
+        if !self
+            .state
+            .snapshot
+            .session_rows
+            .iter()
+            .any(|row| row.session_id == session_id)
+        {
             self.state
-                .set_status_message("select a running chat before interrupting");
-            return;
-        };
+                .set_status_message("running chat target is no longer available");
+            return false;
+        }
+        self.invalidate_session_target_requests();
         if self.state.app_state.current_session_id == Some(session_id) && self.state.is_busy() {
             self.cancel_active_run();
-            return;
+            return true;
         }
         self.state
             .set_status_message(format!("interrupting running chat {}...", session_id));
-        self.state.begin_session_maintenance_mutation();
-        self.spawn_session_interrupt(session_id);
+        let operation_id = self.state.begin_session_maintenance_mutation();
+        let target = SessionMutationRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            project_id: self.app.workspace.project_id,
+            session_id,
+            operation_id,
+        };
+        self.spawn_session_interrupt(target);
+        true
     }
 
-    pub(crate) fn set_selected_session_memory_mode(&mut self, mode: SessionMemoryMode) {
-        if self.state.is_busy() {
-            self.state
-                .set_status_message("chat memory mode cannot change while a local run is active");
-            return;
+    pub(crate) fn set_session_memory_mode(
+        &mut self,
+        session_id: SessionId,
+        mode: SessionMemoryMode,
+    ) -> bool {
+        if !self.ensure_navigation_admission("chat memory mode") {
+            return false;
         }
-        let Some(session_id) = self.state.selected_session_id() else {
+        if !self
+            .state
+            .snapshot
+            .session_rows
+            .iter()
+            .any(|row| row.session_id == session_id)
+        {
             self.state
-                .set_status_message("select a chat before changing memory mode");
-            return;
-        };
+                .set_status_message("chat memory target is no longer available");
+            return false;
+        }
+        self.invalidate_session_target_requests();
         self.state.set_status_message(format!(
             "setting chat {} memory mode to {}...",
             session_id,
             mode.key()
         ));
-        self.state.begin_session_maintenance_mutation();
-        self.spawn_session_memory_mode(session_id, mode);
+        let operation_id = self.state.begin_session_maintenance_mutation();
+        let target = SessionMutationRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            project_id: self.app.workspace.project_id,
+            session_id,
+            operation_id,
+        };
+        self.spawn_session_memory_mode(target, mode);
+        true
     }
 
-    pub(crate) fn set_session_search(&mut self, text: String) {
-        if self.state.background_mutation_pending() {
-            self.state.set_status_message(
-                "session search cannot start while a background mutation is active",
-            );
-            return;
+    pub(crate) fn set_session_search(&mut self, text: String) -> bool {
+        if !self.ensure_navigation_admission("session search") {
+            return false;
         }
         self.state.set_session_search_text(text.clone());
         let operation_id = self.state.begin_session_search();
@@ -1090,14 +4174,12 @@ impl DesktopController {
             self.state.view.session_search_include_archived,
             request_id,
         );
+        true
     }
 
-    pub(crate) fn set_session_search_include_archived(&mut self, include_archived: bool) {
-        if self.state.background_mutation_pending() {
-            self.state.set_status_message(
-                "session search cannot start while a background mutation is active",
-            );
-            return;
+    pub(crate) fn set_session_search_include_archived(&mut self, include_archived: bool) -> bool {
+        if !self.ensure_navigation_admission("session search") {
+            return false;
         }
         self.state
             .set_session_search_include_archived(include_archived);
@@ -1108,24 +4190,26 @@ impl DesktopController {
             include_archived,
             request_id,
         );
+        true
     }
 
-    pub(crate) fn delete_selected_project(&mut self) {
-        if self.state.is_busy() {
-            self.state
-                .set_status_message("project cannot be deleted while a run is active");
-            return;
+    pub(crate) fn delete_project(&mut self, project_id: ProjectId) -> bool {
+        if !self.ensure_navigation_admission("project deletion") {
+            return false;
         }
-        let Some(project_id) = self.state.selected_project_id() else {
+        let Some(project_root) = self
+            .state
+            .snapshot
+            .project_rows
+            .iter()
+            .find(|row| row.project_id == project_id)
+            .map(|row| Utf8PathBuf::from(&row.path))
+        else {
             self.state
-                .set_status_message("select a project before deleting");
-            return;
+                .set_status_message("project deletion target is no longer available");
+            return false;
         };
-        let Some(project_root) = self.state.selected_project_path().map(Utf8PathBuf::from) else {
-            self.state
-                .set_status_message("selected project path is not available");
-            return;
-        };
+        self.invalidate_session_target_requests();
         self.state
             .set_status_message(format!("deleting project {}...", project_id));
         let mut hidden_roots = self.preferences.deleted_project_roots.clone();
@@ -1135,18 +4219,32 @@ impl DesktopController {
         if !hidden_roots.iter().any(|root| root == &project_root) {
             hidden_roots.push(project_root.clone());
         }
-        self.state.begin_project_delete_mutation();
-        self.spawn_project_delete(project_id, project_root, hidden_roots);
+        let operation_id = self.state.begin_project_delete_mutation();
+        let target = ProjectDeleteRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            owner_project_id: self.app.workspace.project_id,
+            project_id,
+            project_root,
+            operation_id,
+        };
+        self.spawn_project_delete(target, hidden_roots);
+        true
     }
 
-    pub(crate) fn export_selected_history_markdown_auto(&mut self) {
-        let Some(session_id) = self.state.selected_session_id() else {
+    pub(crate) fn export_history_markdown_auto(&mut self, session_id: SessionId) {
+        let Some(title) = self
+            .state
+            .snapshot
+            .session_rows
+            .iter()
+            .find(|row| row.session_id == session_id)
+            .map(|row| row.label.clone())
+        else {
             self.state
-                .set_status_message("select a session before exporting history");
+                .set_status_message("history export target is no longer available");
             return;
         };
-        let default_file_name =
-            history_markdown_file_name(&self.state.selected_session_title(), session_id);
+        let default_file_name = history_markdown_file_name(&title, session_id);
         let export_path = self
             .app
             .workspace
@@ -1154,7 +4252,7 @@ impl DesktopController {
             .join(".moyai")
             .join("history-exports")
             .join(default_file_name);
-        self.export_selected_history_markdown_to_path(export_path);
+        self.export_history_markdown_to_path(session_id, export_path);
     }
 
     pub(crate) fn export_open_transcript_markdown_auto(&mut self) {
@@ -1204,18 +4302,28 @@ impl DesktopController {
         }
     }
 
-    pub(crate) fn export_selected_history_markdown_to_path(&mut self, path: Utf8PathBuf) {
+    pub(crate) fn export_history_markdown_to_path(
+        &mut self,
+        session_id: SessionId,
+        path: Utf8PathBuf,
+    ) {
         if !self.state.can_export_history() {
             self.state.set_status_message(
                 "history export cannot start while another operation is active",
             );
             return;
         }
-        let Some(session_id) = self.state.selected_session_id() else {
+        if !self
+            .state
+            .snapshot
+            .session_rows
+            .iter()
+            .any(|row| row.session_id == session_id)
+        {
             self.state
-                .set_status_message("select a session before exporting history");
+                .set_status_message("history export target is no longer available");
             return;
-        };
+        }
         self.state
             .set_status_message("exporting history markdown...");
         let target = HistoryExportRequestTarget {
@@ -1319,7 +4427,7 @@ impl DesktopController {
         &self,
         session_id: SessionId,
         reason: SessionLoadReason,
-        request_id: Option<NavigationRequestId>,
+        request_id: NavigationRequestId,
     ) {
         let app = self.app.clone();
         let runtime_tx = self.runtime_tx.clone();
@@ -1329,19 +4437,42 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop session runtime");
             let result = runtime.block_on(async move {
-                let load_result = if reason == SessionLoadReason::CurrentRefresh {
-                    load_latest_session_detail(&app, session_id).await
-                } else {
-                    load_session_detail(&app, session_id).await
-                };
-                load_result
-                    .map(loaded_session_from_detail)
-                    .map_err(|error| error.to_string())
+                let detail = load_session_detail(&app, session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                loaded_session_from_detail_with_activity(&app, detail).await
             });
             let _ = runtime_tx.send(RuntimeMessage::SessionLoaded {
                 request_id,
                 session_id,
                 reason,
+                result,
+            });
+        });
+    }
+
+    fn spawn_current_session_refresh(&mut self, session_id: SessionId) {
+        let app = self.app.clone();
+        let target = SessionRefreshRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            session_id,
+        };
+        let request_id = self.current_session_refresh_requests.begin(target.clone());
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop current-session-refresh runtime");
+            let result = runtime.block_on(async move {
+                let detail = load_latest_session_detail(&app, session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                loaded_session_from_detail_with_activity(&app, detail).await
+            });
+            let _ = runtime_tx.send(RuntimeMessage::CurrentSessionRefreshed {
+                request_id,
+                target,
                 result,
             });
         });
@@ -1394,6 +4525,7 @@ impl DesktopController {
                     turn_page_limit: page.limit,
                     turn_page_total: page.total,
                     turn_page_has_more: page.has_more,
+                    agent_activity_records: None,
                 })
             });
             let _ = runtime_tx.send(RuntimeMessage::TurnPageLoaded {
@@ -1448,6 +4580,7 @@ impl DesktopController {
                     turn_page_limit: page.limit,
                     turn_page_total: page.total,
                     turn_page_has_more: page.has_more,
+                    agent_activity_records: None,
                 })
             });
             let _ = runtime_tx.send(RuntimeMessage::LiveSessionRefreshed {
@@ -1472,10 +4605,10 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop latest-session-refresh runtime");
             let result = runtime.block_on(async move {
-                load_latest_session_detail(&app, session_id)
+                let detail = load_latest_session_detail(&app, session_id)
                     .await
-                    .map(loaded_session_from_detail)
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                Ok(loaded_session_from_detail(detail, None))
             });
             let _ = runtime_tx.send(RuntimeMessage::LiveSessionRefreshed {
                 request_id,
@@ -1485,7 +4618,36 @@ impl DesktopController {
         });
     }
 
-    fn spawn_session_rejoin(&self, session_id: SessionId, request_id: Option<NavigationRequestId>) {
+    fn spawn_durable_agent_activity_refresh(&mut self, session_id: SessionId) {
+        let app = self.app.clone();
+        let target = SessionRefreshRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            session_id,
+        };
+        let request_id = self
+            .durable_agent_activity_refresh_requests
+            .begin(target.clone());
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop durable-agent-activity runtime");
+            let result = runtime.block_on(async move {
+                app.run_service
+                    .durable_agent_activity_records(session_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            let _ = runtime_tx.send(RuntimeMessage::DurableAgentActivityRefreshed {
+                request_id,
+                target,
+                result,
+            });
+        });
+    }
+
+    fn spawn_session_rejoin(&self, session_id: SessionId, request_id: NavigationRequestId) {
         let app = self.app.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
@@ -1509,6 +4671,11 @@ impl DesktopController {
                     .list_todos(session_id)
                     .await
                     .map_err(|error| error.to_string())?;
+                let agent_activity_records = app
+                    .run_service
+                    .durable_agent_activity_records(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 Ok(LoadedSession {
                     session: rejoin.read.session,
                     transcript,
@@ -1519,6 +4686,7 @@ impl DesktopController {
                     turn_page_limit: rejoin.read.turns.limit,
                     turn_page_total: rejoin.read.turns.total,
                     turn_page_has_more: rejoin.read.turns.has_more,
+                    agent_activity_records: Some(agent_activity_records),
                 })
             });
             let _ = runtime_tx.send(RuntimeMessage::SessionLoaded {
@@ -1530,8 +4698,13 @@ impl DesktopController {
         });
     }
 
-    fn spawn_session_cancel_persist(&self, session_id: SessionId) {
+    fn spawn_session_cancel_persist(&mut self, session_id: SessionId) {
         let app = self.app.clone();
+        let target = SessionRefreshRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            session_id,
+        };
+        let request_id = self.current_session_refresh_requests.begin(target.clone());
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1543,37 +4716,14 @@ impl DesktopController {
                     .cancel_running_session(session_id, "run cancelled by user")
                     .await
                     .map_err(|error| error.to_string())?;
-                load_session_detail(&app, session_id)
+                let detail = load_session_detail(&app, session_id)
                     .await
-                    .map(
-                        |(
-                            session,
-                            transcript,
-                            turn_items,
-                            state,
-                            todos,
-                            turn_page_offset,
-                            turn_page_limit,
-                            turn_page_total,
-                            turn_page_has_more,
-                        )| LoadedSession {
-                            session,
-                            transcript,
-                            turn_items,
-                            state,
-                            todos,
-                            turn_page_offset,
-                            turn_page_limit,
-                            turn_page_total,
-                            turn_page_has_more,
-                        },
-                    )
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                loaded_session_from_detail_with_activity(&app, detail).await
             });
-            let _ = runtime_tx.send(RuntimeMessage::SessionLoaded {
-                request_id: None,
-                session_id,
-                reason: SessionLoadReason::CurrentRefresh,
+            let _ = runtime_tx.send(RuntimeMessage::CurrentSessionRefreshed {
+                request_id,
+                target,
                 result,
             });
         });
@@ -1609,7 +4759,7 @@ impl DesktopController {
 
     fn spawn_session_archive(
         &self,
-        session_id: SessionId,
+        target: SessionMutationRequestTarget,
         archived: bool,
         query: String,
         include_archived: bool,
@@ -1617,6 +4767,7 @@ impl DesktopController {
         let app = self.app.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
+            let session_id = target.session_id;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1631,17 +4782,23 @@ impl DesktopController {
                     .map_err(|error| error.to_string())
             });
             let _ = runtime_tx.send(RuntimeMessage::SessionArchived {
-                session_id,
+                target,
                 archived,
                 result,
             });
         });
     }
 
-    fn spawn_session_rollback(&self, session_id: SessionId, query: String, include_archived: bool) {
+    fn spawn_session_rollback(
+        &self,
+        target: SessionMutationRequestTarget,
+        query: String,
+        include_archived: bool,
+    ) {
         let app = self.app.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
+            let session_id = target.session_id;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1660,43 +4817,25 @@ impl DesktopController {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-                let (
-                    session,
-                    transcript,
-                    turn_items,
-                    state,
-                    todos,
-                    turn_page_offset,
-                    turn_page_limit,
-                    turn_page_total,
-                    turn_page_has_more,
-                ) = load_session_detail(&app, session_id)
+                let detail = load_session_detail(&app, session_id)
                     .await
                     .map_err(|error| error.to_string())?;
+                let loaded = loaded_session_from_detail_with_activity(&app, detail).await?;
                 Ok(DesktopRollbackLoaded {
                     snapshot,
-                    loaded: LoadedSession {
-                        session,
-                        transcript,
-                        turn_items,
-                        state,
-                        todos,
-                        turn_page_offset,
-                        turn_page_limit,
-                        turn_page_total,
-                        turn_page_has_more,
-                    },
+                    loaded,
                     dropped_turn_count: rollback.dropped_turn_ids.len(),
                 })
             });
-            let _ = runtime_tx.send(RuntimeMessage::SessionRolledBack { session_id, result });
+            let _ = runtime_tx.send(RuntimeMessage::SessionRolledBack { target, result });
         });
     }
 
-    fn spawn_session_fork(&self, source_session_id: SessionId, title: Option<String>) {
+    fn spawn_session_fork(&self, target: SessionMutationRequestTarget, title: Option<String>) {
         let app = self.app.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
+            let source_session_id = target.session_id;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1721,18 +4860,15 @@ impl DesktopController {
                 )
                 .await
             });
-            let session_id = result
-                .as_ref()
-                .map(|loaded| loaded.loaded.session.id)
-                .unwrap_or(source_session_id);
-            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied { session_id, result });
+            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied { target, result });
         });
     }
 
-    fn spawn_session_interrupt(&self, session_id: SessionId) {
+    fn spawn_session_interrupt(&self, target: SessionMutationRequestTarget) {
         let app = self.app.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
+            let session_id = target.session_id;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1752,14 +4888,19 @@ impl DesktopController {
                 )
                 .await
             });
-            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied { session_id, result });
+            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied { target, result });
         });
     }
 
-    fn spawn_session_memory_mode(&self, session_id: SessionId, mode: SessionMemoryMode) {
+    fn spawn_session_memory_mode(
+        &self,
+        target: SessionMutationRequestTarget,
+        mode: SessionMemoryMode,
+    ) {
         let app = self.app.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
+            let session_id = target.session_id;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1781,7 +4922,7 @@ impl DesktopController {
                 )
                 .await
             });
-            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied { session_id, result });
+            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied { target, result });
         });
     }
 
@@ -1815,13 +4956,13 @@ impl DesktopController {
 
     fn spawn_project_delete(
         &self,
-        project_id: ProjectId,
-        project_root: Utf8PathBuf,
+        target: ProjectDeleteRequestTarget,
         hidden_roots: Vec<Utf8PathBuf>,
     ) {
         let app = self.app.clone();
         let runtime_tx = self.runtime_tx.clone();
-        let project_root_for_thread = project_root.clone();
+        let project_id = target.project_id;
+        let project_root_for_thread = target.project_root.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1872,16 +5013,18 @@ impl DesktopController {
                     .map_err(|error| error.to_string())?;
                 Ok(WorkspaceLoadResult { app, snapshot })
             });
-            let _ = runtime_tx.send(RuntimeMessage::ProjectDeleted {
-                project_id,
-                project_root,
-                result,
-            });
+            let _ = runtime_tx.send(RuntimeMessage::ProjectDeleted { target, result });
         });
     }
 
-    fn spawn_current_todos_refresh(&self, session_id: SessionId) {
+    fn spawn_current_todos_refresh(&mut self, session_id: SessionId) {
         let service = self.app.session_service.clone();
+        let target = SessionRefreshRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            session_id,
+        };
+        let request_id = self.current_todo_refresh_requests.begin(target.clone());
+        self.state.begin_current_todo_refresh();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1894,68 +5037,82 @@ impl DesktopController {
                     .await
                     .map_err(|error| error.to_string())
             });
-            let _ = runtime_tx.send(RuntimeMessage::CurrentTodosLoaded { session_id, result });
+            let _ = runtime_tx.send(RuntimeMessage::CurrentTodosLoaded {
+                request_id,
+                target,
+                result,
+            });
         });
     }
 
-    pub(crate) fn start_run(&mut self) {
+    pub(crate) fn start_run(&mut self, prompt: String) -> bool {
         if self.state.navigation_loading() {
             self.state
                 .set_status_message("wait for navigation to finish before sending");
-            return;
+            return false;
         }
-        let prompt = self.state.composer.draft_prompt.trim().to_string();
+        let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
-            return;
+            self.state.set_status_message("prompt is empty");
+            return false;
         }
         let prompt_dispatch = crate::session::PromptDispatchPart::raw(&prompt);
-        self.launch_run_with_options(prompt, prompt_dispatch, None);
+        self.launch_run_with_options(prompt, prompt_dispatch, None, false)
     }
 
-    pub(crate) fn start_quick_chat(&mut self) {
+    pub(crate) fn start_quick_chat(&mut self) -> bool {
         if !self.ensure_navigation_admission("chat") {
-            return;
+            return false;
         }
         self.invalidate_session_target_requests();
         let Some(root) = quick_chat_workspace_directory() else {
-            self.state.start_new_chat();
+            self.start_new_chat_with_global_access();
             self.persist_preferences();
-            return;
+            return true;
         };
         if self.is_quick_chat_workspace() {
-            self.state.start_new_chat();
+            self.start_new_chat_with_global_access();
             self.persist_preferences();
-            return;
+            return true;
         }
         if let Err(error) = std::fs::create_dir_all(root.as_std_path()) {
             self.state.set_status_message(format!(
                 "failed to prepare quick chat workspace {}: {error}",
                 root
             ));
-            return;
+            return false;
         }
         self.state.hide_overlay();
         self.state
             .set_status_message("opening workspace-free quick chat...");
         let request_id = self.state.begin_workspace_load(root.clone(), None);
         self.spawn_workspace_load(root, request_id);
+        true
     }
 
-    pub(crate) fn start_project_session(&mut self, index: usize) {
-        if !self.select_project_if_admitted(index) {
-            return;
+    pub(crate) fn start_project_session(&mut self, index: usize) -> bool {
+        if !self.ensure_navigation_admission("project") {
+            return false;
         }
-        let Some(path) = self.state.selected_project_path().map(Utf8PathBuf::from) else {
+        let Some(path) = self
+            .state
+            .snapshot
+            .project_rows
+            .get(index)
+            .map(|row| Utf8PathBuf::from(&row.path))
+        else {
             self.state
-                .set_status_message("select a project before starting a development chat");
-            return;
+                .set_status_message("project selection is no longer available");
+            return false;
         };
+        self.invalidate_session_target_requests();
         self.state.hide_overlay();
         if path == self.app.workspace.root {
-            self.state.start_new_chat();
+            self.state.select_project(index);
+            self.start_new_chat_with_global_access();
             self.state.set_status_message("new development chat ready");
             self.persist_preferences();
-            return;
+            return true;
         }
         self.state.set_status_message(format!(
             "opening project {} for a new development chat...",
@@ -1965,11 +5122,12 @@ impl DesktopController {
             .state
             .begin_new_project_session_workspace_load(path.clone());
         self.spawn_workspace_load_for_new_project_session(path, request_id);
+        true
     }
 
-    pub(crate) fn open_quick_chat_session(&mut self, index: usize) {
+    pub(crate) fn open_quick_chat_session(&mut self, index: usize) -> bool {
         if !self.ensure_navigation_admission("chat") {
-            return;
+            return false;
         }
         let Some(session_id) = self
             .state
@@ -1979,12 +5137,12 @@ impl DesktopController {
             .map(|row| row.session_id)
         else {
             self.state.set_status_message("select a chat first");
-            return;
+            return false;
         };
         let Some(root) = quick_chat_workspace_directory() else {
             self.state
                 .set_status_message("quick chat workspace is unavailable");
-            return;
+            return false;
         };
         if self.is_quick_chat_workspace() {
             if let Some(row_index) = self
@@ -1994,8 +5152,7 @@ impl DesktopController {
                 .iter()
                 .position(|row| row.session_id == session_id)
             {
-                self.select_session_and_open(row_index);
-                return;
+                return self.select_session_and_open(row_index);
             }
         }
         self.invalidate_session_target_requests();
@@ -2006,28 +5163,30 @@ impl DesktopController {
             .state
             .begin_workspace_load(root.clone(), Some(session_id));
         self.spawn_workspace_load_for_selection(root, Some(session_id), request_id);
+        true
     }
 
-    pub(crate) fn delete_quick_chat_session(&mut self, index: usize) {
-        self.invalidate_session_target_requests();
+    pub(crate) fn delete_quick_chat_session(&mut self, session_id: SessionId) -> bool {
         if !self.ensure_navigation_admission("quick chat deletion") {
-            return;
+            return false;
         }
-        let Some(session_id) = self
+        if !self
             .state
             .snapshot
             .chat_session_rows
-            .get(index)
-            .map(|row| row.session_id)
-        else {
+            .iter()
+            .any(|row| row.session_id == session_id)
+        {
             self.state
-                .set_status_message("select a chat before deleting");
-            return;
-        };
+                .set_status_message("quick-chat deletion target is no longer available");
+            return false;
+        }
+        self.invalidate_session_target_requests();
         self.state
             .set_status_message(format!("deleting chat {}...", session_id));
         let operation_id = self.state.begin_session_delete_mutation();
         self.spawn_session_delete(session_id, operation_id);
+        true
     }
 
     pub(crate) fn create_project_from_picker(&mut self) {
@@ -2051,19 +5210,45 @@ impl DesktopController {
         }
     }
 
-    pub(crate) fn start_review_uncommitted(&mut self) {
-        let prompt = self.state.composer.draft_prompt.trim().to_string();
+    pub(crate) fn start_review_uncommitted(&mut self, prompt: String) -> bool {
+        let prompt = prompt.trim().to_string();
         let prompt_dispatch = crate::session::PromptDispatchPart::raw(&prompt);
-        self.launch_run_with_options(prompt, prompt_dispatch, Some(ReviewRequest::Uncommitted));
+        self.launch_run_with_options(
+            prompt,
+            prompt_dispatch,
+            Some(ReviewRequest::Uncommitted),
+            false,
+        )
     }
 
-    pub(crate) fn start_prompt_enhance(&mut self) {
-        let raw_prompt = self.state.composer.draft_prompt.trim().to_string();
-        if raw_prompt.is_empty() || self.state.is_busy() || self.state.navigation_loading() {
-            return;
+    pub(crate) fn start_prompt_enhance(&mut self, raw_prompt: String) -> bool {
+        let raw_prompt = raw_prompt.trim().to_string();
+        if !unique_background_request_admission_open(false, self.state.prompt_enhance_pending()) {
+            self.state
+                .set_status_message("prompt enhancement is already in progress");
+            return false;
+        }
+        if raw_prompt.is_empty()
+            || self.state.is_busy()
+            || self.state.navigation_loading()
+            || self.current_agent_tree_active()
+            || self.run_lifecycle.root_is_active()
+        {
+            self.state
+                .set_status_message("prompt enhancement is not currently available");
+            return false;
         }
         let request_id = self.next_enhance_request_id;
-        self.next_enhance_request_id += 1;
+        let Some(next_request_id) = request_id.checked_add(1) else {
+            self.state
+                .set_status_message("prompt enhancement request generation is exhausted");
+            return false;
+        };
+        self.next_enhance_request_id = next_request_id;
+        let target = DraftRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            session_id: self.state.app_state.current_session_id,
+        };
         self.state.begin_prompt_enhance(request_id, &raw_prompt);
         let runtime_tx = self.runtime_tx.clone();
         let config = self.state.provider_config.effective_config.clone();
@@ -2077,36 +5262,54 @@ impl DesktopController {
                     .await
                     .map_err(|error| error.to_string())
             });
-            let _ = runtime_tx.send(RuntimeMessage::EnhanceFinished { request_id, result });
+            let _ = runtime_tx.send(RuntimeMessage::EnhanceFinished {
+                request_id,
+                target,
+                result,
+            });
         });
+        true
     }
 
-    pub(crate) fn send_prompt_review(&mut self, send_enhanced: bool) {
+    pub(crate) fn send_prompt_review(&mut self, send_enhanced: bool, review_draft: String) -> bool {
         if self.state.navigation_loading() {
             self.state
                 .set_status_message("wait for navigation to finish before sending");
-            return;
+            return false;
+        }
+        if send_enhanced {
+            self.state.set_review_draft(review_draft);
         }
         let Some(prompt_dispatch) = self.state.build_prompt_dispatch(send_enhanced) else {
             self.state
                 .set_status_message("enhanced draft is not ready yet");
-            return;
+            return false;
         };
         let prompt = prompt_dispatch.dispatch_prompt_text.clone();
-        self.state.cancel_prompt_review();
-        self.launch_run_with_options(prompt, prompt_dispatch, None);
+        self.launch_run_with_options(prompt, prompt_dispatch, None, true)
     }
 
-    pub(crate) fn load_provider_models(&mut self) {
+    pub(crate) fn load_provider_models(&mut self) -> bool {
+        if self.provider_model_load_pending() {
+            self.state
+                .set_status_message("provider model load is already in progress");
+            return false;
+        }
         let normalized =
             normalize_provider_base_url(&self.state.provider_config.provider_base_url_input);
         if normalized.is_empty() {
             self.state.fail_provider_model_load("provider URL is empty");
-            return;
+            return false;
         }
         let target = ProviderCatalogRequestTarget {
             base_url: normalized.clone(),
             metadata_mode: self.state.provider_config.provider_metadata_mode_input,
+            config_generation: self.state.provider_config.config_generation,
+            selected_model_id: self
+                .state
+                .provider_config
+                .provider_selected_model_id_input
+                .clone(),
         };
         let request_id = self.provider_catalog_requests.begin(target.clone());
         self.state.begin_provider_model_load(normalized.clone());
@@ -2123,15 +5326,9 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop model-discovery runtime");
             let result = runtime.block_on(async move {
-                let models = fetch_provider_model_infos(&config, &request_base_url)
+                fetch_provider_model_infos(&config, &request_base_url)
                     .await
-                    .map_err(|error| error.to_string())?;
-                let availability_report =
-                    check_model_availability(&config, None, Some(&request_base_url), false).await;
-                Ok(DesktopProviderModelLoad {
-                    models,
-                    availability_report,
-                })
+                    .map_err(|error| error.to_string())
             });
             let _ = runtime_tx.send(RuntimeMessage::ModelCatalogLoaded {
                 request_id,
@@ -2139,36 +5336,100 @@ impl DesktopController {
                 result,
             });
         });
+        true
     }
 
-    pub(crate) fn set_provider_base_url_input(&mut self, input: String) {
-        self.provider_catalog_requests.clear();
-        self.state.set_provider_base_url_input(input);
+    pub(crate) fn provider_model_load_pending(&self) -> bool {
+        !unique_background_request_admission_open(
+            self.provider_catalog_requests.is_pending(),
+            self.state.provider_model_load_pending(),
+        )
     }
 
-    pub(crate) fn set_provider_metadata_mode_input(&mut self, mode: ProviderMetadataMode) {
-        self.provider_catalog_requests.clear();
-        self.state.set_provider_metadata_mode_input(mode);
+    pub(crate) fn accept_provider_action_input(
+        &mut self,
+        base_url: String,
+        metadata_mode: ProviderMetadataMode,
+        context_window: String,
+        max_output_tokens: String,
+        selected_model_id: String,
+    ) {
+        let target_changed = self.state.accept_provider_action_input(
+            base_url,
+            metadata_mode,
+            context_window,
+            max_output_tokens,
+            selected_model_id,
+        );
+        if target_changed {
+            self.provider_catalog_requests.clear();
+        }
     }
 
-    pub(crate) fn check_startup_docling(&mut self) {
-        let config = self.state.provider_config.effective_config.docling.clone();
-        if !config.enabled {
-            self.state.begin_startup_docling_check();
+    pub(crate) fn drive_startup_readiness(&mut self) {
+        self.start_startup_provider_readiness();
+        self.start_startup_docling_readiness();
+    }
+
+    fn start_startup_provider_readiness(&mut self) {
+        if !self.state.startup_provider_readiness_pending()
+            || self.startup_provider_requests.is_pending()
+        {
             return;
         }
+        let config = self.state.provider_config.effective_config.clone();
+        let normalized = normalize_provider_base_url(&config.model.base_url);
+        let target = ProviderReadinessRequestTarget {
+            base_url: normalized.clone(),
+            model_id: config.model.model.clone(),
+            metadata_mode: config.model.provider_metadata_mode,
+            supports_tools: config.model.supports_tools,
+            supports_reasoning: config.model.supports_reasoning,
+            supports_images: config.model.supports_images,
+            parallel_tool_calls: config.model.parallel_tool_calls,
+            max_parallel_predictions: config.model.max_parallel_predictions,
+            config_generation: self.state.provider_config.config_generation,
+        };
+        let request_id = self.startup_provider_requests.begin(target.clone());
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let mut config = config;
+            config.model.base_url = normalized;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop provider-readiness runtime");
+            let report = runtime.block_on(async move {
+                check_model_availability(&config, None, None, false).await
+            });
+            let _ = runtime_tx.send(RuntimeMessage::StartupProviderChecked {
+                request_id,
+                target,
+                report,
+            });
+        });
+    }
+
+    fn start_startup_docling_readiness(&mut self) {
+        if !self.state.startup_docling_readiness_pending()
+            || self.startup_docling_requests.is_pending()
+        {
+            return;
+        }
+        let config = self.state.provider_config.effective_config.docling.clone();
         let normalized = normalize_docling_base_url(&config.base_url);
         if normalized.is_empty() {
             self.state
                 .fail_startup_docling_check("Docling Serve URL が未設定です。");
             return;
         }
-        if !self.state.begin_startup_docling_check() {
-            return;
-        }
+        let target = DoclingRequestTarget {
+            base_url: normalized.clone(),
+            config_generation: self.state.provider_config.config_generation,
+        };
+        let request_id = self.startup_docling_requests.begin(target.clone());
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
-            let requested_base_url = normalized.clone();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -2179,45 +5440,93 @@ impl DesktopController {
                     .map_err(|error| error.to_string())
             });
             let _ = runtime_tx.send(RuntimeMessage::StartupDoclingChecked {
-                requested_base_url,
+                request_id,
+                target,
                 result,
             });
         });
     }
 
-    pub(crate) fn apply_provider_session(&mut self) {
-        let setup_overlay = self.state.view.startup_overlay_forced;
-        let Some(config) = self.apply_provider_selection_to_effective_config() else {
-            return;
-        };
-        self.state.reset_effective_config(config);
-        self.state.mark_startup_config_reviewed();
-        self.load_provider_models();
-        self.check_startup_docling();
-        self.state
-            .set_status_message("applied provider selection to this UI session; checking provider");
-        if !setup_overlay {
-            self.state.hide_overlay();
+    fn reset_effective_config_without_network(&mut self, config: ResolvedConfig) {
+        let catalog_was_pending =
+            self.provider_catalog_requests.is_pending() || self.state.provider_model_load_pending();
+        self.provider_catalog_requests.clear();
+        self.startup_provider_requests.clear();
+        self.startup_docling_requests.clear();
+        if catalog_was_pending {
+            self.state.cancel_provider_model_load();
+        }
+        commit_effective_config(&mut self.state, &self.run_lifecycle, config);
+        self.state.retarget_startup_readiness_for_config_change();
+    }
+
+    fn sync_loaded_session_access_mode(&self, access_mode: crate::config::AccessMode) {
+        self.run_lifecycle.set_access_mode(access_mode);
+    }
+
+    fn start_new_chat_with_global_access(&mut self) {
+        self.state.start_new_chat();
+        if self.state.app_state.current_session_id.is_none() {
+            let access_mode = self.app.config.permissions.access_mode;
+            self.state.provider_config.update_access_mode(access_mode);
+            self.run_lifecycle.set_access_mode(access_mode);
         }
     }
 
-    pub(crate) fn save_provider_global(&mut self) {
+    pub(crate) fn apply_provider_session(&mut self) -> bool {
+        if !self.state.can_apply_provider_selection() {
+            self.state.set_status_message(
+                "load the current provider model list and select a model before applying",
+            );
+            return false;
+        }
+        let setup_overlay = self.state.view.startup_overlay_forced;
         let Some(config) = self.apply_provider_selection_to_effective_config() else {
-            return;
+            return false;
         };
-        self.state.reset_effective_config(config);
+        self.reset_effective_config_without_network(config);
+        self.state.mark_startup_config_reviewed();
+        self.state
+            .set_status_message("applied provider selection to this UI session");
+        if !setup_overlay {
+            self.state.hide_overlay();
+        }
+        true
+    }
+
+    pub(crate) fn save_provider_global(&mut self) -> bool {
+        if !self.state.can_apply_provider_selection() {
+            self.state.set_status_message(
+                "load the current provider model list and select a model before saving",
+            );
+            return false;
+        }
+        let Some(config) = self.apply_provider_selection_to_effective_config() else {
+            return false;
+        };
+        if let Err(error) = self.stage_provider_config_for_persistence(&config) {
+            self.state
+                .set_status_message(format!("config save failed: {error}"));
+            return false;
+        }
         match self.state.provider_config.config_editor.save_scope(
             &self.app.workspace.root,
             crate::tui::config_editor::ConfigSaveScope::Global,
         ) {
             Ok(message) => {
-                self.reload_config();
+                self.app.config = config.clone();
+                if !self.reload_config() {
+                    return false;
+                }
                 self.state.mark_startup_config_reviewed();
                 self.state.set_status_message(message);
+                true
             }
-            Err(error) => self
-                .state
-                .set_status_message(format!("config save failed: {error}")),
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("config save failed: {error}"));
+                false
+            }
         }
     }
 
@@ -2230,8 +5539,7 @@ impl DesktopController {
         {
             Ok(patch) => {
                 let config = apply_config_patch(self.app.config.clone(), patch.clone());
-                self.state.reset_effective_config(config);
-                self.check_startup_docling();
+                self.reset_effective_config_without_network(config);
                 self.state
                     .set_status_message("applied override to this UI session");
                 true
@@ -2244,13 +5552,343 @@ impl DesktopController {
         }
     }
 
-    pub(crate) fn toggle_access_mode_session(&mut self) {
-        let mut config = self.state.provider_config.effective_config.clone();
-        config.permissions.access_mode = config.permissions.access_mode.next();
-        let access_mode = config.permissions.access_mode;
-        self.state.reset_effective_config(config);
-        if let Some(live_config) = &self.active_live_config {
-            live_config.set_access_mode(access_mode);
+    pub(crate) fn root_run_generation(&self) -> Option<u64> {
+        self.run_lifecycle.root_generation()
+    }
+
+    fn last_root_run_epoch(&self) -> u64 {
+        self.next_root_run_generation.saturating_sub(1)
+    }
+
+    pub(crate) fn access_mode_mutation_runtime_contract(&self) -> (String, bool) {
+        let root_run_generation = self.root_run_generation();
+        let agent_tree_active = self.current_agent_tree_active();
+        (
+            access_runtime_owner_token(
+                root_run_generation,
+                agent_tree_active,
+                self.last_root_run_epoch(),
+            ),
+            !self.state.navigation_loading()
+                && !self.state.background_mutation_pending()
+                && access_runtime_allows_mutation(root_run_generation, agent_tree_active),
+        )
+    }
+
+    pub(crate) fn access_mode_mutation_admission_open(&self) -> bool {
+        self.access_mode_mutation_runtime_contract().1
+    }
+
+    fn access_mode_persistence_target_relation(
+        &self,
+        target: &AccessModePersistenceTarget,
+    ) -> AccessModePersistenceTargetRelation {
+        let (runtime_owner_token, _) = self.access_mode_mutation_runtime_contract();
+        let relation = access_mode_persistence_target_relation(
+            target,
+            &self.app.workspace.root,
+            self.state.app_state.current_session_id,
+            self.state.provider_config.config_generation,
+            &runtime_owner_token,
+        );
+        if relation != AccessModePersistenceTargetRelation::Stale {
+            return relation;
+        }
+        self.access_mode_persistence_relation_after_root_finish(target)
+    }
+
+    fn access_mode_persistence_relation_after_root_finish(
+        &self,
+        target: &AccessModePersistenceTarget,
+    ) -> AccessModePersistenceTargetRelation {
+        let Some(root_run_generation) = target.root_run_generation else {
+            return AccessModePersistenceTargetRelation::Stale;
+        };
+        if target.workspace_root != self.app.workspace.root
+            || target.config_generation != self.state.provider_config.config_generation
+            || self.root_run_generation().is_some()
+            || self.last_root_run_epoch() != root_run_generation
+            || target.runtime_owner_token != format!("root:{root_run_generation}")
+        {
+            return AccessModePersistenceTargetRelation::Stale;
+        }
+        match (target.session_id, self.state.app_state.current_session_id) {
+            (target_session_id, current_session_id) if target_session_id == current_session_id => {
+                AccessModePersistenceTargetRelation::Exact
+            }
+            (None, Some(session_id)) => {
+                AccessModePersistenceTargetRelation::AdoptedSession(session_id)
+            }
+            _ => AccessModePersistenceTargetRelation::Stale,
+        }
+    }
+
+    pub(crate) fn toggle_access_mode_remembered(&mut self) -> bool {
+        let session_service = self.app.session_service.clone();
+        let expected_access_mode = self
+            .state
+            .provider_config
+            .effective_config
+            .permissions
+            .access_mode;
+        self.start_access_mode_persistence(
+            ConfigEditorState::compare_and_set_global_access_mode,
+            move |session_id, access_mode| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.block_on(async move {
+                    session_service
+                        .compare_and_set_root_session_access_mode(
+                            session_id,
+                            expected_access_mode,
+                            access_mode,
+                        )
+                        .await
+                        .and_then(|updated| {
+                            updated.map(|_| ()).ok_or_else(|| {
+                                crate::error::SessionError::Message(format!(
+                                    "session {session_id} access mode changed before this update"
+                                ))
+                            })
+                        })
+                        .map_err(|error| error.to_string())
+                })
+            },
+        )
+    }
+
+    fn start_access_mode_persistence<CompareAndSetGlobal, PersistSession>(
+        &mut self,
+        compare_and_set_global: CompareAndSetGlobal,
+        persist_session: PersistSession,
+    ) -> bool
+    where
+        CompareAndSetGlobal: FnMut(
+                crate::config::AccessMode,
+                crate::config::AccessMode,
+            ) -> Result<Option<Utf8PathBuf>, String>
+            + Send
+            + 'static,
+        PersistSession:
+            FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String> + Send + 'static,
+    {
+        if !self.access_mode_mutation_admission_open() {
+            self.state.set_status_message(
+                "access mode cannot change while navigation or an owner mutation is active",
+            );
+            return false;
+        }
+        let old_effective_access_mode = self
+            .state
+            .provider_config
+            .effective_config
+            .permissions
+            .access_mode;
+        let access_mode = old_effective_access_mode.next();
+        let (runtime_owner_token, _) = self.access_mode_mutation_runtime_contract();
+        let target = AccessModePersistenceTarget {
+            operation_id: self.state.begin_access_mode_persistence(),
+            workspace_root: self.app.workspace.root.clone(),
+            session_id: self.state.app_state.current_session_id,
+            config_generation: self.state.provider_config.config_generation,
+            root_run_generation: self.root_run_generation(),
+            runtime_owner_token,
+            old_global_access_mode: self.app.config.permissions.access_mode,
+            old_effective_access_mode,
+            access_mode,
+        };
+        let request_id = self.access_mode_persistence_requests.begin(target.clone());
+        let runtime_tx = self.runtime_tx.clone();
+        let worker_target = target.clone();
+        let worker = Arc::new(AccessModePersistenceWorker::new(
+            compare_and_set_global,
+            persist_session,
+        ));
+        let initial_worker = worker.clone();
+        std::thread::spawn(move || {
+            let result = initial_worker.persist_initial_owners(&worker_target);
+            let _ = runtime_tx.send(RuntimeMessage::AccessModePersisted {
+                request_id,
+                target: worker_target,
+                phase: AccessModePersistencePhase::InitialOwners,
+                worker: initial_worker,
+                result,
+            });
+        });
+        self.state
+            .set_status_message(if target.session_id.is_some() {
+                "saving access mode to global config and the current root session"
+            } else {
+                "saving access mode to global config"
+            });
+        true
+    }
+
+    fn spawn_adopted_session_access_persistence(
+        &self,
+        request_id: LatestRequestId,
+        target: AccessModePersistenceTarget,
+        session_id: SessionId,
+        remembered_path: Utf8PathBuf,
+        worker: Arc<AccessModePersistenceWorker>,
+    ) {
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let result = worker.persist_adopted_session(&target, session_id, remembered_path);
+            let _ = runtime_tx.send(RuntimeMessage::AccessModePersisted {
+                request_id,
+                target,
+                phase: AccessModePersistencePhase::AdoptedSession { session_id },
+                worker,
+                result,
+            });
+        });
+    }
+
+    fn resume_pending_access_mode_adoption(&mut self, session_id: SessionId) -> bool {
+        let Some(pending) = self.pending_access_mode_adoption.as_ref() else {
+            return false;
+        };
+        let request_id = pending.request_id;
+        let target = pending.target.clone();
+        let request_is_current = self
+            .access_mode_persistence_requests
+            .is_current(request_id, &target);
+        let operation_is_current = self
+            .state
+            .access_mode_persistence_is_current(target.operation_id);
+        let relation = self.access_mode_persistence_target_relation(&target);
+        if !request_is_current
+            || !operation_is_current
+            || relation != AccessModePersistenceTargetRelation::AdoptedSession(session_id)
+        {
+            let _ = self.pending_access_mode_adoption.take();
+            let _ = self
+                .access_mode_persistence_requests
+                .finish_if_current(request_id, &target);
+            let _ = self
+                .state
+                .finish_access_mode_persistence(target.operation_id);
+            let _ = self.reload_config();
+            self.state.set_status_message(
+                "access mode owner changed before session admission; current configuration was reloaded",
+            );
+            return false;
+        }
+        let pending = self
+            .pending_access_mode_adoption
+            .take()
+            .expect("pending access mode adoption checked above");
+        self.spawn_adopted_session_access_persistence(
+            pending.request_id,
+            pending.target,
+            session_id,
+            pending.remembered_path,
+            pending.worker,
+        );
+        self.state.set_status_message(
+            "global access mode saved; saving the admitted current root session",
+        );
+        true
+    }
+
+    fn settle_pending_access_mode_without_session(&mut self) {
+        let Some(pending) = self.pending_access_mode_adoption.take() else {
+            return;
+        };
+        let relation = self.access_mode_persistence_target_relation(&pending.target);
+        let request_is_current = self
+            .access_mode_persistence_requests
+            .finish_if_current(pending.request_id, &pending.target);
+        let operation_is_current = self
+            .state
+            .finish_access_mode_persistence(pending.target.operation_id);
+        let target_is_current = request_is_current
+            && operation_is_current
+            && relation == AccessModePersistenceTargetRelation::Exact;
+        if !target_is_current {
+            let _ = self.reload_config();
+            return;
+        }
+        self.app.config.permissions.access_mode = pending.target.access_mode;
+        self.state
+            .provider_config
+            .update_access_mode(pending.target.access_mode);
+        self.run_lifecycle
+            .set_access_mode(pending.target.access_mode);
+        self.state.set_status_message(format!(
+            "global config access mode set to {} and remembered in {}",
+            pending.target.access_mode.label(),
+            pending.remembered_path
+        ));
+    }
+
+    #[cfg(test)]
+    fn toggle_access_mode_with_persistence<CompareAndSetGlobal, PersistSession>(
+        &mut self,
+        compare_and_set_global: CompareAndSetGlobal,
+        persist_session: PersistSession,
+    ) -> bool
+    where
+        CompareAndSetGlobal: FnMut(
+            crate::config::AccessMode,
+            crate::config::AccessMode,
+        ) -> Result<Option<Utf8PathBuf>, String>,
+        PersistSession: FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String>,
+    {
+        if !self.access_mode_mutation_admission_open() {
+            self.state.set_status_message(
+                "access mode cannot change while navigation or an owner mutation is active",
+            );
+            return false;
+        }
+        let access_mode = self
+            .state
+            .provider_config
+            .effective_config
+            .permissions
+            .access_mode
+            .next();
+        let old_global_access_mode = self.app.config.permissions.access_mode;
+        let current_root_session_id = self.state.app_state.current_session_id;
+        let remembered_path = match persist_desktop_access_mode_owners(
+            old_global_access_mode,
+            access_mode,
+            current_root_session_id,
+            compare_and_set_global,
+            persist_session,
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = self.reload_config();
+                self.state.set_status_message(format!(
+                    "access mode was not changed; configuration was reloaded: {error}"
+                ));
+                return false;
+            }
+        };
+        if self.state.app_state.current_session_id != current_root_session_id {
+            self.state.set_status_message(
+                "access mode owner changed before commit; reload the current chat".to_string(),
+            );
+            return false;
+        }
+        self.app.config.permissions.access_mode = access_mode;
+        self.state.provider_config.update_access_mode(access_mode);
+        self.run_lifecycle.set_access_mode(access_mode);
+        if let Some(session_id) = current_root_session_id {
+            for session in &mut self.state.app_state.sessions {
+                if session.id == session_id {
+                    session.access_mode = access_mode;
+                }
+            }
+            for summary in &mut self.state.app_state.loaded_sessions {
+                if summary.session.id == session_id {
+                    summary.session.access_mode = access_mode;
+                }
+            }
         }
         let auto_approved = self
             .pending_permission_request
@@ -2266,10 +5904,10 @@ impl DesktopController {
             self.pending_permission_request_id = None;
             self.state.clear_permission();
         }
-        let scope = if self.active_live_config.is_some() {
-            "active run"
+        let scope = if current_root_session_id.is_some() {
+            "global config and current root session"
         } else {
-            "UI session"
+            "global config"
         };
         let suffix = if auto_approved {
             "; pending confirmation approved"
@@ -2277,9 +5915,11 @@ impl DesktopController {
             ""
         };
         self.state.set_status_message(format!(
-            "{scope} access mode set to {}{suffix}",
-            access_mode.label()
+            "{scope} access mode set to {} and remembered in {}{suffix}",
+            access_mode.label(),
+            remembered_path
         ));
+        true
     }
 
     pub(crate) fn save_global_config(&mut self) -> bool {
@@ -2288,7 +5928,9 @@ impl DesktopController {
             crate::tui::config_editor::ConfigSaveScope::Global,
         ) {
             Ok(message) => {
-                self.reload_config();
+                if !self.reload_config() {
+                    return false;
+                }
                 self.state.mark_startup_config_reviewed();
                 self.state.set_status_message(message);
                 true
@@ -2301,22 +5943,27 @@ impl DesktopController {
         }
     }
 
-    pub(crate) fn import_global_config_toml_dialog(&mut self) -> bool {
+    pub(crate) fn pick_global_config_toml_dialog(&mut self) -> Option<Utf8PathBuf> {
         match pick_config_toml_file() {
-            Ok(Some(path)) => match import_global_config_toml(&path) {
-                Ok(message) => {
-                    self.reload_config();
-                    self.state.mark_startup_config_reviewed();
-                    self.state.set_status_message(message);
-                    true
+            Ok(path) => path,
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("config import failed: {error}"));
+                None
+            }
+        }
+    }
+
+    pub(crate) fn import_global_config_toml_path(&mut self, path: &Utf8Path) -> bool {
+        match import_global_config_toml(path) {
+            Ok(message) => {
+                if !self.reload_config() {
+                    return false;
                 }
-                Err(error) => {
-                    self.state
-                        .set_status_message(format!("config import failed: {error}"));
-                    false
-                }
-            },
-            Ok(None) => false,
+                self.state.mark_startup_config_reviewed();
+                self.state.set_status_message(message);
+                true
+            }
             Err(error) => {
                 self.state
                     .set_status_message(format!("config import failed: {error}"));
@@ -2325,38 +5972,40 @@ impl DesktopController {
         }
     }
 
-    fn reload_config(&mut self) {
+    fn reload_config(&mut self) -> bool {
         match ConfigLoader::load(&self.app.workspace.root, None) {
             Ok(config) => {
                 self.app.config = config.clone();
-                self.state.reset_effective_config(config);
-                if !self
-                    .state
-                    .provider_config
-                    .provider_base_url_input
-                    .trim()
-                    .is_empty()
-                {
-                    self.load_provider_models();
-                }
-                self.check_startup_docling();
+                self.reset_effective_config_without_network(config);
+                true
             }
-            Err(error) => self
-                .state
-                .set_status_message(format!("failed to reload config: {error}")),
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("failed to reload config: {error}"));
+                false
+            }
         }
     }
 
-    pub(crate) fn switch_workspace(&mut self) {
+    pub(crate) fn switch_workspace(&mut self) -> bool {
         if !self.ensure_navigation_admission("workspace") {
-            return;
+            return false;
         }
         let Some(requested) = self.resolve_workspace_input() else {
-            return;
+            return false;
         };
         self.invalidate_session_target_requests();
         let request_id = self.state.begin_workspace_load(requested.clone(), None);
         self.spawn_workspace_load(requested, request_id);
+        true
+    }
+
+    pub(crate) fn show_workspace_picker(&mut self) {
+        if !self.ensure_navigation_admission("workspace") {
+            return;
+        }
+        let path = self.app.workspace.root.to_string();
+        self.state.show_workspace_picker(&path);
     }
 
     fn spawn_workspace_load(&self, requested: Utf8PathBuf, request_id: NavigationRequestId) {
@@ -2415,7 +6064,7 @@ impl DesktopController {
         });
     }
 
-    pub(crate) fn browse_workspace_dialog(&mut self) {
+    pub(crate) fn browse_workspace_dialog(&mut self) -> Option<Utf8PathBuf> {
         let start_dir = if self.state.workspace_input.trim().is_empty() {
             Some(self.app.workspace.root.clone())
         } else {
@@ -2424,14 +6073,16 @@ impl DesktopController {
         };
         match pick_workspace_directory(start_dir.as_ref()) {
             Ok(Some(path)) => {
-                self.state.set_workspace_input(path.to_string());
                 self.state
                     .set_status_message(format!("selected workspace {}", path));
+                Some(path)
             }
-            Ok(None) => {}
-            Err(error) => self
-                .state
-                .set_status_message(format!("workspace browse failed: {error}")),
+            Ok(None) => None,
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("workspace browse failed: {error}"));
+                None
+            }
         }
     }
 
@@ -2535,9 +6186,11 @@ impl DesktopController {
         self.open_path_in_file_manager(&folder);
     }
 
-    pub(crate) fn open_typed_path_in_file_manager(&mut self) {
+    pub(crate) fn open_typed_path_in_file_manager(&mut self) -> bool {
         if let Some(path) = self.resolve_workspace_input() {
-            self.open_path_in_file_manager(&path);
+            self.open_path_in_file_manager(&path)
+        } else {
+            false
         }
     }
 
@@ -2562,7 +6215,7 @@ impl DesktopController {
         self.open_path_in_file_manager(&folder);
     }
 
-    fn open_path_in_file_manager(&mut self, path: &camino::Utf8Path) {
+    fn open_path_in_file_manager(&mut self, path: &camino::Utf8Path) -> bool {
         let mut command = if cfg!(target_os = "windows") {
             ProcessCommand::new("explorer")
         } else if cfg!(target_os = "macos") {
@@ -2571,12 +6224,18 @@ impl DesktopController {
             ProcessCommand::new("xdg-open")
         };
         match command.arg(path.as_str()).spawn() {
-            Ok(_) => self
-                .state
-                .set_status_message(format!("opened {} in file manager", path)),
-            Err(error) => self
-                .state
-                .set_status_message(format!("failed to open {} in file manager: {error}", path)),
+            Ok(_) => {
+                self.state
+                    .set_status_message(format!("opened {} in file manager", path));
+                true
+            }
+            Err(error) => {
+                self.state.set_status_message(format!(
+                    "failed to open {} in file manager: {error}",
+                    path
+                ));
+                false
+            }
         }
     }
 
@@ -2654,6 +6313,67 @@ impl DesktopController {
         ))
     }
 
+    fn stage_provider_config_for_persistence(
+        &mut self,
+        config: &ResolvedConfig,
+    ) -> Result<(), String> {
+        let metadata_mode = match config.model.provider_metadata_mode {
+            ProviderMetadataMode::LmStudioNativeRequired => "lm_studio_native_required",
+            ProviderMetadataMode::OpenAiCompatibleOnly => "openai_compatible_only",
+        };
+        self.state.set_config_values_by_key(vec![
+            (
+                ConfigField::BaseUrl.label().to_string(),
+                config.model.base_url.clone(),
+            ),
+            (
+                ConfigField::Model.label().to_string(),
+                config.model.model.clone(),
+            ),
+            (
+                ConfigField::ProviderMetadataMode.label().to_string(),
+                metadata_mode.to_string(),
+            ),
+            (
+                ConfigField::ContextWindow.label().to_string(),
+                config.model.context_window.to_string(),
+            ),
+            (
+                ConfigField::MaxOutputTokens.label().to_string(),
+                config.model.max_output_tokens.to_string(),
+            ),
+            (
+                ConfigField::SupportsTools.label().to_string(),
+                config.model.supports_tools.to_string(),
+            ),
+            (
+                ConfigField::SupportsReasoning.label().to_string(),
+                config.model.supports_reasoning.to_string(),
+            ),
+            (
+                ConfigField::SupportsImages.label().to_string(),
+                config.model.supports_images.to_string(),
+            ),
+            (
+                ConfigField::ParallelToolCalls.label().to_string(),
+                config.model.parallel_tool_calls.to_string(),
+            ),
+            (
+                ConfigField::MaxParallelPredictions.label().to_string(),
+                config.model.max_parallel_predictions.to_string(),
+            ),
+            (
+                ConfigField::ExtraBodyJson.label().to_string(),
+                config
+                    .model
+                    .extra_body_json
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            ),
+        ])
+    }
+
     fn persist_preferences(&mut self) {
         if !self.persist_preferences_to_disk {
             return;
@@ -2704,9 +6424,17 @@ impl DesktopController {
 
     pub(crate) fn cancel_active_run(&mut self) {
         let mut requested = false;
-        if let Some(cancel) = &self.active_run_cancel {
-            cancel.cancel();
+        let session_id = self.state.app_state.current_session_id;
+        let root_run_active = self.run_lifecycle.root_is_active();
+        let sub_agent_active = self.current_agent_tree_active();
+        if self.run_lifecycle.request_cancel() {
             requested = true;
+        }
+        if root_run_active || sub_agent_active {
+            if let Some(session_id) = session_id {
+                let _ = self.app.run_service.cancel_agent_tree(session_id);
+                requested = true;
+            }
         }
         if let Some(response) = self.permission_response.take() {
             let _ = response.send(false);
@@ -2716,8 +6444,7 @@ impl DesktopController {
             requested = true;
         }
         if requested {
-            self.active_live_config = None;
-            let session_id = self.state.app_state.current_session_id;
+            self.durable_agent_activity_refresh_requests.clear();
             self.state.mark_run_cancellation_requested(
                 "run cancelled by user",
                 "停止しました。現在の処理を中断しています。",
@@ -2738,26 +6465,85 @@ impl DesktopController {
         self.persist_preferences();
     }
 
+    fn advance_composer_commit_generation(&mut self) {
+        self.composer_commit_generation = self.composer_commit_generation.saturating_add(1);
+    }
+
+    fn commit_pending_root_submission(&mut self, run_generation: u64) -> bool {
+        let Some(pending) = self
+            .pending_root_submission
+            .take_if(|pending| pending.run_generation == run_generation)
+        else {
+            return false;
+        };
+        self.state
+            .push_local_prompt_dispatch(&pending.prompt_dispatch);
+        let current_session_id = self.state.app_state.current_session_id;
+        if pending.owner_workspace_path.as_str() == self.state.snapshot.workspace_path
+            && pending.owner_session_id.is_none()
+            && current_session_id.is_some()
+        {
+            self.state.adopt_composer_owner(current_session_id);
+        } else {
+            self.state.rebind_composer_owner(current_session_id);
+        }
+        self.state
+            .composer
+            .image_attachment_paths
+            .retain(|path| !pending.image_paths.contains(path));
+        self.state.composer.image_attachment_input.clear();
+        if pending.cancel_prompt_review_on_commit {
+            self.state.cancel_prompt_review();
+        }
+        self.advance_composer_commit_generation();
+        true
+    }
+
+    fn discard_pending_root_submission(&mut self, run_generation: u64) {
+        let _ = self
+            .pending_root_submission
+            .take_if(|pending| pending.run_generation == run_generation);
+    }
+
     fn launch_run_with_options(
         &mut self,
         prompt: String,
         prompt_dispatch: crate::session::PromptDispatchPart,
         review_request: Option<ReviewRequest>,
-    ) {
+        cancel_prompt_review_on_commit: bool,
+    ) -> bool {
+        if self.state.background_mutation_pending() {
+            self.state
+                .set_status_message("wait for the current owner mutation to finish before sending");
+            return false;
+        }
         if self.state.navigation_loading() {
             self.state
                 .set_status_message("wait for navigation to finish before starting a run");
-            return;
+            return false;
         }
-        if self.active_run_cancel.is_some() {
-            if review_request.is_none() && !prompt.trim().is_empty() {
-                self.launch_active_turn_steer(prompt, prompt_dispatch);
+        if self.run_lifecycle.root_is_active() {
+            if self.run_lifecycle.can_steer_root()
+                && review_request.is_none()
+                && !prompt.trim().is_empty()
+            {
+                let accepted = self.launch_active_turn_steer(prompt, prompt_dispatch);
+                if accepted && cancel_prompt_review_on_commit {
+                    self.state.cancel_prompt_review();
+                }
+                return accepted;
             } else {
                 self.state.set_status_message(
                     "前回の停止処理を片付けています。状態が更新されてから再度実行してください。",
                 );
             }
-            return;
+            return false;
+        }
+        if self.current_agent_tree_active() {
+            self.state.set_status_message(
+                "Sub Agentの完了または停止後に、新しい依頼を送信できます。".to_string(),
+            );
+            return false;
         }
         if review_request.is_none()
             && !prompt.trim().is_empty()
@@ -2767,12 +6553,23 @@ impl DesktopController {
                 crate::tui::state::RunStatus::Running
             )
         {
-            self.launch_active_turn_steer(prompt, prompt_dispatch);
-            return;
+            let accepted = self.launch_active_turn_steer(prompt, prompt_dispatch);
+            if accepted && cancel_prompt_review_on_commit {
+                self.state.cancel_prompt_review();
+            }
+            return accepted;
         }
         if prompt.trim().is_empty() && review_request.is_none() {
-            return;
+            return false;
         }
+        self.invalidate_session_search_requests();
+        let run_generation = self.next_root_run_generation;
+        let Some(next_generation) = run_generation.checked_add(1) else {
+            self.state
+                .set_status_message("desktop run generation is exhausted; restart moyAI");
+            return false;
+        };
+        self.next_root_run_generation = next_generation;
         let image_paths = self.state.composer.image_attachment_paths.clone();
         let cancel = build_cancel_token();
         let live_config = LiveConfigOverrides::new(
@@ -2809,7 +6606,7 @@ impl DesktopController {
                 .model
                 .base_url
                 .clone(),
-            config_override: Some(full_effective_override(
+            config_override: Some(desktop_run_config_override(
                 &self.state.provider_config.effective_config,
             )),
             output_mode: OutputMode::Human,
@@ -2820,13 +6617,19 @@ impl DesktopController {
             image_paths,
             cancel: cancel.clone(),
             live_config: Some(live_config.clone()),
+            agent_confirmation: None,
+            agent_context: None,
         };
-        self.active_run_cancel = Some(cancel);
-        self.active_live_config = Some(live_config);
-        self.state.push_local_prompt_dispatch(&prompt_dispatch);
-        self.state.composer.draft_prompt.clear();
-        self.state.composer.image_attachment_paths.clear();
-        self.state.composer.image_attachment_input.clear();
+        self.run_lifecycle
+            .begin(run_generation, cancel, live_config);
+        self.pending_root_submission = Some(PendingRootSubmission {
+            run_generation,
+            owner_workspace_path: self.app.workspace.root.clone(),
+            owner_session_id: request.session_id,
+            prompt_dispatch,
+            image_paths: self.state.composer.image_attachment_paths.clone(),
+            cancel_prompt_review_on_commit,
+        });
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
         let next_permission_request_id = self.next_permission_request_id.clone();
@@ -2835,59 +6638,74 @@ impl DesktopController {
             .clone()
             .unwrap_or_else(|| self.state.current_session_label());
         std::thread::spawn(move || {
+            let mut request = request;
+            let worker_cancel = request.cancel.clone();
             let mut renderer = DesktopRenderer {
                 tx: runtime_tx.clone(),
+                run_generation,
                 notification_title: notification_title.clone(),
                 notified_terminal: false,
             };
-            let mut prompt = DesktopConfirmationPrompt {
+            let mut prompt = SharedConfirmationPrompt::new(DesktopConfirmationPrompt {
                 tx: runtime_tx.clone(),
                 next_permission_request_id,
-            };
+            });
+            request.agent_confirmation = Some(prompt.clone());
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build desktop worker runtime");
             runtime.block_on(async move {
-                if let Err(error) = run_service
+                let result = run_service
                     .execute(AppCommand::Run(request), &mut renderer, &mut prompt)
                     .await
-                {
-                    let error = error.to_string();
-                    let notification_body = run_error_notification_body(
-                        &notification_title,
-                        &crate::tui::state::RunStatus::Failed,
-                        &error,
-                    );
-                    send_windows_desktop_notification("moyAI", &notification_body);
-                    let _ = runtime_tx.send(RuntimeMessage::Finished(Err(error)));
+                    .map_err(|error| error.to_string());
+                match &result {
+                    Ok(summary) if !renderer.notified_terminal => {
+                        let notification_body =
+                            run_completion_notification_body(&renderer.notification_title, summary);
+                        send_windows_desktop_notification("moyAI", &notification_body);
+                    }
+                    Err(error)
+                        if !renderer.notified_terminal
+                            && desktop_run_failure_notification_allowed(
+                                worker_cancel.is_cancelled(),
+                            ) =>
+                    {
+                        let notification_body = run_error_notification_body(
+                            &renderer.notification_title,
+                            &crate::tui::state::RunStatus::Failed,
+                            error,
+                        );
+                        send_windows_desktop_notification("moyAI", &notification_body);
+                    }
+                    _ => {}
                 }
+                publish_desktop_run_finished(&runtime_tx, run_generation, result);
             });
         });
+        true
     }
 
     fn launch_active_turn_steer(
         &mut self,
         prompt: String,
         prompt_dispatch: crate::session::PromptDispatchPart,
-    ) {
+    ) -> bool {
         let Some(session_id) = self.state.app_state.current_session_id else {
             self.state
                 .set_status_message("実行中のセッションが見つからないため steer できません。");
-            return;
+            return false;
         };
         let image_paths = self.state.composer.image_attachment_paths.clone();
-        self.state.push_local_prompt_dispatch(&prompt_dispatch);
-        self.state.composer.draft_prompt.clear();
-        self.state.composer.image_attachment_paths.clear();
-        self.state.composer.image_attachment_input.clear();
         self.state
-            .set_status_message("実行中の turn に追加入力を送信しました。");
+            .set_status_message("実行中の turn に追加入力を保存しています。");
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
         let next_permission_request_id = self.next_permission_request_id.clone();
         let cwd = self.app.workspace.cwd.clone();
-        std::thread::spawn(move || {
+        let stored_image_paths = image_paths.clone();
+        let result = std::thread::spawn(move || {
             let mut renderer = DesktopSteerRenderer;
             let mut prompt_ui = DesktopConfirmationPrompt {
                 tx: runtime_tx.clone(),
@@ -2897,7 +6715,7 @@ impl DesktopController {
                 .enable_all()
                 .build()
                 .expect("failed to build desktop steer runtime");
-            let result = runtime
+            runtime
                 .block_on(async move {
                     run_service
                         .execute(
@@ -2917,9 +6735,21 @@ impl DesktopController {
                         .await
                 })
                 .map(|_| ())
-                .map_err(|error| error.to_string());
-            let _ = runtime_tx.send(RuntimeMessage::SteerStored(result));
-        });
+                .map_err(|error| error.to_string())
+        })
+        .join()
+        .map_err(|_| "desktop steer worker panicked".to_string())
+        .and_then(|result| result);
+        let accepted = finish_steer_submission(
+            &mut self.state,
+            &prompt_dispatch,
+            &stored_image_paths,
+            result,
+        );
+        if accepted {
+            self.advance_composer_commit_generation();
+        }
+        accepted
     }
 
     fn current_editor_context(&self) -> EditorContext {
@@ -2955,7 +6785,7 @@ impl DesktopController {
 
     fn apply_session_loaded_message(
         &mut self,
-        request_id: Option<NavigationRequestId>,
+        request_id: NavigationRequestId,
         session_id: SessionId,
         reason: SessionLoadReason,
         result: Result<LoadedSession, String>,
@@ -2963,26 +6793,18 @@ impl DesktopController {
         match result {
             Ok(loaded) => {
                 if self.session_load_is_blocked_by_active_run() {
-                    if reason == SessionLoadReason::CurrentRefresh {
-                        self.state.clear_post_run_refresh_pending();
-                    }
-                    if let Some(request_id) = request_id {
-                        self.state.finish_navigation(request_id);
-                    }
-                    return;
-                }
-                if !self.should_apply_loaded_session(request_id, session_id, reason) {
-                    if reason == SessionLoadReason::CurrentRefresh {
-                        self.state.clear_post_run_refresh_pending();
-                    }
-                    if let Some(request_id) = request_id {
-                        self.state.finish_navigation(request_id);
-                    }
-                    return;
-                }
-                if let Some(request_id) = request_id {
                     self.state.finish_navigation(request_id);
+                    return;
                 }
+                if !self
+                    .state
+                    .is_current_session_navigation(request_id, session_id)
+                {
+                    self.state.finish_navigation(request_id);
+                    return;
+                }
+                self.state.finish_navigation(request_id);
+                let access_mode = loaded.session.access_mode;
                 self.state.load_open_session(
                     &loaded.session,
                     &loaded.transcript,
@@ -2994,30 +6816,59 @@ impl DesktopController {
                     loaded.turn_page_total,
                     loaded.turn_page_has_more,
                 );
-                if reason == SessionLoadReason::CurrentRefresh {
-                    self.state.clear_post_run_refresh_pending();
-                    return;
+                self.sync_loaded_session_access_mode(access_mode);
+                if let Some(records) = loaded.agent_activity_records {
+                    self.loaded_agent_activity_records = Some((loaded.session.id, records));
+                    self.durable_agent_activity_refresh_failures = 0;
                 }
                 self.state.set_status_message(match reason {
                     SessionLoadReason::RunningRejoin => {
                         format!("rejoined running session {}", session_id)
                     }
                     SessionLoadReason::UserSelection => format!("opened session {}", session_id),
-                    SessionLoadReason::CurrentRefresh => {
-                        format!("refreshed session {}", session_id)
-                    }
                 });
             }
             Err(error) => {
-                if reason == SessionLoadReason::CurrentRefresh {
-                    self.state.clear_post_run_refresh_pending();
+                finish_navigation_failure(&mut self.state, request_id, error);
+            }
+        }
+    }
+
+    fn apply_current_session_refreshed_message(
+        &mut self,
+        session_id: SessionId,
+        result: Result<LoadedSession, String>,
+    ) {
+        if self.session_load_is_blocked_by_active_run()
+            || self.state.app_state.current_session_id != Some(session_id)
+        {
+            self.state.clear_post_run_refresh_pending();
+            return;
+        }
+        match result {
+            Ok(loaded) => {
+                let access_mode = loaded.session.access_mode;
+                self.state.load_open_session(
+                    &loaded.session,
+                    &loaded.transcript,
+                    &loaded.turn_items,
+                    loaded.state,
+                    loaded.todos,
+                    loaded.turn_page_offset,
+                    loaded.turn_page_limit,
+                    loaded.turn_page_total,
+                    loaded.turn_page_has_more,
+                );
+                self.sync_loaded_session_access_mode(access_mode);
+                if let Some(records) = loaded.agent_activity_records {
+                    self.loaded_agent_activity_records = Some((loaded.session.id, records));
+                    self.durable_agent_activity_refresh_failures = 0;
                 }
-                if request_id
-                    .map(|request_id| self.state.finish_navigation(request_id))
-                    .unwrap_or(true)
-                {
-                    self.state.set_status_message(error);
-                }
+                self.state.clear_post_run_refresh_pending();
+            }
+            Err(error) => {
+                self.state.clear_post_run_refresh_pending();
+                self.state.set_status_message(error);
             }
         }
     }
@@ -3032,26 +6883,7 @@ impl DesktopController {
     fn refresh_current_session_after_terminal_run(&mut self) {
         self.refresh_snapshot();
         if let Some(session_id) = self.state.app_state.current_session_id {
-            self.spawn_session_load(session_id, SessionLoadReason::CurrentRefresh, None);
-        }
-    }
-
-    fn should_apply_loaded_session(
-        &self,
-        request_id: Option<NavigationRequestId>,
-        session_id: SessionId,
-        reason: SessionLoadReason,
-    ) -> bool {
-        match reason {
-            SessionLoadReason::UserSelection | SessionLoadReason::RunningRejoin => {
-                request_id.is_some_and(|request_id| {
-                    self.state
-                        .is_current_session_navigation(request_id, session_id)
-                }) && self.state.selected_session_id() == Some(session_id)
-            }
-            SessionLoadReason::CurrentRefresh => {
-                self.state.app_state.current_session_id == Some(session_id)
-            }
+            self.spawn_current_session_refresh(session_id);
         }
     }
 
@@ -3073,7 +6905,7 @@ impl DesktopController {
                     self.spawn_session_load(
                         session_id,
                         SessionLoadReason::UserSelection,
-                        Some(request_id),
+                        request_id,
                     );
                 } else {
                     self.state.set_status_message(format!(
@@ -3083,9 +6915,7 @@ impl DesktopController {
                 }
             }
             Err(error) => {
-                if self.state.finish_navigation(request_id) {
-                    self.state.set_status_message(error);
-                }
+                finish_navigation_failure(&mut self.state, request_id, error);
             }
         }
     }
@@ -3101,20 +6931,22 @@ impl DesktopController {
                     return;
                 }
                 self.replace_workspace_from_load(loaded);
-                self.state.start_new_chat();
+                self.start_new_chat_with_global_access();
                 self.state.set_status_message("new development chat ready");
             }
             Err(error) => {
-                if self.state.finish_navigation(request_id) {
-                    self.state.set_status_message(error);
-                }
+                finish_navigation_failure(&mut self.state, request_id, error);
             }
         }
     }
 
     fn replace_workspace_from_load(&mut self, loaded: WorkspaceLoadResult) {
+        let next_config_generation =
+            next_config_generation(self.state.provider_config.config_generation);
         self.invalidate_session_target_requests();
         self.provider_catalog_requests.clear();
+        self.startup_provider_requests.clear();
+        self.startup_docling_requests.clear();
         self.app = loaded.app.clone();
         if !self.is_quick_chat_workspace() {
             self.preferences
@@ -3122,20 +6954,14 @@ impl DesktopController {
         }
         self.session_search_requests.clear();
         self.state = DesktopState::new(loaded.snapshot, self.app.config.clone());
+        self.state.provider_config.config_generation = next_config_generation;
+        self.loaded_agent_activity_records = None;
+        self.durable_agent_activity_refresh_failures = 0;
         self.state.workspace_input = self.app.workspace.cwd.to_string();
         if let Some(opacity) = self.preferences.window_opacity_percent {
             self.state.set_window_opacity_percent(opacity);
         }
         self.persist_preferences();
-        if !self
-            .state
-            .provider_config
-            .provider_base_url_input
-            .trim()
-            .is_empty()
-        {
-            self.load_provider_models();
-        }
     }
 
     fn snapshot_target_is_current(&self, target: &SnapshotRequestTarget) -> bool {
@@ -3162,6 +6988,25 @@ impl DesktopController {
         normalize_provider_base_url(&self.state.provider_config.provider_base_url_input)
             == target.base_url
             && self.state.provider_config.provider_metadata_mode_input == target.metadata_mode
+            && self.state.provider_config.config_generation == target.config_generation
+            && self.state.provider_config.provider_selected_model_id_input
+                == target.selected_model_id
+    }
+
+    fn provider_readiness_target_is_current(
+        &self,
+        target: &ProviderReadinessRequestTarget,
+    ) -> bool {
+        let model = &self.state.provider_config.effective_config.model;
+        normalize_provider_base_url(&model.base_url) == target.base_url
+            && model.model == target.model_id
+            && model.provider_metadata_mode == target.metadata_mode
+            && model.supports_tools == target.supports_tools
+            && model.supports_reasoning == target.supports_reasoning
+            && model.supports_images == target.supports_images
+            && model.parallel_tool_calls == target.parallel_tool_calls
+            && model.max_parallel_predictions == target.max_parallel_predictions
+            && self.state.provider_config.config_generation == target.config_generation
     }
 
     pub(crate) fn drain_runtime_messages(&mut self) -> bool {
@@ -3170,12 +7015,22 @@ impl DesktopController {
             changed = true;
             let _contract = message.async_contract();
             match message {
-                RuntimeMessage::RunEvent(event) => {
-                    if self
-                        .active_run_cancel
-                        .as_ref()
-                        .is_some_and(|cancel| cancel.is_cancelled())
+                RuntimeMessage::RunEvent {
+                    run_generation,
+                    event,
+                } => {
+                    if !self.run_lifecycle.owns(run_generation) {
+                        continue;
+                    }
+                    if matches!(
+                        &event,
+                        RunEvent::UserTurnStored { .. } | RunEvent::UserMessageStored { .. }
+                    ) {
+                        self.commit_pending_root_submission(run_generation);
+                    }
+                    if self.run_lifecycle.cancellation_requested()
                         && !run_event_is_terminal(&event)
+                        && !matches!(&event, RunEvent::SessionStarted { .. })
                     {
                         continue;
                     }
@@ -3184,10 +7039,19 @@ impl DesktopController {
                         | RunEvent::SessionTitleUpdated { session_id, .. } => Some(*session_id),
                         _ => None,
                     };
+                    if matches!(&event, RunEvent::SessionStarted { .. }) {
+                        self.durable_agent_activity_refresh_failures = 0;
+                    }
                     let live_refresh_session_id = event
                         .session_id()
                         .or(self.state.app_state.current_session_id);
+                    if run_event_is_terminal(&event) {
+                        self.run_lifecycle.observe_terminal_event();
+                    }
                     self.state.apply_run_event(&event);
+                    if let RunEvent::SessionStarted { session_id, .. } = &event {
+                        self.resume_pending_access_mode_adoption(*session_id);
+                    }
                     if live_event_requires_canonical_refresh(&event)
                         && live_refresh_session_id == self.state.app_state.current_session_id
                     {
@@ -3214,7 +7078,6 @@ impl DesktopController {
                     }
                     if event_requires_todo_refresh(&event) {
                         if let Some(session_id) = self.state.app_state.current_session_id {
-                            self.state.begin_current_todo_refresh();
                             self.spawn_current_todos_refresh(session_id);
                         }
                     }
@@ -3222,42 +7085,64 @@ impl DesktopController {
                         self.spawn_snapshot_refresh_for_session(session_id);
                     }
                 }
-                RuntimeMessage::Finished(result) => match result {
-                    Ok(summary) => {
-                        self.active_run_cancel = None;
-                        self.active_live_config = None;
-                        self.pending_permission_request = None;
-                        self.pending_permission_request_id = None;
-                        self.permission_response = None;
-                        self.state.clear_permission();
-                        self.state.finish_agent_run();
-                        self.state.mark_post_run_refresh_pending();
-                        self.state.app_state.set_summary(summary);
-                        self.refresh_current_session_after_terminal_run();
+                RuntimeMessage::Finished {
+                    run_generation,
+                    result,
+                } => {
+                    if !self.run_lifecycle.owns(run_generation) {
+                        continue;
                     }
-                    Err(error) => {
-                        self.active_run_cancel = None;
-                        self.active_live_config = None;
-                        self.pending_permission_request = None;
-                        self.pending_permission_request_id = None;
-                        self.permission_response = None;
-                        self.state.clear_permission();
-                        self.state.finish_agent_run();
-                        if !matches!(
-                            self.state.app_state.run_status,
-                            crate::tui::state::RunStatus::Cancelled
-                        ) {
-                            self.state.app_state.run_status = crate::tui::state::RunStatus::Failed;
-                        }
-                        self.state.set_status_message(error);
-                        if self.state.app_state.current_session_id.is_some() {
+                    if self.state.app_state.current_session_id.is_none() {
+                        self.settle_pending_access_mode_without_session();
+                    }
+                    match result {
+                        Ok(summary) => {
+                            self.commit_pending_root_submission(run_generation);
+                            let preserve_child_permission = preserve_permission_after_root_finish(
+                                self.pending_permission_request.as_ref(),
+                            );
+                            self.run_lifecycle.finish_root();
+                            if !preserve_child_permission {
+                                self.pending_permission_request = None;
+                                self.pending_permission_request_id = None;
+                                self.permission_response = None;
+                                self.state.clear_permission();
+                            }
+                            self.state.finish_agent_run();
                             self.state.mark_post_run_refresh_pending();
+                            self.state.app_state.set_summary(summary);
                             self.refresh_current_session_after_terminal_run();
-                        } else {
-                            self.state.clear_post_run_refresh_pending();
+                        }
+                        Err(error) => {
+                            self.discard_pending_root_submission(run_generation);
+                            let preserve_child_permission = preserve_permission_after_root_finish(
+                                self.pending_permission_request.as_ref(),
+                            );
+                            self.run_lifecycle.finish_root();
+                            if !preserve_child_permission {
+                                self.pending_permission_request = None;
+                                self.pending_permission_request_id = None;
+                                self.permission_response = None;
+                                self.state.clear_permission();
+                            }
+                            self.state.finish_agent_run();
+                            if !matches!(
+                                self.state.app_state.run_status,
+                                crate::tui::state::RunStatus::Cancelled
+                            ) {
+                                self.state.app_state.run_status =
+                                    crate::tui::state::RunStatus::Failed;
+                            }
+                            self.state.set_status_message(error);
+                            if self.state.app_state.current_session_id.is_some() {
+                                self.state.mark_post_run_refresh_pending();
+                                self.refresh_current_session_after_terminal_run();
+                            } else {
+                                self.state.clear_post_run_refresh_pending();
+                            }
                         }
                     }
-                },
+                }
                 RuntimeMessage::Permission {
                     confirmation_id,
                     request,
@@ -3268,19 +7153,42 @@ impl DesktopController {
                     self.permission_response = Some(response);
                     self.state.set_permission(confirmation_id, &request);
                 }
-                RuntimeMessage::EnhanceFinished { request_id, result } => match result {
-                    Ok(draft) => {
-                        if self.state.finish_prompt_enhance(request_id, draft) {
-                            self.state.set_status_message("review enhanced draft");
+                RuntimeMessage::PermissionCancelled { confirmation_id } => {
+                    if clear_cancelled_permission(
+                        &mut self.pending_permission_request,
+                        &mut self.pending_permission_request_id,
+                        &mut self.permission_response,
+                        confirmation_id,
+                    ) {
+                        self.state.clear_permission();
+                    }
+                }
+                RuntimeMessage::EnhanceFinished {
+                    request_id,
+                    target,
+                    result,
+                } => {
+                    if target.workspace_root != self.app.workspace.root
+                        || target.session_id != self.state.app_state.current_session_id
+                    {
+                        self.state.fail_prompt_enhance(request_id);
+                        continue;
+                    }
+                    match result {
+                        Ok(draft) => {
+                            if self.state.finish_prompt_enhance(request_id, draft) {
+                                self.state.set_status_message("review enhanced draft");
+                            }
+                        }
+                        Err(error) => {
+                            if self.state.fail_prompt_enhance(request_id) {
+                                self.state.set_status_message(format!(
+                                    "prompt enhancement failed: {error}"
+                                ));
+                            }
                         }
                     }
-                    Err(error) => {
-                        if self.state.fail_prompt_enhance(request_id) {
-                            self.state
-                                .set_status_message(format!("prompt enhancement failed: {error}"));
-                        }
-                    }
-                },
+                }
                 RuntimeMessage::SnapshotLoaded {
                     request_id,
                     target,
@@ -3297,7 +7205,9 @@ impl DesktopController {
                         continue;
                     }
                     match result {
-                        Ok(snapshot) => self.state.replace_snapshot(snapshot),
+                        Ok(snapshot) => self
+                            .state
+                            .replace_snapshot_preserving_current_owner(snapshot),
                         Err(error) => self.state.set_status_message(error),
                     }
                 }
@@ -3307,6 +7217,20 @@ impl DesktopController {
                     reason,
                     result,
                 } => self.apply_session_loaded_message(request_id, session_id, reason, result),
+                RuntimeMessage::CurrentSessionRefreshed {
+                    request_id,
+                    target,
+                    result,
+                } => {
+                    if !self
+                        .current_session_refresh_requests
+                        .finish_if_current(request_id, &target)
+                        || !self.live_session_target_is_current(&target)
+                    {
+                        continue;
+                    }
+                    self.apply_current_session_refreshed_message(target.session_id, result);
+                }
                 RuntimeMessage::SessionDeleted { target, result } => {
                     if !finish_session_delete_request(
                         &mut self.state,
@@ -3321,7 +7245,12 @@ impl DesktopController {
                         Ok(snapshot) => {
                             let deleted_was_current =
                                 self.state.app_state.current_session_id == Some(session_id);
-                            self.state.replace_snapshot(snapshot);
+                            if deleted_was_current {
+                                self.state.replace_snapshot(snapshot);
+                            } else {
+                                self.state
+                                    .replace_snapshot_preserving_current_owner(snapshot);
+                            }
                             if deleted_was_current {
                                 if let Some(next_session_id) = self.state.selected_session_id() {
                                     self.state.set_status_message(format!(
@@ -3332,10 +7261,10 @@ impl DesktopController {
                                     self.spawn_session_load(
                                         next_session_id,
                                         SessionLoadReason::UserSelection,
-                                        Some(request_id),
+                                        request_id,
                                     );
                                 } else {
-                                    self.state.start_new_chat();
+                                    self.start_new_chat_with_global_access();
                                     self.state
                                         .set_status_message(format!("deleted chat {}", session_id));
                                 }
@@ -3350,16 +7279,31 @@ impl DesktopController {
                     }
                 }
                 RuntimeMessage::SessionArchived {
-                    session_id,
+                    target,
                     archived,
                     result,
                 } => {
-                    self.state.finish_session_archive_mutation();
+                    if !session_mutation_target_matches(
+                        &target,
+                        &self.app.workspace.root,
+                        self.app.workspace.project_id,
+                    ) || !self
+                        .state
+                        .finish_session_archive_mutation(target.operation_id)
+                    {
+                        continue;
+                    }
+                    let session_id = target.session_id;
                     match result {
                         Ok(snapshot) => {
                             let archived_was_current = archived
                                 && self.state.app_state.current_session_id == Some(session_id);
-                            self.state.replace_snapshot(snapshot);
+                            if archived_was_current {
+                                self.state.replace_snapshot(snapshot);
+                            } else {
+                                self.state
+                                    .replace_snapshot_preserving_current_owner(snapshot);
+                            }
                             if archived_was_current {
                                 if let Some(next_session_id) = self.state.selected_session_id() {
                                     self.state.set_status_message(format!(
@@ -3370,10 +7314,10 @@ impl DesktopController {
                                     self.spawn_session_load(
                                         next_session_id,
                                         SessionLoadReason::UserSelection,
-                                        Some(request_id),
+                                        request_id,
                                     );
                                 } else {
-                                    self.state.start_new_chat();
+                                    self.start_new_chat_with_global_access();
                                     self.state.set_status_message(format!(
                                         "archived chat {}",
                                         session_id
@@ -3392,12 +7336,23 @@ impl DesktopController {
                             .set_status_message(format!("chat archive failed: {error}")),
                     }
                 }
-                RuntimeMessage::SessionRolledBack { session_id, result } => {
-                    self.state.finish_session_rollback_mutation();
+                RuntimeMessage::SessionRolledBack { target, result } => {
+                    if !session_mutation_target_matches(
+                        &target,
+                        &self.app.workspace.root,
+                        self.app.workspace.project_id,
+                    ) || !self
+                        .state
+                        .finish_session_rollback_mutation(target.operation_id)
+                    {
+                        continue;
+                    }
+                    let session_id = target.session_id;
                     match result {
                         Ok(rolled_back) => {
-                            self.state.replace_snapshot(rolled_back.snapshot);
-                            if self.state.selected_session_id() == Some(session_id)
+                            self.state
+                                .replace_snapshot_preserving_current_owner(rolled_back.snapshot);
+                            if self.state.app_state.current_session_id == Some(session_id)
                                 && !self.session_load_is_blocked_by_active_run()
                             {
                                 let loaded = rolled_back.loaded;
@@ -3412,6 +7367,10 @@ impl DesktopController {
                                     loaded.turn_page_total,
                                     loaded.turn_page_has_more,
                                 );
+                                if let Some(records) = loaded.agent_activity_records {
+                                    self.loaded_agent_activity_records =
+                                        Some((loaded.session.id, records));
+                                }
                             }
                             self.state.set_status_message(format!(
                                 "rolled back {} turn(s) in chat {}",
@@ -3423,15 +7382,27 @@ impl DesktopController {
                             .set_status_message(format!("chat rollback failed: {error}")),
                     }
                 }
-                RuntimeMessage::SessionOperationApplied { session_id, result } => {
-                    self.state.finish_session_maintenance_mutation();
+                RuntimeMessage::SessionOperationApplied { target, result } => {
+                    if !session_mutation_target_matches(
+                        &target,
+                        &self.app.workspace.root,
+                        self.app.workspace.project_id,
+                    ) || !self
+                        .state
+                        .finish_session_maintenance_mutation(target.operation_id)
+                    {
+                        continue;
+                    }
                     match result {
                         Ok(applied) => {
-                            self.state.replace_snapshot(applied.snapshot);
-                            if self.state.selected_session_id() == Some(session_id)
+                            let session_id = applied.loaded.session.id;
+                            self.state
+                                .replace_snapshot_preserving_current_owner(applied.snapshot);
+                            if self.state.app_state.current_session_id == Some(session_id)
                                 && !self.session_load_is_blocked_by_active_run()
                             {
                                 let loaded = applied.loaded;
+                                let access_mode = loaded.session.access_mode;
                                 self.state.load_open_session(
                                     &loaded.session,
                                     &loaded.transcript,
@@ -3443,6 +7414,11 @@ impl DesktopController {
                                     loaded.turn_page_total,
                                     loaded.turn_page_has_more,
                                 );
+                                self.sync_loaded_session_access_mode(access_mode);
+                                if let Some(records) = loaded.agent_activity_records {
+                                    self.loaded_agent_activity_records =
+                                        Some((loaded.session.id, records));
+                                }
                             }
                             self.state.set_status_message(applied.message);
                         }
@@ -3456,14 +7432,17 @@ impl DesktopController {
                         continue;
                     };
                     let _ = self.state.finish_session_search(completion.operation_id);
-                    if !completion.is_latest {
+                    let root_run_active =
+                        self.run_lifecycle.root_is_active() || self.state.is_busy();
+                    let agent_tree_active = self.current_agent_tree_active();
+                    if !apply_session_search_result(
+                        &mut self.state,
+                        completion.is_latest,
+                        root_run_active,
+                        agent_tree_active,
+                        result,
+                    ) {
                         continue;
-                    }
-                    match result {
-                        Ok(snapshot) => self.state.replace_snapshot(snapshot),
-                        Err(error) => self
-                            .state
-                            .set_status_message(format!("session search failed: {error}")),
                     }
                 }
                 RuntimeMessage::TurnPageLoaded {
@@ -3485,6 +7464,7 @@ impl DesktopController {
                     }
                     match result {
                         Ok(loaded) => {
+                            let access_mode = loaded.session.access_mode;
                             self.state.load_open_session(
                                 &loaded.session,
                                 &loaded.transcript,
@@ -3496,6 +7476,11 @@ impl DesktopController {
                                 loaded.turn_page_total,
                                 loaded.turn_page_has_more,
                             );
+                            self.sync_loaded_session_access_mode(access_mode);
+                            if let Some(records) = loaded.agent_activity_records {
+                                self.loaded_agent_activity_records =
+                                    Some((loaded.session.id, records));
+                            }
                             self.state.set_status_message(format!(
                                 "loaded turn page {}-{} of {}",
                                 loaded.turn_page_offset.saturating_add(1),
@@ -3541,67 +7526,123 @@ impl DesktopController {
                                 loaded.turn_page_total,
                                 loaded.turn_page_has_more,
                             );
+                            if let Some(records) = loaded.agent_activity_records {
+                                self.loaded_agent_activity_records =
+                                    Some((loaded.session.id, records));
+                            }
                         }
                         Err(error) => self
                             .state
                             .set_status_message(format!("live session refresh failed: {error}")),
                     }
                 }
-                RuntimeMessage::ProjectDeleted {
-                    project_id,
-                    project_root,
+                RuntimeMessage::DurableAgentActivityRefreshed {
+                    request_id,
+                    target,
                     result,
                 } => {
-                    self.state.finish_project_delete_mutation();
+                    if !finish_durable_agent_activity_refresh_request(
+                        &mut self.durable_agent_activity_refresh_requests,
+                        request_id,
+                        &target,
+                        &self.app.workspace.root,
+                        self.state.app_state.current_session_id,
+                    ) {
+                        continue;
+                    }
+                    match result {
+                        Ok(records) => {
+                            self.loaded_agent_activity_records = Some((target.session_id, records));
+                            self.durable_agent_activity_refresh_failures = 0;
+                        }
+                        Err(error) => {
+                            self.durable_agent_activity_refresh_failures = self
+                                .durable_agent_activity_refresh_failures
+                                .saturating_add(1)
+                                .min(3);
+                            if self.durable_agent_activity_refresh_failures >= 3 {
+                                self.state.set_status_message(format!(
+                                    "Sub Agent activity refresh failed after 3 attempts: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                RuntimeMessage::ProjectDeleted { target, result } => {
+                    if !project_delete_target_matches(
+                        &target,
+                        &self.app.workspace.root,
+                        self.app.workspace.project_id,
+                    ) || !self
+                        .state
+                        .finish_project_delete_mutation(target.operation_id)
+                    {
+                        continue;
+                    }
+                    let project_id = target.project_id;
+                    let project_root = target.project_root;
                     match result {
                         Ok(loaded) => {
                             let deleted_was_current = self.app.workspace.project_id == project_id;
                             self.preferences.mark_project_deleted(&project_root);
-                            self.app = loaded.app.clone();
+                            if deleted_was_current {
+                                self.app = loaded.app.clone();
+                            }
                             if !self.is_quick_chat_workspace() {
                                 self.preferences
                                     .unmark_project_deleted(&self.app.workspace.root);
                             }
                             if deleted_was_current {
+                                let next_config_generation = next_config_generation(
+                                    self.state.provider_config.config_generation,
+                                );
                                 self.session_search_requests.clear();
                                 self.snapshot_requests.clear();
                                 self.turn_page_requests.clear();
                                 self.live_session_refresh_requests.clear();
+                                self.current_session_refresh_requests.clear();
+                                self.current_todo_refresh_requests.clear();
+                                self.durable_agent_activity_refresh_requests.clear();
                                 self.history_export_requests.clear();
                                 self.provider_catalog_requests.clear();
+                                self.startup_provider_requests.clear();
+                                self.startup_docling_requests.clear();
                                 self.state =
                                     DesktopState::new(loaded.snapshot, self.app.config.clone());
+                                self.state.provider_config.config_generation =
+                                    next_config_generation;
+                                self.loaded_agent_activity_records = None;
+                                self.durable_agent_activity_refresh_failures = 0;
                                 self.state.workspace_input = self.app.workspace.cwd.to_string();
                                 if let Some(opacity) = self.preferences.window_opacity_percent {
                                     self.state.set_window_opacity_percent(opacity);
                                 }
                                 self.persist_preferences();
-                                if !self
-                                    .state
-                                    .provider_config
-                                    .provider_base_url_input
-                                    .trim()
-                                    .is_empty()
-                                {
-                                    self.load_provider_models();
-                                }
                             } else {
-                                self.state.replace_snapshot(loaded.snapshot);
+                                self.state
+                                    .replace_snapshot_preserving_current_owner(loaded.snapshot);
                                 self.persist_preferences();
                             }
-                            if let Some(next_session_id) = self.state.selected_session_id() {
-                                self.state.set_status_message(format!(
-                                    "deleted project {}; opening {}...",
-                                    project_id, next_session_id
-                                ));
-                                let request_id = self.state.begin_session_load(next_session_id);
-                                self.spawn_session_load(
-                                    next_session_id,
-                                    SessionLoadReason::UserSelection,
-                                    Some(request_id),
-                                );
+                            if deleted_was_current {
+                                if let Some(next_session_id) = self.state.selected_session_id() {
+                                    self.state.set_status_message(format!(
+                                        "deleted project {}; opening {}...",
+                                        project_id, next_session_id
+                                    ));
+                                    let request_id = self.state.begin_session_load(next_session_id);
+                                    self.spawn_session_load(
+                                        next_session_id,
+                                        SessionLoadReason::UserSelection,
+                                        request_id,
+                                    );
+                                } else {
+                                    self.start_new_chat_with_global_access();
+                                    self.state.set_status_message(format!(
+                                        "deleted project {}",
+                                        project_id
+                                    ));
+                                }
                             } else {
-                                self.state.start_new_chat();
                                 self.state
                                     .set_status_message(format!("deleted project {}", project_id));
                             }
@@ -3611,18 +7652,29 @@ impl DesktopController {
                             .set_status_message(format!("project delete failed: {error}")),
                     }
                 }
-                RuntimeMessage::CurrentTodosLoaded { session_id, result } => match result {
-                    Ok(todos) => {
-                        self.state.finish_current_todo_refresh();
-                        if self.state.app_state.current_session_id == Some(session_id) {
+                RuntimeMessage::CurrentTodosLoaded {
+                    request_id,
+                    target,
+                    result,
+                } => {
+                    if !self
+                        .current_todo_refresh_requests
+                        .finish_if_current(request_id, &target)
+                        || !self.live_session_target_is_current(&target)
+                    {
+                        continue;
+                    }
+                    match result {
+                        Ok(todos) => {
+                            self.state.finish_current_todo_refresh();
                             self.state.app_state.set_sidebar_todos(todos);
                         }
+                        Err(error) => {
+                            self.state.finish_current_todo_refresh();
+                            self.state.set_status_message(error);
+                        }
                     }
-                    Err(error) => {
-                        self.state.finish_current_todo_refresh();
-                        self.state.set_status_message(error);
-                    }
-                },
+                }
                 RuntimeMessage::ModelCatalogLoaded {
                     request_id,
                     target,
@@ -3631,37 +7683,55 @@ impl DesktopController {
                     if !self
                         .provider_catalog_requests
                         .finish_if_current(request_id, &target)
-                        || !self.provider_catalog_target_is_current(&target)
                     {
                         continue;
                     }
+                    if !self.provider_catalog_target_is_current(&target) {
+                        self.state.cancel_provider_model_load();
+                        continue;
+                    }
                     match result {
-                        Ok(load) => {
-                            self.state
-                                .finish_startup_provider_model_load(&load.availability_report);
-                            self.state.finish_provider_model_load(load.models);
-                        }
-                        Err(error) => {
-                            self.state.fail_startup_provider_model_load(error.clone());
-                            self.state.fail_provider_model_load(error);
-                        }
+                        Ok(models) => self.state.finish_provider_model_load(models),
+                        Err(error) => self.state.fail_provider_model_load(error),
                     }
                 }
+                RuntimeMessage::StartupProviderChecked {
+                    request_id,
+                    target,
+                    report,
+                } => {
+                    if !self
+                        .startup_provider_requests
+                        .finish_if_current(request_id, &target)
+                        || !self.provider_readiness_target_is_current(&target)
+                    {
+                        continue;
+                    }
+                    self.state.finish_startup_provider_model_load(&report);
+                }
                 RuntimeMessage::StartupDoclingChecked {
-                    requested_base_url,
+                    request_id,
+                    target,
                     result,
                 } => {
+                    if !self
+                        .startup_docling_requests
+                        .finish_if_current(request_id, &target)
+                    {
+                        continue;
+                    }
                     let current = normalize_docling_base_url(
                         &self.state.provider_config.effective_config.docling.base_url,
                     );
                     if !self.state.provider_config.effective_config.docling.enabled
-                        || current != requested_base_url
+                        || current != target.base_url
+                        || self.state.provider_config.config_generation != target.config_generation
                     {
                         continue;
                     }
                     match result {
                         Ok(()) => {
-                            self.state.finish_startup_docling_check(&requested_base_url);
+                            self.state.finish_startup_docling_check(&target.base_url);
                         }
                         Err(error) => {
                             self.state.fail_startup_docling_check(error.clone());
@@ -3671,16 +7741,6 @@ impl DesktopController {
                         }
                     }
                 }
-                RuntimeMessage::SteerStored(result) => match result {
-                    Ok(()) => {
-                        self.state
-                            .set_status_message("追加入力を実行中の turn に保存しました。");
-                    }
-                    Err(error) => {
-                        self.state
-                            .set_status_message(format!("追加入力の保存に失敗しました: {error}"));
-                    }
-                },
                 RuntimeMessage::HistoryExported {
                     request_id,
                     target,
@@ -3691,7 +7751,6 @@ impl DesktopController {
                         request_id,
                         &target,
                         &self.app.workspace.root,
-                        self.state.selected_session_id(),
                     ) else {
                         continue;
                     };
@@ -3708,6 +7767,155 @@ impl DesktopController {
                             .set_status_message(format!("history markdown export failed: {error}")),
                     }
                 }
+                RuntimeMessage::AccessModePersisted {
+                    request_id,
+                    target,
+                    phase,
+                    worker,
+                    result,
+                } => {
+                    if !self
+                        .access_mode_persistence_requests
+                        .is_current(request_id, &target)
+                        || !self
+                            .state
+                            .access_mode_persistence_is_current(target.operation_id)
+                    {
+                        continue;
+                    }
+                    let target_relation = self.access_mode_persistence_target_relation(&target);
+                    if let (
+                        AccessModePersistencePhase::InitialOwners,
+                        Ok(path),
+                        AccessModePersistenceTargetRelation::AdoptedSession(session_id),
+                    ) = (&phase, &result, target_relation)
+                    {
+                        self.spawn_adopted_session_access_persistence(
+                            request_id,
+                            target.clone(),
+                            session_id,
+                            path.clone(),
+                            worker,
+                        );
+                        self.state.set_status_message(
+                            "global access mode saved; saving the adopted current root session",
+                        );
+                        continue;
+                    }
+                    if matches!(phase, AccessModePersistencePhase::InitialOwners)
+                        && target_relation == AccessModePersistenceTargetRelation::Exact
+                        && target.session_id.is_none()
+                        && target.root_run_generation.is_some()
+                        && target.root_run_generation == self.root_run_generation()
+                    {
+                        if let Ok(path) = &result {
+                            self.pending_access_mode_adoption = Some(PendingAccessModeAdoption {
+                                request_id,
+                                target,
+                                remembered_path: path.clone(),
+                                worker,
+                            });
+                            self.state.set_status_message(
+                                "global access mode saved; waiting for current root session admission",
+                            );
+                            continue;
+                        }
+                    }
+                    let request_is_current = self
+                        .access_mode_persistence_requests
+                        .finish_if_current(request_id, &target);
+                    let operation_is_current = self
+                        .state
+                        .finish_access_mode_persistence(target.operation_id);
+                    if !request_is_current || !operation_is_current {
+                        continue;
+                    }
+                    let (target_is_current, committed_session_id) = match (phase, target_relation) {
+                        (
+                            AccessModePersistencePhase::InitialOwners,
+                            AccessModePersistenceTargetRelation::Exact,
+                        ) => (true, target.session_id),
+                        (
+                            AccessModePersistencePhase::AdoptedSession { session_id },
+                            AccessModePersistenceTargetRelation::AdoptedSession(current_session_id),
+                        ) if session_id == current_session_id => (true, Some(session_id)),
+                        _ => (false, None),
+                    };
+                    match result {
+                        Ok(path) if target_is_current => {
+                            self.app.config.permissions.access_mode = target.access_mode;
+                            self.state
+                                .provider_config
+                                .update_access_mode(target.access_mode);
+                            self.run_lifecycle.set_access_mode(target.access_mode);
+                            if let Some(session_id) = committed_session_id {
+                                for session in &mut self.state.app_state.sessions {
+                                    if session.id == session_id {
+                                        session.access_mode = target.access_mode;
+                                    }
+                                }
+                                for summary in &mut self.state.app_state.loaded_sessions {
+                                    if summary.session.id == session_id {
+                                        summary.session.access_mode = target.access_mode;
+                                    }
+                                }
+                            }
+                            let auto_approved = self
+                                .pending_permission_request
+                                .as_ref()
+                                .is_some_and(|request| {
+                                    crate::tool::context::access_mode_allows_permission(
+                                        target.access_mode,
+                                        request,
+                                    )
+                                });
+                            if auto_approved {
+                                if let Some(response) = self.permission_response.take() {
+                                    let _ = response.send(true);
+                                }
+                                self.pending_permission_request = None;
+                                self.pending_permission_request_id = None;
+                                self.state.clear_permission();
+                            }
+                            let scope = if committed_session_id.is_some() {
+                                "global config and current root session"
+                            } else {
+                                "global config"
+                            };
+                            let suffix = if auto_approved {
+                                "; pending confirmation approved"
+                            } else {
+                                ""
+                            };
+                            self.state.set_status_message(format!(
+                                "{scope} access mode set to {} and remembered in {}{suffix}",
+                                target.access_mode.label(),
+                                path
+                            ));
+                        }
+                        Ok(_) => {
+                            let _ = self.reload_config();
+                            self.state.set_status_message(
+                                "access mode was persisted for its original owner; current configuration was reloaded",
+                            );
+                        }
+                        Err(error) => {
+                            let _ = self.reload_config();
+                            if target_is_current
+                                && self.state.app_state.current_session_id.is_some()
+                            {
+                                self.state
+                                    .provider_config
+                                    .update_access_mode(target.old_effective_access_mode);
+                                self.run_lifecycle
+                                    .set_access_mode(target.old_effective_access_mode);
+                            }
+                            self.state.set_status_message(format!(
+                                "access mode was not changed; configuration was reloaded: {error}"
+                            ));
+                        }
+                    }
+                }
                 RuntimeMessage::WorkspaceSwitched { request_id, result } => {
                     self.apply_workspace_switched_message(request_id, result)
                 }
@@ -3718,6 +7926,21 @@ impl DesktopController {
         }
         changed
     }
+}
+
+fn desktop_run_failure_notification_allowed(cancelled: bool) -> bool {
+    !cancelled
+}
+
+fn publish_desktop_run_finished(
+    tx: &tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
+    run_generation: u64,
+    result: Result<RunSummary, String>,
+) {
+    let _ = tx.send(RuntimeMessage::Finished {
+        run_generation,
+        result,
+    });
 }
 
 fn resolve_pending_permission(
@@ -3737,30 +7960,57 @@ fn resolve_pending_permission(
     Ok(true)
 }
 
+fn clear_cancelled_permission(
+    request: &mut Option<PermissionRequest>,
+    pending_confirmation_id: &mut Option<u64>,
+    response: &mut Option<mpsc::Sender<bool>>,
+    expected_confirmation_id: u64,
+) -> bool {
+    if *pending_confirmation_id != Some(expected_confirmation_id) {
+        return false;
+    }
+    *request = None;
+    *pending_confirmation_id = None;
+    *response = None;
+    true
+}
+
+fn preserve_permission_after_root_finish(request: Option<&PermissionRequest>) -> bool {
+    request.is_some_and(|request| request.agent_path.is_some())
+}
+
 fn loaded_session_from_detail(
-    (
-        session,
-        transcript,
-        turn_items,
-        state,
-        todos,
-        turn_page_offset,
-        turn_page_limit,
-        turn_page_total,
-        turn_page_has_more,
-    ): LoadedSessionDetail,
+    detail: LoadedSessionDetail,
+    agent_activity_records: Option<Vec<AgentActivityRecord>>,
 ) -> LoadedSession {
     LoadedSession {
-        session,
-        transcript,
-        turn_items,
-        state,
-        todos,
-        turn_page_offset,
-        turn_page_limit,
-        turn_page_total,
-        turn_page_has_more,
+        session: detail.session,
+        transcript: detail.transcript,
+        turn_items: detail.turn_items,
+        state: detail.state,
+        todos: detail.todos,
+        turn_page_offset: detail.turn_page_offset,
+        turn_page_limit: detail.turn_page_limit,
+        turn_page_total: detail.turn_page_total,
+        turn_page_has_more: detail.turn_page_has_more,
+        agent_activity_records,
     }
+}
+
+async fn loaded_session_from_detail_with_activity(
+    app: &App,
+    detail: LoadedSessionDetail,
+) -> Result<LoadedSession, String> {
+    let session_id = detail.session.id;
+    let agent_activity_records = app
+        .run_service
+        .durable_agent_activity_records(session_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(loaded_session_from_detail(
+        detail,
+        Some(agent_activity_records),
+    ))
 }
 
 async fn load_session_operation_projection(
@@ -3771,31 +8021,27 @@ async fn load_session_operation_projection(
     let snapshot = load_snapshot_for_selection(app, Some(session_id))
         .await
         .map_err(|error| error.to_string())?;
-    let (
-        session,
-        transcript,
-        turn_items,
-        state,
-        todos,
-        turn_page_offset,
-        turn_page_limit,
-        turn_page_total,
-        turn_page_has_more,
-    ) = load_session_detail(app, session_id)
+    let detail = load_session_detail(app, session_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let agent_activity_records = app
+        .run_service
+        .durable_agent_activity_records(session_id)
         .await
         .map_err(|error| error.to_string())?;
     Ok(DesktopSessionOperationLoaded {
         snapshot,
         loaded: LoadedSession {
-            session,
-            transcript,
-            turn_items,
-            state,
-            todos,
-            turn_page_offset,
-            turn_page_limit,
-            turn_page_total,
-            turn_page_has_more,
+            session: detail.session,
+            transcript: detail.transcript,
+            turn_items: detail.turn_items,
+            state: detail.state,
+            todos: detail.todos,
+            turn_page_offset: detail.turn_page_offset,
+            turn_page_limit: detail.turn_page_limit,
+            turn_page_total: detail.turn_page_total,
+            turn_page_has_more: detail.turn_page_has_more,
+            agent_activity_records: Some(agent_activity_records),
         },
         message,
     })
@@ -4467,14 +8713,17 @@ fn provider_catalog_probe_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopProviderModelLoad, HistoryExportRequestTarget, ProviderCatalogRequestTarget,
-        RuntimeMessage, RuntimeMessageAsyncContract, SessionRefreshRequestTarget,
+        DesktopRenderer, DoclingRequestTarget, HistoryExportRequestTarget,
+        ProviderCatalogRequestTarget, ProviderReadinessRequestTarget, RuntimeMessage,
+        RuntimeMessageAsyncContract, SessionRefreshRequestTarget,
         fallback_workspace_after_project_delete, first_restorable_project_root,
         normalize_image_attachment_path, notification_session_title,
         open_transcript_rows_to_markdown, provider_catalog_probe_config,
-        resolve_pending_permission, run_completion_notification_body,
+        publish_desktop_run_finished, resolve_pending_permission, run_completion_notification_body,
         run_terminal_event_notification_body, transcript_markdown_file_name,
+        unique_background_request_admission_open,
     };
+    use crate::cli::EventRenderer as _;
     use crate::config::{ProviderMetadataMode, ResolvedConfig};
     use crate::desktop::async_ops::LatestRequestTracker;
     use crate::desktop::models::DesktopTranscriptRowKind;
@@ -4496,10 +8745,20 @@ mod tests {
     }
 
     #[test]
+    fn unique_background_request_admission_rejects_either_pending_owner() {
+        assert!(unique_background_request_admission_open(false, false));
+        assert!(!unique_background_request_admission_open(true, false));
+        assert!(!unique_background_request_admission_open(false, true));
+        assert!(!unique_background_request_admission_open(true, true));
+    }
+
+    #[test]
     fn runtime_message_async_contract_classifies_representative_backflow_sources() {
         let provider_target = ProviderCatalogRequestTarget {
             base_url: "http://127.0.0.1:1234".to_string(),
             metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            config_generation: 1,
+            selected_model_id: "qwen/qwen3.6-35b-a3b".to_string(),
         };
         let provider_request_id = LatestRequestTracker::default().begin(provider_target.clone());
         let history_target = HistoryExportRequestTarget {
@@ -4520,52 +8779,72 @@ mod tests {
             RuntimeMessage::ModelCatalogLoaded {
                 request_id: provider_request_id,
                 target: provider_target,
-                result: Ok(DesktopProviderModelLoad {
-                    models: Vec::new(),
-                    availability_report: ModelAvailabilityReport {
-                        gate: "model_availability".to_string(),
-                        status: ModelAvailabilityStatus::Pass,
-                        generated_by: "desktop_app_test".to_string(),
-                        model: "qwen/qwen3.6-35b-a3b".to_string(),
-                        base_url: "http://127.0.0.1:1234".to_string(),
-                        provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
-                        v1_present: true,
-                        native_present: true,
-                        require_vision: false,
-                        vision_capable: false,
-                        vision_probe_passed: false,
-                        vision_probes: Vec::new(),
-                        tool_use_capable: Some(true),
-                        capability_overrides: Vec::new(),
-                        tool_call_probe_passed: true,
-                        tool_call_probes: Vec::new(),
-                        reasoning_capable: Some(false),
-                        context: Some(131072),
-                        max_output_tokens: Some(8192),
-                        max_parallel_predictions: Some(1),
-                        matched_model: None,
-                        v1_models: Vec::new(),
-                        native_models: Vec::new(),
-                        openai_error: None,
-                        native_error: None,
-                        checked_at_ms: 0,
-                    },
-                }),
+                result: Ok(Vec::new()),
             }
             .async_contract(),
             RuntimeMessageAsyncContract::ProviderOperation
         );
+        let readiness_target = ProviderReadinessRequestTarget {
+            base_url: "http://127.0.0.1:1234".to_string(),
+            model_id: "qwen/qwen3.6-35b-a3b".to_string(),
+            metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            supports_tools: true,
+            supports_reasoning: false,
+            supports_images: false,
+            parallel_tool_calls: true,
+            max_parallel_predictions: 1,
+            config_generation: 1,
+        };
+        let readiness_request_id = LatestRequestTracker::default().begin(readiness_target.clone());
+        assert_eq!(
+            RuntimeMessage::StartupProviderChecked {
+                request_id: readiness_request_id,
+                target: readiness_target,
+                report: ModelAvailabilityReport {
+                    gate: "model_availability".to_string(),
+                    status: ModelAvailabilityStatus::Pass,
+                    generated_by: "desktop_app_test".to_string(),
+                    model: "qwen/qwen3.6-35b-a3b".to_string(),
+                    base_url: "http://127.0.0.1:1234".to_string(),
+                    provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+                    v1_present: true,
+                    native_present: true,
+                    require_vision: false,
+                    vision_capable: false,
+                    vision_probe_passed: false,
+                    vision_probes: Vec::new(),
+                    tool_use_capable: Some(true),
+                    capability_overrides: Vec::new(),
+                    tool_call_probe_passed: true,
+                    tool_call_probes: Vec::new(),
+                    reasoning_capable: Some(false),
+                    context: Some(131072),
+                    max_output_tokens: Some(8192),
+                    max_parallel_predictions: Some(1),
+                    matched_model: None,
+                    v1_models: Vec::new(),
+                    native_models: Vec::new(),
+                    openai_error: None,
+                    native_error: None,
+                    checked_at_ms: 0,
+                },
+            }
+            .async_contract(),
+            RuntimeMessageAsyncContract::ProviderOperation
+        );
+        let docling_target = DoclingRequestTarget {
+            base_url: "http://127.0.0.1:8123".to_string(),
+            config_generation: 1,
+        };
+        let docling_request_id = LatestRequestTracker::default().begin(docling_target.clone());
         assert_eq!(
             RuntimeMessage::StartupDoclingChecked {
-                requested_base_url: "http://127.0.0.1:8123".to_string(),
+                request_id: docling_request_id,
+                target: docling_target,
                 result: Ok(()),
             }
             .async_contract(),
             RuntimeMessageAsyncContract::ProviderOperation
-        );
-        assert_eq!(
-            RuntimeMessage::SteerStored(Ok(())).async_contract(),
-            RuntimeMessageAsyncContract::BackgroundOperation
         );
         assert_eq!(
             {
@@ -4584,7 +8863,11 @@ mod tests {
             RuntimeMessageAsyncContract::RunStream
         );
         assert_eq!(
-            RuntimeMessage::Finished(Err("failed".to_string())).async_contract(),
+            RuntimeMessage::Finished {
+                run_generation: 1,
+                result: Err("failed".to_string()),
+            }
+            .async_contract(),
             RuntimeMessageAsyncContract::TerminalRun
         );
     }
@@ -4896,6 +9179,42 @@ mod tests {
     }
 
     #[test]
+    fn desktop_renderer_defers_state_completion_until_worker_settlement() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = DesktopRenderer {
+            tx: tx.clone(),
+            run_generation: 12,
+            notification_title: "test".to_string(),
+            notified_terminal: false,
+        };
+        let summary = RunSummary {
+            session_id: crate::session::SessionId::new(),
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        };
+
+        renderer.finish(&summary).expect("renderer finish");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        publish_desktop_run_finished(&tx, 12, Ok(summary.clone()));
+        assert!(matches!(
+            rx.try_recv().expect("worker settlement"),
+            RuntimeMessage::Finished {
+                run_generation: 12,
+                result: Ok(received),
+            } if received.session_id == summary.session_id
+        ));
+    }
+
+    #[test]
     fn terminal_event_notification_body_uses_terminal_state() {
         let body = run_terminal_event_notification_body(
             "vision GUI",
@@ -4922,6 +9241,7 @@ mod tests {
 
 struct DesktopRenderer {
     tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
+    run_generation: u64,
     notification_title: String,
     notified_terminal: bool,
 }
@@ -4940,20 +9260,15 @@ impl EventRenderer for DesktopRenderer {
             }
         }
         self.tx
-            .send(RuntimeMessage::RunEvent(event.clone()))
+            .send(RuntimeMessage::RunEvent {
+                run_generation: self.run_generation,
+                event: event.clone(),
+            })
             .map_err(|error| CliRenderError::Message(error.to_string()))
     }
 
-    fn finish(&mut self, summary: &RunSummary) -> Result<(), CliRenderError> {
-        if !self.notified_terminal {
-            let notification_body =
-                run_completion_notification_body(&self.notification_title, summary);
-            send_windows_desktop_notification("moyAI", &notification_body);
-            self.notified_terminal = true;
-        }
-        self.tx
-            .send(RuntimeMessage::Finished(Ok(summary.clone())))
-            .map_err(|error| CliRenderError::Message(error.to_string()))
+    fn finish(&mut self, _summary: &RunSummary) -> Result<(), CliRenderError> {
+        Ok(())
     }
 
     fn render_session_list(&mut self, _sessions: &[SessionRecord]) -> Result<(), CliRenderError> {
@@ -5128,6 +9443,17 @@ struct DesktopConfirmationPrompt {
 
 impl ConfirmationPrompt for DesktopConfirmationPrompt {
     fn confirm(&mut self, request: &PermissionRequest) -> Result<bool, CliPromptError> {
+        self.confirm_with_cancel(request, &CancellationToken::new())
+    }
+
+    fn confirm_with_cancel(
+        &mut self,
+        request: &PermissionRequest,
+        cancel: &CancellationToken,
+    ) -> Result<bool, CliPromptError> {
+        if cancel.is_cancelled() {
+            return Ok(false);
+        }
         let (response_tx, response_rx) = mpsc::channel();
         let confirmation_id = self
             .next_permission_request_id
@@ -5139,9 +9465,23 @@ impl ConfirmationPrompt for DesktopConfirmationPrompt {
                 response: response_tx,
             })
             .map_err(|error| CliPromptError::Message(error.to_string()))?;
-        response_rx
-            .recv()
-            .map_err(|error| CliPromptError::Message(error.to_string()))
+        loop {
+            match response_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(allow) => return Ok(allow),
+                Err(mpsc::RecvTimeoutError::Timeout) if cancel.is_cancelled() => {
+                    let _ = self
+                        .tx
+                        .send(RuntimeMessage::PermissionCancelled { confirmation_id });
+                    return Ok(false);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(CliPromptError::Message(
+                        "desktop permission response channel disconnected".to_string(),
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -5394,10 +9734,19 @@ fn import_global_config_toml(source: &Utf8Path) -> Result<String, String> {
     let text = fs::read_to_string(source.as_std_path()).map_err(|error| error.to_string())?;
     toml::from_str::<PartialResolvedConfig>(&text).map_err(|error| error.to_string())?;
     let target = global_config_path().map_err(|error| error.to_string())?;
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent.as_std_path()).map_err(|error| error.to_string())?;
-    }
-    fs::write(target.as_std_path(), text).map_err(|error| error.to_string())?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("global config path has no parent: {target}"))?;
+    fs::create_dir_all(parent.as_std_path()).map_err(|error| error.to_string())?;
+    let mut temp =
+        NamedTempFile::new_in(parent.as_std_path()).map_err(|error| error.to_string())?;
+    temp.write_all(text.as_bytes())
+        .map_err(|error| error.to_string())?;
+    temp.as_file_mut()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temp.persist(target.as_std_path())
+        .map_err(|error| error.error.to_string())?;
     Ok(format!("imported config.toml to {}", target))
 }
 

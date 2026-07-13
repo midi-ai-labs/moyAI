@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rusqlite::Connection;
 
@@ -8,6 +9,8 @@ use crate::error::StorageError;
 use crate::storage::{
     SqliteChangeRepository, SqliteProjectRepository, SqliteSessionRepository, StoragePaths,
 };
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -26,6 +29,7 @@ impl SqliteStore {
         std::fs::create_dir_all(&paths.data_dir)?;
         std::fs::create_dir_all(&paths.truncation_dir)?;
         let connection = Connection::open(&paths.database_path)?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Self {
@@ -162,6 +166,85 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
+
+    #[test]
+    fn production_connection_configures_a_busy_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8");
+        let paths = StoragePaths {
+            data_dir: data_dir.clone(),
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+        };
+
+        let store = SqliteStore::open(&paths).expect("store");
+        let timeout_ms = store
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+            .expect("busy timeout");
+
+        assert_eq!(timeout_ms, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    #[test]
+    fn second_production_connection_retries_a_busy_writer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8");
+        let paths = StoragePaths {
+            data_dir: data_dir.clone(),
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+        };
+        let first = SqliteStore::open(&paths).expect("first store");
+        first.migrate().expect("migrate");
+        let second = SqliteStore::open(&paths).expect("second store");
+        first
+            .connection
+            .lock()
+            .expect("first sqlite mutex")
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold writer transaction");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).expect("writer started");
+            second
+                .connection
+                .lock()
+                .expect("second sqlite mutex")
+                .execute(
+                    "INSERT INTO projects
+                     (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                     VALUES ('busy-project', 'C:/busy', 'busy', 'none', 1, 1)",
+                    [],
+                )
+        });
+        started_rx.recv().expect("writer start");
+        std::thread::sleep(Duration::from_millis(100));
+        first
+            .connection
+            .lock()
+            .expect("first sqlite mutex")
+            .execute_batch("COMMIT")
+            .expect("release writer transaction");
+
+        assert_eq!(
+            writer.join().expect("writer thread").expect("busy retry"),
+            1
+        );
+        let stored = first
+            .connection
+            .lock()
+            .expect("first sqlite mutex")
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = 'busy-project'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("stored project");
+        assert_eq!(stored, 1);
+    }
 
     #[test]
     fn cleanup_orphan_internal_files_removes_only_unreferenced_appdata_artifacts() {

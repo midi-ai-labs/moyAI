@@ -1,6 +1,6 @@
-import type { ConfigMutationTarget } from "./types";
+import type { ConfigMutationTarget } from "./types.ts";
 
-export type { ConfigMutationTarget } from "./types";
+export type { ConfigMutationTarget } from "./types.ts";
 
 export interface ConfigValueInput {
   key: string;
@@ -10,6 +10,7 @@ export interface ConfigValueInput {
 export interface ConfigMutationOwner {
   configDirty: boolean;
   configDraftValues: Map<string, string>;
+  configDraftBaselineValues: Map<string, string>;
   configDraftTarget: ConfigMutationTarget | null;
   configDraftRevision: number;
   nextConfigMutationGeneration: number;
@@ -35,10 +36,16 @@ export function updateConfigDraftValue(
   }
   for (const value of baseValues) {
     if (!owner.configDraftValues.has(value.key)) owner.configDraftValues.set(value.key, value.text);
+    if (!owner.configDraftBaselineValues.has(value.key)) {
+      owner.configDraftBaselineValues.set(value.key, value.text);
+    }
   }
   owner.configDraftValues.set(key, text);
-  owner.configDirty = true;
+  owner.configDirty = Array.from(owner.configDraftValues).some(
+    ([fieldKey, fieldValue]) => owner.configDraftBaselineValues.get(fieldKey) !== fieldValue,
+  );
   owner.configDraftRevision += 1;
+  if (!owner.configDirty) resetConfigDraftStorage(owner);
 }
 
 export function configMutationValues(
@@ -110,9 +117,18 @@ export function configMutationPending(owner: ConfigMutationOwner): boolean {
   return owner.activeConfigMutationGeneration !== null;
 }
 
+export function discardConfigDraft(owner: ConfigMutationOwner): void {
+  clearConfigDraft(owner);
+}
+
 function clearConfigDraft(owner: ConfigMutationOwner): void {
   owner.configDirty = false;
-  owner.configDraftValues.clear();
-  owner.configDraftTarget = null;
+  resetConfigDraftStorage(owner);
   owner.configDraftRevision += 1;
+}
+
+function resetConfigDraftStorage(owner: ConfigMutationOwner): void {
+  owner.configDraftValues.clear();
+  owner.configDraftBaselineValues.clear();
+  owner.configDraftTarget = null;
 }

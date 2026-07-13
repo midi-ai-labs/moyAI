@@ -24,7 +24,7 @@ pub struct App {
     pub workspace: crate::workspace::Workspace,
     pub store: crate::storage::StoreBundle,
     pub session_service: crate::session::SessionService,
-    pub run_service: crate::app::RunService,
+    pub run_service: std::sync::Arc<crate::app::RunService>,
     pub session_event_hub: SessionRuntimeEventHub,
 }
 
@@ -67,6 +67,10 @@ pub struct RunRequest {
     pub image_paths: Vec<Utf8PathBuf>,
     pub cancel: CancellationToken,
     pub live_config: Option<LiveConfigOverrides>,
+    /// Cloneable permission channel inherited by child agent sessions.
+    pub agent_confirmation: Option<crate::cli::SharedConfirmationPrompt>,
+    /// Internal identity for a child turn. User-owned surface requests always leave this unset.
+    pub agent_context: Option<crate::app::AgentRunContext>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,4 +1,4 @@
-import type { DesktopWebState, RowMutationTarget } from "./types";
+import type { DesktopWebState, RowMutationTarget } from "./types.ts";
 
 export function rowMutationTarget(state: DesktopWebState, rowId: string): RowMutationTarget {
   return {

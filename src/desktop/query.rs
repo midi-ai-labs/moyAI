@@ -21,17 +21,17 @@ pub use super::artifact_projection::{file_change_rows_from_turn_items, format_ar
 
 pub const DESKTOP_TURN_PAGE_LIMIT: usize = 80;
 
-pub type LoadedSessionDetail = (
-    SessionRecord,
-    Transcript,
-    Vec<crate::protocol::TurnItem>,
-    SessionStateSnapshot,
-    Vec<TodoItem>,
-    usize,
-    usize,
-    usize,
-    bool,
-);
+pub struct LoadedSessionDetail {
+    pub session: SessionRecord,
+    pub transcript: Transcript,
+    pub turn_items: Vec<crate::protocol::TurnItem>,
+    pub state: SessionStateSnapshot,
+    pub todos: Vec<TodoItem>,
+    pub turn_page_offset: usize,
+    pub turn_page_limit: usize,
+    pub turn_page_total: usize,
+    pub turn_page_has_more: bool,
+}
 
 pub async fn load_snapshot(app: &App, args: &DesktopArgs) -> Result<DesktopSnapshot, AppRunError> {
     load_snapshot_for_selection(app, args.session_id).await
@@ -111,13 +111,23 @@ pub async fn load_latest_session_detail(
     app: &App,
     session_id: SessionId,
 ) -> Result<LoadedSessionDetail, AppRunError> {
-    let total = app
-        .session_service
-        .canonical_turn_items(session_id)
-        .await?
-        .len();
-    let offset = latest_turn_page_offset(total, DESKTOP_TURN_PAGE_LIMIT);
-    load_session_detail_at(app, session_id, offset).await
+    for _ in 0..3 {
+        let total = app
+            .session_service
+            .canonical_turn_items(session_id)
+            .await?
+            .len();
+        let offset = latest_turn_page_offset(total, DESKTOP_TURN_PAGE_LIMIT);
+        let detail = load_session_detail_at(app, session_id, offset).await?;
+        let stable_offset =
+            latest_turn_page_offset(detail.turn_page_total, DESKTOP_TURN_PAGE_LIMIT);
+        if detail.turn_page_offset == stable_offset {
+            return Ok(detail);
+        }
+    }
+    Err(AppRunError::Message(format!(
+        "session {session_id} changed while its latest detail snapshot was being captured"
+    )))
 }
 
 async fn load_session_detail_at(
@@ -125,24 +135,40 @@ async fn load_session_detail_at(
     session_id: SessionId,
     turn_page_offset: usize,
 ) -> Result<LoadedSessionDetail, AppRunError> {
-    let page = app
-        .session_service
-        .canonical_turn_page(session_id, turn_page_offset, DESKTOP_TURN_PAGE_LIMIT)
-        .await?;
-    let transcript = app.session_service.canonical_transcript(session_id).await?;
-    let state = app.session_service.load_state(session_id).await?;
-    let todos = app.session_service.list_todos(session_id).await?;
-    Ok((
-        page.session,
-        transcript,
-        page.items,
-        state,
-        todos,
-        page.offset,
-        page.limit,
-        page.total,
-        page.has_more,
-    ))
+    for _ in 0..3 {
+        let page = app
+            .session_service
+            .canonical_turn_page(session_id, turn_page_offset, DESKTOP_TURN_PAGE_LIMIT)
+            .await?;
+        let transcript = app.session_service.canonical_transcript(session_id).await?;
+        let state = app.session_service.load_state(session_id).await?;
+        let todos = app.session_service.list_todos(session_id).await?;
+        let fence = app
+            .session_service
+            .canonical_turn_page(session_id, turn_page_offset, DESKTOP_TURN_PAGE_LIMIT)
+            .await?;
+        let stable = page.session.updated_at_ms == fence.session.updated_at_ms
+            && page.session.status == fence.session.status
+            && page.total == fence.total
+            && page.items.last().map(|item| item.id) == fence.items.last().map(|item| item.id);
+        let detail = LoadedSessionDetail {
+            session: fence.session,
+            transcript,
+            turn_items: fence.items,
+            state,
+            todos,
+            turn_page_offset: fence.offset,
+            turn_page_limit: fence.limit,
+            turn_page_total: fence.total,
+            turn_page_has_more: fence.has_more,
+        };
+        if stable {
+            return Ok(detail);
+        }
+    }
+    Err(AppRunError::Message(format!(
+        "session {session_id} changed while its detail snapshot was being captured"
+    )))
 }
 
 fn latest_turn_page_offset(total: usize, limit: usize) -> usize {
@@ -454,6 +480,15 @@ fn transcript_rows_from_turn_items_with_context(
             crate::protocol::TurnItemPayload::AgentMessage { text } => {
                 current.assistant_bodies.push(text.clone());
             }
+            crate::protocol::TurnItemPayload::InterAgentCommunication { communication } => {
+                current.system_rows.push(desktop_transcript_row(
+                    DesktopTranscriptRowKind::System,
+                    String::new(),
+                    format!("Sub Agent · {}", communication.author),
+                    communication.content.clone(),
+                    Vec::new(),
+                ));
+            }
             crate::protocol::TurnItemPayload::ToolStatus {
                 title,
                 status,
@@ -510,6 +545,7 @@ fn transcript_rows_from_turn_items_with_context(
                 current.terminal_status = Some(*status);
             }
             crate::protocol::TurnItemPayload::Reasoning { .. }
+            | crate::protocol::TurnItemPayload::SubAgentActivity { .. }
             | crate::protocol::TurnItemPayload::Plan { .. }
             | crate::protocol::TurnItemPayload::PromptDispatch { .. }
             | crate::protocol::TurnItemPayload::State { .. }
@@ -1720,6 +1756,15 @@ mod tests {
         assert_eq!(latest_turn_page_offset(151, DESKTOP_TURN_PAGE_LIMIT), 80);
         assert_eq!(latest_turn_page_offset(160, DESKTOP_TURN_PAGE_LIMIT), 80);
         assert_eq!(latest_turn_page_offset(161, DESKTOP_TURN_PAGE_LIMIT), 160);
+    }
+
+    #[test]
+    fn latest_page_snapshot_detects_growth_across_the_80_to_81_boundary() {
+        let before = latest_turn_page_offset(80, DESKTOP_TURN_PAGE_LIMIT);
+        let after = latest_turn_page_offset(81, DESKTOP_TURN_PAGE_LIMIT);
+        assert_eq!(before, 0);
+        assert_eq!(after, 80);
+        assert_ne!(before, after);
     }
 
     #[test]

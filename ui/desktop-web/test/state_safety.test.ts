@@ -6,6 +6,7 @@ import {
   beginConfigMutation,
   configDraftAppliesTo,
   configMutationValues,
+  discardConfigDraft,
   finishConfigMutation,
   reconcileConfigDraftTarget,
   updateConfigDraftValue,
@@ -33,6 +34,7 @@ function dirtyDraft(draftTarget = target()) {
   return {
     configDirty: true,
     configDraftValues: new Map([["model.model", "draft-value"]]),
+    configDraftBaselineValues: new Map([["model.model", "baseline-value"]]),
     configDraftTarget: draftTarget,
     configDraftRevision: 1,
     nextConfigMutationGeneration: 1,
@@ -171,6 +173,7 @@ test("config mutation payload survives closing settings and remains draft-owned"
   const draft = {
     configDirty: false,
     configDraftValues: new Map<string, string>(),
+    configDraftBaselineValues: new Map<string, string>(),
     configDraftTarget: null,
     configDraftRevision: 0,
     nextConfigMutationGeneration: 1,
@@ -293,7 +296,7 @@ test("settings commit requires a draft except during initial setup", () => {
   assert.equal(configCommitEnabled(true, true, true), false);
 });
 
-test("typed conflict carries a refresh projection while internal and transport errors stay fatal", () => {
+test("typed conflict carries a refresh projection while other errors stay outside conflict recovery", () => {
   const state = rowState("session-a", ["session-a"]);
   state.projection_revision = "8";
   const conflict = { kind: "conflict", message: "row changed", state };
@@ -341,23 +344,42 @@ test("regular modal detection excludes menu popovers and contains focus cyclical
   assert.equal(nextDialogFocusIndex(-1, 0, false), -1);
 });
 
-test("navigation admission rejects run, background mutation, and active navigation", () => {
-  assert.equal(
-    navigationIsIdle({ busy: false, background_mutation_pending: false, navigation_loading: false }),
-    true,
-  );
-  assert.equal(
-    navigationIsIdle({ busy: true, background_mutation_pending: false, navigation_loading: false }),
-    false,
-  );
-  assert.equal(
-    navigationIsIdle({ busy: false, background_mutation_pending: true, navigation_loading: false }),
-    false,
-  );
-  assert.equal(
-    navigationIsIdle({ busy: false, background_mutation_pending: false, navigation_loading: true }),
-    false,
-  );
+test("navigation admission consumes the single Rust capability projection", () => {
+  assert.equal(navigationIsIdle({ navigation_admission_open: true }), true);
+  assert.equal(navigationIsIdle({ navigation_admission_open: false }), false);
+});
+
+test("reverting every field to its baseline automatically clears dirty state", () => {
+  const draft = {
+    configDirty: false,
+    configDraftValues: new Map<string, string>(),
+    configDraftBaselineValues: new Map<string, string>(),
+    configDraftTarget: null,
+    configDraftRevision: 0,
+    nextConfigMutationGeneration: 1,
+    activeConfigMutationGeneration: null as number | null,
+  };
+  const baseline = [{ key: "model.model", text: "model-a" }];
+
+  updateConfigDraftValue(draft, target(), baseline, "model.model", "model-b");
+  assert.equal(draft.configDirty, true);
+  updateConfigDraftValue(draft, target(), baseline, "model.model", "model-a");
+
+  assert.equal(draft.configDirty, false);
+  assert.equal(draft.configDraftTarget, null);
+  assert.equal(draft.configDraftValues.size, 0);
+  assert.equal(draft.configDraftBaselineValues.size, 0);
+});
+
+test("discard resets an invalid settings draft without committing it", () => {
+  const draft = dirtyDraft();
+
+  discardConfigDraft(draft);
+
+  assert.equal(draft.configDirty, false);
+  assert.equal(draft.configDraftTarget, null);
+  assert.equal(draft.configDraftValues.size, 0);
+  assert.equal(draft.configDraftBaselineValues.size, 0);
 });
 
 function rowState(ownerSessionId: string, sessionIds: string[]): DesktopWebState {

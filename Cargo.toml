@@ -1,6 +1,6 @@
 [package]
 name = "moyai"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2024"
 build = "build.rs"
 license = "MIT"
@@ -20,6 +20,11 @@ tauri-desktop = [
 [lib]
 name = "moyai"
 path = "src/lib.rs"
+
+[[bin]]
+name = "moyai-desktop"
+path = "src/bin/moyai-desktop.rs"
+required-features = ["tauri-desktop"]
 
 [dependencies]
 async-trait = "0.1.89"

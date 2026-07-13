@@ -9,5 +9,5 @@ pub use parse::{
     SessionListArgs, SessionLoadedArgs, SessionMemoryArgs, SessionRejoinArgs, SessionRollbackArgs,
     SessionShowArgs, SessionTurnsArgs, TuiArgs,
 };
-pub use prompt::{ConfirmationPrompt, StdConfirmationPrompt};
+pub use prompt::{ConfirmationPrompt, SharedConfirmationPrompt, StdConfirmationPrompt};
 pub use render::{EventRenderer, HumanRenderer, JsonRenderer};

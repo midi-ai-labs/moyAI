@@ -69,6 +69,9 @@ impl ToolRegistry {
     pub fn core_agent_for_config(config: &crate::config::ResolvedConfig) -> Self {
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         insert_core_agent_tools(&mut tools);
+        if config.multi_agent.enabled {
+            insert_multi_agent_tools(&mut tools);
+        }
         if config.docling.enabled {
             tools.insert(
                 "docling_convert".to_string(),
@@ -80,6 +83,32 @@ impl ToolRegistry {
                 "mcp_call".to_string(),
                 Arc::new(crate::tool::mcp_call::McpCallTool),
             );
+        }
+        Self { tools }
+    }
+
+    pub fn with_config_overlays(&self, config: &crate::config::ResolvedConfig) -> Self {
+        let mut tools = self.tools.clone();
+        if config.multi_agent.enabled {
+            insert_multi_agent_tools(&mut tools);
+        } else {
+            remove_multi_agent_tools(&mut tools);
+        }
+        if config.docling.enabled {
+            tools.insert(
+                "docling_convert".to_string(),
+                Arc::new(crate::tool::docling_convert::DoclingConvertTool),
+            );
+        } else {
+            tools.remove("docling_convert");
+        }
+        if config.mcp.enabled {
+            tools.insert(
+                "mcp_call".to_string(),
+                Arc::new(crate::tool::mcp_call::McpCallTool),
+            );
+        } else {
+            tools.remove("mcp_call");
         }
         Self { tools }
     }
@@ -166,6 +195,46 @@ fn insert_goal_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
     );
 }
 
+fn insert_multi_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
+    tools.insert(
+        "spawn_agent".to_string(),
+        Arc::new(crate::tool::multi_agent::SpawnAgentTool),
+    );
+    tools.insert(
+        "send_message".to_string(),
+        Arc::new(crate::tool::multi_agent::SendMessageTool),
+    );
+    tools.insert(
+        "followup_task".to_string(),
+        Arc::new(crate::tool::multi_agent::FollowupTaskTool),
+    );
+    tools.insert(
+        "wait_agent".to_string(),
+        Arc::new(crate::tool::multi_agent::WaitAgentTool),
+    );
+    tools.insert(
+        "interrupt_agent".to_string(),
+        Arc::new(crate::tool::multi_agent::InterruptAgentTool),
+    );
+    tools.insert(
+        "list_agents".to_string(),
+        Arc::new(crate::tool::multi_agent::ListAgentsTool),
+    );
+}
+
+fn remove_multi_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
+    for name in [
+        "spawn_agent",
+        "send_message",
+        "followup_task",
+        "wait_agent",
+        "interrupt_agent",
+        "list_agents",
+    ] {
+        tools.remove(name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -234,6 +303,12 @@ mod tests {
 
         assert!(!names.contains(&"docling_convert".to_string()));
         assert!(!names.contains(&"mcp_call".to_string()));
+        assert!(!names.contains(&"spawn_agent".to_string()));
+        assert!(!names.contains(&"send_message".to_string()));
+        assert!(!names.contains(&"followup_task".to_string()));
+        assert!(!names.contains(&"wait_agent".to_string()));
+        assert!(!names.contains(&"interrupt_agent".to_string()));
+        assert!(!names.contains(&"list_agents".to_string()));
     }
 
     #[test]
@@ -246,5 +321,38 @@ mod tests {
 
         assert!(names.contains(&"docling_convert".to_string()));
         assert!(names.contains(&"mcp_call".to_string()));
+    }
+
+    #[test]
+    fn core_agent_for_config_includes_multi_agent_tools_only_when_enabled() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.multi_agent.enabled = true;
+
+        let names = super::ToolRegistry::core_agent_for_config(&config).available_tool_names();
+
+        for name in [
+            "spawn_agent",
+            "send_message",
+            "followup_task",
+            "wait_agent",
+            "interrupt_agent",
+            "list_agents",
+        ] {
+            assert!(names.contains(&name.to_string()), "missing {name}");
+        }
+        let default_names = super::ToolRegistry::core_agent().available_tool_names();
+        for name in [
+            "spawn_agent",
+            "send_message",
+            "followup_task",
+            "wait_agent",
+            "interrupt_agent",
+            "list_agents",
+        ] {
+            assert!(
+                !default_names.contains(&name.to_string()),
+                "the no-config registry must keep {name} disabled"
+            );
+        }
     }
 }

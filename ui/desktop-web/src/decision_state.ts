@@ -1,7 +1,7 @@
 export interface PermissionDecisionOwner {
   permissionDecisionPending: boolean;
   permissionDecisionAllow: boolean | null;
-  permissionDecisionConfirmationId: number | null;
+  permissionDecisionConfirmationId: string | null;
   permissionDecisionError: string;
 }
 
@@ -12,7 +12,7 @@ export interface LocalDecisionOwner {
 
 export function beginPermissionDecision(
   owner: PermissionDecisionOwner,
-  confirmationId: number | null,
+  confirmationId: string | null,
   allow: boolean,
 ): boolean {
   if (confirmationId === null || owner.permissionDecisionPending) return false;
@@ -38,9 +38,9 @@ export function failPermissionDecision(owner: PermissionDecisionOwner, message: 
 }
 
 export function permissionDecisionResponseAccepted(
-  expectedConfirmationId: number,
+  expectedConfirmationId: string,
   confirmationVisible: boolean,
-  currentConfirmationId: number | null,
+  currentConfirmationId: string | null,
 ): boolean {
   return !confirmationVisible || currentConfirmationId !== expectedConfirmationId;
 }

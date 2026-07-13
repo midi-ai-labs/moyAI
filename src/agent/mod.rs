@@ -12,7 +12,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::ConfirmationPrompt;
-use crate::config::{AccessMode, ResolvedConfig};
+use crate::config::{AccessMode, MultiAgentMode, ResolvedConfig};
 use crate::context::context_window::ContextWindowTokenStatus;
 use crate::context::world_state::WorldState;
 use crate::error::AgentError;
@@ -21,7 +21,8 @@ use crate::llm::{
     ModelToolCall, ToolSchema,
 };
 use crate::protocol::{
-    ContentPart, HistoryItem, HistoryItemPayload, TurnId, canonical_tool_call_arguments,
+    ContentPart, HistoryItem, HistoryItemPayload, ProtocolEventStore, TurnId,
+    canonical_tool_call_arguments,
 };
 use crate::runtime::{ActiveSteerInput, LiveConfigOverrides, RunEventSink};
 use crate::session::{
@@ -47,13 +48,38 @@ impl PromptBuilder {
         &self,
         world_state: &WorldState,
         skills_snapshot: &crate::skill::SkillsSnapshot,
+        config: &ResolvedConfig,
+        is_sub_agent: bool,
     ) -> String {
-        format!(
-            "{}\n\n{}\n\n{}",
-            include_str!("../../assets/prompts/system.md").trim(),
-            world_state.rendered,
-            crate::skill::render_available_skills_from_snapshot(skills_snapshot)
-        )
+        let mut sections = vec![
+            include_str!("../../assets/prompts/system.md")
+                .trim()
+                .to_string(),
+            world_state.rendered.clone(),
+            crate::skill::render_available_skills_from_snapshot(skills_snapshot),
+        ];
+        if config.multi_agent.enabled {
+            sections.push(
+                match config.multi_agent.mode {
+                    MultiAgentMode::ExplicitRequestOnly => {
+                        include_str!("../../assets/prompts/multi_agent_explicit.md")
+                    }
+                    MultiAgentMode::Proactive => {
+                        include_str!("../../assets/prompts/multi_agent_proactive.md")
+                    }
+                }
+                .trim()
+                .to_string(),
+            );
+            if is_sub_agent {
+                sections.push(
+                    include_str!("../../assets/prompts/sub_agent.md")
+                        .trim()
+                        .to_string(),
+                );
+            }
+        }
+        sections.join("\n\n")
     }
 }
 
@@ -86,6 +112,8 @@ pub struct AgentRunRequest {
     pub cancel: CancellationToken,
     pub live_config: Option<LiveConfigOverrides>,
     pub steer_rx: Option<UnboundedReceiver<ActiveSteerInput>>,
+    pub is_sub_agent: bool,
+    pub agent_context: Option<crate::app::AgentRunContext>,
 }
 
 impl AgentRunRequest {
@@ -104,6 +132,7 @@ pub struct AgentLoop {
     store: StoreBundle,
     prompt_builder: PromptBuilder,
     tool_services: ToolServices,
+    model_request_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl AgentLoop {
@@ -120,7 +149,15 @@ impl AgentLoop {
             store,
             prompt_builder,
             tool_services,
+            model_request_gate: None,
         }
+    }
+
+    pub fn with_model_request_concurrency(mut self, max_concurrent_requests: usize) -> Self {
+        self.model_request_gate = Some(Arc::new(tokio::sync::Semaphore::new(
+            max_concurrent_requests.max(1),
+        )));
+        self
     }
 
     pub async fn run(
@@ -154,13 +191,26 @@ impl AgentLoop {
         sink.emit_pre_recorded(started)?;
 
         let started_at = Instant::now();
-        let tool_schemas = self.tool_schemas();
+        let registry = self.registry.with_config_overlays(&request.config);
+        let tool_schemas = Self::tool_schemas(&registry);
         let mut seen_steer_ids = request
             .runtime_input
             .history_items
             .iter()
             .filter_map(|item| {
                 matches!(item.payload, HistoryItemPayload::SteerTurn { .. }).then_some(item.id)
+            })
+            .collect::<HashSet<_>>();
+        let mut seen_agent_message_ids = request
+            .runtime_input
+            .history_items
+            .iter()
+            .filter_map(|item| {
+                matches!(
+                    item.payload,
+                    HistoryItemPayload::InterAgentCommunication { .. }
+                )
+                .then_some(item.id)
             })
             .collect::<HashSet<_>>();
         let mut messages = messages_from_history(&request.runtime_input.history_items);
@@ -204,6 +254,16 @@ impl AgentLoop {
                     &mut seen_steer_ids,
                 )
                 .await?;
+                drain_pending_agent_communications(
+                    &self.store,
+                    &request,
+                    &mut messages,
+                    &mut seen_agent_message_ids,
+                )?;
+
+                if let Some(agent) = request.agent_context.as_ref() {
+                    agent.set_activity(format!("Preparing model request {}", model_request_count + 1));
+                }
 
                 let goal_for_request = self.goal_for_request(request.session.session.id).await?;
                 if let Some(goal_for_request) = &goal_for_request {
@@ -233,6 +293,29 @@ impl AgentLoop {
                 model_request_count += 1;
                 let mut collector = StreamingResponseCollector::new(assistant.id, sink);
                 let stream_response = {
+                    let request_gate = request
+                        .agent_context
+                        .as_ref()
+                        .map(crate::app::AgentRunContext::model_request_gate)
+                        .or_else(|| self.model_request_gate.clone());
+                    let _model_request_permit = match request_gate {
+                        Some(gate) => {
+                            let acquire = gate.acquire_owned();
+                            tokio::pin!(acquire);
+                            tokio::select! {
+                                permit = &mut acquire => Some(permit.map_err(|_| {
+                                    AgentError::Message(
+                                        "model request concurrency gate closed".to_string(),
+                                    )
+                                })?),
+                                _ = request.cancel.cancelled() => None,
+                            }
+                        }
+                        None => None,
+                    };
+                    if request.cancel.is_cancelled() {
+                        None
+                    } else {
                     let stream = self.llm.stream_chat(
                         prepared_request.chat_request,
                         request.cancel.clone(),
@@ -250,6 +333,7 @@ impl AgentLoop {
                                 ensure_admission_active(&self.store, &request).await?;
                             }
                         }
+                    }
                     }
                 };
                 let Some(response) = stream_response else {
@@ -357,6 +441,15 @@ impl AgentLoop {
                     {
                         continue;
                     }
+                    if drain_pending_agent_communications(
+                        &self.store,
+                        &request,
+                        &mut messages,
+                        &mut seen_agent_message_ids,
+                    )? > 0
+                    {
+                        continue;
+                    }
                     let event = RunEvent::SessionCompleted {
                         session_id: request.session.session.id,
                         finish_reason: Some(response.finish_reason),
@@ -453,6 +546,9 @@ impl AgentLoop {
                             .await;
                     }
                     ensure_admission_active(&self.store, &request).await?;
+                    if let Some(agent) = request.agent_context.as_ref() {
+                        agent.set_activity(format!("Running {}", call.tool_name));
+                    }
                     guard.record_tool_call(&call)?;
                     tool_call_count += 1;
                     *tool_calls_by_name
@@ -460,6 +556,7 @@ impl AgentLoop {
                         .or_default() += 1;
                     let tool_output = self
                         .handle_tool_call(
+                            &registry,
                             &request,
                             assistant.id,
                             &tool_schemas,
@@ -559,7 +656,12 @@ impl AgentLoop {
         let chat_request = ChatRequest {
             model: request.model.clone(),
             base_url: request.config.model.base_url.clone(),
-            system_prompt: self.prompt_builder.build(&world_state, &skills_snapshot),
+            system_prompt: self.prompt_builder.build(
+                &world_state,
+                &skills_snapshot,
+                &request.config,
+                request.is_sub_agent,
+            ),
             messages: messages.to_vec(),
             tools: tools.to_vec(),
             tool_choice: None,
@@ -608,6 +710,7 @@ impl AgentLoop {
 
     async fn handle_tool_call(
         &self,
+        registry: &ToolRegistry,
         request: &AgentRunRequest,
         assistant_message_id: MessageId,
         schemas: &[ToolSchema],
@@ -678,18 +781,29 @@ impl AgentLoop {
             ),
             prompt,
             services: &self.tool_services,
+            agent: request.agent_context.as_ref(),
         };
         let execution_result = {
-            let execution = self.registry.execute(&call.tool_name, arguments, ctx);
+            // Multi-agent mutations cross the in-memory tree and durable session/protocol
+            // stores. Once their fenced operation has started, let that short local operation
+            // reach a consistent commit or rollback even if this turn is cancelled meanwhile.
+            // The ownership check below still prevents recording a result for a stale run.
+            let settle_multi_agent_mutation = matches!(
+                call.tool_name.as_str(),
+                "spawn_agent" | "send_message" | "followup_task" | "interrupt_agent"
+            );
+            let execution = registry.execute(&call.tool_name, arguments, ctx);
             tokio::pin!(execution);
             loop {
                 tokio::select! {
                     result = &mut execution => break result,
                     _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                        if request.cancel.is_cancelled() {
+                        if request.cancel.is_cancelled() && !settle_multi_agent_mutation {
                             return Err(AgentError::Message("tool execution cancelled".to_string()));
                         }
-                        ensure_admission_active(&self.store, request).await?;
+                        if !settle_multi_agent_mutation {
+                            ensure_admission_active(&self.store, request).await?;
+                        }
                     }
                 }
             }
@@ -888,8 +1002,8 @@ impl AgentLoop {
         Ok(())
     }
 
-    fn tool_schemas(&self) -> Vec<ToolSchema> {
-        self.registry
+    fn tool_schemas(registry: &ToolRegistry) -> Vec<ToolSchema> {
+        registry
             .specs()
             .into_iter()
             .map(|spec| ToolSchema {
@@ -1038,6 +1152,40 @@ async fn drain_pending_steers(
     Ok(drained)
 }
 
+fn drain_pending_agent_communications(
+    store: &StoreBundle,
+    request: &AgentRunRequest,
+    messages: &mut Vec<ModelMessage>,
+    seen_message_ids: &mut HashSet<crate::protocol::HistoryItemId>,
+) -> Result<usize, AgentError> {
+    let Some(agent) = request.agent_context.as_ref() else {
+        return Ok(0);
+    };
+    let _ = agent.drain_mailbox();
+    let history_items = store
+        .protocol_event_store()
+        .list_history_items_for_session(request.session.session.id)?;
+    let mut drained = 0;
+    for item in history_items {
+        let HistoryItemPayload::InterAgentCommunication { communication } = item.payload else {
+            continue;
+        };
+        if !seen_message_ids.insert(item.id) {
+            continue;
+        }
+        messages.push(ModelMessage::Assistant {
+            content: serde_json::to_string(&communication).unwrap_or_else(|_| {
+                format!(
+                    "Message from {} to {}: {}",
+                    communication.author, communication.recipient, communication.content
+                )
+            }),
+        });
+        drained += 1;
+    }
+    Ok(drained)
+}
+
 struct ToolOutputForModel {
     result_text: String,
     failed: bool,
@@ -1172,6 +1320,15 @@ impl LoopGuard {
     }
 
     fn record_tool_call(&mut self, call: &ModelToolCall) -> Result<(), AgentError> {
+        // Waiting for Sub Agent progress is intentionally repeatable: a root agent may
+        // need several identical waits before a long-running child changes state.
+        // The overall step budget still bounds this loop.
+        if call.tool_name == "wait_agent" {
+            self.last_tool_signature = None;
+            self.consecutive_repeat_count = 0;
+            return Ok(());
+        }
+
         let signature = format!("{}:{}", call.tool_name, call.arguments_json);
         if self.last_tool_signature.as_deref() == Some(signature.as_str()) {
             self.consecutive_repeat_count += 1;
@@ -1461,6 +1618,18 @@ fn messages_from_history(history_items: &[HistoryItem]) -> Vec<ModelMessage> {
                     },
                 )),
             },
+            HistoryItemPayload::InterAgentCommunication { communication } => projected.push((
+                index,
+                1,
+                ModelMessage::Assistant {
+                    content: serde_json::to_string(communication).unwrap_or_else(|_| {
+                        format!(
+                            "Message from {} to {}: {}",
+                            communication.author, communication.recipient, communication.content
+                        )
+                    }),
+                },
+            )),
             HistoryItemPayload::ToolCall {
                 call_id,
                 tool,
@@ -2652,6 +2821,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repeat_guard_allows_repeated_wait_agent_calls() {
+        let mut guard = LoopGuard::new(128);
+        let wait = ModelToolCall {
+            call_id: "wait_1".to_string(),
+            tool_name: "wait_agent".to_string(),
+            arguments_json: r#"{"timeout_ms":30000}"#.to_string(),
+        };
+
+        for _ in 0..4 {
+            guard
+                .record_tool_call(&wait)
+                .expect("repeated waits are valid while a child remains active");
+        }
+    }
+
     struct ScriptedRun {
         summary: Result<RunSummary, AgentError>,
         store: StoreBundle,
@@ -2808,6 +2993,8 @@ mod tests {
                     cancel: CancellationToken::new(),
                     live_config,
                     steer_rx,
+                    is_sub_agent: false,
+                    agent_context: None,
                 },
                 &mut prompt,
                 &mut sink,

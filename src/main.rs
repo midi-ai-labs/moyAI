@@ -14,7 +14,7 @@ use moyai::app::{
 use moyai::cli::parse::parse as parse_cli;
 use moyai::cli::{
     CliCommand, EventRenderer, HumanRenderer, JsonRenderer, ModelAvailabilityArgs, OutputMode,
-    RunArgs, StdConfirmationPrompt,
+    RunArgs, SharedConfirmationPrompt, StdConfirmationPrompt,
 };
 use moyai::config::{ConfigLoader, ProviderMetadataMode, ShellFamily};
 #[cfg(feature = "tauri-desktop")]
@@ -103,6 +103,11 @@ fn run_desktop_command(command: CliCommand) -> Result<(), (u8, String)> {
 
 #[cfg(feature = "tauri-desktop")]
 fn run_desktop_on_current_thread(args: moyai::cli::parse::DesktopArgs) -> Result<(), (u8, String)> {
+    let Some(_desktop_instance) =
+        desktop::DesktopInstanceGuard::acquire_or_notify().map_err(|error| (4, error))?
+    else {
+        return Ok(());
+    };
     let command = CliCommand::Desktop(args.clone());
     let global_config_existed_at_launch = moyai::config::loader::global_config_path()
         .map(|path| path.exists())
@@ -156,13 +161,12 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
     if let CliCommand::ModelAvailability(args) = command.clone() {
         return run_model_availability_command(args).await;
     }
-    let desktop_global_config_existed_at_launch = if matches!(command, CliCommand::Desktop(_)) {
-        moyai::config::loader::global_config_path()
-            .map(|path| path.exists())
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    if matches!(command, CliCommand::Desktop(_)) {
+        return Err((
+            4,
+            "desktop commands must use the guarded desktop launcher".to_string(),
+        ));
+    }
     let app = AppBootstrap::build(&command)
         .await
         .map_err(|error| (3, error.to_string()))?;
@@ -172,41 +176,26 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
             .map_err(|error| (4, error.to_string()))?;
         return Ok(());
     }
-    if let CliCommand::Desktop(args) = command.clone() {
-        #[cfg(feature = "tauri-desktop")]
-        {
-            desktop::run(
-                app,
-                desktop::DesktopArgs {
-                    directory: args.directory.clone(),
-                    session_id: args.session_id,
-                    continue_last: args.continue_last,
-                    global_config_existed_at_launch: desktop_global_config_existed_at_launch,
-                },
-            )
-            .await
-            .map_err(|error| (4, error.to_string()))?;
-            return Ok(());
-        }
-        #[cfg(not(feature = "tauri-desktop"))]
-        {
-            let _ = (app, args);
-            return Err((
-                2,
-                "desktop command requires the tauri-desktop feature".to_string(),
-            ));
-        }
+    let wait_for_agent_tree = matches!(&command, CliCommand::Run(_));
+    let mut app_command = to_app_command(&command, &app);
+    let mut prompt = SharedConfirmationPrompt::new(StdConfirmationPrompt);
+    if let AppCommand::Run(request) = &mut app_command {
+        request.agent_confirmation = Some(prompt.clone());
     }
-    let app_command = to_app_command(&command, &app);
     install_cli_interrupt_handler(&app_command);
     let output_mode = command_output_mode(&command);
     let mut renderer = build_renderer(output_mode);
-    let mut prompt = StdConfirmationPrompt;
     let summary = app
         .run_service
         .execute(app_command, renderer.as_mut(), &mut prompt)
         .await
         .map_err(|error| (4, error.to_string()))?;
+    if wait_for_agent_tree {
+        app.run_service
+            .wait_for_agent_tree_quiescence(summary.session_id)
+            .await
+            .map_err(|error| (4, error.to_string()))?;
+    }
     if summary.status == SessionStatus::Cancelled {
         return Err((130, "run cancelled by user".to_string()));
     }
@@ -304,6 +293,8 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             image_paths: args.image_paths.clone(),
             cancel: build_cancel_token(),
             live_config: None,
+            agent_confirmation: None,
+            agent_context: None,
         }),
         CliCommand::SessionList(args) => AppCommand::SessionList(SessionListRequest {
             project_id: app.workspace.project_id,

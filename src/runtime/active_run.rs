@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
+    watch,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::RuntimeError;
@@ -23,6 +26,7 @@ struct ActiveRunEntry {
     generation: u64,
     cancel: CancellationToken,
     steer_tx: UnboundedSender<ActiveSteerInput>,
+    steer_activity_tx: watch::Sender<u64>,
     turn_id: Option<TurnId>,
 }
 
@@ -54,12 +58,14 @@ impl ActiveRunRegistry {
         state.next_generation = state.next_generation.wrapping_add(1);
         let generation = state.next_generation;
         let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let (steer_activity_tx, _) = watch::channel(0);
         state.runs.insert(
             session_id,
             ActiveRunEntry {
                 generation,
                 cancel,
                 steer_tx,
+                steer_activity_tx,
                 turn_id: None,
             },
         );
@@ -133,7 +139,46 @@ impl ActiveRunRegistry {
                 RuntimeError::Message(format!(
                     "active run for session {session_id} stopped before steer input was delivered"
                 ))
-            })
+            })?;
+        run.steer_activity_tx
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        Ok(())
+    }
+
+    pub fn steer_generation(&self, session_id: SessionId) -> Result<u64, RuntimeError> {
+        let state = self.lock()?;
+        let run = state.runs.get(&session_id).ok_or_else(|| {
+            RuntimeError::Message(format!(
+                "session {session_id} has no active run to observe steer input"
+            ))
+        })?;
+        Ok(*run.steer_activity_tx.borrow())
+    }
+
+    pub async fn wait_for_steer_activity(
+        &self,
+        session_id: SessionId,
+        observed_generation: u64,
+    ) -> Result<u64, RuntimeError> {
+        let mut activity = {
+            let state = self.lock()?;
+            let run = state.runs.get(&session_id).ok_or_else(|| {
+                RuntimeError::Message(format!(
+                    "session {session_id} has no active run to observe steer input"
+                ))
+            })?;
+            run.steer_activity_tx.subscribe()
+        };
+        let current = *activity.borrow_and_update();
+        if current != observed_generation {
+            return Ok(current);
+        }
+        activity.changed().await.map_err(|_| {
+            RuntimeError::Message(format!(
+                "active run for session {session_id} stopped while waiting for steer input"
+            ))
+        })?;
+        Ok(*activity.borrow_and_update())
     }
 
     fn set_turn_id(
@@ -261,5 +306,48 @@ mod tests {
         );
         assert!(registry.cancel(session_id));
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn steer_activity_wakes_observers_without_consuming_the_input() {
+        let registry = ActiveRunRegistry::default();
+        let session_id = SessionId::new();
+        let mut lease = registry
+            .try_start(session_id, CancellationToken::new())
+            .expect("register run");
+        let turn_id = TurnId::new();
+        lease.set_turn_id(turn_id).expect("set turn");
+        let mut receiver = lease.take_steer_receiver().expect("receiver");
+        let observed = registry.steer_generation(session_id).expect("generation");
+        let history_item_id = HistoryItemId::new();
+
+        registry
+            .enqueue_steer(
+                session_id,
+                turn_id,
+                history_item_id,
+                SteerTurn {
+                    expected_turn_id: turn_id,
+                    items: Vec::new(),
+                    additional_context: Default::default(),
+                    client_user_message_id: None,
+                },
+            )
+            .expect("enqueue steer");
+
+        assert_ne!(
+            registry
+                .wait_for_steer_activity(session_id, observed)
+                .await
+                .expect("activity"),
+            observed
+        );
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("steer remains queued")
+                .history_item_id,
+            history_item_id
+        );
     }
 }

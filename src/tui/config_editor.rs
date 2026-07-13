@@ -1,15 +1,15 @@
 use std::fs;
 use std::io::Write;
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use tempfile::NamedTempFile;
 
-use crate::config::loader::global_config_path;
+use crate::config::loader::{acquire_global_config_write_lease, global_config_path};
 use crate::config::model::{
-    AccessMode, McpServerConfig, PartialDoclingConfig, PartialFileGuardConfig,
-    PartialInspectionConfig, PartialMcpConfig, PartialModelConfig, PartialPermissionsConfig,
-    PartialResolvedConfig, PartialSessionConfig, PartialShellConfig, PromptProfile,
-    ProviderMetadataMode, ResolvedConfig,
+    AccessMode, McpServerConfig, MultiAgentMode, PartialDoclingConfig, PartialFileGuardConfig,
+    PartialInspectionConfig, PartialMcpConfig, PartialModelConfig, PartialMultiAgentConfig,
+    PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig, PartialShellConfig,
+    PromptProfile, ProviderMetadataMode, ResolvedConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,10 @@ pub enum ConfigField {
     PromptProfile,
     ProviderMetadataMode,
     AccessMode,
+    MultiAgentEnabled,
+    MultiAgentMode,
+    MultiAgentMaxAgents,
+    MultiAgentMaxModelRequests,
     Temperature,
     TopP,
     TopK,
@@ -66,12 +70,16 @@ pub enum ConfigField {
 }
 
 impl ConfigField {
-    pub const ALL: [ConfigField; 43] = [
+    pub const ALL: [ConfigField; 47] = [
         ConfigField::BaseUrl,
         ConfigField::Model,
         ConfigField::PromptProfile,
         ConfigField::ProviderMetadataMode,
         ConfigField::AccessMode,
+        ConfigField::MultiAgentEnabled,
+        ConfigField::MultiAgentMode,
+        ConfigField::MultiAgentMaxAgents,
+        ConfigField::MultiAgentMaxModelRequests,
         ConfigField::Temperature,
         ConfigField::TopP,
         ConfigField::TopK,
@@ -119,6 +127,10 @@ impl ConfigField {
             ConfigField::PromptProfile => "model.prompt_profile",
             ConfigField::ProviderMetadataMode => "model.provider_metadata_mode",
             ConfigField::AccessMode => "permissions.access_mode",
+            ConfigField::MultiAgentEnabled => "multi_agent.enabled",
+            ConfigField::MultiAgentMode => "multi_agent.mode",
+            ConfigField::MultiAgentMaxAgents => "multi_agent.max_concurrent_agents",
+            ConfigField::MultiAgentMaxModelRequests => "multi_agent.max_concurrent_model_requests",
             ConfigField::Temperature => "model.temperature",
             ConfigField::TopP => "model.top_p",
             ConfigField::TopK => "model.top_k",
@@ -171,6 +183,10 @@ impl ConfigField {
             ConfigField::PromptProfile => Some("MOYAI_PROMPT_PROFILE"),
             ConfigField::ProviderMetadataMode => Some("MOYAI_PROVIDER_METADATA_MODE"),
             ConfigField::AccessMode => Some("MOYAI_ACCESS_MODE"),
+            ConfigField::MultiAgentEnabled => Some("MOYAI_MULTI_AGENT_ENABLED"),
+            ConfigField::MultiAgentMode => Some("MOYAI_MULTI_AGENT_MODE"),
+            ConfigField::MultiAgentMaxAgents => Some("MOYAI_MULTI_AGENT_MAX_AGENTS"),
+            ConfigField::MultiAgentMaxModelRequests => Some("MOYAI_MULTI_AGENT_MAX_MODEL_REQUESTS"),
             ConfigField::Temperature => Some("MOYAI_TEMPERATURE"),
             ConfigField::TopP => Some("MOYAI_TOP_P"),
             ConfigField::TopK => Some("MOYAI_TOP_K"),
@@ -307,6 +323,83 @@ impl ConfigEditorState {
             }
         }
     }
+
+    pub fn remember_global_access_mode(access_mode: AccessMode) -> Result<Utf8PathBuf, String> {
+        let path = global_config_path().map_err(|error| error.to_string())?;
+        save_access_mode(&path, access_mode)?;
+        Ok(path)
+    }
+
+    pub fn compare_and_set_global_access_mode(
+        expected: AccessMode,
+        access_mode: AccessMode,
+    ) -> Result<Option<Utf8PathBuf>, String> {
+        let path = global_config_path().map_err(|error| error.to_string())?;
+        compare_and_set_access_mode(&path, expected, access_mode)
+            .map(|updated| updated.then_some(path))
+    }
+}
+
+fn save_access_mode(path: &Utf8Path, access_mode: AccessMode) -> Result<(), String> {
+    write_access_mode(path, None, access_mode).map(|_| ())
+}
+
+fn compare_and_set_access_mode(
+    path: &Utf8Path,
+    expected: AccessMode,
+    access_mode: AccessMode,
+) -> Result<bool, String> {
+    write_access_mode(path, Some(expected), access_mode)
+}
+
+fn write_access_mode(
+    path: &Utf8Path,
+    expected: Option<AccessMode>,
+    access_mode: AccessMode,
+) -> Result<bool, String> {
+    let _write_lease =
+        acquire_global_config_write_lease(path).map_err(|error| error.to_string())?;
+    let mut existing = read_toml_document(path)?;
+    let current = access_mode_from_document(&existing)?;
+    if expected.is_some_and(|expected| current != expected) {
+        return Ok(false);
+    }
+    let root = existing
+        .as_table_mut()
+        .ok_or_else(|| "global config root must be a TOML table".to_string())?;
+    let permissions = root
+        .entry("permissions".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "global config section `permissions` must be a TOML table".to_string())?;
+    permissions.insert(
+        "access_mode".to_string(),
+        toml::Value::String(access_mode.as_str().to_string()),
+    );
+    let text = toml::to_string_pretty(&existing).map_err(|error| error.to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    persist_config_tempfile(path, &text)?;
+    Ok(true)
+}
+
+fn access_mode_from_document(document: &toml::Value) -> Result<AccessMode, String> {
+    let Some(value) = document
+        .get("permissions")
+        .and_then(|permissions| permissions.get("access_mode"))
+    else {
+        return Ok(ResolvedConfig::default().permissions.access_mode);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| "permissions.access_mode must be a string".to_string())?;
+    match value {
+        "default" | "standard" => Ok(AccessMode::Default),
+        "auto_review" | "auto-review" => Ok(AccessMode::AutoReview),
+        "full_access" | "full-access" => Ok(AccessMode::FullAccess),
+        _ => Err(format!("unknown permissions.access_mode `{value}`")),
+    }
 }
 
 fn save_config_sections(path: &Utf8Path, editor: &ConfigEditorState) -> Result<(), String> {
@@ -320,6 +413,8 @@ fn save_config_sections(path: &Utf8Path, editor: &ConfigEditorState) -> Result<(
         return Ok(());
     }
 
+    let _write_lease =
+        acquire_global_config_write_lease(path).map_err(|error| error.to_string())?;
     let mut existing = read_toml_document(path)?;
     let patch = parse_editor_patch_matching(editor, true)?;
     let patch = toml::Value::try_from(patch).map_err(|error| error.to_string())?;
@@ -403,6 +498,7 @@ fn parse_editor_patch_matching(
     let mut patch = PartialResolvedConfig::default();
     let mut model = PartialModelConfig::default();
     let mut permissions = PartialPermissionsConfig::default();
+    let mut multi_agent = PartialMultiAgentConfig::default();
     let mut session = PartialSessionConfig::default();
     let mut shell = PartialShellConfig::default();
     let mut inspection = PartialInspectionConfig::default();
@@ -435,6 +531,19 @@ fn parse_editor_patch_matching(
                     Some(value) => Some(parse_access_mode(&value)?),
                     None => None,
                 }
+            }
+            ConfigField::MultiAgentEnabled => multi_agent.enabled = parse_bool(text)?,
+            ConfigField::MultiAgentMode => {
+                multi_agent.mode = match parse_string(text) {
+                    Some(value) => Some(parse_multi_agent_mode(&value)?),
+                    None => None,
+                }
+            }
+            ConfigField::MultiAgentMaxAgents => {
+                multi_agent.max_concurrent_agents = parse_number(text)?
+            }
+            ConfigField::MultiAgentMaxModelRequests => {
+                multi_agent.max_concurrent_model_requests = parse_number(text)?
             }
             ConfigField::Temperature => model.temperature = parse_number(text)?,
             ConfigField::TopP => model.top_p = parse_number(text)?,
@@ -529,6 +638,7 @@ fn parse_editor_patch_matching(
 
     patch.model = Some(model);
     patch.permissions = Some(permissions);
+    patch.multi_agent = Some(multi_agent);
     patch.session = Some(session);
     patch.shell = Some(shell);
     patch.inspection = Some(inspection);
@@ -570,6 +680,11 @@ fn parse_access_mode(value: &str) -> Result<AccessMode, String> {
         "full_access" | "full-access" | "full" => Ok(AccessMode::FullAccess),
         other => Err(format!("unsupported access_mode `{other}`")),
     }
+}
+
+fn parse_multi_agent_mode(value: &str) -> Result<MultiAgentMode, String> {
+    MultiAgentMode::parse(&value.to_ascii_lowercase())
+        .ok_or_else(|| format!("unsupported multi_agent.mode `{value}`"))
 }
 
 fn parse_string(value: &str) -> Option<String> {
@@ -634,6 +749,12 @@ fn field_value(key: ConfigField, config: &ResolvedConfig) -> String {
             AccessMode::AutoReview => "auto_review".to_string(),
             AccessMode::FullAccess => "full_access".to_string(),
         },
+        ConfigField::MultiAgentEnabled => config.multi_agent.enabled.to_string(),
+        ConfigField::MultiAgentMode => config.multi_agent.mode.as_str().to_string(),
+        ConfigField::MultiAgentMaxAgents => config.multi_agent.max_concurrent_agents.to_string(),
+        ConfigField::MultiAgentMaxModelRequests => {
+            config.multi_agent.max_concurrent_model_requests.to_string()
+        }
         ConfigField::Temperature => config
             .model
             .temperature
@@ -736,10 +857,17 @@ impl ValueExt for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
     use camino::Utf8PathBuf;
 
-    use super::{ConfigEditorState, ConfigField, parse_editor_patch, save_config_sections};
-    use crate::config::{ProviderMetadataMode, ResolvedConfig};
+    use super::{
+        ConfigEditorState, ConfigField, compare_and_set_access_mode, parse_editor_patch,
+        save_access_mode, save_config_sections,
+    };
+    use crate::config::{AccessMode, ProviderMetadataMode, ResolvedConfig};
 
     #[test]
     fn config_editor_projects_provider_metadata_mode_patch() {
@@ -868,6 +996,32 @@ mod tests {
     }
 
     #[test]
+    fn remembering_access_mode_updates_only_the_existing_permission_field() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        std::fs::write(
+            &path,
+            "[model]\nmodel = \"keep-model\"\n\n[permissions]\naccess_mode = \"default\"\n\n[future]\nflag = \"keep\"\n",
+        )
+        .expect("seed config");
+
+        for (mode, expected) in [
+            (AccessMode::AutoReview, "auto_review"),
+            (AccessMode::FullAccess, "full_access"),
+            (AccessMode::Default, "default"),
+        ] {
+            save_access_mode(&path, mode).expect("remember access mode");
+
+            let saved = std::fs::read_to_string(&path).expect("read saved config");
+            let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+            assert_eq!(saved["permissions"]["access_mode"].as_str(), Some(expected));
+            assert_eq!(saved["model"]["model"].as_str(), Some("keep-model"));
+            assert_eq!(saved["future"]["flag"].as_str(), Some("keep"));
+        }
+    }
+
+    #[test]
     fn clearing_dirty_optional_field_removes_only_that_override() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
@@ -892,5 +1046,179 @@ mod tests {
         let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
         assert!(saved["model"].get("temperature").is_none());
         assert_eq!(saved["model"]["model"].as_str(), Some("keep-model"));
+    }
+
+    #[test]
+    fn access_mode_compare_and_set_preserves_external_field_changes() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        std::fs::write(
+            &path,
+            "[permissions]\naccess_mode = \"default\"\n[model]\nmodel = \"keep-model\"\n",
+        )
+        .expect("seed config");
+
+        assert!(
+            compare_and_set_access_mode(&path, AccessMode::Default, AccessMode::FullAccess)
+                .expect("first CAS")
+        );
+        assert!(
+            !compare_and_set_access_mode(&path, AccessMode::Default, AccessMode::AutoReview)
+                .expect("stale CAS")
+        );
+
+        let saved = std::fs::read_to_string(&path).expect("read saved config");
+        let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+        assert_eq!(
+            saved["permissions"]["access_mode"].as_str(),
+            Some("full_access")
+        );
+        assert_eq!(saved["model"]["model"].as_str(), Some("keep-model"));
+    }
+
+    #[test]
+    fn concurrent_global_saves_preserve_each_writers_dirty_field() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        std::fs::write(&path, "[future]\nflag = \"keep\"\n").expect("seed config");
+        let barrier = Arc::new(Barrier::new(3));
+
+        let access_path = path.clone();
+        let access_barrier = Arc::clone(&barrier);
+        let access_writer = std::thread::spawn(move || {
+            let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+            let field = editor
+                .fields
+                .iter_mut()
+                .find(|field| field.key == ConfigField::AccessMode)
+                .expect("access mode field");
+            field.value = "full_access".to_string();
+            field.dirty = true;
+            access_barrier.wait();
+            save_config_sections(&access_path, &editor)
+        });
+
+        let model_path = path.clone();
+        let model_barrier = Arc::clone(&barrier);
+        let model_writer = std::thread::spawn(move || {
+            let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+            let field = editor
+                .fields
+                .iter_mut()
+                .find(|field| field.key == ConfigField::Model)
+                .expect("model field");
+            field.value = "concurrent-model".to_string();
+            field.dirty = true;
+            model_barrier.wait();
+            save_config_sections(&model_path, &editor)
+        });
+
+        barrier.wait();
+        access_writer
+            .join()
+            .expect("access writer")
+            .expect("access save");
+        model_writer
+            .join()
+            .expect("model writer")
+            .expect("model save");
+
+        let saved = std::fs::read_to_string(&path).expect("read saved config");
+        let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+        assert_eq!(
+            saved["permissions"]["access_mode"].as_str(),
+            Some("full_access")
+        );
+        assert_eq!(saved["model"]["model"].as_str(), Some("concurrent-model"));
+        assert_eq!(saved["future"]["flag"].as_str(), Some("keep"));
+    }
+
+    #[test]
+    fn cross_process_global_saves_preserve_each_writers_dirty_field() {
+        const CHILD_ROLE_ENV: &str = "MOYAI_CONFIG_LEASE_TEST_ROLE";
+        const CONFIG_PATH_ENV: &str = "MOYAI_CONFIG_LEASE_TEST_PATH";
+        const START_PATH_ENV: &str = "MOYAI_CONFIG_LEASE_TEST_START";
+        const TEST_NAME: &str = "tui::config_editor::tests::cross_process_global_saves_preserve_each_writers_dirty_field";
+
+        if let Ok(role) = std::env::var(CHILD_ROLE_ENV) {
+            let path = Utf8PathBuf::from(
+                std::env::var(CONFIG_PATH_ENV).expect("child config path environment"),
+            );
+            let start_path = Utf8PathBuf::from(
+                std::env::var(START_PATH_ENV).expect("child start path environment"),
+            );
+            let ready_path = start_path.with_file_name(format!("ready-{role}"));
+            std::fs::write(&ready_path, "ready").expect("child ready marker");
+            wait_for_test_file(&start_path, Duration::from_secs(5));
+            let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+            let (key, value) = match role.as_str() {
+                "access" => (ConfigField::AccessMode, "full_access"),
+                "model" => (ConfigField::Model, "cross-process-model"),
+                other => panic!("unknown child role {other}"),
+            };
+            let field = editor
+                .fields
+                .iter_mut()
+                .find(|field| field.key == key)
+                .expect("child config field");
+            field.value = value.to_string();
+            field.dirty = true;
+            for _ in 0..8 {
+                save_config_sections(&path, &editor).expect("child config save");
+            }
+            return;
+        }
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 config path");
+        let start_path =
+            Utf8PathBuf::from_path_buf(temp_dir.path().join("start")).expect("utf8 start path");
+        std::fs::write(&path, "[future]\nflag = \"keep\"\n").expect("seed config");
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut children = ["access", "model"].map(|role| {
+            Command::new(&executable)
+                .arg("--exact")
+                .arg(TEST_NAME)
+                .arg("--nocapture")
+                .env(CHILD_ROLE_ENV, role)
+                .env(CONFIG_PATH_ENV, path.as_str())
+                .env(START_PATH_ENV, start_path.as_str())
+                .spawn()
+                .expect("spawn config writer child")
+        });
+        for role in ["access", "model"] {
+            wait_for_test_file(
+                &start_path.with_file_name(format!("ready-{role}")),
+                Duration::from_secs(5),
+            );
+        }
+        std::fs::write(&start_path, "start").expect("release config writers");
+        for child in &mut children {
+            let status = child.wait().expect("config writer child status");
+            assert!(status.success(), "config writer child failed: {status}");
+        }
+
+        let saved = std::fs::read_to_string(&path).expect("read saved config");
+        let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+        assert_eq!(
+            saved["permissions"]["access_mode"].as_str(),
+            Some("full_access")
+        );
+        assert_eq!(
+            saved["model"]["model"].as_str(),
+            Some("cross-process-model")
+        );
+        assert_eq!(saved["future"]["flag"].as_str(), Some("keep"));
+    }
+
+    fn wait_for_test_file(path: &camino::Utf8Path, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "timed out waiting for {path}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

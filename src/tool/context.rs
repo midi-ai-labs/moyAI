@@ -37,6 +37,7 @@ pub struct ToolContext<'a> {
     pub run_mutation_fence: RunMutationFence,
     pub prompt: &'a mut dyn ConfirmationPrompt,
     pub services: &'a ToolServices,
+    pub agent: Option<&'a crate::app::AgentRunContext>,
 }
 
 #[derive(Clone)]
@@ -141,15 +142,27 @@ impl<'a> ToolContext<'a> {
             targets,
             outside_workspace,
             risks,
+            agent_path: self
+                .agent
+                .filter(|agent| agent.is_sub_agent())
+                .map(|agent| agent.path().to_string()),
+            agent_task_name: self
+                .agent
+                .filter(|agent| agent.is_sub_agent())
+                .map(|agent| agent.task_name().to_string()),
         };
 
         if access_mode_allows_permission(self.current_access_mode(), &request) {
             return Ok(());
         }
 
-        if self.prompt.confirm(&request).map_err(|error| {
-            ToolError::Message(format!("failed to prompt for permission: {error}"))
-        })? {
+        if self
+            .prompt
+            .confirm_with_cancel(&request, &self.cancel)
+            .map_err(|error| {
+                ToolError::Message(format!("failed to prompt for permission: {error}"))
+            })?
+        {
             Ok(())
         } else {
             Err(ToolError::Message("permission denied by user".to_string()))
@@ -197,30 +210,23 @@ fn full_access_allows(request: &crate::tool::PermissionRequest) -> bool {
 }
 
 fn default_allows(request: &crate::tool::PermissionRequest) -> bool {
-    !request.outside_workspace && request.risks.is_empty()
+    if request.outside_workspace || !request.risks.is_empty() {
+        return false;
+    }
+    matches!(
+        request.access,
+        AccessKind::List | AccessKind::Search | AccessKind::Read
+    )
 }
 
 fn auto_review_allows(request: &crate::tool::PermissionRequest) -> bool {
-    if request.outside_workspace {
+    if request.outside_workspace || !request.risks.is_empty() {
         return false;
     }
     match request.access {
         AccessKind::List | AccessKind::Search | AccessKind::Read => true,
-        AccessKind::Edit => !request
-            .risks
-            .iter()
-            .any(PermissionRiskClass::requires_review),
+        AccessKind::Edit => true,
         AccessKind::Shell => false,
-    }
-}
-
-trait PermissionRiskClass {
-    fn requires_review(&self) -> bool;
-}
-
-impl PermissionRiskClass for crate::tool::PermissionRisk {
-    fn requires_review(&self) -> bool {
-        true
     }
 }
 
@@ -276,6 +282,8 @@ mod tests {
             targets: vec![Utf8PathBuf::from("C:/workspace")],
             outside_workspace: false,
             risks,
+            agent_path: None,
+            agent_task_name: None,
         }
     }
 
@@ -283,6 +291,10 @@ mod tests {
     fn access_mode_policy_allows_shell_when_switched_to_full_access() {
         let request = permission(AccessKind::Shell, Vec::new());
 
+        assert!(!access_mode_allows_permission(
+            AccessMode::Default,
+            &request
+        ));
         assert!(!access_mode_allows_permission(
             AccessMode::AutoReview,
             &request
@@ -304,6 +316,74 @@ mod tests {
             AccessMode::FullAccess,
             &request
         ));
+    }
+
+    #[test]
+    fn access_mode_policy_is_monotonic_for_risk_free_workspace_operations() {
+        let cases = [
+            (AccessKind::List, [true, true, true]),
+            (AccessKind::Search, [true, true, true]),
+            (AccessKind::Read, [true, true, true]),
+            (AccessKind::Edit, [false, true, true]),
+            (AccessKind::Shell, [false, false, true]),
+        ];
+        let modes = [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ];
+
+        for (access, expected) in cases {
+            let request = permission(access, Vec::new());
+            for (index, mode) in modes.into_iter().enumerate() {
+                assert_eq!(
+                    access_mode_allows_permission(mode, &request),
+                    expected[index],
+                    "unexpected {mode:?} decision for {access:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_access_mode_reviews_boundary_and_hard_risk_requests() {
+        let modes = [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ];
+        let hard_risks = [
+            crate::tool::PermissionRisk::Network,
+            crate::tool::PermissionRisk::ExternalConnection,
+            crate::tool::PermissionRisk::ProtectedWorkspaceAuthority,
+        ];
+
+        for mode in modes {
+            for risk in hard_risks {
+                let request = permission(AccessKind::Shell, vec![risk]);
+                assert!(!access_mode_allows_permission(mode, &request));
+            }
+            let mut outside = permission(AccessKind::Read, Vec::new());
+            outside.outside_workspace = true;
+            assert!(!access_mode_allows_permission(mode, &outside));
+        }
+    }
+
+    #[test]
+    fn destructive_and_move_risks_expand_only_at_full_access() {
+        let modes = [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ];
+        for risk in [
+            crate::tool::PermissionRisk::DestructiveDelete,
+            crate::tool::PermissionRisk::MoveOrRename,
+        ] {
+            let request = permission(AccessKind::Edit, vec![risk]);
+            let decisions = modes.map(|mode| access_mode_allows_permission(mode, &request));
+            assert_eq!(decisions, [false, false, true]);
+        }
     }
 
     #[tokio::test]

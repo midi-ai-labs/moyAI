@@ -110,14 +110,12 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
         })
         .invoke_handler(tauri::generate_handler![
             desktop_state,
-            set_prompt,
             submit_prompt,
             cancel_run,
             new_chat,
             new_project_session,
             review_uncommitted,
             enhance_prompt,
-            set_review_draft,
             send_prompt_review,
             cancel_prompt_review,
             refresh_desktop,
@@ -142,7 +140,6 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             select_artifact,
             export_history_markdown,
             export_transcript_markdown,
-            set_image_input,
             attach_image,
             browse_image,
             clear_images,
@@ -159,7 +156,6 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             show_command_palette,
             show_shortcuts,
             close_overlay,
-            set_workspace_input,
             switch_workspace,
             browse_workspace,
             open_workspace_folder,
@@ -169,12 +165,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             open_artifact_folder,
             set_local_search,
             insert_command,
-            set_provider_base_url,
-            set_provider_metadata_mode,
-            set_provider_context_window,
-            set_provider_max_output_tokens,
             load_provider_models,
-            select_provider_model,
             apply_provider_session,
             save_provider_global,
             apply_session_config,
@@ -314,6 +305,7 @@ where
     F: FnOnce(&mut DesktopController),
 {
     let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
     action(&mut controller);
     controller.drain_runtime_messages();
     controller.next_web_state()
@@ -335,6 +327,84 @@ where
     controller
         .next_web_state()
         .map_err(DesktopCommandError::internal)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopDraftActionTarget {
+    workspace_path: String,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopSessionSearchTarget {
+    workspace_path: String,
+    project_id: Option<String>,
+}
+
+fn validate_session_search_target(
+    expected: &DesktopSessionSearchTarget,
+    workspace_path: &str,
+    project_id: Option<String>,
+) -> Result<(), DesktopCommandConflict> {
+    if expected.workspace_path != workspace_path || expected.project_id != project_id {
+        return Err(DesktopCommandConflict::new(
+            "the session search owner changed before the query was applied; review the current project and try again",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_session_search_target(
+    controller: &DesktopController,
+    expected: &DesktopSessionSearchTarget,
+) -> Result<(), DesktopCommandConflict> {
+    validate_session_search_target(
+        expected,
+        controller.app.workspace.root.as_str(),
+        controller
+            .state
+            .selected_project_id()
+            .map(|project_id| project_id.to_string()),
+    )
+}
+
+fn ensure_draft_action_target(
+    controller: &DesktopController,
+    expected: &DesktopDraftActionTarget,
+) -> Result<(), DesktopCommandConflict> {
+    let session_id = controller
+        .state
+        .app_state
+        .current_session_id
+        .map(|session_id| session_id.to_string());
+    validate_draft_action_target(expected, controller.app.workspace.root.as_str(), session_id)
+}
+
+fn validate_draft_action_target(
+    expected: &DesktopDraftActionTarget,
+    workspace_path: &str,
+    session_id: Option<String>,
+) -> Result<(), DesktopCommandConflict> {
+    if expected.workspace_path != workspace_path || expected.session_id != session_id {
+        return Err(DesktopCommandConflict::new(
+            "the request draft owner changed before the action was applied; review the current chat and try again",
+        ));
+    }
+    Ok(())
+}
+
+fn rejected_action(controller: &DesktopController, fallback: &str) -> DesktopCommandConflict {
+    DesktopCommandConflict::new(
+        controller
+            .state
+            .app_state
+            .status_message
+            .as_deref()
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or(fallback),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -398,7 +468,6 @@ enum DesktopRowCollection {
     Artifact,
     Attachment,
     Command,
-    ProviderModel,
 }
 
 fn ensure_indexed_row_mutation_target(
@@ -444,14 +513,47 @@ fn ensure_indexed_row_mutation_target(
             .command_rows
             .get(index)
             .map(|row| row.path.clone()),
-        DesktopRowCollection::ProviderModel => controller
-            .state
-            .provider_config
-            .provider_models
-            .get(index)
-            .cloned(),
     };
     ensure_row_mutation_target(controller, expected, actual)
+}
+
+fn validated_session_id(
+    controller: &DesktopController,
+    index: usize,
+) -> Result<crate::session::SessionId, DesktopCommandConflict> {
+    controller
+        .state
+        .snapshot
+        .session_rows
+        .get(index)
+        .map(|row| row.session_id)
+        .ok_or_else(|| DesktopCommandConflict::new("the session row is no longer available"))
+}
+
+fn validated_quick_chat_session_id(
+    controller: &DesktopController,
+    index: usize,
+) -> Result<crate::session::SessionId, DesktopCommandConflict> {
+    controller
+        .state
+        .snapshot
+        .chat_session_rows
+        .get(index)
+        .map(|row| row.session_id)
+        .ok_or_else(|| DesktopCommandConflict::new("the quick-chat row is no longer available"))
+}
+
+fn validated_project_id(
+    controller: &DesktopController,
+    index: usize,
+) -> Result<crate::session::ProjectId, DesktopCommandConflict> {
+    controller
+        .state
+        .snapshot
+        .project_rows
+        .get(index)
+        .map(|row| row.project_id)
+        .ok_or_else(|| DesktopCommandConflict::new("the project row is no longer available"))
 }
 
 fn ensure_stable_view_admission(
@@ -497,24 +599,25 @@ async fn desktop_state(
 ) -> Result<DesktopWebState, String> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
+    controller.drive_startup_readiness();
     apply_native_window_opacity(&window, controller.state.view.window_opacity_percent)?;
     controller.next_web_state()
 }
 
 #[tauri::command]
-async fn set_prompt(
+async fn submit_prompt(
     controller: State<'_, SharedController>,
     text: String,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        controller.state.set_draft_prompt(text);
+    expected_target: DesktopDraftActionTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_draft_action_target(controller, &expected_target)?;
+        if !controller.start_run(text) {
+            return Err(rejected_action(controller, "the prompt was not submitted"));
+        }
+        Ok(())
     })
     .await
-}
-
-#[tauri::command]
-async fn submit_prompt(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::start_run).await
 }
 
 #[tauri::command]
@@ -523,8 +626,16 @@ async fn cancel_run(controller: State<'_, SharedController>) -> Result<DesktopWe
 }
 
 #[tauri::command]
-async fn new_chat(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::start_quick_chat).await
+async fn new_chat(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        if !controller.start_quick_chat() {
+            return Err(rejected_action(controller, "new chat was not started"));
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -540,7 +651,12 @@ async fn new_project_session(
             DesktopRowCollection::Project,
             index,
         )?;
-        controller.start_project_session(index);
+        if !controller.start_project_session(index) {
+            return Err(rejected_action(
+                controller,
+                "new project chat was not started",
+            ));
+        }
         Ok(())
     })
     .await
@@ -549,24 +665,34 @@ async fn new_project_session(
 #[tauri::command]
 async fn review_uncommitted(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::start_review_uncommitted).await
+    text: String,
+    expected_target: DesktopDraftActionTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_draft_action_target(controller, &expected_target)?;
+        if !controller.start_review_uncommitted(text) {
+            return Err(rejected_action(controller, "the review was not started"));
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn enhance_prompt(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::start_prompt_enhance).await
-}
-
-#[tauri::command]
-async fn set_review_draft(
-    controller: State<'_, SharedController>,
     text: String,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        controller.state.set_review_draft(text);
+    expected_target: DesktopDraftActionTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_draft_action_target(controller, &expected_target)?;
+        if !controller.start_prompt_enhance(text) {
+            return Err(rejected_action(
+                controller,
+                "prompt enhancement was not started",
+            ));
+        }
+        Ok(())
     })
     .await
 }
@@ -575,9 +701,18 @@ async fn set_review_draft(
 async fn send_prompt_review(
     controller: State<'_, SharedController>,
     enhanced: bool,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        controller.send_prompt_review(enhanced)
+    text: String,
+    expected_target: DesktopDraftActionTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_draft_action_target(controller, &expected_target)?;
+        if !controller.send_prompt_review(enhanced, text) {
+            return Err(rejected_action(
+                controller,
+                "the reviewed prompt was not sent",
+            ));
+        }
+        Ok(())
     })
     .await
 }
@@ -612,7 +747,12 @@ async fn select_project(
             DesktopRowCollection::Project,
             index,
         )?;
-        controller.select_project_and_open(index);
+        if !controller.select_project_and_open(index) {
+            return Err(rejected_action(
+                controller,
+                "project navigation was not started",
+            ));
+        }
         Ok(())
     })
     .await
@@ -631,7 +771,12 @@ async fn select_session(
             DesktopRowCollection::Session,
             index,
         )?;
-        controller.select_session_and_open(index);
+        if !controller.select_session_and_open(index) {
+            return Err(rejected_action(
+                controller,
+                "session navigation was not started",
+            ));
+        }
         Ok(())
     })
     .await
@@ -650,8 +795,11 @@ async fn rejoin_session(
             DesktopRowCollection::Session,
             index,
         )?;
-        if controller.select_session_if_admitted(index) {
-            controller.rejoin_selected_session();
+        if !controller.rejoin_session_if_admitted(index) {
+            return Err(rejected_action(
+                controller,
+                "session rejoin was not started",
+            ));
         }
         Ok(())
     })
@@ -735,7 +883,12 @@ async fn select_chat_session(
             DesktopRowCollection::QuickChatSession,
             index,
         )?;
-        controller.open_quick_chat_session(index);
+        if !controller.open_quick_chat_session(index) {
+            return Err(rejected_action(
+                controller,
+                "quick-chat navigation was not started",
+            ));
+        }
         Ok(())
     })
     .await
@@ -745,9 +898,17 @@ async fn select_chat_session(
 async fn set_session_search(
     controller: State<'_, SharedController>,
     text: String,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        controller.set_session_search(text);
+    expected_target: DesktopSessionSearchTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_session_search_target(controller, &expected_target)?;
+        if !controller.set_session_search(text) {
+            return Err(rejected_action(
+                controller,
+                "the session search was not started",
+            ));
+        }
+        Ok(())
     })
     .await
 }
@@ -756,9 +917,17 @@ async fn set_session_search(
 async fn set_session_search_include_archived(
     controller: State<'_, SharedController>,
     include_archived: bool,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        controller.set_session_search_include_archived(include_archived);
+    expected_target: DesktopSessionSearchTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_session_search_target(controller, &expected_target)?;
+        if !controller.set_session_search_include_archived(include_archived) {
+            return Err(rejected_action(
+                controller,
+                "the session search was not started",
+            ));
+        }
+        Ok(())
     })
     .await
 }
@@ -777,8 +946,9 @@ async fn archive_session(
             index,
         )?;
         ensure_session_archive_admission(controller, index)?;
-        if controller.select_session_if_admitted(index) {
-            controller.archive_selected_session(true);
+        let session_id = validated_session_id(controller, index)?;
+        if !controller.archive_session(session_id, true) {
+            return Err(rejected_action(controller, "chat archive was not started"));
         }
         Ok(())
     })
@@ -798,8 +968,12 @@ async fn unarchive_session(
             DesktopRowCollection::Session,
             index,
         )?;
-        if controller.select_session_if_admitted(index) {
-            controller.archive_selected_session(false);
+        let session_id = validated_session_id(controller, index)?;
+        if !controller.archive_session(session_id, false) {
+            return Err(rejected_action(
+                controller,
+                "chat unarchive was not started",
+            ));
         }
         Ok(())
     })
@@ -819,8 +993,9 @@ async fn rollback_session(
             DesktopRowCollection::Session,
             index,
         )?;
-        if controller.select_session_if_admitted(index) {
-            controller.rollback_selected_session();
+        let session_id = validated_session_id(controller, index)?;
+        if !controller.rollback_session(session_id) {
+            return Err(rejected_action(controller, "chat rollback was not started"));
         }
         Ok(())
     })
@@ -840,8 +1015,9 @@ async fn fork_session(
             DesktopRowCollection::Session,
             index,
         )?;
-        if controller.select_session_if_admitted(index) {
-            controller.fork_selected_session();
+        let session_id = validated_session_id(controller, index)?;
+        if !controller.fork_session(session_id) {
+            return Err(rejected_action(controller, "chat fork was not started"));
         }
         Ok(())
     })
@@ -861,8 +1037,12 @@ async fn interrupt_session(
             DesktopRowCollection::Session,
             index,
         )?;
-        if controller.select_session_if_admitted(index) {
-            controller.interrupt_selected_session();
+        let session_id = validated_session_id(controller, index)?;
+        if !controller.interrupt_session(session_id) {
+            return Err(rejected_action(
+                controller,
+                "chat interrupt was not started",
+            ));
         }
         Ok(())
     })
@@ -882,8 +1062,14 @@ async fn enable_session_memory(
             DesktopRowCollection::Session,
             index,
         )?;
-        if controller.select_session_if_admitted(index) {
-            controller.set_selected_session_memory_mode(crate::session::SessionMemoryMode::Enabled);
+        let session_id = validated_session_id(controller, index)?;
+        if !controller
+            .set_session_memory_mode(session_id, crate::session::SessionMemoryMode::Enabled)
+        {
+            return Err(rejected_action(
+                controller,
+                "chat memory update was not started",
+            ));
         }
         Ok(())
     })
@@ -903,9 +1089,14 @@ async fn disable_session_memory(
             DesktopRowCollection::Session,
             index,
         )?;
-        if controller.select_session_if_admitted(index) {
-            controller
-                .set_selected_session_memory_mode(crate::session::SessionMemoryMode::Disabled);
+        let session_id = validated_session_id(controller, index)?;
+        if !controller
+            .set_session_memory_mode(session_id, crate::session::SessionMemoryMode::Disabled)
+        {
+            return Err(rejected_action(
+                controller,
+                "chat memory update was not started",
+            ));
         }
         Ok(())
     })
@@ -925,8 +1116,12 @@ async fn delete_project(
             DesktopRowCollection::Project,
             index,
         )?;
-        if controller.select_project_if_admitted(index) {
-            controller.delete_selected_project();
+        let project_id = validated_project_id(controller, index)?;
+        if !controller.delete_project(project_id) {
+            return Err(rejected_action(
+                controller,
+                "project deletion was not started",
+            ));
         }
         Ok(())
     })
@@ -946,8 +1141,9 @@ async fn delete_session(
             DesktopRowCollection::Session,
             index,
         )?;
-        if controller.select_session_if_admitted(index) {
-            controller.delete_selected_session();
+        let session_id = validated_session_id(controller, index)?;
+        if !controller.delete_session(session_id) {
+            return Err(rejected_action(controller, "chat deletion was not started"));
         }
         Ok(())
     })
@@ -967,7 +1163,13 @@ async fn delete_chat_session(
             DesktopRowCollection::QuickChatSession,
             index,
         )?;
-        controller.delete_quick_chat_session(index);
+        let session_id = validated_quick_chat_session_id(controller, index)?;
+        if !controller.delete_quick_chat_session(session_id) {
+            return Err(rejected_action(
+                controller,
+                "quick-chat deletion was not started",
+            ));
+        }
         Ok(())
     })
     .await
@@ -1006,7 +1208,8 @@ async fn export_history_markdown(
             DesktopRowCollection::Session,
             index,
         )?;
-        controller.export_selected_history_markdown_auto();
+        let session_id = validated_session_id(controller, index)?;
+        controller.export_history_markdown_auto(session_id);
         Ok(())
     })
     .await
@@ -1032,52 +1235,73 @@ async fn export_transcript_markdown(
 }
 
 #[tauri::command]
-async fn set_image_input(
-    controller: State<'_, SharedController>,
-    text: String,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        controller.state.set_image_attachment_input(text);
-    })
-    .await
-}
-
-#[tauri::command]
 async fn attach_image(
     app: tauri::AppHandle,
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
+    text: String,
+    expected_target: DesktopDraftActionTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_draft_action_target(&controller, &expected_target) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    controller.state.set_image_attachment_input(text);
     let Some(path) = controller.prepare_image_attachment_from_input() else {
-        return controller.next_web_state();
+        return Err(command_conflict_error(
+            &mut controller,
+            DesktopCommandConflict::new("the image path was not attached"),
+        ));
     };
-    controller.authorize_attachment_asset(&app, &path)?;
+    controller
+        .authorize_attachment_asset(&app, &path)
+        .map_err(DesktopCommandError::internal)?;
     controller.state.attach_image_path(path);
     controller.drain_runtime_messages();
-    controller.next_web_state()
+    controller
+        .next_web_state()
+        .map_err(DesktopCommandError::internal)
 }
 
 #[tauri::command]
 async fn browse_image(
     app: tauri::AppHandle,
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
+    expected_target: DesktopDraftActionTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_draft_action_target(&controller, &expected_target) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     let Some(path) = controller.browse_image_dialog() else {
-        return controller.next_web_state();
+        return controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal);
     };
-    controller.authorize_attachment_asset(&app, &path)?;
+    controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_draft_action_target(&controller, &expected_target) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    controller
+        .authorize_attachment_asset(&app, &path)
+        .map_err(DesktopCommandError::internal)?;
     controller.state.attach_image_path(path);
     controller.drain_runtime_messages();
-    controller.next_web_state()
+    controller
+        .next_web_state()
+        .map_err(DesktopCommandError::internal)
 }
 
 #[tauri::command]
-async fn clear_images(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
+async fn clear_images(
+    controller: State<'_, SharedController>,
+    expected_target: DesktopDraftActionTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_draft_action_target(controller, &expected_target)?;
         controller.state.clear_image_attachments();
+        Ok(())
     })
     .await
 }
@@ -1170,11 +1394,7 @@ async fn show_provider_editor(
 async fn show_workspace_picker(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        let path = controller.app.workspace.root.to_string();
-        controller.state.show_workspace_picker(&path);
-    })
-    .await
+    mutate_controller(controller, DesktopController::show_workspace_picker).await
 }
 
 #[tauri::command]
@@ -1203,28 +1423,48 @@ async fn close_overlay(controller: State<'_, SharedController>) -> Result<Deskto
 }
 
 #[tauri::command]
-async fn set_workspace_input(
+async fn switch_workspace(
     controller: State<'_, SharedController>,
     text: String,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
+    expected_target: DesktopDraftActionTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_draft_action_target(controller, &expected_target)?;
         controller.state.set_workspace_input(text);
+        if !controller.switch_workspace() {
+            return Err(rejected_action(
+                controller,
+                "the workspace was not switched",
+            ));
+        }
+        Ok(())
     })
     .await
 }
 
 #[tauri::command]
-async fn switch_workspace(
-    controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::switch_workspace).await
-}
-
-#[tauri::command]
 async fn browse_workspace(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::browse_workspace_dialog).await
+    text: String,
+    expected_target: DesktopDraftActionTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_draft_action_target(&controller, &expected_target) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    controller.state.set_workspace_input(text);
+    let selected = controller.browse_workspace_dialog();
+    controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_draft_action_target(&controller, &expected_target) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Some(path) = selected {
+        controller.state.set_workspace_input(path.to_string());
+    }
+    controller
+        .next_web_state()
+        .map_err(DesktopCommandError::internal)
 }
 
 #[tauri::command]
@@ -1249,13 +1489,24 @@ async fn open_global_config_folder(
 async fn import_global_config_toml(
     controller: State<'_, SharedController>,
     expected_target: DesktopConfigMutationTarget,
+    config_owner_mutation_open: bool,
 ) -> Result<(DesktopWebState, bool), DesktopCommandError> {
     let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_external_config_owner_mutation_open(config_owner_mutation_open) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_target) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    let selected = controller.pick_global_config_toml_dialog();
     controller.drain_runtime_messages();
     if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    let imported = controller.import_global_config_toml_dialog();
+    let imported = selected
+        .as_deref()
+        .is_some_and(|path| controller.import_global_config_toml_path(path));
     controller.drain_runtime_messages();
     Ok((
         controller
@@ -1268,11 +1519,17 @@ async fn import_global_config_toml(
 #[tauri::command]
 async fn open_typed_path(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(
-        controller,
-        DesktopController::open_typed_path_in_file_manager,
-    )
+    text: String,
+    expected_target: DesktopDraftActionTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_draft_action_target(controller, &expected_target)?;
+        controller.state.set_workspace_input(text);
+        if !controller.open_typed_path_in_file_manager() {
+            return Err(rejected_action(controller, "the path was not opened"));
+        }
+        Ok(())
+    })
     .await
 }
 
@@ -1301,9 +1558,12 @@ async fn open_artifact_folder(
 async fn set_local_search(
     controller: State<'_, SharedController>,
     text: String,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
+    expected_target: DesktopDraftActionTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_draft_action_target(controller, &expected_target)?;
         controller.state.set_local_search_text(text);
+        Ok(())
     })
     .await
 }
@@ -1327,91 +1587,69 @@ async fn insert_command(
     .await
 }
 
-#[tauri::command]
-async fn set_provider_base_url(
-    controller: State<'_, SharedController>,
-    text: String,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        controller.set_provider_base_url_input(text);
-    })
-    .await
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopProviderActionInput {
+    base_url: String,
+    metadata_mode: String,
+    context_window: String,
+    max_output_tokens: String,
+    selected_model_id: String,
+    config_owner_mutation_open: bool,
 }
 
-#[tauri::command]
-async fn set_provider_metadata_mode(
-    controller: State<'_, SharedController>,
-    mode: String,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        let parsed = match mode.as_str() {
-            "lm_studio_native_required"
-            | "lm-studio-native-required"
-            | "lm_studio"
-            | "lm-studio" => crate::config::ProviderMetadataMode::LmStudioNativeRequired,
-            "openai_compatible_only" | "openai-compatible-only" | "openai" => {
-                crate::config::ProviderMetadataMode::OpenAiCompatibleOnly
-            }
-            _ => {
-                controller
-                    .state
-                    .set_status_message(format!("unknown provider metadata mode: {mode}"));
-                return;
-            }
-        };
-        controller.set_provider_metadata_mode_input(parsed);
-    })
-    .await
-}
-
-#[tauri::command]
-async fn set_provider_context_window(
-    controller: State<'_, SharedController>,
-    text: String,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        controller.state.set_provider_context_window_input(text);
-    })
-    .await
-}
-
-#[tauri::command]
-async fn set_provider_max_output_tokens(
-    controller: State<'_, SharedController>,
-    text: String,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        controller.state.set_provider_max_output_tokens_input(text);
-    })
-    .await
+fn accept_provider_action_input(
+    controller: &mut DesktopController,
+    input: DesktopProviderActionInput,
+) -> Result<(), DesktopCommandConflict> {
+    let metadata_mode = match input.metadata_mode.as_str() {
+        "lm_studio_native_required" | "lm-studio-native-required" | "lm_studio" | "lm-studio" => {
+            crate::config::ProviderMetadataMode::LmStudioNativeRequired
+        }
+        "openai_compatible_only" | "openai-compatible-only" | "openai" => {
+            crate::config::ProviderMetadataMode::OpenAiCompatibleOnly
+        }
+        _ => {
+            controller.state.set_status_message(format!(
+                "unknown provider metadata mode: {}",
+                input.metadata_mode
+            ));
+            return Err(rejected_action(
+                controller,
+                "the provider metadata mode is invalid",
+            ));
+        }
+    };
+    controller.accept_provider_action_input(
+        input.base_url,
+        metadata_mode,
+        input.context_window,
+        input.max_output_tokens,
+        input.selected_model_id,
+    );
+    Ok(())
 }
 
 #[tauri::command]
 async fn load_provider_models(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::load_provider_models).await
-}
-
-#[tauri::command]
-async fn select_provider_model(
-    controller: State<'_, SharedController>,
-    index: i32,
-    expected_target: DesktopRowMutationTarget,
+    input: DesktopProviderActionInput,
+    expected_target: DesktopConfigMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
-        let index_usize = usize::try_from(index).map_err(|_| {
-            DesktopCommandConflict::new(
-                "the provider model selection is no longer available; reload the model list",
-            )
-        })?;
-        ensure_indexed_row_mutation_target(
-            controller,
-            &expected_target,
-            DesktopRowCollection::ProviderModel,
-            index_usize,
-        )?;
-        controller.state.set_provider_model_selection(index);
+        ensure_config_mutation_target(controller, &expected_target)?;
+        if controller.provider_model_load_pending() {
+            return Err(DesktopCommandConflict::new(
+                "provider model load is already in progress",
+            ));
+        }
+        accept_provider_action_input(controller, input)?;
+        if !controller.load_provider_models() {
+            return Err(rejected_action(
+                controller,
+                "the provider model list was not loaded",
+            ));
+        }
         Ok(())
     })
     .await
@@ -1420,15 +1658,43 @@ async fn select_provider_model(
 #[tauri::command]
 async fn apply_provider_session(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::apply_provider_session).await
+    input: DesktopProviderActionInput,
+    expected_target: DesktopConfigMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_config_mutation_target(controller, &expected_target)?;
+        ensure_external_config_owner_mutation_open(input.config_owner_mutation_open)?;
+        accept_provider_action_input(controller, input)?;
+        if !controller.apply_provider_session() {
+            return Err(rejected_action(
+                controller,
+                "the provider settings were not applied",
+            ));
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn save_provider_global(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::save_provider_global).await
+    input: DesktopProviderActionInput,
+    expected_target: DesktopConfigMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_config_mutation_target(controller, &expected_target)?;
+        ensure_external_config_owner_mutation_open(input.config_owner_mutation_open)?;
+        accept_provider_action_input(controller, input)?;
+        if !controller.save_provider_global() {
+            return Err(rejected_action(
+                controller,
+                "the provider settings were not saved",
+            ));
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1443,6 +1709,17 @@ struct DesktopConfigMutationTarget {
     workspace_path: String,
     session_id: Option<String>,
     config_generation: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopAccessModeMutationTarget {
+    workspace_path: String,
+    session_id: Option<String>,
+    config_generation: u64,
+    access_mode: crate::config::AccessMode,
+    runtime_owner_token: String,
+    config_owner_mutation_open: bool,
 }
 
 fn validate_config_mutation_target(
@@ -1462,6 +1739,17 @@ fn validate_config_mutation_target(
     Ok(())
 }
 
+fn ensure_external_config_owner_mutation_open(
+    config_owner_mutation_open: bool,
+) -> Result<(), DesktopCommandConflict> {
+    if !config_owner_mutation_open {
+        return Err(DesktopCommandConflict::new(
+            "finish or discard the current settings draft before changing configuration from another surface",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_config_mutation_target(
     controller: &DesktopController,
     expected: &DesktopConfigMutationTarget,
@@ -1475,6 +1763,58 @@ fn ensure_config_mutation_target(
             .map(|session_id| session_id.to_string()),
         controller.state.provider_config.config_generation,
     )
+}
+
+fn validate_access_mode_mutation_target(
+    expected: &DesktopAccessModeMutationTarget,
+    workspace_path: &str,
+    session_id: Option<String>,
+    config_generation: u64,
+    access_mode: crate::config::AccessMode,
+    runtime_owner_token: String,
+) -> Result<(), DesktopCommandConflict> {
+    if expected.workspace_path != workspace_path
+        || expected.session_id != session_id
+        || expected.config_generation != config_generation
+        || expected.access_mode != access_mode
+        || expected.runtime_owner_token != runtime_owner_token
+    {
+        return Err(DesktopCommandConflict::new(
+            "access-mode owner changed before the mutation was applied; review the current chat and try again",
+        ));
+    }
+    ensure_external_config_owner_mutation_open(expected.config_owner_mutation_open)?;
+    Ok(())
+}
+
+fn ensure_access_mode_mutation_target(
+    controller: &DesktopController,
+    expected: &DesktopAccessModeMutationTarget,
+) -> Result<(), DesktopCommandConflict> {
+    let (runtime_owner_token, admission_open) = controller.access_mode_mutation_runtime_contract();
+    validate_access_mode_mutation_target(
+        expected,
+        controller.app.workspace.root.as_str(),
+        controller
+            .state
+            .app_state
+            .current_session_id
+            .map(|session_id| session_id.to_string()),
+        controller.state.provider_config.config_generation,
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .permissions
+            .access_mode,
+        runtime_owner_token,
+    )?;
+    if !admission_open {
+        return Err(DesktopCommandConflict::new(
+            "access mode cannot change while navigation or an owner mutation is active",
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1540,8 +1880,30 @@ async fn save_global_config(
 #[tauri::command]
 async fn toggle_access_mode(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::toggle_access_mode_session).await
+    expected_target: DesktopAccessModeMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_access_mode_mutation_target(controller, &expected_target)?;
+        let expected_session_id = expected_target.session_id.clone();
+        if !controller.toggle_access_mode_remembered() {
+            return Err(rejected_action(
+                controller,
+                "the access mode was not changed",
+            ));
+        }
+        let committed_session_id = controller
+            .state
+            .app_state
+            .current_session_id
+            .map(|session_id| session_id.to_string());
+        if committed_session_id != expected_session_id {
+            return Err(DesktopCommandConflict::new(
+                "the current root session changed before the access mode commit completed",
+            ));
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1605,17 +1967,72 @@ fn apply_windows_window_opacity(window: &tauri::WebviewWindow, percent: i32) -> 
 async fn answer_permission(
     controller: State<'_, SharedController>,
     allow: bool,
-    confirmation_id: u64,
+    confirmation_id: String,
 ) -> Result<DesktopWebState, String> {
+    let confirmation_id = parse_permission_confirmation_id(&confirmation_id)?;
     mutate_controller(controller, |controller| {
         controller.answer_permission(confirmation_id, allow);
     })
     .await
 }
 
+fn parse_permission_confirmation_id(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| "permission confirmation id must be an unsigned decimal integer".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_action_target_rejects_workspace_and_current_session_drift() {
+        let expected = DesktopDraftActionTarget {
+            workspace_path: "C:/workspace".to_string(),
+            session_id: Some("session-a".to_string()),
+        };
+        assert!(
+            validate_draft_action_target(&expected, "C:/workspace", Some("session-a".to_string()),)
+                .is_ok()
+        );
+        assert!(
+            validate_draft_action_target(&expected, "C:/other", Some("session-a".to_string()),)
+                .is_err()
+        );
+        assert!(
+            validate_draft_action_target(&expected, "C:/workspace", Some("session-b".to_string()),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn session_search_target_rejects_workspace_and_project_drift() {
+        let expected = DesktopSessionSearchTarget {
+            workspace_path: "C:/workspace".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        assert!(
+            validate_session_search_target(
+                &expected,
+                "C:/workspace",
+                Some("project-a".to_string()),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_session_search_target(&expected, "C:/other", Some("project-a".to_string()),)
+                .is_err()
+        );
+        assert!(
+            validate_session_search_target(
+                &expected,
+                "C:/workspace",
+                Some("project-b".to_string()),
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn config_mutation_target_rejects_workspace_session_and_generation_changes() {
@@ -1671,6 +2088,100 @@ mod tests {
             .is_err(),
             "returning to the same workspace/session must not admit an older generation"
         );
+    }
+
+    #[test]
+    fn access_mode_target_rejects_owner_generation_and_mode_drift() {
+        let expected = DesktopAccessModeMutationTarget {
+            workspace_path: "C:/workspace".to_string(),
+            session_id: Some("session-a".to_string()),
+            config_generation: 7,
+            access_mode: crate::config::AccessMode::Default,
+            runtime_owner_token: "root:11".to_string(),
+            config_owner_mutation_open: true,
+        };
+
+        assert!(
+            validate_access_mode_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                7,
+                crate::config::AccessMode::Default,
+                "root:11".to_string(),
+            )
+            .is_ok()
+        );
+        for (workspace, session, generation, access_mode, runtime_owner_token) in [
+            (
+                "C:/other",
+                Some("session-a".to_string()),
+                7,
+                crate::config::AccessMode::Default,
+                "root:11".to_string(),
+            ),
+            (
+                "C:/workspace",
+                Some("session-b".to_string()),
+                7,
+                crate::config::AccessMode::Default,
+                "root:11".to_string(),
+            ),
+            (
+                "C:/workspace",
+                Some("session-a".to_string()),
+                8,
+                crate::config::AccessMode::Default,
+                "root:11".to_string(),
+            ),
+            (
+                "C:/workspace",
+                Some("session-a".to_string()),
+                7,
+                crate::config::AccessMode::AutoReview,
+                "root:11".to_string(),
+            ),
+            (
+                "C:/workspace",
+                Some("session-a".to_string()),
+                7,
+                crate::config::AccessMode::Default,
+                "tree:11".to_string(),
+            ),
+        ] {
+            assert!(
+                validate_access_mode_mutation_target(
+                    &expected,
+                    workspace,
+                    session,
+                    generation,
+                    access_mode,
+                    runtime_owner_token,
+                )
+                .is_err()
+            );
+        }
+        let dirty = DesktopAccessModeMutationTarget {
+            config_owner_mutation_open: false,
+            ..expected
+        };
+        assert!(
+            validate_access_mode_mutation_target(
+                &dirty,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                7,
+                crate::config::AccessMode::Default,
+                "root:11".to_string(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn external_config_owner_mutations_require_a_clean_client_draft() {
+        assert!(ensure_external_config_owner_mutation_open(true).is_ok());
+        assert!(ensure_external_config_owner_mutation_open(false).is_err());
     }
 
     #[test]
@@ -1746,5 +2257,14 @@ mod tests {
         ] {
             assert!(validate_session_archive_loaded_status(status).is_ok());
         }
+    }
+
+    #[test]
+    fn permission_confirmation_id_parses_full_u64_decimal_range() {
+        assert_eq!(
+            parse_permission_confirmation_id("18446744073709551615"),
+            Ok(u64::MAX)
+        );
+        assert!(parse_permission_confirmation_id("9007199254740993.0").is_err());
     }
 }
