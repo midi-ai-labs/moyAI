@@ -1,6 +1,7 @@
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ResolvedConfig;
+use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
 use crate::error::LlmError;
 use crate::llm::{
     ChatRequest, ConfigModelCatalog, LlmClient, LlmEvent, LlmEventSink, ModelCatalog, ModelMessage,
@@ -38,6 +39,10 @@ pub async fn enhance_prompt(config: &ResolvedConfig, raw_prompt: &str) -> Result
                     content: raw_prompt.to_string(),
                 }],
                 tools: Vec::new(),
+                provider_api_mode: ProviderApiMode::ChatCompletions,
+                reasoning: None,
+                reasoning_capability: ProviderReasoningCapability::Unsupported,
+                responses_continuation: None,
                 tool_choice: None,
                 parallel_tool_calls: false,
                 timeout_ms: effective_config.model.request_timeout_ms,

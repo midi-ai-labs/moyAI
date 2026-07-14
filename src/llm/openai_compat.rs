@@ -10,13 +10,16 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ProviderMetadataMode;
-use crate::config::model::ProviderReasoningCapability;
+use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
 use crate::error::LlmError;
 use crate::llm::contract::{ReasoningRequest, validate_chat_completions_reasoning_request};
 use crate::llm::dto::{
     OpenAiChatChunk, OpenAiChatRequest, OpenAiContent, OpenAiContentPart, OpenAiErrorPayload,
     OpenAiFunctionSchema, OpenAiImageUrl, OpenAiMessage, OpenAiMessageToolCall,
     OpenAiMessageToolCallFunction, OpenAiToolSchema, OpenAiUsage,
+};
+use crate::llm::responses::{
+    ResponsesRequestOptions, ResponsesStreamAccumulator, ResponsesTerminal, to_responses_request,
 };
 use crate::llm::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary, ModelMessage,
@@ -63,13 +66,29 @@ impl LlmClient for OpenAiCompatClient {
         cancel: CancellationToken,
         sink: &mut dyn LlmEventSink,
     ) -> Result<LlmResponseSummary, LlmError> {
+        match request.provider_api_mode {
+            ProviderApiMode::Responses => {
+                return self.stream_responses(request, cancel, sink).await;
+            }
+            ProviderApiMode::ChatCompletions => {}
+            ProviderApiMode::Auto => {
+                return Err(LlmError::Message(
+                    "provider_api_mode must be resolved before transport dispatch".to_string(),
+                ));
+            }
+        }
         let mut stream_retry_attempt = 0_u8;
+        let body = to_openai_request(&request)?;
 
         'stream_attempt: loop {
-            let Some(response) = self.send_request(&request, &cancel).await? else {
+            let Some(response) = self
+                .send_request(&request, "v1/chat/completions", &body, &cancel)
+                .await?
+            else {
                 return Ok(LlmResponseSummary {
                     finish_reason: FinishReason::Cancelled,
                     usage: None,
+                    response_id: None,
                 });
             };
 
@@ -89,6 +108,7 @@ impl LlmClient for OpenAiCompatClient {
                                 return Ok(LlmResponseSummary {
                                     finish_reason: FinishReason::Cancelled,
                                     usage,
+                                    response_id: None,
                                 });
                             }
                             result = tokio::time::timeout(timeout, stream.next()) => {
@@ -110,6 +130,7 @@ impl LlmClient for OpenAiCompatClient {
                                             return Ok(LlmResponseSummary {
                                                 finish_reason: FinishReason::Cancelled,
                                                 usage,
+                                                response_id: None,
                                             });
                                         }
                                         continue 'stream_attempt;
@@ -130,6 +151,7 @@ impl LlmClient for OpenAiCompatClient {
                                 return Ok(LlmResponseSummary {
                                     finish_reason: FinishReason::Cancelled,
                                     usage,
+                                    response_id: None,
                                 });
                             }
                             result = stream.next() => result,
@@ -155,6 +177,7 @@ impl LlmClient for OpenAiCompatClient {
                             return Ok(LlmResponseSummary {
                                 finish_reason: FinishReason::Cancelled,
                                 usage,
+                                response_id: None,
                             });
                         }
                         continue 'stream_attempt;
@@ -254,15 +277,200 @@ impl LlmClient for OpenAiCompatClient {
             return Ok(LlmResponseSummary {
                 finish_reason,
                 usage,
+                response_id: None,
             });
         }
     }
 }
 
 impl OpenAiCompatClient {
+    async fn stream_responses(
+        &self,
+        request: ChatRequest,
+        cancel: CancellationToken,
+        sink: &mut dyn LlmEventSink,
+    ) -> Result<LlmResponseSummary, LlmError> {
+        let body = to_responses_request(&request, ResponsesRequestOptions::from_request(&request))?;
+        let mut stream_retry_attempt = 0_u8;
+        let mut event_retry_attempt = 0_u8;
+
+        'stream_attempt: loop {
+            let Some(response) = self
+                .send_request(&request, "v1/responses", &body, &cancel)
+                .await?
+            else {
+                return Ok(LlmResponseSummary {
+                    finish_reason: FinishReason::Cancelled,
+                    usage: None,
+                    response_id: None,
+                });
+            };
+
+            let mut stream = response.bytes_stream().eventsource();
+            let mut accumulator = ResponsesStreamAccumulator::default();
+            let mut received_sse_events = 0_usize;
+            let mut emitted_model_events = 0_usize;
+
+            loop {
+                let next_event =
+                    if let Some(timeout) = stream_idle_timeout(request.stream_idle_timeout_ms) {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                return Ok(LlmResponseSummary {
+                                    finish_reason: FinishReason::Cancelled,
+                                    usage: None,
+                                    response_id: None,
+                                });
+                            }
+                            result = tokio::time::timeout(timeout, stream.next()) => {
+                                match result {
+                                    Ok(event) => event,
+                                    Err(_) if should_retry_stream_idle_timeout_before_first_event(
+                                        received_sse_events,
+                                        stream_retry_attempt,
+                                        request.stream_max_retries,
+                                    ) => {
+                                        stream_retry_attempt += 1;
+                                        if !sleep_retry_delay(
+                                            retry_delay_ms(stream_retry_attempt, None),
+                                            &cancel,
+                                        )
+                                        .await
+                                        {
+                                            return Ok(LlmResponseSummary {
+                                                finish_reason: FinishReason::Cancelled,
+                                                usage: None,
+                                                response_id: None,
+                                            });
+                                        }
+                                        continue 'stream_attempt;
+                                    }
+                                    Err(_) => {
+                                        return Err(stream_idle_timeout_error(
+                                            request.stream_idle_timeout_ms,
+                                            stream_retry_attempt,
+                                            request.stream_max_retries,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                return Ok(LlmResponseSummary {
+                                    finish_reason: FinishReason::Cancelled,
+                                    usage: None,
+                                    response_id: None,
+                                });
+                            }
+                            result = stream.next() => result,
+                        }
+                    };
+
+                let Some(event) = next_event else {
+                    return Err(LlmError::Message(
+                        "Responses stream closed before response.completed".to_string(),
+                    ));
+                };
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error)
+                        if received_sse_events == 0
+                            && should_retry_stream_event_error(&error)
+                            && stream_retry_attempt < request.stream_max_retries =>
+                    {
+                        stream_retry_attempt += 1;
+                        if !sleep_retry_delay(retry_delay_ms(stream_retry_attempt, None), &cancel)
+                            .await
+                        {
+                            return Ok(LlmResponseSummary {
+                                finish_reason: FinishReason::Cancelled,
+                                usage: None,
+                                response_id: None,
+                            });
+                        }
+                        continue 'stream_attempt;
+                    }
+                    Err(error) => {
+                        return Err(LlmError::Message(format!(
+                            "Responses SSE stream error: {error}"
+                        )));
+                    }
+                };
+                received_sse_events += 1;
+
+                if event.data == "[DONE]" {
+                    return Err(LlmError::Message(
+                        "Responses stream ended with [DONE] before response.completed".to_string(),
+                    ));
+                }
+
+                let update = accumulator.push_json(&event.data).map_err(|error| {
+                    LlmError::Message(format!(
+                        "failed to parse Responses stream event: {error}. Raw event: {}",
+                        summarize_stream_chunk(&event.data)
+                    ))
+                })?;
+                match update.terminal {
+                    Some(ResponsesTerminal::Completed {
+                        response_id,
+                        finish_reason,
+                        usage,
+                    }) => {
+                        for event in update.events {
+                            sink.push(event)?;
+                        }
+                        return Ok(LlmResponseSummary {
+                            finish_reason,
+                            usage,
+                            response_id: Some(response_id),
+                        });
+                    }
+                    Some(ResponsesTerminal::Failed { code, message, .. }) => {
+                        if emitted_model_events == 0
+                            && is_retryable_responses_event_code(code.as_deref())
+                            && event_retry_attempt < self.max_retries
+                        {
+                            event_retry_attempt += 1;
+                            if !sleep_retry_delay(
+                                retry_delay_ms(event_retry_attempt, None),
+                                &cancel,
+                            )
+                            .await
+                            {
+                                return Ok(LlmResponseSummary {
+                                    finish_reason: FinishReason::Cancelled,
+                                    usage: None,
+                                    response_id: None,
+                                });
+                            }
+                            continue 'stream_attempt;
+                        }
+                        let code = code.map(|code| format!(" ({code})")).unwrap_or_default();
+                        return Err(LlmError::Message(format!(
+                            "Responses request failed{code}: {message}"
+                        )));
+                    }
+                    Some(ResponsesTerminal::Incomplete { reason, usage, .. }) => {
+                        return Err(LlmError::IncompleteResponse { reason, usage });
+                    }
+                    None => {
+                        emitted_model_events += update.events.len();
+                        for event in update.events {
+                            sink.push(event)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn send_request(
         &self,
         request: &ChatRequest,
+        endpoint_path: &str,
+        body: &Value,
         cancel: &CancellationToken,
     ) -> Result<Option<reqwest::Response>, LlmError> {
         let mut attempt = 0u8;
@@ -281,11 +489,12 @@ impl OpenAiCompatClient {
             let request_builder = self
                 .client
                 .post(format!(
-                    "{}/v1/chat/completions",
-                    request.base_url.trim_end_matches('/')
+                    "{}/{}",
+                    request.base_url.trim_end_matches('/'),
+                    endpoint_path.trim_start_matches('/')
                 ))
                 .headers(headers)
-                .json(&to_openai_request(request)?);
+                .json(body);
 
             let result = if let Some(timeout) = request_header_timeout(request.timeout_ms) {
                 match tokio::select! {
@@ -461,6 +670,21 @@ fn is_retryable_status(status: StatusCode) -> bool {
         || status.is_server_error()
 }
 
+fn is_retryable_responses_event_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "rate_limit_exceeded"
+                | "rate_limit_error"
+                | "server_error"
+                | "internal_server_error"
+                | "server_overloaded"
+                | "overloaded"
+                | "timeout"
+        )
+    )
+}
+
 fn should_retry_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
 }
@@ -596,7 +820,17 @@ pub fn streaming_tool_call_late_name_preserves_typed_tool_identity_fixture_passe
 }
 
 fn to_openai_request(request: &ChatRequest) -> Result<Value, LlmError> {
-    to_openai_request_with_reasoning(request, None, ProviderReasoningCapability::Unsupported)
+    if request.provider_api_mode != ProviderApiMode::ChatCompletions {
+        return Err(LlmError::Message(
+            "Chat Completions request serialization requires provider_api_mode=chat_completions"
+                .to_string(),
+        ));
+    }
+    to_openai_request_with_reasoning(
+        request,
+        request.reasoning.as_ref(),
+        request.reasoning_capability,
+    )
 }
 
 pub(crate) fn to_openai_request_with_reasoning(
@@ -897,23 +1131,35 @@ fn summarize_stream_error(error: &OpenAiErrorPayload) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    use serde_json::Value;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::response::Response;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::{Value, json};
+    use tokio_util::sync::CancellationToken;
 
     use super::{
-        PartialToolCall, is_retryable_status, parse_finish_reason, resolve_finish_reason,
+        OpenAiCompatClient, PartialToolCall, is_retryable_responses_event_code,
+        is_retryable_status, parse_finish_reason, resolve_finish_reason,
         should_retry_stream_event_error, to_openai_request, to_openai_request_with_reasoning,
         validate_streamed_tool_calls,
     };
     use crate::config::ProviderMetadataMode;
     use crate::config::model::{
-        ChatCompletionsReasoningParameters, ProviderReasoningCapability, ReasoningEffort,
-        ReasoningSummary,
+        ChatCompletionsReasoningParameters, ProviderApiMode, ProviderReasoningCapability,
+        ReasoningEffort, ReasoningSummary,
     };
     use crate::llm::contract::{OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY, ReasoningRequest};
     use crate::llm::{
-        ChatRequest, ModelCapabilities, ModelMessage, ModelProfile, ProviderToolChoice, ToolSchema,
+        ChatRequest, LlmClient, LlmEvent, LlmEventSink, ModelCapabilities, ModelMessage,
+        ModelProfile, ModelToolCall, ProviderToolChoice, ResponsesContinuation, ToolSchema,
     };
+    use crate::session::{FinishReason, TokenUsage};
 
     #[test]
     fn openai_compatible_only_payload_sends_language_policy_as_system_prompt() {
@@ -933,6 +1179,10 @@ mod tests {
             system_prompt: "Base coding prompt".to_string(),
             messages: Vec::new(),
             tools: Vec::new(),
+            provider_api_mode: ProviderApiMode::ChatCompletions,
+            reasoning: None,
+            reasoning_capability: ProviderReasoningCapability::Unsupported,
+            responses_continuation: None,
             tool_choice: None,
             parallel_tool_calls: false,
             timeout_ms: 30_000,
@@ -988,6 +1238,10 @@ mod tests {
                 }),
                 strict: false,
             }],
+            provider_api_mode: ProviderApiMode::ChatCompletions,
+            reasoning: None,
+            reasoning_capability: ProviderReasoningCapability::Unsupported,
+            responses_continuation: None,
             tool_choice: Some(ProviderToolChoice::Required),
             parallel_tool_calls: true,
             timeout_ms: 30_000,
@@ -1061,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_reasoning_fails_closed_for_unsupported_or_unimplemented_transports() {
+    fn enabled_reasoning_fails_closed_for_unsupported_or_mismatched_transports() {
         let request = reasoning_fixture_request();
         let reasoning = ReasoningRequest {
             effort: Some(ReasoningEffort::Low),
@@ -1080,7 +1334,10 @@ mod tests {
             to_openai_request_with_reasoning(
                 &request,
                 Some(&reasoning),
-                ProviderReasoningCapability::ResponsesItemsNotImplemented,
+                ProviderReasoningCapability::Responses {
+                    supports_summary: true,
+                    supports_previous_response_id: true,
+                },
             )
             .is_err()
         );
@@ -1186,10 +1443,521 @@ mod tests {
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
         ));
         assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(is_retryable_responses_event_code(Some("server_error")));
+        assert!(is_retryable_responses_event_code(Some(
+            "rate_limit_exceeded"
+        )));
+        assert!(!is_retryable_responses_event_code(Some("invalid_request")));
+        assert!(!is_retryable_responses_event_code(None));
 
         let utf8_error = String::from_utf8(vec![0xff]).expect_err("invalid utf8");
         let stream_error = eventsource_stream::EventStreamError::<reqwest::Error>::Utf8(utf8_error);
         assert!(!should_retry_stream_event_error(&stream_error));
+    }
+
+    #[tokio::test]
+    async fn responses_transport_posts_typed_wire_and_projects_completed_text_and_summary() {
+        let response = responses_sse([
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "Inspected the repository"
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "delta": "The change is ready."
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_text_1",
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 7,
+                        "total_tokens": 19,
+                        "output_tokens_details": { "reasoning_tokens": 4 }
+                    }
+                }
+            }),
+        ]);
+        let (base_url, requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![
+                ModelMessage::System {
+                    content: "Repository policy".to_string(),
+                },
+                ModelMessage::User {
+                    content: "Inspect the repository".to_string(),
+                },
+            ],
+        );
+        request.reasoning = Some(ReasoningRequest {
+            effort: Some(ReasoningEffort::High),
+            summary: ReasoningSummary::Detailed,
+        });
+        let client = OpenAiCompatClient::new(1_000, 5_000, 0, None).expect("fixture client");
+        let mut sink = RecordingLlmEventSink::default();
+
+        let summary = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect("completed Responses stream");
+        server.abort();
+
+        assert_eq!(summary.finish_reason, FinishReason::Stop);
+        assert_eq!(summary.response_id.as_deref(), Some("resp_text_1"));
+        assert!(matches!(
+            summary.usage.as_ref(),
+            Some(TokenUsage {
+                prompt_tokens: 12,
+                completion_tokens: 7,
+                total_tokens: 19,
+                reasoning_tokens: Some(4),
+            })
+        ));
+        assert!(matches!(
+            sink.events.as_slice(),
+            [
+                LlmEvent::ReasoningDelta(reasoning),
+                LlmEvent::TextDelta(text),
+                LlmEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 12,
+                        completion_tokens: 7,
+                        total_tokens: 19,
+                        reasoning_tokens: Some(4),
+                    }),
+                },
+            ] if reasoning == "Inspected the repository" && text == "The change is ready."
+        ));
+
+        let captured = requests.lock().expect("Responses request capture");
+        assert_eq!(captured.len(), 1);
+        let wire = &captured[0];
+        assert_eq!(wire["model"], json!("responses-fixture-model"));
+        assert_eq!(
+            wire["instructions"],
+            json!("Responses fixture instructions\n\nRepository policy")
+        );
+        assert_eq!(
+            wire["input"],
+            json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "Inspect the repository"
+                }]
+            }])
+        );
+        assert_eq!(
+            wire["reasoning"],
+            json!({ "effort": "high", "summary": "detailed" })
+        );
+        assert_eq!(wire["max_output_tokens"], json!(4_096));
+        assert_eq!(wire["store"], json!(true));
+        assert_eq!(wire["stream"], json!(true));
+        assert!(wire.get("messages").is_none());
+        assert!(wire.get("previous_response_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn responses_transport_reuses_response_id_and_sends_only_incremental_tool_output() {
+        let first_response = responses_sse([
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": { "id": "resp_tool_1" }
+            }),
+        ]);
+        let second_response = responses_sse([
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_2",
+                "delta": "README inspected."
+            }),
+            json!({
+                "type": "response.completed",
+                "response": { "id": "resp_text_2" }
+            }),
+        ]);
+        let (base_url, requests, server) =
+            start_responses_fixture(vec![first_response, second_response]).await;
+        let mut first_request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Inspect README.md".to_string(),
+            }],
+        );
+        first_request.tools = vec![ToolSchema {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+            strict: true,
+        }];
+        first_request.tool_choice = Some(ProviderToolChoice::Required);
+        first_request.extra_body = Some(json!({ "num_ctx": 131_072 }));
+        let client = OpenAiCompatClient::new(1_000, 5_000, 0, None).expect("fixture client");
+        let mut first_sink = RecordingLlmEventSink::default();
+
+        let first_summary = client
+            .stream_chat(
+                first_request.clone(),
+                CancellationToken::new(),
+                &mut first_sink,
+            )
+            .await
+            .expect("function-call Responses stream");
+        assert_eq!(first_summary.finish_reason, FinishReason::ToolCall);
+        assert_eq!(first_summary.response_id.as_deref(), Some("resp_tool_1"));
+        assert!(matches!(
+            first_sink.events.as_slice(),
+            [
+                LlmEvent::ToolCallStart { call_id, tool_name },
+                LlmEvent::ToolCallArgsDelta {
+                    call_id: arguments_call_id,
+                    delta,
+                },
+                LlmEvent::Finished {
+                    finish_reason: FinishReason::ToolCall,
+                    ..
+                },
+            ] if call_id == "call_1"
+                && tool_name == "read_file"
+                && arguments_call_id == "call_1"
+                && delta == "{\"path\":\"README.md\"}"
+        ));
+
+        let mut second_request = first_request;
+        second_request.messages = vec![
+            ModelMessage::User {
+                content: "Inspect README.md".to_string(),
+            },
+            ModelMessage::AssistantToolCalls {
+                content: None,
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_1".to_string(),
+                    tool_name: "read_file".to_string(),
+                    arguments_json: "{\"path\":\"README.md\"}".to_string(),
+                }],
+            },
+            ModelMessage::Tool {
+                call_id: "call_1".to_string(),
+                tool_name: "read_file".to_string(),
+                result: "README contents".to_string(),
+                metadata: Value::Null,
+            },
+        ];
+        second_request.responses_continuation = Some(ResponsesContinuation {
+            previous_response_id: first_summary
+                .response_id
+                .expect("first response id for continuation"),
+            input_start: 2,
+        });
+        let mut second_sink = RecordingLlmEventSink::default();
+
+        let second_summary = client
+            .stream_chat(second_request, CancellationToken::new(), &mut second_sink)
+            .await
+            .expect("continued Responses stream");
+        server.abort();
+
+        assert_eq!(second_summary.finish_reason, FinishReason::Stop);
+        assert_eq!(second_summary.response_id.as_deref(), Some("resp_text_2"));
+        assert!(matches!(
+            second_sink.events.as_slice(),
+            [
+                LlmEvent::TextDelta(text),
+                LlmEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    ..
+                },
+            ] if text == "README inspected."
+        ));
+
+        let captured = requests.lock().expect("Responses request capture");
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].get("previous_response_id").is_none());
+        assert_eq!(captured[0]["num_ctx"], json!(131_072));
+        assert_eq!(
+            captured[0]["input"],
+            json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Inspect README.md" }]
+            }])
+        );
+        assert_eq!(captured[1]["previous_response_id"], json!("resp_tool_1"));
+        assert_eq!(captured[1]["num_ctx"], json!(131_072));
+        assert_eq!(
+            captured[1]["input"],
+            json!([{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "README contents"
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_transport_retries_typed_transient_failure_before_visible_output() {
+        let failed = responses_sse([json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_retryable",
+                "error": { "code": "server_error", "message": "try again" }
+            }
+        })]);
+        let completed = responses_sse([
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_after_retry",
+                "delta": "Recovered."
+            }),
+            json!({
+                "type": "response.completed",
+                "response": { "id": "resp_recovered" }
+            }),
+        ]);
+        let (base_url, requests, server) = start_responses_fixture(vec![failed, completed]).await;
+        let request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Retry transient failure".to_string(),
+            }],
+        );
+        let client = OpenAiCompatClient::new(1_000, 5_000, 1, None).expect("fixture client");
+        let mut sink = RecordingLlmEventSink::default();
+
+        let summary = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect("retryable Responses event should recover");
+        server.abort();
+
+        assert_eq!(summary.response_id.as_deref(), Some("resp_recovered"));
+        assert_eq!(requests.lock().expect("request capture").len(), 2);
+        assert!(matches!(
+            sink.events.as_slice(),
+            [
+                LlmEvent::TextDelta(text),
+                LlmEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    ..
+                }
+            ] if text == "Recovered."
+        ));
+    }
+
+    #[tokio::test]
+    async fn responses_transport_rejects_failed_incomplete_and_terminal_less_streams() {
+        let failed = responses_sse([json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_failed",
+                "error": { "code": "server_error", "message": "unavailable" }
+            }
+        })]);
+        let incomplete = responses_sse([json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_incomplete",
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "total_tokens": 30
+                }
+            }
+        })]);
+        let terminal_less = responses_sse([json!({
+            "type": "response.output_text.delta",
+            "item_id": "msg_unfinished",
+            "delta": "partial output"
+        })]);
+        let (base_url, _requests, server) =
+            start_responses_fixture(vec![failed, incomplete, terminal_less]).await;
+        let request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Run the failure fixture".to_string(),
+            }],
+        );
+        let client = OpenAiCompatClient::new(1_000, 5_000, 0, None).expect("fixture client");
+
+        for (index, expected) in [
+            "Responses request failed (server_error): unavailable",
+            "provider returned an incomplete response: max_output_tokens",
+            "Responses stream closed before response.completed",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut sink = RecordingLlmEventSink::default();
+            let error = client
+                .stream_chat(request.clone(), CancellationToken::new(), &mut sink)
+                .await
+                .expect_err("non-completed Responses stream must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected Responses error: {error}"
+            );
+            if index == 1 {
+                assert!(matches!(
+                    error.token_usage(),
+                    Some(TokenUsage {
+                        prompt_tokens: 10,
+                        completion_tokens: 20,
+                        total_tokens: 30,
+                        reasoning_tokens: None,
+                    })
+                ));
+            } else {
+                assert!(error.token_usage().is_none());
+            }
+            assert!(
+                !sink
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, LlmEvent::Finished { .. })),
+                "failed Responses streams must not emit Finished: {:?}",
+                sink.events
+            );
+        }
+        server.abort();
+    }
+
+    #[derive(Clone)]
+    struct ResponsesFixtureState {
+        requests: Arc<Mutex<Vec<Value>>>,
+        responses: Arc<Vec<String>>,
+        next_response: Arc<AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct RecordingLlmEventSink {
+        events: Vec<LlmEvent>,
+    }
+
+    impl LlmEventSink for RecordingLlmEventSink {
+        fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
+            self.events.push(event);
+            Ok(())
+        }
+    }
+
+    async fn start_responses_fixture(
+        responses: Vec<String>,
+    ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = ResponsesFixtureState {
+            requests: requests.clone(),
+            responses: Arc::new(responses),
+            next_response: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/v1/responses", post(responses_fixture_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses fixture");
+        let address = listener.local_addr().expect("Responses fixture address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses fixture");
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    async fn responses_fixture_handler(
+        State(state): State<ResponsesFixtureState>,
+        Json(request): Json<Value>,
+    ) -> Response {
+        state
+            .requests
+            .lock()
+            .expect("Responses request capture")
+            .push(request);
+        let response_index = state.next_response.fetch_add(1, Ordering::SeqCst);
+        let Some(response) = state.responses.get(response_index) else {
+            return Response::builder()
+                .status(500)
+                .body(Body::from(format!(
+                    "unexpected Responses fixture request {}",
+                    response_index + 1
+                )))
+                .expect("fixture overflow response");
+        };
+
+        Response::builder()
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(response.clone()))
+            .expect("Responses fixture SSE response")
+    }
+
+    fn responses_sse(events: impl IntoIterator<Item = Value>) -> String {
+        events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn responses_fixture_request(base_url: &str, messages: Vec<ModelMessage>) -> ChatRequest {
+        ChatRequest {
+            model: ModelProfile {
+                name: "responses-fixture-model".to_string(),
+                context_window: 128_000,
+                max_output_tokens: 4_096,
+                provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+                capabilities: ModelCapabilities {
+                    supports_tools: true,
+                    supports_reasoning: true,
+                    supports_images: true,
+                },
+            },
+            base_url: base_url.to_string(),
+            system_prompt: "Responses fixture instructions".to_string(),
+            messages,
+            tools: Vec::new(),
+            provider_api_mode: ProviderApiMode::Responses,
+            reasoning: None,
+            reasoning_capability: ProviderReasoningCapability::Responses {
+                supports_summary: true,
+                supports_previous_response_id: true,
+            },
+            responses_continuation: None,
+            tool_choice: None,
+            parallel_tool_calls: false,
+            timeout_ms: 5_000,
+            stream_idle_timeout_ms: 5_000,
+            stream_max_retries: 0,
+            extra_headers: BTreeMap::new(),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            extra_body: None,
+        }
     }
 
     fn reasoning_fixture_request() -> ChatRequest {
@@ -1211,6 +1979,10 @@ mod tests {
                 content: "Plan a repository change".to_string(),
             }],
             tools: Vec::new(),
+            provider_api_mode: ProviderApiMode::ChatCompletions,
+            reasoning: None,
+            reasoning_capability: ProviderReasoningCapability::Unsupported,
+            responses_continuation: None,
             tool_choice: None,
             parallel_tool_calls: false,
             timeout_ms: 30_000,

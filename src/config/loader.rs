@@ -9,11 +9,11 @@ use fs2::FileExt;
 use crate::cli::RunArgs;
 use crate::config::merge::apply_patch;
 use crate::config::model::{
-    AccessMode, PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig,
-    PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig,
-    PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig,
-    PartialSessionConfig, PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig,
-    ResolvedConfig,
+    AccessMode, ChatCompletionsReasoningParameters, PartialDoclingConfig, PartialFileGuardConfig,
+    PartialFormatConfig, PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig,
+    PartialMcpConfig, PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig,
+    PartialResolvedConfig, PartialSessionConfig, PartialShellConfig, PartialToolOutputConfig,
+    PartialWorkspaceConfig, ProviderApiMode, ReasoningEffort, ReasoningSummary, ResolvedConfig,
 };
 use crate::error::ConfigError;
 
@@ -139,6 +139,12 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             model: Some(config.model.model.clone()),
             prompt_profile: Some(config.model.prompt_profile),
             provider_metadata_mode: Some(config.model.provider_metadata_mode),
+            provider_api_mode: Some(config.model.provider_api_mode),
+            chat_completions_reasoning_parameters: config
+                .model
+                .chat_completions_reasoning_parameters,
+            reasoning_effort: config.model.reasoning_effort.clone(),
+            reasoning_summary: Some(config.model.reasoning_summary),
             api_key_env: Some(config.model.api_key_env.clone()),
             extra_headers: Some(config.model.extra_headers.clone()),
             request_timeout_ms: Some(config.model.request_timeout_ms),
@@ -292,6 +298,13 @@ fn env_patch() -> PartialResolvedConfig {
             patch.model.get_or_insert_default().provider_metadata_mode = Some(parsed);
         }
     }
+    apply_reasoning_env_overrides(
+        &mut patch,
+        env::var("MOYAI_PROVIDER_API_MODE").ok(),
+        env::var("MOYAI_CHAT_COMPLETIONS_REASONING_PARAMETERS").ok(),
+        env::var("MOYAI_REASONING_EFFORT").ok(),
+        env::var("MOYAI_REASONING_SUMMARY").ok(),
+    );
     if let Ok(value) = env::var("MOYAI_API_KEY_ENV") {
         patch.model.get_or_insert_default().api_key_env = Some(Some(value));
     }
@@ -525,6 +538,38 @@ fn env_patch() -> PartialResolvedConfig {
     patch
 }
 
+fn apply_reasoning_env_overrides(
+    patch: &mut PartialResolvedConfig,
+    provider_api_mode: Option<String>,
+    chat_completions_reasoning_parameters: Option<String>,
+    reasoning_effort: Option<String>,
+    reasoning_summary: Option<String>,
+) {
+    if let Some(value) = provider_api_mode
+        && let Some(parsed) = parse_provider_api_mode(&value)
+    {
+        patch.model.get_or_insert_default().provider_api_mode = Some(parsed);
+    }
+    if let Some(value) = chat_completions_reasoning_parameters
+        && let Some(parsed) = parse_chat_completions_reasoning_parameters(&value)
+    {
+        patch
+            .model
+            .get_or_insert_default()
+            .chat_completions_reasoning_parameters = Some(parsed);
+    }
+    if let Some(value) = reasoning_effort
+        && let Some(parsed) = parse_reasoning_effort(&value)
+    {
+        patch.model.get_or_insert_default().reasoning_effort = Some(parsed);
+    }
+    if let Some(value) = reasoning_summary
+        && let Some(parsed) = parse_reasoning_summary(&value)
+    {
+        patch.model.get_or_insert_default().reasoning_summary = Some(parsed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +586,10 @@ mod tests {
         assert!(text.contains("base_url = \"http://127.0.0.1:1234\""));
         assert!(text.contains("model = \"qwen/qwen3.6-35b-a3b\""));
         assert!(text.contains("provider_metadata_mode = \"lm_studio_native_required\""));
+        assert!(text.contains("provider_api_mode = \"auto\""));
+        assert!(text.contains("reasoning_summary = \"none\""));
+        assert!(!text.contains("chat_completions_reasoning_parameters"));
+        assert!(!text.contains("reasoning_effort"));
         assert!(text.contains("max_output_tokens = 8192"));
         assert!(text.contains("[docling]"));
         assert!(text.contains("enabled = false"));
@@ -625,6 +674,66 @@ mod tests {
         let text = fs::read_to_string(&path).expect("read config");
         toml::from_str::<PartialResolvedConfig>(&text).expect("complete config");
     }
+
+    #[test]
+    fn reasoning_environment_overrides_are_typed_and_keep_model_capability_independent() {
+        let mut patch = PartialResolvedConfig::default();
+        apply_reasoning_env_overrides(
+            &mut patch,
+            Some("chat-completions".to_string()),
+            Some("effort-and-summary".to_string()),
+            Some("HIGH".to_string()),
+            Some("concise".to_string()),
+        );
+
+        let resolved = apply_patch(ResolvedConfig::default(), patch);
+        assert_eq!(
+            resolved.model.provider_api_mode,
+            ProviderApiMode::ChatCompletions
+        );
+        assert_eq!(
+            resolved.model.chat_completions_reasoning_parameters,
+            Some(ChatCompletionsReasoningParameters::EffortAndSummary)
+        );
+        assert_eq!(resolved.model.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(resolved.model.reasoning_summary, ReasoningSummary::Concise);
+        assert!(!resolved.model.supports_reasoning);
+    }
+
+    #[test]
+    fn reasoning_environment_value_parsers_cover_supported_contracts() {
+        assert_eq!(parse_provider_api_mode("auto"), Some(ProviderApiMode::Auto));
+        assert_eq!(
+            parse_provider_api_mode("responses"),
+            Some(ProviderApiMode::Responses)
+        );
+        assert_eq!(
+            parse_chat_completions_reasoning_parameters("effort_only"),
+            Some(ChatCompletionsReasoningParameters::EffortOnly)
+        );
+        assert_eq!(
+            parse_chat_completions_reasoning_parameters("effort-and-summary"),
+            Some(ChatCompletionsReasoningParameters::EffortAndSummary)
+        );
+        assert_eq!(
+            parse_reasoning_effort("medium"),
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(
+            parse_reasoning_effort("provider_future_effort"),
+            Some(ReasoningEffort::Custom(
+                "provider_future_effort".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_reasoning_summary("detailed"),
+            Some(ReasoningSummary::Detailed)
+        );
+        assert_eq!(parse_provider_api_mode("invalid"), None);
+        assert_eq!(parse_chat_completions_reasoning_parameters("invalid"), None);
+        assert_eq!(parse_reasoning_effort("  "), None);
+        assert_eq!(parse_reasoning_summary("invalid"), None);
+    }
 }
 
 fn parse_prompt_profile(value: &str) -> Option<crate::config::model::PromptProfile> {
@@ -652,6 +761,54 @@ fn parse_provider_metadata_mode(value: &str) -> Option<crate::config::model::Pro
         | "openai-compatible" => {
             Some(crate::config::model::ProviderMetadataMode::OpenAiCompatibleOnly)
         }
+        _ => None,
+    }
+}
+
+fn parse_provider_api_mode(value: &str) -> Option<ProviderApiMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(ProviderApiMode::Auto),
+        "chat_completions" | "chat-completions" | "chat" => Some(ProviderApiMode::ChatCompletions),
+        "responses" | "response" => Some(ProviderApiMode::Responses),
+        _ => None,
+    }
+}
+
+fn parse_chat_completions_reasoning_parameters(
+    value: &str,
+) -> Option<ChatCompletionsReasoningParameters> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "effort_only" | "effort-only" | "effort" => {
+            Some(ChatCompletionsReasoningParameters::EffortOnly)
+        }
+        "effort_and_summary" | "effort-and-summary" | "summary" => {
+            Some(ChatCompletionsReasoningParameters::EffortAndSummary)
+        }
+        _ => None,
+    }
+}
+
+fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    match normalized.as_str() {
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" => {
+            normalized.parse().ok()
+        }
+        "x_high" | "x-high" => Some(ReasoningEffort::XHigh),
+        _ => trimmed.parse().ok(),
+    }
+}
+
+fn parse_reasoning_summary(value: &str) -> Option<ReasoningSummary> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(ReasoningSummary::None),
+        "auto" => Some(ReasoningSummary::Auto),
+        "concise" => Some(ReasoningSummary::Concise),
+        "detailed" => Some(ReasoningSummary::Detailed),
         _ => None,
     }
 }

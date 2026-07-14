@@ -83,6 +83,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::config::ProviderMetadataMode;
+    use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
     use crate::llm::{ChatRequest, ModelCapabilities, ModelMessage, ModelProfile};
 
     #[test]
@@ -105,6 +106,10 @@ mod tests {
                 content: "hello".to_string(),
             }],
             tools: Vec::new(),
+            provider_api_mode: ProviderApiMode::ChatCompletions,
+            reasoning: None,
+            reasoning_capability: ProviderReasoningCapability::Unsupported,
+            responses_continuation: None,
             tool_choice: None,
             parallel_tool_calls: false,
             timeout_ms: 1,

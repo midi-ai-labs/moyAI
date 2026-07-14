@@ -5,6 +5,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ResolvedConfig;
+use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
 use crate::error::LlmError;
 use crate::llm::{ChatRequest, LlmClient, LlmEvent, LlmEventSink, ModelMessage, ModelProfile};
 use crate::tool::PermissionRequest;
@@ -95,6 +96,10 @@ impl PermissionReviewer<'_> {
                 content: user_message,
             }],
             tools: Vec::new(),
+            provider_api_mode: ProviderApiMode::ChatCompletions,
+            reasoning: None,
+            reasoning_capability: ProviderReasoningCapability::Unsupported,
+            responses_continuation: None,
             tool_choice: None,
             parallel_tool_calls: false,
             timeout_ms: self.config.model.request_timeout_ms,
@@ -238,6 +243,7 @@ mod tests {
             Ok(LlmResponseSummary {
                 finish_reason: FinishReason::Stop,
                 usage: None,
+                response_id: None,
             })
         }
     }

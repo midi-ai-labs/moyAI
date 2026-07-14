@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ProviderMetadataMode;
+use crate::config::model::ProviderApiMode;
 use crate::config::model::{ProviderReasoningCapability, ReasoningEffort, ReasoningSummary};
 use crate::error::LlmError;
 use crate::session::{FinishReason, TokenUsage};
@@ -106,6 +107,14 @@ pub struct ChatRequest {
     pub system_prompt: String,
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ToolSchema>,
+    #[serde(default)]
+    pub provider_api_mode: ProviderApiMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningRequest>,
+    #[serde(default)]
+    pub reasoning_capability: ProviderReasoningCapability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_continuation: Option<ResponsesContinuation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ProviderToolChoice>,
     #[serde(default)]
@@ -124,6 +133,15 @@ pub struct ChatRequest {
     pub extra_body: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponsesContinuation {
+    pub previous_response_id: String,
+    /// Index into the non-system messages in `ChatRequest.messages`. Messages
+    /// before this point are already represented by `previous_response_id`;
+    /// system messages always remain part of the current `instructions` projection.
+    pub input_start: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,6 +158,12 @@ impl ReasoningRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedChatCompletionsReasoningRequest {
+    pub effort: Option<ReasoningEffort>,
+    pub summary: Option<ReasoningSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedResponsesReasoningRequest {
     pub effort: Option<ReasoningEffort>,
     pub summary: Option<ReasoningSummary>,
 }
@@ -169,10 +193,44 @@ pub(crate) fn validate_chat_completions_reasoning_request(
                 summary: (request.summary != ReasoningSummary::None).then_some(request.summary),
             }))
         }
-        ProviderReasoningCapability::ResponsesItemsNotImplemented => Err(LlmError::Message(
-            "item-based Responses reasoning state continuity is not implemented by the OpenAI-compatible Chat Completions transport"
+        ProviderReasoningCapability::Responses { .. } => Err(LlmError::Message(
+            "Responses reasoning capability cannot be used with the Chat Completions transport"
                 .to_string(),
         )),
+    }
+}
+
+pub(crate) fn validate_responses_reasoning_request(
+    request: Option<&ReasoningRequest>,
+    capability: ProviderReasoningCapability,
+) -> Result<Option<ValidatedResponsesReasoningRequest>, LlmError> {
+    let Some(request) = request.filter(|request| !request.is_disabled()) else {
+        return Ok(None);
+    };
+
+    match capability {
+        ProviderReasoningCapability::Unsupported => Err(LlmError::Message(
+            "reasoning parameters were requested for a provider that does not advertise a typed reasoning request contract"
+                .to_string(),
+        )),
+        ProviderReasoningCapability::ChatCompletions { .. } => Err(LlmError::Message(
+            "Chat Completions reasoning capability cannot be used with the Responses transport"
+                .to_string(),
+        )),
+        ProviderReasoningCapability::Responses {
+            supports_summary, ..
+        } => {
+            if request.summary != ReasoningSummary::None && !supports_summary {
+                return Err(LlmError::Message(
+                    "reasoning summary was requested for a Responses provider that does not advertise summary support"
+                        .to_string(),
+                ));
+            }
+            Ok(Some(ValidatedResponsesReasoningRequest {
+                effort: request.effort.clone(),
+                summary: (request.summary != ReasoningSummary::None).then_some(request.summary),
+            }))
+        }
     }
 }
 
@@ -201,6 +259,20 @@ impl ChatRequest {
     }
 
     pub fn validate_provider_lifecycle(&self) -> Result<(), LlmError> {
+        if self.provider_api_mode == ProviderApiMode::Auto {
+            return Err(LlmError::Message(
+                "ChatRequest provider_api_mode must be resolved before transport dispatch"
+                    .to_string(),
+            ));
+        }
+        if let Some(capability_api_mode) = self.reasoning_capability.api_mode()
+            && capability_api_mode != self.provider_api_mode
+        {
+            return Err(LlmError::Message(format!(
+                "reasoning capability for {capability_api_mode:?} cannot be used with {:?}",
+                self.provider_api_mode
+            )));
+        }
         if !self.model.capabilities.supports_tools && !self.tools.is_empty() {
             return Err(LlmError::Message(
                 "ChatRequest provider tools require a tool-capable model profile".to_string(),
@@ -228,6 +300,41 @@ impl ChatRequest {
             return Err(LlmError::Message(
                 "ChatRequest image content requires a vision-capable model profile".to_string(),
             ));
+        }
+        if let Some(continuation) = &self.responses_continuation {
+            if self.provider_api_mode != ProviderApiMode::Responses {
+                return Err(LlmError::Message(
+                    "previous_response_id continuation requires the Responses API".to_string(),
+                ));
+            }
+            if continuation.previous_response_id.trim().is_empty() {
+                return Err(LlmError::Message(
+                    "Responses continuation requires a non-empty previous_response_id".to_string(),
+                ));
+            }
+            let non_system_message_count = self
+                .messages
+                .iter()
+                .filter(|message| !matches!(message, ModelMessage::System { .. }))
+                .count();
+            if continuation.input_start > non_system_message_count {
+                return Err(LlmError::Message(format!(
+                    "Responses continuation input_start {} exceeds non-system message count {}",
+                    continuation.input_start, non_system_message_count
+                )));
+            }
+            if !matches!(
+                self.reasoning_capability,
+                ProviderReasoningCapability::Responses {
+                    supports_previous_response_id: true,
+                    ..
+                }
+            ) {
+                return Err(LlmError::Message(
+                    "Responses continuation requires advertised previous_response_id support"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -404,6 +511,13 @@ fn output_budget_fixture_chat_request() -> ChatRequest {
             }),
             strict: false,
         }],
+        provider_api_mode: ProviderApiMode::Responses,
+        reasoning: None,
+        reasoning_capability: ProviderReasoningCapability::Responses {
+            supports_summary: true,
+            supports_previous_response_id: true,
+        },
+        responses_continuation: None,
         tool_choice: Some(ProviderToolChoice::Required),
         parallel_tool_calls: true,
         timeout_ms: 600_000,
@@ -511,6 +625,8 @@ pub trait LlmEventSink {
 pub struct LlmResponseSummary {
     pub finish_reason: FinishReason,
     pub usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
 }
 
 pub fn validate_toolless_text_response(
@@ -547,7 +663,8 @@ mod tests {
         LlmResponseSummary, OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY, ReasoningRequest,
         openai_compatible_only_tool_policy_fixture_passes, system_prompt_with_provider_policy,
         tool_call_turn_uses_configured_output_budget_fixture_passes,
-        validate_chat_completions_reasoning_request, validate_toolless_text_response,
+        validate_chat_completions_reasoning_request, validate_responses_reasoning_request,
+        validate_toolless_text_response,
     };
     use crate::config::ProviderMetadataMode;
     use crate::config::model::{
@@ -627,6 +744,7 @@ mod tests {
             let summary = LlmResponseSummary {
                 finish_reason,
                 usage: None,
+                response_id: None,
             };
             let result = validate_toolless_text_response("test operation", &summary, false);
             if finish_reason == FinishReason::Stop {
@@ -645,6 +763,7 @@ mod tests {
         let summary = LlmResponseSummary {
             finish_reason: FinishReason::Stop,
             usage: None,
+            response_id: None,
         };
         assert!(matches!(
             validate_toolless_text_response("test operation", &summary, true),
@@ -660,7 +779,10 @@ mod tests {
             ProviderReasoningCapability::ChatCompletions {
                 parameters: ChatCompletionsReasoningParameters::EffortOnly,
             },
-            ProviderReasoningCapability::ResponsesItemsNotImplemented,
+            ProviderReasoningCapability::Responses {
+                supports_summary: true,
+                supports_previous_response_id: true,
+            },
         ] {
             assert!(
                 validate_chat_completions_reasoning_request(Some(&disabled), capability)
@@ -686,7 +808,10 @@ mod tests {
         assert!(
             validate_chat_completions_reasoning_request(
                 Some(&effort),
-                ProviderReasoningCapability::ResponsesItemsNotImplemented,
+                ProviderReasoningCapability::Responses {
+                    supports_summary: true,
+                    supports_previous_response_id: true,
+                },
             )
             .is_err()
         );
@@ -726,6 +851,41 @@ mod tests {
                 },
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn responses_reasoning_contract_validates_summary_support() {
+        let request = ReasoningRequest {
+            effort: Some(ReasoningEffort::High),
+            summary: ReasoningSummary::Concise,
+        };
+        assert!(
+            validate_responses_reasoning_request(
+                Some(&request),
+                ProviderReasoningCapability::Responses {
+                    supports_summary: true,
+                    supports_previous_response_id: true,
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_responses_reasoning_request(
+                Some(&request),
+                ProviderReasoningCapability::Responses {
+                    supports_summary: false,
+                    supports_previous_response_id: true,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_responses_reasoning_request(
+                Some(&request),
+                ProviderReasoningCapability::Unsupported,
+            )
+            .is_err()
         );
     }
 }

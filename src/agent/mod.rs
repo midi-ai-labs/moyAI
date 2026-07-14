@@ -13,13 +13,14 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::ConfirmationPrompt;
+use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
 use crate::config::{AccessMode, MultiAgentMode, PromptProfile, ResolvedConfig};
 use crate::context::context_window::ContextWindowTokenStatus;
 use crate::context::world_state::WorldState;
 use crate::error::AgentError;
 use crate::llm::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, ModelContentPart, ModelMessage, ModelProfile,
-    ModelToolCall, ToolSchema,
+    ModelToolCall, ReasoningRequest, ResponsesContinuation, ToolSchema,
 };
 use crate::protocol::{
     ContentPart, HistoryItem, HistoryItemPayload, ProtocolEventStore, TurnId,
@@ -254,6 +255,7 @@ impl AgentLoop {
         let mut failed_tool_calls_by_name = BTreeMap::<String, usize>::new();
         let mut latest_usage: Option<TokenUsage> = None;
         let mut active_goal_id_for_turn: Option<String> = None;
+        let mut responses_continuation: Option<ResponsesContinuation> = None;
 
         let outcome: Result<RunSummary, AgentError> = async {
             loop {
@@ -300,12 +302,20 @@ impl AgentLoop {
                 if let Some(goal_for_request) = &goal_for_request {
                     active_goal_id_for_turn = Some(goal_for_request.goal_id.clone());
                 }
-                let request_messages = messages_with_goal_steering(
+                let (request_messages, has_transient_goal_steering) = messages_with_goal_steering(
                     &messages,
                     goal_for_request.as_ref().map(|goal| &goal.goal),
                 );
-                let prepared_request =
-                    self.chat_request(&request, &request_messages, &tool_schemas)?;
+                let prepared_request = self.chat_request(
+                    &request,
+                    &request_messages,
+                    &tool_schemas,
+                    // Goal steering is a request-local user item whose budget text can
+                    // change every round, so it is not a stable Responses prefix.
+                    (!has_transient_goal_steering)
+                        .then(|| responses_continuation.clone())
+                        .flatten(),
+                )?;
                 let prepared_request =
                     self.ensure_context_within_limit(&request, prepared_request)?;
                 sink.emit(RunEvent::WorldStateUpdated {
@@ -322,6 +332,7 @@ impl AgentLoop {
                 })?;
                 renew_admission_lease(&self.store, &request).await?;
                 model_request_count += 1;
+                let provider_api_mode = prepared_request.chat_request.provider_api_mode;
                 let mut collector = StreamingResponseCollector::new(assistant.id, sink);
                 let stream_response = {
                     let request_gate = request
@@ -386,8 +397,26 @@ impl AgentLoop {
                         )
                         .await;
                 };
-                let response = response?;
                 ensure_admission_active(&self.store, &request).await?;
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if let Some(usage) = error.token_usage().cloned() {
+                            latest_usage = Some(usage.clone());
+                            if let Some(goal_for_request) = &goal_for_request {
+                                self.store
+                                    .session_repo()
+                                    .account_thread_goal_usage_for_goal(
+                                        request.session.session.id,
+                                        goal_token_delta(Some(&usage)),
+                                        Some(goal_for_request.goal_id.as_str()),
+                                    )
+                                    .await?;
+                            }
+                        }
+                        return Err(error.into());
+                    }
+                };
                 let collector = collector.into_inner();
                 latest_usage = response.usage.clone();
                 if let Some(goal_for_request) = &goal_for_request {
@@ -466,6 +495,15 @@ impl AgentLoop {
                     messages.push(ModelMessage::Assistant {
                         content: collector.text.clone(),
                     });
+                    responses_continuation = (!has_transient_goal_steering)
+                        .then(|| {
+                            response_continuation_after_output(
+                                provider_api_mode,
+                                response.response_id.clone(),
+                                non_system_message_count(&messages),
+                            )
+                        })
+                        .flatten();
                     if drain_pending_steers(
                         &self.store,
                         &mut request,
@@ -660,6 +698,15 @@ impl AgentLoop {
                     content: (!collector.text.trim().is_empty()).then_some(collector.text),
                     tool_calls: collector.tool_calls.clone(),
                 });
+                responses_continuation = (!has_transient_goal_steering)
+                    .then(|| {
+                        response_continuation_after_output(
+                            provider_api_mode,
+                            response.response_id,
+                            non_system_message_count(&messages),
+                        )
+                    })
+                    .flatten();
 
                 for call in collector.tool_calls {
                     if request.run_control.is_cancelled() {
@@ -877,6 +924,7 @@ impl AgentLoop {
         request: &AgentRunRequest,
         messages: &[ModelMessage],
         tools: &[ToolSchema],
+        responses_continuation: Option<ResponsesContinuation>,
     ) -> Result<PreparedChatRequest, AgentError> {
         let mut prompt_config = request.config.clone();
         prompt_config.permissions.access_mode = request.current_access_mode();
@@ -890,6 +938,20 @@ impl AgentLoop {
             .tool_services
             .skills
             .snapshot_for_workspace(&request.session.workspace.root);
+        let provider_api_mode = request
+            .config
+            .model
+            .provider_api_mode
+            .resolved_for_provider_metadata_mode(request.config.model.provider_metadata_mode);
+        let reasoning = reasoning_request(&request.config);
+        if reasoning.is_some() && !request.model.capabilities.supports_reasoning {
+            return Err(AgentError::Message(format!(
+                "reasoning parameters were requested for model `{}`, but its current profile does not advertise reasoning support",
+                request.model.name
+            )));
+        }
+        let reasoning_capability =
+            reasoning_capability_for_config(&request.config, provider_api_mode);
         let chat_request = ChatRequest {
             model: request.model.clone(),
             base_url: request.config.model.base_url.clone(),
@@ -902,6 +964,10 @@ impl AgentLoop {
             ),
             messages: messages.to_vec(),
             tools: tools.to_vec(),
+            provider_api_mode,
+            reasoning,
+            reasoning_capability,
+            responses_continuation,
             tool_choice: None,
             parallel_tool_calls: crate::llm::effective_parallel_tool_calls(
                 tools.len(),
@@ -1798,19 +1864,67 @@ struct PreparedChatRequest {
     world_state: WorldState,
 }
 
+fn reasoning_request(config: &ResolvedConfig) -> Option<ReasoningRequest> {
+    let request = ReasoningRequest {
+        effort: config.model.reasoning_effort.clone(),
+        summary: config.model.reasoning_summary,
+    };
+    (!request.is_disabled()).then_some(request)
+}
+
+fn reasoning_capability_for_config(
+    config: &ResolvedConfig,
+    provider_api_mode: ProviderApiMode,
+) -> ProviderReasoningCapability {
+    match provider_api_mode {
+        ProviderApiMode::Auto => ProviderReasoningCapability::Unsupported,
+        ProviderApiMode::ChatCompletions => config
+            .model
+            .chat_completions_reasoning_parameters
+            .map(|parameters| ProviderReasoningCapability::ChatCompletions { parameters })
+            .unwrap_or(ProviderReasoningCapability::Unsupported),
+        ProviderApiMode::Responses => ProviderReasoningCapability::Responses {
+            supports_summary: true,
+            supports_previous_response_id: true,
+        },
+    }
+}
+
+fn response_continuation_after_output(
+    provider_api_mode: ProviderApiMode,
+    response_id: Option<String>,
+    input_start: usize,
+) -> Option<ResponsesContinuation> {
+    (provider_api_mode == ProviderApiMode::Responses)
+        .then_some(response_id)
+        .flatten()
+        .filter(|response_id| !response_id.trim().is_empty())
+        .map(|previous_response_id| ResponsesContinuation {
+            previous_response_id,
+            input_start,
+        })
+}
+
+fn non_system_message_count(messages: &[ModelMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| !matches!(message, ModelMessage::System { .. }))
+        .count()
+}
+
 fn messages_with_goal_steering(
     messages: &[ModelMessage],
     goal: Option<&ThreadGoal>,
-) -> Vec<ModelMessage> {
+) -> (Vec<ModelMessage>, bool) {
     let Some(goal) = goal else {
-        return messages.to_vec();
+        return (messages.to_vec(), false);
     };
     let Some(steering) = goal_steering::steering_message_for_goal(goal) else {
-        return messages.to_vec();
+        return (messages.to_vec(), false);
     };
     let mut request_messages = messages.to_vec();
     request_messages.push(steering);
-    request_messages
+    (request_messages, true)
 }
 
 async fn ensure_admission_active(
@@ -2840,6 +2954,35 @@ mod tests {
     use crate::tool::truncate::ToolTruncator;
     use crate::workspace::WorkspaceDiscovery;
 
+    #[test]
+    fn response_continuation_reuses_only_typed_responses_ids() {
+        let continuation = response_continuation_after_output(
+            ProviderApiMode::Responses,
+            Some("resp_123".to_string()),
+            4,
+        )
+        .expect("Responses id should become same-run continuation state");
+        assert_eq!(continuation.previous_response_id, "resp_123");
+        assert_eq!(continuation.input_start, 4);
+
+        assert!(
+            response_continuation_after_output(
+                ProviderApiMode::ChatCompletions,
+                Some("resp_ignored".to_string()),
+                4,
+            )
+            .is_none()
+        );
+        assert!(
+            response_continuation_after_output(
+                ProviderApiMode::Responses,
+                Some("   ".to_string()),
+                4,
+            )
+            .is_none()
+        );
+    }
+
     struct ScriptedClient {
         responses: Mutex<Vec<ScriptedResponse>>,
         requests: Arc<Mutex<Vec<ChatRequest>>>,
@@ -2871,6 +3014,7 @@ mod tests {
                     total_tokens: 15,
                     reasoning_tokens: None,
                 }),
+                response_id: None,
             })
         }
     }

@@ -113,8 +113,24 @@ pub enum ProviderMetadataMode {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiMode {
     #[default]
+    Auto,
     ChatCompletions,
     Responses,
+}
+
+impl ProviderApiMode {
+    pub const fn resolved_for_provider_metadata_mode(
+        self,
+        provider_metadata_mode: ProviderMetadataMode,
+    ) -> Self {
+        match self {
+            Self::Auto => match provider_metadata_mode {
+                ProviderMetadataMode::LmStudioNativeRequired => Self::Responses,
+                ProviderMetadataMode::OpenAiCompatibleOnly => Self::ChatCompletions,
+            },
+            explicit => explicit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,10 +154,10 @@ pub enum ProviderReasoningCapability {
     ChatCompletions {
         parameters: ChatCompletionsReasoningParameters,
     },
-    /// Reserved for the item-based Responses transport. The current
-    /// OpenAI-compatible client must reject this capability rather than
-    /// pretending that Chat Completions can preserve provider reasoning state.
-    ResponsesItemsNotImplemented,
+    Responses {
+        supports_summary: bool,
+        supports_previous_response_id: bool,
+    },
 }
 
 impl ProviderReasoningCapability {
@@ -149,7 +165,7 @@ impl ProviderReasoningCapability {
         match self {
             Self::Unsupported => None,
             Self::ChatCompletions { .. } => Some(ProviderApiMode::ChatCompletions),
-            Self::ResponsesItemsNotImplemented => Some(ProviderApiMode::Responses),
+            Self::Responses { .. } => Some(ProviderApiMode::Responses),
         }
     }
 }
@@ -274,6 +290,10 @@ pub struct ModelConfig {
     pub model: String,
     pub prompt_profile: PromptProfile,
     pub provider_metadata_mode: ProviderMetadataMode,
+    pub provider_api_mode: ProviderApiMode,
+    pub chat_completions_reasoning_parameters: Option<ChatCompletionsReasoningParameters>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_summary: ReasoningSummary,
     pub api_key_env: Option<String>,
     pub extra_headers: BTreeMap<String, String>,
     pub request_timeout_ms: u64,
@@ -480,6 +500,10 @@ impl Default for ResolvedConfig {
                 model: DEFAULT_MODEL_NAME.to_string(),
                 prompt_profile: PromptProfile::Auto,
                 provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+                provider_api_mode: ProviderApiMode::Auto,
+                chat_completions_reasoning_parameters: None,
+                reasoning_effort: None,
+                reasoning_summary: ReasoningSummary::None,
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
                 extra_headers: BTreeMap::new(),
                 request_timeout_ms: 600_000,
@@ -637,6 +661,12 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
             model: Some(config.model.model.clone()),
             prompt_profile: Some(config.model.prompt_profile),
             provider_metadata_mode: Some(config.model.provider_metadata_mode),
+            provider_api_mode: Some(config.model.provider_api_mode),
+            chat_completions_reasoning_parameters: config
+                .model
+                .chat_completions_reasoning_parameters,
+            reasoning_effort: config.model.reasoning_effort.clone(),
+            reasoning_summary: Some(config.model.reasoning_summary),
             api_key_env: None,
             extra_headers: Some(config.model.extra_headers.clone()),
             request_timeout_ms: Some(config.model.request_timeout_ms),
@@ -743,6 +773,10 @@ pub struct PartialModelConfig {
     pub model: Option<String>,
     pub prompt_profile: Option<PromptProfile>,
     pub provider_metadata_mode: Option<ProviderMetadataMode>,
+    pub provider_api_mode: Option<ProviderApiMode>,
+    pub chat_completions_reasoning_parameters: Option<ChatCompletionsReasoningParameters>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_summary: Option<ReasoningSummary>,
     pub api_key_env: Option<Option<String>>,
     pub extra_headers: Option<BTreeMap<String, String>>,
     pub request_timeout_ms: Option<u64>,
@@ -898,7 +932,36 @@ mod reasoning_contract_tests {
     }
 
     #[test]
-    fn provider_reasoning_capability_keeps_responses_state_explicitly_unimplemented() {
+    fn provider_api_mode_auto_resolves_from_the_typed_provider_contract() {
+        assert_eq!(ProviderApiMode::default(), ProviderApiMode::Auto);
+        assert_eq!(
+            ProviderApiMode::Auto.resolved_for_provider_metadata_mode(
+                super::ProviderMetadataMode::LmStudioNativeRequired,
+            ),
+            ProviderApiMode::Responses
+        );
+        assert_eq!(
+            ProviderApiMode::Auto.resolved_for_provider_metadata_mode(
+                super::ProviderMetadataMode::OpenAiCompatibleOnly,
+            ),
+            ProviderApiMode::ChatCompletions
+        );
+        assert_eq!(
+            ProviderApiMode::ChatCompletions.resolved_for_provider_metadata_mode(
+                super::ProviderMetadataMode::LmStudioNativeRequired,
+            ),
+            ProviderApiMode::ChatCompletions
+        );
+        assert_eq!(
+            ProviderApiMode::Responses.resolved_for_provider_metadata_mode(
+                super::ProviderMetadataMode::OpenAiCompatibleOnly,
+            ),
+            ProviderApiMode::Responses
+        );
+    }
+
+    #[test]
+    fn provider_reasoning_capability_describes_responses_state_support() {
         let effort_only = ProviderReasoningCapability::ChatCompletions {
             parameters: ChatCompletionsReasoningParameters::EffortOnly,
         };
@@ -915,10 +978,18 @@ mod reasoning_contract_tests {
         );
         assert!(!ChatCompletionsReasoningParameters::EffortOnly.supports_summary());
         assert!(ChatCompletionsReasoningParameters::EffortAndSummary.supports_summary());
-        assert_eq!(
-            ProviderReasoningCapability::ResponsesItemsNotImplemented.api_mode(),
-            Some(ProviderApiMode::Responses)
-        );
+        let responses = ProviderReasoningCapability::Responses {
+            supports_summary: true,
+            supports_previous_response_id: true,
+        };
+        assert_eq!(responses.api_mode(), Some(ProviderApiMode::Responses));
+        assert!(matches!(
+            responses,
+            ProviderReasoningCapability::Responses {
+                supports_summary: true,
+                supports_previous_response_id: true,
+            }
+        ));
         assert_eq!(ProviderReasoningCapability::Unsupported.api_mode(), None);
     }
 
@@ -929,5 +1000,16 @@ mod reasoning_contract_tests {
             serde_json::to_string(&ReasoningSummary::Concise).expect("summary"),
             "\"concise\""
         );
+    }
+
+    #[test]
+    fn model_reasoning_defaults_preserve_provider_defaults_and_output_capability() {
+        let model = super::ResolvedConfig::default().model;
+
+        assert_eq!(model.provider_api_mode, ProviderApiMode::Auto);
+        assert_eq!(model.chat_completions_reasoning_parameters, None);
+        assert_eq!(model.reasoning_effort, None);
+        assert_eq!(model.reasoning_summary, ReasoningSummary::None);
+        assert!(!model.supports_reasoning);
     }
 }

@@ -3,11 +3,13 @@ pub mod contract;
 pub mod dto;
 pub mod model_probe;
 pub mod openai_compat;
+pub mod responses;
 
 pub use catalog::{ConfigModelCatalog, ModelCatalog};
 pub use contract::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary, ModelCapabilities,
-    ModelContentPart, ModelMessage, ModelProfile, ModelToolCall, ProviderToolChoice, ToolSchema,
+    ModelContentPart, ModelMessage, ModelProfile, ModelToolCall, ProviderToolChoice,
+    ReasoningRequest, ResponsesContinuation, ToolSchema,
     control_plane_parallel_tool_calls_projection, effective_parallel_tool_calls,
     tool_surface_scoped_parallel_tool_calls_projection, validate_toolless_text_response,
 };

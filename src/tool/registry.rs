@@ -268,8 +268,8 @@ mod tests {
                 "list",
                 "read",
                 "shell",
-                "update_plan",
                 "update_goal",
+                "update_plan",
                 "write"
             ]
         );

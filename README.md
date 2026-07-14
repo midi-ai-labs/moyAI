@@ -61,6 +61,8 @@ moyAI is designed around those constraints:
 - One Desktop instance per user; launching it again restores the existing window.
 - CLI and TUI for terminal-centered workflows.
 - OpenAI-compatible local LLM connection with model availability checks.
+- Evidence-first task planning with the canonical `update_plan` tool for non-trivial work.
+- LM Studio Responses API support with same-run `previous_response_id` continuity and typed reasoning summaries.
 - LM Studio metadata discovery through `/v1/models` and `/api/v1/models`.
 - Workspace search, directory inspection, guarded file reads, diff-based edits, and shell execution.
 - Permission presets: `default`, `auto_review`, and `full_access`. Desktop remembers the selected preset globally for the next launch and also on the currently open root session. In TUI, F8 remembers the choice for the open root session, or globally when no session is open; child agent sessions cannot replace the root access owner. `auto_review` keeps deterministic low-risk operations as a fast path and sends remaining permission requests to a separate, tool-less AI reviewer using the configured model. The typed JSON allow/deny `outcome` is the sole decision owner; omitted risk, user authorization, and rationale metadata receive safe defaults. Only a normally completed `allow` runs automatically, while deny, an unknown outcome, timeout, transport, response-shape, parse, or provider-terminal failures fall back to human confirmation. `full_access` automatically allows detected risks inside the configured boundary and still confirms outside-boundary actions. Choosing **do not run; change instructions** records only the requesting tool as `Declined`, records other tools stopped by the interruption as `Cancelled`, and interrupts the current root task—even when a child agent requested approval—without feeding a denial back to the model. The internal **deny and continue** decision, an external Stop, and an operational failure remain separate typed outcomes. Neither classification nor AI review is an OS filesystem sandbox, and commands run with the current user account.
@@ -143,6 +145,8 @@ Example:
 base_url = "http://127.0.0.1:1234"
 model = "qwen/qwen3.6-35b-a3b"
 provider_metadata_mode = "lm_studio_native_required"
+provider_api_mode = "auto"
+reasoning_summary = "none"
 context_window = 131072
 supports_tools = true
 supports_images = true
@@ -173,6 +177,10 @@ Common environment variables:
 - `MOYAI_BASE_URL`
 - `MOYAI_MODEL`
 - `MOYAI_PROVIDER_METADATA_MODE`
+- `MOYAI_PROVIDER_API_MODE`
+- `MOYAI_CHAT_COMPLETIONS_REASONING_PARAMETERS`
+- `MOYAI_REASONING_EFFORT`
+- `MOYAI_REASONING_SUMMARY`
 - `MOYAI_CONFIG_PATH`
 - `MOYAI_DATA_DIR`
 - `MOYAI_ACCESS_MODE`
@@ -206,6 +214,18 @@ inside moyAI instead of relying on shell environment variables. Current vLLM-MLX
 `/v1/status` responses expose the hosted model name, but not the server startup `--max-tokens` /
 `--max-request-tokens` values, so moyAI auto-detects the model and keeps request limits as managed
 config unless a provider exposes those fields in `/v1/models`.
+
+`provider_api_mode = "auto"` is the default transport policy. It resolves LM Studio native mode to
+`/v1/responses` and OpenAI-compatible-only mode to `/v1/chat/completions`. The Responses transport
+keeps provider state within the active run by reusing `previous_response_id` and sending only new
+tool outputs or steer input after a completed response. Raw reasoning text is neither replayed nor
+stored as assistant context; only typed reasoning-summary events are exposed when a summary is
+requested.
+
+Reasoning controls are optional. A reasoning-capable model can use, for example,
+`reasoning_effort = "medium"` and `reasoning_summary = "concise"`. Responses has a standard typed
+contract. Chat Completions varies by provider, so reasoning parameters remain fail-closed unless
+`chat_completions_reasoning_parameters = "effort_only"` or `"effort_and_summary"` is configured.
 
 ## Multi-Agent Collaboration (Opt-in)
 

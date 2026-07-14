@@ -18,6 +18,18 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
     if let Some(value) = patch.provider_metadata_mode {
         target.provider_metadata_mode = value;
     }
+    if let Some(value) = patch.provider_api_mode {
+        target.provider_api_mode = value;
+    }
+    if let Some(value) = patch.chat_completions_reasoning_parameters {
+        target.chat_completions_reasoning_parameters = Some(value);
+    }
+    if let Some(value) = patch.reasoning_effort {
+        target.reasoning_effort = Some(value);
+    }
+    if let Some(value) = patch.reasoning_summary {
+        target.reasoning_summary = value;
+    }
     if let Some(value) = patch.api_key_env {
         target.api_key_env = value;
     }
@@ -313,4 +325,47 @@ pub fn apply_patch(mut target: ResolvedConfig, patch: PartialResolvedConfig) -> 
         apply_logging(&mut target.logging, value);
     }
     target
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_patch;
+    use crate::config::model::{
+        ChatCompletionsReasoningParameters, PartialModelConfig, PartialResolvedConfig,
+        ProviderApiMode, ReasoningEffort, ReasoningSummary, ResolvedConfig,
+    };
+
+    #[test]
+    fn model_reasoning_patch_merges_without_changing_output_capability() {
+        let defaults = ResolvedConfig::default();
+        assert!(!defaults.model.supports_reasoning);
+
+        let resolved = apply_patch(
+            defaults,
+            PartialResolvedConfig {
+                model: Some(PartialModelConfig {
+                    provider_api_mode: Some(ProviderApiMode::ChatCompletions),
+                    chat_completions_reasoning_parameters: Some(
+                        ChatCompletionsReasoningParameters::EffortAndSummary,
+                    ),
+                    reasoning_effort: Some(ReasoningEffort::High),
+                    reasoning_summary: Some(ReasoningSummary::Detailed),
+                    ..PartialModelConfig::default()
+                }),
+                ..PartialResolvedConfig::default()
+            },
+        );
+
+        assert_eq!(
+            resolved.model.provider_api_mode,
+            ProviderApiMode::ChatCompletions
+        );
+        assert_eq!(
+            resolved.model.chat_completions_reasoning_parameters,
+            Some(ChatCompletionsReasoningParameters::EffortAndSummary)
+        );
+        assert_eq!(resolved.model.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(resolved.model.reasoning_summary, ReasoningSummary::Detailed);
+        assert!(!resolved.model.supports_reasoning);
+    }
 }

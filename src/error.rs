@@ -103,8 +103,22 @@ pub enum LlmError {
     },
     #[error("{operation} received a tool call in a tool-less text response")]
     ToollessTextShape { operation: String },
+    #[error("provider returned an incomplete response: {reason}")]
+    IncompleteResponse {
+        reason: String,
+        usage: Option<crate::session::TokenUsage>,
+    },
     #[error("{0}")]
     Message(String),
+}
+
+impl LlmError {
+    pub fn token_usage(&self) -> Option<&crate::session::TokenUsage> {
+        match self {
+            Self::IncompleteResponse { usage, .. } => usage.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
