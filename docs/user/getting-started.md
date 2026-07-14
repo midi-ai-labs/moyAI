@@ -57,10 +57,12 @@ TUI では実行中も `Ctrl+Enter` で現在 turn へ追加指示を送り、`C
 `access_mode` は shell / file operation の確認動作を切り替える。
 
 - `default`: 設定済み境界内のlist/search/readだけを自動承認する。編集、shell、設定済み境界外、network、delete/moveなどは確認する。
-- `auto_review`: 上記に加えてrisk-freeな設定済み境界内の編集を自動承認する。shell、外部接続、設定済み境界外、危険操作は確認する。
-- `full_access`: 強い権限で実行する。通常の設定済み境界内操作は自動承認するが、検出したnetwork・外部接続・設定済み境界外・保護対象は引き続き確認する。信頼できるworkspaceでのみ使う。
+- `auto_review`: risk-freeな設定済み境界内操作と、明示設定したDocling endpointへのworkspace内file uploadは決定論的規則で即時承認する。それ以外は、独立したAI Reviewerがユーザー依頼、直近task context、正確なpermission request、対象path、検出riskを評価する。typed JSONの`outcome`だけを判定元とし、省略された`risk_level`、`user_authorization`、`rationale`は安全な既定値へ正規化する。正常なtool-less `Stop`で完了した`allow`だけを実行し、`deny`、unknown outcome、timeout、通信失敗、provider終端・response shape・JSON形式の不整合では理由を付けて人間確認へ戻す。
+- `full_access`: PathGuardが設定済み境界内として受理した操作は、network・外部接続/setup・delete/move・保護対象を含めて自動承認する。検出した設定済み境界外操作だけは引き続き確認する。信頼できるworkspaceでのみ使う。
 
-permission reviewはtool requestとshell command中のliteral target/riskを分類する仕組みであり、OS filesystem sandboxではない。特にshellは現在のユーザー権限で動き、変数、式、子process内で動的に組み立てたpathをmoyAIが実行前に完全解決することはできない。境界の強制が必要な環境では`default`または`auto_review`を使い、shellを確認してから許可する。
+permission reviewのdeterministic fast pathはtool requestとshell command中のliteral target/riskをhardcoded規則で分類する。`auto_review`のAI Reviewerはmain agentと同じ設定済みmodel/providerを使う別requestで、tool accessを持たず、shellや言語名そのものではなく目的、宛先、範囲、可逆性を評価する。したがってreview対象ごとに追加のmodel callが発生する。特にshellとその子processは現在のユーザー権限で動き、変数、式、script内部で動的に組み立てたpathやnetwork accessをmoyAIが実行前に完全解決することはできない。AI判定もOS filesystem sandboxではないため、`auto_review`は信頼できるworkspaceで使い、より厳しい確認が必要な環境では`default`を使う。
+
+`read`と`grep`はUTF-8を優先し、UTF-8でないtextを厳密にShift_JIS decodeできる場合は自動的に読み取る。Shift_JISで読んだfileはUTF-8専用編集baselineの対象にしない。長いtool/Docling出力がmoyAIのRoaming data directoryへ退避された場合、現在sessionが生成した正確な出力fileだけを`read`または`grep`で再利用できる。
 
 Desktopではtopbar/composer付近のaccess mode chipから切り替える。明示的に切り替えた値はglobal configの`permissions.access_mode`と、現在開いているroot sessionへ一貫して保存される。これにより、次回起動、別workspace、新規chatではglobal設定を使い、同じsessionをDesktopまたはTUIで再度開いた場合も同じ選択を使う。sessionを開いていない場合はglobal設定だけを保存する。`MOYAI_ACCESS_MODE`など、より優先度の高い明示overrideがある場合はその値が優先される。
 
@@ -70,8 +72,12 @@ TUIでは、root sessionを開いた状態のF8とConfig EditorのF2（Apply Ses
 
 確認が必要な tool call では dialog が出る。
 
-- `許可`: tool call を続行する。
-- `拒否`: tool call を実行せず、拒否結果を model に返す。
+- `実行する`: tool call を承認して続行する。
+- `実行せず、指示を変更する`: tool call を実行せず、要求元のtaskを停止して次の指示を待つ。拒否結果をmodelへ返して自動retryさせる動作ではない。
+
+Desktopでは`Esc`も「実行せず、指示を変更する」と同じ動作になる。CLIの`N`または空入力、TUIの`d`または`Esc`も同様に、要求元taskを停止する。TUIの`Ctrl+X`は引き続きcurrent Agent Tree全体を停止する操作であり、個別のpermission応答とは異なる。
+
+このとき、そのconfirmationを要求したtoolだけは`Failed`ではなく`Declined`（未実行）、同じ中断で止まるroot・sibling・他agentのtoolは`Cancelled`、current root turnは`Interrupted`かつ`ApprovalAborted`として保存される。Sub Agentが要求した場合もcurrent root taskへ伝播する。内部/API上の「実行せず続行する」`Denied`、通常のStop (`UserStop` / `TreeStopped`)、runtime・storage・providerの失敗 (`Failed`) は別の状態であり、互いにpermission拒否へ変換しない。sessionを開き直した後も、このtyped状態から同じ表示を復元する。
 
 例: `curl http://...`、`git pull`、delete/move 系 shell command、workspace 外書き込み。
 

@@ -4,11 +4,12 @@ use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::protocol::TurnInterruptionCause;
+use crate::runtime::cancel::{RunTerminalRoute, RunTerminalRouteKind};
+use crate::runtime::{RunCancelOutcome, RunContinuationOutcome, RunControl};
+use crate::session::SessionId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
-
-use crate::session::SessionId;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -280,6 +281,8 @@ pub enum AgentControlError {
     StaleExecution(AgentPath),
     #[error("agent `{0}` still has registered children")]
     AgentHasChildren(AgentPath),
+    #[error("the root run control is already owned by a different live agent tree")]
+    RunControlOwnedByDifferentTree,
 }
 
 #[derive(Clone)]
@@ -288,10 +291,40 @@ pub struct AgentControl {
 }
 
 struct AgentControlInner {
-    tree_cancel: CancellationToken,
+    tree_control: RunControl,
+    root_terminal_router: Arc<RunTerminalRoute>,
     state: Mutex<AgentTreeState>,
     mail_delivery: Mutex<()>,
     activity_tx: watch::Sender<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TreeClassificationResult {
+    root_outcome: RunCancelOutcome,
+    tree_applied: bool,
+    source_matched: bool,
+}
+
+impl TreeClassificationResult {
+    fn rejected() -> Self {
+        Self {
+            root_outcome: RunCancelOutcome::Rejected,
+            tree_applied: false,
+            source_matched: true,
+        }
+    }
+
+    fn unroutable() -> Self {
+        Self {
+            root_outcome: RunCancelOutcome::Rejected,
+            tree_applied: false,
+            source_matched: false,
+        }
+    }
+
+    fn changed(self) -> bool {
+        matches!(self.root_outcome, RunCancelOutcome::Applied) || self.tree_applied
+    }
 }
 
 struct AgentTreeState {
@@ -306,7 +339,7 @@ struct AgentEntry {
     status: AgentStatus,
     last_activity: Option<String>,
     execution_marker: Option<Arc<()>>,
-    node_cancel: CancellationToken,
+    run_control: RunControl,
     mailbox: VecDeque<AgentMailboxMessage>,
     mailbox_generation: u64,
     trigger_admission_epoch: u64,
@@ -318,7 +351,14 @@ pub struct AgentExecutionLease {
     control: AgentControl,
     path: AgentPath,
     marker: Arc<()>,
-    cancel: CancellationToken,
+    run_control: RunControl,
+}
+
+pub enum AgentRootContinuationOutcome {
+    Admitted(AgentExecutionLease),
+    Blocked,
+    NotReady,
+    Invalid,
 }
 
 #[must_use]
@@ -337,13 +377,20 @@ impl AgentControl {
         root_session_id: SessionId,
         max_concurrent_agents: usize,
     ) -> Result<(Self, AgentExecutionLease), AgentControlError> {
+        Self::with_root_control(root_session_id, max_concurrent_agents, RunControl::new())
+    }
+
+    pub fn with_root_control(
+        root_session_id: SessionId,
+        max_concurrent_agents: usize,
+        root_control: RunControl,
+    ) -> Result<(Self, AgentExecutionLease), AgentControlError> {
         if max_concurrent_agents == 0 {
             return Err(AgentControlError::InvalidCapacity);
         }
 
-        let tree_cancel = CancellationToken::new();
+        let tree_control = RunControl::new();
         let (activity_tx, _) = watch::channel(0);
-        let root_cancel = tree_cancel.child_token();
         let (mailbox_activity_tx, _) = watch::channel(0);
         let root = AgentPath::root();
         let mut agents = HashMap::new();
@@ -356,7 +403,7 @@ impl AgentControl {
                 status: AgentStatus::PendingInit,
                 last_activity: None,
                 execution_marker: None,
-                node_cancel: root_cancel,
+                run_control: root_control.clone(),
                 mailbox: VecDeque::new(),
                 mailbox_generation: 0,
                 trigger_admission_epoch: 0,
@@ -364,18 +411,26 @@ impl AgentControl {
                 mailbox_activity_tx,
             },
         );
-        let control = Self {
-            inner: Arc::new(AgentControlInner {
-                tree_cancel,
+        let inner = Arc::new_cyclic(|tree: &std::sync::Weak<AgentControlInner>| {
+            let tree = tree.clone();
+            let root_terminal_router: Arc<RunTerminalRoute> =
+                Arc::new(move |source, kind, cause| {
+                    let inner = tree.upgrade()?;
+                    AgentControl { inner }.route_terminal_outcome(source, kind, cause)
+                });
+            AgentControlInner {
+                tree_control,
+                root_terminal_router,
                 state: Mutex::new(AgentTreeState {
                     max_concurrent_agents,
                     agents,
                 }),
                 mail_delivery: Mutex::new(()),
                 activity_tx,
-            }),
-        };
-        let root_execution = control.try_acquire_execution(&root)?;
+            }
+        });
+        let control = Self { inner };
+        let root_execution = control.try_acquire_execution_with_control(&root, root_control)?;
         Ok((control, root_execution))
     }
 
@@ -390,7 +445,7 @@ impl AgentControl {
             .join(task_name)
             .map_err(AgentControlError::InvalidPath)?;
         let mut state = self.lock()?;
-        if self.inner.tree_cancel.is_cancelled() {
+        if self.inner.tree_control.is_cancelled() {
             return Err(AgentControlError::TreeCancelled);
         }
         if !state.agents.contains_key(parent) {
@@ -416,7 +471,7 @@ impl AgentControl {
         // canonical spawn order and no separate sequence counter is needed.
         let spawn_order = state.agents.len() as u64;
         let marker = Arc::new(());
-        let node_cancel = self.inner.tree_cancel.child_token();
+        let run_control = RunControl::new();
         let (mailbox_activity_tx, _) = watch::channel(0);
         state.agents.insert(
             child_path.clone(),
@@ -427,7 +482,7 @@ impl AgentControl {
                 status: AgentStatus::PendingInit,
                 last_activity: initial_activity,
                 execution_marker: Some(Arc::clone(&marker)),
-                node_cancel: node_cancel.clone(),
+                run_control: run_control.clone(),
                 mailbox: VecDeque::new(),
                 mailbox_generation: 0,
                 trigger_admission_epoch: 0,
@@ -446,7 +501,7 @@ impl AgentControl {
                 control: self.clone(),
                 path: child_path,
                 marker,
-                cancel: node_cancel,
+                run_control,
             },
         ))
     }
@@ -455,8 +510,16 @@ impl AgentControl {
         &self,
         path: &AgentPath,
     ) -> Result<AgentExecutionLease, AgentControlError> {
+        self.try_acquire_execution_with_control(path, RunControl::new())
+    }
+
+    pub fn try_acquire_execution_with_control(
+        &self,
+        path: &AgentPath,
+        run_control: RunControl,
+    ) -> Result<AgentExecutionLease, AgentControlError> {
         let mut state = self.lock()?;
-        if self.inner.tree_cancel.is_cancelled() {
+        if self.inner.tree_control.is_cancelled() {
             return Err(AgentControlError::TreeCancelled);
         }
         let agent = state
@@ -472,14 +535,17 @@ impl AgentControl {
             });
         }
 
+        if path.is_root() {
+            self.install_root_terminal_router(&run_control)?;
+        }
+
         let marker = Arc::new(());
-        let node_cancel = self.inner.tree_cancel.child_token();
         let agent = state
             .agents
             .get_mut(path)
             .expect("agent existence was checked while holding the same registry lock");
         agent.execution_marker = Some(Arc::clone(&marker));
-        agent.node_cancel = node_cancel.clone();
+        agent.run_control = run_control.clone();
         drop(state);
         self.notify_activity();
 
@@ -487,8 +553,65 @@ impl AgentControl {
             control: self.clone(),
             path: path.clone(),
             marker,
-            cancel: node_cancel,
+            run_control,
         })
+    }
+
+    pub fn try_acquire_root_continuation(
+        &self,
+        run_control: RunControl,
+    ) -> Result<AgentRootContinuationOutcome, AgentControlError> {
+        let root_path = AgentPath::root();
+        let mut state = self.lock()?;
+        if self.inner.tree_control.is_cancelled() {
+            return Ok(AgentRootContinuationOutcome::Blocked);
+        }
+        let root = state
+            .agents
+            .get(&root_path)
+            .ok_or_else(|| AgentControlError::AgentNotFound(root_path.clone()))?;
+        if !root.run_control.same_owner(&run_control) {
+            return Ok(AgentRootContinuationOutcome::Invalid);
+        }
+        if state.agents.values().any(|agent| {
+            agent.execution_marker.is_some()
+                || agent.mailbox.iter().any(|message| message.trigger_turn)
+        }) {
+            return Ok(AgentRootContinuationOutcome::NotReady);
+        }
+        if active_agent_count(&state) >= state.max_concurrent_agents {
+            return Err(AgentControlError::AgentLimitReached {
+                max_concurrent_agents: state.max_concurrent_agents,
+            });
+        }
+        self.install_root_terminal_router(&run_control)?;
+        match run_control.begin_next_turn_after_success() {
+            RunContinuationOutcome::Blocked => {
+                return Ok(AgentRootContinuationOutcome::Blocked);
+            }
+            RunContinuationOutcome::Invalid => {
+                return Ok(AgentRootContinuationOutcome::Invalid);
+            }
+            RunContinuationOutcome::Admitted => {}
+        }
+
+        let marker = Arc::new(());
+        let root = state
+            .agents
+            .get_mut(&root_path)
+            .expect("root existence was checked while holding the same registry lock");
+        root.execution_marker = Some(Arc::clone(&marker));
+        root.run_control = run_control.clone();
+        drop(state);
+        self.notify_activity();
+        Ok(AgentRootContinuationOutcome::Admitted(
+            AgentExecutionLease {
+                control: self.clone(),
+                path: root_path,
+                marker,
+                run_control,
+            },
+        ))
     }
 
     /// Applies the capacity selected for the next root run without replacing retained rows.
@@ -540,7 +663,7 @@ impl AgentControl {
         }
 
         let spawn_order = state.agents.len() as u64;
-        let node_cancel = self.inner.tree_cancel.child_token();
+        let run_control = RunControl::new();
         let (mailbox_activity_tx, _) = watch::channel(0);
         state.agents.insert(
             child_path.clone(),
@@ -551,7 +674,7 @@ impl AgentControl {
                 status,
                 last_activity: initial_activity,
                 execution_marker: None,
-                node_cancel,
+                run_control,
                 mailbox: VecDeque::new(),
                 mailbox_generation: 0,
                 trigger_admission_epoch: 0,
@@ -669,7 +792,7 @@ impl AgentControl {
         let _delivery = self.lock_mail_delivery()?;
         let (author_session_id, recipient_session_id, trigger_admission_epoch) = {
             let state = self.lock()?;
-            if schedule_triggered && self.inner.tree_cancel.is_cancelled() {
+            if schedule_triggered && self.inner.tree_control.is_cancelled() {
                 return Err(AgentControlError::TreeCancelled);
             }
             let author = state
@@ -699,7 +822,7 @@ impl AgentControl {
             return Err(AgentControlError::AgentNotFound(message.author.clone()));
         }
         let suppress_trigger = schedule_triggered
-            && (self.inner.tree_cancel.is_cancelled()
+            && (self.inner.tree_control.is_cancelled()
                 || !state
                     .agents
                     .get(&message.recipient)
@@ -773,7 +896,7 @@ impl AgentControl {
         agent.status = status;
         agent.last_activity = activity;
         agent.execution_marker = None;
-        let scheduled = if self.inner.tree_cancel.is_cancelled() {
+        let scheduled = if self.inner.tree_control.is_cancelled() {
             Vec::new()
         } else {
             self.reserve_pending_triggered_executions_locked(&mut state)
@@ -801,7 +924,7 @@ impl AgentControl {
             .agents
             .remove(path)
             .ok_or_else(|| AgentControlError::AgentNotFound(path.clone()))?;
-        agent.node_cancel.cancel();
+        agent.run_control.supersede();
         drop(state);
         self.notify_activity();
         Ok(())
@@ -814,7 +937,7 @@ impl AgentControl {
             .values()
             .all(|agent| agent.execution_marker.is_none());
         Ok(no_active
-            && (self.inner.tree_cancel.is_cancelled()
+            && (self.inner.tree_control.is_cancelled()
                 || state
                     .agents
                     .values()
@@ -916,7 +1039,7 @@ impl AgentControl {
     }
 
     pub fn cancel_agent(&self, path: &AgentPath) -> Result<(), AgentControlError> {
-        let cancel = {
+        let run_control = {
             let state = self.lock()?;
             let agent = state
                 .agents
@@ -925,9 +1048,9 @@ impl AgentControl {
             if agent.execution_marker.is_none() {
                 return Err(AgentControlError::AgentNotActive(path.clone()));
             }
-            agent.node_cancel.clone()
+            agent.run_control.clone()
         };
-        cancel.cancel();
+        run_control.interrupt(TurnInterruptionCause::AgentInterrupted);
         self.notify_activity();
         Ok(())
     }
@@ -936,7 +1059,7 @@ impl AgentControl {
     /// Unlike `cancel_agent`, a child cannot restart from an already queued trigger turn.
     pub fn cancel_for_durable_terminal(&self, path: &AgentPath) -> Result<(), AgentControlError> {
         if path.is_root() {
-            self.cancel_tree();
+            self.supersede_tree();
             return Ok(());
         }
 
@@ -946,7 +1069,7 @@ impl AgentControl {
                 .agents
                 .get_mut(path)
                 .ok_or_else(|| AgentControlError::AgentNotFound(path.clone()))?;
-            agent.node_cancel.cancel();
+            agent.run_control.supersede();
             if agent.trigger_purge_pending == 0 {
                 agent.trigger_admission_epoch = agent.trigger_admission_epoch.wrapping_add(1);
             }
@@ -979,13 +1102,374 @@ impl AgentControl {
         Ok(())
     }
 
-    pub fn cancel_tree(&self) {
-        self.inner.tree_cancel.cancel();
-        self.notify_activity();
+    pub fn interrupt_tree(&self, root_cause: TurnInterruptionCause) -> bool {
+        self.cancel_tree_with_root_cause(root_cause)
     }
 
-    pub fn tree_cancel_token(&self) -> CancellationToken {
-        self.inner.tree_cancel.clone()
+    /// Classifies a permission Abort at the root and its requesting agent as one action.
+    ///
+    /// The requesting agent receives `ApprovalAborted`, while all other descendants receive
+    /// `TreeStopped`. If a Stop, failure, or supersession already owns either the root or the
+    /// requesting run, the Abort is rejected without classifying the other owner. A detached child
+    /// may still abort after root success is sealed; the sealed root is preserved while the tree
+    /// owner and requester are classified together.
+    pub fn abort_tree_from_permission(
+        &self,
+        requesting_control: &RunControl,
+    ) -> crate::runtime::RunCancelOutcome {
+        let Ok(state) = self.lock() else {
+            return crate::runtime::RunCancelOutcome::Rejected;
+        };
+        let Some(root) = state
+            .agents
+            .iter()
+            .find_map(|(path, agent)| path.is_root().then_some(agent))
+        else {
+            return crate::runtime::RunCancelOutcome::Rejected;
+        };
+        let requesting_path = state.agents.iter().find_map(|(path, agent)| {
+            agent
+                .run_control
+                .same_owner(requesting_control)
+                .then_some(path)
+        });
+        let Some(requesting_path) = requesting_path else {
+            return crate::runtime::RunCancelOutcome::Rejected;
+        };
+
+        let approval_aborted = crate::runtime::RunCancellationCause::Interruption(
+            TurnInterruptionCause::ApprovalAborted,
+        );
+        let detached_after_root_success = root.run_control.success_is_sealed();
+        let outcome = if detached_after_root_success {
+            root.run_control.block_continuation_local();
+            let requester_is_live_descendant = !requesting_path.is_root()
+                && state
+                    .agents
+                    .get(requesting_path)
+                    .is_some_and(agent_has_live_work);
+            if !requester_is_live_descendant {
+                return crate::runtime::RunCancelOutcome::Rejected;
+            }
+            RunControl::request_linked_cancellation(
+                &self.inner.tree_control,
+                crate::runtime::RunCancellationCause::Interruption(
+                    TurnInterruptionCause::TreeStopped,
+                ),
+                requesting_control,
+                approval_aborted,
+            )
+        } else {
+            RunControl::request_linked_cancellation(
+                &root.run_control,
+                approval_aborted.clone(),
+                requesting_control,
+                approval_aborted,
+            )
+        };
+        if outcome == crate::runtime::RunCancelOutcome::Rejected {
+            return outcome;
+        }
+
+        let tree_stopped =
+            crate::runtime::RunCancellationCause::Interruption(TurnInterruptionCause::TreeStopped);
+        // `tree_control` is private and every active-root tree producer is serialized by `state`,
+        // so a root/requester linked claim cannot race a different tree classification here. The
+        // detached sealed-root branch already linked `tree_control` with the requester above.
+        let tree_owns_stop = if detached_after_root_success {
+            true
+        } else {
+            let tree_outcome = self.inner.tree_control.request_cancel(tree_stopped.clone());
+            tree_outcome != crate::runtime::RunCancelOutcome::Rejected
+                || self.inner.tree_control.cause().as_ref() == Some(&tree_stopped)
+        };
+        debug_assert!(
+            tree_owns_stop,
+            "an accepted root permission Abort must own the tree terminal classification"
+        );
+        if tree_owns_stop {
+            for (path, agent) in &state.agents {
+                if !path.is_root() && !agent.run_control.same_owner(requesting_control) {
+                    agent.run_control.request_cancel(tree_stopped.clone());
+                }
+            }
+        }
+        drop(state);
+        self.notify_activity();
+        outcome
+    }
+
+    fn supersede_tree(&self) -> bool {
+        self.classify_tree(
+            crate::runtime::RunCancellationCause::Superseded,
+            crate::runtime::RunCancellationCause::Superseded,
+            false,
+        )
+    }
+
+    pub fn fail_tree(&self, message: impl Into<String>) -> bool {
+        self.classify_failure_tree(message).changed()
+    }
+
+    fn route_terminal_outcome(
+        &self,
+        source: &RunControl,
+        kind: RunTerminalRouteKind,
+        cause: crate::runtime::RunCancellationCause,
+    ) -> Option<RunCancelOutcome> {
+        let (descendant_cause, allow_detached_tree_action) = routed_descendant_cause(&cause);
+        let result = self.classify_tree_result(
+            cause,
+            descendant_cause,
+            allow_detached_tree_action,
+            Some((source, kind)),
+        );
+        result.source_matched.then_some(result.root_outcome)
+    }
+
+    fn classify_failure_tree(&self, message: impl Into<String>) -> TreeClassificationResult {
+        let message = message.into();
+        self.classify_tree_result(
+            crate::runtime::RunCancellationCause::Failure(message.clone()),
+            crate::runtime::RunCancellationCause::Failure(message),
+            false,
+            None,
+        )
+    }
+
+    /// Reconciles an exact-turn durable root terminal after another in-memory producer may have
+    /// won locally before that durable commit was observed.
+    ///
+    /// The root and each descendant retain their first locally visible classification, while the
+    /// durable terminal still closes the tree-wide scheduling owner and reaches every descendant.
+    pub fn reconcile_durable_root_terminal(
+        &self,
+        root_cause: crate::runtime::RunCancellationCause,
+    ) -> bool {
+        let descendant_cause = match &root_cause {
+            crate::runtime::RunCancellationCause::Interruption(_) => {
+                crate::runtime::RunCancellationCause::Interruption(
+                    TurnInterruptionCause::TreeStopped,
+                )
+            }
+            crate::runtime::RunCancellationCause::Superseded => {
+                crate::runtime::RunCancellationCause::Superseded
+            }
+            crate::runtime::RunCancellationCause::Failure(message) => {
+                crate::runtime::RunCancellationCause::Failure(message.clone())
+            }
+        };
+        let Ok(state) = self.lock() else {
+            return false;
+        };
+        let Some(root) = state
+            .agents
+            .iter()
+            .find_map(|(path, agent)| path.is_root().then_some(agent))
+        else {
+            return false;
+        };
+        let root_applied = matches!(
+            root.run_control.request_cancel_local(root_cause),
+            crate::runtime::RunCancelOutcome::Applied
+        );
+        let tree_applied = self.inner.tree_control.cancel(descendant_cause.clone());
+        if !tree_applied && !self.inner.tree_control.is_cancelled() {
+            return root_applied;
+        }
+        for (path, agent) in &state.agents {
+            if !path.is_root() {
+                agent.run_control.cancel(descendant_cause.clone());
+            }
+        }
+        drop(state);
+        self.notify_activity();
+        root_applied || tree_applied
+    }
+
+    fn cancel_tree_with_root_cause(&self, root_cause: TurnInterruptionCause) -> bool {
+        self.classify_tree(
+            crate::runtime::RunCancellationCause::Interruption(root_cause),
+            crate::runtime::RunCancellationCause::Interruption(TurnInterruptionCause::TreeStopped),
+            true,
+        )
+    }
+
+    fn classify_tree(
+        &self,
+        root_cause: crate::runtime::RunCancellationCause,
+        descendant_cause: crate::runtime::RunCancellationCause,
+        allow_detached_tree_action: bool,
+    ) -> bool {
+        self.classify_tree_result(
+            root_cause,
+            descendant_cause,
+            allow_detached_tree_action,
+            None,
+        )
+        .changed()
+    }
+
+    fn classify_tree_result(
+        &self,
+        root_cause: crate::runtime::RunCancellationCause,
+        descendant_cause: crate::runtime::RunCancellationCause,
+        allow_detached_tree_action: bool,
+        root_route: Option<(&RunControl, RunTerminalRouteKind)>,
+    ) -> TreeClassificationResult {
+        let Ok(state) = self.lock() else {
+            return if root_route.is_some() {
+                TreeClassificationResult::unroutable()
+            } else {
+                TreeClassificationResult::rejected()
+            };
+        };
+        let Some(root) = state
+            .agents
+            .iter()
+            .find_map(|(path, agent)| path.is_root().then_some(agent))
+        else {
+            return if root_route.is_some() {
+                TreeClassificationResult::unroutable()
+            } else {
+                TreeClassificationResult::rejected()
+            };
+        };
+        if root_route.is_some_and(|(source, _)| !root.run_control.same_owner(source)) {
+            return TreeClassificationResult::unroutable();
+        }
+        let mut effective_root_cause = root_cause;
+        let mut effective_descendant_cause = descendant_cause;
+        let mut effective_allow_detached_tree_action = allow_detached_tree_action;
+        let preclassified_root_outcome = match root_route.map(|(_, kind)| kind) {
+            Some(RunTerminalRouteKind::ResolveSuccessCommitAuthoritatively) => Some(
+                if root
+                    .run_control
+                    .resolve_success_commit_authoritatively_local(effective_root_cause.clone())
+                {
+                    RunCancelOutcome::Applied
+                } else {
+                    RunCancelOutcome::Rejected
+                },
+            ),
+            Some(RunTerminalRouteKind::AbandonSuccessCommit) => {
+                match root
+                    .run_control
+                    .abandon_success_commit_local(effective_root_cause.clone())
+                {
+                    Some(actual_cause) => {
+                        let (actual_descendant_cause, actual_allow_detached) =
+                            routed_descendant_cause(&actual_cause);
+                        effective_root_cause = actual_cause;
+                        effective_descendant_cause = actual_descendant_cause;
+                        effective_allow_detached_tree_action = actual_allow_detached;
+                        Some(RunCancelOutcome::Applied)
+                    }
+                    None => Some(RunCancelOutcome::Rejected),
+                }
+            }
+            Some(RunTerminalRouteKind::Request | RunTerminalRouteKind::ReleaseSuccessCommit)
+            | None => None,
+        };
+        let root_success_is_durable = root.run_control.success_is_sealed();
+        let detached_request =
+            matches!(root_route, None | Some((_, RunTerminalRouteKind::Request)));
+        if detached_request && root_success_is_durable && effective_allow_detached_tree_action {
+            root.run_control.block_continuation_local();
+            if root_route.is_none()
+                && !state
+                    .agents
+                    .iter()
+                    .any(|(path, agent)| !path.is_root() && agent_has_live_work(agent))
+            {
+                return TreeClassificationResult::rejected();
+            }
+            let tree_applied = self
+                .inner
+                .tree_control
+                .cancel(effective_descendant_cause.clone());
+            let tree_owns_requested_cause = tree_applied
+                || self.inner.tree_control.cause().as_ref() == Some(&effective_descendant_cause);
+            if !tree_owns_requested_cause {
+                return TreeClassificationResult::rejected();
+            }
+            for (path, agent) in &state.agents {
+                if !path.is_root() {
+                    agent.run_control.cancel(effective_descendant_cause.clone());
+                }
+            }
+            drop(state);
+            self.notify_activity();
+            return TreeClassificationResult {
+                root_outcome: RunCancelOutcome::Rejected,
+                tree_applied,
+                source_matched: true,
+            };
+        }
+        let root_outcome = preclassified_root_outcome.unwrap_or_else(|| {
+            root.run_control
+                .request_cancel_local(effective_root_cause.clone())
+        });
+        let root_owns_requested_cause =
+            matches!(root_outcome, crate::runtime::RunCancelOutcome::Applied)
+                || root.run_control.cause().as_ref() == Some(&effective_root_cause);
+        let (deferred_tree_action, deferred_requires_live_descendant) = match root_outcome {
+            crate::runtime::RunCancelOutcome::Deferred(deferral) => (
+                effective_allow_detached_tree_action || !deferral.is_success_commit_only(),
+                root_route.is_none() && deferral.is_success_commit_only(),
+            ),
+            crate::runtime::RunCancelOutcome::Applied
+            | crate::runtime::RunCancelOutcome::Rejected => (false, false),
+        };
+        if !root_owns_requested_cause && !deferred_tree_action {
+            return TreeClassificationResult {
+                root_outcome,
+                tree_applied: false,
+                source_matched: true,
+            };
+        }
+        if deferred_tree_action
+            && deferred_requires_live_descendant
+            && !state
+                .agents
+                .iter()
+                .any(|(path, agent)| !path.is_root() && agent_has_live_work(agent))
+        {
+            return TreeClassificationResult {
+                root_outcome,
+                tree_applied: false,
+                source_matched: true,
+            };
+        }
+        let tree_applied = self
+            .inner
+            .tree_control
+            .cancel(effective_descendant_cause.clone());
+        let tree_owns_requested_cause = tree_applied
+            || self.inner.tree_control.cause().as_ref() == Some(&effective_descendant_cause);
+        if !tree_owns_requested_cause {
+            return TreeClassificationResult {
+                root_outcome,
+                tree_applied: false,
+                source_matched: true,
+            };
+        }
+        for (path, agent) in &state.agents {
+            if !path.is_root() {
+                agent.run_control.cancel(effective_descendant_cause.clone());
+            }
+        }
+        drop(state);
+        self.notify_activity();
+        TreeClassificationResult {
+            root_outcome,
+            tree_applied,
+            source_matched: true,
+        }
+    }
+
+    pub fn tree_is_cancelled(&self) -> bool {
+        self.inner.tree_control.is_cancelled()
     }
 
     fn release_execution(&self, path: &AgentPath, marker: &Arc<()>) {
@@ -1042,19 +1526,19 @@ impl AgentControl {
                 break;
             }
             let marker = Arc::new(());
-            let cancel = self.inner.tree_cancel.child_token();
+            let run_control = RunControl::new();
             let agent = state
                 .agents
                 .get_mut(&path)
                 .expect("scheduled agent was selected from this registry");
             agent.execution_marker = Some(marker.clone());
-            agent.node_cancel = cancel.clone();
+            agent.run_control = run_control.clone();
             agent.status = AgentStatus::PendingInit;
             leases.push(AgentExecutionLease {
                 control: self.clone(),
                 path,
                 marker,
-                cancel,
+                run_control,
             });
         }
         leases
@@ -1065,6 +1549,15 @@ impl AgentControl {
             .activity_tx
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
+
+    fn install_root_terminal_router(
+        &self,
+        run_control: &RunControl,
+    ) -> Result<(), AgentControlError> {
+        run_control
+            .install_terminal_router(&self.inner.root_terminal_router)
+            .map_err(|()| AgentControlError::RunControlOwnedByDifferentTree)
+    }
 }
 
 impl AgentExecutionLease {
@@ -1072,8 +1565,12 @@ impl AgentExecutionLease {
         &self.path
     }
 
-    pub fn cancel_token(&self) -> CancellationToken {
-        self.cancel.clone()
+    pub fn run_control(&self) -> RunControl {
+        self.run_control.clone()
+    }
+
+    pub fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        self.run_control.token()
     }
 }
 
@@ -1089,6 +1586,28 @@ fn active_agent_count(state: &AgentTreeState) -> usize {
         .values()
         .filter(|agent| agent.execution_marker.is_some())
         .count()
+}
+
+fn agent_has_live_work(agent: &AgentEntry) -> bool {
+    agent.execution_marker.is_some() || agent.mailbox.iter().any(|message| message.trigger_turn)
+}
+
+fn routed_descendant_cause(
+    root_cause: &crate::runtime::RunCancellationCause,
+) -> (crate::runtime::RunCancellationCause, bool) {
+    match root_cause {
+        crate::runtime::RunCancellationCause::Interruption(_) => (
+            crate::runtime::RunCancellationCause::Interruption(TurnInterruptionCause::TreeStopped),
+            true,
+        ),
+        crate::runtime::RunCancellationCause::Superseded => {
+            (crate::runtime::RunCancellationCause::Superseded, false)
+        }
+        crate::runtime::RunCancellationCause::Failure(message) => (
+            crate::runtime::RunCancellationCause::Failure(message.clone()),
+            false,
+        ),
+    }
 }
 
 fn snapshot_agent(state: &AgentTreeState, path: &AgentPath) -> Option<AgentSnapshot> {
@@ -1118,6 +1637,1014 @@ fn snapshot_agent(state: &AgentTreeState, path: &AgentPath) -> Option<AgentSnaps
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::RunCancellationCause;
+
+    #[derive(Clone, Copy, Debug)]
+    enum TreeTerminalProducer {
+        UserStop,
+        ApprovalAbort,
+        Failure,
+        Superseded,
+    }
+
+    fn apply_tree_terminal_producer(
+        control: &AgentControl,
+        producer: TreeTerminalProducer,
+    ) -> bool {
+        match producer {
+            TreeTerminalProducer::UserStop => {
+                control.interrupt_tree(TurnInterruptionCause::UserStop)
+            }
+            TreeTerminalProducer::ApprovalAbort => {
+                control.interrupt_tree(TurnInterruptionCause::ApprovalAborted)
+            }
+            TreeTerminalProducer::Failure => control.fail_tree("operational failure"),
+            TreeTerminalProducer::Superseded => {
+                control
+                    .cancel_for_durable_terminal(&AgentPath::root())
+                    .expect("supersede tree");
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn active_root_success_commit_preserves_root_success_but_explicit_actions_stop_children() {
+        for producer in [
+            TreeTerminalProducer::UserStop,
+            TreeTerminalProducer::ApprovalAbort,
+        ] {
+            let root_control = RunControl::new();
+            let (control, root_execution) =
+                AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                    .expect("agent tree");
+            let (_, child_execution) = control
+                .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+                .expect("child");
+            let child_control = child_execution.run_control();
+            let success_commit = root_control
+                .begin_success_commit()
+                .expect("success reservation");
+
+            assert!(apply_tree_terminal_producer(&control, producer));
+            assert_eq!(
+                child_control.cause(),
+                Some(RunCancellationCause::Interruption(
+                    TurnInterruptionCause::TreeStopped
+                )),
+                "producer={producer:?}"
+            );
+            assert!(control.tree_is_cancelled(), "producer={producer:?}");
+            assert_eq!(root_control.cause(), None, "producer={producer:?}");
+            assert!(success_commit.seal());
+            assert_eq!(root_control.cause(), None, "producer={producer:?}");
+
+            control
+                .complete_execution(root_execution, AgentStatus::Completed(None), None)
+                .expect("complete root");
+            control
+                .complete_execution(child_execution, AgentStatus::Interrupted, None)
+                .expect("complete child");
+        }
+    }
+
+    #[test]
+    fn raw_current_root_interrupt_routes_cli_stop_to_the_whole_tree() {
+        let root_control = RunControl::new();
+        let (control, _root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                .expect("agent tree");
+        let (_, child_execution) = control
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("child");
+        let child_control = child_execution.run_control();
+
+        assert!(root_control.interrupt(TurnInterruptionCause::UserStop));
+
+        assert_eq!(
+            root_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop
+            ))
+        );
+        assert_eq!(
+            child_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::TreeStopped
+            ))
+        );
+        assert!(control.tree_is_cancelled());
+        assert!(child_control.begin_tool_effect_admission().is_none());
+    }
+
+    #[test]
+    fn raw_current_root_interrupt_preserves_sealed_success_and_stops_descendants() {
+        let root_control = RunControl::new();
+        let (control, _root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                .expect("agent tree");
+        let (_, child_execution) = control
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("child");
+        let child_control = child_execution.run_control();
+        assert!(root_control.seal_success());
+
+        assert_eq!(
+            root_control.request_cancel(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop,
+            )),
+            RunCancelOutcome::Rejected
+        );
+
+        assert!(root_control.success_is_sealed());
+        assert_eq!(
+            child_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::TreeStopped
+            ))
+        );
+        assert!(control.tree_is_cancelled());
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RootSuccessStopCase {
+        Committing,
+        Sealed,
+    }
+
+    #[test]
+    fn raw_explicit_stop_latches_tree_without_descendants_during_or_after_success() {
+        for success_case in [RootSuccessStopCase::Committing, RootSuccessStopCase::Sealed] {
+            let root_control = RunControl::new();
+            let (control, root_execution) =
+                AgentControl::with_root_control(SessionId::new(), 1, root_control.clone())
+                    .expect("agent tree");
+
+            match success_case {
+                RootSuccessStopCase::Committing => {
+                    let success = root_control.begin_success_commit().expect("success commit");
+                    assert!(matches!(
+                        root_control.request_cancel(RunCancellationCause::Interruption(
+                            TurnInterruptionCause::UserStop,
+                        )),
+                        RunCancelOutcome::Deferred(_)
+                    ));
+                    assert!(control.tree_is_cancelled());
+                    assert!(success.seal());
+                }
+                RootSuccessStopCase::Sealed => {
+                    assert!(root_control.seal_success());
+                    assert_eq!(
+                        root_control.request_cancel(RunCancellationCause::Interruption(
+                            TurnInterruptionCause::UserStop,
+                        )),
+                        RunCancelOutcome::Rejected
+                    );
+                }
+            }
+
+            assert!(root_control.success_is_sealed());
+            assert!(control.tree_is_cancelled());
+            control
+                .complete_execution(root_execution, AgentStatus::Completed(None), None)
+                .expect("complete root");
+            assert!(matches!(
+                control.try_acquire_execution(&AgentPath::root()),
+                Err(AgentControlError::TreeCancelled)
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_stop_before_root_continuation_claim_preserves_success_and_blocks_admission() {
+        let root_control = RunControl::new();
+        let (control, root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 1, root_control.clone())
+                .expect("agent tree");
+        let success = root_control.begin_success_commit().expect("success commit");
+
+        assert!(matches!(
+            root_control.request_cancel(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop,
+            )),
+            RunCancelOutcome::Deferred(_)
+        ));
+        assert!(success.seal());
+        control
+            .complete_execution(root_execution, AgentStatus::Completed(None), None)
+            .expect("complete root");
+
+        assert!(matches!(
+            control
+                .try_acquire_root_continuation(root_control.clone())
+                .expect("continuation outcome"),
+            AgentRootContinuationOutcome::Blocked
+        ));
+        assert!(root_control.success_is_sealed());
+        assert_eq!(root_control.cause(), None);
+        assert!(control.tree_is_cancelled());
+    }
+
+    #[test]
+    fn root_continuation_claim_before_stop_keeps_the_same_tree_owner() {
+        let root_control = RunControl::new();
+        let (control, root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 1, root_control.clone())
+                .expect("agent tree");
+        assert!(root_control.seal_success());
+        control
+            .complete_execution(root_execution, AgentStatus::Completed(None), None)
+            .expect("complete root");
+
+        let continuation = match control
+            .try_acquire_root_continuation(root_control.clone())
+            .expect("continuation outcome")
+        {
+            AgentRootContinuationOutcome::Admitted(lease) => lease,
+            AgentRootContinuationOutcome::Blocked
+            | AgentRootContinuationOutcome::NotReady
+            | AgentRootContinuationOutcome::Invalid => panic!("continuation was not admitted"),
+        };
+        assert!(!root_control.success_is_sealed());
+
+        assert_eq!(
+            root_control.request_cancel(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop,
+            )),
+            RunCancelOutcome::Applied
+        );
+        assert_eq!(
+            root_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop
+            ))
+        );
+        assert!(continuation.cancel_token().is_cancelled());
+        assert!(control.tree_is_cancelled());
+        control
+            .complete_execution(continuation, AgentStatus::Interrupted, None)
+            .expect("complete cancelled continuation");
+    }
+
+    #[test]
+    fn root_continuation_waits_for_pending_trigger_work_under_the_registry_lock() {
+        let root_control = RunControl::new();
+        let (control, root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                .expect("agent tree");
+        let (child, child_execution) = control
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("child");
+        assert!(matches!(
+            control
+                .try_acquire_root_continuation(root_control.clone())
+                .expect("active tree continuation outcome"),
+            AgentRootContinuationOutcome::NotReady
+        ));
+        control
+            .complete_execution(child_execution, AgentStatus::Completed(None), None)
+            .expect("complete child");
+        control
+            .enqueue_mail(AgentMailboxMessage::new(
+                AgentPath::root(),
+                child.path.clone(),
+                "follow-up",
+                true,
+            ))
+            .expect("pending trigger mail");
+        assert!(root_control.seal_success());
+        control
+            .complete_execution(root_execution, AgentStatus::Completed(None), None)
+            .expect("complete root");
+
+        assert!(matches!(
+            control
+                .try_acquire_root_continuation(root_control.clone())
+                .expect("continuation outcome"),
+            AgentRootContinuationOutcome::NotReady
+        ));
+        control
+            .drain_mailbox(&child.path)
+            .expect("drain trigger mail");
+        let continuation = match control
+            .try_acquire_root_continuation(root_control.clone())
+            .expect("continuation outcome")
+        {
+            AgentRootContinuationOutcome::Admitted(lease) => lease,
+            AgentRootContinuationOutcome::Blocked
+            | AgentRootContinuationOutcome::NotReady
+            | AgentRootContinuationOutcome::Invalid => panic!("continuation was not admitted"),
+        };
+        drop(continuation);
+    }
+
+    #[test]
+    fn raw_root_supersession_routes_open_and_deferred_release_to_the_whole_tree() {
+        for deferred in [false, true] {
+            let root_control = RunControl::new();
+            let (control, _root_execution) =
+                AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                    .expect("agent tree");
+            let (_, child_execution) = control
+                .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+                .expect("child");
+            let child_control = child_execution.run_control();
+            let success =
+                deferred.then(|| root_control.begin_success_commit().expect("success commit"));
+
+            let outcome = root_control.request_cancel(RunCancellationCause::Superseded);
+            if let Some(success) = success {
+                assert_eq!(
+                    outcome,
+                    RunCancelOutcome::Deferred(crate::runtime::RunCancelDeferral {
+                        primary: crate::runtime::RunReservationKind::SuccessCommit,
+                        secondary: None,
+                    })
+                );
+                assert_eq!(root_control.cause(), None);
+                assert_eq!(child_control.cause(), None);
+                assert!(!control.tree_is_cancelled());
+                success.release();
+            } else {
+                assert_eq!(outcome, RunCancelOutcome::Applied);
+            }
+
+            assert_eq!(root_control.cause(), Some(RunCancellationCause::Superseded));
+            assert_eq!(
+                child_control.cause(),
+                Some(RunCancellationCause::Superseded)
+            );
+            assert!(control.tree_is_cancelled());
+            assert!(child_control.begin_tool_effect_admission().is_none());
+        }
+    }
+
+    #[test]
+    fn active_root_success_commit_blocks_internal_tree_terminal_producers() {
+        for producer in [
+            TreeTerminalProducer::Failure,
+            TreeTerminalProducer::Superseded,
+        ] {
+            let root_control = RunControl::new();
+            let (control, root_execution) =
+                AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                    .expect("agent tree");
+            let (_, child_execution) = control
+                .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+                .expect("child");
+            let child_control = child_execution.run_control();
+            let success_commit = root_control
+                .begin_success_commit()
+                .expect("success reservation");
+
+            assert!(!apply_tree_terminal_producer(&control, producer));
+            assert_eq!(child_control.cause(), None, "producer={producer:?}");
+            assert!(!control.tree_is_cancelled(), "producer={producer:?}");
+            assert!(success_commit.seal());
+            assert_eq!(root_control.cause(), None, "producer={producer:?}");
+
+            control
+                .complete_execution(root_execution, AgentStatus::Completed(None), None)
+                .expect("complete root");
+            control
+                .complete_execution(child_execution, AgentStatus::Completed(None), None)
+                .expect("complete child");
+        }
+    }
+
+    #[test]
+    fn root_failure_deferred_by_tool_settlement_stops_descendants_before_commit_releases() {
+        let root_control = RunControl::new();
+        let (control, root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                .expect("agent tree");
+        let (_, child_execution) = control
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("child");
+        let child_control = child_execution.run_control();
+        let settlement = root_control
+            .begin_tool_settlement()
+            .expect("root tool settlement");
+        let failure = RunCancellationCause::Failure("durable tool commit failed".to_string());
+
+        assert!(control.fail_tree("durable tool commit failed"));
+        assert_eq!(root_control.cause(), None);
+        assert_eq!(child_control.cause(), Some(failure.clone()));
+        assert!(child_control.begin_tool_effect_admission().is_none());
+        assert!(control.tree_is_cancelled());
+
+        settlement.release();
+        assert_eq!(root_control.cause(), Some(failure));
+
+        control
+            .complete_execution(
+                root_execution,
+                AgentStatus::Errored("failed".to_string()),
+                None,
+            )
+            .expect("complete root");
+        control
+            .complete_execution(
+                child_execution,
+                AgentStatus::Errored("tree failed".to_string()),
+                None,
+            )
+            .expect("complete child");
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RootFailureReservationCase {
+        EffectAdmission,
+        EffectCommit,
+        ToolSettlement,
+    }
+
+    #[test]
+    fn root_terminal_router_rejects_sibling_effects_before_deferred_root_release() {
+        for reservation_case in [
+            RootFailureReservationCase::EffectAdmission,
+            RootFailureReservationCase::EffectCommit,
+            RootFailureReservationCase::ToolSettlement,
+        ] {
+            let root_control = RunControl::new();
+            let (control, root_execution) =
+                AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                    .expect("agent tree");
+            let (_, child_execution) = control
+                .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+                .expect("child");
+            let child_control = child_execution.run_control();
+            let failure = RunCancellationCause::Failure(format!(
+                "heartbeat failed during {reservation_case:?}"
+            ));
+            let (expected_kind, release): (crate::runtime::RunReservationKind, Box<dyn FnOnce()>) =
+                match reservation_case {
+                    RootFailureReservationCase::EffectAdmission => {
+                        let reservation = root_control
+                            .begin_tool_effect_admission()
+                            .expect("effect admission");
+                        let expected_failure = failure.clone();
+                        (
+                            crate::runtime::RunReservationKind::ToolEffectAdmission,
+                            Box::new(move || {
+                                assert_eq!(reservation.admit(), Err(expected_failure));
+                            }),
+                        )
+                    }
+                    RootFailureReservationCase::EffectCommit => {
+                        let reservation = root_control
+                            .begin_tool_effect_commit()
+                            .expect("effect commit");
+                        (
+                            crate::runtime::RunReservationKind::ToolEffectCommit,
+                            Box::new(move || reservation.release()),
+                        )
+                    }
+                    RootFailureReservationCase::ToolSettlement => {
+                        let reservation = root_control
+                            .begin_tool_settlement()
+                            .expect("tool settlement");
+                        (
+                            crate::runtime::RunReservationKind::ToolSettlement,
+                            Box::new(move || reservation.release()),
+                        )
+                    }
+                };
+
+            assert_eq!(
+                root_control.request_cancel(failure.clone()),
+                RunCancelOutcome::Deferred(crate::runtime::RunCancelDeferral {
+                    primary: expected_kind,
+                    secondary: None,
+                }),
+                "reservation={reservation_case:?}"
+            );
+            assert_eq!(
+                root_control.cause(),
+                None,
+                "reservation={reservation_case:?}"
+            );
+            assert_eq!(
+                child_control.cause(),
+                Some(failure.clone()),
+                "reservation={reservation_case:?}"
+            );
+            assert!(
+                control.tree_is_cancelled(),
+                "reservation={reservation_case:?}"
+            );
+            assert!(
+                child_control.begin_tool_effect_admission().is_none(),
+                "reservation={reservation_case:?}"
+            );
+
+            release();
+            assert_eq!(
+                root_control.cause(),
+                Some(failure),
+                "reservation={reservation_case:?}"
+            );
+            control
+                .complete_execution(
+                    root_execution,
+                    AgentStatus::Errored("root failed".to_string()),
+                    None,
+                )
+                .expect("complete root");
+            control
+                .complete_execution(
+                    child_execution,
+                    AgentStatus::Errored("tree failed".to_string()),
+                    None,
+                )
+                .expect("complete child");
+        }
+    }
+
+    #[test]
+    fn root_terminal_router_preserves_success_commit_and_sealed_success() {
+        let root_control = RunControl::new();
+        let (control, root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                .expect("agent tree");
+        let (_, child_execution) = control
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("child");
+        let child_control = child_execution.run_control();
+        let success = root_control.begin_success_commit().expect("success commit");
+
+        assert_eq!(
+            root_control.request_cancel(RunCancellationCause::Failure(
+                "late operational failure".to_string()
+            )),
+            RunCancelOutcome::Deferred(crate::runtime::RunCancelDeferral {
+                primary: crate::runtime::RunReservationKind::SuccessCommit,
+                secondary: None,
+            })
+        );
+        assert_eq!(child_control.cause(), None);
+        assert!(!control.tree_is_cancelled());
+        assert!(success.seal());
+        assert!(root_control.success_is_sealed());
+
+        assert_eq!(
+            root_control.request_cancel(RunCancellationCause::Failure(
+                "failure after durable success".to_string()
+            )),
+            RunCancelOutcome::Rejected
+        );
+        assert_eq!(child_control.cause(), None);
+        assert!(!control.tree_is_cancelled());
+
+        control
+            .complete_execution(root_execution, AgentStatus::Completed(None), None)
+            .expect("complete root");
+        control
+            .complete_execution(child_execution, AgentStatus::Completed(None), None)
+            .expect("complete child");
+    }
+
+    #[test]
+    fn root_success_reservation_failure_resolution_closes_tree_before_return() {
+        let root_control = RunControl::new();
+        let (control, _root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                .expect("agent tree");
+        let (_, child_execution) = control
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("child");
+        let child_control = child_execution.run_control();
+        let success = root_control.begin_success_commit().expect("success commit");
+        let failure = RunCancellationCause::Failure(
+            "success terminal commit lost durable authority".to_string(),
+        );
+
+        assert!(success.abandon_with_cancellation(failure.clone()));
+
+        assert_eq!(root_control.cause(), Some(failure.clone()));
+        assert_eq!(child_control.cause(), Some(failure));
+        assert!(control.tree_is_cancelled());
+        assert!(child_control.begin_tool_effect_admission().is_none());
+    }
+
+    #[test]
+    fn internal_success_abandonment_preserves_a_pending_stop_as_first_cause() {
+        let root_control = RunControl::new();
+        let (control, _root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                .expect("agent tree");
+        let (_, child_execution) = control
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("child");
+        let child_control = child_execution.run_control();
+        let success = root_control.begin_success_commit().expect("success commit");
+
+        assert_eq!(
+            root_control.request_cancel(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop,
+            )),
+            RunCancelOutcome::Deferred(crate::runtime::RunCancelDeferral {
+                primary: crate::runtime::RunReservationKind::SuccessCommit,
+                secondary: None,
+            })
+        );
+        assert_eq!(root_control.cause(), None);
+        assert_eq!(
+            child_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::TreeStopped
+            ))
+        );
+
+        assert!(
+            success.abandon_with_cancellation(RunCancellationCause::Failure(
+                "internal success commit failure".to_string(),
+            ))
+        );
+
+        assert_eq!(
+            root_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop
+            ))
+        );
+        assert_eq!(
+            child_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::TreeStopped
+            ))
+        );
+        assert!(control.tree_is_cancelled());
+    }
+
+    #[test]
+    fn authoritative_success_resolution_uses_exact_durable_cause() {
+        let root_control = RunControl::new();
+        let (control, _root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                .expect("agent tree");
+        let (_, child_execution) = control
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("child");
+        let child_control = child_execution.run_control();
+        let success = root_control.begin_success_commit().expect("success commit");
+        let durable_failure =
+            RunCancellationCause::Failure("exact durable failure owner".to_string());
+
+        assert_eq!(
+            root_control.request_cancel(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop,
+            )),
+            RunCancelOutcome::Deferred(crate::runtime::RunCancelDeferral {
+                primary: crate::runtime::RunReservationKind::SuccessCommit,
+                secondary: None,
+            })
+        );
+        assert!(success.resolve_authoritative_cancellation(durable_failure.clone()));
+
+        assert_eq!(root_control.cause(), Some(durable_failure));
+        assert_eq!(
+            child_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::TreeStopped
+            ))
+        );
+        assert!(control.tree_is_cancelled());
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DetachedSuccessResolutionCase {
+        Authoritative,
+        Abandon,
+    }
+
+    #[test]
+    fn detached_success_resolution_keeps_applied_outcome_and_tree_fanout() {
+        for resolution_case in [
+            DetachedSuccessResolutionCase::Authoritative,
+            DetachedSuccessResolutionCase::Abandon,
+        ] {
+            let root_control = RunControl::new();
+            let (control, root_execution) =
+                AgentControl::with_root_control(SessionId::new(), 1, root_control.clone())
+                    .expect("agent tree");
+            let success = root_control.begin_success_commit().expect("success commit");
+            drop(root_execution);
+            let cause = RunCancellationCause::Interruption(TurnInterruptionCause::UserStop);
+
+            let resolved = match resolution_case {
+                DetachedSuccessResolutionCase::Authoritative => {
+                    success.resolve_authoritative_cancellation(cause.clone())
+                }
+                DetachedSuccessResolutionCase::Abandon => {
+                    success.abandon_with_cancellation(cause.clone())
+                }
+            };
+
+            assert!(resolved, "resolution={resolution_case:?}");
+            assert_eq!(root_control.cause(), Some(cause));
+            assert!(control.tree_is_cancelled());
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SuccessCommitReleaseCase {
+        Explicit,
+        Drop,
+    }
+
+    #[test]
+    fn releasing_or_dropping_deferred_root_failure_closes_tree_before_return() {
+        for release_case in [
+            SuccessCommitReleaseCase::Explicit,
+            SuccessCommitReleaseCase::Drop,
+        ] {
+            let root_control = RunControl::new();
+            let (control, _root_execution) =
+                AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                    .expect("agent tree");
+            let (_, child_execution) = control
+                .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+                .expect("child");
+            let child_control = child_execution.run_control();
+            let success = root_control.begin_success_commit().expect("success commit");
+            let failure =
+                RunCancellationCause::Failure(format!("heartbeat failed before {release_case:?}"));
+
+            assert_eq!(
+                root_control.request_cancel(failure.clone()),
+                RunCancelOutcome::Deferred(crate::runtime::RunCancelDeferral {
+                    primary: crate::runtime::RunReservationKind::SuccessCommit,
+                    secondary: None,
+                })
+            );
+            assert_eq!(root_control.cause(), None);
+            assert_eq!(child_control.cause(), None);
+            assert!(!control.tree_is_cancelled());
+
+            match release_case {
+                SuccessCommitReleaseCase::Explicit => success.release(),
+                SuccessCommitReleaseCase::Drop => drop(success),
+            }
+
+            assert_eq!(root_control.cause(), Some(failure.clone()));
+            assert_eq!(child_control.cause(), Some(failure));
+            assert!(control.tree_is_cancelled());
+            assert!(child_control.begin_tool_effect_admission().is_none());
+        }
+    }
+
+    #[test]
+    fn stale_root_terminal_router_is_replaced_when_control_joins_a_new_tree() {
+        let root_control = RunControl::new();
+        let (first_tree, first_root) =
+            AgentControl::with_root_control(SessionId::new(), 1, root_control.clone())
+                .expect("first tree");
+        drop(first_root);
+        drop(first_tree);
+
+        let (second_tree, second_root) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                .expect("second tree");
+        let (_, child) = second_tree
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("second-tree child");
+        let child_control = child.run_control();
+        let failure = RunCancellationCause::Failure("second tree failed".to_string());
+
+        assert!(root_control.fail("second tree failed"));
+        assert_eq!(root_control.cause(), Some(failure.clone()));
+        assert_eq!(child_control.cause(), Some(failure));
+        assert!(second_tree.tree_is_cancelled());
+
+        second_tree
+            .complete_execution(
+                second_root,
+                AgentStatus::Errored("root failed".to_string()),
+                None,
+            )
+            .expect("complete root");
+        second_tree
+            .complete_execution(child, AgentStatus::Errored("tree failed".to_string()), None)
+            .expect("complete child");
+    }
+
+    #[test]
+    fn stale_root_owner_cannot_route_late_failure_into_the_current_turn() {
+        let stale_root_control = RunControl::new();
+        let (control, stale_root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 2, stale_root_control.clone())
+                .expect("agent tree");
+        let (_, child_execution) = control
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("child");
+        let child_control = child_execution.run_control();
+        assert!(stale_root_control.seal_success());
+        drop(stale_root_execution);
+
+        let current_root_control = RunControl::new();
+        let _current_root_execution = control
+            .try_acquire_execution_with_control(&AgentPath::root(), current_root_control.clone())
+            .expect("current root turn");
+
+        assert!(!stale_root_control.fail("late failure from stale root owner"));
+        assert!(stale_root_control.success_is_sealed());
+        assert_eq!(current_root_control.cause(), None);
+        assert_eq!(child_control.cause(), None);
+        assert!(!control.tree_is_cancelled());
+        child_control
+            .begin_tool_effect_admission()
+            .expect("current sibling admission remains open")
+            .admit()
+            .expect("current sibling effect may start");
+    }
+
+    #[test]
+    fn child_failure_remains_local_and_does_not_close_sibling_effect_admission() {
+        let root_control = RunControl::new();
+        let (control, root) =
+            AgentControl::with_root_control(SessionId::new(), 3, root_control.clone())
+                .expect("agent tree");
+        let (_, failed_child) = control
+            .register_child(&AgentPath::root(), "failed_child", SessionId::new(), None)
+            .expect("failed child");
+        let (_, sibling) = control
+            .register_child(&AgentPath::root(), "sibling", SessionId::new(), None)
+            .expect("sibling");
+        let failed_child_control = failed_child.run_control();
+        let sibling_control = sibling.run_control();
+        let failure = RunCancellationCause::Failure("child-only failure".to_string());
+
+        assert!(failed_child_control.fail("child-only failure"));
+        assert_eq!(failed_child_control.cause(), Some(failure));
+        assert_eq!(root_control.cause(), None);
+        assert_eq!(sibling_control.cause(), None);
+        assert!(!control.tree_is_cancelled());
+        sibling_control
+            .begin_tool_effect_admission()
+            .expect("sibling admission remains open")
+            .admit()
+            .expect("sibling effect may start");
+
+        control
+            .complete_execution(root, AgentStatus::Completed(None), None)
+            .expect("complete root");
+        control
+            .complete_execution(
+                failed_child,
+                AgentStatus::Errored("child failed".to_string()),
+                None,
+            )
+            .expect("complete failed child");
+        control
+            .complete_execution(sibling, AgentStatus::Completed(None), None)
+            .expect("complete sibling");
+    }
+
+    #[test]
+    fn one_live_root_control_cannot_be_attached_to_two_agent_trees() {
+        let root_control = RunControl::new();
+        let (first_tree, first_root) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                .expect("first tree");
+        let (_, first_child) = first_tree
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("first-tree child");
+        let first_child_control = first_child.run_control();
+
+        let second = AgentControl::with_root_control(SessionId::new(), 1, root_control.clone());
+        assert!(matches!(
+            second,
+            Err(AgentControlError::RunControlOwnedByDifferentTree)
+        ));
+
+        let failure = RunCancellationCause::Failure("first tree still owns failure".to_string());
+        assert!(root_control.fail("first tree still owns failure"));
+        assert_eq!(first_child_control.cause(), Some(failure));
+        assert!(first_tree.tree_is_cancelled());
+        first_tree
+            .complete_execution(
+                first_root,
+                AgentStatus::Errored("root failed".to_string()),
+                None,
+            )
+            .expect("complete root");
+        first_tree
+            .complete_execution(
+                first_child,
+                AgentStatus::Errored("tree failed".to_string()),
+                None,
+            )
+            .expect("complete child");
+    }
+
+    #[test]
+    fn same_tree_can_reacquire_its_root_control_with_the_existing_router() {
+        let root_control = RunControl::new();
+        let (control, root) =
+            AgentControl::with_root_control(SessionId::new(), 1, root_control.clone())
+                .expect("agent tree");
+        drop(root);
+
+        let reacquired = control
+            .try_acquire_execution_with_control(&AgentPath::root(), root_control)
+            .expect("same-tree root continuation");
+        drop(reacquired);
+    }
+
+    #[test]
+    fn a_different_root_terminal_cause_blocks_every_competing_tree_producer() {
+        let cases = [
+            (
+                RunCancellationCause::Failure("first failure".to_string()),
+                TreeTerminalProducer::UserStop,
+            ),
+            (
+                RunCancellationCause::Interruption(TurnInterruptionCause::UserStop),
+                TreeTerminalProducer::ApprovalAbort,
+            ),
+            (
+                RunCancellationCause::Superseded,
+                TreeTerminalProducer::Failure,
+            ),
+            (
+                RunCancellationCause::Failure("first failure".to_string()),
+                TreeTerminalProducer::Superseded,
+            ),
+        ];
+        for (existing_cause, producer) in cases {
+            let root_control = RunControl::new();
+            assert!(root_control.cancel(existing_cause.clone()));
+            let (control, _root_execution) =
+                AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                    .expect("agent tree");
+            let (_, child_execution) = control
+                .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+                .expect("child");
+
+            assert!(!apply_tree_terminal_producer(&control, producer));
+            assert_eq!(root_control.cause(), Some(existing_cause));
+            assert_eq!(child_execution.run_control().cause(), None);
+            assert!(!control.tree_is_cancelled());
+        }
+    }
+
+    #[test]
+    fn explicit_stop_uses_the_tree_owner_as_soon_as_root_success_is_durable() {
+        let root_control = RunControl::new();
+        let (control, root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                .expect("agent tree");
+        let (_, child_execution) = control
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("child");
+        let child_control = child_execution.run_control();
+        assert!(root_control.seal_success());
+
+        assert!(control.interrupt_tree(TurnInterruptionCause::UserStop));
+        assert_eq!(root_control.cause(), None);
+        assert_eq!(
+            child_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::TreeStopped
+            ))
+        );
+        control
+            .complete_execution(root_execution, AgentStatus::Completed(None), None)
+            .expect("complete root");
+    }
+
+    #[test]
+    fn restored_status_without_a_worker_does_not_claim_live_tree_ownership() {
+        for stale_status in [AgentStatus::PendingInit, AgentStatus::Running] {
+            let root_control = RunControl::new();
+            let (control, root_execution) =
+                AgentControl::with_root_control(SessionId::new(), 2, root_control.clone())
+                    .expect("agent tree");
+            let restored = control
+                .restore_inactive_child(
+                    &AgentPath::root(),
+                    "restored",
+                    SessionId::new(),
+                    stale_status.clone(),
+                    None,
+                )
+                .expect("restore inactive child");
+            assert!(!restored.is_active);
+            assert!(root_control.seal_success());
+
+            assert!(!control.interrupt_tree(TurnInterruptionCause::UserStop));
+            assert!(!control.tree_is_cancelled());
+            assert_eq!(
+                control.status(&restored.path).expect("restored status"),
+                stale_status
+            );
+
+            control
+                .complete_execution(root_execution, AgentStatus::Completed(None), None)
+                .expect("complete root");
+        }
+    }
 
     #[test]
     fn agent_paths_are_canonical_and_resolve_relative_or_absolute_references() {
@@ -1437,7 +2964,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("durable commit entered");
 
-        control.cancel_tree();
+        control.interrupt_tree(TurnInterruptionCause::UserStop);
         release_commit_tx.send(()).expect("release commit");
         let outcome = sender
             .join()
@@ -1547,7 +3074,7 @@ mod tests {
             .try_acquire_execution(&child.path)
             .expect("restart child");
         assert!(!restarted.cancel_token().is_cancelled());
-        control.cancel_tree();
+        control.interrupt_tree(TurnInterruptionCause::UserStop);
         assert!(root_execution.cancel_token().is_cancelled());
         assert!(restarted.cancel_token().is_cancelled());
         drop(restarted);
@@ -1586,7 +3113,7 @@ mod tests {
             .expect("durable child terminal");
         assert!(child_execution.cancel_token().is_cancelled());
         assert!(!root_execution.cancel_token().is_cancelled());
-        assert!(!control.tree_cancel_token().is_cancelled());
+        assert!(!control.tree_is_cancelled());
         let restored = control
             .list_agents(Some(&child.path))
             .expect("child snapshot")
@@ -1604,7 +3131,7 @@ mod tests {
             .cancel_for_durable_terminal(&root)
             .expect("durable root terminal");
         assert!(root_execution.cancel_token().is_cancelled());
-        assert!(control.tree_cancel_token().is_cancelled());
+        assert!(control.tree_is_cancelled());
     }
 
     #[test]

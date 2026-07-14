@@ -294,10 +294,7 @@ pub fn project_history_item_for_run_event(
             message_id: None,
             message: message.clone(),
         },
-        RunEvent::SessionInterrupted { reason, .. } => HistoryItemPayload::Error {
-            message_id: None,
-            message: reason.clone(),
-        },
+        RunEvent::SessionInterrupted { .. } => return None,
         RunEvent::ReasoningDelta { delta, .. } => HistoryItemPayload::Reasoning {
             text: delta.clone(),
         },
@@ -356,6 +353,40 @@ pub fn project_history_item_for_run_event(
             blocked_action: blocked_action_from_metadata(metadata),
             result_hash: result_hash_from_metadata(metadata),
             verification_run: verification_run_result_from_metadata(metadata),
+        },
+        RunEvent::ToolCallDeclined {
+            tool_call_id,
+            reason,
+            metadata,
+            ..
+        } => HistoryItemPayload::ToolOutput {
+            call_id: *tool_call_id,
+            status: ToolLifecycleStatus::Declined,
+            title: "tool declined".to_string(),
+            output_text: reason.clone(),
+            metadata: metadata.clone(),
+            success: None,
+            progress_effect: ToolProgressEffect::Unknown,
+            blocked_action: None,
+            result_hash: None,
+            verification_run: None,
+        },
+        RunEvent::ToolCallCancelled {
+            tool_call_id,
+            reason,
+            metadata,
+            ..
+        } => HistoryItemPayload::ToolOutput {
+            call_id: *tool_call_id,
+            status: ToolLifecycleStatus::Cancelled,
+            title: "tool cancelled".to_string(),
+            output_text: reason.clone(),
+            metadata: metadata.clone(),
+            success: None,
+            progress_effect: ToolProgressEffect::Unknown,
+            blocked_action: None,
+            result_hash: None,
+            verification_run: None,
         },
         RunEvent::ToolCallFailed {
             tool_call_id,
@@ -520,6 +551,30 @@ pub fn project_turn_item_for_run_event(
             title: title.clone(),
             summary: summary.clone(),
         },
+        RunEvent::ToolCallDeclined {
+            tool_call_id,
+            tool,
+            reason,
+            ..
+        } => TurnItemPayload::ToolStatus {
+            call_id: *tool_call_id,
+            tool: tool.clone(),
+            status: ToolLifecycleStatus::Declined,
+            title: "Tool declined".to_string(),
+            summary: reason.clone(),
+        },
+        RunEvent::ToolCallCancelled {
+            tool_call_id,
+            tool,
+            reason,
+            ..
+        } => TurnItemPayload::ToolStatus {
+            call_id: *tool_call_id,
+            tool: tool.clone(),
+            status: ToolLifecycleStatus::Cancelled,
+            title: "Tool cancelled".to_string(),
+            summary: reason.clone(),
+        },
         RunEvent::ToolCallFailed {
             tool_call_id,
             tool,
@@ -589,18 +644,22 @@ pub fn project_turn_item_for_run_event(
         RunEvent::SessionCompleted { .. } => TurnItemPayload::Terminal {
             status: TurnTerminalStatus::Completed,
             summary: "session completed".to_string(),
+            cause: None,
         },
         RunEvent::SessionAwaitingUser { .. } => TurnItemPayload::Terminal {
             status: TurnTerminalStatus::AwaitingUser,
             summary: "session awaiting user".to_string(),
+            cause: None,
         },
         RunEvent::SessionFailed { message, .. } => TurnItemPayload::Terminal {
             status: TurnTerminalStatus::Failed,
             summary: message.clone(),
+            cause: None,
         },
-        RunEvent::SessionInterrupted { reason, .. } => TurnItemPayload::Terminal {
+        RunEvent::SessionInterrupted { reason, cause, .. } => TurnItemPayload::Terminal {
             status: TurnTerminalStatus::Interrupted,
             summary: reason.clone(),
+            cause: *cause,
         },
         RunEvent::RetryScheduled { message, .. } => TurnItemPayload::Warning {
             message: message.clone(),
@@ -726,6 +785,38 @@ fn runtime_msg_for_run_event(
                 metadata,
             ),
         },
+        RunEvent::ToolCallDeclined {
+            tool_call_id,
+            tool,
+            reason,
+            metadata,
+        } => {
+            let mut envelope = tool_envelope(
+                *tool_call_id,
+                tool.clone(),
+                ToolLifecycleStatus::Declined,
+                Some(reason),
+                Some(reason.clone()),
+            );
+            apply_completed_tool_metadata(&mut envelope, metadata);
+            RuntimeEventMsg::ToolLifecycle { envelope }
+        }
+        RunEvent::ToolCallCancelled {
+            tool_call_id,
+            tool,
+            reason,
+            metadata,
+        } => {
+            let mut envelope = tool_envelope(
+                *tool_call_id,
+                tool.clone(),
+                ToolLifecycleStatus::Cancelled,
+                Some(reason),
+                Some(reason.clone()),
+            );
+            apply_completed_tool_metadata(&mut envelope, metadata);
+            RuntimeEventMsg::ToolLifecycle { envelope }
+        }
         RunEvent::ToolCallFailed {
             tool_call_id,
             tool,
@@ -827,8 +918,9 @@ fn runtime_msg_for_run_event(
         RunEvent::SessionFailed { message, .. } => RuntimeEventMsg::TurnFailed {
             message: message.clone(),
         },
-        RunEvent::SessionInterrupted { reason, .. } => RuntimeEventMsg::TurnInterrupted {
+        RunEvent::SessionInterrupted { reason, cause, .. } => RuntimeEventMsg::TurnInterrupted {
             reason: reason.clone(),
+            cause: *cause,
         },
     }
 }
@@ -864,6 +956,8 @@ fn session_id_for_run_event(event: &RunEvent) -> Option<SessionId> {
         | RunEvent::ReasoningDelta { .. }
         | RunEvent::ToolCallPending { .. }
         | RunEvent::ToolCallCompleted { .. }
+        | RunEvent::ToolCallDeclined { .. }
+        | RunEvent::ToolCallCancelled { .. }
         | RunEvent::ToolCallFailed { .. }
         | RunEvent::ToolProposalRejected { .. }
         | RunEvent::CandidateRepairEditRecorded { .. }
@@ -1347,7 +1441,7 @@ fn tool_name_from_token(token: &str) -> Option<crate::tool::ToolName> {
         "skill" => Some(crate::tool::ToolName::Skill),
         "docling_convert" => Some(crate::tool::ToolName::DoclingConvert),
         "mcp_call" => Some(crate::tool::ToolName::McpCall),
-        "todowrite" => Some(crate::tool::ToolName::TodoWrite),
+        "update_plan" | "todowrite" | "todo_write" => Some(crate::tool::ToolName::UpdatePlan),
         "get_goal" => Some(crate::tool::ToolName::GetGoal),
         "create_goal" => Some(crate::tool::ToolName::CreateGoal),
         "update_goal" => Some(crate::tool::ToolName::UpdateGoal),
@@ -1403,10 +1497,20 @@ fn hash_text(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::protocol::{
-        HistoryItemAuthorityRole, HistoryItemPayload, RuntimeEventMsg, TurnItemProjectionRole,
+        HistoryItemAuthorityRole, RuntimeEventMsg, TurnInterruptionCause, TurnItemProjectionRole,
         TurnTerminalStatus,
     };
     use crate::session::{RunEvent, SessionId};
+
+    #[test]
+    fn plan_tool_tokens_project_to_the_canonical_identity() {
+        for token in ["update_plan", "todowrite", "todo_write"] {
+            assert_eq!(
+                tool_name_from_token(token),
+                Some(crate::tool::ToolName::UpdatePlan)
+            );
+        }
+    }
 
     #[test]
     fn session_interrupted_projects_to_interrupted_terminal_items() {
@@ -1415,6 +1519,7 @@ mod tests {
             &RunEvent::SessionInterrupted {
                 session_id,
                 reason: "run cancelled by user".to_string(),
+                cause: Some(TurnInterruptionCause::UserStop),
             },
             None,
             TurnId::new(),
@@ -1423,24 +1528,28 @@ mod tests {
         .expect("interrupted event should project");
 
         match projection.runtime_event.msg {
-            RuntimeEventMsg::TurnInterrupted { reason } => {
+            RuntimeEventMsg::TurnInterrupted { reason, cause } => {
                 assert_eq!(reason, "run cancelled by user");
+                assert_eq!(cause, Some(TurnInterruptionCause::UserStop));
             }
             other => panic!("unexpected runtime event: {other:?}"),
         }
         match projection.turn_item.expect("terminal turn item").payload {
-            TurnItemPayload::Terminal { status, summary } => {
+            TurnItemPayload::Terminal {
+                status,
+                summary,
+                cause,
+            } => {
                 assert_eq!(status, TurnTerminalStatus::Interrupted);
                 assert_eq!(summary, "run cancelled by user");
+                assert_eq!(cause, Some(TurnInterruptionCause::UserStop));
             }
             other => panic!("unexpected turn item: {other:?}"),
         }
-        match projection.history_item.expect("history item").payload {
-            HistoryItemPayload::Error { message, .. } => {
-                assert_eq!(message, "run cancelled by user");
-            }
-            other => panic!("unexpected history item: {other:?}"),
-        }
+        assert!(
+            projection.history_item.is_none(),
+            "an interruption is typed terminal state, not a history error"
+        );
     }
 
     #[test]

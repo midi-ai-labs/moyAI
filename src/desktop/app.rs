@@ -13,7 +13,10 @@ use crate::app::{
     AgentActivityRecord, App, AppBootstrap, AppCommand, ReviewRequest, RunRequest,
     SessionSteerRequest,
 };
-use crate::cli::{ConfirmationPrompt, EventRenderer, OutputMode, SharedConfirmationPrompt};
+use crate::cli::{
+    ConfirmationOutcome, ConfirmationPrompt, EventRenderer, OutputMode, ReviewDecision,
+    SharedConfirmationPrompt,
+};
 use crate::config::loader::global_config_path;
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::{PartialModelConfig, PartialResolvedConfig, full_effective_override};
@@ -25,7 +28,11 @@ use crate::llm::{
     check_model_availability, extra_body_with_num_ctx, fetch_provider_model_infos,
     normalize_provider_base_url,
 };
-use crate::runtime::{AgentStatus, LiveConfigOverrides, SystemClock, build_cancel_token};
+use crate::protocol::{ToolApprovalDecision, TurnInterruptionCause};
+use crate::runtime::{
+    AgentStatus, LiveConfigOverrides, RunCancelOutcome, RunCancellationCause, RunControl,
+    SystemClock,
+};
 use crate::session::markdown::{
     MarkdownExportEvent, MarkdownMetadataLine, MarkdownTerminalStatus,
     render_codex_turn_block_markdown,
@@ -40,7 +47,6 @@ use crate::tui::config_editor::{ConfigEditorState, ConfigField};
 use crate::workspace::project::normalize_path;
 use tauri::Manager;
 use tempfile::NamedTempFile;
-use tokio_util::sync::CancellationToken;
 
 use super::args::{DesktopArgs, quick_chat_workspace_directory};
 use super::async_ops::{
@@ -56,9 +62,11 @@ use super::query::{
     load_snapshot_for_session_search,
 };
 use super::state::DesktopState;
+#[cfg(test)]
+use super::web_model::desktop_web_state;
 use super::web_model::{
     DesktopRuntimeProjection, DesktopWebState, access_runtime_allows_mutation,
-    access_runtime_owner_token, agent_activity_projection, desktop_web_state,
+    access_runtime_owner_token, agent_activity_projection, desktop_web_state_with_permission,
     navigation_admission_blocker,
 };
 
@@ -74,7 +82,8 @@ enum RuntimeMessage {
     Permission {
         confirmation_id: u64,
         request: PermissionRequest,
-        response: mpsc::Sender<bool>,
+        response: mpsc::Sender<ReviewDecision>,
+        run_control: RunControl,
     },
     PermissionCancelled {
         confirmation_id: u64,
@@ -98,6 +107,7 @@ enum RuntimeMessage {
     CurrentSessionRefreshed {
         request_id: LatestRequestId,
         target: SessionRefreshRequestTarget,
+        purpose: CurrentSessionRefreshPurpose,
         result: Result<LoadedSession, String>,
     },
     SessionDeleted {
@@ -485,6 +495,25 @@ enum SessionLoadReason {
     RunningRejoin,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CurrentSessionRefreshPurpose {
+    Refresh,
+    StopSettlement,
+}
+
+fn stop_settlement_status_message(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Completed => "root run completed; any remaining agent work was stopped",
+        SessionStatus::Failed => "root run failed; any remaining agent work was stopped",
+        SessionStatus::AwaitingUser => {
+            "root run is awaiting user; any remaining agent work was stopped"
+        }
+        SessionStatus::Idle | SessionStatus::Running | SessionStatus::Cancelled => {
+            "stopped the active agent tree"
+        }
+    }
+}
+
 struct LoadedSession {
     session: crate::session::SessionRecord,
     transcript: crate::session::Transcript,
@@ -686,7 +715,7 @@ enum DesktopRootRunPhase {
 
 struct DesktopRootRun {
     generation: u64,
-    cancel: CancellationToken,
+    run_control: RunControl,
     live_config: LiveConfigOverrides,
     phase: DesktopRootRunPhase,
 }
@@ -709,12 +738,12 @@ impl DesktopRunLifecycle {
     fn begin(
         &mut self,
         generation: u64,
-        cancel: CancellationToken,
+        run_control: RunControl,
         live_config: LiveConfigOverrides,
     ) {
         self.root = Some(DesktopRootRun {
             generation,
-            cancel,
+            run_control,
             live_config,
             phase: DesktopRootRunPhase::Running,
         });
@@ -749,7 +778,7 @@ impl DesktopRunLifecycle {
     fn cancellation_requested(&self) -> bool {
         self.root
             .as_ref()
-            .is_some_and(|run| run.cancel.is_cancelled())
+            .is_some_and(|run| run.run_control.is_cancelled())
     }
 
     fn live_config(&self) -> Option<&LiveConfigOverrides> {
@@ -766,9 +795,18 @@ impl DesktopRunLifecycle {
         let Some(run) = self.root.as_mut() else {
             return false;
         };
-        run.cancel.cancel();
-        run.phase = DesktopRootRunPhase::Finalizing;
-        true
+        let accepted = match run
+            .run_control
+            .request_cancel(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop,
+            )) {
+            RunCancelOutcome::Applied | RunCancelOutcome::Deferred(_) => true,
+            RunCancelOutcome::Rejected => false,
+        };
+        if accepted {
+            run.phase = DesktopRootRunPhase::Finalizing;
+        }
+        accepted
     }
 
     fn observe_terminal_event(&mut self) {
@@ -915,7 +953,7 @@ mod command_projection_owner_tests {
 
     #[test]
     fn terminal_event_moves_root_run_to_finalizing_without_admitting_steer() {
-        let cancel = CancellationToken::new();
+        let cancel = RunControl::new();
         let live = LiveConfigOverrides::new(crate::config::AccessMode::Default);
         let live_observer = live.clone();
         let mut lifecycle = DesktopRunLifecycle::default();
@@ -971,7 +1009,7 @@ mod command_projection_owner_tests {
 
     #[test]
     fn pre_admission_root_owns_cancellation_before_any_run_event() {
-        let cancel = CancellationToken::new();
+        let cancel = RunControl::new();
         let observer = cancel.clone();
         let mut lifecycle = DesktopRunLifecycle::default();
         lifecycle.begin(
@@ -986,6 +1024,44 @@ mod command_projection_owner_tests {
         assert!(lifecycle.request_cancel());
         assert!(observer.is_cancelled());
         assert!(lifecycle.root_is_finalizing());
+    }
+
+    #[test]
+    fn deferred_stop_finalizes_desktop_ui_while_success_remains_authoritative() {
+        let control = RunControl::new();
+        let success = control
+            .begin_success_commit()
+            .expect("success commit reservation");
+        let mut lifecycle = DesktopRunLifecycle::default();
+        lifecycle.begin(
+            13,
+            control.clone(),
+            LiveConfigOverrides::new(crate::config::AccessMode::Default),
+        );
+
+        assert!(
+            lifecycle.request_cancel(),
+            "a deferred Stop is accepted as a pending UI terminal"
+        );
+        assert!(lifecycle.root_is_finalizing());
+        assert!(!lifecycle.can_steer_root());
+        assert_eq!(control.cause(), None);
+
+        assert!(success.seal());
+        assert!(control.success_is_sealed());
+        assert_eq!(control.cause(), None);
+        lifecycle.finish_root();
+
+        let sealed = RunControl::new();
+        assert!(sealed.seal_success());
+        lifecycle.begin(
+            14,
+            sealed,
+            LiveConfigOverrides::new(crate::config::AccessMode::Default),
+        );
+        assert!(!lifecycle.request_cancel());
+        assert!(!lifecycle.root_is_finalizing());
+        assert!(lifecycle.can_steer_root());
     }
 
     #[test]
@@ -1007,7 +1083,7 @@ mod command_projection_owner_tests {
         );
         let live = LiveConfigOverrides::new(crate::config::AccessMode::Default);
         let mut lifecycle = DesktopRunLifecycle::default();
-        lifecycle.begin(1, CancellationToken::new(), live.clone());
+        lifecycle.begin(1, RunControl::new(), live.clone());
         let mut candidate = ResolvedConfig::default();
         candidate.permissions.access_mode = crate::config::AccessMode::FullAccess;
 
@@ -1025,9 +1101,17 @@ mod command_projection_owner_tests {
     }
 
     #[test]
-    fn cancelled_desktop_run_does_not_emit_a_failure_notification() {
-        assert!(desktop_run_failure_notification_allowed(false));
-        assert!(!desktop_run_failure_notification_allowed(true));
+    fn only_typed_interruptions_suppress_desktop_failure_notifications() {
+        let interruption = RunCancellationCause::Interruption(TurnInterruptionCause::UserStop);
+        let failure = RunCancellationCause::Failure("provider unavailable".to_string());
+        let superseded = RunCancellationCause::Superseded;
+
+        assert!(desktop_run_failure_notification_allowed(None));
+        assert!(!desktop_run_failure_notification_allowed(Some(
+            &interruption,
+        )));
+        assert!(desktop_run_failure_notification_allowed(Some(&failure)));
+        assert!(desktop_run_failure_notification_allowed(Some(&superseded)));
     }
 
     #[test]
@@ -1352,7 +1436,7 @@ mod command_projection_owner_tests {
         let live = LiveConfigOverrides::new(initial_access_mode);
         controller
             .run_lifecycle
-            .begin(1, CancellationToken::new(), live.clone());
+            .begin(1, RunControl::new(), live.clone());
         let expected_access_mode = initial_access_mode.next();
         let session_service = controller.app.session_service.clone();
         let persisted_service = session_service.clone();
@@ -1478,7 +1562,7 @@ mod command_projection_owner_tests {
         let live = LiveConfigOverrides::new(initial_access_mode);
         controller
             .run_lifecycle
-            .begin(1, CancellationToken::new(), live.clone());
+            .begin(1, RunControl::new(), live.clone());
         let expected_access_mode = initial_access_mode.next();
         let persisted_service = controller.app.session_service.clone();
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -1645,7 +1729,7 @@ mod command_projection_owner_tests {
         let live = LiveConfigOverrides::new(initial_access_mode);
         controller
             .run_lifecycle
-            .begin(1, CancellationToken::new(), live.clone());
+            .begin(1, RunControl::new(), live.clone());
         let expected_access_mode = initial_access_mode.next();
         let persisted_service = controller.app.session_service.clone();
 
@@ -1765,6 +1849,656 @@ mod command_projection_owner_tests {
         (temp, root, controller)
     }
 
+    fn loaded_test_session(
+        controller: &DesktopController,
+        root: &Utf8Path,
+        session_id: SessionId,
+        status: SessionStatus,
+        cause: Option<TurnInterruptionCause>,
+    ) -> LoadedSession {
+        let session = SessionRecord {
+            id: session_id,
+            project_id: controller.app.workspace.project_id,
+            title: "approval owner test".to_string(),
+            status,
+            cwd: root.to_path_buf(),
+            model: controller.app.config.model.model.clone(),
+            base_url: controller.app.config.model.base_url.clone(),
+            access_mode: controller.app.config.permissions.access_mode,
+            model_parameters: crate::session::SessionModelParameters::default(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            completed_at_ms: matches!(
+                status,
+                SessionStatus::Completed
+                    | SessionStatus::AwaitingUser
+                    | SessionStatus::Cancelled
+                    | SessionStatus::Failed
+            )
+            .then_some(2),
+        };
+        let turn_items = cause
+            .map(|cause| crate::protocol::TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: crate::protocol::TurnId::new(),
+                source_item_id: None,
+                sequence_no: 1,
+                payload: crate::protocol::TurnItemPayload::Terminal {
+                    status: crate::protocol::TurnTerminalStatus::Interrupted,
+                    summary: "unrelated durable summary".to_string(),
+                    cause: Some(cause),
+                },
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        LoadedSession {
+            transcript: crate::session::Transcript {
+                session: session.clone(),
+                messages: Vec::new(),
+            },
+            session,
+            turn_page_total: turn_items.len(),
+            turn_items,
+            state: crate::session::SessionStateSnapshot::default(),
+            todos: Vec::new(),
+            turn_page_offset: 0,
+            turn_page_limit: DESKTOP_TURN_PAGE_LIMIT,
+            turn_page_has_more: false,
+            agent_activity_records: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_child_permission_survives_root_finish_and_ordinary_refresh() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        controller.state.app_state.current_session_id = Some(session_id);
+        controller.state.app_state.run_status = crate::tui::state::RunStatus::Completed;
+        let request = test_permission("detached-child");
+        let expected_path = request.agent_path.clone();
+        let expected_task = request.agent_task_name.clone();
+        let (response, receiver) = mpsc::channel();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request,
+            responder: response,
+            run_control: RunControl::new(),
+        });
+
+        controller.settle_pending_permission_after_root_finish();
+        controller.apply_current_session_refreshed_message(
+            session_id,
+            CurrentSessionRefreshPurpose::Refresh,
+            Ok(loaded_test_session(
+                &controller,
+                &root,
+                session_id,
+                SessionStatus::Completed,
+                None,
+            )),
+        );
+
+        let projection = controller.next_web_state().expect("permission projection");
+        assert_eq!(projection.confirmation_id.as_deref(), Some("42"));
+        assert!(projection.confirmation_visible);
+        let confirmation = projection.confirmation.expect("confirmation requester");
+        assert_eq!(confirmation.agent_path, expected_path);
+        assert_eq!(confirmation.agent_task_name, expected_task);
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Completed
+        );
+
+        assert_eq!(
+            controller.answer_permission(42, ReviewDecision::Approved),
+            PendingPermissionResolution::Resolved
+        );
+        assert_eq!(receiver.try_recv(), Ok(ReviewDecision::Approved));
+    }
+
+    #[tokio::test]
+    async fn terminal_child_permission_does_not_survive_root_finish_without_cancel_event() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let request = test_permission("terminal-child");
+        let (response, receiver) = mpsc::channel();
+        let run_control = RunControl::new();
+        assert!(run_control.interrupt(TurnInterruptionCause::TreeStopped));
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request,
+            responder: response,
+            run_control,
+        });
+
+        controller.settle_pending_permission_after_root_finish();
+
+        assert!(controller.pending_permission.is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(
+            !controller
+                .next_web_state()
+                .expect("projection")
+                .confirmation_visible
+        );
+    }
+
+    #[tokio::test]
+    async fn session_reselection_preserves_durable_interruption_presentation() {
+        for cause in [
+            TurnInterruptionCause::ApprovalAborted,
+            TurnInterruptionCause::UserStop,
+        ] {
+            let (_temp, root, mut controller) = empty_access_test_controller().await;
+            let session_id = SessionId::new();
+            let request_id = controller.state.begin_session_load(session_id);
+            let loaded = loaded_test_session(
+                &controller,
+                &root,
+                session_id,
+                SessionStatus::Cancelled,
+                Some(cause),
+            );
+
+            controller.apply_session_loaded_message(
+                request_id,
+                session_id,
+                SessionLoadReason::UserSelection,
+                Ok(loaded),
+            );
+
+            let expected = crate::tui::state::interruption_status_message(cause);
+            assert_eq!(
+                controller.state.app_state.status_message.as_deref(),
+                Some(expected.as_str())
+            );
+            assert!(
+                !controller
+                    .state
+                    .app_state
+                    .status_message
+                    .as_deref()
+                    .is_some_and(|message| message.starts_with("opened session"))
+            );
+            let projection = controller.next_web_state().expect("rehydrated projection");
+            assert_eq!(projection.status_message, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_permission_answer_clears_the_modal_and_waits_for_new_instructions() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let request = test_permission("abort this operation");
+        let (response, receiver) = mpsc::channel();
+        let run_control = RunControl::new();
+        let run_control_observer = run_control.clone();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request: request.clone(),
+            responder: response,
+            run_control,
+        });
+
+        assert_eq!(
+            controller.answer_permission(42, ReviewDecision::Abort),
+            PendingPermissionResolution::Resolved
+        );
+        assert_eq!(receiver.try_recv(), Ok(ReviewDecision::Abort));
+        assert_eq!(run_control_observer.cause(), None);
+        assert!(controller.pending_permission.is_none());
+        assert_eq!(
+            controller.state.app_state.status_message.as_deref(),
+            Some(crate::tui::state::permission_decision_pending_status_message().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_permission_answer_preserves_an_existing_terminal_owner() {
+        let causes = [
+            RunCancellationCause::Interruption(TurnInterruptionCause::UserStop),
+            RunCancellationCause::Failure("provider failed first".to_string()),
+            RunCancellationCause::Superseded,
+        ];
+
+        for cause in causes {
+            let (_temp, _root, mut controller) = empty_access_test_controller().await;
+            let request = test_permission("late abort");
+            let (response, receiver) = mpsc::channel();
+            let run_control = RunControl::new();
+            assert!(run_control.cancel(cause.clone()));
+            controller.pending_permission = Some(PendingPermission {
+                confirmation_id: 42,
+                request: request.clone(),
+                responder: response,
+                run_control,
+            });
+
+            assert_eq!(
+                controller.answer_permission(42, ReviewDecision::Abort),
+                PendingPermissionResolution::AlreadyTerminal(cause.clone())
+            );
+            assert!(controller.pending_permission.is_none());
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+            assert_eq!(
+                controller.state.app_state.status_message,
+                Some(crate::tui::state::run_cancellation_status_message(&cause))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_responder_failure_remains_an_operational_failure() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let request = test_permission("disconnected responder");
+        let (response, receiver) = mpsc::channel();
+        drop(receiver);
+        let run_control = RunControl::new();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request: request.clone(),
+            responder: response,
+            run_control: run_control.clone(),
+        });
+
+        let outcome = controller.answer_permission(42, ReviewDecision::Approved);
+        let PendingPermissionResolution::Failed(cause) = outcome else {
+            panic!("disconnected responder must be a typed failure");
+        };
+        assert!(matches!(
+            &cause,
+            RunCancellationCause::Failure(message)
+                if message.contains("desktop permission response failed")
+        ));
+        assert_eq!(run_control.cause(), Some(cause.clone()));
+        assert!(controller.pending_permission.is_none());
+        assert_eq!(
+            controller.state.app_state.status_message,
+            Some(crate::tui::state::run_cancellation_status_message(&cause))
+        );
+    }
+
+    #[test]
+    fn responder_failure_after_a_competing_terminal_claim_consumes_the_ticket() {
+        for decision in [ReviewDecision::Approved, ReviewDecision::Abort] {
+            let request = test_permission("post-take terminal race");
+            let (response, receiver) = mpsc::channel();
+            drop(receiver);
+            let run_control = RunControl::new();
+            let cause = RunCancellationCause::Failure(format!(
+                "competing failure before {decision:?} delivery"
+            ));
+            let mut pending = Some(PendingPermission {
+                confirmation_id: 42,
+                request,
+                responder: response,
+                run_control: run_control.clone(),
+            });
+
+            let resolution =
+                resolve_pending_permission_after_take(&mut pending, 42, decision, |_| {
+                    assert!(run_control.cancel(cause.clone()));
+                });
+
+            assert_eq!(
+                resolution,
+                PendingPermissionResolution::AlreadyTerminal(cause.clone())
+            );
+            assert!(pending.is_none());
+            assert_eq!(run_control.cause(), Some(cause));
+        }
+    }
+
+    #[tokio::test]
+    async fn synchronous_access_mode_autoapproval_preserves_a_closed_responder_as_failure() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let initial_access_mode = crate::config::AccessMode::Default;
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        let request = test_permission("closed synchronous autoapproval responder");
+        let (response, receiver) = mpsc::channel();
+        drop(receiver);
+        let run_control = RunControl::new();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request: request.clone(),
+            responder: response,
+            run_control: run_control.clone(),
+        });
+
+        assert!(controller.toggle_access_mode_with_persistence(
+            |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, crate::config::AccessMode::AutoReview);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            |_, _| Ok(()),
+        ));
+
+        let cause = run_control.cause().expect("typed autoapproval failure");
+        assert!(matches!(
+            &cause,
+            RunCancellationCause::Failure(message)
+                if message.contains("desktop permission response failed")
+        ));
+        assert!(controller.pending_permission.is_none());
+        let status = controller
+            .state
+            .app_state
+            .status_message
+            .as_deref()
+            .expect("failure status");
+        assert!(status.contains(&crate::tui::state::run_cancellation_status_message(&cause)));
+        assert!(!status.contains("pending confirmation approved"));
+        assert!(!status.contains("pending confirmation decision sent"));
+    }
+
+    #[tokio::test]
+    async fn asynchronous_access_mode_autoapproval_preserves_a_closed_responder_as_failure() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let initial_access_mode = crate::config::AccessMode::Default;
+        controller.app.config.permissions.access_mode = initial_access_mode;
+        controller
+            .state
+            .provider_config
+            .update_access_mode(initial_access_mode);
+        let request = test_permission("closed asynchronous autoapproval responder");
+        let (response, receiver) = mpsc::channel();
+        drop(receiver);
+        let run_control = RunControl::new();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request: request.clone(),
+            responder: response,
+            run_control: run_control.clone(),
+        });
+
+        assert!(controller.start_access_mode_persistence(
+            move |expected, access_mode| {
+                assert_eq!(expected, initial_access_mode);
+                assert_eq!(access_mode, crate::config::AccessMode::AutoReview);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            |_, _| Ok(()),
+        ));
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if !controller.state.background_mutation_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.state.background_mutation_pending());
+        let cause = run_control.cause().expect("typed autoapproval failure");
+        assert!(matches!(
+            &cause,
+            RunCancellationCause::Failure(message)
+                if message.contains("desktop permission response failed")
+        ));
+        assert!(controller.pending_permission.is_none());
+        let status = controller
+            .state
+            .app_state
+            .status_message
+            .as_deref()
+            .expect("failure status");
+        assert!(status.contains(&crate::tui::state::run_cancellation_status_message(&cause)));
+        assert!(!status.contains("pending confirmation approved"));
+        assert!(!status.contains("pending confirmation decision sent"));
+    }
+
+    #[tokio::test]
+    async fn autoapproval_consumes_a_ticket_already_owned_by_a_terminal_cause() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let request = test_permission("terminal autoapproval ticket");
+        let (response, receiver) = mpsc::channel();
+        let run_control = RunControl::new();
+        let cause =
+            RunCancellationCause::Failure("provider failed before autoapproval".to_string());
+        assert!(run_control.cancel(cause.clone()));
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request: request.clone(),
+            responder: response,
+            run_control,
+        });
+
+        let resolution = controller
+            .auto_approve_pending_permission(crate::config::AccessMode::AutoReview)
+            .expect("autoapproval resolution");
+
+        assert_eq!(
+            resolution,
+            PendingPermissionResolution::AlreadyTerminal(cause)
+        );
+        assert!(controller.pending_permission.is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_routes_through_root_owner_and_waits_for_permission_cancellation_event() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let root_control = RunControl::new();
+        controller.run_lifecycle.begin(
+            1,
+            root_control.clone(),
+            LiveConfigOverrides::new(crate::config::AccessMode::Default),
+        );
+        let request = test_permission("child stop routing");
+        let (response, _receiver) = mpsc::channel();
+        let child_control = RunControl::new();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request: request.clone(),
+            responder: response,
+            run_control: child_control.clone(),
+        });
+
+        controller.cancel_active_run();
+
+        assert_eq!(
+            root_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop
+            ))
+        );
+        assert_eq!(
+            child_control.cause(),
+            None,
+            "the Desktop Stop surface must not classify a pending child directly"
+        );
+        assert!(controller.pending_permission.is_some());
+
+        assert!(child_control.interrupt(TurnInterruptionCause::TreeStopped));
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::PermissionCancelled {
+                confirmation_id: 42,
+            })
+            .expect("permission cancellation event");
+        controller.drain_runtime_messages();
+        assert!(controller.pending_permission.is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_only_agent_tree_stop_dispatches_session_owner_and_preserves_root_result() {
+        use crate::protocol::ProtocolEventStore as _;
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, workspace_root, mut controller) = empty_access_test_controller().await;
+        let repository = controller.app.store.session_repo();
+        let new_session = |title: &str| NewSession {
+            project_id: controller.app.workspace.project_id,
+            title: title.to_string(),
+            cwd: workspace_root.clone(),
+            model: controller.app.config.model.model.clone(),
+            base_url: controller.app.config.model.base_url.clone(),
+            access_mode: crate::config::AccessMode::Default,
+        };
+        let root = repository
+            .create_session(new_session("durable root"))
+            .await
+            .expect("root session");
+        let child = repository
+            .create_session(new_session("durable child"))
+            .await
+            .expect("child session");
+        repository
+            .insert_session_spawn_edge(
+                root.id,
+                root.id,
+                child.id,
+                "/root/durable-child",
+                "durable-child",
+            )
+            .await
+            .expect("spawn edge");
+        let root_admission = repository
+            .admit_session_run(root.id)
+            .await
+            .expect("root admission")
+            .expect("root admitted");
+        let root_turn = crate::protocol::TurnId::new();
+        assert!(
+            repository
+                .activate_admitted_turn(root.id, &root_admission, root_turn)
+                .await
+                .expect("activate root")
+        );
+        controller
+            .app
+            .store
+            .protocol_event_store()
+            .append_history_item(&crate::protocol::HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id: root.id,
+                turn_id: root_turn,
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::Message {
+                    message_id: None,
+                    role: crate::session::MessageRole::User,
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: "run detached work".to_string(),
+                    }],
+                },
+            })
+            .expect("root history");
+        assert!(
+            repository
+                .terminalize_active_session_with_protocol_event(
+                    root.id,
+                    SessionStatus::Completed,
+                    &RunEvent::SessionCompleted {
+                        session_id: root.id,
+                        finish_reason: None,
+                    },
+                    root_turn,
+                    None,
+                )
+                .await
+                .expect("complete root")
+        );
+        let child_admission = repository
+            .admit_session_run(child.id)
+            .await
+            .expect("child admission")
+            .expect("child admitted");
+        let child_turn = crate::protocol::TurnId::new();
+        assert!(
+            repository
+                .activate_admitted_turn(child.id, &child_admission, child_turn)
+                .await
+                .expect("activate child")
+        );
+        controller.state.app_state.current_session_id = Some(root.id);
+        controller.loaded_agent_activity_records = Some((
+            root.id,
+            vec![agent_record(
+                child.id,
+                "/root/durable-child",
+                AgentStatus::Running,
+                "",
+            )],
+        ));
+        assert!(controller.current_agent_tree_active());
+        assert!(!controller.run_lifecycle.root_is_active());
+
+        controller.cancel_active_run();
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if !controller.current_session_refresh_requests.is_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.current_session_refresh_requests.is_pending());
+        assert_eq!(
+            repository
+                .get_session(root.id)
+                .await
+                .expect("preserved root")
+                .status,
+            SessionStatus::Completed
+        );
+        assert_eq!(
+            repository
+                .get_session(child.id)
+                .await
+                .expect("stopped child")
+                .status,
+            SessionStatus::Cancelled
+        );
+        assert_eq!(
+            controller.state.app_state.status_message.as_deref(),
+            Some("root run completed; any remaining agent work was stopped")
+        );
+
+        controller.loaded_agent_activity_records = Some((
+            root.id,
+            vec![agent_record(
+                child.id,
+                "/root/stale-child",
+                AgentStatus::Running,
+                "",
+            )],
+        ));
+        controller.cancel_active_run();
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if !controller.current_session_refresh_requests.is_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Completed,
+            "a rejected durable Stop must not reclassify the preserved root"
+        );
+        assert!(
+            controller
+                .state
+                .app_state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("failed to stop active agent tree"))
+        );
+    }
+
     #[tokio::test]
     async fn pending_access_adoption_without_session_started_settles_global_only_on_finished() {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
@@ -1778,7 +2512,7 @@ mod command_projection_owner_tests {
         let live = LiveConfigOverrides::new(initial_access_mode);
         controller
             .run_lifecycle
-            .begin(1, CancellationToken::new(), live.clone());
+            .begin(1, RunControl::new(), live.clone());
         let session_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         assert!(controller.start_access_mode_persistence(
@@ -1874,7 +2608,7 @@ mod command_projection_owner_tests {
         let session_title = session.title.clone();
         controller.run_lifecycle.begin(
             1,
-            CancellationToken::new(),
+            RunControl::new(),
             LiveConfigOverrides::new(initial_access_mode),
         );
         let (adopted_started_tx, adopted_started_rx) = mpsc::sync_channel(1);
@@ -1937,7 +2671,7 @@ mod command_projection_owner_tests {
         let next_live = LiveConfigOverrides::new(initial_access_mode);
         controller
             .run_lifecycle
-            .begin(2, CancellationToken::new(), next_live.clone());
+            .begin(2, RunControl::new(), next_live.clone());
         controller.next_root_run_generation = 3;
         assert_eq!(
             controller.access_mode_persistence_target_relation(&old_target),
@@ -2149,7 +2883,7 @@ mod command_projection_owner_tests {
         let live = LiveConfigOverrides::new(session_access_mode);
         controller
             .run_lifecycle
-            .begin(41, CancellationToken::new(), live.clone());
+            .begin(41, RunControl::new(), live.clone());
         for _ in 0..300 {
             controller.drain_runtime_messages();
             if !controller.state.background_mutation_pending() {
@@ -2209,7 +2943,7 @@ mod command_projection_owner_tests {
         )
         .await
         .expect("controller");
-        let cancel = CancellationToken::new();
+        let cancel = RunControl::new();
         let cancel_observer = cancel.clone();
         controller.run_lifecycle.begin(
             1,
@@ -2322,7 +3056,7 @@ mod command_projection_owner_tests {
 
         controller.run_lifecycle.begin(
             77,
-            CancellationToken::new(),
+            RunControl::new(),
             LiveConfigOverrides::new(crate::config::AccessMode::Default),
         );
         assert!(!controller.start_run("steer after access settles".to_string()));
@@ -2861,7 +3595,7 @@ mod command_projection_owner_tests {
         let failed_generation = 900;
         controller.run_lifecycle.begin(
             failed_generation,
-            CancellationToken::new(),
+            RunControl::new(),
             LiveConfigOverrides::new(crate::config::AccessMode::Default),
         );
         controller.state.begin_agent_run();
@@ -2932,7 +3666,7 @@ mod command_projection_owner_tests {
         let admitted_generation = failed_generation + 1;
         controller.run_lifecycle.begin(
             admitted_generation,
-            CancellationToken::new(),
+            RunControl::new(),
             LiveConfigOverrides::new(crate::config::AccessMode::Default),
         );
         controller.state.begin_agent_run();
@@ -3064,15 +3798,15 @@ mod command_projection_owner_tests {
         let initial_access_mode = controller.app.config.permissions.access_mode;
         let live = LiveConfigOverrides::new(initial_access_mode);
         let live_observer = live.clone();
-        controller
-            .run_lifecycle
-            .begin(1, CancellationToken::new(), live);
+        controller.run_lifecycle.begin(1, RunControl::new(), live);
         let request = test_permission("pending permission");
         let (response, receiver) = mpsc::channel();
-        controller.pending_permission_request = Some(request.clone());
-        controller.pending_permission_request_id = Some(42);
-        controller.permission_response = Some(response);
-        controller.state.set_permission(42, &request);
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request: request.clone(),
+            responder: response,
+            run_control: RunControl::new(),
+        });
 
         assert!(!controller.toggle_access_mode_with_persistence(
             |_, _| Err("simulated persistence failure".to_string()),
@@ -3093,10 +3827,23 @@ mod command_projection_owner_tests {
             initial_access_mode
         );
         assert_eq!(live_observer.access_mode(), initial_access_mode);
-        assert_eq!(controller.pending_permission_request_id, Some(42));
-        assert!(controller.pending_permission_request.is_some());
-        assert_eq!(controller.state.permission_request_id, Some(42));
-        assert!(controller.state.app_state.permission.is_some());
+        assert_eq!(
+            controller
+                .pending_permission
+                .as_ref()
+                .map(|pending| pending.confirmation_id),
+            Some(42)
+        );
+        assert_eq!(
+            controller
+                .pending_permission
+                .as_ref()
+                .map(|pending| pending.request.summary.as_str()),
+            Some(request.summary.as_str())
+        );
+        let projection = controller.next_web_state().expect("permission projection");
+        assert_eq!(projection.confirmation_id.as_deref(), Some("42"));
+        assert!(projection.confirmation_visible);
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -3253,13 +4000,13 @@ mod command_projection_owner_tests {
             next_permission_request_id: Arc::new(AtomicU64::new(41)),
         });
 
-        let first_cancel = CancellationToken::new();
+        let first_cancel = RunControl::new();
         let (first_done_tx, first_done_rx) = mpsc::sync_channel(1);
         let mut first_prompt = broker.clone();
         let first_wait_cancel = first_cancel.clone();
         std::thread::spawn(move || {
             let result =
-                first_prompt.confirm_with_cancel(&test_permission("first"), &first_wait_cancel);
+                first_prompt.confirm_with_control(&test_permission("first"), &first_wait_cancel);
             let _ = first_done_tx.send(result);
         });
 
@@ -3271,37 +4018,34 @@ mod command_projection_owner_tests {
             } => (confirmation_id, response),
             _ => panic!("expected first desktop permission"),
         };
-        first_cancel.cancel();
+        first_cancel.interrupt(TurnInterruptionCause::UserStop);
         match recv_runtime_message(&mut runtime_rx) {
             RuntimeMessage::PermissionCancelled { confirmation_id } => {
                 assert_eq!(confirmation_id, first_id)
             }
             _ => panic!("expected desktop permission cancellation"),
         }
-        assert!(
-            !first_done_rx
+        assert!(matches!(
+            first_done_rx
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .expect("first confirmation result")
-                .expect("first confirmation")
-        );
+                .expect("first confirmation"),
+            ConfirmationOutcome::Interrupted
+        ));
 
-        let mut pending_request = Some(test_permission("first"));
-        let mut pending_id = Some(first_id);
-        let mut pending_response = Some(first_response);
-        assert!(!clear_cancelled_permission(
-            &mut pending_request,
-            &mut pending_id,
-            &mut pending_response,
-            first_id + 1,
-        ));
-        assert_eq!(pending_id, Some(first_id));
-        assert!(clear_cancelled_permission(
-            &mut pending_request,
-            &mut pending_id,
-            &mut pending_response,
-            first_id,
-        ));
-        assert!(pending_id.is_none());
+        let mut pending = Some(PendingPermission {
+            confirmation_id: first_id,
+            request: test_permission("first"),
+            responder: first_response,
+            run_control: first_cancel,
+        });
+        assert!(!clear_cancelled_permission(&mut pending, first_id + 1));
+        assert_eq!(
+            pending.as_ref().map(|pending| pending.confirmation_id),
+            Some(first_id)
+        );
+        assert!(clear_cancelled_permission(&mut pending, first_id));
+        assert!(pending.is_none());
 
         let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
         let mut second_prompt = broker;
@@ -3319,13 +4063,81 @@ mod command_projection_owner_tests {
         };
         assert!(second_id > first_id);
         second_response
-            .send(true)
+            .send(ReviewDecision::Approved)
             .expect("answer second permission");
-        assert!(
+        assert_eq!(
             second_done_rx
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .expect("second confirmation result")
-                .expect("second confirmation")
+                .expect("second confirmation"),
+            ReviewDecision::Approved
+        );
+    }
+
+    #[test]
+    fn desktop_permission_abort_is_ticket_local_and_loses_to_existing_cause() {
+        let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt = DesktopConfirmationPrompt {
+            tx: runtime_tx,
+            next_permission_request_id: Arc::new(AtomicU64::new(61)),
+        };
+        let control = RunControl::new();
+        let observer = control.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = prompt.confirm_with_control(&test_permission("abort"), &control);
+            let _ = done_tx.send(result);
+        });
+        let response = match recv_runtime_message(&mut runtime_rx) {
+            RuntimeMessage::Permission { response, .. } => response,
+            _ => panic!("expected Desktop permission"),
+        };
+        response
+            .send(ReviewDecision::Abort)
+            .expect("send ticket-local abort");
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("abort result")
+                .expect("abort outcome"),
+            ConfirmationOutcome::AbortRequested
+        );
+        assert_eq!(observer.cause(), None);
+
+        let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt = DesktopConfirmationPrompt {
+            tx: runtime_tx,
+            next_permission_request_id: Arc::new(AtomicU64::new(71)),
+        };
+        let control = RunControl::new();
+        let observer = control.clone();
+        let worker_control = control.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result =
+                prompt.confirm_with_control(&test_permission("competing abort"), &worker_control);
+            let _ = done_tx.send(result);
+        });
+        let response = match recv_runtime_message(&mut runtime_rx) {
+            RuntimeMessage::Permission { response, .. } => response,
+            _ => panic!("expected competing Desktop permission"),
+        };
+        assert!(control.fail("provider failed first"));
+        response
+            .send(ReviewDecision::Abort)
+            .expect("send losing abort");
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("competing result")
+                .expect("competing outcome"),
+            ConfirmationOutcome::Interrupted
+        );
+        assert_eq!(
+            observer.cause(),
+            Some(RunCancellationCause::Failure(
+                "provider failed first".to_string()
+            ))
         );
     }
 
@@ -3481,6 +4293,13 @@ mod command_projection_owner_tests {
     }
 }
 
+struct PendingPermission {
+    confirmation_id: u64,
+    request: PermissionRequest,
+    responder: mpsc::Sender<ReviewDecision>,
+    run_control: RunControl,
+}
+
 pub(crate) struct DesktopController {
     pub(crate) app: App,
     pub(crate) state: DesktopState,
@@ -3488,9 +4307,7 @@ pub(crate) struct DesktopController {
     persist_preferences_to_disk: bool,
     runtime_tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
     runtime_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeMessage>,
-    permission_response: Option<mpsc::Sender<bool>>,
-    pending_permission_request: Option<PermissionRequest>,
-    pending_permission_request_id: Option<u64>,
+    pending_permission: Option<PendingPermission>,
     next_permission_request_id: Arc<AtomicU64>,
     run_lifecycle: DesktopRunLifecycle,
     pending_root_submission: Option<PendingRootSubmission>,
@@ -3642,9 +4459,7 @@ impl DesktopController {
             persist_preferences_to_disk,
             runtime_tx,
             runtime_rx,
-            permission_response: None,
-            pending_permission_request: None,
-            pending_permission_request_id: None,
+            pending_permission: None,
             next_permission_request_id: Arc::new(AtomicU64::new(1)),
             run_lifecycle: DesktopRunLifecycle::default(),
             pending_root_submission: None,
@@ -3685,6 +4500,7 @@ impl DesktopController {
     }
 
     pub(crate) fn next_web_state(&mut self) -> Result<DesktopWebState, String> {
+        self.discard_terminal_pending_permission();
         self.reconcile_attachment_asset_authorizations()?;
         let revision = advance_projection_revision(&mut self.projection_revision)?;
         let mut runtime_projection = DesktopRuntimeProjection {
@@ -3719,7 +4535,13 @@ impl DesktopController {
                 self.spawn_durable_agent_activity_refresh(root_session_id);
             }
         }
-        let mut projection = desktop_web_state(&self.state, &runtime_projection);
+        let mut projection = desktop_web_state_with_permission(
+            &self.state,
+            &runtime_projection,
+            self.pending_permission
+                .as_ref()
+                .map(|pending| (pending.confirmation_id, &pending.request)),
+        );
         projection.projection_revision = projection_revision_text(revision);
         Ok(projection)
     }
@@ -4473,6 +5295,7 @@ impl DesktopController {
             let _ = runtime_tx.send(RuntimeMessage::CurrentSessionRefreshed {
                 request_id,
                 target,
+                purpose: CurrentSessionRefreshPurpose::Refresh,
                 result,
             });
         });
@@ -4698,7 +5521,11 @@ impl DesktopController {
         });
     }
 
-    fn spawn_session_cancel_persist(&mut self, session_id: SessionId) {
+    fn spawn_session_cancel_persist(
+        &mut self,
+        session_id: SessionId,
+        in_memory_stop_accepted: bool,
+    ) {
         let app = self.app.clone();
         let target = SessionRefreshRequestTarget {
             workspace_root: self.app.workspace.root.clone(),
@@ -4712,10 +5539,14 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop cancel-persist runtime");
             let result = runtime.block_on(async move {
-                app.session_service
+                let durable_stop_accepted = app
+                    .session_service
                     .cancel_running_session(session_id, "run cancelled by user")
                     .await
                     .map_err(|error| error.to_string())?;
+                if !in_memory_stop_accepted && !durable_stop_accepted {
+                    return Err("active agent tree no longer accepted the Stop request".to_string());
+                }
                 let detail = load_session_detail(&app, session_id)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -4724,6 +5555,7 @@ impl DesktopController {
             let _ = runtime_tx.send(RuntimeMessage::CurrentSessionRefreshed {
                 request_id,
                 target,
+                purpose: CurrentSessionRefreshPurpose::StopSettlement,
                 result,
             });
         });
@@ -5890,35 +6722,37 @@ impl DesktopController {
                 }
             }
         }
-        let auto_approved = self
-            .pending_permission_request
-            .as_ref()
-            .is_some_and(|request| {
-                crate::tool::context::access_mode_allows_permission(access_mode, request)
-            });
-        if auto_approved {
-            if let Some(response) = self.permission_response.take() {
-                let _ = response.send(true);
-            }
-            self.pending_permission_request = None;
-            self.pending_permission_request_id = None;
-            self.state.clear_permission();
-        }
+        let auto_approval = self.auto_approve_pending_permission(access_mode);
+        let auto_decision_sent = matches!(
+            auto_approval.as_ref(),
+            Some(PendingPermissionResolution::Resolved)
+        );
         let scope = if current_root_session_id.is_some() {
             "global config and current root session"
         } else {
             "global config"
         };
-        let suffix = if auto_approved {
-            "; pending confirmation approved"
+        let suffix = if auto_decision_sent {
+            "; pending confirmation decision sent"
         } else {
             ""
         };
-        self.state.set_status_message(format!(
+        let config_message = format!(
             "{scope} access mode set to {} and remembered in {}{suffix}",
             access_mode.label(),
             remembered_path
-        ));
+        );
+        self.state.set_status_message(match auto_approval {
+            Some(PendingPermissionResolution::Failed(cause))
+            | Some(PendingPermissionResolution::AlreadyTerminal(cause)) => format!(
+                "{config_message}; {}",
+                crate::tui::state::run_cancellation_status_message(&cause)
+            ),
+            Some(PendingPermissionResolution::AlreadySettled) => {
+                format!("{config_message}; permission request was already settled")
+            }
+            _ => config_message,
+        });
         true
     }
 
@@ -6394,31 +7228,66 @@ impl DesktopController {
         is_quick_chat_workspace_path(&self.app.workspace.root)
     }
 
-    pub(crate) fn answer_permission(&mut self, confirmation_id: u64, allow: bool) -> bool {
-        match resolve_pending_permission(
-            &mut self.pending_permission_request_id,
-            &mut self.permission_response,
-            confirmation_id,
-            allow,
-        ) {
-            Ok(false) => {
-                self.state.set_status_message(
-                    "confirmation changed before the answer was applied; review the current request",
-                );
-                false
-            }
-            Ok(true) => {
-                self.pending_permission_request = None;
-                self.state.clear_permission();
-                true
-            }
-            Err(error) => {
-                self.pending_permission_request = None;
-                self.state.clear_permission();
+    pub(crate) fn answer_permission(
+        &mut self,
+        confirmation_id: u64,
+        decision: ReviewDecision,
+    ) -> PendingPermissionResolution {
+        match resolve_pending_permission(&mut self.pending_permission, confirmation_id, decision) {
+            PendingPermissionResolution::NotCurrent => PendingPermissionResolution::NotCurrent,
+            PendingPermissionResolution::AlreadyTerminal(cause) => {
                 self.state
-                    .set_status_message(format!("failed to answer confirmation: {error}"));
-                false
+                    .set_status_message(crate::tui::state::run_cancellation_status_message(&cause));
+                PendingPermissionResolution::AlreadyTerminal(cause)
             }
+            PendingPermissionResolution::AlreadySettled => {
+                self.state
+                    .set_status_message("permission request was already settled");
+                PendingPermissionResolution::AlreadySettled
+            }
+            PendingPermissionResolution::Resolved => {
+                self.state.set_status_message(
+                    crate::tui::state::permission_decision_pending_status_message(),
+                );
+                PendingPermissionResolution::Resolved
+            }
+            PendingPermissionResolution::Failed(cause) => {
+                self.state
+                    .set_status_message(crate::tui::state::run_cancellation_status_message(&cause));
+                PendingPermissionResolution::Failed(cause)
+            }
+        }
+    }
+
+    fn auto_approve_pending_permission(
+        &mut self,
+        access_mode: crate::config::AccessMode,
+    ) -> Option<PendingPermissionResolution> {
+        let confirmation_id = self.pending_permission.as_ref().and_then(|pending| {
+            crate::tool::context::access_mode_allows_permission(access_mode, &pending.request)
+                .then_some(pending.confirmation_id)
+        })?;
+        let resolution = resolve_pending_permission(
+            &mut self.pending_permission,
+            confirmation_id,
+            ReviewDecision::Approved,
+        );
+        Some(resolution)
+    }
+
+    fn discard_terminal_pending_permission(&mut self) {
+        if self
+            .pending_permission
+            .as_ref()
+            .is_some_and(|pending| pending.run_control.cause().is_some())
+        {
+            self.pending_permission = None;
+        }
+    }
+
+    fn settle_pending_permission_after_root_finish(&mut self) {
+        if !preserve_permission_after_root_finish(self.pending_permission.as_ref()) {
+            self.pending_permission = None;
         }
     }
 
@@ -6427,22 +7296,29 @@ impl DesktopController {
         let session_id = self.state.app_state.current_session_id;
         let root_run_active = self.run_lifecycle.root_is_active();
         let sub_agent_active = self.current_agent_tree_active();
+        let semantic_tree_target = root_run_active || sub_agent_active;
         if self.run_lifecycle.request_cancel() {
             requested = true;
         }
-        if root_run_active || sub_agent_active {
+        if semantic_tree_target {
             if let Some(session_id) = session_id {
-                let _ = self.app.run_service.cancel_agent_tree(session_id);
-                requested = true;
+                requested |= self
+                    .app
+                    .run_service
+                    .cancel_agent_tree(session_id, TurnInterruptionCause::UserStop);
             }
         }
-        if let Some(response) = self.permission_response.take() {
-            let _ = response.send(false);
-            self.pending_permission_request = None;
-            self.pending_permission_request_id = None;
-            self.state.clear_permission();
-            requested = true;
-        }
+        let durable_stop_dispatched = if semantic_tree_target {
+            if let Some(session_id) = session_id {
+                self.state.mark_post_run_refresh_pending();
+                self.spawn_session_cancel_persist(session_id, requested);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         if requested {
             self.durable_agent_activity_refresh_requests.clear();
             self.state.mark_run_cancellation_requested(
@@ -6450,10 +7326,9 @@ impl DesktopController {
                 "停止しました。現在の処理を中断しています。",
             );
             self.state.finish_agent_run();
-            if let Some(session_id) = session_id {
-                self.state.mark_post_run_refresh_pending();
-                self.spawn_session_cancel_persist(session_id);
-            }
+        } else if durable_stop_dispatched {
+            self.state
+                .set_status_message("stopping the active agent tree...");
         } else {
             self.state
                 .set_status_message("停止できる実行中タスクはありません。");
@@ -6571,7 +7446,7 @@ impl DesktopController {
         };
         self.next_root_run_generation = next_generation;
         let image_paths = self.state.composer.image_attachment_paths.clone();
-        let cancel = build_cancel_token();
+        let run_control = RunControl::new();
         let live_config = LiveConfigOverrides::new(
             self.state
                 .provider_config
@@ -6615,13 +7490,13 @@ impl DesktopController {
             editor_context: Some(self.current_editor_context()),
             review_request,
             image_paths,
-            cancel: cancel.clone(),
+            run_control: run_control.clone(),
             live_config: Some(live_config.clone()),
             agent_confirmation: None,
             agent_context: None,
         };
         self.run_lifecycle
-            .begin(run_generation, cancel, live_config);
+            .begin(run_generation, run_control, live_config);
         self.pending_root_submission = Some(PendingRootSubmission {
             run_generation,
             owner_workspace_path: self.app.workspace.root.clone(),
@@ -6639,17 +7514,21 @@ impl DesktopController {
             .unwrap_or_else(|| self.state.current_session_label());
         std::thread::spawn(move || {
             let mut request = request;
-            let worker_cancel = request.cancel.clone();
+            let worker_run_control = request.run_control.clone();
+            let root_run_control = request.run_control.clone();
             let mut renderer = DesktopRenderer {
                 tx: runtime_tx.clone(),
                 run_generation,
                 notification_title: notification_title.clone(),
                 notified_terminal: false,
             };
-            let mut prompt = SharedConfirmationPrompt::new(DesktopConfirmationPrompt {
-                tx: runtime_tx.clone(),
-                next_permission_request_id,
-            });
+            let mut prompt = SharedConfirmationPrompt::new_with_root_control(
+                DesktopConfirmationPrompt {
+                    tx: runtime_tx.clone(),
+                    next_permission_request_id,
+                },
+                root_run_control,
+            );
             request.agent_confirmation = Some(prompt.clone());
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -6669,7 +7548,7 @@ impl DesktopController {
                     Err(error)
                         if !renderer.notified_terminal
                             && desktop_run_failure_notification_allowed(
-                                worker_cancel.is_cancelled(),
+                                worker_run_control.cause().as_ref(),
                             ) =>
                     {
                         let notification_body = run_error_notification_body(
@@ -6821,12 +7700,16 @@ impl DesktopController {
                     self.loaded_agent_activity_records = Some((loaded.session.id, records));
                     self.durable_agent_activity_refresh_failures = 0;
                 }
-                self.state.set_status_message(match reason {
-                    SessionLoadReason::RunningRejoin => {
-                        format!("rejoined running session {}", session_id)
-                    }
-                    SessionLoadReason::UserSelection => format!("opened session {}", session_id),
-                });
+                if !self.state.status_code.is_terminal_interruption() {
+                    self.state.set_status_message(match reason {
+                        SessionLoadReason::RunningRejoin => {
+                            format!("rejoined running session {}", session_id)
+                        }
+                        SessionLoadReason::UserSelection => {
+                            format!("opened session {}", session_id)
+                        }
+                    });
+                }
             }
             Err(error) => {
                 finish_navigation_failure(&mut self.state, request_id, error);
@@ -6837,9 +7720,11 @@ impl DesktopController {
     fn apply_current_session_refreshed_message(
         &mut self,
         session_id: SessionId,
+        purpose: CurrentSessionRefreshPurpose,
         result: Result<LoadedSession, String>,
     ) {
-        if self.session_load_is_blocked_by_active_run()
+        if (purpose == CurrentSessionRefreshPurpose::Refresh
+            && self.session_load_is_blocked_by_active_run())
             || self.state.app_state.current_session_id != Some(session_id)
         {
             self.state.clear_post_run_refresh_pending();
@@ -6847,6 +7732,7 @@ impl DesktopController {
         }
         match result {
             Ok(loaded) => {
+                let loaded_status = loaded.session.status;
                 let access_mode = loaded.session.access_mode;
                 self.state.load_open_session(
                     &loaded.session,
@@ -6865,10 +7751,22 @@ impl DesktopController {
                     self.durable_agent_activity_refresh_failures = 0;
                 }
                 self.state.clear_post_run_refresh_pending();
+                if purpose == CurrentSessionRefreshPurpose::StopSettlement {
+                    self.state.finish_agent_run();
+                    if !self.state.status_code.is_terminal_interruption() {
+                        self.state
+                            .set_status_message(stop_settlement_status_message(loaded_status));
+                    }
+                }
             }
             Err(error) => {
                 self.state.clear_post_run_refresh_pending();
-                self.state.set_status_message(error);
+                if purpose == CurrentSessionRefreshPurpose::StopSettlement {
+                    self.state
+                        .set_status_message(format!("failed to stop active agent tree: {error}"));
+                } else {
+                    self.state.set_status_message(error);
+                }
             }
         }
     }
@@ -7049,6 +7947,9 @@ impl DesktopController {
                         self.run_lifecycle.observe_terminal_event();
                     }
                     self.state.apply_run_event(&event);
+                    if let Some(message) = desktop_terminal_status_message(&event) {
+                        self.state.set_status_message_preserving_code(message);
+                    }
                     if let RunEvent::SessionStarted { session_id, .. } = &event {
                         self.resume_pending_access_mode_adoption(*session_id);
                     }
@@ -7098,16 +7999,8 @@ impl DesktopController {
                     match result {
                         Ok(summary) => {
                             self.commit_pending_root_submission(run_generation);
-                            let preserve_child_permission = preserve_permission_after_root_finish(
-                                self.pending_permission_request.as_ref(),
-                            );
                             self.run_lifecycle.finish_root();
-                            if !preserve_child_permission {
-                                self.pending_permission_request = None;
-                                self.pending_permission_request_id = None;
-                                self.permission_response = None;
-                                self.state.clear_permission();
-                            }
+                            self.settle_pending_permission_after_root_finish();
                             self.state.finish_agent_run();
                             self.state.mark_post_run_refresh_pending();
                             self.state.app_state.set_summary(summary);
@@ -7115,16 +8008,8 @@ impl DesktopController {
                         }
                         Err(error) => {
                             self.discard_pending_root_submission(run_generation);
-                            let preserve_child_permission = preserve_permission_after_root_finish(
-                                self.pending_permission_request.as_ref(),
-                            );
                             self.run_lifecycle.finish_root();
-                            if !preserve_child_permission {
-                                self.pending_permission_request = None;
-                                self.pending_permission_request_id = None;
-                                self.permission_response = None;
-                                self.state.clear_permission();
-                            }
+                            self.settle_pending_permission_after_root_finish();
                             self.state.finish_agent_run();
                             if !matches!(
                                 self.state.app_state.run_status,
@@ -7133,7 +8018,9 @@ impl DesktopController {
                                 self.state.app_state.run_status =
                                     crate::tui::state::RunStatus::Failed;
                             }
-                            self.state.set_status_message(error);
+                            if !self.state.status_code.is_terminal_interruption() {
+                                self.state.set_status_message(error);
+                            }
                             if self.state.app_state.current_session_id.is_some() {
                                 self.state.mark_post_run_refresh_pending();
                                 self.refresh_current_session_after_terminal_run();
@@ -7147,21 +8034,23 @@ impl DesktopController {
                     confirmation_id,
                     request,
                     response,
+                    run_control,
                 } => {
-                    self.pending_permission_request = Some(request.clone());
-                    self.pending_permission_request_id = Some(confirmation_id);
-                    self.permission_response = Some(response);
-                    self.state.set_permission(confirmation_id, &request);
+                    let next = PendingPermission {
+                        confirmation_id,
+                        request: request.clone(),
+                        responder: response,
+                        run_control,
+                    };
+                    if let Some(previous) = self.pending_permission.replace(next) {
+                        previous.run_control.fail(format!(
+                            "desktop replaced unresolved permission confirmation {} with {}",
+                            previous.confirmation_id, confirmation_id
+                        ));
+                    }
                 }
                 RuntimeMessage::PermissionCancelled { confirmation_id } => {
-                    if clear_cancelled_permission(
-                        &mut self.pending_permission_request,
-                        &mut self.pending_permission_request_id,
-                        &mut self.permission_response,
-                        confirmation_id,
-                    ) {
-                        self.state.clear_permission();
-                    }
+                    clear_cancelled_permission(&mut self.pending_permission, confirmation_id);
                 }
                 RuntimeMessage::EnhanceFinished {
                     request_id,
@@ -7220,6 +8109,7 @@ impl DesktopController {
                 RuntimeMessage::CurrentSessionRefreshed {
                     request_id,
                     target,
+                    purpose,
                     result,
                 } => {
                     if !self
@@ -7229,7 +8119,11 @@ impl DesktopController {
                     {
                         continue;
                     }
-                    self.apply_current_session_refreshed_message(target.session_id, result);
+                    self.apply_current_session_refreshed_message(
+                        target.session_id,
+                        purpose,
+                        result,
+                    );
                 }
                 RuntimeMessage::SessionDeleted { target, result } => {
                     if !finish_session_delete_request(
@@ -7860,38 +8754,40 @@ impl DesktopController {
                                     }
                                 }
                             }
-                            let auto_approved = self
-                                .pending_permission_request
-                                .as_ref()
-                                .is_some_and(|request| {
-                                    crate::tool::context::access_mode_allows_permission(
-                                        target.access_mode,
-                                        request,
-                                    )
-                                });
-                            if auto_approved {
-                                if let Some(response) = self.permission_response.take() {
-                                    let _ = response.send(true);
-                                }
-                                self.pending_permission_request = None;
-                                self.pending_permission_request_id = None;
-                                self.state.clear_permission();
-                            }
+                            let auto_approval =
+                                self.auto_approve_pending_permission(target.access_mode);
+                            let auto_decision_sent = matches!(
+                                auto_approval.as_ref(),
+                                Some(PendingPermissionResolution::Resolved)
+                            );
                             let scope = if committed_session_id.is_some() {
                                 "global config and current root session"
                             } else {
                                 "global config"
                             };
-                            let suffix = if auto_approved {
-                                "; pending confirmation approved"
+                            let suffix = if auto_decision_sent {
+                                "; pending confirmation decision sent"
                             } else {
                                 ""
                             };
-                            self.state.set_status_message(format!(
+                            let config_message = format!(
                                 "{scope} access mode set to {} and remembered in {}{suffix}",
                                 target.access_mode.label(),
                                 path
-                            ));
+                            );
+                            self.state.set_status_message(match auto_approval {
+                                Some(PendingPermissionResolution::Failed(cause))
+                                | Some(PendingPermissionResolution::AlreadyTerminal(cause)) => {
+                                    format!(
+                                        "{config_message}; {}",
+                                        crate::tui::state::run_cancellation_status_message(&cause)
+                                    )
+                                }
+                                Some(PendingPermissionResolution::AlreadySettled) => format!(
+                                    "{config_message}; permission request was already settled"
+                                ),
+                                _ => config_message,
+                            });
                         }
                         Ok(_) => {
                             let _ = self.reload_config();
@@ -7928,8 +8824,8 @@ impl DesktopController {
     }
 }
 
-fn desktop_run_failure_notification_allowed(cancelled: bool) -> bool {
-    !cancelled
+fn desktop_run_failure_notification_allowed(cause: Option<&RunCancellationCause>) -> bool {
+    !matches!(cause, Some(RunCancellationCause::Interruption(_)))
 }
 
 fn publish_desktop_run_finished(
@@ -7944,39 +8840,69 @@ fn publish_desktop_run_finished(
 }
 
 fn resolve_pending_permission(
-    pending_confirmation_id: &mut Option<u64>,
-    response: &mut Option<mpsc::Sender<bool>>,
+    pending: &mut Option<PendingPermission>,
     expected_confirmation_id: u64,
-    allow: bool,
-) -> Result<bool, String> {
-    if *pending_confirmation_id != Some(expected_confirmation_id) {
-        return Ok(false);
+    decision: ReviewDecision,
+) -> PendingPermissionResolution {
+    resolve_pending_permission_after_take(pending, expected_confirmation_id, decision, |_| {})
+}
+
+fn resolve_pending_permission_after_take(
+    pending: &mut Option<PendingPermission>,
+    expected_confirmation_id: u64,
+    decision: ReviewDecision,
+    after_take: impl FnOnce(&PendingPermission),
+) -> PendingPermissionResolution {
+    if pending.as_ref().map(|pending| pending.confirmation_id) != Some(expected_confirmation_id) {
+        return PendingPermissionResolution::NotCurrent;
     }
-    *pending_confirmation_id = None;
-    let response = response
-        .take()
-        .ok_or_else(|| "confirmation response channel is unavailable".to_string())?;
-    response.send(allow).map_err(|error| error.to_string())?;
-    Ok(true)
+    let Some(pending) = pending.take() else {
+        return PendingPermissionResolution::NotCurrent;
+    };
+    if let Some(cause) = pending.run_control.cause() {
+        return PendingPermissionResolution::AlreadyTerminal(cause);
+    }
+    after_take(&pending);
+    if let Err(error) = pending.responder.send(decision) {
+        let failure =
+            RunCancellationCause::Failure(format!("desktop permission response failed: {error}"));
+        return match pending.run_control.request_cancel(failure.clone()) {
+            RunCancelOutcome::Applied | RunCancelOutcome::Deferred(_) => {
+                PendingPermissionResolution::Failed(failure)
+            }
+            RunCancelOutcome::Rejected => match pending.run_control.cause() {
+                Some(cause) => PendingPermissionResolution::AlreadyTerminal(cause),
+                None => PendingPermissionResolution::AlreadySettled,
+            },
+        };
+    }
+    PendingPermissionResolution::Resolved
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingPermissionResolution {
+    Resolved,
+    NotCurrent,
+    AlreadyTerminal(RunCancellationCause),
+    AlreadySettled,
+    Failed(RunCancellationCause),
 }
 
 fn clear_cancelled_permission(
-    request: &mut Option<PermissionRequest>,
-    pending_confirmation_id: &mut Option<u64>,
-    response: &mut Option<mpsc::Sender<bool>>,
+    pending: &mut Option<PendingPermission>,
     expected_confirmation_id: u64,
 ) -> bool {
-    if *pending_confirmation_id != Some(expected_confirmation_id) {
+    if pending.as_ref().map(|pending| pending.confirmation_id) != Some(expected_confirmation_id) {
         return false;
     }
-    *request = None;
-    *pending_confirmation_id = None;
-    *response = None;
+    *pending = None;
     true
 }
 
-fn preserve_permission_after_root_finish(request: Option<&PermissionRequest>) -> bool {
-    request.is_some_and(|request| request.agent_path.is_some())
+fn preserve_permission_after_root_finish(pending: Option<&PendingPermission>) -> bool {
+    pending.is_some_and(|pending| {
+        pending.request.agent_path.is_some() && pending.run_control.cause().is_none()
+    })
 }
 
 fn loaded_session_from_detail(
@@ -8161,8 +9087,7 @@ fn markdown_events_for_transcript_row(row: &DesktopTranscriptRow) -> Vec<Markdow
         "work_summary_completed" => vec![
             MarkdownExportEvent::detail(row.title.clone(), transcript_detail_body(row)),
             MarkdownExportEvent::terminal(
-                transcript_terminal_status_from_body(row)
-                    .unwrap_or(MarkdownTerminalStatus::Completed),
+                MarkdownTerminalStatus::Completed,
                 transcript_terminal_summary(row),
             ),
         ],
@@ -8211,21 +9136,6 @@ fn render_file_change_markdown_lines(changes: &[super::models::DesktopFileChange
         body.push('\n');
     }
     body
-}
-
-fn transcript_terminal_status_from_body(
-    row: &DesktopTranscriptRow,
-) -> Option<MarkdownTerminalStatus> {
-    let lower = row.body.to_ascii_lowercase();
-    if lower.contains("cancelled") || row.body.contains("停止しました") {
-        Some(MarkdownTerminalStatus::Interrupted)
-    } else if lower.contains("failed") || row.body.contains("失敗しました") {
-        Some(MarkdownTerminalStatus::Failed)
-    } else if lower.contains("awaiting user") || row.body.contains("確認待ち") {
-        Some(MarkdownTerminalStatus::AwaitingUser)
-    } else {
-        None
-    }
 }
 
 fn transcript_terminal_summary(row: &DesktopTranscriptRow) -> String {
@@ -8713,17 +9623,17 @@ fn provider_catalog_probe_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopRenderer, DoclingRequestTarget, HistoryExportRequestTarget,
-        ProviderCatalogRequestTarget, ProviderReadinessRequestTarget, RuntimeMessage,
-        RuntimeMessageAsyncContract, SessionRefreshRequestTarget,
-        fallback_workspace_after_project_delete, first_restorable_project_root,
-        normalize_image_attachment_path, notification_session_title,
+        DesktopRenderer, DoclingRequestTarget, HistoryExportRequestTarget, PendingPermission,
+        PendingPermissionResolution, ProviderCatalogRequestTarget, ProviderReadinessRequestTarget,
+        RuntimeMessage, RuntimeMessageAsyncContract, SessionRefreshRequestTarget,
+        desktop_terminal_status_message, fallback_workspace_after_project_delete,
+        first_restorable_project_root, normalize_image_attachment_path, notification_session_title,
         open_transcript_rows_to_markdown, provider_catalog_probe_config,
         publish_desktop_run_finished, resolve_pending_permission, run_completion_notification_body,
         run_terminal_event_notification_body, transcript_markdown_file_name,
         unique_background_request_admission_open,
     };
-    use crate::cli::EventRenderer as _;
+    use crate::cli::{EventRenderer as _, ReviewDecision};
     use crate::config::{ProviderMetadataMode, ResolvedConfig};
     use crate::desktop::async_ops::LatestRequestTracker;
     use crate::desktop::models::DesktopTranscriptRowKind;
@@ -8875,27 +9785,72 @@ mod tests {
     #[test]
     fn stale_permission_answer_id_is_rejected_without_consuming_current_request() {
         let (response_tx, response_rx) = mpsc::channel();
-        let mut pending_confirmation_id = Some(42);
-        let mut response = Some(response_tx);
+        let run_control = crate::runtime::RunControl::new();
+        let run_control_observer = run_control.clone();
+        let mut pending = Some(PendingPermission {
+            confirmation_id: 42,
+            request: crate::tool::PermissionRequest {
+                access: crate::workspace::AccessKind::Read,
+                summary: "inspect the workspace".to_string(),
+                details: Vec::new(),
+                targets: Vec::new(),
+                outside_workspace: false,
+                risks: Vec::new(),
+                agent_path: None,
+                agent_task_name: None,
+            },
+            responder: response_tx,
+            run_control,
+        });
 
         assert_eq!(
-            resolve_pending_permission(&mut pending_confirmation_id, &mut response, 41, true,),
-            Ok(false)
+            resolve_pending_permission(&mut pending, 41, ReviewDecision::Approved),
+            PendingPermissionResolution::NotCurrent
         );
-        assert_eq!(pending_confirmation_id, Some(42));
-        assert!(response.is_some());
+        assert_eq!(
+            pending.as_ref().map(|pending| pending.confirmation_id),
+            Some(42)
+        );
         assert!(matches!(
             response_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
+        assert_eq!(run_control_observer.cause(), None);
 
         assert_eq!(
-            resolve_pending_permission(&mut pending_confirmation_id, &mut response, 42, false,),
-            Ok(true)
+            resolve_pending_permission(&mut pending, 42, ReviewDecision::Abort),
+            PendingPermissionResolution::Resolved
         );
+        assert!(pending.is_none());
+        assert_eq!(response_rx.try_recv(), Ok(ReviewDecision::Abort));
+        assert_eq!(run_control_observer.cause(), None);
+    }
+
+    #[test]
+    fn terminal_status_message_uses_the_typed_interruption_cause() {
+        let session_id = crate::session::SessionId::new();
+        let approval_abort = crate::session::RunEvent::SessionInterrupted {
+            session_id,
+            reason: "an arbitrary provider-facing description".to_string(),
+            cause: Some(crate::protocol::TurnInterruptionCause::ApprovalAborted),
+        };
         assert_eq!(
-            response_rx.recv().expect("current decision response"),
-            false
+            desktop_terminal_status_message(&approval_abort),
+            Some(crate::tui::state::interruption_status_message(
+                crate::protocol::TurnInterruptionCause::ApprovalAborted
+            ))
+        );
+
+        let explicit_stop = crate::session::RunEvent::SessionInterrupted {
+            session_id,
+            reason: "operation skipped after review".to_string(),
+            cause: Some(crate::protocol::TurnInterruptionCause::UserStop),
+        };
+        assert_eq!(
+            desktop_terminal_status_message(&explicit_stop),
+            Some(crate::tui::state::interruption_status_message(
+                crate::protocol::TurnInterruptionCause::UserStop
+            ))
         );
     }
 
@@ -9164,6 +10119,7 @@ mod tests {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 3,
             failed_tool_count: 1,
             change_count: 2,
@@ -9192,6 +10148,7 @@ mod tests {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -9221,6 +10178,7 @@ mod tests {
             &RunEvent::SessionInterrupted {
                 session_id: crate::session::SessionId::new(),
                 reason: "user requested stop\nsecond line".to_string(),
+                cause: Some(crate::protocol::TurnInterruptionCause::UserStop),
             },
         )
         .expect("terminal event should produce a notification");
@@ -9442,17 +10400,19 @@ struct DesktopConfirmationPrompt {
 }
 
 impl ConfirmationPrompt for DesktopConfirmationPrompt {
-    fn confirm(&mut self, request: &PermissionRequest) -> Result<bool, CliPromptError> {
-        self.confirm_with_cancel(request, &CancellationToken::new())
+    fn confirm(&mut self, request: &PermissionRequest) -> Result<ReviewDecision, CliPromptError> {
+        let control = RunControl::new();
+        self.confirm_with_control(request, &control)?
+            .into_review_decision()
     }
 
-    fn confirm_with_cancel(
+    fn confirm_with_control(
         &mut self,
         request: &PermissionRequest,
-        cancel: &CancellationToken,
-    ) -> Result<bool, CliPromptError> {
-        if cancel.is_cancelled() {
-            return Ok(false);
+        control: &RunControl,
+    ) -> Result<ConfirmationOutcome, CliPromptError> {
+        if control.is_cancelled() {
+            return Ok(ConfirmationOutcome::Interrupted);
         }
         let (response_tx, response_rx) = mpsc::channel();
         let confirmation_id = self
@@ -9463,22 +10423,44 @@ impl ConfirmationPrompt for DesktopConfirmationPrompt {
                 confirmation_id,
                 request: request.clone(),
                 response: response_tx,
+                run_control: control.clone(),
             })
             .map_err(|error| CliPromptError::Message(error.to_string()))?;
         loop {
             match response_rx.recv_timeout(std::time::Duration::from_millis(25)) {
-                Ok(allow) => return Ok(allow),
-                Err(mpsc::RecvTimeoutError::Timeout) if cancel.is_cancelled() => {
+                Ok(_) if control.is_cancelled() => {
+                    return Ok(ConfirmationOutcome::Interrupted);
+                }
+                Ok(ReviewDecision::Approved) => {
+                    return Ok(ConfirmationOutcome::Resolved(
+                        ToolApprovalDecision::Approved,
+                    ));
+                }
+                Ok(ReviewDecision::Denied) => {
+                    return Ok(ConfirmationOutcome::Resolved(
+                        ToolApprovalDecision::Denied {
+                            reason: "permission denied by user".to_string(),
+                        },
+                    ));
+                }
+                Ok(ReviewDecision::Abort) => return Ok(ConfirmationOutcome::AbortRequested),
+                Err(mpsc::RecvTimeoutError::Timeout) if control.is_cancelled() => {
                     let _ = self
                         .tx
                         .send(RuntimeMessage::PermissionCancelled { confirmation_id });
-                    return Ok(false);
+                    return Ok(ConfirmationOutcome::Interrupted);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(CliPromptError::Message(
-                        "desktop permission response channel disconnected".to_string(),
-                    ));
+                    if control.is_cancelled() {
+                        let _ = self
+                            .tx
+                            .send(RuntimeMessage::PermissionCancelled { confirmation_id });
+                        return Ok(ConfirmationOutcome::Interrupted);
+                    }
+                    let message = "desktop permission response channel disconnected".to_string();
+                    control.fail(message.clone());
+                    return Err(CliPromptError::Message(message));
                 }
             }
         }
@@ -9509,6 +10491,15 @@ fn run_event_is_terminal(event: &RunEvent) -> bool {
             | RunEvent::SessionInterrupted { .. }
             | RunEvent::SessionFailed { .. }
     )
+}
+
+fn desktop_terminal_status_message(event: &RunEvent) -> Option<String> {
+    match event {
+        RunEvent::SessionInterrupted {
+            cause: Some(cause), ..
+        } => Some(crate::tui::state::interruption_status_message(*cause)),
+        _ => None,
+    }
 }
 
 async fn purge_deleted_project_roots(

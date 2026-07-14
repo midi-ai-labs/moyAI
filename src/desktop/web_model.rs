@@ -5,10 +5,11 @@ use super::models::{
     DesktopSessionRow, DesktopTranscriptRow,
 };
 use super::startup::{DesktopStartupCheckStatus, DesktopStartupStatus};
-use super::state::{DesktopOverlay, DesktopState};
+use super::state::{DesktopOverlay, DesktopState, DesktopStatusCode};
 use crate::app::AgentActivityRecord;
 use crate::config::{AccessMode, ProviderMetadataMode};
 use crate::runtime::AgentStatus;
+use crate::tool::PermissionRequest;
 use crate::tui::config_editor::{ConfigField, ConfigFieldState};
 use crate::tui::state::{PromptReviewPhase, RunStatus};
 
@@ -196,6 +197,7 @@ pub struct DesktopWebState {
     pub selected_session_title: String,
     pub status_message: String,
     pub status_detail: String,
+    pub status_code: DesktopStatusCode,
     pub run_status_key: String,
     pub run_status_text: String,
     pub run_phase: String,
@@ -281,9 +283,18 @@ pub struct DesktopWebState {
     pub window_opacity_percent: i32,
 }
 
+#[cfg(test)]
 pub(crate) fn desktop_web_state(
     state: &DesktopState,
     runtime: &DesktopRuntimeProjection,
+) -> DesktopWebState {
+    desktop_web_state_with_permission(state, runtime, None)
+}
+
+pub(crate) fn desktop_web_state_with_permission(
+    state: &DesktopState,
+    runtime: &DesktopRuntimeProjection,
+    pending_permission: Option<(u64, &PermissionRequest)>,
 ) -> DesktopWebState {
     let state_busy = state.is_busy();
     let root_run_active = runtime.root_run_active();
@@ -351,9 +362,12 @@ pub(crate) fn desktop_web_state(
             .app_state
             .status_message
             .as_deref()
-            .map(display_status_projection)
+            .map(|message| display_status_projection(state.status_code, message))
             .unwrap_or_else(|| ("準備完了".to_string(), String::new()))
     };
+    let confirmation_text = pending_permission
+        .map(|(_, request)| format_permission_confirmation_text(request))
+        .unwrap_or_default();
     let token_meter = token_meter_projection(
         state.app_state.latest_context_window.as_ref(),
         state.provider_config.effective_config.model.context_window,
@@ -409,6 +423,11 @@ pub(crate) fn desktop_web_state(
         selected_session_title: state.selected_session_title(),
         status_message,
         status_detail,
+        status_code: if pre_admission_active {
+            DesktopStatusCode::Plain
+        } else {
+            state.status_code
+        },
         run_status_key: if pre_admission_active {
             "running".to_string()
         } else {
@@ -440,19 +459,21 @@ pub(crate) fn desktop_web_state(
         token_meter_label: token_meter.label,
         token_meter_title: token_meter.title,
         token_meter_level: token_meter.level,
-        confirmation_visible: detail.confirmation_visible,
-        confirmation_id: state.permission_request_id.map(|id| id.to_string()),
-        confirmation_text: detail.confirmation_text,
-        confirmation: state.app_state.permission.as_ref().map(|permission| {
-            DesktopPermissionProjection {
-                summary: permission.summary.clone(),
-                details: permission.details.clone(),
-                targets: permission.targets.clone(),
-                outside_workspace: permission.outside_workspace,
-                risks: permission.risks.clone(),
-                agent_path: permission.agent_path.clone(),
-                agent_task_name: permission.agent_task_name.clone(),
-            }
+        confirmation_visible: pending_permission.is_some(),
+        confirmation_id: pending_permission.map(|(id, _)| id.to_string()),
+        confirmation_text,
+        confirmation: pending_permission.map(|(_, permission)| DesktopPermissionProjection {
+            summary: permission.summary.clone(),
+            details: permission.details.clone(),
+            targets: permission.targets.iter().map(ToString::to_string).collect(),
+            outside_workspace: permission.outside_workspace,
+            risks: permission
+                .risks
+                .iter()
+                .map(|risk| risk.label().to_string())
+                .collect(),
+            agent_path: permission.agent_path.clone(),
+            agent_task_name: permission.agent_task_name.clone(),
         }),
         startup: startup_projection(state),
         composer_commit_generation: runtime.composer_commit_generation.to_string(),
@@ -1003,41 +1024,39 @@ fn trim_trailing_decimal(value: String) -> String {
     value.replace(".0", "")
 }
 
-fn display_status_projection(message: &str) -> (String, String) {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("run llm error")
-        || lower.contains("llm http error")
-        || lower.contains("error sending request for url")
-    {
-        return (
-            "LLMに接続できません。LLM URL とモデル設定を確認してください。".to_string(),
-            message.to_string(),
-        );
-    }
-    if lower.contains("configured model") && lower.contains("is not available") {
-        return (
-            "設定中のモデルが見つかりません。モデル名と LLM URL を確認してください。".to_string(),
-            message.to_string(),
-        );
-    }
-    if lower.contains("does not advertise image support")
-        || lower.contains("choose a vision-capable model")
-    {
-        return (
-            "このモデルは画像入力に対応していません。画像対応モデルを選択してください。"
-                .to_string(),
-            message.to_string(),
-        );
-    }
-    if lower.contains("permission denied by user") {
-        return (
-            "ユーザーが許可しなかったため、操作を実行しませんでした。".to_string(),
-            String::new(),
-        );
-    }
-    if lower.contains("run cancelled by user") || lower.contains("tool execution cancelled by user")
-    {
-        return ("停止しました。".to_string(), String::new());
+fn display_status_projection(code: DesktopStatusCode, message: &str) -> (String, String) {
+    match code {
+        DesktopStatusCode::ProviderTransport => {
+            return (
+                "LLMに接続できません。LLM URL とモデル設定を確認してください。".to_string(),
+                message.to_string(),
+            );
+        }
+        DesktopStatusCode::ModelUnavailable => {
+            return (
+                "設定中のモデルが見つかりません。モデル名と LLM URL を確認してください。"
+                    .to_string(),
+                message.to_string(),
+            );
+        }
+        DesktopStatusCode::ImageUnsupported => {
+            return (
+                "このモデルは画像入力に対応していません。画像対応モデルを選択してください。"
+                    .to_string(),
+                message.to_string(),
+            );
+        }
+        DesktopStatusCode::PermissionPolicyDenied => {
+            return (
+                "操作が許可されませんでした。アクセス設定と対象を確認してください。".to_string(),
+                message.to_string(),
+            );
+        }
+        DesktopStatusCode::Plain
+        | DesktopStatusCode::ApprovalAborted
+        | DesktopStatusCode::UserStopped
+        | DesktopStatusCode::AgentInterrupted
+        | DesktopStatusCode::TreeStopped => {}
     }
     if message == "run completed" {
         return ("実行完了".to_string(), String::new());
@@ -1063,6 +1082,43 @@ fn display_status_projection(message: &str) -> (String, String) {
         }
         _ => (message.to_string(), String::new()),
     }
+}
+
+fn format_permission_confirmation_text(permission: &PermissionRequest) -> String {
+    let targets = if permission.targets.is_empty() {
+        "(なし)".to_string()
+    } else {
+        permission
+            .targets
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let risks = if permission.risks.is_empty() {
+        "なし".to_string()
+    } else {
+        permission
+            .risks
+            .iter()
+            .map(|risk| risk.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let details = if permission.details.is_empty() {
+        "なし".to_string()
+    } else {
+        permission.details.join("\n")
+    };
+    format!(
+        "{}\n\n実行内容:\n{details}\n\n対象: {targets}\nワークスペース外: {}\nリスク: {risks}",
+        permission.summary,
+        if permission.outside_workspace {
+            "はい"
+        } else {
+            "いいえ"
+        }
+    )
 }
 
 fn display_run_phase(phase: &str) -> String {
@@ -1144,6 +1200,46 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_free_form_status_with_error_keywords_is_not_reclassified() {
+        for message in [
+            "permission approval aborted by user",
+            "run cancelled by user",
+            "storage connection refused while loading model 404",
+            "provider failed after reporting permission denied by user",
+        ] {
+            assert_eq!(
+                display_status_projection(DesktopStatusCode::Plain, message),
+                (message.to_string(), String::new()),
+                "message={message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_status_code_selects_specialized_guidance_without_message_inference() {
+        let message = "opaque diagnostic";
+        let (provider, provider_detail) =
+            display_status_projection(DesktopStatusCode::ProviderTransport, message);
+        assert!(provider.contains("LLMに接続できません"));
+        assert_eq!(provider_detail, message);
+
+        let (model, model_detail) =
+            display_status_projection(DesktopStatusCode::ModelUnavailable, message);
+        assert!(model.contains("モデルが見つかりません"));
+        assert_eq!(model_detail, message);
+
+        let (image, image_detail) =
+            display_status_projection(DesktopStatusCode::ImageUnsupported, message);
+        assert!(image.contains("画像入力に対応していません"));
+        assert_eq!(image_detail, message);
+
+        let (permission, permission_detail) =
+            display_status_projection(DesktopStatusCode::PermissionPolicyDenied, message);
+        assert!(permission.contains("許可されませんでした"));
+        assert_eq!(permission_detail, message);
+    }
 
     #[test]
     fn config_field_metadata_matches_rust_parser_shapes_and_bounds() {

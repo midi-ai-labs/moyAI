@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use eventsource_stream::Eventsource;
+use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
@@ -10,7 +10,9 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ProviderMetadataMode;
+use crate::config::model::ProviderReasoningCapability;
 use crate::error::LlmError;
+use crate::llm::contract::{ReasoningRequest, validate_chat_completions_reasoning_request};
 use crate::llm::dto::{
     OpenAiChatChunk, OpenAiChatRequest, OpenAiContent, OpenAiContentPart, OpenAiErrorPayload,
     OpenAiFunctionSchema, OpenAiImageUrl, OpenAiMessage, OpenAiMessageToolCall,
@@ -143,7 +145,7 @@ impl LlmClient for OpenAiCompatClient {
                     Ok(event) => event,
                     Err(error)
                         if emitted_events == 0
-                            && should_retry_stream_event_error(&error.to_string())
+                            && should_retry_stream_event_error(&error)
                             && stream_retry_attempt < request.stream_max_retries =>
                     {
                         stream_retry_attempt += 1;
@@ -233,7 +235,7 @@ impl LlmClient for OpenAiCompatClient {
                     }
                     if let Some(value) = choice.finish_reason {
                         saw_terminal_signal = true;
-                        finish_reason = Some(parse_finish_reason(&value));
+                        finish_reason = Some(parse_finish_reason(&value)?);
                     }
                 }
             }
@@ -242,13 +244,8 @@ impl LlmClient for OpenAiCompatClient {
                 return Err(stream_missing_terminal_signal_error());
             }
 
-            for (delta_index, entry) in tool_calls.iter() {
-                if !entry.started && !entry.arguments.is_empty() {
-                    return Err(stream_missing_tool_name_error(*delta_index));
-                }
-            }
-
-            let finish_reason = finish_reason.unwrap_or(FinishReason::Stop);
+            let has_complete_tool_calls = validate_streamed_tool_calls(&tool_calls)?;
+            let finish_reason = resolve_finish_reason(finish_reason, has_complete_tool_calls)?;
 
             sink.push(LlmEvent::Finished {
                 finish_reason,
@@ -367,7 +364,7 @@ async fn parse_response_failure(response: reqwest::Response) -> Result<ResponseF
     Ok(ResponseFailure {
         status,
         message: summarize_failure_body(&body),
-        retryable: is_retryable_status(status, &body),
+        retryable: is_retryable_status(status),
         retry_after_ms: retry_after_ms(&headers),
     })
 }
@@ -391,6 +388,47 @@ fn stream_missing_terminal_signal_error() -> LlmError {
     LlmError::Message(
         "openai-compatible stream ended without terminal [DONE] event or finish_reason".to_string(),
     )
+}
+
+fn resolve_finish_reason(
+    finish_reason: Option<FinishReason>,
+    has_tool_calls: bool,
+) -> Result<FinishReason, LlmError> {
+    match (finish_reason, has_tool_calls) {
+        (Some(finish_reason), _) => Ok(finish_reason),
+        (None, true) => Ok(FinishReason::ToolCall),
+        (None, false) => Err(LlmError::Message(
+            "openai-compatible stream ended without a finish_reason".to_string(),
+        )),
+    }
+}
+
+fn validate_streamed_tool_calls(
+    tool_calls: &HashMap<usize, PartialToolCall>,
+) -> Result<bool, LlmError> {
+    if tool_calls.is_empty() {
+        return Ok(false);
+    }
+    for (delta_index, entry) in tool_calls {
+        let Some(tool_name) = entry
+            .tool_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        else {
+            return Err(stream_missing_tool_name_error(*delta_index));
+        };
+        if entry.arguments.trim().is_empty() {
+            return Err(LlmError::Message(format!(
+                "openai-compatible stream ended with incomplete arguments for tool `{tool_name}` at delta index {delta_index}"
+            )));
+        }
+        serde_json::from_str::<Value>(&entry.arguments).map_err(|error| {
+            LlmError::Message(format!(
+                "openai-compatible stream ended with malformed arguments for tool `{tool_name}` at delta index {delta_index}: {error}"
+            ))
+        })?;
+    }
+    Ok(true)
 }
 
 fn stream_missing_tool_name_error(delta_index: usize) -> LlmError {
@@ -417,36 +455,21 @@ fn summarize_failure_body(body: &str) -> String {
     }
 }
 
-fn is_retryable_status(status: StatusCode, body: &str) -> bool {
-    if matches!(
-        status,
-        StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::REQUEST_TIMEOUT
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT
-            | StatusCode::BAD_GATEWAY
-    ) {
-        return true;
-    }
-
-    let lower = body.to_ascii_lowercase();
-    lower.contains("overloaded")
-        || lower.contains("rate limit")
-        || lower.contains("too many requests")
-        || lower.contains("temporarily unavailable")
-        || lower.contains("timeout")
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
 }
 
 fn should_retry_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
 }
 
-fn should_retry_stream_event_error(error: &str) -> bool {
-    let lowered = error.to_ascii_lowercase();
-    lowered.contains("transport error")
-        || lowered.contains("error decoding response body")
-        || lowered.contains("connection")
-        || lowered.contains("timed out")
+fn should_retry_stream_event_error(error: &EventStreamError<reqwest::Error>) -> bool {
+    matches!(
+        error,
+        EventStreamError::Transport(error) if should_retry_transport_error(error)
+    )
 }
 
 fn request_header_timeout(timeout_ms: u64) -> Option<Duration> {
@@ -573,7 +596,17 @@ pub fn streaming_tool_call_late_name_preserves_typed_tool_identity_fixture_passe
 }
 
 fn to_openai_request(request: &ChatRequest) -> Result<Value, LlmError> {
+    to_openai_request_with_reasoning(request, None, ProviderReasoningCapability::Unsupported)
+}
+
+pub(crate) fn to_openai_request_with_reasoning(
+    request: &ChatRequest,
+    reasoning_request: Option<&ReasoningRequest>,
+    reasoning_capability: ProviderReasoningCapability,
+) -> Result<Value, LlmError> {
     request.validate_provider_lifecycle()?;
+    let reasoning =
+        validate_chat_completions_reasoning_request(reasoning_request, reasoning_capability)?;
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
     let mut system_segments = vec![request.provider_system_prompt()];
     let mut non_system_messages = Vec::with_capacity(request.messages.len());
@@ -685,6 +718,26 @@ fn to_openai_request(request: &ChatRequest) -> Result<Value, LlmError> {
     if let Some(extra) = &request.extra_body {
         merge_extra_body(&mut body, extra.clone());
     }
+    if let Some(reasoning) = reasoning {
+        let body_map = body.as_object_mut().ok_or_else(|| {
+            LlmError::Message(
+                "OpenAI-compatible Chat Completions request must serialize as an object"
+                    .to_string(),
+            )
+        })?;
+        if let Some(effort) = reasoning.effort {
+            body_map.insert(
+                "reasoning_effort".to_string(),
+                serde_json::to_value(effort)?,
+            );
+        }
+        if let Some(summary) = reasoning.summary {
+            body_map.insert(
+                "reasoning_summary".to_string(),
+                serde_json::to_value(summary)?,
+            );
+        }
+    }
     if let Some(tool_choice) = request
         .tool_choice
         .as_ref()
@@ -779,16 +832,21 @@ fn is_runtime_owned_openai_request_key(key: &str) -> bool {
             | "tools"
             | "tool_choice"
             | "parallel_tool_calls"
+            | "reasoning_effort"
+            | "reasoning_summary"
     )
 }
 
-fn parse_finish_reason(value: &str) -> FinishReason {
+fn parse_finish_reason(value: &str) -> Result<FinishReason, LlmError> {
     match value {
-        "tool_calls" => FinishReason::ToolCall,
-        "length" => FinishReason::Length,
-        "cancelled" => FinishReason::Cancelled,
-        "error" => FinishReason::Error,
-        _ => FinishReason::Stop,
+        "stop" => Ok(FinishReason::Stop),
+        "tool_calls" | "function_call" => Ok(FinishReason::ToolCall),
+        "length" => Ok(FinishReason::Length),
+        "cancelled" | "canceled" => Ok(FinishReason::Cancelled),
+        "error" | "content_filter" => Ok(FinishReason::Error),
+        unknown => Err(LlmError::Message(format!(
+            "openai-compatible provider returned unknown finish_reason `{unknown}`"
+        ))),
     }
 }
 
@@ -842,9 +900,17 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::to_openai_request;
+    use super::{
+        PartialToolCall, is_retryable_status, parse_finish_reason, resolve_finish_reason,
+        should_retry_stream_event_error, to_openai_request, to_openai_request_with_reasoning,
+        validate_streamed_tool_calls,
+    };
     use crate::config::ProviderMetadataMode;
-    use crate::llm::contract::OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY;
+    use crate::config::model::{
+        ChatCompletionsReasoningParameters, ProviderReasoningCapability, ReasoningEffort,
+        ReasoningSummary,
+    };
+    use crate::llm::contract::{OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY, ReasoningRequest};
     use crate::llm::{
         ChatRequest, ModelCapabilities, ModelMessage, ModelProfile, ProviderToolChoice, ToolSchema,
     };
@@ -947,6 +1013,219 @@ mod tests {
 
         assert_eq!(tool_body["max_tokens"].as_u64(), Some(131_072));
         assert_eq!(no_tool_body["max_tokens"].as_u64(), Some(131_072));
+    }
+
+    #[test]
+    fn reasoning_fields_are_omitted_without_an_explicit_typed_provider_contract() {
+        let request = reasoning_fixture_request();
+
+        let body = to_openai_request(&request).expect("request serialization succeeds");
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning_summary").is_none());
+    }
+
+    #[test]
+    fn typed_chat_completions_reasoning_serializes_verified_wire_fields() {
+        let request = reasoning_fixture_request();
+        let effort_only = ReasoningRequest {
+            effort: Some(ReasoningEffort::Medium),
+            summary: ReasoningSummary::None,
+        };
+
+        let effort_only_body = to_openai_request_with_reasoning(
+            &request,
+            Some(&effort_only),
+            ProviderReasoningCapability::ChatCompletions {
+                parameters: ChatCompletionsReasoningParameters::EffortOnly,
+            },
+        )
+        .expect("provider-verified effort field");
+        assert_eq!(effort_only_body["reasoning_effort"], "medium");
+        assert!(effort_only_body.get("reasoning_summary").is_none());
+
+        let effort_and_summary = ReasoningRequest {
+            effort: Some(ReasoningEffort::High),
+            summary: ReasoningSummary::Concise,
+        };
+        let effort_and_summary_body = to_openai_request_with_reasoning(
+            &request,
+            Some(&effort_and_summary),
+            ProviderReasoningCapability::ChatCompletions {
+                parameters: ChatCompletionsReasoningParameters::EffortAndSummary,
+            },
+        )
+        .expect("provider-verified effort and summary fields");
+        assert_eq!(effort_and_summary_body["reasoning_effort"], "high");
+        assert_eq!(effort_and_summary_body["reasoning_summary"], "concise");
+    }
+
+    #[test]
+    fn enabled_reasoning_fails_closed_for_unsupported_or_unimplemented_transports() {
+        let request = reasoning_fixture_request();
+        let reasoning = ReasoningRequest {
+            effort: Some(ReasoningEffort::Low),
+            summary: ReasoningSummary::None,
+        };
+
+        assert!(
+            to_openai_request_with_reasoning(
+                &request,
+                Some(&reasoning),
+                ProviderReasoningCapability::Unsupported,
+            )
+            .is_err()
+        );
+        assert!(
+            to_openai_request_with_reasoning(
+                &request,
+                Some(&reasoning),
+                ProviderReasoningCapability::ResponsesItemsNotImplemented,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn extra_body_cannot_own_or_override_reasoning_wire_fields() {
+        let mut request = reasoning_fixture_request();
+        request.extra_body = Some(serde_json::json!({
+            "reasoning_effort": "ultra",
+            "reasoning_summary": "detailed",
+            "num_ctx": 8192
+        }));
+
+        let disabled_body = to_openai_request(&request).expect("disabled reasoning payload");
+        assert!(disabled_body.get("reasoning_effort").is_none());
+        assert!(disabled_body.get("reasoning_summary").is_none());
+        assert_eq!(disabled_body["num_ctx"], 8192);
+
+        let typed_body = to_openai_request_with_reasoning(
+            &request,
+            Some(&ReasoningRequest {
+                effort: Some(ReasoningEffort::Medium),
+                summary: ReasoningSummary::None,
+            }),
+            ProviderReasoningCapability::ChatCompletions {
+                parameters: ChatCompletionsReasoningParameters::EffortOnly,
+            },
+        )
+        .expect("typed reasoning owns wire field");
+        assert_eq!(typed_body["reasoning_effort"], "medium");
+        assert!(typed_body.get("reasoning_summary").is_none());
+        assert_eq!(typed_body["num_ctx"], 8192);
+    }
+
+    #[test]
+    fn finish_reason_parser_is_typed_and_unknown_values_fail_closed() {
+        assert_eq!(
+            parse_finish_reason("stop").expect("stop"),
+            crate::session::FinishReason::Stop
+        );
+        assert_eq!(
+            parse_finish_reason("tool_calls").expect("tools"),
+            crate::session::FinishReason::ToolCall
+        );
+        assert_eq!(
+            parse_finish_reason("content_filter").expect("provider error"),
+            crate::session::FinishReason::Error
+        );
+        assert!(parse_finish_reason("provider_specific_success").is_err());
+        assert_eq!(
+            resolve_finish_reason(None, true).expect("complete tool calls provide one safe type"),
+            crate::session::FinishReason::ToolCall
+        );
+        assert!(resolve_finish_reason(None, false).is_err());
+    }
+
+    #[test]
+    fn missing_finish_reason_requires_every_tool_call_to_be_complete_and_parseable() {
+        let complete = std::collections::HashMap::from([(
+            0,
+            PartialToolCall {
+                call_id: Some("call_0".to_string()),
+                tool_name: Some("read".to_string()),
+                arguments: "{}".to_string(),
+                ..PartialToolCall::default()
+            },
+        )]);
+        assert!(validate_streamed_tool_calls(&complete).expect("complete call"));
+        assert_eq!(
+            resolve_finish_reason(
+                None,
+                validate_streamed_tool_calls(&complete).expect("complete call")
+            )
+            .expect("safe inference"),
+            crate::session::FinishReason::ToolCall
+        );
+
+        for partial in [
+            PartialToolCall {
+                call_id: Some("id_only".to_string()),
+                ..PartialToolCall::default()
+            },
+            PartialToolCall {
+                tool_name: Some("read".to_string()),
+                ..PartialToolCall::default()
+            },
+            PartialToolCall {
+                tool_name: Some("read".to_string()),
+                arguments: "{\"path\":".to_string(),
+                ..PartialToolCall::default()
+            },
+        ] {
+            let calls = std::collections::HashMap::from([(0, partial)]);
+            assert!(validate_streamed_tool_calls(&calls).is_err());
+        }
+    }
+
+    #[test]
+    fn retry_classification_uses_status_and_typed_stream_errors() {
+        assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+
+        let utf8_error = String::from_utf8(vec![0xff]).expect_err("invalid utf8");
+        let stream_error = eventsource_stream::EventStreamError::<reqwest::Error>::Utf8(utf8_error);
+        assert!(!should_retry_stream_event_error(&stream_error));
+    }
+
+    fn reasoning_fixture_request() -> ChatRequest {
+        ChatRequest {
+            model: ModelProfile {
+                name: "reasoning-chat-completions-fixture-model".to_string(),
+                context_window: 131_072,
+                max_output_tokens: 8_192,
+                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+                capabilities: ModelCapabilities {
+                    supports_tools: true,
+                    supports_reasoning: true,
+                    supports_images: false,
+                },
+            },
+            base_url: "http://openai-compatible.fixture.invalid".to_string(),
+            system_prompt: "Base coding prompt".to_string(),
+            messages: vec![ModelMessage::User {
+                content: "Plan a repository change".to_string(),
+            }],
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: false,
+            timeout_ms: 30_000,
+            stream_idle_timeout_ms: 300_000,
+            stream_max_retries: 0,
+            extra_headers: BTreeMap::new(),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            extra_body: None,
+        }
     }
 
     fn first_system_prompt(body: &Value) -> &str {

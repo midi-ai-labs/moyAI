@@ -1,9 +1,8 @@
-use crate::protocol::TurnItem;
+use crate::protocol::{TurnInterruptionCause, TurnItem};
 use crate::session::{
     ProjectId, PromptDispatchPart, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus,
     TodoItem, Transcript, latest_context_window_from_transcript,
 };
-use crate::tool::PermissionRequest;
 use crate::tui::state::{AppState, RunStatus};
 
 use super::async_ops::{
@@ -24,6 +23,38 @@ use crate::llm::{ModelAvailabilityReport, ProviderModelInfo, normalize_provider_
 pub const MIN_WINDOW_OPACITY_PERCENT: i32 = 50;
 pub const MAX_WINDOW_OPACITY_PERCENT: i32 = 100;
 pub const DEFAULT_WINDOW_OPACITY_PERCENT: i32 = 96;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopStatusCode {
+    Plain,
+    ProviderTransport,
+    ModelUnavailable,
+    ImageUnsupported,
+    PermissionPolicyDenied,
+    ApprovalAborted,
+    UserStopped,
+    AgentInterrupted,
+    TreeStopped,
+}
+
+impl DesktopStatusCode {
+    pub fn from_interruption(cause: TurnInterruptionCause) -> Self {
+        match cause {
+            TurnInterruptionCause::ApprovalAborted => Self::ApprovalAborted,
+            TurnInterruptionCause::UserStop => Self::UserStopped,
+            TurnInterruptionCause::AgentInterrupted => Self::AgentInterrupted,
+            TurnInterruptionCause::TreeStopped => Self::TreeStopped,
+        }
+    }
+
+    pub fn is_terminal_interruption(self) -> bool {
+        matches!(
+            self,
+            Self::ApprovalAborted | Self::UserStopped | Self::AgentInterrupted | Self::TreeStopped
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopOverlay {
@@ -52,7 +83,7 @@ pub struct DesktopState {
     pub navigation: DesktopNavigationState,
     pub view: DesktopViewState,
     pub startup: DesktopStartupState,
-    pub permission_request_id: Option<u64>,
+    pub status_code: DesktopStatusCode,
 }
 
 impl DesktopState {
@@ -68,7 +99,7 @@ impl DesktopState {
             navigation: DesktopNavigationState::default(),
             view: DesktopViewState::default(),
             startup: DesktopStartupState::ready(),
-            permission_request_id: None,
+            status_code: DesktopStatusCode::Plain,
         }
         .with_provider_fields()
     }
@@ -580,7 +611,6 @@ impl DesktopState {
     pub fn async_polling_required(&self) -> bool {
         self.view.async_operations.polling_required()
             || self.is_busy()
-            || self.app_state.permission.is_some()
             || self.startup.status == super::startup::DesktopStartupStatus::Loading
     }
 
@@ -866,6 +896,11 @@ impl DesktopState {
         );
         self.app_state
             .load_turn_items(session, turn_items, state, todos);
+        self.status_code = self
+            .app_state
+            .interruption_cause
+            .map(DesktopStatusCode::from_interruption)
+            .unwrap_or(DesktopStatusCode::Plain);
         if let Some(context_window) = latest_context_window_from_transcript(transcript) {
             self.app_state.latest_context_window = Some(context_window);
         }
@@ -914,6 +949,12 @@ impl DesktopState {
 
     pub fn apply_run_event(&mut self, event: &crate::session::RunEvent) {
         self.app_state.apply_run_event(event);
+        self.status_code = match event {
+            crate::session::RunEvent::SessionInterrupted {
+                cause: Some(cause), ..
+            } => DesktopStatusCode::from_interruption(*cause),
+            _ => DesktopStatusCode::Plain,
+        };
         match event {
             crate::session::RunEvent::SessionStarted { session_id, title } => {
                 self.update_session_row_title(*session_id, title);
@@ -964,21 +1005,11 @@ impl DesktopState {
         }
     }
 
-    pub fn set_permission(&mut self, request_id: u64, request: &PermissionRequest) {
-        self.permission_request_id = Some(request_id);
-        self.app_state.set_permission(request);
-    }
-
-    pub fn clear_permission(&mut self) {
-        self.permission_request_id = None;
-        self.app_state.clear_permission();
-    }
-
     pub fn mark_run_cancellation_requested(&mut self, reason: &str, status_message: &str) {
         self.app_state.run_status = RunStatus::Cancelled;
-        self.permission_request_id = None;
-        self.app_state.permission = None;
         self.app_state.status_message = Some(status_message.to_string());
+        self.app_state.interruption_cause = Some(TurnInterruptionCause::UserStop);
+        self.status_code = DesktopStatusCode::UserStopped;
         self.app_state.progress.status = "Cancelled".to_string();
         self.app_state.progress.current_phase = "terminal".to_string();
         self.app_state.progress.active_step = reason.to_string();
@@ -1060,6 +1091,20 @@ impl DesktopState {
     }
 
     pub fn set_status_message(&mut self, message: impl Into<String>) {
+        self.app_state.status_message = Some(message.into());
+        self.status_code = DesktopStatusCode::Plain;
+    }
+
+    pub fn set_typed_status_message(
+        &mut self,
+        code: DesktopStatusCode,
+        message: impl Into<String>,
+    ) {
+        self.app_state.status_message = Some(message.into());
+        self.status_code = code;
+    }
+
+    pub fn set_status_message_preserving_code(&mut self, message: impl Into<String>) {
         self.app_state.status_message = Some(message.into());
     }
 
@@ -1309,29 +1354,12 @@ impl DesktopState {
             .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.provider_loaded_base_url = None;
         let message = message.into();
-        let lower = message.to_ascii_lowercase();
-        let (title, hint) = if lower.contains("error sending request")
-            || lower.contains("connection refused")
-            || lower.contains("failed to connect")
-        {
-            (
-                "LLM provider に接続できません",
-                "LM Studio が起動しているか、Base URL が http://127.0.0.1:1234 のように到達可能なURLになっているか確認してください。",
-            )
-        } else if lower.contains("model") && (lower.contains("not found") || lower.contains("404"))
-        {
-            (
-                "指定したモデルが見つかりません",
-                "Provider設定でモデル一覧を読み込み、現在ロード済みのモデルを選択してください。",
-            )
-        } else {
-            (
-                "処理に失敗しました",
-                "設定と対象ワークスペースを確認してください。原因の切り分けには技術詳細を参照してください。",
-            )
-        };
-        self.provider_config
-            .set_status(DesktopProviderStatusKind::Error, title, hint, message);
+        self.provider_config.set_status(
+            DesktopProviderStatusKind::Error,
+            "Providerモデル一覧を読み込めません",
+            "Base URL と Provider の稼働状態を確認し、もう一度モデル一覧を読み込んでください。",
+            message,
+        );
         self.provider_config.provider_models = ensure_current_model(
             self.provider_config.provider_models.clone(),
             &self.provider_config.effective_config.model.model,
@@ -1978,6 +2006,114 @@ mod tests {
         state.reset_effective_config(changed_target);
         assert!(!state.can_apply_provider_selection());
         assert_eq!(state.provider_config.provider_loaded_base_url, None);
+    }
+
+    #[test]
+    fn typed_terminal_status_matches_between_live_event_and_rehydrate() {
+        for cause in [
+            crate::protocol::TurnInterruptionCause::ApprovalAborted,
+            crate::protocol::TurnInterruptionCause::UserStop,
+        ] {
+            let session_id = SessionId::new();
+            let mut session = session_record(session_id);
+            session.status = SessionStatus::Cancelled;
+
+            let mut live = DesktopState::new(
+                snapshot(
+                    vec![session_row(
+                        session_id,
+                        &session.title,
+                        SessionStatus::Running,
+                    )],
+                    0,
+                ),
+                ResolvedConfig::default(),
+            );
+            live.app_state.current_session_id = Some(session_id);
+            live.apply_run_event(&crate::session::RunEvent::SessionInterrupted {
+                session_id,
+                reason: "opaque live interruption".to_string(),
+                cause: Some(cause),
+            });
+
+            let terminal = TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: crate::protocol::TurnId::new(),
+                source_item_id: None,
+                sequence_no: 1,
+                payload: crate::protocol::TurnItemPayload::Terminal {
+                    status: crate::protocol::TurnTerminalStatus::Interrupted,
+                    summary: "unrelated persisted summary".to_string(),
+                    cause: Some(cause),
+                },
+            };
+            let transcript = Transcript {
+                session: session.clone(),
+                messages: Vec::new(),
+            };
+            let mut rehydrated = DesktopState::new(
+                snapshot(
+                    vec![session_row(
+                        session_id,
+                        &session.title,
+                        SessionStatus::Cancelled,
+                    )],
+                    0,
+                ),
+                ResolvedConfig::default(),
+            );
+            rehydrated.load_open_session(
+                &session,
+                &transcript,
+                &[terminal],
+                SessionStateSnapshot::default(),
+                Vec::new(),
+                0,
+                50,
+                1,
+                false,
+            );
+
+            assert_eq!(rehydrated.status_code, live.status_code);
+            assert_eq!(
+                rehydrated.app_state.status_message,
+                live.app_state.status_message
+            );
+        }
+    }
+
+    #[test]
+    fn provider_catalog_failure_uses_operation_type_not_error_keywords() {
+        let messages = [
+            "storage connection refused while loading model 404: access denied",
+            "plain provider diagnostic",
+        ];
+        for message in messages {
+            let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+            state.begin_provider_model_load("http://127.0.0.1:1234".to_string());
+            state.fail_provider_model_load(message);
+
+            assert_eq!(
+                state.provider_config.provider_status.title,
+                "Providerモデル一覧を読み込めません"
+            );
+            assert_eq!(state.provider_config.provider_status.details, message);
+            assert!(
+                !state
+                    .provider_config
+                    .provider_status
+                    .title
+                    .contains("モデルが見つかりません")
+            );
+            assert!(
+                !state
+                    .provider_config
+                    .provider_status
+                    .title
+                    .contains("許可されません")
+            );
+        }
     }
 
     #[test]

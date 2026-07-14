@@ -63,13 +63,15 @@ impl Tool for WriteTool {
         if is_protected_workspace_authority_path(&ctx.workspace.root, &guarded.absolute) {
             risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
         }
-        ctx.confirm_if_needed(
-            AccessKind::Edit,
-            format!("Write full contents to {}", guarded.absolute),
-            vec![guarded.absolute.clone()],
-            !guarded.inside_workspace && !guarded.trusted_external,
-            risks,
-        )?;
+        let effect_admission = ctx
+            .confirm_if_needed(
+                AccessKind::Edit,
+                format!("Write full contents to {}", guarded.absolute),
+                vec![guarded.absolute.clone()],
+                !guarded.inside_workspace && !guarded.trusted_external,
+                risks,
+            )
+            .await?;
         ctx.run_mutation_fence.assert_owned().await?;
 
         let services = ctx.services.clone();
@@ -110,9 +112,9 @@ impl Tool for WriteTool {
                     original.as_deref(),
                     content,
                 )?;
-                let formatted = services
-                    .formatter
+                let formatted = effect_admission
                     .format_if_configured(
+                        &services.formatter,
                         &path_in_task,
                         normalized.clone(),
                         FormatterExecutionOptions {
@@ -223,6 +225,7 @@ async fn commit_write_change(
 
     validate_write_commit_precondition(&services.edit_safety, path, expected_identity.as_ref())?;
     run_mutation_fence.assert_owned().await?;
+    let _effect_commit = run_mutation_fence.begin_effect_commit()?;
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -371,10 +374,120 @@ fn no_content_write_result(path: String) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
+    use std::time::Duration;
 
-    use crate::edit::{EditSafety, read_file_with_identity};
+    use crate::config::{FormatConfig, FormatterRule, NewlineStyle};
+    use crate::edit::{EditSafety, Formatter, FormatterExecutionOptions, read_file_with_identity};
+    use crate::protocol::TurnInterruptionCause;
+    use crate::runtime::RunControl;
+    use crate::tool::context::ToolEffectAdmission;
 
     use super::validate_write_commit_precondition;
+
+    fn marker_formatter() -> Formatter {
+        Formatter::new(FormatConfig {
+            default_newline: NewlineStyle::Lf,
+            ensure_trailing_newline: true,
+            commands: vec![FormatterRule {
+                glob: "**/*.txt".to_string(),
+                command: marker_wait_command(),
+            }],
+        })
+    }
+
+    fn formatter_options(root: Utf8PathBuf, control: &RunControl) -> FormatterExecutionOptions {
+        FormatterExecutionOptions {
+            workspace_root: root,
+            timeout_ms: 30_000,
+            max_output_bytes: 1_024,
+            cancel: control.token(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn marker_wait_command() -> Vec<String> {
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "Set-Content -LiteralPath 'formatter-started.marker' -Value 'started'; Start-Sleep -Seconds 30"
+                .to_string(),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    fn marker_wait_command() -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf started > formatter-started.marker; sleep 30".to_string(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn terminal_before_write_effect_admission_spawns_no_formatter_and_mutates_no_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let target = root.join("output.txt");
+        let marker = root.join("formatter-started.marker");
+        let control = RunControl::new();
+        assert!(control.interrupt(TurnInterruptionCause::UserStop));
+
+        let error = ToolEffectAdmission::new(control.clone())
+            .format_if_configured(
+                &marker_formatter(),
+                &target,
+                "content".to_string(),
+                formatter_options(root, &control),
+            )
+            .await
+            .expect_err("terminal producer must win before the formatter effect");
+
+        assert!(matches!(error, crate::error::ToolError::RunInterrupted));
+        assert!(!marker.exists());
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn stop_during_write_formatter_kills_it_before_file_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let target = root.join("output.txt");
+        let marker = root.join("formatter-started.marker");
+        let control = RunControl::new();
+        let worker_control = control.clone();
+        let worker_root = root.clone();
+        let worker_target = target.clone();
+        let worker = tokio::spawn(async move {
+            ToolEffectAdmission::new(worker_control.clone())
+                .format_if_configured(
+                    &marker_formatter(),
+                    &worker_target,
+                    "content".to_string(),
+                    formatter_options(worker_root, &worker_control),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("formatter process must publish its start marker");
+        assert!(control.interrupt(TurnInterruptionCause::UserStop));
+        let error = tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("formatter cancellation timeout")
+            .expect("formatter worker")
+            .expect_err("Stop must cancel the blocked formatter");
+
+        assert!(error.to_string().contains("cancelled by user"));
+        assert!(marker.exists());
+        assert!(!target.exists());
+    }
 
     #[test]
     fn commit_revalidation_preserves_same_size_external_rewrite() {

@@ -16,23 +16,27 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use tokio_util::sync::CancellationToken;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionSteerRequest};
 use crate::cli::{
-    ConfirmationPrompt, EventRenderer, OutputMode, SharedConfirmationPrompt, TuiArgs,
+    ConfirmationOutcome, ConfirmationPrompt, EventRenderer, OutputMode, ReviewDecision,
+    SharedConfirmationPrompt, TuiArgs,
 };
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::full_effective_override;
 use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
-use crate::runtime::{LiveConfigOverrides, SystemClock, build_cancel_token};
+use crate::protocol::{ToolApprovalDecision, TurnInterruptionCause};
+use crate::runtime::{
+    LiveConfigOverrides, RunCancelOutcome, RunCancellationCause, RunControl, SystemClock,
+};
 use crate::session::markdown::{history_items_to_markdown, history_markdown_file_name};
 use crate::session::{
     EditorContext, LoadedSessionStatus, LoadedSessionSummary, PromptDispatchPart, RunEvent,
-    RunSummary, SessionId, SessionRecord, SessionStateSnapshot, TodoItem, TodoStatus,
+    RunSummary, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus, TodoItem,
+    TodoStatus,
 };
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
@@ -43,13 +47,15 @@ use super::query::{latest_session, recent_sessions, search_sessions, session_vie
 use super::reducer::reduce_run_event;
 use super::state::{
     AppState, Modal, PromptReviewPhase, Route, RunStatus, TranscriptEntry, TranscriptKind,
+    interruption_status_message, permission_decision_pending_status_message,
+    run_cancellation_status_message,
 };
 
 type TerminalHandle = Terminal<CrosstermBackend<Stdout>>;
 
 struct TuiRootRun {
     generation: u64,
-    cancel: CancellationToken,
+    run_control: RunControl,
 }
 
 #[derive(Default)]
@@ -58,11 +64,14 @@ struct TuiRootRunLifecycle {
 }
 
 impl TuiRootRunLifecycle {
-    fn begin(&mut self, generation: u64, cancel: CancellationToken) -> bool {
+    fn begin(&mut self, generation: u64, run_control: RunControl) -> bool {
         if self.active.is_some() {
             return false;
         }
-        self.active = Some(TuiRootRun { generation, cancel });
+        self.active = Some(TuiRootRun {
+            generation,
+            run_control,
+        });
         true
     }
 
@@ -74,11 +83,17 @@ impl TuiRootRunLifecycle {
         let Some(active) = self.active.as_ref() else {
             return false;
         };
-        active.cancel.cancel();
-        true
+        match active
+            .run_control
+            .request_cancel(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop,
+            )) {
+            RunCancelOutcome::Applied | RunCancelOutcome::Deferred(_) => true,
+            RunCancelOutcome::Rejected => false,
+        }
     }
 
-    fn finish(&mut self, generation: u64) -> Option<bool> {
+    fn finish(&mut self, generation: u64) -> Option<Option<RunCancellationCause>> {
         if self
             .active
             .as_ref()
@@ -86,9 +101,7 @@ impl TuiRootRunLifecycle {
         {
             return None;
         }
-        self.active
-            .take()
-            .map(|active| active.cancel.is_cancelled())
+        self.active.take().map(|active| active.run_control.cause())
     }
 }
 
@@ -136,6 +149,13 @@ pub async fn run(app: App, args: TuiArgs) -> Result<(), AppRunError> {
     result
 }
 
+struct PendingPermission {
+    confirmation_id: u64,
+    request: PermissionRequest,
+    responder: mpsc::Sender<ReviewDecision>,
+    run_control: RunControl,
+}
+
 struct TuiController {
     app: App,
     state: AppState,
@@ -150,9 +170,7 @@ struct TuiController {
     next_root_run_generation: u64,
     runtime_tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
     runtime_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeMessage>,
-    permission_response: Option<mpsc::Sender<bool>>,
-    pending_permission_request: Option<PermissionRequest>,
-    pending_permission_request_id: Option<u64>,
+    pending_permission: Option<PendingPermission>,
     next_permission_request_id: Arc<AtomicU64>,
     preview_entries: Vec<TranscriptEntry>,
     preview_todos: Vec<TodoItem>,
@@ -187,9 +205,7 @@ impl TuiController {
             next_root_run_generation: 1,
             runtime_tx,
             runtime_rx,
-            permission_response: None,
-            pending_permission_request: None,
-            pending_permission_request_id: None,
+            pending_permission: None,
             next_permission_request_id: Arc::new(AtomicU64::new(1)),
             preview_entries: Vec::new(),
             preview_todos: Vec::new(),
@@ -238,7 +254,7 @@ impl TuiController {
         {
             return self.stop_current_run().await;
         }
-        if self.state.permission.is_some() {
+        if self.pending_permission.is_some() {
             return self.handle_permission_key(key);
         }
         match self.state.modal {
@@ -541,36 +557,45 @@ impl TuiController {
     }
 
     fn handle_permission_key(&mut self, key: KeyEvent) -> Result<(), AppRunError> {
-        match key.code {
-            KeyCode::Char('a') => self.answer_permission(true)?,
-            KeyCode::Char('d') | KeyCode::Esc => self.answer_permission(false)?,
-            _ => {}
+        if let Some(decision) = permission_decision_for_key(key) {
+            self.answer_permission(decision)?;
         }
         Ok(())
     }
 
-    fn answer_permission(&mut self, allow: bool) -> Result<(), AppRunError> {
-        let request_already_ended = self
-            .permission_response
-            .take()
-            .is_some_and(|response| response.send(allow).is_err());
-        self.pending_permission_request = None;
-        self.pending_permission_request_id = None;
-        self.state.clear_permission();
-        if request_already_ended {
-            self.state.status_message =
-                Some("permission request already ended before the response".to_string());
+    fn answer_permission(&mut self, decision: ReviewDecision) -> Result<(), AppRunError> {
+        if let Some(cause) = self
+            .pending_permission
+            .as_ref()
+            .and_then(|pending| pending.run_control.cause())
+        {
+            self.pending_permission = None;
+            self.state.status_message = Some(run_cancellation_status_message(&cause));
+            return Ok(());
+        }
+        let Some(pending) = self.pending_permission.take() else {
+            return Err(AppRunError::Message(
+                "permission request is no longer current".to_string(),
+            ));
+        };
+        let response_failure = pending.responder.send(decision).err().map(|error| {
+            let failure =
+                RunCancellationCause::Failure(format!("TUI permission response failed: {error}"));
+            pending.run_control.cancel(failure.clone());
+            pending.run_control.cause().unwrap_or(failure)
+        });
+        if let Some(cause) = response_failure {
+            self.state.status_message = Some(run_cancellation_status_message(&cause));
+        } else {
+            self.state.status_message = Some(permission_decision_pending_status_message());
         }
         Ok(())
     }
 
     async fn stop_current_run(&mut self) -> Result<(), AppRunError> {
-        if self.state.permission.is_some() {
-            self.answer_permission(false)?;
-        }
-        let root_cancelled = self.root_run_lifecycle.request_cancel();
+        let root_stop_accepted = self.root_run_lifecycle.request_cancel();
         let Some(session_id) = self.state.current_session_id else {
-            if root_cancelled {
+            if root_stop_accepted {
                 self.state.run_status = RunStatus::Cancelled;
                 self.state.status_message =
                     Some("stop requested before run admission completed".to_string());
@@ -579,19 +604,27 @@ impl TuiController {
             self.state.status_message = Some("no active session to stop".to_string());
             return Ok(());
         };
-        let tree_cancelled = self.app.run_service.cancel_agent_tree(session_id);
+        let tree_cancelled = self
+            .app
+            .run_service
+            .cancel_agent_tree(session_id, TurnInterruptionCause::UserStop);
         match self
             .app
             .session_service
             .interrupt_running_session(session_id, "Stopped from TUI.".to_string())
             .await
         {
-            Ok(_) => {
-                self.state.run_status = RunStatus::Cancelled;
-                self.state.status_message = Some("stop requested for active run".to_string());
+            Ok(session) => {
+                self.state.run_status = tui_run_status_for_session_status(session.status);
+                self.state.status_message = Some(if session.status == SessionStatus::Cancelled {
+                    "stop requested for active run".to_string()
+                } else {
+                    "stopped the active agent tree; root result was preserved".to_string()
+                });
+                self.refresh_sessions().await?;
             }
             Err(error) => {
-                if root_cancelled || tree_cancelled {
+                if root_stop_accepted || tree_cancelled {
                     self.state.run_status = RunStatus::Cancelled;
                     self.state.status_message = Some("stopped the active agent tree".to_string());
                 } else {
@@ -748,9 +781,7 @@ impl TuiController {
         self.composer = build_composer();
         self.review_editor = build_composer();
         self.workspace_picker = build_composer();
-        self.permission_response = None;
-        self.pending_permission_request = None;
-        self.pending_permission_request_id = None;
+        self.pending_permission = None;
         self.preview_entries.clear();
         self.preview_todos.clear();
         self.refresh_sessions().await?;
@@ -888,10 +919,10 @@ impl TuiController {
                 Some("TUI run generation is exhausted; restart moyAI".to_string());
             return Ok(());
         };
-        let cancel = build_cancel_token();
+        let run_control = RunControl::new();
         if !self
             .root_run_lifecycle
-            .begin(run_generation, cancel.clone())
+            .begin(run_generation, run_control.clone())
         {
             self.state.status_message = Some(
                 "wait for the previous run to finish stopping before starting another".to_string(),
@@ -914,7 +945,7 @@ impl TuiController {
             editor_context: Some(self.current_editor_context()),
             review_request,
             image_paths: Vec::new(),
-            cancel,
+            run_control,
             live_config: Some(self.live_config.clone()),
             agent_confirmation: None,
             agent_context: None,
@@ -927,13 +958,17 @@ impl TuiController {
         let next_permission_request_id = self.next_permission_request_id.clone();
         std::thread::spawn(move || {
             let mut request = request;
+            let root_run_control = request.run_control.clone();
             let mut renderer = TuiRenderer {
                 tx: runtime_tx.clone(),
             };
-            let mut prompt = SharedConfirmationPrompt::new(TuiConfirmationPrompt {
-                tx: runtime_tx.clone(),
-                next_permission_request_id,
-            });
+            let mut prompt = SharedConfirmationPrompt::new_with_root_control(
+                TuiConfirmationPrompt {
+                    tx: runtime_tx.clone(),
+                    next_permission_request_id,
+                },
+                root_run_control,
+            );
             request.agent_confirmation = Some(prompt.clone());
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1071,31 +1106,29 @@ impl TuiController {
                     run_generation,
                     result,
                 } => {
-                    let Some(cancelled) = self.root_run_lifecycle.finish(run_generation) else {
+                    let Some(cancellation_cause) = self.root_run_lifecycle.finish(run_generation)
+                    else {
                         continue;
                     };
                     match result {
                         Ok(summary) => {
-                            let child_permission = self
-                                .pending_permission_request
-                                .as_ref()
-                                .filter(|request| request.agent_path.is_some())
-                                .cloned();
+                            self.settle_pending_permission_after_root_success();
                             self.state.set_summary(summary);
                             self.refresh_sessions().await?;
                             if let Some(session_id) = self.state.current_session_id {
                                 self.open_session(session_id).await?;
                             }
-                            if let Some(request) = child_permission {
-                                self.state.set_permission(&request);
-                            }
                         }
                         Err(message) => {
-                            self.state.run_status = tui_terminal_error_status(cancelled);
-                            self.state.status_message = Some(if cancelled {
-                                "run cancelled by user".to_string()
-                            } else {
-                                message
+                            self.pending_permission = None;
+                            self.state.run_status =
+                                tui_terminal_error_status(cancellation_cause.as_ref());
+                            self.state.status_message = Some(match cancellation_cause {
+                                Some(RunCancellationCause::Interruption(cause)) => {
+                                    interruption_status_message(cause)
+                                }
+                                Some(RunCancellationCause::Failure(failure)) => failure,
+                                Some(RunCancellationCause::Superseded) | None => message,
                             });
                         }
                     }
@@ -1104,21 +1137,23 @@ impl TuiController {
                     confirmation_id,
                     request,
                     response,
+                    run_control,
                 } => {
-                    self.permission_response = Some(response);
-                    self.pending_permission_request = Some(request.clone());
-                    self.pending_permission_request_id = Some(confirmation_id);
-                    self.state.set_permission(&request);
+                    let next = PendingPermission {
+                        confirmation_id,
+                        request: request.clone(),
+                        responder: response,
+                        run_control,
+                    };
+                    if let Some(previous) = self.pending_permission.replace(next) {
+                        previous.run_control.fail(format!(
+                            "TUI replaced unresolved permission confirmation {} with {}",
+                            previous.confirmation_id, confirmation_id
+                        ));
+                    }
                 }
                 RuntimeMessage::PermissionCancelled { confirmation_id } => {
-                    if clear_cancelled_tui_permission(
-                        &mut self.pending_permission_request,
-                        &mut self.pending_permission_request_id,
-                        &mut self.permission_response,
-                        confirmation_id,
-                    ) {
-                        self.state.clear_permission();
-                    }
+                    clear_cancelled_tui_permission(&mut self.pending_permission, confirmation_id);
                 }
                 RuntimeMessage::SteerStored(result) => match result {
                     Ok(()) => {
@@ -1154,8 +1189,27 @@ impl TuiController {
                     }
                 },
             }
+            self.discard_terminal_pending_permission();
         }
         Ok(())
+    }
+
+    fn discard_terminal_pending_permission(&mut self) {
+        if self
+            .pending_permission
+            .as_ref()
+            .is_some_and(|pending| pending.run_control.cause().is_some())
+        {
+            self.pending_permission = None;
+        }
+    }
+
+    fn settle_pending_permission_after_root_success(&mut self) {
+        if !self.pending_permission.as_ref().is_some_and(|pending| {
+            pending.request.agent_path.is_some() && pending.run_control.cause().is_none()
+        }) {
+            self.pending_permission = None;
+        }
     }
 
     async fn open_session(&mut self, session_id: SessionId) -> Result<(), AppRunError> {
@@ -1470,7 +1524,7 @@ impl TuiController {
             Modal::WorkspacePicker => self.render_workspace_picker(frame),
             Modal::None => {}
         }
-        if self.state.permission.is_some() {
+        if self.pending_permission.is_some() {
             self.render_permission_overlay(frame);
         }
     }
@@ -2056,7 +2110,11 @@ impl TuiController {
     fn render_permission_overlay(&self, frame: &mut Frame<'_>) {
         let area = centered_rect(70, 40, frame.area());
         frame.render_widget(Clear, area);
-        if let Some(permission) = &self.state.permission {
+        if let Some(permission) = self
+            .pending_permission
+            .as_ref()
+            .map(|pending| &pending.request)
+        {
             let mut lines = vec![
                 Line::from(permission.summary.clone()),
                 Line::from(""),
@@ -2085,7 +2143,12 @@ impl TuiController {
                     if permission.targets.is_empty() {
                         "(none)".to_string()
                     } else {
-                        permission.targets.join(", ")
+                        permission
+                            .targets
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     }
                 )),
                 Line::from(format!(
@@ -2097,7 +2160,12 @@ impl TuiController {
                     if permission.risks.is_empty() {
                         "none".to_string()
                     } else {
-                        permission.risks.join(", ")
+                        permission
+                            .risks
+                            .iter()
+                            .map(|risk| risk.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     }
                 )),
                 Line::from(format!(
@@ -2105,9 +2173,9 @@ impl TuiController {
                     self.effective_config.permissions.access_mode.as_str()
                 )),
                 Line::from(""),
-                Line::from("a = allow once"),
-                Line::from("d / Esc = reject"),
-                Line::from("Ctrl+X = stop active run"),
+                Line::from("a = approve and run once"),
+                Line::from("d / Esc = do not run; stop the requesting task for new instructions"),
+                Line::from("Ctrl+X = stop the entire active agent tree"),
             ]);
             frame.render_widget(
                 Paragraph::new(Text::from(lines))
@@ -2129,7 +2197,8 @@ enum RuntimeMessage {
     Permission {
         confirmation_id: u64,
         request: PermissionRequest,
-        response: mpsc::Sender<bool>,
+        response: mpsc::Sender<ReviewDecision>,
+        run_control: RunControl,
     },
     PermissionCancelled {
         confirmation_id: u64,
@@ -2267,11 +2336,22 @@ fn publish_tui_run_finished(
     });
 }
 
-fn tui_terminal_error_status(cancelled: bool) -> RunStatus {
-    if cancelled {
+fn tui_terminal_error_status(cause: Option<&RunCancellationCause>) -> RunStatus {
+    if matches!(cause, Some(RunCancellationCause::Interruption(_))) {
         RunStatus::Cancelled
     } else {
         RunStatus::Failed
+    }
+}
+
+fn tui_run_status_for_session_status(status: SessionStatus) -> RunStatus {
+    match status {
+        SessionStatus::Idle => RunStatus::Idle,
+        SessionStatus::Running => RunStatus::Running,
+        SessionStatus::Completed => RunStatus::Completed,
+        SessionStatus::AwaitingUser => RunStatus::AwaitingUser,
+        SessionStatus::Cancelled => RunStatus::Cancelled,
+        SessionStatus::Failed => RunStatus::Failed,
     }
 }
 
@@ -2281,17 +2361,19 @@ struct TuiConfirmationPrompt {
 }
 
 impl ConfirmationPrompt for TuiConfirmationPrompt {
-    fn confirm(&mut self, request: &PermissionRequest) -> Result<bool, CliPromptError> {
-        self.confirm_with_cancel(request, &CancellationToken::new())
+    fn confirm(&mut self, request: &PermissionRequest) -> Result<ReviewDecision, CliPromptError> {
+        let control = RunControl::new();
+        self.confirm_with_control(request, &control)?
+            .into_review_decision()
     }
 
-    fn confirm_with_cancel(
+    fn confirm_with_control(
         &mut self,
         request: &PermissionRequest,
-        cancel: &CancellationToken,
-    ) -> Result<bool, CliPromptError> {
-        if cancel.is_cancelled() {
-            return Ok(false);
+        control: &RunControl,
+    ) -> Result<ConfirmationOutcome, CliPromptError> {
+        if control.is_cancelled() {
+            return Ok(ConfirmationOutcome::Interrupted);
         }
         let (response_tx, response_rx) = mpsc::channel();
         let confirmation_id = self
@@ -2302,22 +2384,44 @@ impl ConfirmationPrompt for TuiConfirmationPrompt {
                 confirmation_id,
                 request: request.clone(),
                 response: response_tx,
+                run_control: control.clone(),
             })
             .map_err(|error| CliPromptError::Message(error.to_string()))?;
         loop {
             match response_rx.recv_timeout(Duration::from_millis(25)) {
-                Ok(allow) => return Ok(allow),
-                Err(mpsc::RecvTimeoutError::Timeout) if cancel.is_cancelled() => {
+                Ok(_) if control.is_cancelled() => {
+                    return Ok(ConfirmationOutcome::Interrupted);
+                }
+                Ok(ReviewDecision::Approved) => {
+                    return Ok(ConfirmationOutcome::Resolved(
+                        ToolApprovalDecision::Approved,
+                    ));
+                }
+                Ok(ReviewDecision::Denied) => {
+                    return Ok(ConfirmationOutcome::Resolved(
+                        ToolApprovalDecision::Denied {
+                            reason: "permission denied by user".to_string(),
+                        },
+                    ));
+                }
+                Ok(ReviewDecision::Abort) => return Ok(ConfirmationOutcome::AbortRequested),
+                Err(mpsc::RecvTimeoutError::Timeout) if control.is_cancelled() => {
                     let _ = self
                         .tx
                         .send(RuntimeMessage::PermissionCancelled { confirmation_id });
-                    return Ok(false);
+                    return Ok(ConfirmationOutcome::Interrupted);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(CliPromptError::Message(
-                        "TUI permission response channel disconnected".to_string(),
-                    ));
+                    if control.is_cancelled() {
+                        let _ = self
+                            .tx
+                            .send(RuntimeMessage::PermissionCancelled { confirmation_id });
+                        return Ok(ConfirmationOutcome::Interrupted);
+                    }
+                    let message = "TUI permission response channel disconnected".to_string();
+                    control.fail(message.clone());
+                    return Err(CliPromptError::Message(message));
                 }
             }
         }
@@ -2341,17 +2445,13 @@ fn tui_permission_agent_identity(
 }
 
 fn clear_cancelled_tui_permission(
-    request: &mut Option<PermissionRequest>,
-    pending_confirmation_id: &mut Option<u64>,
-    response: &mut Option<mpsc::Sender<bool>>,
+    pending: &mut Option<PendingPermission>,
     expected_confirmation_id: u64,
 ) -> bool {
-    if *pending_confirmation_id != Some(expected_confirmation_id) {
+    if pending.as_ref().map(|pending| pending.confirmation_id) != Some(expected_confirmation_id) {
         return false;
     }
-    *request = None;
-    *pending_confirmation_id = None;
-    *response = None;
+    *pending = None;
     true
 }
 
@@ -2408,6 +2508,14 @@ fn build_composer() -> TextArea<'static> {
 
 fn is_stop_key(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn permission_decision_for_key(key: KeyEvent) -> Option<ReviewDecision> {
+    match key.code {
+        KeyCode::Char('a') => Some(ReviewDecision::Approved),
+        KeyCode::Char('d') | KeyCode::Esc => Some(ReviewDecision::Abort),
+        _ => None,
+    }
 }
 
 fn key_leaves_current_task(key: KeyEvent, route: Route) -> bool {
@@ -3079,6 +3187,20 @@ mod key_tests {
         }
     }
 
+    fn completed_tui_summary(session_id: SessionId) -> RunSummary {
+        RunSummary {
+            session_id,
+            assistant_message_id: None,
+            status: SessionStatus::Completed,
+            finish_reason: Some(crate::session::FinishReason::Stop),
+            interruption_cause: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        }
+    }
+
     fn recv_tui_runtime_message(
         receiver: &mut tokio::sync::mpsc::UnboundedReceiver<RuntimeMessage>,
     ) -> RuntimeMessage {
@@ -3117,24 +3239,437 @@ mod key_tests {
 
     #[test]
     fn pending_tui_root_run_cancel_is_owned_until_matching_finish() {
-        let token = CancellationToken::new();
+        let control = RunControl::new();
         let mut lifecycle = TuiRootRunLifecycle::default();
-        assert!(lifecycle.begin(7, token.clone()));
+        assert!(lifecycle.begin(7, control.clone()));
         assert!(lifecycle.is_active());
 
         assert!(lifecycle.request_cancel());
-        assert!(token.is_cancelled());
+        assert_eq!(
+            control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop
+            ))
+        );
         assert!(
-            !lifecycle.begin(8, CancellationToken::new()),
+            !lifecycle.begin(8, RunControl::new()),
             "a cancelled run remains the owner until its matching finish"
         );
         assert_eq!(lifecycle.finish(6), None);
         assert!(lifecycle.is_active());
-        assert_eq!(lifecycle.finish(7), Some(true));
+        let cause = lifecycle
+            .finish(7)
+            .expect("matching generation owns settlement")
+            .expect("stop cause");
+        assert_eq!(
+            cause,
+            RunCancellationCause::Interruption(TurnInterruptionCause::UserStop)
+        );
         assert!(!lifecycle.is_active());
         assert!(!lifecycle.request_cancel());
-        assert_eq!(tui_terminal_error_status(true), RunStatus::Cancelled);
-        assert_eq!(tui_terminal_error_status(false), RunStatus::Failed);
+        assert_eq!(
+            tui_terminal_error_status(Some(&cause)),
+            RunStatus::Cancelled
+        );
+        assert_eq!(
+            tui_terminal_error_status(Some(&RunCancellationCause::Interruption(
+                TurnInterruptionCause::ApprovalAborted
+            ))),
+            RunStatus::Cancelled
+        );
+        assert_eq!(
+            tui_terminal_error_status(Some(&RunCancellationCause::Failure(
+                "provider failed".to_string()
+            ))),
+            RunStatus::Failed
+        );
+        assert_eq!(
+            tui_terminal_error_status(Some(&RunCancellationCause::Superseded)),
+            RunStatus::Failed
+        );
+        assert_eq!(tui_terminal_error_status(None), RunStatus::Failed);
+    }
+
+    #[test]
+    fn deferred_stop_is_tui_cancel_pending_while_success_remains_authoritative() {
+        let control = RunControl::new();
+        let success = control
+            .begin_success_commit()
+            .expect("success commit reservation");
+        let mut lifecycle = TuiRootRunLifecycle::default();
+        assert!(lifecycle.begin(8, control.clone()));
+
+        assert!(
+            lifecycle.request_cancel(),
+            "a deferred Stop is accepted as cancel-pending"
+        );
+        assert!(lifecycle.is_active());
+        assert_eq!(control.cause(), None);
+
+        assert!(success.seal());
+        assert!(control.success_is_sealed());
+        assert_eq!(control.cause(), None);
+        assert_eq!(lifecycle.finish(8), Some(None));
+        assert!(!lifecycle.is_active());
+
+        let sealed = RunControl::new();
+        assert!(sealed.seal_success());
+        assert!(lifecycle.begin(9, sealed));
+        assert!(
+            !lifecycle.request_cancel(),
+            "a rejected Stop is not reported as cancel-pending"
+        );
+        assert_eq!(lifecycle.finish(9), Some(None));
+    }
+
+    #[tokio::test]
+    async fn tui_stop_routes_through_root_owner_and_keeps_pending_permission_until_event() {
+        let (_temp, mut controller, _session_id) =
+            tui_controller_with_session("root-owned-stop").await;
+        let root_control = RunControl::new();
+        assert!(controller.root_run_lifecycle.begin(7, root_control.clone()));
+        let request = test_tui_permission("child-stop-routing");
+        let (response, _receiver) = mpsc::channel();
+        let child_control = RunControl::new();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request: request.clone(),
+            responder: response,
+            run_control: child_control.clone(),
+        });
+
+        controller.stop_current_run().await.expect("stop request");
+
+        assert_eq!(
+            root_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop
+            ))
+        );
+        assert_eq!(
+            child_control.cause(),
+            None,
+            "the TUI Stop surface must not classify a pending child directly"
+        );
+        assert!(controller.pending_permission.is_some());
+        assert!(controller.state.permission.is_none());
+
+        assert!(child_control.interrupt(TurnInterruptionCause::TreeStopped));
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::PermissionCancelled {
+                confirmation_id: 42,
+            })
+            .expect("permission cancellation event");
+        controller
+            .drain_runtime_messages()
+            .await
+            .expect("drain cancellation event");
+        assert!(controller.pending_permission.is_none());
+        assert!(controller.state.permission.is_none());
+    }
+
+    #[tokio::test]
+    async fn tui_root_terminal_event_and_finished_keep_a_live_child_permission_visible() {
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("live-child-after-root-success").await;
+        append_tui_user_history(&controller, session_id, "root task");
+        assert!(controller.root_run_lifecycle.begin(7, RunControl::new()));
+        let request = test_tui_permission("live-child");
+        let expected_path = request.agent_path.clone();
+        let (response, receiver) = mpsc::channel();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request,
+            responder: response,
+            run_control: RunControl::new(),
+        });
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent(RunEvent::SessionCompleted {
+                session_id,
+                finish_reason: Some(crate::session::FinishReason::Stop),
+            }))
+            .expect("terminal event");
+        controller
+            .drain_runtime_messages()
+            .await
+            .expect("terminal event drain");
+        assert_eq!(
+            controller
+                .pending_permission
+                .as_ref()
+                .and_then(|pending| pending.request.agent_path.clone()),
+            expected_path
+        );
+        assert!(controller.state.permission.is_none());
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: 7,
+                result: Ok(completed_tui_summary(session_id)),
+            })
+            .expect("root finish");
+        controller
+            .drain_runtime_messages()
+            .await
+            .expect("root finish drain");
+        assert_eq!(
+            controller
+                .pending_permission
+                .as_ref()
+                .map(|pending| pending.confirmation_id),
+            Some(42)
+        );
+        assert!(controller.state.permission.is_none());
+
+        controller
+            .answer_permission(ReviewDecision::Approved)
+            .expect("answer surviving child permission");
+        assert_eq!(receiver.try_recv(), Ok(ReviewDecision::Approved));
+    }
+
+    #[tokio::test]
+    async fn tui_root_success_drops_a_terminal_child_permission_without_cancel_event() {
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("terminal-child-after-root-success").await;
+        append_tui_user_history(&controller, session_id, "root task");
+        assert!(controller.root_run_lifecycle.begin(7, RunControl::new()));
+        let request = test_tui_permission("terminal-child");
+        let (response, receiver) = mpsc::channel();
+        let child_control = RunControl::new();
+        assert!(child_control.interrupt(TurnInterruptionCause::TreeStopped));
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request,
+            responder: response,
+            run_control: child_control,
+        });
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent(RunEvent::SessionCompleted {
+                session_id,
+                finish_reason: Some(crate::session::FinishReason::Stop),
+            }))
+            .expect("terminal event");
+        controller
+            .drain_runtime_messages()
+            .await
+            .expect("terminal event drain");
+        assert!(controller.pending_permission.is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: 7,
+                result: Ok(completed_tui_summary(session_id)),
+            })
+            .expect("root finish");
+        controller
+            .drain_runtime_messages()
+            .await
+            .expect("root finish drain");
+        assert!(controller.pending_permission.is_none());
+        assert!(controller.state.permission.is_none());
+    }
+
+    #[tokio::test]
+    async fn tui_abort_permission_answer_preserves_an_existing_terminal_owner() {
+        let causes = [
+            RunCancellationCause::Interruption(TurnInterruptionCause::UserStop),
+            RunCancellationCause::Failure("provider failed first".to_string()),
+            RunCancellationCause::Superseded,
+        ];
+
+        for cause in causes {
+            let (_temp, mut controller, _session_id) =
+                tui_controller_with_session("late-permission-abort").await;
+            let request = test_tui_permission("late-abort");
+            let (response, receiver) = mpsc::channel();
+            let run_control = RunControl::new();
+            assert!(run_control.cancel(cause.clone()));
+            controller.pending_permission = Some(PendingPermission {
+                confirmation_id: 42,
+                request: request.clone(),
+                responder: response,
+                run_control,
+            });
+
+            controller
+                .answer_permission(ReviewDecision::Abort)
+                .expect("late abort uses the existing terminal owner");
+            assert!(controller.pending_permission.is_none());
+            assert!(controller.state.permission.is_none());
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+            assert_eq!(
+                controller.state.status_message,
+                Some(run_cancellation_status_message(&cause))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_permission_send_success_is_neutral_until_runtime_classifies_the_turn() {
+        let (_temp, mut controller, _session_id) =
+            tui_controller_with_session("permission-decision-pending").await;
+        let request = test_tui_permission("abort-pending-classification");
+        let (response, receiver) = mpsc::channel();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request: request.clone(),
+            responder: response,
+            run_control: RunControl::new(),
+        });
+
+        controller
+            .answer_permission(ReviewDecision::Abort)
+            .expect("send permission decision");
+
+        assert_eq!(receiver.try_recv(), Ok(ReviewDecision::Abort));
+        assert!(controller.pending_permission.is_none());
+        assert!(controller.state.permission.is_none());
+        assert_eq!(
+            controller.state.status_message,
+            Some(permission_decision_pending_status_message())
+        );
+    }
+
+    #[tokio::test]
+    async fn tui_permission_responder_failure_remains_an_operational_failure() {
+        let (_temp, mut controller, _session_id) =
+            tui_controller_with_session("permission-responder-failure").await;
+        let request = test_tui_permission("disconnected-responder");
+        let (response, receiver) = mpsc::channel();
+        drop(receiver);
+        let run_control = RunControl::new();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request: request.clone(),
+            responder: response,
+            run_control: run_control.clone(),
+        });
+
+        controller
+            .answer_permission(ReviewDecision::Approved)
+            .expect("surface records the responder failure");
+        let cause = run_control.cause().expect("typed responder failure");
+        assert!(matches!(
+            &cause,
+            RunCancellationCause::Failure(message)
+                if message.contains("TUI permission response failed")
+        ));
+        assert!(controller.pending_permission.is_none());
+        assert!(controller.state.permission.is_none());
+        assert_eq!(
+            controller.state.status_message,
+            Some(run_cancellation_status_message(&cause))
+        );
+    }
+
+    #[tokio::test]
+    async fn tui_durable_only_tree_stop_preserves_completed_root_status() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, mut controller, root_session_id) =
+            tui_controller_with_session("durable-only-stop").await;
+        let repository = controller.app.store.session_repo();
+        let root_admission = repository
+            .admit_session_run(root_session_id)
+            .await
+            .expect("root admission")
+            .expect("root admitted");
+        let root_turn = crate::protocol::TurnId::new();
+        assert!(
+            repository
+                .activate_admitted_turn(root_session_id, &root_admission, root_turn)
+                .await
+                .expect("activate root")
+        );
+        append_tui_user_history(&controller, root_session_id, "run detached work");
+        assert!(
+            repository
+                .terminalize_active_session_with_protocol_event(
+                    root_session_id,
+                    SessionStatus::Completed,
+                    &RunEvent::SessionCompleted {
+                        session_id: root_session_id,
+                        finish_reason: None,
+                    },
+                    root_turn,
+                    None,
+                )
+                .await
+                .expect("complete root")
+        );
+        let child = repository
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "durable child".to_string(),
+                cwd: controller.app.workspace.cwd.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("child session");
+        repository
+            .insert_session_spawn_edge(
+                root_session_id,
+                root_session_id,
+                child.id,
+                "/root/durable-child",
+                "durable-child",
+            )
+            .await
+            .expect("spawn edge");
+        let child_admission = repository
+            .admit_session_run(child.id)
+            .await
+            .expect("child admission")
+            .expect("child admitted");
+        let child_turn = crate::protocol::TurnId::new();
+        assert!(
+            repository
+                .activate_admitted_turn(child.id, &child_admission, child_turn)
+                .await
+                .expect("activate child")
+        );
+        controller
+            .open_session(root_session_id)
+            .await
+            .expect("open root");
+        assert_eq!(controller.state.run_status, RunStatus::Completed);
+        assert!(!controller.root_run_lifecycle.is_active());
+
+        controller.stop_current_run().await.expect("tree stop");
+
+        assert_eq!(controller.state.run_status, RunStatus::Completed);
+        assert_eq!(
+            repository
+                .get_session(root_session_id)
+                .await
+                .expect("preserved root")
+                .status,
+            SessionStatus::Completed
+        );
+        assert_eq!(
+            repository
+                .get_session(child.id)
+                .await
+                .expect("stopped child")
+                .status,
+            SessionStatus::Cancelled
+        );
     }
 
     #[test]
@@ -3146,6 +3681,7 @@ mod key_tests {
             assistant_message_id: None,
             status: crate::session::SessionStatus::Completed,
             finish_reason: Some(crate::session::FinishReason::Stop),
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -3166,6 +3702,27 @@ mod key_tests {
                 result: Ok(received),
             } if received.session_id == summary.session_id
         ));
+    }
+
+    #[test]
+    fn tui_permission_keys_approve_or_abort_without_reusing_tree_stop() {
+        assert_eq!(
+            permission_decision_for_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(ReviewDecision::Approved)
+        );
+        assert_eq!(
+            permission_decision_for_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Some(ReviewDecision::Abort)
+        );
+        assert_eq!(
+            permission_decision_for_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(ReviewDecision::Abort)
+        );
+        assert_eq!(
+            permission_decision_for_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            None,
+            "Ctrl+X remains the separate tree-wide stop action"
+        );
     }
 
     #[test]
@@ -3216,53 +3773,53 @@ mod key_tests {
             next_permission_request_id: Arc::new(AtomicU64::new(11)),
         });
 
-        let first_cancel = CancellationToken::new();
+        let first_control = RunControl::new();
         let (first_done_tx, first_done_rx) = mpsc::sync_channel(1);
         let mut first_prompt = broker.clone();
-        let first_wait_cancel = first_cancel.clone();
+        let first_wait_control = first_control.clone();
         std::thread::spawn(move || {
-            let result =
-                first_prompt.confirm_with_cancel(&test_tui_permission("first"), &first_wait_cancel);
+            let result = first_prompt
+                .confirm_with_control(&test_tui_permission("first"), &first_wait_control);
             let _ = first_done_tx.send(result);
         });
-        let (first_id, first_response) = match recv_tui_runtime_message(&mut runtime_rx) {
-            RuntimeMessage::Permission {
-                confirmation_id,
-                response,
-                ..
-            } => (confirmation_id, response),
-            _ => panic!("expected first TUI permission"),
-        };
-        first_cancel.cancel();
+        let (first_id, first_response, first_request_control) =
+            match recv_tui_runtime_message(&mut runtime_rx) {
+                RuntimeMessage::Permission {
+                    confirmation_id,
+                    response,
+                    run_control,
+                    ..
+                } => (confirmation_id, response, run_control),
+                _ => panic!("expected first TUI permission"),
+            };
+        first_control.interrupt(TurnInterruptionCause::UserStop);
         match recv_tui_runtime_message(&mut runtime_rx) {
             RuntimeMessage::PermissionCancelled { confirmation_id } => {
                 assert_eq!(confirmation_id, first_id)
             }
             _ => panic!("expected TUI permission cancellation"),
         }
-        assert!(
-            !first_done_rx
+        assert_eq!(
+            first_done_rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("first TUI confirmation result")
-                .expect("first TUI confirmation")
+                .expect("first TUI confirmation"),
+            ConfirmationOutcome::Interrupted
         );
 
-        let mut pending_request = Some(test_tui_permission("first"));
-        let mut pending_id = Some(first_id);
-        let mut pending_response = Some(first_response);
-        assert!(!clear_cancelled_tui_permission(
-            &mut pending_request,
-            &mut pending_id,
-            &mut pending_response,
-            first_id + 1,
-        ));
-        assert_eq!(pending_id, Some(first_id));
-        assert!(clear_cancelled_tui_permission(
-            &mut pending_request,
-            &mut pending_id,
-            &mut pending_response,
-            first_id,
-        ));
+        let mut pending = Some(PendingPermission {
+            confirmation_id: first_id,
+            request: test_tui_permission("first"),
+            responder: first_response,
+            run_control: first_request_control,
+        });
+        assert!(!clear_cancelled_tui_permission(&mut pending, first_id + 1,));
+        assert_eq!(
+            pending.as_ref().map(|pending| pending.confirmation_id),
+            Some(first_id)
+        );
+        assert!(clear_cancelled_tui_permission(&mut pending, first_id));
+        assert!(pending.is_none());
 
         let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
         let mut second_prompt = broker;
@@ -3280,13 +3837,81 @@ mod key_tests {
         };
         assert!(second_id > first_id);
         second_response
-            .send(true)
+            .send(ReviewDecision::Approved)
             .expect("answer second TUI permission");
-        assert!(
+        assert_eq!(
             second_done_rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("second TUI confirmation result")
-                .expect("second TUI confirmation")
+                .expect("second TUI confirmation"),
+            ReviewDecision::Approved
+        );
+    }
+
+    #[test]
+    fn tui_permission_abort_is_ticket_local_and_loses_to_existing_cause() {
+        let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt = TuiConfirmationPrompt {
+            tx: runtime_tx,
+            next_permission_request_id: Arc::new(AtomicU64::new(31)),
+        };
+        let control = RunControl::new();
+        let observer = control.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = prompt.confirm_with_control(&test_tui_permission("abort"), &control);
+            let _ = done_tx.send(result);
+        });
+        let response = match recv_tui_runtime_message(&mut runtime_rx) {
+            RuntimeMessage::Permission { response, .. } => response,
+            _ => panic!("expected TUI permission"),
+        };
+        response
+            .send(ReviewDecision::Abort)
+            .expect("send ticket-local abort");
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("abort result")
+                .expect("abort outcome"),
+            ConfirmationOutcome::AbortRequested
+        );
+        assert_eq!(observer.cause(), None);
+
+        let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt = TuiConfirmationPrompt {
+            tx: runtime_tx,
+            next_permission_request_id: Arc::new(AtomicU64::new(41)),
+        };
+        let control = RunControl::new();
+        let observer = control.clone();
+        let worker_control = control.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = prompt
+                .confirm_with_control(&test_tui_permission("competing abort"), &worker_control);
+            let _ = done_tx.send(result);
+        });
+        let response = match recv_tui_runtime_message(&mut runtime_rx) {
+            RuntimeMessage::Permission { response, .. } => response,
+            _ => panic!("expected competing TUI permission"),
+        };
+        assert!(control.fail("provider failed first"));
+        response
+            .send(ReviewDecision::Abort)
+            .expect("send losing abort");
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("competing result")
+                .expect("competing outcome"),
+            ConfirmationOutcome::Interrupted
+        );
+        assert_eq!(
+            observer.cause(),
+            Some(RunCancellationCause::Failure(
+                "provider failed first".to_string()
+            ))
         );
     }
 

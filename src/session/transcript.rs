@@ -301,6 +301,8 @@ fn tool_status_from_lifecycle(status: ToolLifecycleStatus) -> ToolCallStatus {
         ToolLifecycleStatus::Pending => ToolCallStatus::Pending,
         ToolLifecycleStatus::Running => ToolCallStatus::Running,
         ToolLifecycleStatus::Completed => ToolCallStatus::Completed,
+        ToolLifecycleStatus::Declined => ToolCallStatus::Declined,
+        ToolLifecycleStatus::Cancelled => ToolCallStatus::Cancelled,
         ToolLifecycleStatus::Failed
         | ToolLifecycleStatus::Blocked
         | ToolLifecycleStatus::Rejected

@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::ConfirmationPrompt;
+use crate::cli::{ConfirmationOutcome, ConfirmationPrompt};
 use crate::config::{AccessMode, ResolvedConfig};
-use crate::edit::{ChangeTracker, EditSafety, Formatter};
+use crate::edit::{ChangeTracker, EditSafety, Formatter, FormatterExecutionOptions};
 use crate::error::ToolError;
-use crate::protocol::TurnId;
-use crate::runtime::LiveConfigOverrides;
+use crate::llm::{LlmClient, ModelProfile};
+use crate::protocol::{ToolApprovalDecision, TurnId};
+use crate::runtime::{LiveConfigOverrides, RunControl};
+use crate::runtime::{RunCancelOutcome, RunCancellationCause};
 use crate::session::{SessionContext, SessionId, ToolCallId};
 use crate::storage::{SqliteSessionRepository, session_repo::RunAdmissionLeaseRenewalOutcome};
 use crate::storage::{StoragePaths, StoreBundle};
@@ -34,10 +36,54 @@ pub struct ToolContext<'a> {
     pub live_config: Option<LiveConfigOverrides>,
     pub tool_call_id: ToolCallId,
     pub cancel: CancellationToken,
+    pub run_control: RunControl,
     pub run_mutation_fence: RunMutationFence,
     pub prompt: &'a mut dyn ConfirmationPrompt,
     pub services: &'a ToolServices,
     pub agent: Option<&'a crate::app::AgentRunContext>,
+    pub permission_reviewer_llm: &'a dyn LlmClient,
+    pub permission_reviewer_model: &'a ModelProfile,
+    pub permission_review_context: &'a str,
+    pub model_request_gate: Option<Arc<tokio::sync::Semaphore>>,
+    pub model_request_count: &'a mut usize,
+}
+
+#[must_use = "call admit immediately before every independently startable observable effect"]
+#[derive(Clone)]
+pub struct ToolEffectAdmission {
+    control: RunControl,
+}
+
+impl ToolEffectAdmission {
+    pub(crate) fn new(control: RunControl) -> Self {
+        Self { control }
+    }
+
+    /// Linearizes one observable tool effect against Stop, Abort, failure, and supersession.
+    /// Multi-stage tools reuse the same approved ticket before every independently startable
+    /// effect so a later formatter, process, network request, or mutation cannot start after a
+    /// terminal producer wins.
+    pub fn admit(&self) -> Result<(), ToolError> {
+        self.control
+            .begin_tool_effect_admission()
+            .ok_or(ToolError::RunInterrupted)?
+            .admit()
+            .map_err(|_| ToolError::RunInterrupted)
+    }
+
+    pub async fn format_if_configured(
+        &self,
+        formatter: &Formatter,
+        path: &Utf8Path,
+        normalized: String,
+        options: FormatterExecutionOptions,
+    ) -> Result<String, ToolError> {
+        self.admit()?;
+        formatter
+            .format_if_configured(path, normalized, options)
+            .await
+            .map_err(ToolError::from)
+    }
 }
 
 #[derive(Clone)]
@@ -46,7 +92,7 @@ pub struct RunMutationFence {
     session_id: SessionId,
     admission_id: String,
     turn_id: TurnId,
-    cancel: CancellationToken,
+    control: RunControl,
 }
 
 impl RunMutationFence {
@@ -55,19 +101,19 @@ impl RunMutationFence {
         session_id: SessionId,
         admission_id: String,
         turn_id: TurnId,
-        cancel: CancellationToken,
+        control: RunControl,
     ) -> Self {
         Self {
             repo,
             session_id,
             admission_id,
             turn_id,
-            cancel,
+            control,
         }
     }
 
     pub async fn assert_owned(&self) -> Result<(), ToolError> {
-        if self.cancel.is_cancelled() {
+        if self.control.is_cancelled() {
             return Err(self.rejected_error("the run is cancelled"));
         }
         let outcome = match self
@@ -77,12 +123,20 @@ impl RunMutationFence {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.cancel.cancel();
+                self.control.fail(error.to_string());
                 return Err(ToolError::Storage(error));
             }
         };
         if outcome != RunAdmissionLeaseRenewalOutcome::Renewed {
-            self.cancel.cancel();
+            match outcome {
+                RunAdmissionLeaseRenewalOutcome::GracefulTerminal => {
+                    self.control.supersede();
+                }
+                RunAdmissionLeaseRenewalOutcome::SupersededOrExpired => {
+                    self.control.supersede();
+                }
+                RunAdmissionLeaseRenewalOutcome::Renewed => unreachable!(),
+            }
             return Err(self.rejected_error(match outcome {
                 RunAdmissionLeaseRenewalOutcome::GracefulTerminal => {
                     "the admitted turn is already terminal"
@@ -93,7 +147,7 @@ impl RunMutationFence {
                 RunAdmissionLeaseRenewalOutcome::Renewed => unreachable!(),
             }));
         }
-        if self.cancel.is_cancelled() {
+        if self.control.is_cancelled() {
             return Err(self.rejected_error("the run was cancelled while checking ownership"));
         }
         Ok(())
@@ -105,17 +159,25 @@ impl RunMutationFence {
             self.session_id, self.admission_id, self.turn_id
         ))
     }
+
+    pub fn begin_effect_commit(
+        &self,
+    ) -> Result<crate::runtime::ToolEffectCommitReservation, ToolError> {
+        self.control
+            .begin_tool_effect_commit()
+            .ok_or(ToolError::RunInterrupted)
+    }
 }
 
 impl<'a> ToolContext<'a> {
-    pub fn confirm_if_needed(
+    pub async fn confirm_if_needed(
         &mut self,
         access: AccessKind,
         summary: String,
         targets: Vec<Utf8PathBuf>,
         outside_workspace: bool,
         risks: Vec<crate::tool::PermissionRisk>,
-    ) -> Result<(), ToolError> {
+    ) -> Result<ToolEffectAdmission, ToolError> {
         self.confirm_if_needed_with_details(
             access,
             summary,
@@ -124,9 +186,10 @@ impl<'a> ToolContext<'a> {
             outside_workspace,
             risks,
         )
+        .await
     }
 
-    pub fn confirm_if_needed_with_details(
+    pub async fn confirm_if_needed_with_details(
         &mut self,
         access: AccessKind,
         summary: String,
@@ -134,8 +197,8 @@ impl<'a> ToolContext<'a> {
         targets: Vec<Utf8PathBuf>,
         outside_workspace: bool,
         risks: Vec<crate::tool::PermissionRisk>,
-    ) -> Result<(), ToolError> {
-        let request = crate::tool::PermissionRequest {
+    ) -> Result<ToolEffectAdmission, ToolError> {
+        let mut request = crate::tool::PermissionRequest {
             access,
             summary,
             details,
@@ -152,20 +215,76 @@ impl<'a> ToolContext<'a> {
                 .map(|agent| agent.task_name().to_string()),
         };
 
-        if access_mode_allows_permission(self.current_access_mode(), &request) {
-            return Ok(());
+        let access_mode = self.current_access_mode();
+        if access_mode_allows_permission(access_mode, &request) {
+            return self.accept_tool_effect();
         }
 
-        if self
+        if access_mode == AccessMode::AutoReview {
+            *self.model_request_count += 1;
+            let reviewer = crate::tool::permission_review::PermissionReviewer {
+                llm: self.permission_reviewer_llm,
+                model: self.permission_reviewer_model,
+                config: self.config,
+                request_gate: self.model_request_gate.clone(),
+            };
+            match reviewer
+                .review(
+                    self.permission_review_context,
+                    &request,
+                    self.cancel.clone(),
+                )
+                .await
+            {
+                Ok(decision) if decision.allows() => return self.accept_tool_effect(),
+                Ok(decision) => request.details.push(format!(
+                    "AI reviewer denied this request (risk: {}): {}",
+                    decision.risk_level.label(),
+                    decision.rationale
+                )),
+                Err(error) => request.details.push(format!(
+                    "AI reviewer could not decide; human confirmation is required: {error}"
+                )),
+            }
+        }
+
+        let outcome = self
             .prompt
-            .confirm_with_cancel(&request, &self.cancel)
+            .confirm_with_control(&request, &self.run_control)
             .map_err(|error| {
-                ToolError::Message(format!("failed to prompt for permission: {error}"))
-            })?
-        {
-            Ok(())
-        } else {
-            Err(ToolError::Message("permission denied by user".to_string()))
+                let message = format!("failed to prompt for permission: {error}");
+                self.run_control.fail(message.clone());
+                ToolError::Message(message)
+            })?;
+        match outcome {
+            ConfirmationOutcome::Resolved(ToolApprovalDecision::Approved) => {
+                self.accept_tool_effect()
+            }
+            ConfirmationOutcome::Resolved(ToolApprovalDecision::Denied { .. }) => {
+                let settlement = self
+                    .run_control
+                    .begin_tool_settlement()
+                    .ok_or(ToolError::RunInterrupted)?;
+                Err(ToolError::PermissionDenied {
+                    settlement: Some(settlement),
+                })
+            }
+            ConfirmationOutcome::AbortRequested => {
+                let approval_abort = RunCancellationCause::Interruption(
+                    crate::protocol::TurnInterruptionCause::ApprovalAborted,
+                );
+                let outcome = self.run_control.request_cancel(approval_abort.clone());
+                if matches!(
+                    outcome,
+                    RunCancelOutcome::Applied | RunCancelOutcome::Deferred(_)
+                ) {
+                    Err(ToolError::PermissionAborted)
+                } else {
+                    Err(ToolError::RunInterrupted)
+                }
+            }
+            ConfirmationOutcome::Aborted => Err(ToolError::PermissionAborted),
+            ConfirmationOutcome::Interrupted => Err(ToolError::RunInterrupted),
         }
     }
 
@@ -175,19 +294,16 @@ impl<'a> ToolContext<'a> {
             .map(LiveConfigOverrides::access_mode)
             .unwrap_or(self.config.permissions.access_mode)
     }
+
+    fn accept_tool_effect(&self) -> Result<ToolEffectAdmission, ToolError> {
+        Ok(ToolEffectAdmission::new(self.run_control.clone()))
+    }
 }
 
 pub fn access_mode_allows_permission(
     access_mode: AccessMode,
     request: &crate::tool::PermissionRequest,
 ) -> bool {
-    if request
-        .risks
-        .iter()
-        .any(|risk| matches!(risk, crate::tool::PermissionRisk::ExternalConnection))
-    {
-        return false;
-    }
     match access_mode {
         AccessMode::FullAccess => full_access_allows(request),
         AccessMode::AutoReview => auto_review_allows(request),
@@ -196,17 +312,7 @@ pub fn access_mode_allows_permission(
 }
 
 fn full_access_allows(request: &crate::tool::PermissionRequest) -> bool {
-    if request.outside_workspace {
-        return false;
-    }
-    !request.risks.iter().any(|risk| {
-        matches!(
-            risk,
-            crate::tool::PermissionRisk::Network
-                | crate::tool::PermissionRisk::ExternalConnection
-                | crate::tool::PermissionRisk::ProtectedWorkspaceAuthority
-        )
-    })
+    !request.outside_workspace
 }
 
 fn default_allows(request: &crate::tool::PermissionRequest) -> bool {
@@ -220,14 +326,15 @@ fn default_allows(request: &crate::tool::PermissionRequest) -> bool {
 }
 
 fn auto_review_allows(request: &crate::tool::PermissionRequest) -> bool {
-    if request.outside_workspace || !request.risks.is_empty() {
+    if request.outside_workspace
+        || request
+            .risks
+            .iter()
+            .any(|risk| !matches!(risk, crate::tool::PermissionRisk::ConfiguredLocalService))
+    {
         return false;
     }
-    match request.access {
-        AccessKind::List | AccessKind::Search | AccessKind::Read => true,
-        AccessKind::Edit => true,
-        AccessKind::Shell => false,
-    }
+    true
 }
 
 #[cfg(test)]
@@ -295,7 +402,7 @@ mod tests {
             AccessMode::Default,
             &request
         ));
-        assert!(!access_mode_allows_permission(
+        assert!(access_mode_allows_permission(
             AccessMode::AutoReview,
             &request
         ));
@@ -306,13 +413,13 @@ mod tests {
     }
 
     #[test]
-    fn access_mode_policy_still_blocks_external_connections() {
+    fn full_access_allows_detected_risks_inside_the_configured_boundary() {
         let request = permission(
             AccessKind::Shell,
             vec![crate::tool::PermissionRisk::ExternalConnection],
         );
 
-        assert!(!access_mode_allows_permission(
+        assert!(access_mode_allows_permission(
             AccessMode::FullAccess,
             &request
         ));
@@ -325,7 +432,7 @@ mod tests {
             (AccessKind::Search, [true, true, true]),
             (AccessKind::Read, [true, true, true]),
             (AccessKind::Edit, [false, true, true]),
-            (AccessKind::Shell, [false, false, true]),
+            (AccessKind::Shell, [false, true, true]),
         ];
         let modes = [
             AccessMode::Default,
@@ -346,12 +453,8 @@ mod tests {
     }
 
     #[test]
-    fn every_access_mode_reviews_boundary_and_hard_risk_requests() {
-        let modes = [
-            AccessMode::Default,
-            AccessMode::AutoReview,
-            AccessMode::FullAccess,
-        ];
+    fn default_and_auto_review_keep_hard_risk_requests_for_review() {
+        let modes = [AccessMode::Default, AccessMode::AutoReview];
         let hard_risks = [
             crate::tool::PermissionRisk::Network,
             crate::tool::PermissionRisk::ExternalConnection,
@@ -363,10 +466,31 @@ mod tests {
                 let request = permission(AccessKind::Shell, vec![risk]);
                 assert!(!access_mode_allows_permission(mode, &request));
             }
-            let mut outside = permission(AccessKind::Read, Vec::new());
-            outside.outside_workspace = true;
+        }
+        let mut outside = permission(AccessKind::Read, Vec::new());
+        outside.outside_workspace = true;
+        for mode in [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ] {
             assert!(!access_mode_allows_permission(mode, &outside));
         }
+    }
+
+    #[test]
+    fn configured_local_service_is_auto_allowed_after_default() {
+        let request = permission(
+            AccessKind::Read,
+            vec![crate::tool::PermissionRisk::ConfiguredLocalService],
+        );
+        let decisions = [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ]
+        .map(|mode| access_mode_allows_permission(mode, &request));
+        assert_eq!(decisions, [false, true, true]);
     }
 
     #[test]
@@ -401,10 +525,10 @@ mod tests {
                 .await
                 .expect("activate turn")
         );
-        let cancel = CancellationToken::new();
-        let fence = RunMutationFence::new(repo, session_id, admission_id, turn_id, cancel.clone());
+        let control = RunControl::new();
+        let fence = RunMutationFence::new(repo, session_id, admission_id, turn_id, control.clone());
         fence.assert_owned().await.expect("fresh owner");
-        cancel.cancel();
+        control.interrupt(crate::protocol::TurnInterruptionCause::UserStop);
         let mut cancelled_mutation_ran = false;
         if fence.assert_owned().await.is_ok() {
             cancelled_mutation_ran = true;
@@ -418,19 +542,19 @@ mod tests {
             .await
             .expect("expired admission")
             .expect("admitted");
-        let expired_cancel = CancellationToken::new();
+        let expired_control = RunControl::new();
         let expired_fence = RunMutationFence::new(
             expired_repo,
             expired_session_id,
             expired_admission_id,
             TurnId::new(),
-            expired_cancel.clone(),
+            expired_control.clone(),
         );
         let mut expired_mutation_ran = false;
         if expired_fence.assert_owned().await.is_ok() {
             expired_mutation_ran = true;
         }
         assert!(!expired_mutation_ran);
-        assert!(expired_cancel.is_cancelled());
+        assert!(expired_control.is_cancelled());
     }
 }

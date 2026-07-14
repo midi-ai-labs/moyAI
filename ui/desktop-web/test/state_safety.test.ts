@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { commandConflictState } from "../src/command_error.ts";
+import {
+  commandConflictState,
+  commandErrorInfo,
+  commandInternalState,
+} from "../src/command_error.ts";
 import {
   beginConfigMutation,
   configDraftAppliesTo,
@@ -11,7 +15,13 @@ import {
   reconcileConfigDraftTarget,
   updateConfigDraftValue,
 } from "../src/config_mutation.ts";
-import { isRegularModalOverlay, modalIsOpen, nextDialogFocusIndex } from "../src/modal_state.ts";
+import {
+  confirmationFocusSelectors,
+  isRegularModalOverlay,
+  modalIdentity,
+  modalIsOpen,
+  nextDialogFocusIndex,
+} from "../src/modal_state.ts";
 import {
   configCommitEnabled,
   navigationIsIdle,
@@ -29,6 +39,7 @@ import {
   rowMutationTargetStillMatches,
 } from "../src/row_target.ts";
 import type { DesktopWebState } from "../src/types.ts";
+import { humanizeError } from "../src/utils.ts";
 
 function dirtyDraft(draftTarget = target()) {
   return {
@@ -304,7 +315,41 @@ test("typed conflict carries a refresh projection while other errors stay outsid
   assert.equal(commandConflictState(conflict), state);
   assert.equal(commandConflictState(JSON.stringify(conflict))?.projection_revision, "8");
   assert.equal(commandConflictState({ kind: "internal", message: "bug", state }), null);
+  assert.equal(commandInternalState({ kind: "internal", message: "bug", state }), state);
+  assert.equal(commandInternalState(conflict), null);
   assert.equal(commandConflictState("transport closed"), null);
+});
+
+test("unknown and storage errors with provider model access keywords stay generic", () => {
+  const message = "storage connection refused while loading model 404: access denied";
+  for (const error of [
+    message,
+    { kind: "internal", category: "storage", code: "storage_failure", message },
+    { kind: "internal", category: "unknown", code: "unknown", message },
+  ]) {
+    const human = humanizeError(error);
+    assert.equal(human.title, "処理に失敗しました");
+    assert.equal(human.details, message);
+  }
+});
+
+test("typed command error codes select guidance without inspecting the message", () => {
+  const opaque = "opaque diagnostic";
+  assert.equal(humanizeError({ code: "provider_transport", message: opaque }).title, "LLM provider に接続できません");
+  assert.equal(humanizeError({ code: "model_unavailable", message: opaque }).title, "指定したモデルが見つかりません");
+  assert.equal(humanizeError({ code: "image_unsupported", message: opaque }).title, "このモデルは画像入力に対応していません");
+  assert.equal(humanizeError({ code: "permission_policy_denied", message: opaque }).title, "操作が許可されませんでした");
+  assert.deepEqual(commandErrorInfo(JSON.stringify({
+    kind: "internal",
+    category: "runtime",
+    code: "runtime_failure",
+    message: opaque,
+  })), {
+    kind: "internal",
+    category: "runtime",
+    code: "runtime_failure",
+    message: opaque,
+  });
 });
 
 test("a repeated-click conflict wins over the earlier command response by Rust revision", () => {
@@ -342,6 +387,26 @@ test("regular modal detection excludes menu popovers and contains focus cyclical
   assert.equal(nextDialogFocusIndex(0, 3, true), 2);
   assert.equal(nextDialogFocusIndex(1, 3, true), 0);
   assert.equal(nextDialogFocusIndex(-1, 0, false), -1);
+});
+
+test("permission modal identity changes by request without changing outer modal lifecycle", () => {
+  const requestA = { confirmation_visible: true, confirmation_id: "A", overlay: "none" };
+  const requestB = { confirmation_visible: true, confirmation_id: "B", overlay: "none" };
+  assert.equal(modalIdentity(requestA), "permission:A");
+  assert.equal(modalIdentity(requestB), "permission:B");
+  assert.notEqual(modalIdentity(requestA), modalIdentity(requestB));
+  assert.equal(modalIdentity({ confirmation_visible: false, confirmation_id: null, overlay: "config" }), "config");
+  assert.equal(modalIsOpen(requestA, false), true);
+  assert.equal(modalIsOpen(requestB, false), true);
+});
+
+test("pending permission focus targets the live status instead of disabled actions", () => {
+  assert.deepEqual(confirmationFocusSelectors(true), [".permission-decision-status"]);
+  assert.deepEqual(confirmationFocusSelectors(false), [
+    ".modal-actions button[autofocus]:not(:disabled)",
+    ".modal-actions button:not(:disabled)",
+    ".permission-decision-status",
+  ]);
 });
 
 test("navigation admission consumes the single Rust capability projection", () => {

@@ -1,5 +1,4 @@
 use camino::Utf8PathBuf;
-use tokio_util::sync::CancellationToken;
 
 use crate::cli::OutputMode;
 use crate::config::AccessMode;
@@ -65,7 +64,7 @@ pub struct RunRequest {
     pub editor_context: Option<EditorContext>,
     pub review_request: Option<ReviewRequest>,
     pub image_paths: Vec<Utf8PathBuf>,
-    pub cancel: CancellationToken,
+    pub run_control: crate::runtime::RunControl,
     pub live_config: Option<LiveConfigOverrides>,
     /// Cloneable permission channel inherited by child agent sessions.
     pub agent_confirmation: Option<crate::cli::SharedConfirmationPrompt>,

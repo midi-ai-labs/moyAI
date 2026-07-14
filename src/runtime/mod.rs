@@ -6,12 +6,19 @@ pub mod event_bus;
 pub mod live_config;
 mod run_process_lease;
 
-pub use active_run::{ActiveRunLease, ActiveRunRegistry, ActiveSteerInput};
+pub use active_run::{
+    ActiveRunInterruptOutcome, ActiveRunLease, ActiveRunRegistry, ActiveSteerInput,
+};
 pub use agent_control::{
     AgentControl, AgentControlError, AgentExecutionLease, AgentMailDeliveryOutcome,
-    AgentMailboxMessage, AgentPath, AgentSnapshot, AgentStatus, AgentTreeSnapshot,
+    AgentMailboxMessage, AgentPath, AgentRootContinuationOutcome, AgentSnapshot, AgentStatus,
+    AgentTreeSnapshot,
 };
-pub use cancel::build_cancel_token;
+pub use cancel::{
+    RunCancelDeferral, RunCancelOutcome, RunCancellationCause, RunContinuationOutcome, RunControl,
+    RunReservationKind, SuccessCommitReservation, ToolEffectAdmissionReservation,
+    ToolEffectCommitReservation, ToolSettlementReservation,
+};
 pub use clock::{Clock, SystemClock};
 pub use event_bus::{
     RunEventBus, RunEventPublisher, RunEventSink, RunEventSubscriber, SessionRuntimeEventHub,

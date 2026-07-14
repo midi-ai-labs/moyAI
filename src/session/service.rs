@@ -2,8 +2,10 @@ use std::fs;
 
 use crate::error::SessionError;
 use crate::protocol::{
-    HistoryItem, HistoryItemPayload, ProtocolEventStore, SteerTurn, TurnId, TurnItem, UserTurn,
+    HistoryItem, HistoryItemPayload, ProtocolEventStore, SteerTurn, TurnId, TurnInterruptionCause,
+    TurnItem, UserTurn,
 };
+use crate::runtime::{ActiveRunInterruptOutcome, RunCancellationCause};
 use crate::session::{
     CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionRead, CanonicalTurnPage,
     IdleTurnAdmission, IdleTurnRejectionReason, LoadedSessionList, LoadedSessionStatus,
@@ -143,19 +145,20 @@ impl SessionService {
             .await?)
     }
 
-    pub async fn mark_interrupted_running_sessions(
-        &self,
-        session_id: crate::session::SessionId,
-    ) -> Result<(), SessionError> {
-        self.cancel_running_session(session_id, "Previous run was interrupted.")
-            .await?;
-        Ok(())
-    }
-
     pub async fn cancel_running_session(
         &self,
         session_id: crate::session::SessionId,
         reason: &str,
+    ) -> Result<bool, SessionError> {
+        self.cancel_running_session_with_cause(session_id, reason, TurnInterruptionCause::UserStop)
+            .await
+    }
+
+    async fn cancel_running_session_with_cause(
+        &self,
+        session_id: crate::session::SessionId,
+        reason: &str,
+        root_cause: TurnInterruptionCause,
     ) -> Result<bool, SessionError> {
         let repo = self.store.session_repo();
         let root_session_id = repo
@@ -180,14 +183,95 @@ impl SessionService {
             }
         }
 
-        let mut cancelled = false;
-        for target_session_id in targets {
-            cancelled |= self.store.active_runs().cancel(target_session_id);
+        let root_control = self.store.active_runs().run_control(session_id);
+        let (fanout_authorized, mut cancelled) =
+            match self.store.active_runs().cancel(session_id, root_cause) {
+                ActiveRunInterruptOutcome::Applied => {
+                    // The in-process worker owns settlement for its current admission.
+                    (true, true)
+                }
+                ActiveRunInterruptOutcome::AlreadyClassified => {
+                    let owns_requested_stop = root_control.as_ref().is_some_and(|control| {
+                        control.cause() == Some(RunCancellationCause::Interruption(root_cause))
+                    });
+                    if owns_requested_stop {
+                        (true, true)
+                    } else if root_control
+                        .as_ref()
+                        .is_some_and(|control| control.success_is_sealed())
+                        && repo.get_session(session_id).await?.status == SessionStatus::Completed
+                    {
+                        // Durable root success is final even while its in-memory lease is being
+                        // released. A user Stop may still target detached descendants.
+                        (true, false)
+                    } else {
+                        (false, false)
+                    }
+                }
+                ActiveRunInterruptOutcome::Deferred => {
+                    // The root success commit remains authoritative, but an explicit user Stop
+                    // may still stop detached descendants while that commit settles.
+                    (true, true)
+                }
+                ActiveRunInterruptOutcome::NotActive => {
+                    let session = repo.get_session(session_id).await?;
+                    match session.status {
+                        SessionStatus::Running | SessionStatus::AwaitingUser => {
+                            let terminalized = self
+                                .terminalize_running_session(
+                                    session_id,
+                                    SessionStatus::Cancelled,
+                                    RunEvent::SessionInterrupted {
+                                        session_id,
+                                        reason: reason.to_string(),
+                                        cause: Some(root_cause),
+                                    },
+                                )
+                                .await?;
+                            (terminalized, terminalized)
+                        }
+                        SessionStatus::Completed
+                        | SessionStatus::Cancelled
+                        | SessionStatus::Failed => {
+                            // The root worker is gone, so a later explicit tree-wide Stop may target
+                            // detached descendants without rewriting the root's durable result.
+                            (true, false)
+                        }
+                        SessionStatus::Idle => (false, false),
+                    }
+                }
+            };
+        if !fanout_authorized {
+            // A competing in-memory terminal classification at the requested root is
+            // authoritative. Descendants must not be stopped through an independent fallback
+            // path; durable terminal roots are handled above after the worker lease is gone.
+            return Ok(false);
+        }
+
+        for target_session_id in targets.into_iter().filter(|target| *target != session_id) {
+            let cause = TurnInterruptionCause::TreeStopped;
+            let child_control = self.store.active_runs().run_control(target_session_id);
+            match self.store.active_runs().cancel(target_session_id, cause) {
+                ActiveRunInterruptOutcome::Applied => {
+                    cancelled = true;
+                    continue;
+                }
+                ActiveRunInterruptOutcome::AlreadyClassified => {
+                    // An already-classified descendant keeps its first typed cause. The root has
+                    // nevertheless authorized this fanout, so no independent reclassification or
+                    // durable overwrite is attempted here.
+                    cancelled |= child_control.is_some_and(|control| {
+                        control.cause() == Some(RunCancellationCause::Interruption(cause))
+                    });
+                    continue;
+                }
+                ActiveRunInterruptOutcome::Deferred => {
+                    continue;
+                }
+                ActiveRunInterruptOutcome::NotActive => {}
+            }
             let session = repo.get_session(target_session_id).await?;
-            if !matches!(
-                session.status,
-                SessionStatus::Running | SessionStatus::AwaitingUser
-            ) {
+            if session.status != SessionStatus::Running {
                 continue;
             }
             cancelled |= self
@@ -197,6 +281,7 @@ impl SessionService {
                     RunEvent::SessionInterrupted {
                         session_id: target_session_id,
                         reason: reason.to_string(),
+                        cause: Some(cause),
                     },
                 )
                 .await?;
@@ -285,10 +370,10 @@ impl SessionService {
             ) && self
                 .recover_orphaned_running_session(
                     session.id,
-                    SessionStatus::Cancelled,
-                    RunEvent::SessionInterrupted {
+                    SessionStatus::Failed,
+                    RunEvent::SessionFailed {
                         session_id: session.id,
-                        reason: reason.to_string(),
+                        message: reason.to_string(),
                     },
                 )
                 .await?
@@ -1134,11 +1219,10 @@ impl NonEmptySetting for Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use tokio_util::sync::CancellationToken;
-
     use super::*;
     use crate::config::{AccessMode, ResolvedConfig};
-    use crate::protocol::UserInputItem;
+    use crate::protocol::{TurnItemPayload, TurnTerminalStatus, UserInputItem};
+    use crate::runtime::RunControl;
     use crate::storage::{SqliteStore, StoragePaths};
     use crate::workspace::WorkspaceDiscovery;
 
@@ -1419,11 +1503,11 @@ mod tests {
     async fn active_run_blocks_session_project_delete_and_manual_compaction() {
         let (service, workspace, _) = service_fixture().await;
         let session = create_session(&service, &workspace).await;
-        let token = CancellationToken::new();
+        let control = RunControl::new();
         let _lease = service
             .store
             .active_runs()
-            .try_start(session.session.id, token)
+            .try_start(session.session.id, control)
             .expect("active run");
 
         assert!(service.delete_session(session.session.id).await.is_err());
@@ -1718,7 +1802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_recovery_terminalizes_hidden_child_without_an_owner() {
+    async fn startup_recovery_fails_hidden_child_without_an_owner() {
         let (service, workspace, _) = service_fixture().await;
         let root = create_session(&service, &workspace).await;
         let child = create_session(&service, &workspace).await;
@@ -1757,14 +1841,7 @@ mod tests {
                 .expect("stale recovery"),
             1
         );
-        assert_eq!(
-            service
-                .get_session(child.session.id)
-                .await
-                .expect("recovered child session")
-                .status,
-            SessionStatus::Cancelled
-        );
+        assert_failed_recovery(&service, child.session.id, "stale child recovery").await;
     }
 
     #[tokio::test]
@@ -1788,14 +1865,12 @@ mod tests {
                 .expect("startup recovery"),
             1
         );
-        assert_eq!(
-            service
-                .get_session(session.session.id)
-                .await
-                .expect("recovered session")
-                .status,
-            SessionStatus::Cancelled
-        );
+        assert_failed_recovery(
+            &service,
+            session.session.id,
+            "recover crashed fresh admission",
+        )
+        .await;
         assert!(
             !service
                 .store
@@ -1901,14 +1976,7 @@ mod tests {
                 .expect("startup recovery"),
             1
         );
-        assert_eq!(
-            recovery
-                .get_session(root.session.id)
-                .await
-                .expect("root session")
-                .status,
-            SessionStatus::Cancelled
-        );
+        assert_failed_recovery(&recovery, root.session.id, "recover only unowned sessions").await;
         assert_eq!(
             recovery
                 .get_session(child.session.id)
@@ -1955,6 +2023,252 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_terminal_classification_blocks_stop_fanout_to_live_children() {
+        enum RootClassification {
+            Failure,
+            Superseded,
+            SuccessSealed,
+        }
+
+        let (service, workspace, _) = service_fixture().await;
+        for classification in [
+            RootClassification::Failure,
+            RootClassification::Superseded,
+            RootClassification::SuccessSealed,
+        ] {
+            let root = create_session(&service, &workspace).await;
+            let child = create_session(&service, &workspace).await;
+            service
+                .store
+                .session_repo()
+                .insert_session_spawn_edge(
+                    root.session.id,
+                    root.session.id,
+                    child.session.id,
+                    "/root/child",
+                    "child",
+                )
+                .await
+                .expect("child edge");
+            let root_control = RunControl::new();
+            let child_control = RunControl::new();
+            let _root_lease = service
+                .store
+                .active_runs()
+                .try_start(root.session.id, root_control.clone())
+                .expect("root run");
+            let _child_lease = service
+                .store
+                .active_runs()
+                .try_start(child.session.id, child_control.clone())
+                .expect("child run");
+
+            match classification {
+                RootClassification::Failure => {
+                    assert!(root_control.fail("provider failed"));
+                }
+                RootClassification::Superseded => {
+                    assert!(root_control.supersede());
+                }
+                RootClassification::SuccessSealed => {
+                    assert!(root_control.seal_success());
+                }
+            }
+
+            assert!(
+                !service
+                    .cancel_running_session(root.session.id, "late stop")
+                    .await
+                    .expect("stop result"),
+                "the root terminal owner must reject a competing Stop"
+            );
+            assert_eq!(child_control.cause(), None);
+            assert!(!child_control.is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_same_root_stop_authorizes_child_fanout() {
+        let (service, workspace, _) = service_fixture().await;
+        let root = create_session(&service, &workspace).await;
+        let child = create_session(&service, &workspace).await;
+        service
+            .store
+            .session_repo()
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.session.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("child edge");
+        let root_control = RunControl::new();
+        let child_control = RunControl::new();
+        let _root_lease = service
+            .store
+            .active_runs()
+            .try_start(root.session.id, root_control.clone())
+            .expect("root run");
+        let _child_lease = service
+            .store
+            .active_runs()
+            .try_start(child.session.id, child_control.clone())
+            .expect("child run");
+        assert!(root_control.interrupt(TurnInterruptionCause::UserStop));
+
+        assert!(
+            service
+                .cancel_running_session(root.session.id, "repeat root stop")
+                .await
+                .expect("stop result")
+        );
+        assert_eq!(
+            child_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::TreeStopped
+            ))
+        );
+    }
+
+    async fn assert_failed_recovery(service: &SessionService, session_id: SessionId, reason: &str) {
+        assert_eq!(
+            service
+                .get_session(session_id)
+                .await
+                .expect("recovered session")
+                .status,
+            SessionStatus::Failed
+        );
+        let items = service
+            .store
+            .protocol_event_store()
+            .list_turn_items_for_session(session_id)
+            .expect("recovery turn items");
+        assert!(items.iter().any(|item| matches!(
+            &item.payload,
+            TurnItemPayload::Terminal {
+                status: TurnTerminalStatus::Failed,
+                summary,
+                cause: None,
+            } if summary == reason
+        )));
+        assert!(!items.iter().any(|item| matches!(
+            &item.payload,
+            TurnItemPayload::Terminal {
+                status: TurnTerminalStatus::Interrupted,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn sealed_durable_root_success_allows_detached_child_stop_before_lease_drop() {
+        let (service, workspace, _) = service_fixture().await;
+        let root = create_session(&service, &workspace).await;
+        let child = create_session(&service, &workspace).await;
+        service
+            .store
+            .session_repo()
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.session.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("child edge");
+        let root_control = RunControl::new();
+        let child_control = RunControl::new();
+        let _root_lease = service
+            .store
+            .active_runs()
+            .try_start(root.session.id, root_control.clone())
+            .expect("root run");
+        let _child_lease = service
+            .store
+            .active_runs()
+            .try_start(child.session.id, child_control.clone())
+            .expect("child run");
+        let (_root_admission, root_turn) = admit_session_turn(&service, root.session.id).await;
+        terminalize_admitted_session(&service, root.session.id, root_turn).await;
+        assert!(root_control.seal_success());
+
+        assert!(
+            service
+                .cancel_running_session(root.session.id, "stop detached child")
+                .await
+                .expect("tree stop")
+        );
+        assert_eq!(
+            service
+                .get_session(root.session.id)
+                .await
+                .expect("completed root")
+                .status,
+            SessionStatus::Completed
+        );
+        assert_eq!(
+            child_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::TreeStopped
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_stop_preserves_committing_root_success_and_stops_child() {
+        let (service, workspace, _) = service_fixture().await;
+        let root = create_session(&service, &workspace).await;
+        let child = create_session(&service, &workspace).await;
+        service
+            .store
+            .session_repo()
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.session.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("child edge");
+        let root_control = RunControl::new();
+        let child_control = RunControl::new();
+        let _root_lease = service
+            .store
+            .active_runs()
+            .try_start(root.session.id, root_control.clone())
+            .expect("root run");
+        let _child_lease = service
+            .store
+            .active_runs()
+            .try_start(child.session.id, child_control.clone())
+            .expect("child run");
+        let success_commit = root_control
+            .begin_success_commit()
+            .expect("reserve success commit");
+
+        assert!(
+            service
+                .cancel_running_session(root.session.id, "stop detached child")
+                .await
+                .expect("tree stop")
+        );
+        assert_eq!(
+            child_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::TreeStopped
+            ))
+        );
+        assert!(success_commit.seal());
+        assert!(root_control.success_is_sealed());
+        assert_eq!(root_control.cause(), None);
+    }
+
+    #[tokio::test]
     async fn completed_root_archive_and_delete_wait_for_active_child_across_processes() {
         let (owner, manager, workspace) = cross_process_service_fixture().await;
         let root = create_session(&owner, &workspace).await;
@@ -1993,7 +2307,7 @@ mod tests {
         let child_live_lease = owner
             .store
             .active_runs()
-            .try_start(child.session.id, CancellationToken::new())
+            .try_start(child.session.id, RunControl::new())
             .expect("in-memory child run");
         for error in [
             owner
@@ -2062,6 +2376,181 @@ mod tests {
             .expect("terminal tree can be deleted");
         assert!(manager.get_session(root.session.id).await.is_err());
         assert!(manager.get_session(child.session.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_after_root_completion_terminalizes_only_detached_running_child() {
+        let (owner, canceller, workspace) = cross_process_service_fixture().await;
+        let root = create_session(&owner, &workspace).await;
+        let child = create_session(&owner, &workspace).await;
+        owner
+            .store
+            .session_repo()
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.session.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("child edge");
+        let (_root_admission, root_turn) = admit_session_turn(&owner, root.session.id).await;
+        terminalize_admitted_session(&owner, root.session.id, root_turn).await;
+        let (child_admission, child_turn) = admit_session_turn(&owner, child.session.id).await;
+
+        assert!(
+            canceller
+                .cancel_running_session(root.session.id, "stop detached child")
+                .await
+                .expect("tree stop")
+        );
+        assert_eq!(
+            owner
+                .get_session(root.session.id)
+                .await
+                .expect("completed root")
+                .status,
+            SessionStatus::Completed,
+            "tree Stop must not rewrite the durable root result"
+        );
+        assert_cancelled_admission(&owner, child.session.id, &child_admission, child_turn).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_after_root_completion_without_live_descendant_is_a_noop() {
+        let (owner, canceller, workspace) = cross_process_service_fixture().await;
+        let root = create_session(&owner, &workspace).await;
+        let (_root_admission, root_turn) = admit_session_turn(&owner, root.session.id).await;
+        terminalize_admitted_session(&owner, root.session.id, root_turn).await;
+
+        assert!(
+            !canceller
+                .cancel_running_session(root.session.id, "late empty tree stop")
+                .await
+                .expect("tree stop")
+        );
+        assert_eq!(
+            owner
+                .get_session(root.session.id)
+                .await
+                .expect("completed root")
+                .status,
+            SessionStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_process_stop_terminalizes_awaiting_user_root_before_child_fanout() {
+        let (owner, canceller, workspace) = cross_process_service_fixture().await;
+        let root = create_session(&owner, &workspace).await;
+        let child = create_session(&owner, &workspace).await;
+        owner
+            .store
+            .session_repo()
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.session.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("child edge");
+        let (root_admission, root_turn) = admit_session_turn(&owner, root.session.id).await;
+        assert!(
+            owner
+                .store
+                .session_repo()
+                .terminalize_active_session_with_protocol_event(
+                    root.session.id,
+                    SessionStatus::AwaitingUser,
+                    &RunEvent::SessionAwaitingUser {
+                        session_id: root.session.id,
+                        finish_reason: Some(crate::session::FinishReason::ToolCall),
+                    },
+                    root_turn,
+                    None,
+                )
+                .await
+                .expect("awaiting user")
+        );
+        let (child_admission, child_turn) = admit_session_turn(&owner, child.session.id).await;
+
+        assert!(
+            canceller
+                .cancel_running_session(root.session.id, "stop awaiting tree")
+                .await
+                .expect("tree stop")
+        );
+        assert_cancelled_admission(&owner, root.session.id, &root_admission, root_turn).await;
+        assert_cancelled_admission(&owner, child.session.id, &child_admission, child_turn).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_failed_or_cancelled_root_is_preserved_while_detached_child_stops() {
+        let (owner, canceller, workspace) = cross_process_service_fixture().await;
+        for terminal_status in [SessionStatus::Failed, SessionStatus::Cancelled] {
+            let root = create_session(&owner, &workspace).await;
+            let child = create_session(&owner, &workspace).await;
+            owner
+                .store
+                .session_repo()
+                .insert_session_spawn_edge(
+                    root.session.id,
+                    root.session.id,
+                    child.session.id,
+                    "/root/child",
+                    "child",
+                )
+                .await
+                .expect("child edge");
+            let (_root_admission, root_turn) = admit_session_turn(&owner, root.session.id).await;
+            let terminal_event = match terminal_status {
+                SessionStatus::Failed => RunEvent::SessionFailed {
+                    session_id: root.session.id,
+                    message: "root failed".to_string(),
+                },
+                SessionStatus::Cancelled => RunEvent::SessionInterrupted {
+                    session_id: root.session.id,
+                    reason: "root already stopped".to_string(),
+                    cause: Some(TurnInterruptionCause::UserStop),
+                },
+                _ => unreachable!(),
+            };
+            assert!(
+                owner
+                    .store
+                    .session_repo()
+                    .terminalize_active_session_with_protocol_event(
+                        root.session.id,
+                        terminal_status,
+                        &terminal_event,
+                        root_turn,
+                        None,
+                    )
+                    .await
+                    .expect("root terminal")
+            );
+            let (child_admission, child_turn) = admit_session_turn(&owner, child.session.id).await;
+
+            assert!(
+                canceller
+                    .cancel_running_session(root.session.id, "stop detached child")
+                    .await
+                    .expect("tree stop")
+            );
+            assert_eq!(
+                owner
+                    .get_session(root.session.id)
+                    .await
+                    .expect("terminal root")
+                    .status,
+                terminal_status
+            );
+            assert_cancelled_admission(&owner, child.session.id, &child_admission, child_turn)
+                .await;
+        }
     }
 
     #[tokio::test]

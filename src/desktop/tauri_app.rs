@@ -8,9 +8,10 @@ use tauri::{
 use tokio::sync::Mutex;
 
 use crate::app::App;
+use crate::cli::ReviewDecision;
 use crate::error::AppRunError;
 
-use super::app::DesktopController;
+use super::app::{DesktopController, PendingPermissionResolution};
 use super::args::DesktopArgs;
 use super::web_model::DesktopWebState;
 
@@ -33,17 +34,62 @@ impl DesktopCommandConflict {
 #[serde(rename_all = "camelCase")]
 struct DesktopCommandError {
     kind: &'static str,
+    category: DesktopCommandErrorCategory,
+    code: DesktopCommandErrorCode,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<DesktopWebState>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DesktopCommandErrorCategory {
+    Unknown,
+    Provider,
+    Model,
+    Image,
+    Permission,
+    Runtime,
+    Storage,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DesktopCommandErrorCode {
+    Unknown,
+    ProviderTransport,
+    ModelUnavailable,
+    ImageUnsupported,
+    PermissionPolicyDenied,
+    RuntimeFailure,
+    StorageFailure,
 }
 
 impl DesktopCommandError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             kind: "internal",
+            category: DesktopCommandErrorCategory::Unknown,
+            code: DesktopCommandErrorCode::Unknown,
             message: message.into(),
             state: None,
+        }
+    }
+
+    fn internal_with_typed_state(
+        category: DesktopCommandErrorCategory,
+        code: DesktopCommandErrorCode,
+        message: impl Into<String>,
+        state: DesktopWebState,
+    ) -> Self {
+        Self {
+            kind: "internal",
+            category,
+            code,
+            message: message.into(),
+            state: Some(state),
         }
     }
 }
@@ -58,6 +104,8 @@ fn command_conflict_error(
     match controller.next_web_state() {
         Ok(state) => DesktopCommandError {
             kind: "conflict",
+            category: DesktopCommandErrorCategory::Unknown,
+            code: DesktopCommandErrorCode::Unknown,
             message: conflict.message,
             state: Some(state),
         },
@@ -1966,14 +2014,54 @@ fn apply_windows_window_opacity(window: &tauri::WebviewWindow, percent: i32) -> 
 #[tauri::command]
 async fn answer_permission(
     controller: State<'_, SharedController>,
-    allow: bool,
+    decision: ReviewDecision,
     confirmation_id: String,
-) -> Result<DesktopWebState, String> {
-    let confirmation_id = parse_permission_confirmation_id(&confirmation_id)?;
-    mutate_controller(controller, |controller| {
-        controller.answer_permission(confirmation_id, allow);
-    })
-    .await
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let confirmation_id = parse_permission_confirmation_id(&confirmation_id)
+        .map_err(DesktopCommandError::internal)?;
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    match controller.answer_permission(confirmation_id, decision) {
+        PendingPermissionResolution::Resolved => {
+            controller.drain_runtime_messages();
+            controller
+                .next_web_state()
+                .map_err(DesktopCommandError::internal)
+        }
+        PendingPermissionResolution::NotCurrent => Err(command_conflict_error(
+            &mut controller,
+            DesktopCommandConflict::new("the permission confirmation is no longer current"),
+        )),
+        PendingPermissionResolution::AlreadyTerminal(cause) => {
+            let message = crate::tui::state::run_cancellation_status_message(&cause);
+            let state = controller
+                .next_web_state()
+                .map_err(DesktopCommandError::internal)?;
+            Err(DesktopCommandError {
+                kind: "conflict",
+                category: DesktopCommandErrorCategory::Unknown,
+                code: DesktopCommandErrorCode::Unknown,
+                message,
+                state: Some(state),
+            })
+        }
+        PendingPermissionResolution::AlreadySettled => Err(command_conflict_error(
+            &mut controller,
+            DesktopCommandConflict::new("the permission confirmation was already settled"),
+        )),
+        PendingPermissionResolution::Failed(cause) => {
+            let message = crate::tui::state::run_cancellation_status_message(&cause);
+            let state = controller
+                .next_web_state()
+                .map_err(DesktopCommandError::internal)?;
+            Err(DesktopCommandError::internal_with_typed_state(
+                DesktopCommandErrorCategory::Runtime,
+                DesktopCommandErrorCode::RuntimeFailure,
+                message,
+                state,
+            ))
+        }
+    }
 }
 
 fn parse_permission_confirmation_id(value: &str) -> Result<u64, String> {
@@ -2266,5 +2354,50 @@ mod tests {
             Ok(u64::MAX)
         );
         assert!(parse_permission_confirmation_id("9007199254740993.0").is_err());
+    }
+
+    #[test]
+    fn permission_decision_uses_the_snake_case_tauri_contract() {
+        assert_eq!(
+            serde_json::from_str::<ReviewDecision>(r#""approved""#).expect("approved decision"),
+            ReviewDecision::Approved
+        );
+        assert_eq!(
+            serde_json::from_str::<ReviewDecision>(r#""abort""#).expect("abort decision"),
+            ReviewDecision::Abort
+        );
+        assert_eq!(
+            serde_json::from_str::<ReviewDecision>(r#""denied""#).expect("denied decision"),
+            ReviewDecision::Denied
+        );
+        assert!(serde_json::from_str::<ReviewDecision>("true").is_err());
+    }
+
+    #[test]
+    fn command_error_contract_does_not_classify_free_form_message_text() {
+        let error = DesktopCommandError::internal(
+            "storage connection refused while loading model 404: access denied",
+        );
+        let json = serde_json::to_value(error).expect("serialize command error");
+        assert_eq!(json["category"], "unknown");
+        assert_eq!(json["code"], "unknown");
+        assert_eq!(
+            serde_json::to_string(&DesktopCommandErrorCode::ProviderTransport)
+                .expect("provider code"),
+            r#""provider_transport""#
+        );
+        assert_eq!(
+            serde_json::to_string(&DesktopCommandErrorCode::ModelUnavailable).expect("model code"),
+            r#""model_unavailable""#
+        );
+        assert_eq!(
+            serde_json::to_string(&DesktopCommandErrorCode::ImageUnsupported).expect("image code"),
+            r#""image_unsupported""#
+        );
+        assert_eq!(
+            serde_json::to_string(&DesktopCommandErrorCode::PermissionPolicyDenied)
+                .expect("permission code"),
+            r#""permission_policy_denied""#
+        );
     }
 }

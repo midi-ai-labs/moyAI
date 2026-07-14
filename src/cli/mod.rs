@@ -2,6 +2,7 @@ pub mod parse;
 pub mod prompt;
 pub mod render;
 
+pub use crate::protocol::ReviewDecision;
 pub use parse::{
     CliCommand, ContractSnapshotArgs, ModelAvailabilityArgs, OutputMode, ReplayReportArgs,
     ReplayRunArgs, RunArgs, SchemaExportArgs, SessionCompactArgs, SessionGoalClearArgs,
@@ -9,5 +10,7 @@ pub use parse::{
     SessionListArgs, SessionLoadedArgs, SessionMemoryArgs, SessionRejoinArgs, SessionRollbackArgs,
     SessionShowArgs, SessionTurnsArgs, TuiArgs,
 };
-pub use prompt::{ConfirmationPrompt, SharedConfirmationPrompt, StdConfirmationPrompt};
+pub use prompt::{
+    ConfirmationOutcome, ConfirmationPrompt, SharedConfirmationPrompt, StdConfirmationPrompt,
+};
 pub use render::{EventRenderer, HumanRenderer, JsonRenderer};

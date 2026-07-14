@@ -3,8 +3,9 @@
 mod goal_steering;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::Value;
@@ -12,7 +13,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::ConfirmationPrompt;
-use crate::config::{AccessMode, MultiAgentMode, ResolvedConfig};
+use crate::config::{AccessMode, MultiAgentMode, PromptProfile, ResolvedConfig};
 use crate::context::context_window::ContextWindowTokenStatus;
 use crate::context::world_state::WorldState;
 use crate::error::AgentError;
@@ -24,13 +25,16 @@ use crate::protocol::{
     ContentPart, HistoryItem, HistoryItemPayload, ProtocolEventStore, TurnId,
     canonical_tool_call_arguments,
 };
-use crate::runtime::{ActiveSteerInput, LiveConfigOverrides, RunEventSink};
+use crate::runtime::{
+    ActiveSteerInput, LiveConfigOverrides, RunCancelOutcome, RunCancellationCause, RunControl,
+    RunEventSink, SuccessCommitReservation,
+};
 use crate::session::{
     AssistantMessageMeta, FinishReason, MessageId, MessageMetadata, MessagePart, MessageRole,
     NewMessage, NewPart, PartKind, RequestDiagnosticsPart, RequestMessageDiagnostic,
     RequestToolCallDiagnostic, RequestToolSchemaDiagnostic, RunConfigSnapshot, RunEvent,
     RunMetrics, RunSummary, SessionContext, SessionStateSnapshot, SessionStatus, TextPart,
-    ThreadGoal, ThreadGoalStatus, TokenUsage,
+    ThreadGoal, ThreadGoalStatus, TokenUsage, ToolCallRecord,
 };
 use crate::storage::{
     StoreBundle,
@@ -39,6 +43,25 @@ use crate::storage::{
 use crate::tool::ToolResult;
 use crate::tool::context::{RunMutationFence, ToolServices};
 use crate::tool::registry::ToolRegistry;
+
+const TOOL_CANCELLATION_CLEANUP_TIMEOUT: Duration =
+    crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE;
+const DEFAULT_PROMPT_PROFILE: &str = include_str!("../../assets/prompts/profile_default.md");
+const QWEN_CODER_PROMPT_PROFILE: &str = include_str!("../../assets/prompts/profile_qwen_coder.md");
+
+async fn await_tool_cancellation_cleanup<T>(
+    cleanup: impl Future<Output = T>,
+    grace: Duration,
+) -> Result<T, tokio::time::error::Elapsed> {
+    tokio::time::timeout(grace, cleanup).await
+}
+
+fn prompt_profile_overlay(profile: PromptProfile, runtime_model_name: &str) -> &'static str {
+    match profile.resolved_for_model(runtime_model_name) {
+        PromptProfile::Auto | PromptProfile::Default => DEFAULT_PROMPT_PROFILE,
+        PromptProfile::QwenCoder => QWEN_CODER_PROMPT_PROFILE,
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PromptBuilder;
@@ -49,10 +72,14 @@ impl PromptBuilder {
         world_state: &WorldState,
         skills_snapshot: &crate::skill::SkillsSnapshot,
         config: &ResolvedConfig,
+        runtime_model_name: &str,
         is_sub_agent: bool,
     ) -> String {
         let mut sections = vec![
             include_str!("../../assets/prompts/system.md")
+                .trim()
+                .to_string(),
+            prompt_profile_overlay(config.model.prompt_profile, runtime_model_name)
                 .trim()
                 .to_string(),
             world_state.rendered.clone(),
@@ -109,7 +136,7 @@ pub struct AgentRunRequest {
     pub state: SessionStateSnapshot,
     pub config: ResolvedConfig,
     pub model: ModelProfile,
-    pub cancel: CancellationToken,
+    pub run_control: RunControl,
     pub live_config: Option<LiveConfigOverrides>,
     pub steer_rx: Option<UnboundedReceiver<ActiveSteerInput>>,
     pub is_sub_agent: bool,
@@ -117,6 +144,10 @@ pub struct AgentRunRequest {
 }
 
 impl AgentRunRequest {
+    fn cancel_token(&self) -> CancellationToken {
+        self.run_control.token()
+    }
+
     fn current_access_mode(&self) -> AccessMode {
         self.live_config
             .as_ref()
@@ -227,9 +258,9 @@ impl AgentLoop {
         let outcome: Result<RunSummary, AgentError> = async {
             loop {
                 guard.check_step_budget()?;
-                if request.cancel.is_cancelled() {
+                if request.run_control.is_cancelled() {
                     return self
-                        .interrupt(
+                        .finish_for_run_control_cause(
                             &request,
                             assistant.id,
                             latest_usage.clone(),
@@ -240,7 +271,7 @@ impl AgentLoop {
                             tool_calls_by_name.clone(),
                             failed_tool_calls_by_name.clone(),
                             started_at,
-                            "run cancelled by user",
+                            active_goal_id_for_turn.as_deref(),
                             sink,
                         )
                         .await;
@@ -301,6 +332,7 @@ impl AgentLoop {
                     let _model_request_permit = match request_gate {
                         Some(gate) => {
                             let acquire = gate.acquire_owned();
+                            let cancel = request.cancel_token();
                             tokio::pin!(acquire);
                             tokio::select! {
                                 permit = &mut acquire => Some(permit.map_err(|_| {
@@ -308,17 +340,17 @@ impl AgentLoop {
                                         "model request concurrency gate closed".to_string(),
                                     )
                                 })?),
-                                _ = request.cancel.cancelled() => None,
+                                _ = cancel.cancelled() => None,
                             }
                         }
                         None => None,
                     };
-                    if request.cancel.is_cancelled() {
+                    if request.run_control.is_cancelled() {
                         None
                     } else {
                     let stream = self.llm.stream_chat(
                         prepared_request.chat_request,
-                        request.cancel.clone(),
+                        request.cancel_token(),
                         &mut collector,
                     );
                     tokio::pin!(stream);
@@ -326,8 +358,7 @@ impl AgentLoop {
                         tokio::select! {
                             response = &mut stream => break Some(response),
                             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                                if request.cancel.is_cancelled() {
-                                    request.cancel.cancel();
+                                if request.run_control.is_cancelled() {
                                     break None;
                                 }
                                 ensure_admission_active(&self.store, &request).await?;
@@ -339,7 +370,7 @@ impl AgentLoop {
                 let Some(response) = stream_response else {
                     drop(collector);
                     return self
-                        .interrupt(
+                        .finish_for_run_control_cause(
                             &request,
                             assistant.id,
                             latest_usage.clone(),
@@ -350,7 +381,7 @@ impl AgentLoop {
                             tool_calls_by_name.clone(),
                             failed_tool_calls_by_name.clone(),
                             started_at,
-                            "run cancelled by user",
+                            active_goal_id_for_turn.as_deref(),
                             sink,
                         )
                         .await;
@@ -385,7 +416,7 @@ impl AgentLoop {
 
                 if response.finish_reason == FinishReason::Cancelled {
                     return self
-                        .interrupt(
+                        .finish_for_run_control_cause(
                             &request,
                             assistant.id,
                             latest_usage.clone(),
@@ -396,14 +427,14 @@ impl AgentLoop {
                             tool_calls_by_name.clone(),
                             failed_tool_calls_by_name.clone(),
                             started_at,
-                            "run cancelled by user",
+                            active_goal_id_for_turn.as_deref(),
                             sink,
                         )
                         .await;
                 }
-                if request.cancel.is_cancelled() {
+                if request.run_control.is_cancelled() {
                     return self
-                        .interrupt(
+                        .finish_for_run_control_cause(
                             &request,
                             assistant.id,
                             latest_usage.clone(),
@@ -414,11 +445,16 @@ impl AgentLoop {
                             tool_calls_by_name.clone(),
                             failed_tool_calls_by_name.clone(),
                             started_at,
-                            "run cancelled by user",
+                            active_goal_id_for_turn.as_deref(),
                             sink,
                         )
                         .await;
                 }
+
+                validate_provider_response_terminal(
+                    response.finish_reason,
+                    !collector.tool_calls.is_empty(),
+                )?;
 
                 if collector.tool_calls.is_empty() {
                     if collector.text.trim().is_empty() {
@@ -459,7 +495,25 @@ impl AgentLoop {
                         Some(response.finish_reason),
                         response.usage.clone(),
                     );
-                    let terminal_commit = repo
+                    let Some(success_commit) = request.run_control.begin_success_commit() else {
+                        return self
+                            .finish_for_run_control_cause(
+                                &request,
+                                assistant.id,
+                                latest_usage.clone(),
+                                tool_call_count,
+                                failed_tool_count,
+                                change_count,
+                                model_request_count,
+                                tool_calls_by_name.clone(),
+                                failed_tool_calls_by_name.clone(),
+                                started_at,
+                                active_goal_id_for_turn.as_deref(),
+                                sink,
+                            )
+                            .await;
+                    };
+                    let terminal_commit = match repo
                         .update_admitted_message_metadata_and_status_with_protocol_event(
                             request.session.session.id,
                             &request.admission_id,
@@ -472,10 +526,57 @@ impl AgentLoop {
                             Some(seen_steer_ids.len()),
                             None,
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(commit) => commit,
+                        Err(error) => {
+                            match self
+                                .durable_terminal_summary(
+                                    &request,
+                                    assistant.id,
+                                    latest_usage.clone(),
+                                    tool_call_count,
+                                    failed_tool_count,
+                                    change_count,
+                                    model_request_count,
+                                    tool_calls_by_name.clone(),
+                                    failed_tool_calls_by_name.clone(),
+                                    started_at,
+                                )
+                                .await
+                            {
+                                Ok(Some(summary)) => {
+                                    resolve_success_commit_from_durable_summary(
+                                        success_commit,
+                                        &summary,
+                                    );
+                                    return Ok(summary);
+                                }
+                                Ok(None) => {
+                                    let message = format!(
+                                        "success terminal commit failed without durable terminal evidence: {error}"
+                                    );
+                                    success_commit.abandon_with_cancellation(
+                                        RunCancellationCause::Failure(message.clone()),
+                                    );
+                                    return Err(AgentError::Message(message));
+                                }
+                                Err(authority_error) => {
+                                    let message = format!(
+                                        "success terminal commit failed and durable ownership could not be read: {error}; authority read: {authority_error}"
+                                    );
+                                    success_commit.abandon_with_cancellation(
+                                        RunCancellationCause::Failure(message.clone()),
+                                    );
+                                    return Err(AgentError::Message(message));
+                                }
+                            }
+                        }
+                    };
                     if let AdmittedTerminalCommit::UnseenSteer { expected, actual } =
                         terminal_commit
                     {
+                        success_commit.release();
                         let drained = drain_pending_steers(
                             &self.store,
                             &mut request,
@@ -491,22 +592,56 @@ impl AgentLoop {
                             request.session.session.id,
                         )));
                     }
-                    if terminal_commit == AdmittedTerminalCommit::NotOwned {
-                        request.cancel.cancel();
+                    if matches!(
+                        terminal_commit,
+                        AdmittedTerminalCommit::NotOwned
+                            | AdmittedTerminalCommit::AlreadyTerminalizedBySameAdmission
+                    ) {
+                        let durable_summary = match self
+                            .durable_terminal_summary(
+                                &request,
+                                assistant.id,
+                                latest_usage.clone(),
+                                tool_call_count,
+                                failed_tool_count,
+                                change_count,
+                                model_request_count,
+                                tool_calls_by_name.clone(),
+                                failed_tool_calls_by_name.clone(),
+                                started_at,
+                            )
+                            .await
+                        {
+                            Ok(summary) => summary,
+                            Err(error) => {
+                                let message = format!(
+                                    "durable terminal ownership could not be resolved after a lost success commit: {error}"
+                                );
+                                success_commit.abandon_with_cancellation(
+                                    RunCancellationCause::Failure(message.clone()),
+                                );
+                                return Err(AgentError::Message(message));
+                            }
+                        };
+                        if let Some(summary) = durable_summary {
+                            resolve_success_commit_from_durable_summary(
+                                success_commit,
+                                &summary,
+                            );
+                            return Ok(summary);
+                        }
+                        success_commit
+                            .abandon_with_cancellation(RunCancellationCause::Superseded);
                         return Err(run_superseded_error(&request));
                     }
-                    if terminal_commit
-                        == AdmittedTerminalCommit::AlreadyTerminalizedBySameAdmission
-                    {
-                        request.cancel.cancel();
-                        return Err(run_superseded_error(&request));
-                    }
+                    success_commit.seal();
                     sink.emit_pre_recorded(event)?;
                     return Ok(RunSummary {
                         session_id: request.session.session.id,
                         assistant_message_id: Some(assistant.id),
                         status: SessionStatus::Completed,
                         finish_reason: Some(response.finish_reason),
+                        interruption_cause: None,
                         tool_call_count,
                         failed_tool_count,
                         change_count,
@@ -527,9 +662,9 @@ impl AgentLoop {
                 });
 
                 for call in collector.tool_calls {
-                    if request.cancel.is_cancelled() {
+                    if request.run_control.is_cancelled() {
                         return self
-                            .interrupt(
+                            .finish_for_run_control_cause(
                                 &request,
                                 assistant.id,
                                 latest_usage.clone(),
@@ -540,7 +675,7 @@ impl AgentLoop {
                                 tool_calls_by_name.clone(),
                                 failed_tool_calls_by_name.clone(),
                                 started_at,
-                                "run cancelled by user",
+                                active_goal_id_for_turn.as_deref(),
                                 sink,
                             )
                             .await;
@@ -563,20 +698,57 @@ impl AgentLoop {
                             call.clone(),
                             prompt,
                             sink,
+                            &mut model_request_count,
                         )
                         .await?;
+                    record_tool_dispatch_failure(
+                        &tool_output,
+                        &call.tool_name,
+                        &mut failed_tool_count,
+                        &mut failed_tool_calls_by_name,
+                    );
+                    let (result_text, tool_change_count) = match tool_output {
+                        ToolDispatchOutcome::Completed {
+                            result_text,
+                            change_count,
+                        } => (result_text, change_count),
+                        ToolDispatchOutcome::Declined { result_text } => (result_text, 0),
+                        ToolDispatchOutcome::Failed { result_text } => {
+                            if let Some(RunCancellationCause::Failure(message)) =
+                                request.run_control.cause()
+                            {
+                                return Err(AgentError::Message(message));
+                            }
+                            (result_text, 0)
+                        }
+                        ToolDispatchOutcome::Interrupted {
+                            change_count: interrupted_change_count,
+                        } => {
+                            change_count += interrupted_change_count;
+                            return self
+                                .finish_for_run_control_cause(
+                                    &request,
+                                    assistant.id,
+                                    latest_usage.clone(),
+                                    tool_call_count,
+                                    failed_tool_count,
+                                    change_count,
+                                    model_request_count,
+                                    tool_calls_by_name.clone(),
+                                    failed_tool_calls_by_name.clone(),
+                                    started_at,
+                                    active_goal_id_for_turn.as_deref(),
+                                    sink,
+                                )
+                                .await;
+                        }
+                    };
                     ensure_admission_active(&self.store, &request).await?;
-                    if tool_output.failed {
-                        failed_tool_count += 1;
-                        *failed_tool_calls_by_name
-                            .entry(call.tool_name.to_string())
-                            .or_default() += 1;
-                    }
-                    change_count += tool_output.change_count;
+                    change_count += tool_change_count;
                     messages.push(ModelMessage::Tool {
                         call_id: call.call_id,
                         tool_name: call.tool_name,
-                        result: tool_output.result_text,
+                        result: result_text,
                         metadata: Value::Null,
                     });
                 }
@@ -588,6 +760,23 @@ impl AgentLoop {
             Ok(summary) => Ok(summary),
             Err(error) => {
                 if matches!(&error, AgentError::RunSuperseded { .. }) {
+                    if let Some(summary) = self
+                        .durable_terminal_summary(
+                            &request,
+                            assistant.id,
+                            latest_usage.clone(),
+                            tool_call_count,
+                            failed_tool_count,
+                            change_count,
+                            model_request_count,
+                            tool_calls_by_name.clone(),
+                            failed_tool_calls_by_name.clone(),
+                            started_at,
+                        )
+                        .await?
+                    {
+                        return Ok(summary);
+                    }
                     return Err(error);
                 }
                 let owned_status = repo
@@ -600,12 +789,12 @@ impl AgentLoop {
                 if !owned_status.is_some_and(|status| {
                     matches!(status, SessionStatus::Running | SessionStatus::AwaitingUser)
                 }) {
-                    request.cancel.cancel();
+                    request.run_control.supersede();
                     return Err(run_superseded_error(&request));
                 }
-                if request.cancel.is_cancelled() {
+                if request.run_control.is_cancelled() {
                     return self
-                        .interrupt(
+                        .finish_for_run_control_cause(
                             &request,
                             assistant.id,
                             latest_usage.clone(),
@@ -616,20 +805,68 @@ impl AgentLoop {
                             tool_calls_by_name.clone(),
                             failed_tool_calls_by_name.clone(),
                             started_at,
-                            "run cancelled by user",
+                            active_goal_id_for_turn.as_deref(),
                             sink,
                         )
                         .await;
                 }
-                self.fail(
-                    &request,
-                    assistant.id,
-                    latest_usage.clone(),
-                    error.to_string(),
-                    active_goal_id_for_turn.as_deref(),
-                    sink,
-                )
-                .await?;
+                let failure_message = error.to_string();
+                if request
+                    .run_control
+                    .request_cancel(RunCancellationCause::Failure(failure_message.clone()))
+                    != RunCancelOutcome::Applied
+                {
+                    if request.run_control.cause().is_some() {
+                        return self
+                            .finish_for_run_control_cause(
+                                &request,
+                                assistant.id,
+                                latest_usage.clone(),
+                                tool_call_count,
+                                failed_tool_count,
+                                change_count,
+                                model_request_count,
+                                tool_calls_by_name.clone(),
+                                failed_tool_calls_by_name.clone(),
+                                started_at,
+                                active_goal_id_for_turn.as_deref(),
+                                sink,
+                            )
+                            .await;
+                    }
+                    return Err(error);
+                }
+                let terminal_commit = self
+                    .fail(
+                        &request,
+                        assistant.id,
+                        latest_usage.clone(),
+                        failure_message,
+                        active_goal_id_for_turn.as_deref(),
+                        sink,
+                    )
+                    .await?;
+                if terminal_commit != AdmittedTerminalCommit::Applied {
+                    if let Some(summary) = self
+                        .durable_terminal_summary(
+                            &request,
+                            assistant.id,
+                            latest_usage.clone(),
+                            tool_call_count,
+                            failed_tool_count,
+                            change_count,
+                            model_request_count,
+                            tool_calls_by_name.clone(),
+                            failed_tool_calls_by_name.clone(),
+                            started_at,
+                        )
+                        .await?
+                    {
+                        return Ok(summary);
+                    }
+                    request.run_control.supersede();
+                    return Err(run_superseded_error(&request));
+                }
                 Err(error)
             }
         }
@@ -660,6 +897,7 @@ impl AgentLoop {
                 &world_state,
                 &skills_snapshot,
                 &request.config,
+                &request.model.name,
                 request.is_sub_agent,
             ),
             messages: messages.to_vec(),
@@ -717,7 +955,8 @@ impl AgentLoop {
         call: ModelToolCall,
         prompt: &mut dyn ConfirmationPrompt,
         sink: &mut dyn RunEventSink,
-    ) -> Result<ToolOutputForModel, AgentError> {
+        model_request_count: &mut usize,
+    ) -> Result<ToolDispatchOutcome, AgentError> {
         let repo = self.store.session_repo();
         let parsed_arguments = parse_tool_arguments(&call.arguments_json)
             .and_then(|value| validate_shallow_schema(&call.tool_name, value, schemas));
@@ -743,7 +982,18 @@ impl AgentLoop {
 
         if let Some(error_text) = validation_error {
             let result_text = format!("invalid arguments for `{}`: {error_text}", call.tool_name);
-            let failed = repo
+            let Some(settlement) = request.run_control.begin_tool_settlement() else {
+                return self
+                    .settle_pending_tool_for_run_cause(
+                        request,
+                        assistant_message_id,
+                        &record,
+                        metadata,
+                        sink,
+                    )
+                    .await;
+            };
+            let Some(failed) = repo
                 .fail_tool_call_with_protocol_bundle(
                     request.session.session.id,
                     &request.admission_id,
@@ -755,34 +1005,48 @@ impl AgentLoop {
                     request.protocol_turn_id,
                     sink.reserve_protocol_sequence_no(),
                 )
-                .await?;
+                .await?
+            else {
+                drop(settlement);
+                return tool_terminal_race_outcome(request);
+            };
+            drop(settlement);
             sink.emit_pre_recorded(failed)?;
-            return Ok(ToolOutputForModel {
-                result_text,
-                failed: true,
-                change_count: 0,
-            });
+            return Ok(ToolDispatchOutcome::Failed { result_text });
         }
 
         renew_admission_lease(&self.store, request).await?;
+        let permission_review_context = permission_review_context(request);
+        let model_request_gate = request
+            .agent_context
+            .as_ref()
+            .map(crate::app::AgentRunContext::model_request_gate)
+            .or_else(|| self.model_request_gate.clone());
         let ctx = crate::tool::context::ToolContext {
             session: &request.session,
             workspace: &request.session.workspace,
             config: &request.config,
             live_config: request.live_config.clone(),
             tool_call_id: record.id,
-            cancel: request.cancel.clone(),
+            cancel: request.cancel_token(),
+            run_control: request.run_control.clone(),
             run_mutation_fence: RunMutationFence::new(
                 self.store.session_repo(),
                 request.session.session.id,
                 request.admission_id.clone(),
                 request.protocol_turn_id,
-                request.cancel.clone(),
+                request.run_control.clone(),
             ),
             prompt,
             services: &self.tool_services,
             agent: request.agent_context.as_ref(),
+            permission_reviewer_llm: self.llm.as_ref(),
+            permission_reviewer_model: &request.model,
+            permission_review_context: &permission_review_context,
+            model_request_gate,
+            model_request_count,
         };
+        let mut cancellation_cleanup_diagnostic = None;
         let execution_result = {
             // Multi-agent mutations cross the in-memory tree and durable session/protocol
             // stores. Once their fenced operation has started, let that short local operation
@@ -797,9 +1061,24 @@ impl AgentLoop {
             loop {
                 tokio::select! {
                     result = &mut execution => break result,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                        if request.cancel.is_cancelled() && !settle_multi_agent_mutation {
-                            return Err(AgentError::Message("tool execution cancelled".to_string()));
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        if request.run_control.is_cancelled() {
+                            break match await_tool_cancellation_cleanup(
+                                &mut execution,
+                                TOOL_CANCELLATION_CLEANUP_TIMEOUT,
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    let message = format!(
+                                        "tool cancellation cleanup exceeded {} ms",
+                                        TOOL_CANCELLATION_CLEANUP_TIMEOUT.as_millis()
+                                    );
+                                    cancellation_cleanup_diagnostic = Some(message.clone());
+                                    Err(crate::error::ToolError::Message(message))
+                                }
+                            };
                         }
                         if !settle_multi_agent_mutation {
                             ensure_admission_active(&self.store, request).await?;
@@ -808,14 +1087,44 @@ impl AgentLoop {
                 }
             }
         };
+        let metadata = cancellation_cleanup_diagnostic
+            .as_deref()
+            .map(|diagnostic| tool_cleanup_diagnostic_metadata(metadata.clone(), diagnostic))
+            .unwrap_or(metadata);
         ensure_admission_active(&self.store, request).await?;
         match execution_result {
             Ok(result) => {
                 let result_text = tool_result_text(&result);
                 let change_count = result.recorded_changes.len();
                 let metadata = merge_tool_metadata(metadata, &result);
+                if request.run_control.cause().is_some() {
+                    return self
+                        .settle_executed_tool_for_run_cause(
+                            request,
+                            assistant_message_id,
+                            &record,
+                            metadata,
+                            &result_text,
+                            result,
+                            sink,
+                        )
+                        .await;
+                }
+                let Some(settlement) = request.run_control.begin_tool_settlement() else {
+                    return self
+                        .settle_executed_tool_for_run_cause(
+                            request,
+                            assistant_message_id,
+                            &record,
+                            metadata,
+                            &result_text,
+                            result,
+                            sink,
+                        )
+                        .await;
+                };
                 if result.change_summaries.is_empty() {
-                    let completed = repo
+                    let Some(completed) = repo
                         .complete_tool_call_with_protocol_bundle(
                             request.session.session.id,
                             &request.admission_id,
@@ -829,32 +1138,16 @@ impl AgentLoop {
                             request.protocol_turn_id,
                             sink.reserve_protocol_sequence_no(),
                         )
-                        .await?;
+                        .await?
+                    else {
+                        drop(settlement);
+                        return tool_terminal_race_outcome(request);
+                    };
+                    drop(settlement);
                     sink.emit_pre_recorded(completed)?;
                 } else {
-                    let file_change_evidence = result
-                        .change_summaries
-                        .iter()
-                        .map(|change| crate::protocol::FileChangeEvidence {
-                            change_id: change.change_id,
-                            kind: change.kind,
-                            path_before: change.path_before.clone(),
-                            path_after: change.path_after.clone(),
-                            summary: change.summary_line(None),
-                        })
-                        .collect::<Vec<_>>();
-                    let diff_summary = crate::session::DiffSummaryPart {
-                        tool_call_id: Some(record.id),
-                        change_ids: result.recorded_changes.clone(),
-                        changes: file_change_evidence,
-                        summary: result
-                            .change_summaries
-                            .iter()
-                            .map(|change| change.summary_line(None))
-                            .collect::<Vec<_>>()
-                            .join("; "),
-                    };
-                    let (completed, file_changes) = repo
+                    let diff_summary = tool_diff_summary(record.id, &result);
+                    let Some((completed, file_changes)) = repo
                         .complete_tool_call_with_file_changes_protocol_bundle(
                             request.session.session.id,
                             &request.admission_id,
@@ -871,19 +1164,117 @@ impl AgentLoop {
                             sink.reserve_protocol_sequence_no(),
                             sink.reserve_protocol_sequence_no(),
                         )
-                        .await?;
+                        .await?
+                    else {
+                        drop(settlement);
+                        return tool_terminal_race_outcome(request);
+                    };
+                    drop(settlement);
                     sink.emit_pre_recorded(completed)?;
                     sink.emit_pre_recorded(file_changes)?;
                 }
-                Ok(ToolOutputForModel {
+                Ok(ToolDispatchOutcome::Completed {
                     result_text,
-                    failed: false,
                     change_count,
                 })
             }
-            Err(error) => {
+            Err(mut error) => {
                 let result_text = error.to_string();
-                let failed = repo
+                let permission_denial_settlement = match &mut error {
+                    crate::error::ToolError::PermissionDenied { settlement } => settlement.take(),
+                    _ => None,
+                };
+                if matches!(
+                    &error,
+                    crate::error::ToolError::PermissionDenied { .. }
+                        | crate::error::ToolError::PermissionAborted
+                ) {
+                    let permission_denied =
+                        matches!(&error, crate::error::ToolError::PermissionDenied { .. });
+                    let permission_aborted =
+                        matches!(&error, crate::error::ToolError::PermissionAborted);
+                    let abort_origin_owns = permission_aborted
+                        && matches!(
+                            request.run_control.cause(),
+                            Some(RunCancellationCause::Interruption(
+                                crate::protocol::TurnInterruptionCause::ApprovalAborted
+                            ))
+                        );
+                    let settlement = if permission_denied {
+                        let Some(settlement) = permission_denial_settlement else {
+                            return Err(crate::error::AgentError::Runtime(
+                                crate::error::RuntimeError::Message(
+                                    "accepted permission denial lost its durable settlement owner"
+                                        .to_string(),
+                                ),
+                            ));
+                        };
+                        Some(settlement)
+                    } else if abort_origin_owns {
+                        None
+                    } else {
+                        let Some(settlement) = request.run_control.begin_tool_settlement() else {
+                            return self
+                                .settle_pending_tool_for_run_cause(
+                                    request,
+                                    assistant_message_id,
+                                    &record,
+                                    metadata,
+                                    sink,
+                                )
+                                .await;
+                        };
+                        Some(settlement)
+                    };
+                    let Some(declined) = repo
+                        .settle_tool_call_without_execution_with_protocol_bundle(
+                            request.session.session.id,
+                            &request.admission_id,
+                            assistant_message_id,
+                            record.id,
+                            record.tool_name,
+                            crate::session::ToolCallStatus::Declined,
+                            &result_text,
+                            metadata,
+                            request.protocol_turn_id,
+                            sink.reserve_protocol_sequence_no(),
+                        )
+                        .await?
+                    else {
+                        drop(settlement);
+                        return tool_terminal_race_outcome(request);
+                    };
+                    drop(settlement);
+                    sink.emit_pre_recorded(declined)?;
+                    return Ok(if permission_aborted {
+                        ToolDispatchOutcome::Interrupted { change_count: 0 }
+                    } else {
+                        ToolDispatchOutcome::Declined { result_text }
+                    });
+                }
+                if request.run_control.cause().is_some() {
+                    return self
+                        .settle_pending_tool_for_run_cause(
+                            request,
+                            assistant_message_id,
+                            &record,
+                            metadata,
+                            sink,
+                        )
+                        .await;
+                }
+                let Some(settlement) = request.run_control.begin_tool_settlement() else {
+                    return self
+                        .settle_pending_tool_for_run_cause(
+                            request,
+                            assistant_message_id,
+                            &record,
+                            metadata,
+                            sink,
+                        )
+                        .await;
+                };
+                let Some(failed) = repo
                     .fail_tool_call_with_protocol_bundle(
                         request.session.session.id,
                         &request.admission_id,
@@ -895,15 +1286,331 @@ impl AgentLoop {
                         request.protocol_turn_id,
                         sink.reserve_protocol_sequence_no(),
                     )
-                    .await?;
+                    .await?
+                else {
+                    drop(settlement);
+                    return tool_terminal_race_outcome(request);
+                };
+                drop(settlement);
                 sink.emit_pre_recorded(failed)?;
-                Ok(ToolOutputForModel {
-                    result_text,
-                    failed: true,
-                    change_count: 0,
-                })
+                Ok(ToolDispatchOutcome::Failed { result_text })
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_pending_tool_for_run_cause(
+        &self,
+        request: &AgentRunRequest,
+        assistant_message_id: MessageId,
+        record: &ToolCallRecord,
+        metadata: Value,
+        sink: &mut dyn RunEventSink,
+    ) -> Result<ToolDispatchOutcome, AgentError> {
+        let repo = self.store.session_repo();
+        match request.run_control.cause() {
+            Some(RunCancellationCause::Interruption(interruption)) => {
+                let Some(event) = repo
+                    .settle_tool_call_without_execution_with_protocol_bundle(
+                        request.session.session.id,
+                        &request.admission_id,
+                        assistant_message_id,
+                        record.id,
+                        record.tool_name,
+                        crate::session::ToolCallStatus::Cancelled,
+                        interruption.legacy_reason(),
+                        metadata,
+                        request.protocol_turn_id,
+                        sink.reserve_protocol_sequence_no(),
+                    )
+                    .await?
+                else {
+                    return tool_terminal_race_outcome(request);
+                };
+                sink.emit_pre_recorded(event)?;
+                Ok(ToolDispatchOutcome::Interrupted { change_count: 0 })
+            }
+            Some(RunCancellationCause::Failure(message)) => {
+                let Some(event) = repo
+                    .fail_tool_call_with_protocol_bundle(
+                        request.session.session.id,
+                        &request.admission_id,
+                        assistant_message_id,
+                        record.id,
+                        record.tool_name,
+                        &message,
+                        metadata,
+                        request.protocol_turn_id,
+                        sink.reserve_protocol_sequence_no(),
+                    )
+                    .await?
+                else {
+                    return tool_terminal_race_outcome(request);
+                };
+                sink.emit_pre_recorded(event)?;
+                Ok(ToolDispatchOutcome::Failed {
+                    result_text: message,
+                })
+            }
+            Some(RunCancellationCause::Superseded) | None => tool_terminal_race_outcome(request),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_executed_tool_for_run_cause(
+        &self,
+        request: &AgentRunRequest,
+        assistant_message_id: MessageId,
+        record: &ToolCallRecord,
+        metadata: Value,
+        result_text: &str,
+        result: ToolResult,
+        sink: &mut dyn RunEventSink,
+    ) -> Result<ToolDispatchOutcome, AgentError> {
+        let change_count = result.recorded_changes.len();
+        let (status, reason, interrupted) = match request.run_control.cause() {
+            Some(RunCancellationCause::Interruption(interruption)) => (
+                crate::session::ToolCallStatus::Cancelled,
+                interruption.legacy_reason().to_string(),
+                true,
+            ),
+            Some(RunCancellationCause::Failure(message)) => {
+                (crate::session::ToolCallStatus::Failed, message, false)
+            }
+            Some(RunCancellationCause::Superseded) | None => {
+                return tool_terminal_race_outcome(request);
+            }
+        };
+        let repo = self.store.session_repo();
+        if result.change_summaries.is_empty() {
+            let terminal = if status == crate::session::ToolCallStatus::Cancelled {
+                repo.settle_tool_call_without_execution_with_protocol_bundle(
+                    request.session.session.id,
+                    &request.admission_id,
+                    assistant_message_id,
+                    record.id,
+                    record.tool_name,
+                    status,
+                    &reason,
+                    metadata,
+                    request.protocol_turn_id,
+                    sink.reserve_protocol_sequence_no(),
+                )
+                .await?
+            } else {
+                repo.fail_tool_call_with_protocol_bundle(
+                    request.session.session.id,
+                    &request.admission_id,
+                    assistant_message_id,
+                    record.id,
+                    record.tool_name,
+                    &reason,
+                    metadata,
+                    request.protocol_turn_id,
+                    sink.reserve_protocol_sequence_no(),
+                )
+                .await?
+            };
+            let Some(terminal) = terminal else {
+                return tool_terminal_race_outcome(request);
+            };
+            sink.emit_pre_recorded(terminal)?;
+        } else {
+            let diff_summary = tool_diff_summary(record.id, &result);
+            let Some((terminal, file_changes)) = repo
+                .settle_executed_tool_call_with_file_changes_protocol_bundle(
+                    request.session.session.id,
+                    &request.admission_id,
+                    assistant_message_id,
+                    record.id,
+                    record.tool_name,
+                    &result.title,
+                    metadata,
+                    result_text,
+                    result.truncated_output_path.as_deref(),
+                    status,
+                    &reason,
+                    diff_summary,
+                    result.change_summaries,
+                    request.protocol_turn_id,
+                    sink.reserve_protocol_sequence_no(),
+                    sink.reserve_protocol_sequence_no(),
+                )
+                .await?
+            else {
+                return tool_terminal_race_outcome(request);
+            };
+            sink.emit_pre_recorded(terminal)?;
+            sink.emit_pre_recorded(file_changes)?;
+        }
+        Ok(if interrupted {
+            ToolDispatchOutcome::Interrupted { change_count }
+        } else {
+            ToolDispatchOutcome::Failed {
+                result_text: reason,
+            }
+        })
+    }
+
+    async fn finish_for_run_control_cause(
+        &self,
+        request: &AgentRunRequest,
+        assistant_message_id: MessageId,
+        usage: Option<TokenUsage>,
+        tool_call_count: usize,
+        failed_tool_count: usize,
+        change_count: usize,
+        model_request_count: usize,
+        tool_calls_by_name: BTreeMap<String, usize>,
+        failed_tool_calls_by_name: BTreeMap<String, usize>,
+        started_at: Instant,
+        expected_active_goal_id: Option<&str>,
+        sink: &mut dyn RunEventSink,
+    ) -> Result<RunSummary, AgentError> {
+        match request.run_control.cause() {
+            Some(RunCancellationCause::Interruption(cause)) => {
+                self.interrupt(
+                    request,
+                    assistant_message_id,
+                    usage,
+                    tool_call_count,
+                    failed_tool_count,
+                    change_count,
+                    model_request_count,
+                    tool_calls_by_name,
+                    failed_tool_calls_by_name,
+                    started_at,
+                    cause,
+                    sink,
+                )
+                .await
+            }
+            Some(RunCancellationCause::Superseded) => {
+                if let Some(summary) = self
+                    .durable_terminal_summary(
+                        request,
+                        assistant_message_id,
+                        usage,
+                        tool_call_count,
+                        failed_tool_count,
+                        change_count,
+                        model_request_count,
+                        tool_calls_by_name,
+                        failed_tool_calls_by_name,
+                        started_at,
+                    )
+                    .await?
+                {
+                    Ok(summary)
+                } else {
+                    Err(run_superseded_error(request))
+                }
+            }
+            Some(RunCancellationCause::Failure(message)) => {
+                let terminal_commit = self
+                    .fail(
+                        request,
+                        assistant_message_id,
+                        usage.clone(),
+                        message.clone(),
+                        expected_active_goal_id,
+                        sink,
+                    )
+                    .await?;
+                if terminal_commit == AdmittedTerminalCommit::Applied {
+                    return Ok(RunSummary {
+                        session_id: request.session.session.id,
+                        assistant_message_id: Some(assistant_message_id),
+                        status: SessionStatus::Failed,
+                        finish_reason: Some(FinishReason::Error),
+                        interruption_cause: None,
+                        tool_call_count,
+                        failed_tool_count,
+                        change_count,
+                        metrics: run_metrics(
+                            request,
+                            started_at,
+                            model_request_count,
+                            usage,
+                            &tool_calls_by_name,
+                            &failed_tool_calls_by_name,
+                        ),
+                    });
+                }
+                if let Some(summary) = self
+                    .durable_terminal_summary(
+                        request,
+                        assistant_message_id,
+                        usage,
+                        tool_call_count,
+                        failed_tool_count,
+                        change_count,
+                        model_request_count,
+                        tool_calls_by_name,
+                        failed_tool_calls_by_name,
+                        started_at,
+                    )
+                    .await?
+                {
+                    return Ok(summary);
+                }
+                request.run_control.supersede();
+                Err(run_superseded_error(request))
+            }
+            None => Err(AgentError::Message(
+                "run cancellation was observed without a classified cause".to_string(),
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn durable_terminal_summary(
+        &self,
+        request: &AgentRunRequest,
+        assistant_message_id: MessageId,
+        usage: Option<TokenUsage>,
+        tool_call_count: usize,
+        failed_tool_count: usize,
+        change_count: usize,
+        model_request_count: usize,
+        tool_calls_by_name: BTreeMap<String, usize>,
+        failed_tool_calls_by_name: BTreeMap<String, usize>,
+        started_at: Instant,
+    ) -> Result<Option<RunSummary>, AgentError> {
+        let Some((status, interruption_cause)) = self
+            .store
+            .session_repo()
+            .corroborated_terminal_for_turn(request.session.session.id, request.protocol_turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let finish_reason = match status {
+            SessionStatus::Cancelled => Some(FinishReason::Cancelled),
+            SessionStatus::Failed => Some(FinishReason::Error),
+            SessionStatus::Completed
+            | SessionStatus::AwaitingUser
+            | SessionStatus::Idle
+            | SessionStatus::Running => None,
+        };
+        Ok(Some(RunSummary {
+            session_id: request.session.session.id,
+            assistant_message_id: Some(assistant_message_id),
+            status,
+            finish_reason,
+            interruption_cause,
+            tool_call_count,
+            failed_tool_count,
+            change_count,
+            metrics: run_metrics(
+                request,
+                started_at,
+                model_request_count,
+                usage,
+                &tool_calls_by_name,
+                &failed_tool_calls_by_name,
+            ),
+        }))
     }
 
     async fn interrupt(
@@ -918,15 +1625,17 @@ impl AgentLoop {
         tool_calls_by_name: BTreeMap<String, usize>,
         failed_tool_calls_by_name: BTreeMap<String, usize>,
         started_at: Instant,
-        reason: &str,
+        cause: crate::protocol::TurnInterruptionCause,
         sink: &mut dyn RunEventSink,
     ) -> Result<RunSummary, AgentError> {
+        let reason = cause.legacy_reason();
         let event = RunEvent::SessionInterrupted {
             session_id: request.session.session.id,
             reason: reason.to_string(),
+            cause: Some(cause),
         };
         let metadata = assistant_metadata(request, Some(FinishReason::Cancelled), usage.clone());
-        let terminalized = self
+        let terminal_commit = self
             .store
             .session_repo()
             .update_admitted_message_metadata_and_status_with_protocol_event(
@@ -941,16 +1650,35 @@ impl AgentLoop {
                 None,
                 None,
             )
-            .await?
-            .was_applied();
-        if terminalized {
-            sink.emit_pre_recorded(event)?;
+            .await?;
+        if terminal_commit != AdmittedTerminalCommit::Applied {
+            if let Some(summary) = self
+                .durable_terminal_summary(
+                    request,
+                    assistant_message_id,
+                    usage,
+                    tool_call_count,
+                    failed_tool_count,
+                    change_count,
+                    model_request_count,
+                    tool_calls_by_name,
+                    failed_tool_calls_by_name,
+                    started_at,
+                )
+                .await?
+            {
+                return Ok(summary);
+            }
+            request.run_control.supersede();
+            return Err(run_superseded_error(request));
         }
+        sink.emit_pre_recorded(event)?;
         Ok(RunSummary {
             session_id: request.session.session.id,
             assistant_message_id: Some(assistant_message_id),
             status: SessionStatus::Cancelled,
             finish_reason: Some(FinishReason::Cancelled),
+            interruption_cause: Some(cause),
             tool_call_count,
             failed_tool_count,
             change_count,
@@ -973,13 +1701,13 @@ impl AgentLoop {
         message: String,
         expected_active_goal_id: Option<&str>,
         sink: &mut dyn RunEventSink,
-    ) -> Result<(), AgentError> {
+    ) -> Result<AdmittedTerminalCommit, AgentError> {
         let event = RunEvent::SessionFailed {
             session_id: request.session.session.id,
             message,
         };
         let metadata = assistant_metadata(request, Some(FinishReason::Error), usage);
-        let terminalized = self
+        let terminal_commit = self
             .store
             .session_repo()
             .update_admitted_message_metadata_and_status_with_protocol_event(
@@ -994,12 +1722,11 @@ impl AgentLoop {
                 None,
                 expected_active_goal_id,
             )
-            .await?
-            .was_applied();
-        if terminalized {
+            .await?;
+        if terminal_commit == AdmittedTerminalCommit::Applied {
             sink.emit_pre_recorded(event)?;
         }
-        Ok(())
+        Ok(terminal_commit)
     }
 
     fn tool_schemas(registry: &ToolRegistry) -> Vec<ToolSchema> {
@@ -1032,6 +1759,32 @@ impl AgentLoop {
                 )
             })
             .map(|(goal, goal_id)| AgentGoalForRequest { goal, goal_id }))
+    }
+}
+
+fn resolve_success_commit_from_durable_summary(
+    reservation: SuccessCommitReservation,
+    summary: &RunSummary,
+) {
+    match summary.status {
+        SessionStatus::Completed | SessionStatus::AwaitingUser => {
+            reservation.seal();
+        }
+        SessionStatus::Cancelled => {
+            let cause = summary.interruption_cause.map_or(
+                RunCancellationCause::Superseded,
+                RunCancellationCause::Interruption,
+            );
+            reservation.resolve_authoritative_cancellation(cause);
+        }
+        SessionStatus::Failed => {
+            reservation.resolve_authoritative_cancellation(RunCancellationCause::Failure(
+                "durable failure owner won the terminal commit".to_string(),
+            ));
+        }
+        SessionStatus::Idle | SessionStatus::Running => {
+            reservation.resolve_authoritative_cancellation(RunCancellationCause::Superseded);
+        }
     }
 }
 
@@ -1077,7 +1830,7 @@ async fn ensure_admission_active(
     }) {
         return Ok(());
     }
-    request.cancel.cancel();
+    request.run_control.supersede();
     Err(run_superseded_error(request))
 }
 
@@ -1096,7 +1849,7 @@ async fn renew_admission_lease(
     if renewed == RunAdmissionLeaseRenewalOutcome::Renewed {
         Ok(())
     } else {
-        request.cancel.cancel();
+        request.run_control.supersede();
         Err(run_superseded_error(request))
     }
 }
@@ -1105,6 +1858,22 @@ fn run_superseded_error(request: &AgentRunRequest) -> AgentError {
     AgentError::RunSuperseded {
         session_id: request.session.session.id,
         admission_id: request.admission_id.clone(),
+    }
+}
+
+fn tool_terminal_race_outcome(
+    request: &AgentRunRequest,
+) -> Result<ToolDispatchOutcome, AgentError> {
+    match request.run_control.cause() {
+        Some(RunCancellationCause::Interruption(_)) => {
+            Ok(ToolDispatchOutcome::Interrupted { change_count: 0 })
+        }
+        Some(RunCancellationCause::Superseded) => Err(run_superseded_error(request)),
+        Some(RunCancellationCause::Failure(message)) => Err(AgentError::Message(message)),
+        None => {
+            request.run_control.supersede();
+            Err(run_superseded_error(request))
+        }
     }
 }
 
@@ -1119,7 +1888,7 @@ async fn drain_pending_steers(
     if let Some(receiver) = request.steer_rx.as_mut() {
         while let Ok(input) = receiver.try_recv() {
             if input.steer.expected_turn_id != request.protocol_turn_id {
-                request.cancel.cancel();
+                request.run_control.supersede();
                 return Err(run_superseded_error(request));
             }
             if seen_steer_ids.insert(input.history_item_id) {
@@ -1137,7 +1906,7 @@ async fn drain_pending_steers(
         )
         .await?
     else {
-        request.cancel.cancel();
+        request.run_control.supersede();
         return Err(run_superseded_error(request));
     };
     for item in stored_steers {
@@ -1186,10 +1955,54 @@ fn drain_pending_agent_communications(
     Ok(drained)
 }
 
-struct ToolOutputForModel {
-    result_text: String,
-    failed: bool,
-    change_count: usize,
+fn validate_provider_response_terminal(
+    finish_reason: FinishReason,
+    has_tool_calls: bool,
+) -> Result<(), AgentError> {
+    match (finish_reason, has_tool_calls) {
+        (FinishReason::Length, _) => Err(AgentError::ProviderOutputLimit),
+        (FinishReason::Error, _) => Err(AgentError::ProviderFinishError),
+        (FinishReason::ToolCall, false) | (FinishReason::Stop, true) => {
+            Err(AgentError::ProviderFinishShape {
+                finish_reason,
+                has_tool_calls,
+            })
+        }
+        (FinishReason::Stop, false)
+        | (FinishReason::ToolCall, true)
+        | (FinishReason::Cancelled, _) => Ok(()),
+    }
+}
+
+enum ToolDispatchOutcome {
+    Completed {
+        result_text: String,
+        change_count: usize,
+    },
+    Declined {
+        result_text: String,
+    },
+    Failed {
+        result_text: String,
+    },
+    Interrupted {
+        change_count: usize,
+    },
+}
+
+fn record_tool_dispatch_failure(
+    outcome: &ToolDispatchOutcome,
+    tool_name: &str,
+    failed_tool_count: &mut usize,
+    failed_tool_calls_by_name: &mut BTreeMap<String, usize>,
+) {
+    if !matches!(outcome, ToolDispatchOutcome::Failed { .. }) {
+        return;
+    }
+    *failed_tool_count += 1;
+    *failed_tool_calls_by_name
+        .entry(tool_name.to_string())
+        .or_default() += 1;
 }
 
 #[derive(Default)]
@@ -1579,6 +2392,50 @@ fn content_markers(content: &str) -> Vec<String> {
     markers
 }
 
+fn permission_review_context(request: &AgentRunRequest) -> String {
+    const MAX_ITEMS: usize = 20;
+    const MAX_ITEM_CHARS: usize = 4_000;
+    const MAX_CONTEXT_CHARS: usize = 16_000;
+
+    let mut rendered = Vec::new();
+    let mut remaining = MAX_CONTEXT_CHARS;
+    for item in request
+        .runtime_input
+        .history_items
+        .iter()
+        .rev()
+        .take(MAX_ITEMS)
+    {
+        if remaining == 0 {
+            break;
+        }
+        let value = serde_json::to_string(&item.payload)
+            .unwrap_or_else(|error| format!("{{\"serialization_error\":\"{error}\"}}"));
+        let clipped = clip_chars(&value, MAX_ITEM_CHARS.min(remaining));
+        remaining = remaining.saturating_sub(clipped.chars().count());
+        rendered.push(clipped);
+    }
+    rendered.reverse();
+    if rendered.is_empty() {
+        "No prior task context is available.".to_string()
+    } else {
+        rendered.join("\n")
+    }
+}
+
+fn clip_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_string()
+    } else {
+        let mut clipped = value
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        clipped.push('…');
+        clipped
+    }
+}
+
 fn messages_from_history(history_items: &[HistoryItem]) -> Vec<ModelMessage> {
     let mut projected = Vec::<(usize, u8, ModelMessage)>::new();
     let mut tool_names_by_call = HashMap::new();
@@ -1598,6 +2455,20 @@ fn messages_from_history(history_items: &[HistoryItem]) -> Vec<ModelMessage> {
         })
         .flatten()
         .copied()
+        .collect::<HashSet<_>>();
+    let non_executed_call_ids = history_items
+        .iter()
+        .filter(|item| !replaced_ids.contains(&item.id))
+        .filter_map(|item| match &item.payload {
+            HistoryItemPayload::ToolOutput {
+                call_id,
+                status:
+                    crate::protocol::ToolLifecycleStatus::Declined
+                    | crate::protocol::ToolLifecycleStatus::Cancelled,
+                ..
+            } => Some(*call_id),
+            _ => None,
+        })
         .collect::<HashSet<_>>();
     for (index, item) in history_items.iter().enumerate() {
         if replaced_ids.contains(&item.id) {
@@ -1638,6 +2509,9 @@ fn messages_from_history(history_items: &[HistoryItem]) -> Vec<ModelMessage> {
                 arguments,
                 ..
             } => {
+                if non_executed_call_ids.contains(call_id) {
+                    continue;
+                }
                 tool_names_by_call.insert(call_id.to_string(), tool.to_string());
                 let selected_arguments =
                     canonical_tool_call_arguments(arguments, model_arguments, effective_arguments);
@@ -1659,6 +2533,9 @@ fn messages_from_history(history_items: &[HistoryItem]) -> Vec<ModelMessage> {
                 output_text,
                 ..
             } => {
+                if non_executed_call_ids.contains(call_id) {
+                    continue;
+                }
                 let call_id_text = call_id.to_string();
                 if let Some(tool_name) = tool_names_by_call.get(&call_id_text).cloned() {
                     projected.push((
@@ -1875,6 +2752,43 @@ fn failed_tool_metadata(mut metadata: Value) -> Value {
     metadata
 }
 
+fn tool_cleanup_diagnostic_metadata(mut metadata: Value, diagnostic: &str) -> Value {
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "cancellation_cleanup_error".to_string(),
+            Value::String(diagnostic.to_string()),
+        );
+    }
+    metadata
+}
+
+fn tool_diff_summary(
+    tool_call_id: crate::session::ToolCallId,
+    result: &ToolResult,
+) -> crate::session::DiffSummaryPart {
+    crate::session::DiffSummaryPart {
+        tool_call_id: Some(tool_call_id),
+        change_ids: result.recorded_changes.clone(),
+        changes: result
+            .change_summaries
+            .iter()
+            .map(|change| crate::protocol::FileChangeEvidence {
+                change_id: change.change_id,
+                kind: change.kind,
+                path_before: change.path_before.clone(),
+                path_after: change.path_after.clone(),
+                summary: change.summary_line(None),
+            })
+            .collect(),
+        summary: result
+            .change_summaries
+            .iter()
+            .map(|change| change.summary_line(None))
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
+
 fn tool_result_text(result: &ToolResult) -> String {
     if result.output_text.trim().is_empty() {
         result.title.clone()
@@ -1906,6 +2820,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use crate::config::{AccessMode, ResolvedConfig};
@@ -1979,14 +2894,307 @@ mod tests {
         }
     }
 
-    struct AllowPrompt;
+    struct DecisionPrompt {
+        requests: Vec<crate::tool::PermissionRequest>,
+        decision: crate::cli::ReviewDecision,
+    }
 
-    impl ConfirmationPrompt for AllowPrompt {
+    impl Default for DecisionPrompt {
+        fn default() -> Self {
+            Self {
+                requests: Vec::new(),
+                decision: crate::cli::ReviewDecision::Approved,
+            }
+        }
+    }
+
+    impl ConfirmationPrompt for DecisionPrompt {
         fn confirm(
             &mut self,
-            _request: &crate::tool::PermissionRequest,
-        ) -> Result<bool, crate::error::CliPromptError> {
-            Ok(true)
+            request: &crate::tool::PermissionRequest,
+        ) -> Result<crate::cli::ReviewDecision, crate::error::CliPromptError> {
+            self.requests.push(request.clone());
+            Ok(self.decision)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TerminalRaceToolBehavior {
+        PermissionAbortOrigin,
+        ApprovalAbortObserver,
+        LateInterruptedResult,
+        LateFailedResult,
+    }
+
+    struct TerminalRaceTool {
+        behavior: TerminalRaceToolBehavior,
+        start_barrier: Option<Arc<tokio::sync::Barrier>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum EffectAdmissionRaceOrder {
+        StopBeforeAdmission,
+        AdmissionBeforeStop,
+    }
+
+    struct EffectAdmissionRaceTool {
+        order: EffectAdmissionRaceOrder,
+        reached_boundary: Arc<tokio::sync::Barrier>,
+        release_boundary: Arc<tokio::sync::Barrier>,
+        side_effects: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DeniedSettlementRaceOrder {
+        ProducerBeforeSettlement,
+        SettlementBeforeProducer,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DeniedSettlementTerminalProducer {
+        Stop,
+        Failure,
+    }
+
+    struct DeniedSettlementRaceTool {
+        order: DeniedSettlementRaceOrder,
+        reached_boundary: Arc<tokio::sync::Barrier>,
+        release_boundary: Arc<tokio::sync::Barrier>,
+    }
+
+    struct CooperativeCleanupTool {
+        started: Arc<tokio::sync::Barrier>,
+        cleanup_completed: Arc<AtomicBool>,
+    }
+
+    #[async_trait(?Send)]
+    impl crate::tool::registry::Tool for EffectAdmissionRaceTool {
+        fn spec(&self) -> crate::tool::ToolSpec {
+            crate::tool::ToolSpec {
+                name: ToolName::Write,
+                description: "deterministic permission/effect admission race fixture",
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _raw_arguments: Value,
+            mut ctx: crate::tool::context::ToolContext<'_>,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            let admission = ctx
+                .confirm_if_needed(
+                    crate::workspace::AccessKind::Edit,
+                    "admit deterministic side effect".to_string(),
+                    vec![ctx.workspace.root.join("effect-admission.txt")],
+                    false,
+                    Vec::new(),
+                )
+                .await?;
+            match self.order {
+                EffectAdmissionRaceOrder::StopBeforeAdmission => {
+                    self.reached_boundary.wait().await;
+                    self.release_boundary.wait().await;
+                    admission.admit()?;
+                    self.side_effects.fetch_add(1, Ordering::SeqCst);
+                }
+                EffectAdmissionRaceOrder::AdmissionBeforeStop => {
+                    admission.admit()?;
+                    self.side_effects.fetch_add(1, Ordering::SeqCst);
+                    self.reached_boundary.wait().await;
+                    self.release_boundary.wait().await;
+                }
+            }
+            Ok(ToolResult {
+                title: "effect admission fixture".to_string(),
+                output_text: "effect boundary crossed".to_string(),
+                metadata: serde_json::json!({"fixture": "effect_admission"}),
+                truncated_output_path: None,
+                recorded_changes: Vec::new(),
+                change_summaries: Vec::new(),
+            })
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl crate::tool::registry::Tool for DeniedSettlementRaceTool {
+        fn spec(&self) -> crate::tool::ToolSpec {
+            crate::tool::ToolSpec {
+                name: ToolName::Write,
+                description: "deterministic denial settlement race fixture",
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _raw_arguments: Value,
+            ctx: crate::tool::context::ToolContext<'_>,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            let settlement = match self.order {
+                DeniedSettlementRaceOrder::ProducerBeforeSettlement => {
+                    self.reached_boundary.wait().await;
+                    self.release_boundary.wait().await;
+                    ctx.run_control
+                        .begin_tool_settlement()
+                        .ok_or(crate::error::ToolError::RunInterrupted)?
+                }
+                DeniedSettlementRaceOrder::SettlementBeforeProducer => {
+                    let settlement = ctx
+                        .run_control
+                        .begin_tool_settlement()
+                        .ok_or(crate::error::ToolError::RunInterrupted)?;
+                    self.reached_boundary.wait().await;
+                    self.release_boundary.wait().await;
+                    settlement
+                }
+            };
+            Err(crate::error::ToolError::PermissionDenied {
+                settlement: Some(settlement),
+            })
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl crate::tool::registry::Tool for CooperativeCleanupTool {
+        fn spec(&self) -> crate::tool::ToolSpec {
+            crate::tool::ToolSpec {
+                name: ToolName::Write,
+                description: "cooperative cancellation cleanup fixture",
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _raw_arguments: Value,
+            ctx: crate::tool::context::ToolContext<'_>,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            self.started.wait().await;
+            ctx.cancel.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            self.cleanup_completed.store(true, Ordering::SeqCst);
+            Err(crate::error::ToolError::RunInterrupted)
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl crate::tool::registry::Tool for TerminalRaceTool {
+        fn spec(&self) -> crate::tool::ToolSpec {
+            crate::tool::ToolSpec {
+                name: ToolName::Write,
+                description: "deterministic tool terminal race fixture",
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _raw_arguments: Value,
+            ctx: crate::tool::context::ToolContext<'_>,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            if let Some(barrier) = &self.start_barrier {
+                barrier.wait().await;
+            }
+            match self.behavior {
+                TerminalRaceToolBehavior::PermissionAbortOrigin => {
+                    ctx.run_control
+                        .interrupt(crate::protocol::TurnInterruptionCause::ApprovalAborted);
+                    Err(crate::error::ToolError::PermissionAborted)
+                }
+                TerminalRaceToolBehavior::ApprovalAbortObserver => {
+                    ctx.run_control.token().cancelled().await;
+                    Err(crate::error::ToolError::RunInterrupted)
+                }
+                TerminalRaceToolBehavior::LateInterruptedResult
+                | TerminalRaceToolBehavior::LateFailedResult => {
+                    let path = ctx.workspace.root.join(match self.behavior {
+                        TerminalRaceToolBehavior::LateInterruptedResult => "late-interrupted.txt",
+                        TerminalRaceToolBehavior::LateFailedResult => "late-failed.txt",
+                        _ => unreachable!(),
+                    });
+                    std::fs::write(&path, "side effect completed before classification\n")
+                        .map_err(|error| crate::error::ToolError::Message(error.to_string()))?;
+                    let change_id = crate::session::ChangeId::new();
+                    match self.behavior {
+                        TerminalRaceToolBehavior::LateInterruptedResult => {
+                            ctx.run_control
+                                .interrupt(crate::protocol::TurnInterruptionCause::ApprovalAborted);
+                        }
+                        TerminalRaceToolBehavior::LateFailedResult => {
+                            ctx.run_control.fail("late tool failure");
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(ToolResult {
+                        title: "late tool result".to_string(),
+                        output_text: "the tool future returned a result after classification"
+                            .to_string(),
+                        metadata: serde_json::json!({"fixture": "terminal_race"}),
+                        truncated_output_path: None,
+                        recorded_changes: vec![change_id],
+                        change_summaries: vec![crate::edit::ChangeSummary {
+                            change_id,
+                            kind: crate::session::ChangeKind::Add,
+                            path_before: None,
+                            path_after: Some(path),
+                        }],
+                    })
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_failure_metrics_count_only_typed_failed_outcomes() {
+        let mut failed_tool_count = 0;
+        let mut failed_tool_calls_by_name = BTreeMap::new();
+
+        for outcome in [
+            ToolDispatchOutcome::Completed {
+                result_text: "completed".to_string(),
+                change_count: 1,
+            },
+            ToolDispatchOutcome::Declined {
+                result_text: "declined".to_string(),
+            },
+            ToolDispatchOutcome::Interrupted { change_count: 0 },
+        ] {
+            record_tool_dispatch_failure(
+                &outcome,
+                "write",
+                &mut failed_tool_count,
+                &mut failed_tool_calls_by_name,
+            );
+        }
+        record_tool_dispatch_failure(
+            &ToolDispatchOutcome::Failed {
+                result_text: "operational failure".to_string(),
+            },
+            "shell",
+            &mut failed_tool_count,
+            &mut failed_tool_calls_by_name,
+        );
+
+        assert_eq!(failed_tool_count, 1);
+        assert_eq!(failed_tool_calls_by_name.len(), 1);
+        assert_eq!(failed_tool_calls_by_name.get("shell"), Some(&1));
+        assert_eq!(failed_tool_calls_by_name.get("write"), None);
+    }
+
+    fn scripted_write_call(call_id: &str) -> ScriptedResponse {
+        ScriptedResponse {
+            events: vec![
+                LlmEvent::ToolCallStart {
+                    call_id: call_id.to_string(),
+                    tool_name: "write".to_string(),
+                },
+                LlmEvent::ToolCallArgsDelta {
+                    call_id: call_id.to_string(),
+                    delta: "{}".to_string(),
+                },
+            ],
+            finish_reason: FinishReason::ToolCall,
         }
     }
 
@@ -2008,7 +3216,7 @@ mod tests {
                             delta: r#"{"path":"hello.txt","content":"hello\n"}"#.to_string(),
                         },
                     ],
-                    finish_reason: FinishReason::Stop,
+                    finish_reason: FinishReason::ToolCall,
                 },
                 ScriptedResponse {
                     events: vec![LlmEvent::TextDelta("done".to_string())],
@@ -2076,7 +3284,789 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_provider_response_terminalizes_cancelled() {
+    async fn aborting_permission_stops_before_retry_or_sibling_tool_execution() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::Default;
+        let run = run_scripted_with_options_and_decision(
+            config,
+            vec![ScriptedResponse {
+                events: vec![
+                    LlmEvent::ToolCallStart {
+                        call_id: "call_1".to_string(),
+                        tool_name: "write".to_string(),
+                    },
+                    LlmEvent::ToolCallArgsDelta {
+                        call_id: "call_1".to_string(),
+                        delta: r#"{"path":"first.txt","content":"must not be written\n"}"#
+                            .to_string(),
+                    },
+                    LlmEvent::ToolCallStart {
+                        call_id: "call_2".to_string(),
+                        tool_name: "write".to_string(),
+                    },
+                    LlmEvent::ToolCallArgsDelta {
+                        call_id: "call_2".to_string(),
+                        delta: r#"{"path":"second.txt","content":"must not be written\n"}"#
+                            .to_string(),
+                    },
+                ],
+                finish_reason: FinishReason::ToolCall,
+            }],
+            None,
+            None,
+            None,
+            crate::cli::ReviewDecision::Abort,
+        )
+        .await
+        .expect("run setup");
+        let summary = run.summary.expect("abort summary");
+        let session = run
+            .store
+            .session_repo()
+            .get_session(run.session_id)
+            .await
+            .expect("session");
+
+        assert_eq!(summary.status, SessionStatus::Cancelled);
+        assert_eq!(session.status, SessionStatus::Cancelled);
+        assert_eq!(summary.tool_call_count, 1);
+        assert_eq!(summary.failed_tool_count, 0);
+        assert_eq!(summary.metrics.model_request_count, 1);
+        assert_eq!(run.requests.len(), 1);
+        assert_eq!(run.confirmations.len(), 1);
+        assert!(!run.root.join("first.txt").exists());
+        assert!(!run.root.join("second.txt").exists());
+        let transcript = run
+            .store
+            .session_repo()
+            .compatibility_transcript(run.session_id)
+            .await
+            .expect("abort transcript");
+        let tool_statuses = transcript
+            .messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match &part.payload {
+                MessagePart::ToolResult(result) => Some(result.status),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_statuses,
+            vec![crate::session::ToolCallStatus::Declined]
+        );
+        assert!(run.events.iter().any(|event| {
+            matches!(
+                event,
+                RunEvent::SessionInterrupted {
+                    cause: Some(crate::protocol::TurnInterruptionCause::ApprovalAborted),
+                    ..
+                }
+            )
+        }));
+        assert!(
+            !run.events
+                .iter()
+                .any(|event| matches!(event, RunEvent::SessionCompleted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_permission_returns_one_tool_result_and_continues_the_same_turn() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::Default;
+        let run = run_scripted_with_options_and_decision(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "call_denied".to_string(),
+                            tool_name: "write".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "call_denied".to_string(),
+                            delta: r#"{"path":"denied.txt","content":"must not be written\n"}"#
+                                .to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        "Understood; the action was not executed.".to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            None,
+            None,
+            None,
+            crate::cli::ReviewDecision::Denied,
+        )
+        .await
+        .expect("run setup");
+        let summary = run.summary.expect("denied run summary");
+
+        assert_eq!(summary.status, SessionStatus::Completed);
+        assert_eq!(summary.tool_call_count, 1);
+        assert_eq!(summary.failed_tool_count, 0);
+        assert_eq!(summary.metrics.model_request_count, 2);
+        assert_eq!(run.requests.len(), 2);
+        assert_eq!(run.confirmations.len(), 1);
+        assert!(!run.root.join("denied.txt").exists());
+        assert!(run.requests[1].messages.iter().any(|message| {
+            matches!(
+                message,
+                ModelMessage::Tool { result, .. }
+                    if result.contains("permission denied by user")
+            )
+        }));
+        assert!(
+            run.events
+                .iter()
+                .any(|event| { matches!(event, RunEvent::ToolCallDeclined { .. }) })
+        );
+        assert!(
+            !run.events
+                .iter()
+                .any(|event| { matches!(event, RunEvent::SessionInterrupted { .. }) })
+        );
+        let transcript = run
+            .store
+            .session_repo()
+            .compatibility_transcript(run.session_id)
+            .await
+            .expect("denied transcript");
+        assert!(transcript.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    &part.payload,
+                    MessagePart::ToolResult(result)
+                        if result.status == crate::session::ToolCallStatus::Declined
+                )
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn tool_effect_admission_makes_stop_first_zero_effect_and_admission_first_startable() {
+        for (order, expected_effects) in [
+            (EffectAdmissionRaceOrder::StopBeforeAdmission, 0),
+            (EffectAdmissionRaceOrder::AdmissionBeforeStop, 1),
+        ] {
+            let mut config = ResolvedConfig::default();
+            config.permissions.access_mode = AccessMode::Default;
+            let run_control = RunControl::new();
+            let reached_boundary = Arc::new(tokio::sync::Barrier::new(2));
+            let release_boundary = Arc::new(tokio::sync::Barrier::new(2));
+            let side_effects = Arc::new(AtomicUsize::new(0));
+            let run = run_scripted_with_control_and_tool(
+                config,
+                vec![scripted_write_call("effect_admission")],
+                run_control.clone(),
+                Arc::new(EffectAdmissionRaceTool {
+                    order,
+                    reached_boundary: Arc::clone(&reached_boundary),
+                    release_boundary: Arc::clone(&release_boundary),
+                    side_effects: Arc::clone(&side_effects),
+                }),
+            );
+            let classify = async {
+                reached_boundary.wait().await;
+                assert_eq!(
+                    run_control.request_cancel(RunCancellationCause::Interruption(
+                        crate::protocol::TurnInterruptionCause::UserStop
+                    )),
+                    match order {
+                        EffectAdmissionRaceOrder::StopBeforeAdmission => RunCancelOutcome::Applied,
+                        EffectAdmissionRaceOrder::AdmissionBeforeStop => RunCancelOutcome::Applied,
+                    }
+                );
+                release_boundary.wait().await;
+            };
+
+            let (run, ()) = tokio::join!(run, classify);
+            let run = run.expect("effect admission run");
+            let summary = run.summary.expect("typed cancellation summary");
+            assert_eq!(summary.status, SessionStatus::Cancelled);
+            assert_eq!(
+                summary.interruption_cause,
+                Some(crate::protocol::TurnInterruptionCause::UserStop)
+            );
+            assert_eq!(side_effects.load(Ordering::SeqCst), expected_effects);
+            assert!(
+                run.events
+                    .iter()
+                    .any(|event| { matches!(event, RunEvent::ToolCallCancelled { .. }) })
+            );
+            assert!(
+                !run.events
+                    .iter()
+                    .any(|event| matches!(event, RunEvent::SessionCompleted { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_effect_admission_makes_failure_first_zero_effect_and_typed_failed_terminal() {
+        for (order, expected_effects) in [
+            (EffectAdmissionRaceOrder::StopBeforeAdmission, 0),
+            (EffectAdmissionRaceOrder::AdmissionBeforeStop, 1),
+        ] {
+            let mut config = ResolvedConfig::default();
+            config.permissions.access_mode = AccessMode::Default;
+            let run_control = RunControl::new();
+            let reached_boundary = Arc::new(tokio::sync::Barrier::new(2));
+            let release_boundary = Arc::new(tokio::sync::Barrier::new(2));
+            let side_effects = Arc::new(AtomicUsize::new(0));
+            let run = run_scripted_with_control_and_tool(
+                config,
+                vec![scripted_write_call("effect_admission_failure")],
+                run_control.clone(),
+                Arc::new(EffectAdmissionRaceTool {
+                    order,
+                    reached_boundary: Arc::clone(&reached_boundary),
+                    release_boundary: Arc::clone(&release_boundary),
+                    side_effects: Arc::clone(&side_effects),
+                }),
+            );
+            let classify = async {
+                reached_boundary.wait().await;
+                assert_eq!(
+                    run_control.request_cancel(RunCancellationCause::Failure(
+                        "provider failed at the effect boundary".to_string()
+                    )),
+                    RunCancelOutcome::Applied
+                );
+                release_boundary.wait().await;
+            };
+
+            let (run, ()) = tokio::join!(run, classify);
+            let run = run.expect("effect admission failure run");
+            let summary = run.summary.as_ref().expect("typed failure summary");
+            assert_eq!(summary.status, SessionStatus::Failed);
+            assert_eq!(summary.interruption_cause, None);
+            assert_eq!(
+                run.store
+                    .session_repo()
+                    .get_session(run.session_id)
+                    .await
+                    .expect("durable failed session")
+                    .status,
+                SessionStatus::Failed
+            );
+            assert_eq!(side_effects.load(Ordering::SeqCst), expected_effects);
+            assert_eq!(run.requests.len(), 1, "terminal failure must stop replay");
+            assert!(
+                run.events
+                    .iter()
+                    .any(|event| matches!(event, RunEvent::ToolCallFailed { .. }))
+            );
+            assert!(
+                run.events
+                    .iter()
+                    .any(|event| matches!(event, RunEvent::SessionFailed { .. }))
+            );
+            assert!(
+                !run.events
+                    .iter()
+                    .any(|event| matches!(event, RunEvent::SessionCompleted { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_denial_settlement_has_exact_order_against_stop_and_failure() {
+        for order in [
+            DeniedSettlementRaceOrder::ProducerBeforeSettlement,
+            DeniedSettlementRaceOrder::SettlementBeforeProducer,
+        ] {
+            for producer in [
+                DeniedSettlementTerminalProducer::Stop,
+                DeniedSettlementTerminalProducer::Failure,
+            ] {
+                let config = ResolvedConfig::default();
+                let run_control = RunControl::new();
+                let reached_boundary = Arc::new(tokio::sync::Barrier::new(2));
+                let release_boundary = Arc::new(tokio::sync::Barrier::new(2));
+                let run = run_scripted_with_control_and_tool(
+                    config,
+                    vec![scripted_write_call("denial_settlement_race")],
+                    run_control.clone(),
+                    Arc::new(DeniedSettlementRaceTool {
+                        order,
+                        reached_boundary: Arc::clone(&reached_boundary),
+                        release_boundary: Arc::clone(&release_boundary),
+                    }),
+                );
+                let classify = async {
+                    reached_boundary.wait().await;
+                    let cause = match producer {
+                        DeniedSettlementTerminalProducer::Stop => {
+                            RunCancellationCause::Interruption(
+                                crate::protocol::TurnInterruptionCause::UserStop,
+                            )
+                        }
+                        DeniedSettlementTerminalProducer::Failure => RunCancellationCause::Failure(
+                            "provider failed during denial settlement".to_string(),
+                        ),
+                    };
+                    let outcome = run_control.request_cancel(cause);
+                    match order {
+                        DeniedSettlementRaceOrder::ProducerBeforeSettlement => {
+                            assert_eq!(outcome, RunCancelOutcome::Applied)
+                        }
+                        DeniedSettlementRaceOrder::SettlementBeforeProducer => {
+                            assert!(matches!(outcome, RunCancelOutcome::Deferred(_)))
+                        }
+                    }
+                    release_boundary.wait().await;
+                };
+
+                let (run, ()) = tokio::join!(run, classify);
+                let run = run.expect("denial settlement race run");
+                let terminal_status = match run.summary.as_ref() {
+                    Ok(summary) => summary.status,
+                    Err(error) => {
+                        assert!(matches!(
+                            producer,
+                            DeniedSettlementTerminalProducer::Failure
+                        ));
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("provider failed during denial settlement")
+                        );
+                        run.store
+                            .session_repo()
+                            .get_session(run.session_id)
+                            .await
+                            .expect("durable failed session")
+                            .status
+                    }
+                };
+                assert_eq!(run.requests.len(), 1, "terminal owner must stop replay");
+                let declined_index = run
+                    .events
+                    .iter()
+                    .position(|event| matches!(event, RunEvent::ToolCallDeclined { .. }));
+                let terminal_index = run.events.iter().position(|event| match producer {
+                    DeniedSettlementTerminalProducer::Stop => {
+                        matches!(event, RunEvent::SessionInterrupted { .. })
+                    }
+                    DeniedSettlementTerminalProducer::Failure => {
+                        matches!(event, RunEvent::SessionFailed { .. })
+                    }
+                });
+                let terminal_index = terminal_index.expect("typed session terminal event");
+
+                match (order, producer) {
+                    (
+                        DeniedSettlementRaceOrder::ProducerBeforeSettlement,
+                        DeniedSettlementTerminalProducer::Stop,
+                    ) => {
+                        assert_eq!(terminal_status, SessionStatus::Cancelled);
+                        assert!(declined_index.is_none());
+                        assert!(
+                            run.events
+                                .iter()
+                                .any(|event| matches!(event, RunEvent::ToolCallCancelled { .. }))
+                        );
+                    }
+                    (
+                        DeniedSettlementRaceOrder::ProducerBeforeSettlement,
+                        DeniedSettlementTerminalProducer::Failure,
+                    ) => {
+                        assert_eq!(terminal_status, SessionStatus::Failed);
+                        assert!(declined_index.is_none());
+                        assert!(
+                            run.events
+                                .iter()
+                                .any(|event| matches!(event, RunEvent::ToolCallFailed { .. }))
+                        );
+                    }
+                    (DeniedSettlementRaceOrder::SettlementBeforeProducer, _) => {
+                        let declined_index = declined_index.expect("durable denied settlement");
+                        assert!(declined_index < terminal_index);
+                        assert_eq!(
+                            terminal_status,
+                            match producer {
+                                DeniedSettlementTerminalProducer::Stop => SessionStatus::Cancelled,
+                                DeniedSettlementTerminalProducer::Failure => SessionStatus::Failed,
+                            }
+                        );
+                    }
+                }
+                assert!(
+                    !run.events
+                        .iter()
+                        .any(|event| matches!(event, RunEvent::SessionCompleted { .. }))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_awaits_bounded_cooperative_tool_cleanup_before_settlement() {
+        let config = ResolvedConfig::default();
+        let run_control = RunControl::new();
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let cleanup_completed = Arc::new(AtomicBool::new(false));
+        let run = run_scripted_with_control_and_tool(
+            config,
+            vec![scripted_write_call("cooperative_cleanup")],
+            run_control.clone(),
+            Arc::new(CooperativeCleanupTool {
+                started: Arc::clone(&started),
+                cleanup_completed: Arc::clone(&cleanup_completed),
+            }),
+        );
+        let cancel = async {
+            started.wait().await;
+            assert!(run_control.interrupt(crate::protocol::TurnInterruptionCause::UserStop));
+        };
+
+        let (run, ()) = tokio::join!(run, cancel);
+        let run = run.expect("cooperative cleanup run");
+        let summary = run.summary.expect("cancelled summary");
+        assert_eq!(summary.status, SessionStatus::Cancelled);
+        assert!(cleanup_completed.load(Ordering::SeqCst));
+        assert_eq!(run.requests.len(), 1);
+        assert!(
+            run.events
+                .iter()
+                .any(|event| matches!(event, RunEvent::ToolCallCancelled { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn non_cooperative_tool_cleanup_obeys_the_injected_deadline() {
+        let started_at = Instant::now();
+        let result = await_tool_cancellation_cleanup(
+            std::future::pending::<()>(),
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn permission_abort_origin_is_declined_while_same_root_observer_is_cancelled() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::FullAccess;
+        let run_control = RunControl::new();
+        let start_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let origin = run_scripted_with_control_and_tool(
+            config.clone(),
+            vec![scripted_write_call("abort_origin")],
+            run_control.clone(),
+            Arc::new(TerminalRaceTool {
+                behavior: TerminalRaceToolBehavior::PermissionAbortOrigin,
+                start_barrier: Some(Arc::clone(&start_barrier)),
+            }),
+        );
+        let observer = run_scripted_with_control_and_tool(
+            config,
+            vec![scripted_write_call("abort_observer")],
+            run_control,
+            Arc::new(TerminalRaceTool {
+                behavior: TerminalRaceToolBehavior::ApprovalAbortObserver,
+                start_barrier: Some(start_barrier),
+            }),
+        );
+        let (origin, observer) = tokio::join!(origin, observer);
+        let origin = origin.expect("origin run setup");
+        let observer = observer.expect("observer run setup");
+
+        assert_eq!(
+            origin.summary.expect("origin summary").status,
+            SessionStatus::Cancelled
+        );
+        assert_eq!(
+            observer.summary.expect("observer summary").status,
+            SessionStatus::Cancelled
+        );
+        assert!(
+            origin
+                .events
+                .iter()
+                .any(|event| { matches!(event, RunEvent::ToolCallDeclined { .. }) })
+        );
+        assert!(
+            !origin
+                .events
+                .iter()
+                .any(|event| { matches!(event, RunEvent::ToolCallCancelled { .. }) })
+        );
+        assert!(
+            observer
+                .events
+                .iter()
+                .any(|event| { matches!(event, RunEvent::ToolCallCancelled { .. }) })
+        );
+        assert!(
+            !observer
+                .events
+                .iter()
+                .any(|event| { matches!(event, RunEvent::ToolCallDeclined { .. }) })
+        );
+
+        let origin_transcript = origin
+            .store
+            .session_repo()
+            .compatibility_transcript(origin.session_id)
+            .await
+            .expect("origin transcript");
+        let observer_transcript = observer
+            .store
+            .session_repo()
+            .compatibility_transcript(observer.session_id)
+            .await
+            .expect("observer transcript");
+        assert!(origin_transcript.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    &part.payload,
+                    MessagePart::ToolResult(result)
+                        if result.status == crate::session::ToolCallStatus::Declined
+                )
+            })
+        }));
+        assert!(observer_transcript.messages.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    &part.payload,
+                    MessagePart::ToolResult(result)
+                        if result.status == crate::session::ToolCallStatus::Cancelled
+                )
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn late_ok_tool_result_uses_typed_terminal_and_preserves_change_evidence() {
+        for (behavior, expected_status, expected_file) in [
+            (
+                TerminalRaceToolBehavior::LateInterruptedResult,
+                crate::session::ToolCallStatus::Cancelled,
+                "late-interrupted.txt",
+            ),
+            (
+                TerminalRaceToolBehavior::LateFailedResult,
+                crate::session::ToolCallStatus::Failed,
+                "late-failed.txt",
+            ),
+        ] {
+            let mut config = ResolvedConfig::default();
+            config.permissions.access_mode = AccessMode::FullAccess;
+            let run = run_scripted_with_control_and_tool(
+                config,
+                vec![scripted_write_call("late_result")],
+                RunControl::new(),
+                Arc::new(TerminalRaceTool {
+                    behavior,
+                    start_barrier: None,
+                }),
+            )
+            .await
+            .expect("late result run setup");
+
+            match behavior {
+                TerminalRaceToolBehavior::LateInterruptedResult => {
+                    assert_eq!(
+                        run.summary.as_ref().expect("interrupted summary").status,
+                        SessionStatus::Cancelled
+                    );
+                    assert!(
+                        run.events
+                            .iter()
+                            .any(|event| { matches!(event, RunEvent::ToolCallCancelled { .. }) })
+                    );
+                }
+                TerminalRaceToolBehavior::LateFailedResult => {
+                    let summary = run.summary.as_ref().expect("typed failure summary");
+                    assert_eq!(summary.status, SessionStatus::Failed);
+                    assert_eq!(summary.finish_reason, Some(FinishReason::Error));
+                    assert_eq!(summary.interruption_cause, None);
+                    assert!(
+                        run.events
+                            .iter()
+                            .any(|event| { matches!(event, RunEvent::ToolCallFailed { .. }) })
+                    );
+                    assert!(
+                        run.events
+                            .iter()
+                            .any(|event| matches!(event, RunEvent::SessionFailed { .. }))
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !run.events
+                    .iter()
+                    .any(|event| { matches!(event, RunEvent::ToolCallCompleted { .. }) })
+            );
+            let recorded_change_id = run
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    RunEvent::FileChangesRecorded { changes, .. } => {
+                        changes.first().map(|change| change.change_id)
+                    }
+                    _ => None,
+                })
+                .expect("file change event");
+            assert!(run.root.join(expected_file).exists());
+
+            let transcript = run
+                .store
+                .session_repo()
+                .compatibility_transcript(run.session_id)
+                .await
+                .expect("late result transcript");
+            assert!(transcript.messages.iter().any(|message| {
+                message.parts.iter().any(|part| {
+                    matches!(
+                        &part.payload,
+                        MessagePart::ToolResult(result) if result.status == expected_status
+                    )
+                })
+            }));
+            assert!(transcript.messages.iter().any(|message| {
+                message.parts.iter().any(|part| {
+                    matches!(
+                        &part.payload,
+                        MessagePart::DiffSummary(summary)
+                            if summary.change_ids.as_slice() == [recorded_change_id]
+                    )
+                })
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_review_routes_detected_risk_through_independent_model_request() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        let run = run_scripted(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "protected_write".to_string(),
+                            tool_name: "write".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "protected_write".to_string(),
+                            delta: r#"{"path":"AGENTS.md","content":"temporary test instruction\n"}"#
+                                .to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        r#"{"risk_level":"medium","user_authorization":"high","outcome":"allow","rationale":"The requested scoped workspace write is relevant."}"#
+                            .to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("run");
+        let summary = run.summary.expect("summary");
+
+        assert_eq!(summary.status, SessionStatus::Completed);
+        assert_eq!(summary.tool_call_count, 1);
+        assert_eq!(summary.failed_tool_count, 0);
+        assert_eq!(summary.metrics.model_request_count, 3);
+        assert_eq!(run.requests.len(), 3);
+        assert!(!run.requests[0].tools.is_empty());
+        assert!(run.requests[1].tools.is_empty());
+        assert!(
+            run.requests[1]
+                .system_prompt
+                .contains("independent permission reviewer")
+        );
+        let ModelMessage::User { content } = &run.requests[1].messages[0] else {
+            panic!("expected reviewer context message");
+        };
+        assert!(content.contains("write hello.txt"));
+        assert!(content.contains("protected_workspace_authority"));
+        assert!(!run.requests[2].tools.is_empty());
+        assert!(run.confirmations.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(run.root.join("AGENTS.md"))
+                .expect("reviewed write")
+                .replace("\r\n", "\n"),
+            "temporary test instruction\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_review_denial_falls_back_to_human_confirmation_with_reason() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        let run = run_scripted(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "protected_write".to_string(),
+                            tool_name: "write".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "protected_write".to_string(),
+                            delta: r#"{"path":"AGENTS.md","content":"human-approved\n"}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        r#"{"risk_level":"high","user_authorization":"low","outcome":"deny","rationale":"The authority-file change needs explicit confirmation."}"#
+                            .to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("run");
+
+        assert_eq!(
+            run.summary.expect("summary").status,
+            SessionStatus::Completed
+        );
+        assert_eq!(run.confirmations.len(), 1);
+        assert!(run.confirmations[0].details.iter().any(|detail| {
+            detail.contains("AI reviewer denied this request (risk: high)")
+                && detail.contains("authority-file change")
+        }));
+        assert_eq!(
+            std::fs::read_to_string(run.root.join("AGENTS.md"))
+                .expect("human-approved write")
+                .replace("\r\n", "\n"),
+            "human-approved\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn unclassified_provider_cancel_terminalizes_as_failure() {
         let config = ResolvedConfig::default();
         let run = run_scripted(
             config,
@@ -2087,7 +4077,9 @@ mod tests {
         )
         .await
         .expect("run");
-        let summary = run.summary.expect("summary");
+        let error = run
+            .summary
+            .expect_err("an unclassified provider cancellation must not impersonate user stop");
         let session = run
             .store
             .session_repo()
@@ -2095,13 +4087,108 @@ mod tests {
             .await
             .expect("session");
 
-        assert_eq!(summary.status, SessionStatus::Cancelled);
-        assert_eq!(session.status, SessionStatus::Cancelled);
+        assert!(error.to_string().contains("without a classified cause"));
+        assert_eq!(session.status, SessionStatus::Failed);
         assert!(
             run.events
                 .iter()
+                .any(|event| matches!(event, RunEvent::SessionFailed { .. }))
+        );
+        assert!(
+            !run.events
+                .iter()
                 .any(|event| matches!(event, RunEvent::SessionInterrupted { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn provider_error_and_length_finish_reasons_fail_even_with_text() {
+        for finish_reason in [FinishReason::Error, FinishReason::Length] {
+            let run = run_scripted(
+                ResolvedConfig::default(),
+                vec![ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("partial provider output".to_string())],
+                    finish_reason,
+                }],
+            )
+            .await
+            .expect("run fixture");
+            let error = run
+                .summary
+                .expect_err("non-success finish reason must fail the turn");
+            assert!(matches!(
+                (finish_reason, &error),
+                (FinishReason::Error, AgentError::ProviderFinishError)
+                    | (FinishReason::Length, AgentError::ProviderOutputLimit)
+            ));
+            assert!(matches!(
+                run.run_control.cause(),
+                Some(RunCancellationCause::Failure(message))
+                    if message == error.to_string()
+            ));
+            assert_eq!(
+                run.store
+                    .session_repo()
+                    .get_session(run.session_id)
+                    .await
+                    .expect("session")
+                    .status,
+                SessionStatus::Failed
+            );
+            assert!(
+                run.events
+                    .iter()
+                    .any(|event| matches!(event, RunEvent::SessionFailed { .. }))
+            );
+            assert!(
+                !run.events
+                    .iter()
+                    .any(|event| matches!(event, RunEvent::SessionCompleted { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_finish_reason_and_tool_payload_must_agree() {
+        let cases = [
+            ScriptedResponse {
+                events: vec![LlmEvent::TextDelta("text without a tool call".to_string())],
+                finish_reason: FinishReason::ToolCall,
+            },
+            ScriptedResponse {
+                events: vec![
+                    LlmEvent::ToolCallStart {
+                        call_id: "unexpected_tool".to_string(),
+                        tool_name: "write".to_string(),
+                    },
+                    LlmEvent::ToolCallArgsDelta {
+                        call_id: "unexpected_tool".to_string(),
+                        delta: r#"{"path":"must-not-exist.txt","content":"no"}"#.to_string(),
+                    },
+                ],
+                finish_reason: FinishReason::Stop,
+            },
+        ];
+
+        for response in cases {
+            let run = run_scripted(ResolvedConfig::default(), vec![response])
+                .await
+                .expect("run fixture");
+            assert!(matches!(
+                run.summary,
+                Err(AgentError::ProviderFinishShape { .. })
+            ));
+            assert_eq!(
+                run.store
+                    .session_repo()
+                    .get_session(run.session_id)
+                    .await
+                    .expect("session")
+                    .status,
+                SessionStatus::Failed
+            );
+            assert!(!run.root.join("must-not-exist.txt").exists());
+        }
     }
 
     #[tokio::test]
@@ -2231,7 +4318,7 @@ mod tests {
                     call_id: "call_1".to_string(),
                     tool_name: "read".to_string(),
                 }],
-                finish_reason: FinishReason::Stop,
+                finish_reason: FinishReason::ToolCall,
             }],
         )
         .await
@@ -2282,7 +4369,7 @@ mod tests {
                     call_id: "call_1".to_string(),
                     tool_name: "read".to_string(),
                 }],
-                finish_reason: FinishReason::Stop,
+                finish_reason: FinishReason::ToolCall,
             }],
             Some(("finish the objective", ThreadGoalStatus::Active, Some(100))),
         )
@@ -2395,7 +4482,7 @@ mod tests {
                         call_id: "call_1".to_string(),
                         tool_name: "read".to_string(),
                     }],
-                    finish_reason: FinishReason::Stop,
+                    finish_reason: FinishReason::ToolCall,
                 },
                 ScriptedResponse {
                     events: vec![LlmEvent::TextDelta("wrapped up".to_string())],
@@ -2477,6 +4564,32 @@ mod tests {
     #[test]
     fn prompt_asset_stays_small() {
         assert!(include_str!("../../assets/prompts/system.md").len() < 8 * 1024);
+        assert!(DEFAULT_PROMPT_PROFILE.len() < 2 * 1024);
+        assert!(QWEN_CODER_PROMPT_PROFILE.len() < 2 * 1024);
+    }
+
+    #[test]
+    fn prompt_profile_auto_resolves_from_runtime_model_name() {
+        assert_eq!(
+            prompt_profile_overlay(PromptProfile::Auto, "qwen/qwen3.6-35b-a3b"),
+            QWEN_CODER_PROMPT_PROFILE
+        );
+        assert_eq!(
+            prompt_profile_overlay(PromptProfile::Auto, "scripted-agent-model"),
+            DEFAULT_PROMPT_PROFILE
+        );
+    }
+
+    #[test]
+    fn explicit_prompt_profile_overrides_runtime_model_family() {
+        assert_eq!(
+            prompt_profile_overlay(PromptProfile::Default, "qwen/qwen3.6-35b-a3b"),
+            DEFAULT_PROMPT_PROFILE
+        );
+        assert_eq!(
+            prompt_profile_overlay(PromptProfile::QwenCoder, "scripted-agent-model"),
+            QWEN_CODER_PROMPT_PROFILE
+        );
     }
 
     #[test]
@@ -2549,6 +4662,79 @@ mod tests {
             ModelMessage::AssistantToolCalls { .. }
         ));
         assert!(matches!(messages[2], ModelMessage::Tool { .. }));
+    }
+
+    #[test]
+    fn history_projection_omits_non_executed_tool_call_and_output_as_a_pair() {
+        for status in [
+            crate::protocol::ToolLifecycleStatus::Declined,
+            crate::protocol::ToolLifecycleStatus::Cancelled,
+        ] {
+            let call_id = ToolCallId::new();
+            let session_id = crate::session::SessionId::new();
+            let turn_id = TurnId::new();
+            let items = vec![
+                HistoryItem {
+                    id: crate::protocol::HistoryItemId::new(),
+                    session_id,
+                    turn_id,
+                    sequence_no: 0,
+                    created_at_ms: SystemClock::now_ms(),
+                    payload: HistoryItemPayload::UserTurn {
+                        message_id: Some(MessageId::new()),
+                        content: vec![ContentPart::Text {
+                            text: "previous request".to_string(),
+                        }],
+                        prompt_dispatch: None,
+                        editor_context: None,
+                        turn_context: None,
+                    },
+                },
+                HistoryItem {
+                    id: crate::protocol::HistoryItemId::new(),
+                    session_id,
+                    turn_id,
+                    sequence_no: 1,
+                    created_at_ms: SystemClock::now_ms(),
+                    payload: HistoryItemPayload::ToolCall {
+                        call_id,
+                        tool: ToolName::Write,
+                        arguments: serde_json::json!({"path":"blocked.txt","content":"no"}),
+                        model_arguments: Value::Null,
+                        effective_arguments: serde_json::json!({"path":"blocked.txt","content":"no"}),
+                        adjusted_arguments: None,
+                        permission_decision: None,
+                        sandbox_decision: None,
+                        allowed_surface: Vec::new(),
+                        retry_policy: None,
+                        terminal_guard_policy: None,
+                    },
+                },
+                HistoryItem {
+                    id: crate::protocol::HistoryItemId::new(),
+                    session_id,
+                    turn_id,
+                    sequence_no: 2,
+                    created_at_ms: SystemClock::now_ms(),
+                    payload: HistoryItemPayload::ToolOutput {
+                        call_id,
+                        status,
+                        title: "not executed".to_string(),
+                        output_text: "approval was not granted".to_string(),
+                        metadata: Value::Null,
+                        success: None,
+                        progress_effect: ToolProgressEffect::Unknown,
+                        blocked_action: None,
+                        result_hash: None,
+                        verification_run: None,
+                    },
+                },
+            ];
+
+            let messages = messages_from_history(&items);
+            assert_eq!(messages.len(), 1, "status={status:?}");
+            assert!(matches!(messages[0], ModelMessage::User { .. }));
+        }
     }
 
     #[test]
@@ -2839,10 +5025,12 @@ mod tests {
 
     struct ScriptedRun {
         summary: Result<RunSummary, AgentError>,
+        run_control: RunControl,
         store: StoreBundle,
         session_id: crate::session::SessionId,
         events: Vec<RunEvent>,
         requests: Vec<ChatRequest>,
+        confirmations: Vec<crate::tool::PermissionRequest>,
         root: Utf8PathBuf,
     }
 
@@ -2868,6 +5056,69 @@ mod tests {
         steer_rx: Option<UnboundedReceiver<ActiveSteerInput>>,
         live_config: Option<LiveConfigOverrides>,
     ) -> Result<ScriptedRun, AgentError> {
+        run_scripted_with_options_and_decision(
+            config,
+            responses,
+            goal,
+            steer_rx,
+            live_config,
+            crate::cli::ReviewDecision::Approved,
+        )
+        .await
+    }
+
+    async fn run_scripted_with_options_and_decision(
+        config: ResolvedConfig,
+        responses: Vec<ScriptedResponse>,
+        goal: Option<(&str, ThreadGoalStatus, Option<i64>)>,
+        steer_rx: Option<UnboundedReceiver<ActiveSteerInput>>,
+        live_config: Option<LiveConfigOverrides>,
+        review_decision: crate::cli::ReviewDecision,
+    ) -> Result<ScriptedRun, AgentError> {
+        run_scripted_internal(
+            config,
+            responses,
+            goal,
+            steer_rx,
+            live_config,
+            review_decision,
+            RunControl::new(),
+            None,
+        )
+        .await
+    }
+
+    async fn run_scripted_with_control_and_tool(
+        config: ResolvedConfig,
+        responses: Vec<ScriptedResponse>,
+        run_control: RunControl,
+        replacement_tool: Arc<dyn crate::tool::registry::Tool>,
+    ) -> Result<ScriptedRun, AgentError> {
+        run_scripted_internal(
+            config,
+            responses,
+            None,
+            None,
+            None,
+            crate::cli::ReviewDecision::Approved,
+            run_control,
+            Some(replacement_tool),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_scripted_internal(
+        config: ResolvedConfig,
+        responses: Vec<ScriptedResponse>,
+        goal: Option<(&str, ThreadGoalStatus, Option<i64>)>,
+        steer_rx: Option<UnboundedReceiver<ActiveSteerInput>>,
+        live_config: Option<LiveConfigOverrides>,
+        review_decision: crate::cli::ReviewDecision,
+        run_control: RunControl,
+        replacement_tool: Option<Arc<dyn crate::tool::registry::Tool>>,
+    ) -> Result<ScriptedRun, AgentError> {
+        let run_control_observer = run_control.clone();
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.keep()).expect("utf8 temp");
         let storage_paths = StoragePaths {
@@ -2960,7 +5211,10 @@ mod tests {
             (None, None)
         };
         let tool_services = test_tool_services(&config, &store, storage_paths);
-        let registry = ToolRegistry::builtin(tool_services.clone());
+        let mut registry = ToolRegistry::builtin(tool_services.clone());
+        if let Some(tool) = replacement_tool {
+            registry.replace_tool_for_test(tool);
+        }
         let requests = Arc::new(Mutex::new(Vec::new()));
         let llm = Arc::new(ScriptedClient {
             responses: Mutex::new(responses),
@@ -2978,7 +5232,10 @@ mod tests {
             events: Vec::new(),
             sequence_no: next_protocol_sequence_no,
         };
-        let mut prompt = AllowPrompt;
+        let mut prompt = DecisionPrompt {
+            decision: review_decision,
+            ..DecisionPrompt::default()
+        };
         let summary = agent
             .run(
                 AgentRunRequest {
@@ -2990,7 +5247,7 @@ mod tests {
                     state: SessionStateSnapshot::default(),
                     config: config.clone(),
                     model: test_model(&config),
-                    cancel: CancellationToken::new(),
+                    run_control,
                     live_config,
                     steer_rx,
                     is_sub_agent: false,
@@ -3004,10 +5261,12 @@ mod tests {
 
         Ok(ScriptedRun {
             summary,
+            run_control: run_control_observer,
             store,
             session_id,
             events: sink.events,
             requests: requests.lock().expect("requests mutex").clone(),
+            confirmations: prompt.requests,
             root,
         })
     }

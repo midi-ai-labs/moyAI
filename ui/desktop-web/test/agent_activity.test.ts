@@ -224,6 +224,8 @@ test("agent pane selection is frontend-local and resets at owner or row boundari
 
 test("permission confirmation identifies the requesting Sub Agent and stays compatible when absent", () => {
   const state = {
+    confirmation_visible: true,
+    confirmation_id: "request-42",
     confirmation_text: "",
     confirmation: {
       summary: "shellを実行します",
@@ -240,6 +242,10 @@ test("permission confirmation identifies the requesting Sub Agent and stays comp
   assert.match(rendered, /&lt;Review Agent&gt;/);
   assert.match(rendered, /\/root\/review/);
   assert.doesNotMatch(rendered, /<Review Agent>/);
+  assert.match(rendered, /data-action="abort-permission"[^>]+autofocus>実行せず、指示を変更する/);
+  assert.match(rendered, /data-action="approve-permission"[^>]*>実行する/);
+  assert.match(rendered, /現在のタスクを停止し、次の指示を待ちます/);
+  assert.match(rendered, /data-permission-id="request-42"/);
 
   state.confirmation = {
     summary: "従来の確認",
@@ -249,6 +255,66 @@ test("permission confirmation identifies the requesting Sub Agent and stays comp
     risks: [],
   };
   assert.doesNotMatch(renderConfirmation(state), /要求元/);
+});
+
+test("permission rendering is declarative, request-owned, and gives each new request a safe focus target", () => {
+  const state = {
+    confirmation_visible: true,
+    confirmation_id: "B",
+    confirmation_text: "確認",
+    confirmation: {
+      summary: "shellを実行します",
+      details: ["npm test"],
+      targets: ["workspace"],
+      outside_workspace: false,
+      risks: [],
+    },
+  } as DesktopWebState;
+
+  const submitting = renderConfirmation(state, {
+    phase: "submitting",
+    requestId: "B",
+    submissionId: 7,
+    decision: "abort",
+  });
+  assert.match(submitting, /data-permission-id="B"[^>]+aria-busy="true"/);
+  assert.equal(submitting.match(/data-permission-action[^>]+disabled/g)?.length, 2);
+  assert.match(submitting, /現在のタスクを停止しています/);
+  assert.match(submitting, /停止しています…/);
+  assert.doesNotMatch(submitting, /data-permission-action[^>]+autofocus/);
+
+  const failed = renderConfirmation(state, {
+    phase: "failed",
+    requestId: "B",
+    error: "再試行 <B>",
+  });
+  assert.match(failed, /再試行 &lt;B&gt;/);
+  assert.match(failed, /data-focus-key="permission:B:abort" autofocus/);
+  assert.doesNotMatch(failed, /aria-busy="true"/);
+
+  const newRequest = renderConfirmation(state, {
+    phase: "failed",
+    requestId: "A",
+    error: "stale A error",
+  });
+  assert.doesNotMatch(newRequest, /stale A error/);
+  assert.match(newRequest, /data-focus-key="permission:B:abort" autofocus/);
+  assert.match(newRequest, /現在のタスクを停止し、次の指示を待ちます/);
+});
+
+test("permission actions send typed approve and abort decisions", async () => {
+  const state = { confirmation_visible: true } as DesktopWebState;
+  const decisions: string[] = [];
+  const context = {
+    submitPermissionDecision: async (decision: string) => {
+      decisions.push(decision);
+    },
+  } as unknown as ActionContext;
+
+  await actionById("approve-permission")?.run(state, context, { index: -1, value: "" });
+  await actionById("abort-permission")?.run(state, context, { index: -1, value: "" });
+
+  assert.deepEqual(decisions, ["approved", "abort"]);
 });
 
 test("run cancellation remains available while only the child agent tree is active", () => {

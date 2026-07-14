@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentLoop, AgentRunRequest, RuntimeInputView};
+use crate::app::agent_runtime::{AgentRuntimeContinuationOutcome, AgentRuntimeExecution};
 use crate::app::session_title::{derive_session_title, is_placeholder_session_title};
 use crate::app::{
     AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest, SessionCompactRequest,
@@ -25,7 +26,7 @@ use crate::app::{
 use crate::cli::{ConfirmationPrompt, EventRenderer};
 use crate::config::model::PartialResolvedConfig;
 use crate::config::{ModelConfig, ResolvedConfig, merge::apply_patch as apply_config_patch};
-use crate::error::{AppRunError, RuntimeError};
+use crate::error::{AgentError, AppRunError, RuntimeError};
 use crate::harness::{HarnessRecordingSink, NativeHarnessRecorder};
 use crate::llm::{
     ConfigModelCatalog, ModelAvailabilityReport, ModelCatalog,
@@ -37,7 +38,9 @@ use crate::protocol::{
     ProtocolEventStore, ProtocolRecordingSink, SandboxProfile, SteerTurn, ThreadOp, ToolChoice,
     TurnContext, UserInputItem, UserTurn,
 };
-use crate::runtime::{RunEventSink, SessionRuntimeEventHub};
+use crate::runtime::{
+    RunCancellationCause, RunContinuationOutcome, RunControl, RunEventSink, SessionRuntimeEventHub,
+};
 use crate::session::{
     DispatchTransformKind, ImagePart, PromptDispatchPart, RunSummary, SessionModelParameters,
     SessionRecord, SessionRepository, SessionSelector, SessionSettingsPatch, SessionStartRequest,
@@ -184,8 +187,13 @@ impl RunService {
             .map_err(AppRunError::Message)
     }
 
-    pub fn cancel_agent_tree(&self, session_id: crate::session::SessionId) -> bool {
-        self.agent_runtime.cancel_tree_for_session(session_id)
+    pub fn cancel_agent_tree(
+        &self,
+        session_id: crate::session::SessionId,
+        root_cause: crate::protocol::TurnInterruptionCause,
+    ) -> bool {
+        self.agent_runtime
+            .cancel_tree_for_session(session_id, root_cause)
     }
 
     pub async fn wait_for_agent_tree_quiescence(
@@ -294,21 +302,57 @@ impl RunService {
         let allow_idle_goal_continuation =
             allows_goal_idle_continuation_after_run(&request.prompt)?;
         let mut summary = self
-            .execute_single_run(request.clone(), renderer, prompt)
+            .execute_single_run(request.clone(), renderer, prompt, None)
             .await?;
         if !allow_idle_goal_continuation {
             return Ok(summary);
         }
 
-        for _ in 0..MAX_GOAL_IDLE_CONTINUATIONS_PER_RUN {
-            self.wait_for_agent_tree_quiescence(summary.session_id)
-                .await?;
-            if !self
-                .should_start_idle_goal_continuation(summary.session_id, &request.cancel)
-                .await?
-            {
-                break;
-            }
+        'continuations: for _ in 0..MAX_GOAL_IDLE_CONTINUATIONS_PER_RUN {
+            let preclaimed_root_execution = loop {
+                self.wait_for_agent_tree_quiescence(summary.session_id)
+                    .await?;
+                let cancel = request.run_control.token();
+                if !self
+                    .should_start_idle_goal_continuation(summary.session_id, &cancel)
+                    .await?
+                {
+                    break 'continuations;
+                }
+                match self
+                    .agent_runtime
+                    .begin_root_continuation(
+                        summary.session_id,
+                        request.run_control.clone(),
+                        request.agent_confirmation.clone(),
+                    )
+                    .map_err(AppRunError::Message)?
+                {
+                    AgentRuntimeContinuationOutcome::Unmanaged => {
+                        match request.run_control.begin_next_turn_after_success() {
+                            RunContinuationOutcome::Admitted => break None,
+                            RunContinuationOutcome::Blocked => break 'continuations,
+                            RunContinuationOutcome::Invalid => {
+                                return Err(AppRunError::Message(format!(
+                                    "session {} admitted an idle goal continuation without a sealed successful prior turn",
+                                    summary.session_id
+                                )));
+                            }
+                        }
+                    }
+                    AgentRuntimeContinuationOutcome::Admitted(execution) => {
+                        break Some(execution);
+                    }
+                    AgentRuntimeContinuationOutcome::Blocked => break 'continuations,
+                    AgentRuntimeContinuationOutcome::NotReady => continue,
+                    AgentRuntimeContinuationOutcome::Invalid => {
+                        return Err(AppRunError::Message(format!(
+                            "session {} admitted an idle goal continuation without the retained root run owner",
+                            summary.session_id
+                        )));
+                    }
+                }
+            };
             let continuation_request = RunRequest {
                 prompt: String::new(),
                 session_id: Some(summary.session_id),
@@ -324,13 +368,18 @@ impl RunService {
                 editor_context: None,
                 review_request: None,
                 image_paths: Vec::new(),
-                cancel: request.cancel.clone(),
+                run_control: request.run_control.clone(),
                 live_config: request.live_config.clone(),
                 agent_confirmation: request.agent_confirmation.clone(),
                 agent_context: request.agent_context.clone(),
             };
             summary = self
-                .execute_single_run(continuation_request, renderer, prompt)
+                .execute_single_run(
+                    continuation_request,
+                    renderer,
+                    prompt,
+                    preclaimed_root_execution,
+                )
                 .await?;
         }
 
@@ -339,9 +388,31 @@ impl RunService {
 
     async fn execute_single_run(
         &self,
+        request: RunRequest,
+        renderer: &mut dyn EventRenderer,
+        prompt: &mut dyn ConfirmationPrompt,
+        mut root_agent_execution: Option<AgentRuntimeExecution>,
+    ) -> Result<RunSummary, AppRunError> {
+        let run_control = request.run_control.clone();
+        let result = self
+            .execute_single_run_inner(request, renderer, prompt, &mut root_agent_execution)
+            .await;
+        if let Err(error) = &result {
+            classify_run_error(&run_control, error);
+        }
+        if let Some(execution) = root_agent_execution.take() {
+            self.agent_runtime
+                .complete_root(execution, &result, run_control.cause());
+        }
+        result
+    }
+
+    async fn execute_single_run_inner(
+        &self,
         mut request: RunRequest,
         renderer: &mut dyn EventRenderer,
         prompt: &mut dyn ConfirmationPrompt,
+        root_agent_execution: &mut Option<AgentRuntimeExecution>,
     ) -> Result<RunSummary, AppRunError> {
         let slash_goal_command = parse_goal_slash_command(&request.prompt)?;
         let selector = match (request.session_id, request.continue_last) {
@@ -422,10 +493,11 @@ impl RunService {
                 )
                 .await;
         }
+        let provider_cancel = request.run_control.token();
         self.hydrate_configured_model_from_provider(
             &mut effective_config,
             !image_parts.is_empty(),
-            &request.cancel,
+            &provider_cancel,
         )
         .await?;
         let model = ConfigModelCatalog::new(effective_config.clone()).resolve(None)?;
@@ -472,7 +544,17 @@ impl RunService {
             }
         }
         let supplied_agent_context = request.agent_context.clone();
-        if let Some(context) = supplied_agent_context.as_ref() {
+        let preclaimed_agent_context = root_agent_execution
+            .as_ref()
+            .map(|execution| execution.context.clone());
+        if supplied_agent_context.is_some() && preclaimed_agent_context.is_some() {
+            return Err(AppRunError::Message(
+                "a run cannot combine a supplied agent context with a preclaimed root continuation"
+                    .to_string(),
+            ));
+        }
+        let provided_agent_context = supplied_agent_context.or(preclaimed_agent_context);
+        if let Some(context) = provided_agent_context.as_ref() {
             if context.session_id() != session_context.session.id {
                 return Err(AppRunError::Message(format!(
                     "agent context session {} does not match requested session {}",
@@ -482,7 +564,7 @@ impl RunService {
             }
         }
         let root_confirmation =
-            if supplied_agent_context.is_none() && effective_config.multi_agent.enabled {
+            if provided_agent_context.is_none() && effective_config.multi_agent.enabled {
                 Some(request.agent_confirmation.clone().ok_or_else(|| {
                     AppRunError::Message(
                         "multi-agent execution requires a shared permission confirmation channel"
@@ -514,8 +596,7 @@ impl RunService {
         };
         let session_id = session_context.session.id;
         let protocol_turn_id = crate::protocol::TurnId::new();
-        let mut root_agent_execution = None;
-        let agent_context = if let Some(context) = supplied_agent_context {
+        let agent_context = if let Some(context) = provided_agent_context {
             Some(context)
         } else if let Some(confirmation) = root_confirmation {
             let execution = match self.agent_runtime.begin_root(
@@ -523,7 +604,7 @@ impl RunService {
                 effective_config.clone(),
                 confirmation,
                 request.live_config.clone(),
-                request.cancel.clone(),
+                request.run_control.clone(),
             ) {
                 Ok(execution) => execution,
                 Err(error) => {
@@ -532,7 +613,7 @@ impl RunService {
                         session_id,
                         &admission_id,
                         protocol_turn_id,
-                        request.cancel.is_cancelled(),
+                        &request.run_control,
                         Err(AppRunError::Message(error)),
                         Ok(()),
                     )
@@ -541,9 +622,8 @@ impl RunService {
                     return result;
                 }
             };
-            request.cancel = execution.cancel_token();
             let context = execution.context.clone();
-            root_agent_execution = Some(execution);
+            *root_agent_execution = Some(execution);
             Some(context)
         } else {
             None
@@ -551,23 +631,18 @@ impl RunService {
         let heartbeat_stop = CancellationToken::new();
         let heartbeat_repo = self.store.session_repo();
         let heartbeat_admission_id = admission_id.clone();
-        let heartbeat_run_cancel = request.cancel.clone();
+        let heartbeat_run_control = request.run_control.clone();
         let heartbeat_agent_context = agent_context.clone();
-        let heartbeat_failure_cancel = agent_context
-            .as_ref()
-            .map(crate::app::AgentRunContext::tree_cancel_token)
-            .unwrap_or_else(|| request.cancel.clone());
         let heartbeat_task = spawn_run_admission_heartbeat(
             session_id,
             admission_id.clone(),
-            request.cancel.clone(),
-            heartbeat_failure_cancel,
+            request.run_control.clone(),
             heartbeat_stop.clone(),
             Duration::from_millis(RUN_ADMISSION_HEARTBEAT_INTERVAL_MS),
             move || {
                 let repo = heartbeat_repo.clone();
                 let admission_id = heartbeat_admission_id.clone();
-                let run_cancel = heartbeat_run_cancel.clone();
+                let run_control = heartbeat_run_control.clone();
                 let agent_context = heartbeat_agent_context.clone();
                 async move {
                     renew_admitted_run_lease_with_terminal_cancel(
@@ -575,7 +650,7 @@ impl RunService {
                         session_id,
                         admission_id,
                         protocol_turn_id,
-                        run_cancel,
+                        run_control,
                         agent_context,
                     )
                     .await
@@ -586,7 +661,7 @@ impl RunService {
             let mut active_run = self
                 .store
                 .active_runs()
-                .try_start(session_id, request.cancel.clone())?;
+                .try_start(session_id, request.run_control.clone())?;
             if let Some(GoalSlashCommand::SetObjective(objective)) = slash_goal_command {
                 self.set_goal_from_slash(session_id, &objective, renderer)
                     .await?;
@@ -701,7 +776,7 @@ impl RunService {
                         state,
                         config: effective_config.clone(),
                         model,
-                        cancel: request.cancel.clone(),
+                        run_control: request.run_control.clone(),
                         live_config: request.live_config.clone(),
                         steer_rx: active_run.take_steer_receiver(),
                         is_sub_agent: agent_context
@@ -731,7 +806,9 @@ impl RunService {
         let heartbeat_result = match heartbeat_task.await {
             Ok(result) => result,
             Err(error) => {
-                request.cancel.cancel();
+                request
+                    .run_control
+                    .fail(format!("run admission heartbeat task failed: {error}"));
                 Err(crate::error::StorageError::Message(format!(
                     "run admission heartbeat task failed: {error}"
                 )))
@@ -742,15 +819,11 @@ impl RunService {
             session_id,
             &admission_id,
             protocol_turn_id,
-            request.cancel.is_cancelled(),
+            &request.run_control,
             admitted_result,
             heartbeat_result,
         )
         .await;
-        if let Some(execution) = root_agent_execution.take() {
-            self.agent_runtime
-                .complete_root(execution, &result, request.cancel.is_cancelled());
-        }
         drop(process_run_lease);
         result
     }
@@ -911,6 +984,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -933,6 +1007,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -960,6 +1035,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -982,6 +1058,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1004,6 +1081,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Cancelled,
             finish_reason: Some(crate::session::FinishReason::Cancelled),
+            interruption_cause: Some(crate::protocol::TurnInterruptionCause::UserStop),
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1026,6 +1104,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1048,6 +1127,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1077,6 +1157,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1149,6 +1230,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1181,6 +1263,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1207,6 +1290,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1242,6 +1326,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1264,6 +1349,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1296,6 +1382,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1318,6 +1405,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1340,6 +1428,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1362,6 +1451,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1390,6 +1480,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1418,6 +1509,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Running,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1449,6 +1541,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1481,6 +1574,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1563,6 +1657,7 @@ impl RunService {
             assistant_message_id: None,
             status: SessionStatus::Running,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -1576,26 +1671,36 @@ async fn renew_admitted_run_lease_with_terminal_cancel(
     session_id: crate::session::SessionId,
     admission_id: String,
     turn_id: crate::protocol::TurnId,
-    run_cancel: CancellationToken,
+    run_control: RunControl,
     agent_context: Option<crate::app::AgentRunContext>,
 ) -> Result<RunAdmissionLeaseRenewalOutcome, crate::error::StorageError> {
     let outcome = repo
         .renew_admitted_run_lease(session_id, &admission_id, turn_id)
         .await?;
+    if outcome == RunAdmissionLeaseRenewalOutcome::SupersededOrExpired {
+        run_control.supersede();
+        return Ok(outcome);
+    }
     if outcome != RunAdmissionLeaseRenewalOutcome::GracefulTerminal {
         return Ok(outcome);
     }
 
-    let status = repo.get_session(session_id).await?.status;
-    let completed_by_this_turn = status == SessionStatus::Completed
-        && repo
-            .corroborated_terminal_status_for_turn(session_id, turn_id)
-            .await?
-            == Some(SessionStatus::Completed);
-    if !completed_by_this_turn {
-        run_cancel.cancel();
-        if let Some(agent_context) = agent_context {
-            let _ = agent_context.cancel_for_durable_terminal();
+    match repo
+        .corroborated_terminal_for_turn(session_id, turn_id)
+        .await?
+    {
+        Some((SessionStatus::Completed | SessionStatus::AwaitingUser, _)) => {}
+        Some((SessionStatus::Cancelled | SessionStatus::Failed, _))
+        | Some((SessionStatus::Running | SessionStatus::Idle, _))
+        | None => {
+            // A terminal session without a corroborating event for this turn belongs to another
+            // durable observer, as do terminal statuses other than this turn's own successful
+            // commit. The existing durable event remains authoritative; the local worker must not
+            // manufacture a second interruption/failure classification.
+            run_control.supersede();
+            if let Some(agent_context) = agent_context {
+                let _ = agent_context.cancel_for_durable_terminal();
+            }
         }
     }
     Ok(outcome)
@@ -1604,8 +1709,7 @@ async fn renew_admitted_run_lease_with_terminal_cancel(
 fn spawn_run_admission_heartbeat<Renew, RenewFuture>(
     session_id: crate::session::SessionId,
     admission_id: String,
-    run_cancel: CancellationToken,
-    failure_cancel: CancellationToken,
+    run_control: RunControl,
     heartbeat_stop: CancellationToken,
     heartbeat_interval: Duration,
     renew: Renew,
@@ -1620,8 +1724,7 @@ where
     // remain blocked for an arbitrary confirmation interval without forfeiting run ownership.
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let thread_admission_id = admission_id.clone();
-    let cancel_on_thread_failure = run_cancel.clone();
-    let tree_cancel_on_thread_failure = failure_cancel.clone();
+    let control_on_thread_failure = run_control.clone();
     let thread_spawn = std::thread::Builder::new()
         .name("moyai-run-admission-heartbeat".to_string())
         .spawn(move || {
@@ -1655,32 +1758,37 @@ where
                     "failed to build run admission heartbeat runtime for session {session_id} admission {thread_admission_id}: {error}"
                 ))),
             };
-            if result.is_err() {
-                cancel_on_thread_failure.cancel();
-                tree_cancel_on_thread_failure.cancel();
+            if let Err(error) = &result {
+                record_heartbeat_failure(&control_on_thread_failure, error.to_string());
             }
             let _ = result_tx.send(result);
         });
 
     let thread_spawn_error = thread_spawn.err().map(|error| {
-        run_cancel.cancel();
-        failure_cancel.cancel();
-        crate::error::StorageError::Message(format!(
+        let error = crate::error::StorageError::Message(format!(
             "failed to start run admission heartbeat thread for session {session_id} admission {admission_id}: {error}"
-        ))
+        ));
+        record_heartbeat_failure(&run_control, error.to_string());
+        error
     });
     tokio::spawn(async move {
         if let Some(error) = thread_spawn_error {
             return Err(error);
         }
         result_rx.await.map_err(|_| {
-            run_cancel.cancel();
-            failure_cancel.cancel();
-            crate::error::StorageError::Message(format!(
+            let error = crate::error::StorageError::Message(format!(
                 "run admission heartbeat thread stopped without a result for session {session_id} admission {admission_id}"
-            ))
+            ));
+            record_heartbeat_failure(&run_control, error.to_string());
+            error
         })?
     })
+}
+
+fn record_heartbeat_failure(run_control: &RunControl, message: String) {
+    // Root controls route Failure through AgentControl synchronously. Child and standalone
+    // controls intentionally keep the exact-owner first-writer behavior in RunControl.
+    run_control.fail(message);
 }
 
 async fn maintain_run_admission_lease<Renew, RenewFuture>(
@@ -1719,11 +1827,10 @@ async fn finish_admitted_run(
     session_id: crate::session::SessionId,
     admission_id: &str,
     protocol_turn_id: crate::protocol::TurnId,
-    cancellation_requested: bool,
+    run_control: &RunControl,
     admitted_result: Result<RunSummary, AppRunError>,
     heartbeat_result: Result<(), crate::error::StorageError>,
 ) -> Result<RunSummary, AppRunError> {
-    let heartbeat_failed = heartbeat_result.is_err();
     let admitted_result = match heartbeat_result {
         Ok(()) => admitted_result,
         Err(heartbeat_error) => match admitted_result {
@@ -1732,7 +1839,7 @@ async fn finish_admitted_run(
                 .corroborated_terminal_status_for_turn(session_id, protocol_turn_id)
                 .await
             {
-                Ok(Some(SessionStatus::Completed)) => {
+                Ok(Some(SessionStatus::Completed | SessionStatus::AwaitingUser)) => {
                     // The exact turn's durable session/protocol commit is authoritative. The
                     // heartbeat failure remains diagnostic and must not reverse completed work.
                     Ok(summary)
@@ -1747,21 +1854,61 @@ async fn finish_admitted_run(
             ))),
         },
     };
+    if let Err(error) = &admitted_result {
+        classify_run_error(run_control, error);
+    }
     let settled = settle_admitted_run_result(
         store,
         session_id,
         admission_id,
         protocol_turn_id,
-        cancellation_requested && !heartbeat_failed,
+        run_control.cause(),
         admitted_result,
     )
     .await;
+    if settled.as_ref().is_ok_and(|summary| {
+        matches!(
+            summary.status,
+            SessionStatus::Completed | SessionStatus::AwaitingUser
+        )
+    }) {
+        run_control.seal_success();
+    }
     let released = store
         .session_repo()
         .release_stopped_run_admission(session_id, admission_id)
         .await;
+    reconcile_admitted_run_release(settled, released, admission_id)
+}
+
+pub(crate) fn classify_run_error(run_control: &RunControl, error: &AppRunError) {
+    let cause = if matches!(error, AppRunError::Agent(AgentError::RunSuperseded { .. })) {
+        RunCancellationCause::Superseded
+    } else {
+        RunCancellationCause::Failure(error.to_string())
+    };
+    let _ = run_control.request_cancel(cause);
+}
+
+fn reconcile_admitted_run_release(
+    settled: Result<RunSummary, AppRunError>,
+    released: Result<bool, crate::error::StorageError>,
+    admission_id: &str,
+) -> Result<RunSummary, AppRunError> {
     match (settled, released) {
         (result, Ok(_)) => result,
+        (Ok(summary), Err(release_error))
+            if matches!(
+                summary.status,
+                SessionStatus::Completed | SessionStatus::AwaitingUser
+            ) =>
+        {
+            eprintln!(
+                "warning: durable run {} completed, but admission {admission_id} could not be released: {release_error}",
+                summary.session_id
+            );
+            Ok(summary)
+        }
         (Ok(_), Err(release_error)) => Err(AppRunError::Storage(release_error)),
         (Err(run_error), Err(release_error)) => Err(AppRunError::Message(format!(
             "{run_error}; additionally failed to release run admission {admission_id}: {release_error}"
@@ -1774,28 +1921,52 @@ async fn settle_admitted_run_result(
     session_id: crate::session::SessionId,
     admission_id: &str,
     protocol_turn_id: crate::protocol::TurnId,
-    cancelled: bool,
+    cancellation_cause: Option<RunCancellationCause>,
     result: Result<RunSummary, AppRunError>,
 ) -> Result<RunSummary, AppRunError> {
     let Err(error) = result else {
         return result;
     };
-    let (status, event) = if cancelled {
-        (
+    if matches!(cancellation_cause, Some(RunCancellationCause::Superseded)) {
+        if let Some(summary) = durable_run_summary_for_turn(store, session_id, protocol_turn_id)
+            .await
+            .map_err(|authority_error| {
+                AppRunError::Message(format!(
+                    "{error}; additionally failed to verify durable terminal truth after supersession: {authority_error}"
+                ))
+            })?
+        {
+            return Ok(summary);
+        }
+        return Err(AppRunError::Agent(AgentError::RunSuperseded {
+            session_id,
+            admission_id: admission_id.to_string(),
+        }));
+    }
+    let (status, event) = match cancellation_cause {
+        Some(RunCancellationCause::Interruption(cause)) => (
             SessionStatus::Cancelled,
             crate::session::RunEvent::SessionInterrupted {
                 session_id,
-                reason: "run cancelled by user".to_string(),
+                reason: cause.legacy_reason().to_string(),
+                cause: Some(cause),
             },
-        )
-    } else {
-        (
+        ),
+        Some(RunCancellationCause::Failure(message)) => (
+            SessionStatus::Failed,
+            crate::session::RunEvent::SessionFailed {
+                session_id,
+                message,
+            },
+        ),
+        Some(RunCancellationCause::Superseded) => unreachable!("handled above"),
+        None => (
             SessionStatus::Failed,
             crate::session::RunEvent::SessionFailed {
                 session_id,
                 message: error.to_string(),
             },
-        )
+        ),
     };
     let repo = store.session_repo();
     let terminalized = repo
@@ -1813,8 +1984,49 @@ async fn settle_admitted_run_result(
                 "{error}; additionally failed to settle admitted run {admission_id}: {cleanup_error}"
             ))
         })?;
-    let _ = terminalized;
+    if !terminalized
+        && let Some(summary) = durable_run_summary_for_turn(store, session_id, protocol_turn_id)
+            .await
+            .map_err(|authority_error| {
+                AppRunError::Message(format!(
+                    "{error}; additionally failed to verify durable terminal truth after losing terminalization: {authority_error}"
+                ))
+            })?
+    {
+        return Ok(summary);
+    }
     Err(error)
+}
+
+async fn durable_run_summary_for_turn(
+    store: &StoreBundle,
+    session_id: crate::session::SessionId,
+    protocol_turn_id: crate::protocol::TurnId,
+) -> Result<Option<RunSummary>, crate::error::StorageError> {
+    let Some((status, interruption_cause)) = store
+        .session_repo()
+        .corroborated_terminal_for_turn(session_id, protocol_turn_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let finish_reason = match status {
+        SessionStatus::Completed => Some(crate::session::FinishReason::Stop),
+        SessionStatus::Cancelled => Some(crate::session::FinishReason::Cancelled),
+        SessionStatus::Failed => Some(crate::session::FinishReason::Error),
+        SessionStatus::AwaitingUser | SessionStatus::Idle | SessionStatus::Running => None,
+    };
+    Ok(Some(RunSummary {
+        session_id,
+        assistant_message_id: None,
+        status,
+        finish_reason,
+        interruption_cause,
+        tool_call_count: 0,
+        failed_tool_count: 0,
+        change_count: 0,
+        metrics: Default::default(),
+    }))
 }
 
 async fn account_goal_before_external_mutation(
@@ -2526,11 +2738,29 @@ mod tests {
             assistant_message_id: None,
             status: crate::session::SessionStatus::Completed,
             finish_reason: Some(crate::session::FinishReason::Stop),
+            interruption_cause: None,
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
             metrics: Default::default(),
         }
+    }
+
+    #[test]
+    fn admission_release_error_cannot_reverse_durable_success() {
+        let session_id = crate::session::SessionId::new();
+        let summary = successful_run_summary(session_id);
+        let reconciled = super::reconcile_admitted_run_release(
+            Ok(summary),
+            Err(crate::error::StorageError::Message(
+                "release write failed".to_string(),
+            )),
+            "admission",
+        )
+        .expect("durable success remains observable");
+
+        assert_eq!(reconciled.session_id, session_id);
+        assert_eq!(reconciled.status, crate::session::SessionStatus::Completed);
     }
 
     async fn commit_completed_turn(
@@ -2853,7 +3083,7 @@ mod tests {
                 session.id,
                 &admission_id,
                 crate::protocol::TurnId::new(),
-                false,
+                None,
                 Err(crate::error::AppRunError::Message(format!(
                     "{setup_stage} failed"
                 ))),
@@ -2881,6 +3111,121 @@ mod tests {
                 "{setup_stage} must release durable admission ownership"
             );
         }
+    }
+
+    #[test]
+    fn admitted_operational_error_classification_preserves_the_first_terminal_owner() {
+        let operational_error = crate::error::AppRunError::Message("provider failed".to_string());
+
+        let open = crate::runtime::RunControl::new();
+        super::classify_run_error(&open, &operational_error);
+        assert_eq!(
+            open.cause(),
+            Some(crate::runtime::RunCancellationCause::Failure(
+                "provider failed".to_string()
+            ))
+        );
+
+        let interrupted = crate::runtime::RunControl::new();
+        assert!(interrupted.interrupt(crate::protocol::TurnInterruptionCause::UserStop));
+        super::classify_run_error(&interrupted, &operational_error);
+        assert_eq!(
+            interrupted.cause(),
+            Some(crate::runtime::RunCancellationCause::Interruption(
+                crate::protocol::TurnInterruptionCause::UserStop
+            ))
+        );
+
+        let superseded = crate::runtime::RunControl::new();
+        assert!(superseded.supersede());
+        super::classify_run_error(&superseded, &operational_error);
+        assert_eq!(
+            superseded.cause(),
+            Some(crate::runtime::RunCancellationCause::Superseded)
+        );
+
+        let success = crate::runtime::RunControl::new();
+        let reservation = success.begin_success_commit().expect("success reservation");
+        super::classify_run_error(&success, &operational_error);
+        assert_eq!(success.cause(), None);
+        assert!(reservation.seal());
+        assert!(success.success_is_sealed());
+    }
+
+    #[test]
+    fn root_operational_error_closes_sibling_admission_before_durable_terminal_settlement() {
+        let root_control = crate::runtime::RunControl::new();
+        let (tree, _root_execution) = crate::runtime::AgentControl::with_root_control(
+            crate::session::SessionId::new(),
+            2,
+            root_control.clone(),
+        )
+        .expect("agent tree");
+        let (_, sibling_execution) = tree
+            .register_child(
+                &crate::runtime::AgentPath::root(),
+                "sibling",
+                crate::session::SessionId::new(),
+                None,
+            )
+            .expect("sibling");
+        let sibling_control = sibling_execution.run_control();
+        let failure = crate::runtime::RunCancellationCause::Failure(
+            "provider failed before terminal settlement".to_string(),
+        );
+
+        // `finish_admitted_run` invokes this synchronous classifier immediately before its
+        // awaited durable terminal settlement. The whole tree must already be closed on return.
+        super::classify_run_error(
+            &root_control,
+            &crate::error::AppRunError::Message(
+                "provider failed before terminal settlement".to_string(),
+            ),
+        );
+
+        assert_eq!(root_control.cause(), Some(failure.clone()));
+        assert_eq!(sibling_control.cause(), Some(failure));
+        assert!(tree.tree_is_cancelled());
+        assert!(sibling_control.begin_tool_effect_admission().is_none());
+    }
+
+    #[test]
+    fn heartbeat_failure_closes_sibling_admission_while_root_effect_is_reserved() {
+        let root_control = crate::runtime::RunControl::new();
+        let (tree, _root_execution) = crate::runtime::AgentControl::with_root_control(
+            crate::session::SessionId::new(),
+            2,
+            root_control.clone(),
+        )
+        .expect("agent tree");
+        let (_, sibling_execution) = tree
+            .register_child(
+                &crate::runtime::AgentPath::root(),
+                "sibling",
+                crate::session::SessionId::new(),
+                None,
+            )
+            .expect("sibling");
+        let sibling_control = sibling_execution.run_control();
+        let root_effect = root_control
+            .begin_tool_effect_admission()
+            .expect("root effect reservation");
+        let failure = crate::runtime::RunCancellationCause::Failure(
+            "heartbeat failed during root effect admission".to_string(),
+        );
+
+        super::record_heartbeat_failure(
+            &root_control,
+            "heartbeat failed during root effect admission".to_string(),
+        );
+
+        assert_eq!(root_control.cause(), None);
+        assert_eq!(sibling_control.cause(), Some(failure.clone()));
+        assert!(tree.tree_is_cancelled());
+        assert!(sibling_control.begin_tool_effect_admission().is_none());
+
+        assert_eq!(root_effect.admit(), Err(failure.clone()));
+        assert_eq!(root_control.cause(), Some(failure));
     }
 
     #[tokio::test]
@@ -2929,15 +3274,14 @@ mod tests {
                 .expect("activate turn")
         );
 
-        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let run_control = crate::runtime::RunControl::new();
         let heartbeat_stop = tokio_util::sync::CancellationToken::new();
         let heartbeat_repo = store.session_repo();
         let heartbeat_admission_id = admission_id.clone();
         let heartbeat_task = super::spawn_run_admission_heartbeat(
             session.id,
             admission_id,
-            run_cancel.clone(),
-            run_cancel.clone(),
+            run_control.clone(),
             heartbeat_stop.clone(),
             std::time::Duration::from_millis(5),
             move || {
@@ -2965,7 +3309,7 @@ mod tests {
         })
         .await
         .expect("background heartbeat did not extend the lease");
-        assert!(!run_cancel.is_cancelled());
+        assert!(!run_control.is_cancelled());
         heartbeat_stop.cancel();
         heartbeat_task
             .await
@@ -2977,13 +3321,12 @@ mod tests {
     async fn heartbeat_progresses_while_foreground_runtime_is_synchronously_blocked() {
         let renewal_count = Arc::new(AtomicUsize::new(0));
         let heartbeat_renewal_count = Arc::clone(&renewal_count);
-        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let run_control = crate::runtime::RunControl::new();
         let heartbeat_stop = tokio_util::sync::CancellationToken::new();
         let heartbeat_task = super::spawn_run_admission_heartbeat(
             crate::session::SessionId::new(),
             "blocked-permission-admission".to_string(),
-            run_cancel.clone(),
-            run_cancel.clone(),
+            run_control.clone(),
             heartbeat_stop.clone(),
             std::time::Duration::from_millis(5),
             move || {
@@ -3001,7 +3344,7 @@ mod tests {
             renewal_count.load(Ordering::SeqCst) > 0,
             "lease renewal must not depend on the foreground executor making progress"
         );
-        assert!(!run_cancel.is_cancelled());
+        assert!(!run_control.is_cancelled());
         heartbeat_stop.cancel();
         heartbeat_task
             .await
@@ -3023,6 +3366,7 @@ mod tests {
                     &crate::session::RunEvent::SessionInterrupted {
                         session_id,
                         reason: "external stop".to_string(),
+                        cause: Some(crate::protocol::TurnInterruptionCause::UserStop),
                     },
                     turn_id,
                     None,
@@ -3030,7 +3374,7 @@ mod tests {
                 .await
                 .expect("external interrupt")
         );
-        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let run_control = crate::runtime::RunControl::new();
 
         assert_eq!(
             super::renew_admitted_run_lease_with_terminal_cancel(
@@ -3038,14 +3382,18 @@ mod tests {
                 session_id,
                 admission_id,
                 turn_id,
-                run_cancel.clone(),
+                run_control.clone(),
                 None,
             )
             .await
             .expect("terminal renewal"),
             crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::GracefulTerminal
         );
-        assert!(run_cancel.is_cancelled());
+        assert!(run_control.is_cancelled());
+        assert_eq!(
+            run_control.cause(),
+            Some(crate::runtime::RunCancellationCause::Superseded)
+        );
     }
 
     #[tokio::test]
@@ -3056,7 +3404,7 @@ mod tests {
             commit_completed_turn(&store, session_id, &admission_id, turn_id, &assistant).await,
             crate::storage::session_repo::AdmittedTerminalCommit::Applied
         );
-        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let run_control = crate::runtime::RunControl::new();
 
         assert_eq!(
             super::renew_admitted_run_lease_with_terminal_cancel(
@@ -3064,14 +3412,14 @@ mod tests {
                 session_id,
                 admission_id,
                 turn_id,
-                run_cancel.clone(),
+                run_control.clone(),
                 None,
             )
             .await
             .expect("terminal renewal"),
             crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::GracefulTerminal
         );
-        assert!(!run_cancel.is_cancelled());
+        assert!(!run_control.is_cancelled());
     }
 
     #[tokio::test]
@@ -3084,12 +3432,11 @@ mod tests {
         let heartbeat_admission_id = admission_id.clone();
         let heartbeat_renewal_entered = Arc::clone(&renewal_entered);
         let heartbeat_allow_renewal = Arc::clone(&allow_renewal);
-        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let run_control = crate::runtime::RunControl::new();
         let heartbeat_task = super::spawn_run_admission_heartbeat(
             session_id,
             admission_id.clone(),
-            run_cancel.clone(),
-            run_cancel.clone(),
+            run_control.clone(),
             tokio_util::sync::CancellationToken::new(),
             std::time::Duration::from_millis(1),
             move || {
@@ -3144,19 +3491,22 @@ mod tests {
         );
         allow_renewal.notify_one();
         let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
-        assert!(!run_cancel.is_cancelled());
+        assert!(!run_control.is_cancelled());
         let completed = super::finish_admitted_run(
             &store,
             session_id,
             &admission_id,
             turn_id,
-            run_cancel.is_cancelled(),
+            &run_control,
             Ok(successful_run_summary(session_id)),
             heartbeat_result,
         )
         .await
         .expect("graceful heartbeat must not reverse terminal success");
         assert_eq!(completed.status, crate::session::SessionStatus::Completed);
+        assert!(run_control.success_is_sealed());
+        assert!(!run_control.interrupt(crate::protocol::TurnInterruptionCause::UserStop));
+        assert!(!run_control.is_cancelled());
     }
 
     #[tokio::test]
@@ -3167,12 +3517,11 @@ mod tests {
         let release_error = Arc::new(tokio::sync::Notify::new());
         let heartbeat_renewal_entered = Arc::clone(&renewal_entered);
         let heartbeat_release_error = Arc::clone(&release_error);
-        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let run_control = crate::runtime::RunControl::new();
         let heartbeat_task = super::spawn_run_admission_heartbeat(
             session_id,
             admission_id.clone(),
-            run_cancel.clone(),
-            run_cancel.clone(),
+            run_control.clone(),
             tokio_util::sync::CancellationToken::new(),
             std::time::Duration::from_millis(1),
             move || {
@@ -3194,9 +3543,12 @@ mod tests {
         .await
         .expect("heartbeat did not reach the error barrier");
         release_error.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(1), run_cancel.cancelled())
-            .await
-            .expect("heartbeat error did not cancel the run");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_control.token().cancelled_owned(),
+        )
+        .await
+        .expect("heartbeat error did not cancel the run");
         let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
 
         assert_eq!(
@@ -3216,7 +3568,7 @@ mod tests {
             session_id,
             &admission_id,
             turn_id,
-            run_cancel.is_cancelled(),
+            &run_control,
             Ok(successful_run_summary(session_id)),
             heartbeat_result,
         )
@@ -3233,12 +3585,11 @@ mod tests {
         let release_panic = Arc::new(tokio::sync::Notify::new());
         let heartbeat_renewal_entered = Arc::clone(&renewal_entered);
         let heartbeat_release_panic = Arc::clone(&release_panic);
-        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let run_control = crate::runtime::RunControl::new();
         let heartbeat_task = super::spawn_run_admission_heartbeat(
             session_id,
             admission_id.clone(),
-            run_cancel.clone(),
-            run_cancel.clone(),
+            run_control.clone(),
             tokio_util::sync::CancellationToken::new(),
             std::time::Duration::from_millis(1),
             move || {
@@ -3259,9 +3610,12 @@ mod tests {
             crate::storage::session_repo::AdmittedTerminalCommit::Applied
         );
         release_panic.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(1), run_cancel.cancelled())
-            .await
-            .expect("heartbeat panic did not cancel the run");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_control.token().cancelled_owned(),
+        )
+        .await
+        .expect("heartbeat panic did not cancel the run");
         let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
 
         let completed = super::finish_admitted_run(
@@ -3269,7 +3623,7 @@ mod tests {
             session_id,
             &admission_id,
             turn_id,
-            run_cancel.is_cancelled(),
+            &run_control,
             Ok(successful_run_summary(session_id)),
             heartbeat_result,
         )
@@ -3282,12 +3636,11 @@ mod tests {
     async fn heartbeat_error_finished_before_terminal_commit_settles_as_failure() {
         let (store, session_id, admission_id, turn_id, assistant) =
             heartbeat_active_turn_fixture("heartbeat storage error").await;
-        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let run_control = crate::runtime::RunControl::new();
         let heartbeat_task = super::spawn_run_admission_heartbeat(
             session_id,
             admission_id.clone(),
-            run_cancel.clone(),
-            run_cancel.clone(),
+            run_control.clone(),
             tokio_util::sync::CancellationToken::new(),
             std::time::Duration::from_millis(1),
             || {
@@ -3296,16 +3649,19 @@ mod tests {
                 )))
             },
         );
-        tokio::time::timeout(std::time::Duration::from_secs(1), run_cancel.cancelled())
-            .await
-            .expect("storage failure did not cancel the run");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_control.token().cancelled_owned(),
+        )
+        .await
+        .expect("storage failure did not cancel the run");
         let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
         let failure = super::finish_admitted_run(
             &store,
             session_id,
             &admission_id,
             turn_id,
-            run_cancel.is_cancelled(),
+            &run_control,
             Ok(successful_run_summary(session_id)),
             heartbeat_result,
         )
@@ -3317,6 +3673,11 @@ mod tests {
                 .to_string()
                 .contains("injected heartbeat storage error")
         );
+        assert!(matches!(
+            run_control.cause(),
+            Some(crate::runtime::RunCancellationCause::Failure(message))
+                if message.contains("injected heartbeat storage error")
+        ));
         assert_eq!(
             store
                 .session_repo()
@@ -3352,26 +3713,28 @@ mod tests {
     async fn heartbeat_panic_cancels_and_still_settles_and_releases() {
         let (store, session_id, admission_id, turn_id, _) =
             heartbeat_active_turn_fixture("heartbeat panic").await;
-        let run_cancel = tokio_util::sync::CancellationToken::new();
+        let run_control = crate::runtime::RunControl::new();
         let heartbeat_task = super::spawn_run_admission_heartbeat(
             session_id,
             admission_id.clone(),
-            run_cancel.clone(),
-            run_cancel.clone(),
+            run_control.clone(),
             tokio_util::sync::CancellationToken::new(),
             std::time::Duration::from_millis(1),
             panicking_heartbeat_renewal,
         );
-        tokio::time::timeout(std::time::Duration::from_secs(1), run_cancel.cancelled())
-            .await
-            .expect("heartbeat panic did not cancel the run");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_control.token().cancelled_owned(),
+        )
+        .await
+        .expect("heartbeat panic did not cancel the run");
         let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
         let failure = super::finish_admitted_run(
             &store,
             session_id,
             &admission_id,
             turn_id,
-            run_cancel.is_cancelled(),
+            &run_control,
             Ok(successful_run_summary(session_id)),
             heartbeat_result,
         )
@@ -3379,6 +3742,11 @@ mod tests {
         .expect_err("heartbeat panic must fail the run");
 
         assert!(failure.to_string().contains("injected heartbeat panic"));
+        assert!(matches!(
+            run_control.cause(),
+            Some(crate::runtime::RunCancellationCause::Failure(message))
+                if message.contains("injected heartbeat panic")
+        ));
         assert_eq!(
             store
                 .session_repo()

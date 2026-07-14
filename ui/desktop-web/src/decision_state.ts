@@ -1,8 +1,31 @@
+export type PermissionReviewDecision = "approved" | "abort";
+
+export type PermissionDecisionState =
+  | { phase: "ready"; requestId: string }
+  | {
+    phase: "submitting";
+    requestId: string;
+    submissionId: number;
+    decision: PermissionReviewDecision;
+  }
+  | { phase: "failed"; requestId: string; error: string };
+
+export interface PermissionDecisionSubmission {
+  requestId: string;
+  submissionId: number;
+  decision: PermissionReviewDecision;
+}
+
+export function permissionDecisionForEscape(
+  confirmationVisible: boolean,
+  repeat: boolean,
+): PermissionReviewDecision | null {
+  return confirmationVisible && !repeat ? "abort" : null;
+}
+
 export interface PermissionDecisionOwner {
-  permissionDecisionPending: boolean;
-  permissionDecisionAllow: boolean | null;
-  permissionDecisionConfirmationId: string | null;
-  permissionDecisionError: string;
+  permissionDecision: PermissionDecisionState | null;
+  nextPermissionSubmissionId: number;
 }
 
 export interface LocalDecisionOwner {
@@ -13,28 +36,74 @@ export interface LocalDecisionOwner {
 export function beginPermissionDecision(
   owner: PermissionDecisionOwner,
   confirmationId: string | null,
-  allow: boolean,
+  decision: PermissionReviewDecision,
+): PermissionDecisionSubmission | null {
+  if (confirmationId === null) return null;
+  reconcilePermissionDecision(owner, confirmationId);
+  if (owner.permissionDecision?.phase === "submitting") return null;
+  const submission: PermissionDecisionSubmission = {
+    requestId: confirmationId,
+    submissionId: owner.nextPermissionSubmissionId++,
+    decision,
+  };
+  owner.permissionDecision = { phase: "submitting", ...submission };
+  return submission;
+}
+
+export function finishPermissionDecision(
+  owner: PermissionDecisionOwner,
+  submission: PermissionDecisionSubmission,
 ): boolean {
-  if (confirmationId === null || owner.permissionDecisionPending) return false;
-  owner.permissionDecisionPending = true;
-  owner.permissionDecisionAllow = allow;
-  owner.permissionDecisionConfirmationId = confirmationId;
-  owner.permissionDecisionError = "";
+  if (!permissionDecisionSubmissionIsCurrent(owner.permissionDecision, submission)) return false;
+  owner.permissionDecision = { phase: "ready", requestId: submission.requestId };
   return true;
 }
 
-export function finishPermissionDecision(owner: PermissionDecisionOwner): void {
-  owner.permissionDecisionPending = false;
-  owner.permissionDecisionAllow = null;
-  owner.permissionDecisionConfirmationId = null;
-  owner.permissionDecisionError = "";
+export function failPermissionDecision(
+  owner: PermissionDecisionOwner,
+  submission: PermissionDecisionSubmission,
+  message: string,
+): boolean {
+  if (!permissionDecisionSubmissionIsCurrent(owner.permissionDecision, submission)) return false;
+  owner.permissionDecision = {
+    phase: "failed",
+    requestId: submission.requestId,
+    error: message,
+  };
+  return true;
 }
 
-export function failPermissionDecision(owner: PermissionDecisionOwner, message: string): void {
-  owner.permissionDecisionPending = false;
-  owner.permissionDecisionAllow = null;
-  owner.permissionDecisionConfirmationId = null;
-  owner.permissionDecisionError = message;
+export function recoverPermissionDecisionFromConflict(
+  owner: PermissionDecisionOwner,
+  submission: PermissionDecisionSubmission,
+  confirmationId: string | null,
+): boolean {
+  if (!permissionDecisionSubmissionIsCurrent(owner.permissionDecision, submission)) return false;
+  owner.permissionDecision = confirmationId === null
+    ? null
+    : { phase: "ready", requestId: confirmationId };
+  return true;
+}
+
+export function reconcilePermissionDecision(
+  owner: PermissionDecisionOwner,
+  confirmationId: string | null,
+): void {
+  if (confirmationId === null) {
+    owner.permissionDecision = null;
+    return;
+  }
+  if (owner.permissionDecision?.requestId !== confirmationId) {
+    owner.permissionDecision = { phase: "ready", requestId: confirmationId };
+  }
+}
+
+export function permissionDecisionShouldFocusComposer(
+  submission: PermissionDecisionSubmission,
+  settlementApplied: boolean,
+  confirmationVisible: boolean,
+): boolean {
+  return settlementApplied && submission.decision === "abort" && !confirmationVisible;
 }
 
 export function permissionDecisionResponseAccepted(
@@ -43,6 +112,15 @@ export function permissionDecisionResponseAccepted(
   currentConfirmationId: string | null,
 ): boolean {
   return !confirmationVisible || currentConfirmationId !== expectedConfirmationId;
+}
+
+function permissionDecisionSubmissionIsCurrent(
+  state: PermissionDecisionState | null,
+  submission: PermissionDecisionSubmission,
+): boolean {
+  return state?.phase === "submitting"
+    && state.requestId === submission.requestId
+    && state.submissionId === submission.submissionId;
 }
 
 export function beginLocalDecision(owner: LocalDecisionOwner, confirmationOpen: boolean): boolean {

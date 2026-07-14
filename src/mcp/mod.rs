@@ -59,6 +59,7 @@ impl McpClient {
         &self,
         server_id: &str,
         route: &str,
+        mut effect_checkpoint: impl FnMut() -> Result<(), ToolError>,
     ) -> Result<McpOperationResult, ToolError> {
         if !self.config.enabled {
             return Err(ToolError::Message("mcp is disabled by config".to_string()));
@@ -75,6 +76,7 @@ impl McpClient {
                     "method": "tools/list",
                     "params": {}
                 }),
+                &mut effect_checkpoint,
             )
             .await?;
         let tools = parse_tools(&response)?;
@@ -99,6 +101,7 @@ impl McpClient {
         route: &str,
         tool_name: &str,
         arguments: Value,
+        mut effect_checkpoint: impl FnMut() -> Result<(), ToolError>,
     ) -> Result<McpOperationResult, ToolError> {
         if !self.config.enabled {
             return Err(ToolError::Message("mcp is disabled by config".to_string()));
@@ -126,6 +129,7 @@ impl McpClient {
                         "arguments": arguments,
                     }
                 }),
+                &mut effect_checkpoint,
             )
             .await?;
         if let Some(error) = response.get("error") {
@@ -182,6 +186,7 @@ impl McpClient {
         server: &McpServerConfig,
         endpoint: &str,
         payload: Value,
+        effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<Value, ToolError> {
         let mut request = self
             .http
@@ -193,8 +198,12 @@ impl McpClient {
             request = request.header(name, value);
         }
 
+        let request = request.body(payload.to_string());
+        // A fallback endpoint is a new externally observable effect. Re-check the
+        // typed run owner at the actual send boundary instead of treating the
+        // whole fallback loop as one admitted operation.
+        effect_checkpoint()?;
         let response = request
-            .body(payload.to_string())
             .send()
             .await
             .map_err(|error| ToolError::Message(format!("mcp request failed: {error}")))?;
@@ -237,6 +246,7 @@ impl McpClient {
         &self,
         server: &McpServerConfig,
         payload: Value,
+        effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<(String, Value), ToolError> {
         let endpoints = endpoint_candidates(&server.base_url);
         if endpoints.is_empty() {
@@ -246,7 +256,10 @@ impl McpClient {
         }
         let mut last_error = None;
         for endpoint in endpoints {
-            match self.post_json(server, &endpoint, payload.clone()).await {
+            match self
+                .post_json(server, &endpoint, payload.clone(), effect_checkpoint)
+                .await
+            {
                 Ok(response) => return Ok((endpoint, response)),
                 Err(error) => last_error = Some(error),
             }
@@ -476,6 +489,14 @@ pub fn mcp_tools_list_rejects_malformed_tool_descriptors_fixture_passes() -> boo
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::routing::any;
+
     use super::*;
 
     #[test]
@@ -487,5 +508,56 @@ mod tests {
 
         assert_eq!(body.len(), MAX_MCP_RESPONSE_BYTES);
         assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn fallback_endpoint_rechecks_typed_effect_admission_before_second_send() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let handler_count = Arc::clone(&request_count);
+        let app = Router::new().fallback(any(move || {
+            let handler_count = Arc::clone(&handler_count);
+            async move {
+                handler_count.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NOT_FOUND
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve MCP fixture");
+        });
+
+        let client = McpClient::new(McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                id: "fixture".to_string(),
+                enabled: true,
+                transport: crate::config::McpTransportKind::Http,
+                base_url: format!("http://{address}"),
+                timeout_ms: 2_000,
+                route_allowlist: Vec::new(),
+                tool_allowlist: Vec::new(),
+                headers: BTreeMap::new(),
+            }],
+        });
+        let mut checkpoints = 0;
+        let error = client
+            .list_tools("fixture", "code", || {
+                checkpoints += 1;
+                if checkpoints == 1 {
+                    Ok(())
+                } else {
+                    Err(ToolError::RunInterrupted)
+                }
+            })
+            .await
+            .expect_err("the typed terminal owner must reject the fallback send");
+
+        assert!(matches!(error, ToolError::RunInterrupted));
+        assert_eq!(checkpoints, 2);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }

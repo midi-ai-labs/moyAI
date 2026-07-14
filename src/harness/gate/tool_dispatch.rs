@@ -9,6 +9,9 @@ pub fn evaluate(events: &[HarnessEvent]) -> GateEvaluation {
                 | HarnessEventKind::ToolDispatchRequested
                 | HarnessEventKind::ToolExecuted
                 | HarnessEventKind::ToolDispatchDenied
+                | HarnessEventKind::ToolDeclined
+                | HarnessEventKind::ToolCancelled
+                | HarnessEventKind::ToolFailed
                 | HarnessEventKind::PermissionRequested
                 | HarnessEventKind::PermissionResolved
         )

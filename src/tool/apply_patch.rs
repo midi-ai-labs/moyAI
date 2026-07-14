@@ -11,7 +11,7 @@ use crate::edit::{
 };
 use crate::error::ToolError;
 use crate::session::ChangeRepository;
-use crate::tool::context::ToolContext;
+use crate::tool::context::{ToolContext, ToolEffectAdmission};
 use crate::tool::registry::Tool;
 use crate::tool::write_support::{
     read_text_file_with_identity, to_summary, write_text_file, write_text_file_noclobber,
@@ -55,12 +55,13 @@ impl Tool for ApplyPatchTool {
         let operations = PatchParser::parse(&input.patch_text).map_err(ToolError::Patch)?;
         validate_apply_patch_participant_ownership(&ctx, operations.as_slice())?;
         let permission_admission = build_patch_permission_admission(&ctx, operations.as_slice())?;
-        confirm_patch_permission_admission(&mut ctx, &permission_admission)?;
+        let effect_admission =
+            confirm_patch_permission_admission(&mut ctx, &permission_admission).await?;
         let lock_paths = apply_patch_tool_invocation_lock_paths(&ctx, operations.as_slice())?;
         let edit_safety = ctx.services.edit_safety.clone();
         edit_safety
             .with_file_locks(&lock_paths, async move {
-                execute_admitted_patch_operations(&mut ctx, operations).await
+                execute_admitted_patch_operations(&mut ctx, operations, effect_admission).await
             })
             .await
     }
@@ -69,10 +70,15 @@ impl Tool for ApplyPatchTool {
 async fn execute_admitted_patch_operations(
     ctx: &mut ToolContext<'_>,
     operations: Vec<PatchOperation>,
+    effect_admission: ToolEffectAdmission,
 ) -> Result<ToolResult, ToolError> {
     ctx.run_mutation_fence.assert_owned().await?;
-    let admission =
-        classify_patch_operations_before_side_effects(ctx, operations.as_slice()).await?;
+    let admission = classify_patch_operations_before_side_effects(
+        ctx,
+        operations.as_slice(),
+        &effect_admission,
+    )
+    .await?;
     if let Some(path) = admission.all_update_operations_no_content_path {
         return Ok(no_content_patch_result(&path, &ctx.workspace.root));
     }
@@ -231,6 +237,7 @@ async fn commit_admitted_patch(
         .snapshot_path_stamps(session_id, &baseline_paths);
 
     ctx.run_mutation_fence.assert_owned().await?;
+    let _effect_commit = ctx.run_mutation_fence.begin_effect_commit()?;
     let applied_count = match apply_patch_mutations(&ctx.services.edit_safety, &commit.mutations) {
         Ok(value) => value,
         Err((error, applied_count)) => {
@@ -464,6 +471,7 @@ struct PatchPermissionAdmission {
 async fn classify_patch_operations_before_side_effects(
     ctx: &ToolContext<'_>,
     operations: &[PatchOperation],
+    effect_admission: &ToolEffectAdmission,
 ) -> Result<PatchOperationAdmission, ToolError> {
     let mut saw_update = false;
     let mut saw_non_update = false;
@@ -488,10 +496,9 @@ async fn classify_patch_operations_before_side_effects(
                     None,
                     contents.clone(),
                 )?;
-                let formatted = ctx
-                    .services
-                    .formatter
+                let formatted = effect_admission
                     .format_if_configured(
+                        &ctx.services.formatter,
                         &guarded.absolute,
                         normalized.clone(),
                         formatter_execution_options(ctx, normalized.len()),
@@ -535,10 +542,9 @@ async fn classify_patch_operations_before_side_effects(
                     Some(&original),
                     patched,
                 )?;
-                let formatted = ctx
-                    .services
-                    .formatter
+                let formatted = effect_admission
                     .format_if_configured(
+                        &ctx.services.formatter,
                         &destination,
                         normalized.clone(),
                         formatter_execution_options(ctx, normalized.len()),
@@ -740,10 +746,10 @@ fn extend_patch_permission_admission(
         .push(patch_permission_detail(operation_name, guarded, move_guard));
 }
 
-fn confirm_patch_permission_admission(
+async fn confirm_patch_permission_admission(
     ctx: &mut ToolContext<'_>,
     admission: &PatchPermissionAdmission,
-) -> Result<(), ToolError> {
+) -> Result<ToolEffectAdmission, ToolError> {
     ctx.confirm_if_needed_with_details(
         AccessKind::Edit,
         format!(
@@ -755,6 +761,7 @@ fn confirm_patch_permission_admission(
         admission.outside_workspace,
         admission.risks.clone(),
     )
+    .await
 }
 
 fn patch_permission_detail(
@@ -1031,10 +1038,152 @@ fn starts_with_indentation(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
+    use std::sync::{Arc, Barrier};
 
-    use crate::edit::{EditSafety, read_file_with_identity};
+    use crate::config::{FormatConfig, FormatterRule, NewlineStyle};
+    use crate::edit::{EditSafety, Formatter, FormatterExecutionOptions, read_file_with_identity};
+    use crate::protocol::TurnInterruptionCause;
+    use crate::runtime::{RunCancelOutcome, RunCancellationCause, RunControl};
+    use crate::tool::context::ToolEffectAdmission;
 
     use super::{FileRollbackState, PatchMutation, apply_patch_mutations};
+
+    fn marker_formatter() -> Formatter {
+        Formatter::new(FormatConfig {
+            default_newline: NewlineStyle::Lf,
+            ensure_trailing_newline: true,
+            commands: vec![FormatterRule {
+                glob: "**/*.txt".to_string(),
+                command: marker_command(),
+            }],
+        })
+    }
+
+    fn formatter_options(root: Utf8PathBuf, control: &RunControl) -> FormatterExecutionOptions {
+        FormatterExecutionOptions {
+            workspace_root: root,
+            timeout_ms: 5_000,
+            max_output_bytes: 1_024,
+            cancel: control.token(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn marker_command() -> Vec<String> {
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "Set-Content -LiteralPath 'formatter-started.marker' -Value 'started'; [Console]::In.ReadToEnd()"
+                .to_string(),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    fn marker_command() -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "touch formatter-started.marker; cat".to_string(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn later_patch_formatter_does_not_spawn_after_typed_terminal() {
+        for cause in [
+            RunCancellationCause::Interruption(TurnInterruptionCause::UserStop),
+            RunCancellationCause::Failure("provider failed between formatters".to_string()),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root =
+                Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 workspace");
+            let first_dir = root.join("first");
+            let second_dir = root.join("second");
+            std::fs::create_dir_all(&first_dir).expect("first formatter directory");
+            std::fs::create_dir_all(&second_dir).expect("second formatter directory");
+            let first_path = first_dir.join("first.txt");
+            let second_path = second_dir.join("second.txt");
+            let control = RunControl::new();
+            let admission = ToolEffectAdmission::new(control.clone());
+            let formatter = marker_formatter();
+
+            admission
+                .format_if_configured(
+                    &formatter,
+                    &first_path,
+                    "first".to_string(),
+                    formatter_options(root.clone(), &control),
+                )
+                .await
+                .expect("first formatter effect");
+            assert!(first_dir.join("formatter-started.marker").exists());
+            assert_eq!(control.request_cancel(cause), RunCancelOutcome::Applied);
+
+            let error = admission
+                .format_if_configured(
+                    &formatter,
+                    &second_path,
+                    "second".to_string(),
+                    formatter_options(root.clone(), &control),
+                )
+                .await
+                .expect_err("terminal owner must block the later formatter");
+            assert!(matches!(error, crate::error::ToolError::RunInterrupted));
+            assert!(!second_dir.join("formatter-started.marker").exists());
+            assert!(!first_path.exists());
+            assert!(!second_path.exists());
+        }
+    }
+
+    #[test]
+    fn stop_before_apply_patch_admission_has_zero_file_mutations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(temp.path().join("must-not-exist.txt")).expect("utf8 path");
+        let control = RunControl::new();
+        let effect_admission = ToolEffectAdmission::new(control.clone());
+        let ready = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_ready = Arc::clone(&ready);
+        let worker_release = Arc::clone(&release);
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let mutations = vec![PatchMutation::Write {
+                path: worker_path,
+                text: "must not be written".to_string(),
+                expected_identity: None,
+                rollback: FileRollbackState::Absent,
+            }];
+            worker_ready.wait();
+            worker_release.wait();
+            effect_admission.admit().map_err(|error| (error, 0))?;
+            apply_patch_mutations(&EditSafety::default(), &mutations)
+        });
+
+        ready.wait();
+        assert_eq!(
+            control.request_cancel(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop
+            )),
+            RunCancelOutcome::Applied
+        );
+        release.wait();
+        let (error, applied_count) = worker
+            .join()
+            .expect("patch worker")
+            .expect_err("Stop must win before patch effects");
+
+        assert!(matches!(error, crate::error::ToolError::RunInterrupted));
+        assert_eq!(applied_count, 0);
+        assert!(!path.exists());
+        assert_eq!(
+            control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop
+            ))
+        );
+    }
 
     #[test]
     fn mutation_commit_preserves_same_size_external_rewrite() {

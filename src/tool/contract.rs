@@ -20,7 +20,8 @@ pub enum ToolName {
     Skill,
     DoclingConvert,
     McpCall,
-    TodoWrite,
+    #[serde(rename = "update_plan", alias = "todo_write", alias = "todowrite")]
+    UpdatePlan,
     GetGoal,
     CreateGoal,
     UpdateGoal,
@@ -50,7 +51,7 @@ impl std::fmt::Display for ToolName {
             ToolName::Skill => "skill",
             ToolName::DoclingConvert => "docling_convert",
             ToolName::McpCall => "mcp_call",
-            ToolName::TodoWrite => "todowrite",
+            ToolName::UpdatePlan => "update_plan",
             ToolName::GetGoal => "get_goal",
             ToolName::CreateGoal => "create_goal",
             ToolName::UpdateGoal => "update_goal",
@@ -63,6 +64,25 @@ impl std::fmt::Display for ToolName {
             ToolName::Invalid => "invalid",
         };
         write!(f, "{value}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolName;
+
+    #[test]
+    fn update_plan_serializes_canonically_and_reads_legacy_names() {
+        assert_eq!(
+            serde_json::to_string(&ToolName::UpdatePlan).expect("serialize"),
+            "\"update_plan\""
+        );
+        for legacy in ["\"todo_write\"", "\"todowrite\""] {
+            assert_eq!(
+                serde_json::from_str::<ToolName>(legacy).expect("legacy alias"),
+                ToolName::UpdatePlan
+            );
+        }
     }
 }
 
@@ -112,6 +132,7 @@ pub enum PermissionRisk {
     MoveOrRename,
     Network,
     ExternalConnection,
+    ConfiguredLocalService,
     ProtectedWorkspaceAuthority,
 }
 
@@ -122,6 +143,7 @@ impl PermissionRisk {
             Self::MoveOrRename => "move/rename",
             Self::Network => "network",
             Self::ExternalConnection => "external connection/setup",
+            Self::ConfiguredLocalService => "configured local service",
             Self::ProtectedWorkspaceAuthority => "protected workspace authority",
         }
     }

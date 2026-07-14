@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::{AccessMode, ShellFamily};
 use crate::error::ErrorCategory;
 use crate::protocol::{
-    FileChangeEvidence, HistoryItem, HistoryItemId, ToolProgressEffect, TurnId, TurnItem,
+    FileChangeEvidence, HistoryItem, HistoryItemId, ToolProgressEffect, TurnId,
+    TurnInterruptionCause, TurnItem,
 };
 use crate::tool::ToolName;
 
@@ -121,7 +122,22 @@ pub enum ToolCallStatus {
     Pending,
     Running,
     Completed,
+    Declined,
+    Cancelled,
     Failed,
+}
+
+impl ToolCallStatus {
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Declined => "declined",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1234,6 +1250,8 @@ pub struct RunSummary {
     pub assistant_message_id: Option<MessageId>,
     pub status: SessionStatus,
     pub finish_reason: Option<FinishReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption_cause: Option<TurnInterruptionCause>,
     pub tool_call_count: usize,
     pub failed_tool_count: usize,
     pub change_count: usize,
@@ -1331,6 +1349,20 @@ pub enum RunEvent {
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         metadata: serde_json::Value,
     },
+    ToolCallDeclined {
+        tool_call_id: ToolCallId,
+        tool: ToolName,
+        reason: String,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        metadata: serde_json::Value,
+    },
+    ToolCallCancelled {
+        tool_call_id: ToolCallId,
+        tool: ToolName,
+        reason: String,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        metadata: serde_json::Value,
+    },
     ToolCallFailed {
         tool_call_id: ToolCallId,
         tool: ToolName,
@@ -1399,6 +1431,8 @@ pub enum RunEvent {
     SessionInterrupted {
         session_id: SessionId,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<TurnInterruptionCause>,
     },
     SessionFailed {
         session_id: SessionId,
@@ -1429,6 +1463,8 @@ impl RunEvent {
             | Self::ReasoningDelta { .. }
             | Self::ToolCallPending { .. }
             | Self::ToolCallCompleted { .. }
+            | Self::ToolCallDeclined { .. }
+            | Self::ToolCallCancelled { .. }
             | Self::ToolCallFailed { .. }
             | Self::ToolProposalRejected { .. }
             | Self::CandidateRepairEditRecorded { .. }

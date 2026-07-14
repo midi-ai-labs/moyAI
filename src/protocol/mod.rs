@@ -111,6 +111,8 @@ pub enum ThreadOp {
     Interrupt {
         turn_id: TurnId,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<TurnInterruptionCause>,
     },
     ApproveTool {
         turn_id: TurnId,
@@ -411,6 +413,39 @@ pub enum ToolApprovalDecision {
     Denied { reason: String },
 }
 
+/// A decision made by a human-facing approval surface.
+///
+/// `Abort` is deliberately not a [`ToolApprovalDecision`]: it interrupts the requesting turn
+/// instead of resolving the tool approval waiter with a rejection result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDecision {
+    Approved,
+    Denied,
+    Abort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnInterruptionCause {
+    ApprovalAborted,
+    UserStop,
+    AgentInterrupted,
+    TreeStopped,
+}
+
+impl TurnInterruptionCause {
+    /// Stable fallback text for older consumers that only understand `reason`.
+    pub const fn legacy_reason(self) -> &'static str {
+        match self {
+            Self::ApprovalAborted => "permission approval aborted by user",
+            Self::UserStop => "run stopped by user",
+            Self::AgentInterrupted => "agent interrupted",
+            Self::TreeStopped => "agent tree stopped",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionMode {
@@ -564,6 +599,8 @@ pub enum RuntimeEventMsg {
     },
     TurnInterrupted {
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<TurnInterruptionCause>,
     },
 }
 
@@ -1216,6 +1253,8 @@ pub enum TurnItemPayload {
     Terminal {
         status: TurnTerminalStatus,
         summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<TurnInterruptionCause>,
     },
 }
 
@@ -1299,6 +1338,7 @@ pub fn turn_item_internal_projection_roles_are_not_primary_display_fixture_passe
         TurnItemPayload::Terminal {
             status: TurnTerminalStatus::Completed,
             summary: "done".to_string(),
+            cause: None,
         },
     ];
 
@@ -1420,6 +1460,8 @@ pub enum ToolLifecycleStatus {
     Pending,
     Running,
     Completed,
+    Declined,
+    Cancelled,
     Failed,
     Blocked,
     Rejected,

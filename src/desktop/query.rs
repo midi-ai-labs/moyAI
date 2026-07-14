@@ -425,6 +425,7 @@ struct TurnTranscriptGroup {
     system_rows: Vec<DesktopTranscriptRow>,
     terminal_summary: Option<String>,
     terminal_status: Option<crate::protocol::TurnTerminalStatus>,
+    terminal_cause: Option<crate::protocol::TurnInterruptionCause>,
 }
 
 impl TurnTranscriptGroup {
@@ -540,9 +541,14 @@ fn transcript_rows_from_turn_items_with_context(
                     Vec::new(),
                 ));
             }
-            crate::protocol::TurnItemPayload::Terminal { status, summary } => {
+            crate::protocol::TurnItemPayload::Terminal {
+                status,
+                summary,
+                cause,
+            } => {
                 current.terminal_summary = Some(summary.clone());
                 current.terminal_status = Some(*status);
+                current.terminal_cause = *cause;
             }
             crate::protocol::TurnItemPayload::Reasoning { .. }
             | crate::protocol::TurnItemPayload::SubAgentActivity { .. }
@@ -664,6 +670,7 @@ fn flush_turn_transcript_group(
     group.file_change_items.clear();
     group.terminal_summary = None;
     group.terminal_status = None;
+    group.terminal_cause = None;
 }
 
 fn turn_work_summary_kind(group: &TurnTranscriptGroup) -> DesktopTranscriptRowKind {
@@ -759,9 +766,14 @@ fn completed_turn_summary_text(
     file_changes: &[DesktopFileChangeRow],
 ) -> String {
     let status = group
-        .terminal_summary
-        .as_ref()
-        .map(|summary| terminal_summary_label(summary))
+        .terminal_cause
+        .map(crate::tui::state::interruption_status_message)
+        .or_else(|| {
+            group
+                .terminal_summary
+                .as_ref()
+                .map(|summary| terminal_summary_label(summary))
+        })
         .unwrap_or_else(|| "作業履歴を記録しました。".to_string());
     let mut lines = vec![format!("- 結果: {status}")];
     if !file_changes.is_empty() {
@@ -837,6 +849,8 @@ fn turn_tool_status_label(status: crate::protocol::ToolLifecycleStatus) -> &'sta
         | crate::protocol::ToolLifecycleStatus::Deferred => "待機",
         crate::protocol::ToolLifecycleStatus::Running => "実行中",
         crate::protocol::ToolLifecycleStatus::Completed => "完了",
+        crate::protocol::ToolLifecycleStatus::Declined => "拒否",
+        crate::protocol::ToolLifecycleStatus::Cancelled => "キャンセル",
         crate::protocol::ToolLifecycleStatus::Failed => "失敗",
     }
 }
@@ -1125,6 +1139,7 @@ pub fn completed_desktop_transcript_primary_reading_fixture_passes() -> bool {
                 payload: crate::protocol::TurnItemPayload::Terminal {
                     status: crate::protocol::TurnTerminalStatus::Completed,
                     summary: "session completed".to_string(),
+                    cause: None,
                 },
             },
             crate::protocol::TurnItem {
@@ -1165,6 +1180,7 @@ pub fn desktop_pseudo_tool_call_closeout_evidence_preserved_fixture_passes() -> 
         assistant_message_id: None,
         status: SessionStatus::Completed,
         finish_reason: None,
+        interruption_cause: None,
         tool_call_count: 1,
         failed_tool_count: 0,
         change_count: 1,
@@ -1381,15 +1397,27 @@ fn current_run_summary_text(state: &AppState, file_changes: &[DesktopFileChangeR
             .iter()
             .filter(|tool| tool.status == ToolCallStatus::Failed)
             .count();
-        lines.push(format!(
-            "- コマンド/ツール: {}件完了{}",
-            completed,
-            if failed > 0 {
-                format!(" / {failed}件失敗")
-            } else {
-                String::new()
-            }
-        ));
+        let declined = state
+            .tool_statuses
+            .iter()
+            .filter(|tool| tool.status == ToolCallStatus::Declined)
+            .count();
+        let cancelled = state
+            .tool_statuses
+            .iter()
+            .filter(|tool| tool.status == ToolCallStatus::Cancelled)
+            .count();
+        let mut counts = vec![format!("{completed}件完了")];
+        if declined > 0 {
+            counts.push(format!("{declined}件拒否"));
+        }
+        if cancelled > 0 {
+            counts.push(format!("{cancelled}件キャンセル"));
+        }
+        if failed > 0 {
+            counts.push(format!("{failed}件失敗"));
+        }
+        lines.push(format!("- コマンド/ツール: {}", counts.join(" / ")));
     }
     if let Some(last_tool) = state.tool_statuses.last()
         && let Some(summary) = last_tool.summary.as_ref().or(last_tool.error.as_ref())
@@ -1471,14 +1499,37 @@ fn format_command_summary_title(tools: &[crate::tui::state::ToolStatusView]) -> 
         .iter()
         .filter(|tool| tool.status == ToolCallStatus::Failed)
         .count();
-    let running = tools.len().saturating_sub(completed + failed);
+    let declined = tools
+        .iter()
+        .filter(|tool| tool.status == ToolCallStatus::Declined)
+        .count();
+    let cancelled = tools
+        .iter()
+        .filter(|tool| tool.status == ToolCallStatus::Cancelled)
+        .count();
+    let running = tools
+        .iter()
+        .filter(|tool| {
+            matches!(
+                tool.status,
+                ToolCallStatus::Pending | ToolCallStatus::Running
+            )
+        })
+        .count();
+    let mut parts = vec![format!("{completed}件のコマンドを実行")];
     if running > 0 {
-        format!("{completed}件のコマンドを実行, {running}件実行中")
-    } else if failed > 0 {
-        format!("{completed}件のコマンドを実行, {failed}件失敗")
-    } else {
-        format!("{completed}件のコマンドを実行")
+        parts.push(format!("{running}件実行中"));
     }
+    if declined > 0 {
+        parts.push(format!("{declined}件拒否"));
+    }
+    if cancelled > 0 {
+        parts.push(format!("{cancelled}件キャンセル"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed}件失敗"));
+    }
+    parts.join(", ")
 }
 
 fn transcript_row_kind_from_entry(kind: TranscriptKind) -> DesktopTranscriptRowKind {
@@ -1607,8 +1658,12 @@ fn format_progress_text(state: &AppState) -> String {
         format!("手順: {}", progress.active_step),
         format!("モデル要求: {}", progress.model_requests),
         format!(
-            "ツール: {}件開始 / {}件完了 / {}件失敗",
-            progress.tool_calls_started, progress.tool_calls_completed, progress.tool_calls_failed
+            "ツール: {}件開始 / {}件完了 / {}件拒否 / {}件キャンセル / {}件失敗",
+            progress.tool_calls_started,
+            progress.tool_calls_completed,
+            progress.tool_calls_declined,
+            progress.tool_calls_cancelled,
+            progress.tool_calls_failed
         ),
         format!("拒否した提案: {}", progress.rejected_tool_proposals),
         format!("圧縮: {}", progress.compactions),
@@ -1697,6 +1752,8 @@ fn tool_call_status_label(status: ToolCallStatus) -> &'static str {
         ToolCallStatus::Pending => "待機中",
         ToolCallStatus::Running => "実行中",
         ToolCallStatus::Completed => "完了",
+        ToolCallStatus::Declined => "拒否",
+        ToolCallStatus::Cancelled => "キャンセル",
         ToolCallStatus::Failed => "失敗",
     }
 }
@@ -1725,6 +1782,59 @@ mod tests {
         session.updated_at_ms = 2;
         session.completed_at_ms = Some(2);
         session
+    }
+
+    #[test]
+    fn terminal_projection_uses_typed_status_and_cause_instead_of_summary_words() {
+        let session = session_record(ProjectId::new(), "typed terminal");
+
+        let interrupted = transcript_rows_from_turn_items_with_context(
+            &session,
+            &[TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id: crate::protocol::TurnId::new(),
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::Terminal {
+                    status: crate::protocol::TurnTerminalStatus::Interrupted,
+                    summary: "provider returned an unrelated failure message".to_string(),
+                    cause: Some(crate::protocol::TurnInterruptionCause::ApprovalAborted),
+                },
+            }],
+        );
+        let interrupted_summary = interrupted
+            .iter()
+            .find(|row| row.kind == "work_summary_cancelled")
+            .expect("typed interrupted row");
+        assert!(interrupted_summary.body.contains("指示を入力してください"));
+        assert!(!interrupted_summary.body.contains("unrelated failure"));
+
+        let failed = transcript_rows_from_turn_items_with_context(
+            &session,
+            &[TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id: crate::protocol::TurnId::new(),
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::Terminal {
+                    status: crate::protocol::TurnTerminalStatus::Failed,
+                    summary: "permission approval aborted by user".to_string(),
+                    cause: None,
+                },
+            }],
+        );
+        let failed_summary = failed
+            .iter()
+            .find(|row| row.kind == "work_summary_failed")
+            .expect("typed failed row");
+        assert!(
+            failed_summary
+                .body
+                .contains("permission approval aborted by user")
+        );
+        assert!(!failed_summary.body.contains("指示を入力してください"));
     }
 
     #[test]
@@ -2287,6 +2397,7 @@ mod tests {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 1,
             failed_tool_count: 0,
             change_count: 1,
@@ -2361,6 +2472,7 @@ mod tests {
                 payload: TurnItemPayload::Terminal {
                     status: crate::protocol::TurnTerminalStatus::Completed,
                     summary: "session completed".to_string(),
+                    cause: None,
                 },
             },
             TurnItem {
@@ -2473,6 +2585,7 @@ mod tests {
                 payload: TurnItemPayload::Terminal {
                     status: crate::protocol::TurnTerminalStatus::Completed,
                     summary: "session completed".to_string(),
+                    cause: None,
                 },
             },
             TurnItem {
@@ -2523,6 +2636,7 @@ mod tests {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 2,
             failed_tool_count: 0,
             change_count: 1,
@@ -2594,6 +2708,7 @@ mod tests {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 2,
             failed_tool_count: 0,
             change_count: 1,
@@ -2646,6 +2761,7 @@ mod tests {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 3,
             failed_tool_count: 0,
             change_count: 2,
@@ -2709,6 +2825,7 @@ mod tests {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 3,
             failed_tool_count: 0,
             change_count: 2,
@@ -2762,6 +2879,7 @@ mod tests {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 3,
             failed_tool_count: 0,
             change_count: 2,
@@ -2817,6 +2935,7 @@ mod tests {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 3,
             failed_tool_count: 0,
             change_count: 2,
@@ -2870,6 +2989,7 @@ mod tests {
             assistant_message_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
+            interruption_cause: None,
             tool_call_count: 3,
             failed_tool_count: 0,
             change_count: 2,

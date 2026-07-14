@@ -115,6 +115,12 @@ impl EventRenderer for HumanRenderer {
             RunEvent::ToolCallCompleted { summary, .. } => {
                 writeln!(stdout, "[tool:done] {summary}")?;
             }
+            RunEvent::ToolCallDeclined { reason, .. } => {
+                writeln!(stdout, "[tool:declined] {reason}")?;
+            }
+            RunEvent::ToolCallCancelled { reason, .. } => {
+                writeln!(stdout, "[tool:cancelled] {reason}")?;
+            }
             RunEvent::ToolCallFailed { error, .. } => {
                 writeln!(stdout, "[tool:error] {error}")?;
             }
@@ -147,7 +153,11 @@ impl EventRenderer for HumanRenderer {
                 writeln!(
                     stdout,
                     "[permission] {}",
-                    if *approved { "approved" } else { "denied" }
+                    if *approved {
+                        "approved"
+                    } else {
+                        "not approved"
+                    }
                 )?;
             }
             RunEvent::RetryScheduled {
@@ -1007,6 +1017,7 @@ pub fn cli_human_renderer_typed_lifecycle_projection_fixture_passes() -> bool {
         assistant_message_id: None,
         status: crate::session::SessionStatus::AwaitingUser,
         finish_reason: None,
+        interruption_cause: None,
         tool_call_count: 2,
         failed_tool_count: 1,
         change_count: 3,

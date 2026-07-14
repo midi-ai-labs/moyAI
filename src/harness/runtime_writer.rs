@@ -237,7 +237,9 @@ fn harness_kind_for_run_event(event: &RunEvent) -> HarnessEventKind {
         }
         RunEvent::ToolCallPending { .. } => HarnessEventKind::ToolDispatchRequested,
         RunEvent::ToolCallCompleted { .. } => HarnessEventKind::ToolExecuted,
-        RunEvent::ToolCallFailed { .. } => HarnessEventKind::ToolDispatchDenied,
+        RunEvent::ToolCallDeclined { .. } => HarnessEventKind::ToolDeclined,
+        RunEvent::ToolCallCancelled { .. } => HarnessEventKind::ToolCancelled,
+        RunEvent::ToolCallFailed { .. } => HarnessEventKind::ToolFailed,
         RunEvent::ToolProposalRejected { .. } => HarnessEventKind::ToolDispatchDenied,
         RunEvent::CandidateRepairEditRecorded { .. } => HarnessEventKind::StateSnapshotRecorded,
         RunEvent::FileChangesRecorded { .. } => HarnessEventKind::ArtifactRegistered,
@@ -283,6 +285,9 @@ fn artifact_kind_for_event(kind: HarnessEventKind) -> Option<ArtifactKind> {
         | HarnessEventKind::ModelProjectionBuilt
         | HarnessEventKind::ModelRequestSent => Some(ArtifactKind::RequestDiagnostics),
         HarnessEventKind::ToolDispatchDenied
+        | HarnessEventKind::ToolDeclined
+        | HarnessEventKind::ToolCancelled
+        | HarnessEventKind::ToolFailed
         | HarnessEventKind::PermissionRequested
         | HarnessEventKind::PermissionResolved
         | HarnessEventKind::ToolExecuted
@@ -309,6 +314,9 @@ fn event_kind_file_label(kind: HarnessEventKind) -> &'static str {
         HarnessEventKind::ModelNoToolStop => "model_no_tool_stop",
         HarnessEventKind::ToolDispatchRequested => "tool_dispatch_requested",
         HarnessEventKind::ToolDispatchDenied => "tool_dispatch_denied",
+        HarnessEventKind::ToolDeclined => "tool_declined",
+        HarnessEventKind::ToolCancelled => "tool_cancelled",
+        HarnessEventKind::ToolFailed => "tool_failed",
         HarnessEventKind::PermissionRequested => "permission_requested",
         HarnessEventKind::PermissionResolved => "permission_resolved",
         HarnessEventKind::ToolExecuted => "tool_executed",
@@ -340,8 +348,48 @@ fn runtime_error(error: impl std::fmt::Display) -> RuntimeError {
 mod tests {
     use super::*;
     use crate::harness::HarnessEventStore;
-    use crate::session::MessageId;
+    use crate::session::{MessageId, ToolCallId};
     use crate::storage::{SqliteStore, StoragePaths};
+    use crate::tool::ToolName;
+
+    #[test]
+    fn tool_terminal_outcomes_keep_distinct_harness_kinds() {
+        let call_id = ToolCallId::new();
+        let metadata = serde_json::Value::Null;
+        let cases = [
+            (
+                RunEvent::ToolCallDeclined {
+                    tool_call_id: call_id,
+                    tool: ToolName::Shell,
+                    reason: "user declined".to_string(),
+                    metadata: metadata.clone(),
+                },
+                HarnessEventKind::ToolDeclined,
+            ),
+            (
+                RunEvent::ToolCallCancelled {
+                    tool_call_id: call_id,
+                    tool: ToolName::Shell,
+                    reason: "tree stopped".to_string(),
+                    metadata: metadata.clone(),
+                },
+                HarnessEventKind::ToolCancelled,
+            ),
+            (
+                RunEvent::ToolCallFailed {
+                    tool_call_id: call_id,
+                    tool: ToolName::Shell,
+                    error: "transport failed".to_string(),
+                    metadata,
+                },
+                HarnessEventKind::ToolFailed,
+            ),
+        ];
+
+        for (event, expected) in cases {
+            assert_eq!(harness_kind_for_run_event(&event), expected);
+        }
+    }
 
     #[test]
     fn records_only_the_runtime_event_without_synthetic_contracts() {

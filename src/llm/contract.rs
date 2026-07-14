@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ProviderMetadataMode;
+use crate::config::model::{ProviderReasoningCapability, ReasoningEffort, ReasoningSummary};
 use crate::error::LlmError;
 use crate::session::{FinishReason, TokenUsage};
 
@@ -121,6 +122,58 @@ pub struct ChatRequest {
     pub seed: Option<u64>,
     pub stop_sequences: Vec<String>,
     pub extra_body: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub summary: ReasoningSummary,
+}
+
+impl ReasoningRequest {
+    pub fn is_disabled(&self) -> bool {
+        self.effort.is_none() && self.summary == ReasoningSummary::None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedChatCompletionsReasoningRequest {
+    pub effort: Option<ReasoningEffort>,
+    pub summary: Option<ReasoningSummary>,
+}
+
+pub(crate) fn validate_chat_completions_reasoning_request(
+    request: Option<&ReasoningRequest>,
+    capability: ProviderReasoningCapability,
+) -> Result<Option<ValidatedChatCompletionsReasoningRequest>, LlmError> {
+    let Some(request) = request.filter(|request| !request.is_disabled()) else {
+        return Ok(None);
+    };
+
+    match capability {
+        ProviderReasoningCapability::Unsupported => Err(LlmError::Message(
+            "reasoning parameters were requested for a provider that does not advertise a typed reasoning request contract"
+                .to_string(),
+        )),
+        ProviderReasoningCapability::ChatCompletions { parameters } => {
+            if request.summary != ReasoningSummary::None && !parameters.supports_summary() {
+                return Err(LlmError::Message(
+                    "reasoning summary was requested for a Chat Completions provider that supports effort only"
+                        .to_string(),
+                ));
+            }
+            Ok(Some(ValidatedChatCompletionsReasoningRequest {
+                effort: request.effort.clone(),
+                summary: (request.summary != ReasoningSummary::None).then_some(request.summary),
+            }))
+        }
+        ProviderReasoningCapability::ResponsesItemsNotImplemented => Err(LlmError::Message(
+            "item-based Responses reasoning state continuity is not implemented by the OpenAI-compatible Chat Completions transport"
+                .to_string(),
+        )),
+    }
 }
 
 pub const OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY: &str = "Respond in the user's language. Do not emit hidden reasoning or `<think>` blocks; return only user-facing content and normal tool calls.";
@@ -460,6 +513,24 @@ pub struct LlmResponseSummary {
     pub usage: Option<TokenUsage>,
 }
 
+pub fn validate_toolless_text_response(
+    operation: impl Into<String>,
+    summary: &LlmResponseSummary,
+    saw_tool_call: bool,
+) -> Result<(), LlmError> {
+    let operation = operation.into();
+    if saw_tool_call {
+        return Err(LlmError::ToollessTextShape { operation });
+    }
+    if summary.finish_reason != FinishReason::Stop {
+        return Err(LlmError::ToollessTextFinish {
+            operation,
+            finish_reason: summary.finish_reason,
+        });
+    }
+    Ok(())
+}
+
 #[async_trait(?Send)]
 pub trait LlmClient: Send + Sync {
     async fn stream_chat(
@@ -473,11 +544,18 @@ pub trait LlmClient: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY,
+        LlmResponseSummary, OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY, ReasoningRequest,
         openai_compatible_only_tool_policy_fixture_passes, system_prompt_with_provider_policy,
         tool_call_turn_uses_configured_output_budget_fixture_passes,
+        validate_chat_completions_reasoning_request, validate_toolless_text_response,
     };
     use crate::config::ProviderMetadataMode;
+    use crate::config::model::{
+        ChatCompletionsReasoningParameters, ProviderReasoningCapability, ReasoningEffort,
+        ReasoningSummary,
+    };
+    use crate::error::LlmError;
+    use crate::session::FinishReason;
 
     #[test]
     fn openai_compatible_only_policy_is_prefixed_to_system_prompt() {
@@ -535,5 +613,119 @@ mod tests {
     #[test]
     fn tool_call_request_uses_configured_output_budget() {
         assert!(tool_call_turn_uses_configured_output_budget_fixture_passes());
+    }
+
+    #[test]
+    fn toolless_text_terminal_contract_accepts_only_stop_without_tool_calls() {
+        for finish_reason in [
+            FinishReason::Stop,
+            FinishReason::ToolCall,
+            FinishReason::Length,
+            FinishReason::Cancelled,
+            FinishReason::Error,
+        ] {
+            let summary = LlmResponseSummary {
+                finish_reason,
+                usage: None,
+            };
+            let result = validate_toolless_text_response("test operation", &summary, false);
+            if finish_reason == FinishReason::Stop {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(LlmError::ToollessTextFinish {
+                        finish_reason: actual,
+                        ..
+                    }) if actual == finish_reason
+                ));
+            }
+        }
+
+        let summary = LlmResponseSummary {
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        };
+        assert!(matches!(
+            validate_toolless_text_response("test operation", &summary, true),
+            Err(LlmError::ToollessTextShape { .. })
+        ));
+    }
+
+    #[test]
+    fn disabled_reasoning_request_is_omitted_for_every_provider_capability() {
+        let disabled = ReasoningRequest::default();
+        for capability in [
+            ProviderReasoningCapability::Unsupported,
+            ProviderReasoningCapability::ChatCompletions {
+                parameters: ChatCompletionsReasoningParameters::EffortOnly,
+            },
+            ProviderReasoningCapability::ResponsesItemsNotImplemented,
+        ] {
+            assert!(
+                validate_chat_completions_reasoning_request(Some(&disabled), capability)
+                    .expect("disabled reasoning must not require provider support")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_request_requires_an_explicit_compatible_provider_contract() {
+        let effort = ReasoningRequest {
+            effort: Some(ReasoningEffort::Medium),
+            summary: ReasoningSummary::None,
+        };
+        assert!(
+            validate_chat_completions_reasoning_request(
+                Some(&effort),
+                ProviderReasoningCapability::Unsupported,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_chat_completions_reasoning_request(
+                Some(&effort),
+                ProviderReasoningCapability::ResponsesItemsNotImplemented,
+            )
+            .is_err()
+        );
+
+        let validated = validate_chat_completions_reasoning_request(
+            Some(&effort),
+            ProviderReasoningCapability::ChatCompletions {
+                parameters: ChatCompletionsReasoningParameters::EffortOnly,
+            },
+        )
+        .expect("typed Chat Completions reasoning")
+        .expect("enabled request");
+        assert_eq!(validated.effort, Some(ReasoningEffort::Medium));
+        assert_eq!(validated.summary, None);
+    }
+
+    #[test]
+    fn effort_only_chat_contract_rejects_reasoning_summary() {
+        let request = ReasoningRequest {
+            effort: Some(ReasoningEffort::High),
+            summary: ReasoningSummary::Concise,
+        };
+        assert!(
+            validate_chat_completions_reasoning_request(
+                Some(&request),
+                ProviderReasoningCapability::ChatCompletions {
+                    parameters: ChatCompletionsReasoningParameters::EffortOnly,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_chat_completions_reasoning_request(
+                Some(&request),
+                ProviderReasoningCapability::ChatCompletions {
+                    parameters: ChatCompletionsReasoningParameters::EffortAndSummary,
+                },
+            )
+            .is_ok()
+        );
     }
 }

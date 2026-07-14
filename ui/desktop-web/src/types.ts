@@ -150,6 +150,17 @@ export interface ProviderStatusProjection {
   details: string;
 }
 
+export type DesktopStatusCode =
+  | "plain"
+  | "provider_transport"
+  | "model_unavailable"
+  | "image_unsupported"
+  | "permission_policy_denied"
+  | "approval_aborted"
+  | "user_stopped"
+  | "agent_interrupted"
+  | "tree_stopped";
+
 export interface RowMutationTarget {
   workspacePath: string;
   ownerProjectId: string | null;
@@ -173,6 +184,7 @@ export interface DesktopWebState {
   selected_session_title: string;
   status_message: string;
   status_detail: string;
+  status_code: DesktopStatusCode;
   run_status_key: RunStatusKey;
   run_status_text: string;
   run_phase: string;

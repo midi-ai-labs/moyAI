@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio_util::sync::CancellationToken;
 
 use crate::app::{AppCommand, RunRequest, RunService};
 use crate::cli::{EventRenderer, OutputMode, SharedConfirmationPrompt};
@@ -13,11 +12,13 @@ use crate::config::model::full_effective_override;
 use crate::error::{AppRunError, CliRenderError};
 use crate::protocol::{
     ContentPart, HistoryItemPayload, InterAgentCommunication, ProtocolEventStore,
-    SubAgentActivityKind, TurnId, project_inter_agent_communication, project_sub_agent_activity,
+    SubAgentActivityKind, TurnId, TurnInterruptionCause, project_inter_agent_communication,
+    project_sub_agent_activity,
 };
 use crate::runtime::{
     AgentControl, AgentControlError, AgentExecutionLease, AgentMailDeliveryOutcome,
-    AgentMailboxMessage, AgentPath, AgentSnapshot, AgentStatus,
+    AgentMailboxMessage, AgentPath, AgentRootContinuationOutcome, AgentSnapshot, AgentStatus,
+    RunCancellationCause, RunControl,
 };
 use crate::session::{
     CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionRead, CanonicalTurnPage,
@@ -107,10 +108,6 @@ impl AgentRunContext {
 
     pub(crate) fn model_request_gate(&self) -> Arc<tokio::sync::Semaphore> {
         self.tree.model_request_gate()
-    }
-
-    pub(crate) fn tree_cancel_token(&self) -> CancellationToken {
-        self.tree.control.tree_cancel_token()
     }
 
     fn effective_config(&self) -> ResolvedConfig {
@@ -258,14 +255,15 @@ pub(crate) struct AgentRuntimeExecution {
     lease: Option<AgentExecutionLease>,
 }
 
-impl AgentRuntimeExecution {
-    pub fn cancel_token(&self) -> CancellationToken {
-        self.lease
-            .as_ref()
-            .expect("agent execution lease is retained until drop")
-            .cancel_token()
-    }
+pub(crate) enum AgentRuntimeContinuationOutcome {
+    Unmanaged,
+    Admitted(AgentRuntimeExecution),
+    Blocked,
+    NotReady,
+    Invalid,
+}
 
+impl AgentRuntimeExecution {
     fn complete(mut self, status: AgentStatus) -> Result<Vec<AgentExecutionLease>, String> {
         let lease = self
             .lease
@@ -325,6 +323,7 @@ struct DurableAgentChild {
     session: SessionRecord,
     task_preview: String,
     result: Option<String>,
+    interruption_cause: Option<TurnInterruptionCause>,
 }
 
 struct AgentLaunchFailure {
@@ -355,6 +354,10 @@ impl AgentTreeRuntime {
         confirmation: SharedConfirmationPrompt,
         max_concurrent_model_requests: usize,
     ) {
+        let control = self.control.clone();
+        confirmation.set_approval_abort_handler(move |requesting_control| {
+            control.abort_tree_from_permission(requesting_control)
+        });
         *self
             .model_request_gate
             .lock()
@@ -402,7 +405,7 @@ impl AgentRuntime {
         config: ResolvedConfig,
         confirmation: SharedConfirmationPrompt,
         live_config: Option<crate::runtime::LiveConfigOverrides>,
-        external_cancel: CancellationToken,
+        run_control: RunControl,
     ) -> Result<AgentRuntimeExecution, String> {
         let root_session_id = session.session.id;
         let (tree, lease) = {
@@ -412,7 +415,7 @@ impl AgentRuntime {
                 .map_err(|_| "agent tree registry lock was poisoned".to_string())?;
             if let Some(tree) = trees
                 .get(&root_session_id)
-                .filter(|tree| !tree.control.tree_cancel_token().is_cancelled())
+                .filter(|tree| !tree.control.tree_is_cancelled())
                 .cloned()
             {
                 if !tree.control.is_quiescent().map_err(agent_control_error)? {
@@ -425,14 +428,17 @@ impl AgentRuntime {
                     .map_err(agent_control_error)?;
                 let lease = tree
                     .control
-                    .try_acquire_execution(&AgentPath::root())
+                    .try_acquire_execution_with_control(&AgentPath::root(), run_control.clone())
                     .map_err(agent_control_error)?;
                 (tree, lease)
             } else {
                 let durable_children = self.load_durable_children(root_session_id)?;
-                let (control, lease) =
-                    AgentControl::new(root_session_id, config.multi_agent.max_concurrent_agents)
-                        .map_err(agent_control_error)?;
+                let (control, lease) = AgentControl::with_root_control(
+                    root_session_id,
+                    config.multi_agent.max_concurrent_agents,
+                    run_control,
+                )
+                .map_err(agent_control_error)?;
                 let tree = Arc::new(AgentTreeRuntime {
                     root_session_id,
                     control,
@@ -490,15 +496,64 @@ impl AgentRuntime {
             workspace: session.workspace.clone(),
             live_config,
         };
-        let control = tree.control.clone();
-        tokio::spawn(forward_external_cancel_while_root_active(
-            control,
-            external_cancel,
-        ));
         Ok(AgentRuntimeExecution {
             context,
             lease: Some(lease),
         })
+    }
+
+    pub(crate) fn begin_root_continuation(
+        self: &Arc<Self>,
+        root_session_id: SessionId,
+        run_control: RunControl,
+        confirmation: Option<SharedConfirmationPrompt>,
+    ) -> Result<AgentRuntimeContinuationOutcome, String> {
+        let tree = self
+            .trees
+            .lock()
+            .map_err(|_| "agent tree registry lock was poisoned".to_string())?
+            .get(&root_session_id)
+            .cloned();
+        let Some(tree) = tree else {
+            return Ok(AgentRuntimeContinuationOutcome::Unmanaged);
+        };
+        let confirmation = confirmation.ok_or_else(|| {
+            "multi-agent continuation requires a shared permission confirmation channel".to_string()
+        })?;
+        let context = self.context_for_path(&tree, &AgentPath::root())?;
+        let max_concurrent_model_requests =
+            context.config.multi_agent.max_concurrent_model_requests;
+        let lease = match tree
+            .control
+            .try_acquire_root_continuation(run_control.clone())
+            .map_err(agent_control_error)?
+        {
+            AgentRootContinuationOutcome::Admitted(lease) => lease,
+            AgentRootContinuationOutcome::Blocked => {
+                return Ok(AgentRuntimeContinuationOutcome::Blocked);
+            }
+            AgentRootContinuationOutcome::NotReady => {
+                return Ok(AgentRuntimeContinuationOutcome::NotReady);
+            }
+            AgentRootContinuationOutcome::Invalid => {
+                return Ok(AgentRuntimeContinuationOutcome::Invalid);
+            }
+        };
+        let execution = AgentRuntimeExecution {
+            context,
+            lease: Some(lease),
+        };
+        if let Err(error) = tree
+            .control
+            .set_status(&AgentPath::root(), AgentStatus::Running)
+        {
+            let message = agent_control_error(error);
+            run_control.fail(message.clone());
+            drop(execution);
+            return Err(message);
+        }
+        tree.install_run_resources(confirmation, max_concurrent_model_requests);
+        Ok(AgentRuntimeContinuationOutcome::Admitted(execution))
     }
 
     fn load_durable_children(
@@ -538,6 +593,7 @@ impl AgentRuntime {
                 session: child,
                 task_preview,
                 result,
+                interruption_cause,
             } = durable_child;
             if edge.root_session_id != tree.root_session_id {
                 return Err(format!(
@@ -563,7 +619,7 @@ impl AgentRuntime {
                     durable_path, expected_path
                 ));
             }
-            let status = rehydrated_agent_state(&child, result)?;
+            let status = rehydrated_agent_state(&child, result, interruption_cause)?;
             let snapshot = tree
                 .control
                 .restore_inactive_child(&parent_path, &edge.task_name, child.id, status, None)
@@ -596,7 +652,11 @@ impl AgentRuntime {
             .into_iter()
             .enumerate()
             .map(|(index, child)| {
-                let status = durable_projection_status(&child.session, child.result);
+                let status = durable_projection_status(
+                    &child.session,
+                    child.result,
+                    child.interruption_cause,
+                );
                 Ok(AgentActivityRecord {
                     agent_path: child.edge.agent_path,
                     session_id: child.session.id,
@@ -618,7 +678,7 @@ impl AgentRuntime {
         self: &Arc<Self>,
         execution: AgentRuntimeExecution,
         result: &Result<RunSummary, AppRunError>,
-        cancelled: bool,
+        cancellation_cause: Option<RunCancellationCause>,
     ) {
         let tree = execution.context.tree.clone();
         let durable_success = matches!(
@@ -629,17 +689,28 @@ impl AgentRuntime {
                     SessionStatus::Completed | SessionStatus::AwaitingUser
                 )
         );
-        if !durable_success && (cancelled || result.is_err()) {
-            tree.control.cancel_tree();
-        }
-        let status = if cancelled && !durable_success {
-            AgentStatus::Interrupted
-        } else {
-            match result {
-                Ok(summary) => agent_status_from_summary(summary, None),
-                Err(error) => AgentStatus::Errored(error.to_string()),
+        let terminal_cause = effective_run_terminal_cause(result, cancellation_cause);
+        if !durable_success {
+            if result.is_ok() {
+                if let Some(cause) = terminal_cause.clone() {
+                    tree.control.reconcile_durable_root_terminal(cause);
+                }
+            } else {
+                match terminal_cause.as_ref() {
+                    Some(RunCancellationCause::Interruption(cause)) => {
+                        tree.control.interrupt_tree(*cause);
+                    }
+                    Some(RunCancellationCause::Superseded) => {
+                        let _ = tree.control.cancel_for_durable_terminal(&AgentPath::root());
+                    }
+                    Some(RunCancellationCause::Failure(message)) => {
+                        tree.control.fail_tree(message.clone());
+                    }
+                    None => {}
+                }
             }
-        };
+        }
+        let status = agent_status_from_terminal_result(result, terminal_cause.as_ref(), None);
         if let Ok(scheduled) = execution.complete(status) {
             self.launch_scheduled_turns(&tree, scheduled);
         }
@@ -690,7 +761,11 @@ impl AgentRuntime {
             .collect()
     }
 
-    pub fn cancel_tree_for_session(&self, session_id: SessionId) -> bool {
+    pub fn cancel_tree_for_session(
+        &self,
+        session_id: SessionId,
+        root_cause: TurnInterruptionCause,
+    ) -> bool {
         let Ok(trees) = self.trees.lock() else {
             return false;
         };
@@ -704,8 +779,7 @@ impl AgentRuntime {
             })
         });
         if let Some(tree) = tree {
-            tree.control.cancel_tree();
-            true
+            tree.control.interrupt_tree(root_cause)
         } else {
             false
         }
@@ -896,7 +970,7 @@ impl AgentRuntime {
         if message.trim().is_empty() {
             return Err("agent message must not be empty".to_string());
         }
-        if caller.tree.control.tree_cancel_token().is_cancelled() {
+        if caller.tree.control.tree_is_cancelled() {
             return Err("the agent tree has been cancelled".to_string());
         }
         let recipient_path = caller.path.resolve(target)?;
@@ -1044,7 +1118,8 @@ impl AgentRuntime {
                 };
                 let run_context = context.clone();
                 let runtime_for_run = runtime.clone();
-                let cancel = lease.cancel_token();
+                let run_control = lease.run_control();
+                let request_run_control = run_control.clone();
                 let result = local.block_on(async move {
                     let config = runtime_for_run
                         .materialize_context_config_and_sync_session(&run_context)
@@ -1065,7 +1140,7 @@ impl AgentRuntime {
                         editor_context: None,
                         review_request: None,
                         image_paths: Vec::new(),
-                        cancel,
+                        run_control: request_run_control,
                         live_config: run_context.live_config.clone(),
                         agent_confirmation: Some(run_context.confirmation_prompt()),
                         agent_context: Some(run_context),
@@ -1074,9 +1149,12 @@ impl AgentRuntime {
                         .execute(AppCommand::Run(request), &mut renderer, &mut confirmation)
                         .await
                 });
-                let cancelled = lease.cancel_token().is_cancelled();
-                let status =
-                    local.block_on(runtime.finish_agent_turn(&context, &result, cancelled));
+                let cancellation_cause = run_control.cause();
+                let status = local.block_on(runtime.finish_agent_turn(
+                    &context,
+                    &result,
+                    cancellation_cause,
+                ));
                 let scheduled = context
                     .tree
                     .control
@@ -1125,24 +1203,37 @@ impl AgentRuntime {
         self: &Arc<Self>,
         context: &AgentRunContext,
         result: &Result<RunSummary, AppRunError>,
-        cancelled: bool,
+        cancellation_cause: Option<RunCancellationCause>,
     ) -> AgentStatus {
-        let final_content = match result {
-            Ok(summary) => self.final_assistant_text(summary).await,
-            Err(error) => Some(error.to_string()),
-        };
-        let mut status = if cancelled {
-            AgentStatus::Interrupted
-        } else {
-            match result {
-                Ok(summary) => agent_status_from_summary(summary, final_content.clone()),
-                Err(error) => AgentStatus::Errored(error.to_string()),
+        let terminal_cause = effective_run_terminal_cause(result, cancellation_cause);
+        let final_content = self
+            .final_child_result_content(result, terminal_cause.as_ref())
+            .await;
+        let mut status = match result {
+            Ok(summary)
+                if matches!(
+                    summary.status,
+                    SessionStatus::Completed | SessionStatus::AwaitingUser | SessionStatus::Failed
+                ) =>
+            {
+                durable_child_terminal_status(summary.status, final_content.clone())
             }
+            _ => agent_status_from_terminal_result(
+                result,
+                terminal_cause.as_ref(),
+                final_content.clone(),
+            ),
         };
         if let Ok(mut metadata) = context.tree.metadata.lock()
             && let Some(node) = metadata.get_mut(&context.path)
         {
             node.updated = true;
+        }
+        if interruption_suppresses_child_result_delivery(terminal_cause.as_ref()) {
+            // An interrupted child has no model result to deliver. In particular, approval Abort
+            // stops the root tree and must not leave an "Agent interrupted" mailbox/history item
+            // that would be replayed after the user's next instruction.
+            return status;
         }
 
         let Some(parent) = context.path.parent() else {
@@ -1293,6 +1384,38 @@ impl AgentRuntime {
             .filter(|text| !text.trim().is_empty())
     }
 
+    async fn final_child_result_content(
+        &self,
+        result: &Result<RunSummary, AppRunError>,
+        terminal_cause: Option<&RunCancellationCause>,
+    ) -> Option<String> {
+        match result {
+            Ok(summary) => match summary.status {
+                SessionStatus::Completed | SessionStatus::AwaitingUser => {
+                    self.final_assistant_text(summary).await.or_else(|| {
+                        self.store
+                            .protocol_event_store()
+                            .list_history_items_for_session(summary.session_id)
+                            .ok()
+                            .and_then(|history| durable_child_result(summary.status, &history))
+                    })
+                }
+                SessionStatus::Failed => self
+                    .store
+                    .protocol_event_store()
+                    .list_history_items_for_session(summary.session_id)
+                    .ok()
+                    .and_then(|history| durable_child_result(summary.status, &history)),
+                SessionStatus::Cancelled | SessionStatus::Idle | SessionStatus::Running => None,
+            },
+            Err(error) => match terminal_cause {
+                Some(RunCancellationCause::Interruption(_)) => None,
+                Some(RunCancellationCause::Failure(message)) => Some(message.clone()),
+                Some(RunCancellationCause::Superseded) | None => Some(error.to_string()),
+            },
+        }
+    }
+
     fn append_communication(
         &self,
         session_id: SessionId,
@@ -1351,6 +1474,39 @@ impl AgentRuntime {
     }
 }
 
+fn effective_run_terminal_cause(
+    result: &Result<RunSummary, AppRunError>,
+    cancellation_cause: Option<RunCancellationCause>,
+) -> Option<RunCancellationCause> {
+    match result {
+        Err(error) => {
+            cancellation_cause.or_else(|| Some(RunCancellationCause::Failure(error.to_string())))
+        }
+        Ok(summary) => match summary.status {
+            SessionStatus::Failed => Some(RunCancellationCause::Failure(format!(
+                "run {} settled with durable failed status",
+                summary.session_id
+            ))),
+            SessionStatus::Cancelled => summary
+                .interruption_cause
+                .map(RunCancellationCause::Interruption)
+                .or_else(|| {
+                    Some(RunCancellationCause::Failure(
+                        missing_interruption_cause_message(summary.session_id),
+                    ))
+                }),
+            SessionStatus::Idle | SessionStatus::Running => {
+                Some(RunCancellationCause::Failure(format!(
+                    "run {} returned non-terminal status {}",
+                    summary.session_id,
+                    summary.status.key()
+                )))
+            }
+            SessionStatus::Completed | SessionStatus::AwaitingUser => None,
+        },
+    }
+}
+
 async fn wait_for_control_quiescence(control: &AgentControl) -> Result<(), AgentControlError> {
     loop {
         if control.is_quiescent()? {
@@ -1364,45 +1520,19 @@ async fn wait_for_control_quiescence(control: &AgentControl) -> Result<(), Agent
     }
 }
 
-async fn forward_external_cancel_while_root_active(
-    control: AgentControl,
-    external_cancel: CancellationToken,
-) {
-    let root = AgentPath::root();
-    loop {
-        let root_active = control
-            .list_agents(Some(&root))
-            .ok()
-            .and_then(|agents| agents.into_iter().find(|agent| agent.path == root))
-            .is_some_and(|agent| agent.is_active);
-        if !root_active {
-            return;
-        }
-        let observed_generation = control.activity_generation();
-        let root_still_active = control
-            .list_agents(Some(&root))
-            .ok()
-            .and_then(|agents| agents.into_iter().find(|agent| agent.path == root))
-            .is_some_and(|agent| agent.is_active);
-        if !root_still_active {
-            return;
-        }
-        tokio::select! {
-            _ = external_cancel.cancelled() => {
-                let _ = control.cancel_agent(&root);
-                return;
-            }
-            result = control.wait_for_activity(observed_generation) => {
-                if result.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
 fn agent_control_error(error: AgentControlError) -> String {
     error.to_string()
+}
+
+fn interruption_suppresses_child_result_delivery(cause: Option<&RunCancellationCause>) -> bool {
+    matches!(
+        cause,
+        Some(RunCancellationCause::Interruption(
+            TurnInterruptionCause::ApprovalAborted
+                | TurnInterruptionCause::TreeStopped
+                | TurnInterruptionCause::UserStop
+        ))
+    )
 }
 
 fn scheduled_mail_delivery(
@@ -1440,11 +1570,27 @@ async fn load_durable_agent_children(
         })
         .unwrap_or_else(|| edge.task_name.clone());
         let result = durable_child_result(session.status, &history);
+        let interruption_cause = if session.status == SessionStatus::Cancelled {
+            match protocol_store
+                .latest_turn_position_for_session(edge.child_session_id)
+                .map_err(|error| error.to_string())?
+            {
+                Some((turn_id, _)) => repo
+                    .corroborated_terminal_for_turn(edge.child_session_id, turn_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .and_then(|(_, cause)| cause),
+                None => None,
+            }
+        } else {
+            None
+        };
         durable_children.push(DurableAgentChild {
             edge,
             session,
             task_preview,
             result,
+            interruption_cause,
         });
     }
     Ok(durable_children)
@@ -1527,6 +1673,7 @@ fn content_parts_text(content: &[ContentPart], separator: &str) -> Option<String
 fn rehydrated_agent_state(
     session: &SessionRecord,
     result: Option<String>,
+    interruption_cause: Option<TurnInterruptionCause>,
 ) -> Result<AgentStatus, String> {
     match session.status {
         SessionStatus::Running => {
@@ -1535,31 +1682,77 @@ fn rehydrated_agent_state(
                 session.id
             ));
         }
-        _ => Ok(durable_projection_status(session, result)),
+        _ => Ok(durable_projection_status(
+            session,
+            result,
+            interruption_cause,
+        )),
     }
 }
 
-fn durable_projection_status(session: &SessionRecord, result: Option<String>) -> AgentStatus {
-    match session.status {
+fn durable_projection_status(
+    session: &SessionRecord,
+    result: Option<String>,
+    interruption_cause: Option<TurnInterruptionCause>,
+) -> AgentStatus {
+    if session.status == SessionStatus::Cancelled {
+        return match interruption_cause {
+            Some(_) => AgentStatus::Interrupted,
+            None => AgentStatus::Errored(missing_interruption_cause_message(session.id)),
+        };
+    }
+    durable_child_terminal_status(session.status, result)
+}
+
+fn missing_interruption_cause_message(session_id: SessionId) -> String {
+    format!("run {session_id} settled as cancelled without a typed interruption cause")
+}
+
+fn durable_child_terminal_status(status: SessionStatus, result: Option<String>) -> AgentStatus {
+    match status {
         SessionStatus::Idle => AgentStatus::Shutdown,
         SessionStatus::Running => AgentStatus::Running,
         SessionStatus::Completed | SessionStatus::AwaitingUser => AgentStatus::Completed(result),
         SessionStatus::Cancelled => AgentStatus::Interrupted,
-        SessionStatus::Failed => AgentStatus::Errored(
-            result
-                .unwrap_or_else(|| "Child session failed before this process started".to_string()),
-        ),
+        SessionStatus::Failed => {
+            AgentStatus::Errored(result.unwrap_or_else(|| {
+                "Child session failed without a durable error message".to_string()
+            }))
+        }
     }
 }
 
-fn agent_status_from_summary(summary: &RunSummary, result: Option<String>) -> AgentStatus {
-    match summary.status {
-        SessionStatus::Completed | SessionStatus::AwaitingUser => AgentStatus::Completed(result),
-        SessionStatus::Cancelled => AgentStatus::Interrupted,
-        SessionStatus::Failed => {
-            AgentStatus::Errored(result.unwrap_or_else(|| "agent run failed".to_string()))
+fn agent_status_from_terminal_result(
+    result: &Result<RunSummary, AppRunError>,
+    terminal_cause: Option<&RunCancellationCause>,
+    content: Option<String>,
+) -> AgentStatus {
+    match terminal_cause {
+        Some(RunCancellationCause::Interruption(_)) => AgentStatus::Interrupted,
+        Some(RunCancellationCause::Failure(message)) => {
+            AgentStatus::Errored(content.unwrap_or_else(|| message.clone()))
         }
-        SessionStatus::Idle | SessionStatus::Running => AgentStatus::Running,
+        Some(RunCancellationCause::Superseded) => {
+            AgentStatus::Errored(content.unwrap_or_else(|| {
+                "agent run was superseded before a durable terminal result was returned".to_string()
+            }))
+        }
+        None => match result {
+            Ok(summary)
+                if matches!(
+                    summary.status,
+                    SessionStatus::Completed | SessionStatus::AwaitingUser
+                ) =>
+            {
+                AgentStatus::Completed(content)
+            }
+            Ok(summary) => AgentStatus::Errored(format!(
+                "run {} returned terminal status {} without a typed terminal cause",
+                summary.session_id,
+                summary.status.key()
+            )),
+            Err(error) => AgentStatus::Errored(error.to_string()),
+        },
     }
 }
 

@@ -28,7 +28,7 @@ pub async fn enhance_prompt(config: &ResolvedConfig, raw_prompt: &str) -> Result
     )?;
     let model = ConfigModelCatalog::new(effective_config.clone()).resolve(None)?;
     let mut sink = PromptEnhanceSink::default();
-    client
+    let summary = client
         .stream_chat(
             ChatRequest {
                 model,
@@ -57,6 +57,7 @@ pub async fn enhance_prompt(config: &ResolvedConfig, raw_prompt: &str) -> Result
             &mut sink,
         )
         .await?;
+    crate::llm::validate_toolless_text_response("prompt enhancer", &summary, sink.saw_tool_call)?;
     let output = sink.output.trim().to_string();
     if output.is_empty() {
         return Err(LlmError::Message(
@@ -85,6 +86,7 @@ fn hydrate_prompt_enhance_config_from_report(
 #[derive(Default)]
 struct PromptEnhanceSink {
     output: String,
+    saw_tool_call: bool,
 }
 
 impl LlmEventSink for PromptEnhanceSink {
@@ -94,9 +96,10 @@ impl LlmEventSink for PromptEnhanceSink {
                 self.output.push_str(&delta);
             }
             LlmEvent::ReasoningDelta(_) => {}
-            LlmEvent::ToolCallStart { .. }
-            | LlmEvent::ToolCallArgsDelta { .. }
-            | LlmEvent::Finished { .. } => {}
+            LlmEvent::ToolCallStart { .. } | LlmEvent::ToolCallArgsDelta { .. } => {
+                self.saw_tool_call = true;
+            }
+            LlmEvent::Finished { .. } => {}
         }
         Ok(())
     }

@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read as _;
-use std::process::ExitStatus;
-use std::process::Stdio;
 
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -12,7 +10,6 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::process::Command;
-use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -21,8 +18,11 @@ use crate::edit::path_for_change_storage;
 use crate::error::ToolError;
 use crate::session::ChangeRepository;
 use crate::tool::context::ToolContext;
+use crate::tool::process::ManagedProcess;
+#[cfg(test)]
+use crate::tool::process::{ProcessTerminationStep, process_tree_termination_plan};
 use crate::tool::registry::Tool;
-use crate::tool::truncate::{BoundedPipeOutput, clip_text_with_ellipsis, read_pipe_bounded};
+use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
 use crate::workspace::{AccessKind, PathGuard, is_protected_workspace_authority_path};
 
@@ -111,14 +111,16 @@ impl Tool for ShellTool {
         };
         let encoding_review = command_text_encoding_review(&input.command, family);
         let risks = shell_permission_risks_from(ctx.workspace, &guarded.absolute, &input.command);
-        ctx.confirm_if_needed_with_details(
-            AccessKind::Shell,
-            description.clone(),
-            shell_permission_details(&input.command, guarded.absolute.as_path()),
-            vec![guarded.absolute.clone()],
-            outside_workspace,
-            risks,
-        )?;
+        let effect_admission = ctx
+            .confirm_if_needed_with_details(
+                AccessKind::Shell,
+                description.clone(),
+                shell_permission_details(&input.command, guarded.absolute.as_path()),
+                vec![guarded.absolute.clone()],
+                outside_workspace,
+                risks,
+            )
+            .await?;
 
         let timeout_ms = input
             .timeout_ms
@@ -146,6 +148,7 @@ impl Tool for ShellTool {
             Err(ShellSnapshotError::Other(error)) => return Err(error),
         };
         ctx.run_mutation_fence.assert_owned().await?;
+        effect_admission.admit()?;
         let output = execute_shell_command(
             &ctx.config.shell,
             &guarded.absolute,
@@ -896,6 +899,12 @@ struct CommandOutput {
     stderr_truncated: bool,
 }
 
+enum ShellWaitOutcome {
+    Exited(Result<std::process::ExitStatus, std::io::Error>),
+    TimedOut,
+    Cancelled,
+}
+
 async fn execute_shell_command(
     shell: &crate::config::ShellConfig,
     workdir: &Utf8Path,
@@ -904,6 +913,17 @@ async fn execute_shell_command(
     max_output_bytes: usize,
     cancel: CancellationToken,
 ) -> Result<CommandOutput, ToolError> {
+    if cancel.is_cancelled() {
+        return Ok(CommandOutput {
+            stdout: String::new(),
+            stderr: "command cancelled by user".to_string(),
+            exit_code: None,
+            timed_out: false,
+            cancelled: true,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        });
+    }
     let family = shell.family.unwrap_or(if cfg!(windows) {
         ShellFamily::PowerShell
     } else {
@@ -929,51 +949,31 @@ async fn execute_shell_command(
 
     command.current_dir(workdir.as_std_path());
     apply_shell_environment(&mut command, shell);
-    configure_process_group(&mut command, shell.hide_windows);
-    command.kill_on_drop(true);
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
+    let mut process = ManagedProcess::spawn(command, shell.hide_windows, max_output_bytes).await?;
 
-    let mut child = command.spawn()?;
-    let pid = child
-        .id()
-        .ok_or_else(|| ToolError::Message("spawned shell process has no process id".to_string()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ToolError::Message("stdout pipe was not captured".to_string()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ToolError::Message("stderr pipe was not captured".to_string()))?;
-    let stdout_task = tokio::spawn(read_pipe_bounded(stdout, max_output_bytes));
-    let stderr_task = tokio::spawn(read_pipe_bounded(stderr, max_output_bytes));
-
-    let (status, timed_out, cancelled, execution_error) = tokio::select! {
-        _ = cancel.cancelled() => {
-                match terminate_shell_child(&mut child, pid, shell.hide_windows).await {
-                    Ok(status) => (Some(status), false, true, None),
-                    Err(error) => (None, false, true, Some(error.to_string())),
-                }
-            }
-        result = timeout(Duration::from_millis(timeout_ms), child.wait()) => match result {
-            Ok(result) => (Some(result?), false, false, None),
-            Err(_) => {
-                match terminate_shell_child(&mut child, pid, shell.hide_windows).await {
-                    Ok(status) => (Some(status), true, false, None),
-                    Err(error) => (None, true, false, Some(error.to_string())),
-                }
-            }
+    let wait_outcome = tokio::select! {
+        _ = cancel.cancelled() => ShellWaitOutcome::Cancelled,
+        result = timeout(Duration::from_millis(timeout_ms), process.wait()) => match result {
+            Ok(result) => ShellWaitOutcome::Exited(result),
+            Err(_) => ShellWaitOutcome::TimedOut,
         }
     };
-
-    let cleanup_error = cleanup_shell_process_tree_after_parent_exit(pid, shell.hide_windows)
-        .await
-        .err()
-        .map(|error| error.to_string());
-
-    let stdout_capture = join_pipe(stdout_task, "stdout").await?;
-    let stderr_capture = join_pipe(stderr_task, "stderr").await?;
+    let (completed, timed_out, cancelled, execution_error) = match wait_outcome {
+        ShellWaitOutcome::Exited(Ok(status)) => {
+            (process.finish_after_exit(status).await, false, false, None)
+        }
+        ShellWaitOutcome::Exited(Err(error)) => (
+            process.terminate().await,
+            false,
+            false,
+            Some(error.to_string()),
+        ),
+        ShellWaitOutcome::TimedOut => (process.terminate().await, true, false, None),
+        ShellWaitOutcome::Cancelled => (process.terminate().await, false, true, None),
+    };
+    let cleanup_error = completed.cleanup_error();
+    let stdout_capture = completed.stdout;
+    let stderr_capture = completed.stderr;
     let stdout = captured_shell_text(stdout_capture.bytes.as_slice(), stdout_capture.truncated);
     let mut stderr = captured_shell_text(stderr_capture.bytes.as_slice(), stderr_capture.truncated);
     for message in [
@@ -994,7 +994,7 @@ async fn execute_shell_command(
     Ok(CommandOutput {
         stdout,
         stderr,
-        exit_code: status.and_then(|value| value.code()),
+        exit_code: completed.status.and_then(|value| value.code()),
         timed_out,
         cancelled,
         stdout_truncated: stdout_capture.truncated,
@@ -1011,17 +1011,6 @@ fn captured_shell_text(bytes: &[u8], truncated: bool) -> String {
         text.push_str("[shell stream capture truncated]");
     }
     text
-}
-
-async fn join_pipe(
-    task: JoinHandle<Result<BoundedPipeOutput, std::io::Error>>,
-    label: &str,
-) -> Result<BoundedPipeOutput, ToolError> {
-    task.await
-        .map_err(|error| {
-            ToolError::Message(format!("failed to join shell {label} reader task: {error}"))
-        })?
-        .map_err(|error| ToolError::Message(format!("failed to read shell {label}: {error}")))
 }
 
 fn apply_shell_environment(command: &mut Command, shell: &crate::config::ShellConfig) {
@@ -1065,172 +1054,13 @@ fn platform_bootstrap_env(
     }
 }
 
-#[cfg(unix)]
-fn configure_process_group(command: &mut Command, _hide_window: bool) {
-    use std::os::unix::process::CommandExt;
-
-    command.process_group(0);
-}
-
-#[cfg(windows)]
-fn configure_process_group(command: &mut Command, hide_window: bool) {
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut flags = CREATE_NEW_PROCESS_GROUP;
-    if hide_window {
-        flags |= CREATE_NO_WINDOW;
-    }
-    command.creation_flags(flags);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_process_group(_command: &mut Command, _hide_window: bool) {}
-
-#[cfg(unix)]
-async fn kill_process_tree(pid: u32, _hide_window: bool) -> Result<(), ToolError> {
-    let process_group = format!("-{pid}");
-    let _ = Command::new("kill")
-        .args(["-TERM", &process_group])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let _ = Command::new("kill")
-        .args(["-KILL", &process_group])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    Ok(())
-}
-
-#[cfg(windows)]
-async fn kill_process_tree(pid: u32, hide_window: bool) -> Result<(), ToolError> {
-    let mut command = Command::new("taskkill");
-    command
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    configure_process_group(&mut command, hide_window);
-    let _ = command.status().await;
-    kill_process_descendants_by_parent_id(pid, hide_window).await?;
-    Ok(())
-}
-
-#[cfg(windows)]
-async fn cleanup_shell_process_tree_after_parent_exit(
-    pid: u32,
-    hide_window: bool,
-) -> Result<(), ToolError> {
-    kill_process_descendants_by_parent_id(pid, hide_window).await
-}
-
-#[cfg(windows)]
-async fn kill_process_descendants_by_parent_id(
-    pid: u32,
-    hide_window: bool,
-) -> Result<(), ToolError> {
-    let script = format!(
-        r#"
-$root = {pid}
-$processes = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId
-$known = @{{}}
-$known[$root] = $true
-$descendants = New-Object System.Collections.Generic.List[int]
-do {{
-    $found = $false
-    foreach ($process in $processes) {{
-        $processId = [int]$process.ProcessId
-        $parentId = [int]$process.ParentProcessId
-        if ($known.ContainsKey($parentId) -and -not $known.ContainsKey($processId)) {{
-            $known[$processId] = $true
-            $descendants.Add($processId)
-            $found = $true
-        }}
-    }}
-}} while ($found)
-foreach ($processId in ($descendants | Sort-Object -Descending)) {{
-    try {{ Stop-Process -Id $processId -Force -ErrorAction Stop }} catch {{ }}
-}}
-"#
-    );
-    let mut command = Command::new("powershell");
-    command
-        .args(["-NoProfile", "-Command", &script])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    configure_process_group(&mut command, hide_window);
-    let _ = command.status().await;
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn cleanup_shell_process_tree_after_parent_exit(
-    pid: u32,
-    _hide_window: bool,
-) -> Result<(), ToolError> {
-    kill_process_tree(pid, false).await
-}
-
-#[cfg(not(any(unix, windows)))]
-async fn cleanup_shell_process_tree_after_parent_exit(
-    _pid: u32,
-    _hide_window: bool,
-) -> Result<(), ToolError> {
-    Ok(())
-}
-
-async fn terminate_shell_child(
-    child: &mut tokio::process::Child,
-    pid: u32,
-    hide_window: bool,
-) -> Result<ExitStatus, ToolError> {
-    for step in shell_timeout_termination_plan() {
-        match step {
-            ShellTerminationStep::ProcessTreeKill => {
-                kill_process_tree(pid, hide_window).await?;
-            }
-            ShellTerminationStep::ParentStartKill => {
-                let _ = child.start_kill();
-            }
-            ShellTerminationStep::WaitForParent => {
-                return timeout(Duration::from_secs(5), child.wait())
-                    .await
-                    .map_err(|_| {
-                        ToolError::Message(
-                            "shell command timed out and could not be terminated cleanly"
-                                .to_string(),
-                        )
-                    })?
-                    .map_err(ToolError::from);
-            }
-        }
-    }
-    Err(ToolError::Message(
-        "shell command timed out and no termination wait step was configured".to_string(),
-    ))
-}
-
-#[cfg(not(any(unix, windows)))]
-async fn kill_process_tree(_pid: u32, _hide_window: bool) -> Result<(), ToolError> {
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ShellTerminationStep {
-    ParentStartKill,
-    ProcessTreeKill,
-    WaitForParent,
-}
-
+#[cfg(test)]
 fn shell_timeout_termination_plan() -> Vec<ShellTerminationStep> {
-    vec![
-        ShellTerminationStep::ProcessTreeKill,
-        ShellTerminationStep::ParentStartKill,
-        ShellTerminationStep::WaitForParent,
-    ]
+    process_tree_termination_plan()
 }
+
+#[cfg(test)]
+type ShellTerminationStep = ProcessTerminationStep;
 
 #[cfg(test)]
 fn references_outside_workspace(workspace: &crate::workspace::Workspace, command: &str) -> bool {
@@ -2661,6 +2491,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_cancelled_shell_returns_without_starting_an_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let output = super::execute_shell_command(
+            &config.shell,
+            &root,
+            pre_cancelled_write_command(),
+            5_000,
+            1_024,
+            cancel,
+        )
+        .await
+        .expect("pre-cancel is a reportable shell outcome");
+
+        assert!(output.cancelled);
+        assert!(!root.join("pre-cancelled.txt").exists());
+    }
+
+    #[tokio::test]
     async fn shell_stream_capture_is_bounded() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
@@ -2722,6 +2575,16 @@ mod tests {
     #[cfg(not(windows))]
     fn cancelled_write_command() -> &'static str {
         "printf changed > cancelled.txt; sleep 5"
+    }
+
+    #[cfg(windows)]
+    fn pre_cancelled_write_command() -> &'static str {
+        "Set-Content -LiteralPath pre-cancelled.txt -Value changed -Encoding UTF8"
+    }
+
+    #[cfg(not(windows))]
+    fn pre_cancelled_write_command() -> &'static str {
+        "printf changed > pre-cancelled.txt"
     }
 
     #[cfg(windows)]

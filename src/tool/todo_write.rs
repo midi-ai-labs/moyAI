@@ -20,6 +20,19 @@ pub struct TodoWriteInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct UpdatePlanInput {
+    #[serde(default)]
+    pub explanation: Option<String>,
+    pub plan: Vec<UpdatePlanInputItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdatePlanInputItem {
+    pub step: String,
+    pub status: TodoStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct TodoWriteInputItem {
     #[serde(default)]
     pub id: Option<String>,
@@ -40,7 +53,7 @@ pub struct TodoWriteInputItem {
 }
 
 #[derive(Debug, Default)]
-pub struct TodoWriteTool;
+pub struct UpdatePlanTool;
 
 fn deserialize_string_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
@@ -96,63 +109,35 @@ fn string_vec_from_value(value: Value) -> Result<Vec<String>, String> {
 }
 
 #[async_trait(?Send)]
-impl Tool for TodoWriteTool {
+impl Tool for UpdatePlanTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: ToolName::TodoWrite,
-            description: "Update the client-visible progress checklist for the current run. This is a progress projection like Codex `update_plan`; it does not replace requested-work, verification, closeout, or tool authority.",
+            name: ToolName::UpdatePlan,
+            description: "Update the client-visible plan for a non-trivial task. Keep steps concise, ordered, and current as work completes or the approach changes. The plan is progress projection only and does not replace doing or verifying the requested work.",
             input_schema: json!({
                 "type": "object",
-                "required": ["todos"],
+                "additionalProperties": false,
+                "required": ["plan"],
                 "properties": {
-                    "todos": {
+                    "explanation": {
+                        "type": "string",
+                        "description": "Optional short explanation of why the plan changed."
+                    },
+                    "plan": {
                         "type": "array",
-                            "description": "The complete updated progress checklist for the current run.",
+                        "description": "The complete updated plan in logical execution order.",
                         "items": {
                             "type": "object",
-                            "required": ["content", "status"],
+                            "additionalProperties": false,
+                            "required": ["step", "status"],
                             "properties": {
-                                "id": {
+                                "step": {
                                     "type": "string",
-                                    "description": "Stable todo id. Human-readable ids such as `step1` are allowed; omitted ids are normalized automatically."
-                                },
-                                "content": {
-                                    "type": "string",
-                                    "description": "Short task description."
-                                },
-                                "kind": {
-                                    "type": "string",
-                                    "enum": ["work", "verification", "repair", "completion"],
-                                    "description": "Task kind. Optional when the task is plain work."
+                                    "description": "A concise, verifiable step."
                                 },
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "blocked", "completed", "cancelled"]
-                                },
-                                "priority": {
-                                    "type": "string",
-                                    "enum": ["high", "medium", "low"],
-                                    "description": "Optional priority. If omitted, moyai defaults verification/repair/completion or in-progress work to `high`, and defaults the rest to `medium`."
-                                },
-                                "targets": {
-                                    "type": "array",
-                                    "items": { "type": "string" },
-                                    "description": "Primary files or directories touched by this task."
-                                },
-                                "depends_on": {
-                                    "type": "array",
-                                    "items": { "type": "string" },
-                                    "description": "Todo ids that must be completed before this task becomes actionable. These may reference the same human-readable ids used in this payload."
-                                },
-                                "success_criteria": {
-                                    "type": "array",
-                                    "items": { "type": "string" },
-                                    "description": "Short acceptance criteria for this task."
-                                },
-                                "blocked_by": {
-                                    "type": "array",
-                                    "items": { "type": "string" },
-                                    "description": "Concrete reasons this blocked task cannot proceed yet."
+                                    "enum": ["pending", "in_progress", "completed"]
                                 }
                             }
                         }
@@ -169,8 +154,8 @@ impl Tool for TodoWriteTool {
     ) -> Result<ToolResult, ToolError> {
         let session_repo = ctx.services.store.session_repo();
         let existing_todos = session_repo.list_todos(ctx.session.session.id).await?;
-        let todos =
-            effective_todos_from_arguments(ctx.session.session.id, raw_arguments, &existing_todos)?;
+        let (todos, explanation) =
+            effective_plan_from_arguments(ctx.session.session.id, raw_arguments, &existing_todos)?;
         validate_todos(&todos)?;
         ctx.run_mutation_fence.assert_owned().await?;
         session_repo
@@ -191,12 +176,78 @@ impl Tool for TodoWriteTool {
                 "open_count": open_count,
                 "blocked_count": blocked_count,
                 "todo_count": todos.len(),
+                "explanation": explanation,
             }),
             truncated_output_path: None,
             recorded_changes: Vec::new(),
             change_summaries: Vec::new(),
         })
     }
+}
+
+pub(crate) fn effective_plan_from_arguments(
+    session_id: SessionId,
+    raw_arguments: Value,
+    existing_todos: &[TodoItem],
+) -> Result<(Vec<TodoItem>, Option<String>), ToolError> {
+    let normalized = match raw_arguments {
+        Value::String(text) => serde_json::from_str::<Value>(&text).map_err(|error| {
+            ToolError::Message(format!(
+                "update_plan arguments must be valid JSON when sent as a string: {error}"
+            ))
+        })?,
+        other => other,
+    };
+
+    // Accept the former rich `todowrite` payload only as a compatibility reader. The
+    // advertised schema and all newly persisted tool identities use `update_plan`.
+    if normalized.get("plan").is_none() && normalized.get("todos").is_some() {
+        return effective_todos_from_arguments(session_id, normalized, existing_todos)
+            .map(|todos| (todos, None));
+    }
+
+    let input = serde_json::from_value::<UpdatePlanInput>(normalized)?;
+    let explanation = input
+        .explanation
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let todos = input
+        .plan
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let content = item.step.trim().to_string();
+            if content.is_empty() {
+                return Err(ToolError::Message(
+                    "update_plan requires every step to be non-empty".to_string(),
+                ));
+            }
+            if matches!(item.status, TodoStatus::Blocked | TodoStatus::Cancelled) {
+                return Err(ToolError::Message(
+                    "update_plan status must be `pending`, `in_progress`, or `completed`"
+                        .to_string(),
+                ));
+            }
+            Ok(TodoItem {
+                id: TodoId::from_stable_input(&format!(
+                    "{session_id}:update_plan:{index}:{content}"
+                )),
+                content,
+                kind: TodoKind::Work,
+                status: item.status,
+                priority: if matches!(item.status, TodoStatus::InProgress) {
+                    TodoPriority::High
+                } else {
+                    TodoPriority::Medium
+                },
+                targets: Vec::new(),
+                depends_on: Vec::new(),
+                success_criteria: Vec::new(),
+                blocked_by: Vec::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((todos, explanation))
 }
 
 pub(crate) fn effective_todos_from_arguments(
@@ -396,6 +447,62 @@ fn todo_status_text(value: TodoStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_plan_exposes_the_small_codex_style_schema() {
+        let spec = UpdatePlanTool.spec();
+
+        assert_eq!(spec.name, ToolName::UpdatePlan);
+        assert_eq!(spec.input_schema["required"], json!(["plan"]));
+        assert_eq!(
+            spec.input_schema["properties"]["plan"]["items"]["required"],
+            json!(["step", "status"])
+        );
+        assert!(spec.input_schema["properties"].get("todos").is_none());
+    }
+
+    #[test]
+    fn update_plan_normalizes_only_projection_fields() {
+        let session_id = SessionId::new();
+        let (todos, explanation) = effective_plan_from_arguments(
+            session_id,
+            json!({
+                "explanation": "Evidence changed the next step",
+                "plan": [
+                    {"step": "Inspect the relevant contracts", "status": "completed"},
+                    {"step": "Implement the smallest coherent change", "status": "in_progress"},
+                    {"step": "Verify the outcome", "status": "pending"}
+                ]
+            }),
+            &[],
+        )
+        .expect("plan");
+
+        assert_eq!(
+            explanation.as_deref(),
+            Some("Evidence changed the next step")
+        );
+        assert_eq!(todos.len(), 3);
+        assert!(todos.iter().all(|todo| todo.kind == TodoKind::Work));
+        assert!(todos.iter().all(|todo| todo.targets.is_empty()));
+        assert!(todos.iter().all(|todo| todo.depends_on.is_empty()));
+        assert_eq!(todos[1].priority, TodoPriority::High);
+        validate_todos(&todos).expect("valid plan");
+    }
+
+    #[test]
+    fn update_plan_rejects_legacy_only_statuses_in_the_canonical_shape() {
+        let error = effective_plan_from_arguments(
+            SessionId::new(),
+            json!({
+                "plan": [{"step": "Wait for input", "status": "blocked"}]
+            }),
+            &[],
+        )
+        .expect_err("blocked is not canonical");
+
+        assert!(error.to_string().contains("pending"));
+    }
 
     #[test]
     fn todo_write_preserves_declared_contract_fields() {

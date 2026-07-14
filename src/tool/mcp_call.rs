@@ -51,13 +51,15 @@ impl Tool for McpCallTool {
             Some(tool_name) => format!("Call MCP tool {}:{}", input.server_id, tool_name),
             None => format!("List MCP tools from {}", input.server_id),
         };
-        ctx.confirm_if_needed(
-            crate::workspace::AccessKind::Read,
-            summary,
-            Vec::new(),
-            false,
-            vec![PermissionRisk::Network],
-        )?;
+        let effect_admission = ctx
+            .confirm_if_needed(
+                crate::workspace::AccessKind::Read,
+                summary,
+                Vec::new(),
+                false,
+                vec![PermissionRisk::Network],
+            )
+            .await?;
         let route = ctx
             .services
             .store
@@ -88,10 +90,16 @@ impl Tool for McpCallTool {
                         route,
                         tool_name,
                         input.arguments.unwrap_or(Value::Object(Default::default())),
+                        || effect_admission.admit(),
                     )
                     .await?
             }
-            None => ctx.services.mcp.list_tools(&input.server_id, route).await?,
+            None => {
+                ctx.services
+                    .mcp
+                    .list_tools(&input.server_id, route, || effect_admission.admit())
+                    .await?
+            }
         };
 
         match operation {

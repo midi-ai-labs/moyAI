@@ -52,6 +52,7 @@ impl DoclingClient {
     pub async fn convert(
         &self,
         request: DoclingConvertRequest,
+        mut effect_checkpoint: impl FnMut() -> Result<(), ToolError>,
     ) -> Result<DoclingConvertResult, ToolError> {
         if !self.config.enabled {
             return Err(ToolError::Message(
@@ -67,8 +68,14 @@ impl DoclingClient {
                 .map(str::trim)
                 .filter(|value| !value.is_empty()),
         ) {
-            (Some(path), None) => self.convert_file(path, &request).await,
-            (None, Some(source_url)) => self.convert_source(source_url, &request).await,
+            (Some(path), None) => {
+                self.convert_file(path, &request, &mut effect_checkpoint)
+                    .await
+            }
+            (None, Some(source_url)) => {
+                self.convert_source(source_url, &request, &mut effect_checkpoint)
+                    .await
+            }
             (Some(_), Some(_)) => Err(ToolError::Message(
                 "docling_convert accepts exactly one of `path` or `source_url`".to_string(),
             )),
@@ -112,6 +119,7 @@ impl DoclingClient {
         &self,
         path: &Utf8Path,
         request: &DoclingConvertRequest,
+        effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<DoclingConvertResult, ToolError> {
         let endpoint = endpoint(&self.config.base_url, "/v1/convert/file");
         let bytes = tokio::fs::read(path.as_std_path())
@@ -129,9 +137,11 @@ impl DoclingClient {
         let mut form = Form::new().part("files", part);
         form = append_convert_form_fields(form, request);
 
-        let body = self
+        let request = self
             .request_builder(&endpoint, reqwest::Method::POST)?
-            .multipart(form)
+            .multipart(form);
+        effect_checkpoint()?;
+        let body = request
             .send()
             .await
             .map_err(|error| ToolError::Message(format!("docling request failed: {error}")))?;
@@ -142,6 +152,7 @@ impl DoclingClient {
         &self,
         source_url: &str,
         request: &DoclingConvertRequest,
+        effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<DoclingConvertResult, ToolError> {
         let endpoint = endpoint(&self.config.base_url, "/v1/convert/source");
         let mut options = serde_json::Map::new();
@@ -185,10 +196,12 @@ impl DoclingClient {
             "options": Value::Object(options),
         });
 
-        let body = self
+        let request = self
             .request_builder(&endpoint, reqwest::Method::POST)?
             .header("Content-Type", "application/json")
-            .body(documents.to_string())
+            .body(documents.to_string());
+        effect_checkpoint()?;
+        let body = request
             .send()
             .await
             .map_err(|error| ToolError::Message(format!("docling request failed: {error}")))?;
@@ -382,5 +395,66 @@ fn compact_body(body: &str) -> String {
         compact
     } else {
         clip_text_with_ellipsis(&compact, 243)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::routing::any;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn typed_effect_admission_is_checked_at_docling_send_boundary() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Docling fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let handler_count = Arc::clone(&request_count);
+        let app = Router::new().fallback(any(move || {
+            let handler_count = Arc::clone(&handler_count);
+            async move {
+                handler_count.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Docling fixture");
+        });
+
+        let client = DoclingClient::new(DoclingConfig {
+            enabled: true,
+            base_url: format!("http://{address}"),
+            timeout_ms: 2_000,
+            api_key_env: None,
+            headers: BTreeMap::new(),
+        });
+        let error = client
+            .convert(
+                DoclingConvertRequest {
+                    path: None,
+                    source_url: Some("https://example.test/document.pdf".to_string()),
+                    from_formats: Vec::new(),
+                    to_formats: vec!["md".to_string()],
+                    do_ocr: None,
+                    include_images: Some(false),
+                    page_range: None,
+                },
+                || Err(ToolError::RunInterrupted),
+            )
+            .await
+            .expect_err("the typed terminal owner must reject the network send");
+
+        assert!(matches!(error, ToolError::RunInterrupted));
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 }

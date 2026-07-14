@@ -580,7 +580,7 @@ fn markdown_session_terminal_summary(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Completed => "session completed",
         SessionStatus::AwaitingUser => "session awaiting user",
-        SessionStatus::Cancelled => "run cancelled by user",
+        SessionStatus::Cancelled => "run cancelled",
         SessionStatus::Failed => "session failed",
         SessionStatus::Running | SessionStatus::Idle => "",
     }
@@ -1036,6 +1036,8 @@ fn tool_lifecycle_status_from_session_status(status: ToolCallStatus) -> ToolLife
         ToolCallStatus::Pending => ToolLifecycleStatus::Pending,
         ToolCallStatus::Running => ToolLifecycleStatus::Running,
         ToolCallStatus::Completed => ToolLifecycleStatus::Completed,
+        ToolCallStatus::Declined => ToolLifecycleStatus::Declined,
+        ToolCallStatus::Cancelled => ToolLifecycleStatus::Cancelled,
         ToolCallStatus::Failed => ToolLifecycleStatus::Failed,
     }
 }

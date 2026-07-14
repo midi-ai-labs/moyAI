@@ -41,6 +41,7 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
     current_session_label: "Session A",
     status_message: "Ready",
     status_detail: "",
+    status_code: "plain",
     access_label: "default",
     access_target: {
       workspacePath: "C:/workspace",

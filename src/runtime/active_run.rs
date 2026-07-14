@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::error::RuntimeError;
+use crate::protocol::{HistoryItemId, SteerTurn, TurnId, TurnInterruptionCause};
+use crate::runtime::{RunCancelOutcome, RunControl};
+use crate::session::SessionId;
 use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender},
     watch,
 };
-use tokio_util::sync::CancellationToken;
-
-use crate::error::RuntimeError;
-use crate::protocol::{HistoryItemId, SteerTurn, TurnId};
-use crate::session::SessionId;
 
 #[derive(Clone, Default)]
 pub struct ActiveRunRegistry {
@@ -24,7 +23,7 @@ struct ActiveRunState {
 
 struct ActiveRunEntry {
     generation: u64,
-    cancel: CancellationToken,
+    control: RunControl,
     steer_tx: UnboundedSender<ActiveSteerInput>,
     steer_activity_tx: watch::Sender<u64>,
     turn_id: Option<TurnId>,
@@ -43,11 +42,19 @@ pub struct ActiveSteerInput {
     pub steer: SteerTurn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveRunInterruptOutcome {
+    Applied,
+    Deferred,
+    AlreadyClassified,
+    NotActive,
+}
+
 impl ActiveRunRegistry {
     pub fn try_start(
         &self,
         session_id: SessionId,
-        cancel: CancellationToken,
+        control: RunControl,
     ) -> Result<ActiveRunLease, RuntimeError> {
         let mut state = self.lock()?;
         if state.runs.contains_key(&session_id) {
@@ -63,7 +70,7 @@ impl ActiveRunRegistry {
             session_id,
             ActiveRunEntry {
                 generation,
-                cancel,
+                control,
                 steer_tx,
                 steer_activity_tx,
                 turn_id: None,
@@ -84,15 +91,31 @@ impl ActiveRunRegistry {
             .unwrap_or(false)
     }
 
-    pub fn cancel(&self, session_id: SessionId) -> bool {
+    pub fn cancel(
+        &self,
+        session_id: SessionId,
+        cause: TurnInterruptionCause,
+    ) -> ActiveRunInterruptOutcome {
         let Ok(state) = self.lock() else {
-            return false;
+            return ActiveRunInterruptOutcome::NotActive;
         };
         let Some(run) = state.runs.get(&session_id) else {
-            return false;
+            return ActiveRunInterruptOutcome::NotActive;
         };
-        run.cancel.cancel();
-        true
+        match run
+            .control
+            .request_cancel(crate::runtime::RunCancellationCause::Interruption(cause))
+        {
+            RunCancelOutcome::Applied => ActiveRunInterruptOutcome::Applied,
+            RunCancelOutcome::Deferred(_) => ActiveRunInterruptOutcome::Deferred,
+            RunCancelOutcome::Rejected => ActiveRunInterruptOutcome::AlreadyClassified,
+        }
+    }
+
+    pub fn run_control(&self, session_id: SessionId) -> Option<RunControl> {
+        self.lock()
+            .ok()
+            .and_then(|state| state.runs.get(&session_id).map(|run| run.control.clone()))
     }
 
     pub fn active_turn_id(&self, session_id: SessionId) -> Option<TurnId> {
@@ -258,7 +281,7 @@ mod tests {
             let release = release.clone();
             workers.push(thread::spawn(move || {
                 barrier.wait();
-                let lease = registry.try_start(session_id, CancellationToken::new());
+                let lease = registry.try_start(session_id, RunControl::new());
                 if lease.is_ok() {
                     release.wait();
                 }
@@ -282,9 +305,9 @@ mod tests {
     fn cancel_and_steer_target_the_registered_run() {
         let registry = ActiveRunRegistry::default();
         let session_id = SessionId::new();
-        let token = CancellationToken::new();
+        let control = RunControl::new();
         let mut lease = registry
-            .try_start(session_id, token.clone())
+            .try_start(session_id, control.clone())
             .expect("register run");
         let turn_id = TurnId::new();
         lease.set_turn_id(turn_id).expect("set turn");
@@ -304,8 +327,71 @@ mod tests {
             receiver.try_recv().expect("steer").history_item_id,
             history_item_id
         );
-        assert!(registry.cancel(session_id));
-        assert!(token.is_cancelled());
+        assert_eq!(
+            registry.cancel(session_id, TurnInterruptionCause::UserStop),
+            ActiveRunInterruptOutcome::Applied
+        );
+        assert_eq!(
+            registry.cancel(session_id, TurnInterruptionCause::ApprovalAborted),
+            ActiveRunInterruptOutcome::AlreadyClassified,
+            "a later classification cannot replace the first interruption cause"
+        );
+        assert!(control.is_cancelled());
+        assert_eq!(
+            control.cause(),
+            Some(crate::runtime::RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop
+            ))
+        );
+    }
+
+    #[test]
+    fn stop_does_not_reclassify_an_active_run_that_already_failed() {
+        let registry = ActiveRunRegistry::default();
+        let session_id = SessionId::new();
+        let control = RunControl::new();
+        let _lease = registry
+            .try_start(session_id, control.clone())
+            .expect("register run");
+
+        assert!(control.fail("provider transport failed"));
+        assert_eq!(
+            registry.cancel(session_id, TurnInterruptionCause::UserStop),
+            ActiveRunInterruptOutcome::AlreadyClassified
+        );
+        assert_eq!(
+            control.cause(),
+            Some(crate::runtime::RunCancellationCause::Failure(
+                "provider transport failed".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn stop_is_reported_as_deferred_while_success_commit_owns_classification() {
+        let registry = ActiveRunRegistry::default();
+        let session_id = SessionId::new();
+        let control = RunControl::new();
+        let _lease = registry
+            .try_start(session_id, control.clone())
+            .expect("register run");
+        let success_commit = control
+            .begin_success_commit()
+            .expect("reserve success commit");
+
+        assert_eq!(
+            registry.cancel(session_id, TurnInterruptionCause::UserStop),
+            ActiveRunInterruptOutcome::Deferred
+        );
+        assert_eq!(
+            registry.cancel(session_id, TurnInterruptionCause::ApprovalAborted),
+            ActiveRunInterruptOutcome::AlreadyClassified
+        );
+        assert_eq!(control.cause(), None);
+        assert!(!control.is_cancelled());
+
+        assert!(success_commit.seal());
+        assert!(control.success_is_sealed());
     }
 
     #[tokio::test]
@@ -313,7 +399,7 @@ mod tests {
         let registry = ActiveRunRegistry::default();
         let session_id = SessionId::new();
         let mut lease = registry
-            .try_start(session_id, CancellationToken::new())
+            .try_start(session_id, RunControl::new())
             .expect("register run");
         let turn_id = TurnId::new();
         lease.set_turn_id(turn_id).expect("set turn");

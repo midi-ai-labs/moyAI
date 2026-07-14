@@ -1,9 +1,58 @@
 import type { DesktopWebState } from "./types";
 
+export type DesktopCommandErrorCategory =
+  | "unknown"
+  | "provider"
+  | "model"
+  | "image"
+  | "permission"
+  | "runtime"
+  | "storage";
+
+export type DesktopCommandErrorCode =
+  | "unknown"
+  | "provider_transport"
+  | "model_unavailable"
+  | "image_unsupported"
+  | "permission_policy_denied"
+  | "runtime_failure"
+  | "storage_failure";
+
+export interface DesktopCommandErrorInfo {
+  kind: "conflict" | "internal" | "unknown";
+  category: DesktopCommandErrorCategory;
+  code: DesktopCommandErrorCode;
+  message: string;
+}
+
 export function commandConflictState(error: unknown): DesktopWebState | null {
   const payload = commandErrorPayload(error);
   if (!payload || payload.kind !== "conflict" || !isDesktopWebState(payload.state)) return null;
   return payload.state;
+}
+
+export function commandInternalState(error: unknown): DesktopWebState | null {
+  const payload = commandErrorPayload(error);
+  if (!payload || payload.kind !== "internal" || !isDesktopWebState(payload.state)) return null;
+  return payload.state;
+}
+
+export function commandErrorInfo(error: unknown): DesktopCommandErrorInfo {
+  const payload = commandErrorPayload(error);
+  if (!payload) {
+    return {
+      kind: "unknown",
+      category: "unknown",
+      code: "unknown",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  return {
+    kind: payload.kind === "conflict" || payload.kind === "internal" ? payload.kind : "unknown",
+    category: commandErrorCategory(payload.category),
+    code: commandErrorCode(payload.code),
+    message: typeof payload.message === "string" ? payload.message : String(error),
+  };
 }
 
 function commandErrorPayload(error: unknown): Record<string, unknown> | null {
@@ -34,5 +83,33 @@ function isProjectionRevision(value: unknown): value is string {
     return BigInt(value) <= 18_446_744_073_709_551_615n;
   } catch {
     return false;
+  }
+}
+
+function commandErrorCategory(value: unknown): DesktopCommandErrorCategory {
+  switch (value) {
+    case "provider":
+    case "model":
+    case "image":
+    case "permission":
+    case "runtime":
+    case "storage":
+      return value;
+    default:
+      return "unknown";
+  }
+}
+
+function commandErrorCode(value: unknown): DesktopCommandErrorCode {
+  switch (value) {
+    case "provider_transport":
+    case "model_unavailable":
+    case "image_unsupported":
+    case "permission_policy_denied":
+    case "runtime_failure":
+    case "storage_failure":
+      return value;
+    default:
+      return "unknown";
   }
 }

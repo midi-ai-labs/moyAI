@@ -8,8 +8,19 @@ import {
   type ConfigValueInput,
   updateConfigDraftValue,
 } from "./config_mutation";
-import { beginLocalDecision, failLocalDecision, finishLocalDecision } from "./decision_state";
-import { isRegularModalOverlay, modalIsOpen, nextDialogFocusIndex } from "./modal_state";
+import {
+  beginLocalDecision,
+  failLocalDecision,
+  finishLocalDecision,
+  permissionDecisionForEscape,
+} from "./decision_state";
+import {
+  confirmationFocusSelectors,
+  isRegularModalOverlay,
+  modalIdentity,
+  modalIsOpen,
+  nextDialogFocusIndex,
+} from "./modal_state";
 import { globalShortcutAction } from "./keyboard_shortcut";
 import { navigationIsIdle } from "./navigation_state";
 import { rowMutationArgs } from "./row_target";
@@ -65,8 +76,9 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
         trapDialogFocus(event);
       } else if (event.key === "Escape" && currentState.confirmation_visible) {
         event.preventDefault();
-        if (event.repeat) return;
-        void dispatchRegisteredAction("deny", currentState, context, { index: -1, value: "" });
+        if (permissionDecisionForEscape(currentState.confirmation_visible, event.repeat) === "abort") {
+          void dispatchRegisteredAction("abort-permission", currentState, context, { index: -1, value: "" });
+        }
       } else if (event.key === "Escape" && context.uiState.pendingLocalConfirmation) {
         event.preventDefault();
         if (!context.uiState.localConfirmationDecisionPending) {
@@ -241,7 +253,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
     const action = node.dataset.action ?? "";
     const index = Number(node.dataset.index ?? "-1");
     const value = node.dataset.agentPath ?? node.dataset.mode ?? "";
-    void dispatchAction(action, index, value, currentState, context).catch((error) => context.reportError(String(error)));
+    void dispatchAction(action, index, value, currentState, context).catch((error) => context.reportError(error));
   });
   document.addEventListener("keydown", (event) => {
     if (event.repeat || (event.key !== "Enter" && event.key !== " ")) return;
@@ -258,7 +270,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
     const action = node.dataset.action ?? "";
     const index = Number(node.dataset.index ?? "-1");
     const value = node.dataset.agentPath ?? node.dataset.mode ?? "";
-    void dispatchAction(action, index, value, currentState, context).catch((error) => context.reportError(String(error)));
+    void dispatchAction(action, index, value, currentState, context).catch((error) => context.reportError(error));
   });
   document.addEventListener("pointerdown", (event) => {
     const target = event.target;
@@ -293,7 +305,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
     const currentState = context.getViewState();
     if (currentState) {
       void dispatchRegisteredAction("toggle-maximize-window", currentState, context, { index: -1, value: "" }).catch((error) =>
-        context.reportError(String(error)),
+        context.reportError(error),
       );
     }
   });
@@ -308,7 +320,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
     const action = control.dataset.action ?? "";
     if (currentState && action) {
       void dispatchRegisteredAction(action, currentState, context, { index: -1, value: "" }).catch((error) =>
-        context.reportError(String(error)),
+        context.reportError(error),
       );
     }
   });
@@ -429,7 +441,7 @@ async function flushTextMutation(key: string, context: ActionContext): Promise<v
       }
     })
     .catch((error) => {
-      if (!context.recoverCommandConflict(error)) context.reportError(String(error));
+      if (!context.recoverCommandConflict(error)) context.reportError(error);
     })
     .finally(() => {
       entry.inFlight = null;
@@ -618,7 +630,7 @@ async function flushOpacityPreview(context: ActionContext): Promise<void> {
   try {
     await command<void>("preview_window_opacity", { percent });
   } catch (error) {
-    context.reportError(String(error));
+    context.reportError(error);
   } finally {
     opacityPreviewInFlight = false;
     if (pendingOpacityPreviewPercent !== null) void flushOpacityPreview(context);
@@ -728,7 +740,7 @@ async function dispatchAction(action: string, index: number, value: string, stat
             if (context.recoverCommandConflict(error)) return;
             if (!finished) return;
             context.rerender();
-            context.reportError(String(error));
+            context.reportError(error);
             return;
           }
           if (!finishConfigMutation(context.uiState, request, imported, context.getViewState()?.config_target ?? null)) return;
@@ -810,7 +822,7 @@ async function runLocalConfirmationMutation(
       return;
     }
     context.rerender();
-    context.reportError(String(error));
+    context.reportError(error);
   }
 }
 
@@ -826,7 +838,11 @@ async function runIndexedMutation(
 }
 
 function focusOverlayPrimary(state: DesktopWebState, uiState: UiLocalState): void {
-  const overlayKey = state.confirmation_visible ? "permission" : uiState.pendingLocalConfirmation ? "local-confirm" : state.overlay;
+  const overlayKey = state.confirmation_visible
+    ? modalIdentity(state)
+    : uiState.pendingLocalConfirmation
+      ? "local-confirm"
+      : state.overlay;
   const active = document.activeElement;
   const activeModal = document.querySelector<HTMLElement>(".modal[role='dialog'], .modal[role='alertdialog'], .modal[data-modal]");
   if (
@@ -842,7 +858,7 @@ function focusOverlayPrimary(state: DesktopWebState, uiState: UiLocalState): voi
     if (active && active !== document.body && active !== document.documentElement) return;
   }
   uiState.lastFocusedOverlay = overlayKey;
-  const confirmationOverlay = overlayKey === "permission" || overlayKey === "local-confirm";
+  const confirmationOverlay = overlayKey.startsWith("permission:") || overlayKey === "local-confirm";
   const selector =
     overlayKey === "command_palette"
       ? "#local-search"
@@ -863,10 +879,13 @@ function focusOverlayPrimary(state: DesktopWebState, uiState: UiLocalState): voi
     return;
   }
   requestAnimationFrame(() => {
+    const confirmationPending = overlayKey.startsWith("permission:")
+      ? uiState.permissionDecision?.phase === "submitting"
+      : uiState.localConfirmationDecisionPending;
     const target = confirmationOverlay
-      ? document.querySelector<HTMLElement>(".modal-actions button[autofocus]:not(:disabled)")
-        ?? document.querySelector<HTMLElement>(".modal-actions button:not(:disabled)")
-        ?? document.querySelector<HTMLElement>(".permission-decision-status")
+      ? confirmationFocusSelectors(confirmationPending)
+        .map((candidate) => document.querySelector<HTMLElement>(candidate))
+        .find((candidate) => candidate !== null)
       : document.querySelector<HTMLElement>(selector);
     target?.focus();
     if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {

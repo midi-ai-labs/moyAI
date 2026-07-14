@@ -1,7 +1,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { command } from "./api";
 import { agentActivityRowsChanged } from "./agent_activity";
-import { commandConflictState } from "./command_error";
+import { commandConflictState, commandInternalState } from "./command_error";
 import type { ActionContext } from "./actions";
 import {
   installGlobalKeyboardShortcuts,
@@ -35,14 +35,18 @@ import {
   deferredProjectionCandidatePreferred,
   projectionUpdateAccepted,
 } from "./projection_state";
-import { modalIsOpen } from "./modal_state";
+import { modalIdentity, modalIsOpen } from "./modal_state";
 import { autoRefreshAllowed, runtimePollingRequired } from "./polling_state";
 import {
   beginPermissionDecision,
   failPermissionDecision,
   finishLocalDecision,
   finishPermissionDecision,
+  permissionDecisionShouldFocusComposer,
   permissionDecisionResponseAccepted,
+  reconcilePermissionDecision,
+  recoverPermissionDecisionFromConflict,
+  type PermissionReviewDecision,
 } from "./decision_state";
 import { escapeHtml, humanizeError } from "./utils";
 import {
@@ -154,7 +158,7 @@ async function refresh(): Promise<void> {
   try {
     render(await command<DesktopWebState>("desktop_state"));
   } catch (error) {
-    reportError(String(error));
+    reportError(error);
   } finally {
     polling = false;
   }
@@ -181,7 +185,7 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
     if (currentState && currentState !== state) acceptState(currentState, true);
   } catch (error) {
     rejectDraftMutation(uiState, name, draftSnapshot);
-    if (!recoverCommandConflict(error)) reportError(String(error));
+    if (!recoverCommandConflict(error)) reportError(error);
   } finally {
     if (startsRun) {
       uiState.runStartMutationPending = false;
@@ -448,7 +452,7 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
           )
         : ""
     }
-    ${state.confirmation_visible ? renderConfirmation(state) : ""}
+    ${state.confirmation_visible ? renderConfirmation(state, uiState.permissionDecision) : ""}
     ${!state.confirmation_visible && !localConfirmationPending && state.overlay !== "none" ? renderOverlay(state) : ""}
     ${backgroundInert ? "" : renderRecoverableError()}
   `;
@@ -477,12 +481,6 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
   restoreFocusSnapshot(focusSnapshot);
   wireEvents(state, eventContext);
   focusSelectedAgentAfterRender();
-  if (state.confirmation_visible && uiState.permissionDecisionPending && uiState.permissionDecisionAllow !== null) {
-    setPermissionDecisionPendingUi(uiState.permissionDecisionAllow);
-  } else if (state.confirmation_visible && uiState.permissionDecisionError) {
-    const status = document.querySelector<HTMLElement>(".permission-decision-status");
-    if (status) status.textContent = uiState.permissionDecisionError;
-  }
   if (
     modalClosing &&
     !focusSnapshot &&
@@ -548,13 +546,10 @@ function reconcileUiLocalState(previous: DesktopWebState | null, state: DesktopW
     uiState.pendingLocalConfirmation = null;
     finishLocalDecision(uiState);
   }
-  if (
-    !state.confirmation_visible
-    || (uiState.permissionDecisionPending
-      && state.confirmation_id !== uiState.permissionDecisionConfirmationId)
-  ) {
-    finishPermissionDecision(uiState);
-  }
+  reconcilePermissionDecision(
+    uiState,
+    state.confirmation_visible ? state.confirmation_id : null,
+  );
 }
 
 function focusPromptIfRequested(state: DesktopWebState): void {
@@ -600,7 +595,7 @@ const STABLE_LIST_SCROLL_SELECTORS = [".project-list", ".chat-list", ".artifact-
 const MODAL_SCROLL_SELECTORS = [".modal", ".settings-content", ".settings-nav", ".select-list"];
 
 function captureFocusSnapshot(previous: DesktopWebState | null, state: DesktopWebState): FocusSnapshot | null {
-  if (!previous || previous.overlay !== state.overlay || previous.confirmation_visible !== state.confirmation_visible) {
+  if (!previous || modalIdentity(previous) !== modalIdentity(state)) {
     return null;
   }
   return captureCurrentFocusSnapshot();
@@ -716,10 +711,6 @@ function selectedSessionIdentity(state: DesktopWebState): string {
 
 function selectedArtifactIdentity(state: DesktopWebState): string {
   return state.artifact_rows[state.selected_artifact_index]?.path ?? "none";
-}
-
-function modalIdentity(state: DesktopWebState): string {
-  return state.confirmation_visible ? "permission" : state.overlay;
 }
 
 function isModalOpening(previous: DesktopWebState, state: DesktopWebState): boolean {
@@ -850,37 +841,67 @@ function finishInteraction(release: InteractionRelease<StateUpdate> | null): voi
   }
 }
 
-async function submitPermissionDecision(allow: boolean): Promise<void> {
-  const confirmationId = currentState?.confirmation_id ?? null;
-  if (confirmationId === null || !beginPermissionDecision(uiState, confirmationId, allow)) return;
-  setPermissionDecisionPendingUi(allow);
+async function submitPermissionDecision(decision: PermissionReviewDecision): Promise<void> {
+  const confirmationId = currentState?.confirmation_visible
+    ? currentState.confirmation_id
+    : null;
+  const submission = beginPermissionDecision(uiState, confirmationId, decision);
+  if (submission === null) return;
+  if (currentState) render(currentState);
   try {
-    const state = await command<DesktopWebState>("answer_permission", { allow, confirmationId });
-    if (!permissionDecisionResponseAccepted(confirmationId, state.confirmation_visible, state.confirmation_id)) {
-      failPermissionDecision(uiState, "決定を反映できませんでした。もう一度お試しください。");
+    const state = await command<DesktopWebState>("answer_permission", {
+      decision,
+      confirmationId: submission.requestId,
+    });
+    let settlementApplied = false;
+    if (
+      !permissionDecisionResponseAccepted(
+        submission.requestId,
+        state.confirmation_visible,
+        state.confirmation_id,
+      )
+    ) {
+      failPermissionDecision(
+        uiState,
+        submission,
+        "決定を反映できませんでした。もう一度お試しください。",
+      );
     } else {
-      finishPermissionDecision(uiState);
+      settlementApplied = finishPermissionDecision(uiState, submission);
+    }
+    if (permissionDecisionShouldFocusComposer(submission, settlementApplied, state.confirmation_visible)) {
+      uiState.focusPromptAfterRender = true;
     }
     acceptState(state, true, "answer_permission", true);
-  } catch {
-    failPermissionDecision(uiState, "決定を反映できませんでした。もう一度お試しください。");
-    if (currentState) render(currentState);
-  }
-}
-
-function setPermissionDecisionPendingUi(allow: boolean): void {
-  const dialog = document.querySelector<HTMLElement>(".confirmation[role='alertdialog']");
-  dialog?.setAttribute("aria-busy", "true");
-  document.querySelectorAll<HTMLButtonElement>("[data-permission-action]").forEach((button) => {
-    button.disabled = true;
-  });
-  const selected = document.querySelector<HTMLButtonElement>(`[data-action="${allow ? "allow" : "deny"}"]`);
-  if (selected) selected.textContent = allow ? "許可しています…" : "拒否しています…";
-  const status = document.querySelector<HTMLElement>(".permission-decision-status");
-  if (status) {
-    status.textContent = allow ? "許可を反映しています。" : "拒否を反映しています。";
-    status.tabIndex = 0;
-    status.focus({ preventScroll: true });
+  } catch (error) {
+    const conflictState = commandConflictState(error);
+    if (conflictState) {
+      const recovered = recoverPermissionDecisionFromConflict(
+        uiState,
+        submission,
+        conflictState.confirmation_visible ? conflictState.confirmation_id : null,
+      );
+      if (recovered && conflictState.confirmation_visible) {
+        const active = document.activeElement;
+        if (active instanceof HTMLElement) active.blur();
+        uiState.lastFocusedOverlay = "none";
+      }
+      acceptState(conflictState, true, "command_conflict");
+      return;
+    }
+    const failureState = commandInternalState(error);
+    if (failureState) {
+      finishPermissionDecision(uiState, submission);
+      acceptState(failureState, true, "answer_permission_failure", true);
+      return;
+    }
+    if (failPermissionDecision(
+      uiState,
+      submission,
+      "決定を反映できませんでした。もう一度お試しください。",
+    )) {
+      if (currentState) render(currentState);
+    }
   }
 }
 
@@ -967,8 +988,8 @@ function shouldDeferAutoRefresh(): boolean {
   return interactionLifecycle.active;
 }
 
-function reportError(message: string): void {
-  const error = humanizeError(message);
+function reportError(value: unknown): void {
+  const error = humanizeError(value);
   if (currentState) {
     uiState.recoverableError = error;
     acceptState(currentState, true);

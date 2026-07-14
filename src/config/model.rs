@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter};
+use std::str::FromStr;
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
@@ -105,6 +107,134 @@ pub enum ProviderMetadataMode {
     LmStudioNativeRequired,
     #[serde(rename = "openai_compatible_only")]
     OpenAiCompatibleOnly,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderApiMode {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatCompletionsReasoningParameters {
+    EffortOnly,
+    EffortAndSummary,
+}
+
+impl ChatCompletionsReasoningParameters {
+    pub const fn supports_summary(self) -> bool {
+        matches!(self, Self::EffortAndSummary)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderReasoningCapability {
+    #[default]
+    Unsupported,
+    ChatCompletions {
+        parameters: ChatCompletionsReasoningParameters,
+    },
+    /// Reserved for the item-based Responses transport. The current
+    /// OpenAI-compatible client must reject this capability rather than
+    /// pretending that Chat Completions can preserve provider reasoning state.
+    ResponsesItemsNotImplemented,
+}
+
+impl ProviderReasoningCapability {
+    pub const fn api_mode(self) -> Option<ProviderApiMode> {
+        match self {
+            Self::Unsupported => None,
+            Self::ChatCompletions { .. } => Some(ProviderApiMode::ChatCompletions),
+            Self::ResponsesItemsNotImplemented => Some(ProviderApiMode::Responses),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+    Ultra,
+    Custom(String),
+}
+
+impl ReasoningEffort {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+            Self::Custom(value) => value,
+        }
+    }
+}
+
+impl Display for ReasoningEffort {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
+            "max" => Ok(Self::Max),
+            "ultra" => Ok(Self::Ultra),
+            "" => Err("reasoning effort must not be empty".to_string()),
+            custom => Ok(Self::Custom(custom.to_string())),
+        }
+    }
+}
+
+impl Serialize for ReasoningEffort {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningSummary {
+    #[default]
+    None,
+    Auto,
+    Concise,
+    Detailed,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -731,4 +861,73 @@ pub struct PartialToolOutputConfig {
 pub struct PartialLoggingConfig {
     pub verbosity: Option<LogVerbosity>,
     pub json_logs: Option<bool>,
+}
+
+#[cfg(test)]
+mod reasoning_contract_tests {
+    use super::{
+        ChatCompletionsReasoningParameters, ProviderApiMode, ProviderReasoningCapability,
+        ReasoningEffort, ReasoningSummary,
+    };
+
+    #[test]
+    fn reasoning_effort_uses_provider_wire_strings_and_preserves_future_values() {
+        for (wire, expected) in [
+            ("none", ReasoningEffort::None),
+            ("minimal", ReasoningEffort::Minimal),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::XHigh),
+            ("max", ReasoningEffort::Max),
+            ("ultra", ReasoningEffort::Ultra),
+            (
+                "provider_future_effort",
+                ReasoningEffort::Custom("provider_future_effort".to_string()),
+            ),
+        ] {
+            let parsed = serde_json::from_str::<ReasoningEffort>(&format!("\"{wire}\""))
+                .expect("reasoning effort");
+            assert_eq!(parsed, expected);
+            assert_eq!(
+                serde_json::to_string(&parsed).expect("wire effort"),
+                format!("\"{wire}\"")
+            );
+        }
+        assert!(serde_json::from_str::<ReasoningEffort>("\"\"").is_err());
+    }
+
+    #[test]
+    fn provider_reasoning_capability_keeps_responses_state_explicitly_unimplemented() {
+        let effort_only = ProviderReasoningCapability::ChatCompletions {
+            parameters: ChatCompletionsReasoningParameters::EffortOnly,
+        };
+        let effort_and_summary = ProviderReasoningCapability::ChatCompletions {
+            parameters: ChatCompletionsReasoningParameters::EffortAndSummary,
+        };
+        assert_eq!(
+            effort_only.api_mode(),
+            Some(ProviderApiMode::ChatCompletions)
+        );
+        assert_eq!(
+            effort_and_summary.api_mode(),
+            Some(ProviderApiMode::ChatCompletions)
+        );
+        assert!(!ChatCompletionsReasoningParameters::EffortOnly.supports_summary());
+        assert!(ChatCompletionsReasoningParameters::EffortAndSummary.supports_summary());
+        assert_eq!(
+            ProviderReasoningCapability::ResponsesItemsNotImplemented.api_mode(),
+            Some(ProviderApiMode::Responses)
+        );
+        assert_eq!(ProviderReasoningCapability::Unsupported.api_mode(), None);
+    }
+
+    #[test]
+    fn reasoning_summary_defaults_to_no_wire_parameter() {
+        assert_eq!(ReasoningSummary::default(), ReasoningSummary::None);
+        assert_eq!(
+            serde_json::to_string(&ReasoningSummary::Concise).expect("summary"),
+            "\"concise\""
+        );
+    }
 }

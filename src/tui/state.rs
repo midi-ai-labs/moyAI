@@ -1,9 +1,10 @@
 use crate::context::ContextWindowTokenStatus;
 use crate::edit::ChangeSummary;
 use crate::protocol::{
-    ToolLifecycleStatus, TurnItem, TurnItemPayload, TurnTerminalStatus,
+    ToolLifecycleStatus, TurnInterruptionCause, TurnItem, TurnItemPayload, TurnTerminalStatus,
     turn_items_in_projection_order,
 };
+use crate::runtime::RunCancellationCause;
 use crate::session::{
     DispatchTransformKind, LoadedSessionStatus, LoadedSessionSummary, PromptDispatchPart, RunEvent,
     RunSummary, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus, TodoItem,
@@ -107,6 +108,8 @@ pub struct RunProgressView {
     pub model_requests: usize,
     pub tool_calls_started: usize,
     pub tool_calls_completed: usize,
+    pub tool_calls_declined: usize,
+    pub tool_calls_cancelled: usize,
     pub tool_calls_failed: usize,
     pub rejected_tool_proposals: usize,
     pub compactions: usize,
@@ -122,6 +125,8 @@ impl Default for RunProgressView {
             model_requests: 0,
             tool_calls_started: 0,
             tool_calls_completed: 0,
+            tool_calls_declined: 0,
+            tool_calls_cancelled: 0,
             tool_calls_failed: 0,
             rejected_tool_proposals: 0,
             compactions: 0,
@@ -162,6 +167,7 @@ pub struct AppState {
     pub session_state: Option<SessionStateSnapshot>,
     pub run_status: RunStatus,
     pub status_message: Option<String>,
+    pub interruption_cause: Option<TurnInterruptionCause>,
     pub permission: Option<PermissionOverlayView>,
     pub progress: RunProgressView,
     pub latest_context_window: Option<ContextWindowTokenStatus>,
@@ -189,6 +195,7 @@ impl Default for AppState {
             session_state: None,
             run_status: RunStatus::Idle,
             status_message: None,
+            interruption_cause: None,
             permission: None,
             progress: RunProgressView::default(),
             latest_context_window: None,
@@ -231,7 +238,18 @@ impl AppState {
         };
         self.sidebar_todos = todos;
         self.session_state = Some(state);
-        self.status_message = self.run_status.default_status_message();
+        self.interruption_cause = if session.status == SessionStatus::Cancelled {
+            latest_interruption_cause(turn_items)
+        } else {
+            None
+        };
+        self.status_message = if session.status == SessionStatus::Cancelled {
+            self.interruption_cause
+                .map(interruption_status_message)
+                .or_else(|| self.run_status.default_status_message())
+        } else {
+            self.run_status.default_status_message()
+        };
         self.permission = None;
         self.prompt_review = None;
         self.active_assistant_message_id = None;
@@ -303,6 +321,7 @@ impl AppState {
     pub fn apply_run_event(&mut self, event: &RunEvent) {
         match event {
             RunEvent::SessionStarted { session_id, title } => {
+                self.interruption_cause = None;
                 self.route = Route::Session;
                 self.current_session_id = Some(*session_id);
                 self.current_session_title = title.clone();
@@ -421,6 +440,58 @@ impl AppState {
                     tool_call_id: Some(*tool_call_id),
                 });
             }
+            RunEvent::ToolCallDeclined {
+                tool_call_id,
+                tool,
+                reason,
+                ..
+            } => {
+                self.progress.tool_calls_declined += 1;
+                self.progress.current_phase = "tool".to_string();
+                self.progress.active_step = format!("Declined {tool}: {reason}");
+                update_tool_status(
+                    &mut self.tool_statuses,
+                    *tool_call_id,
+                    *tool,
+                    &tool.to_string(),
+                    ToolCallStatus::Declined,
+                    Some(reason.clone()),
+                    None,
+                );
+                self.transcript_entries.push(TranscriptEntry {
+                    kind: TranscriptKind::System,
+                    title: format!("Tool {tool} declined"),
+                    body: reason.clone(),
+                    message_id: None,
+                    tool_call_id: Some(*tool_call_id),
+                });
+            }
+            RunEvent::ToolCallCancelled {
+                tool_call_id,
+                tool,
+                reason,
+                ..
+            } => {
+                self.progress.tool_calls_cancelled += 1;
+                self.progress.current_phase = "tool".to_string();
+                self.progress.active_step = format!("Cancelled {tool}: {reason}");
+                update_tool_status(
+                    &mut self.tool_statuses,
+                    *tool_call_id,
+                    *tool,
+                    &tool.to_string(),
+                    ToolCallStatus::Cancelled,
+                    Some(reason.clone()),
+                    None,
+                );
+                self.transcript_entries.push(TranscriptEntry {
+                    kind: TranscriptKind::System,
+                    title: format!("Tool {tool} cancelled"),
+                    body: reason.clone(),
+                    message_id: None,
+                    tool_call_id: Some(*tool_call_id),
+                });
+            }
             RunEvent::ToolCallFailed {
                 tool_call_id,
                 tool,
@@ -511,6 +582,7 @@ impl AppState {
                 );
             }
             RunEvent::SessionCompleted { .. } => {
+                self.interruption_cause = None;
                 self.run_status = RunStatus::Completed;
                 self.permission = None;
                 self.status_message = self.run_status.default_status_message();
@@ -519,6 +591,7 @@ impl AppState {
                 self.progress.active_step = "Run completed".to_string();
             }
             RunEvent::SessionAwaitingUser { .. } => {
+                self.interruption_cause = None;
                 self.run_status = RunStatus::AwaitingUser;
                 self.permission = None;
                 self.status_message = self.run_status.default_status_message();
@@ -526,10 +599,15 @@ impl AppState {
                 self.progress.current_phase = "awaiting_user".to_string();
                 self.progress.active_step = "Awaiting user input".to_string();
             }
-            RunEvent::SessionInterrupted { reason, .. } => {
+            RunEvent::SessionInterrupted { reason, cause, .. } => {
+                self.interruption_cause = *cause;
                 self.run_status = RunStatus::Cancelled;
                 self.permission = None;
-                self.status_message = Some(reason.clone());
+                self.status_message = Some(
+                    cause
+                        .map(interruption_status_message)
+                        .unwrap_or_else(|| "run cancelled".to_string()),
+                );
                 self.progress.status = "Cancelled".to_string();
                 self.progress.current_phase = "terminal".to_string();
                 self.progress.active_step = reason.clone();
@@ -542,6 +620,7 @@ impl AppState {
                 });
             }
             RunEvent::SessionFailed { message, .. } => {
+                self.interruption_cause = None;
                 self.run_status = RunStatus::Failed;
                 self.permission = None;
                 self.status_message = Some(message.clone());
@@ -605,7 +684,7 @@ impl AppState {
                 self.progress.active_step = if *approved {
                     "permission approved".to_string()
                 } else {
-                    "permission denied".to_string()
+                    "permission not approved".to_string()
                 };
             }
             RunEvent::UserMessageStored { .. } | RunEvent::UserTurnStored { .. } => {}
@@ -728,6 +807,44 @@ impl AppState {
     }
 }
 
+fn latest_interruption_cause(turn_items: &[TurnItem]) -> Option<TurnInterruptionCause> {
+    turn_items_in_projection_order(turn_items)
+        .into_iter()
+        .rev()
+        .find(|item| matches!(item.payload, TurnItemPayload::Terminal { .. }))
+        .and_then(|item| match item.payload {
+            TurnItemPayload::Terminal {
+                status: TurnTerminalStatus::Interrupted,
+                cause,
+                ..
+            } => cause,
+            _ => None,
+        })
+}
+
+pub(crate) fn interruption_status_message(cause: TurnInterruptionCause) -> String {
+    match cause {
+        TurnInterruptionCause::ApprovalAborted => {
+            "操作を実行せず、タスクを停止しました。続けるには指示を入力してください。".to_string()
+        }
+        TurnInterruptionCause::UserStop => "run stopped by user".to_string(),
+        TurnInterruptionCause::AgentInterrupted => "agent interrupted".to_string(),
+        TurnInterruptionCause::TreeStopped => "agent tree stopped".to_string(),
+    }
+}
+
+pub(crate) fn permission_decision_pending_status_message() -> String {
+    "操作に対する決定を送信しました。処理結果を待っています。".to_string()
+}
+
+pub(crate) fn run_cancellation_status_message(cause: &RunCancellationCause) -> String {
+    match cause {
+        RunCancellationCause::Interruption(cause) => interruption_status_message(*cause),
+        RunCancellationCause::Failure(message) => message.clone(),
+        RunCancellationCause::Superseded => "run superseded by a newer owner".to_string(),
+    }
+}
+
 fn loaded_summary_from_session(session: SessionRecord) -> LoadedSessionSummary {
     LoadedSessionSummary {
         session,
@@ -793,6 +910,8 @@ fn tool_status_transcript_title(tool: ToolName, status: ToolLifecycleStatus) -> 
             pending_tool_transcript_title(tool)
         }
         ToolLifecycleStatus::Completed => "実行済コマンド",
+        ToolLifecycleStatus::Declined => "実行しなかったコマンド",
+        ToolLifecycleStatus::Cancelled => "キャンセルしたコマンド",
         ToolLifecycleStatus::Failed
         | ToolLifecycleStatus::Blocked
         | ToolLifecycleStatus::Rejected
@@ -822,6 +941,14 @@ fn progress_from_loaded_state(
         tool_calls_completed: tools
             .iter()
             .filter(|tool| tool.status == ToolCallStatus::Completed)
+            .count(),
+        tool_calls_declined: tools
+            .iter()
+            .filter(|tool| tool.status == ToolCallStatus::Declined)
+            .count(),
+        tool_calls_cancelled: tools
+            .iter()
+            .filter(|tool| tool.status == ToolCallStatus::Cancelled)
             .count(),
         tool_calls_failed: tools
             .iter()
@@ -1004,10 +1131,16 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
                 message_id: None,
                 tool_call_id: None,
             }),
-            TurnItemPayload::Terminal { status, summary } => Some(TranscriptEntry {
+            TurnItemPayload::Terminal {
+                status,
+                summary,
+                cause,
+            } => Some(TranscriptEntry {
                 kind: terminal_transcript_kind(*status),
                 title: "Terminal".to_string(),
-                body: summary.clone(),
+                body: cause
+                    .map(interruption_status_message)
+                    .unwrap_or_else(|| summary.clone()),
                 message_id: None,
                 tool_call_id: None,
             }),
@@ -1156,14 +1289,18 @@ fn session_tool_status_from_lifecycle(status: ToolLifecycleStatus) -> ToolCallSt
         | ToolLifecycleStatus::Deferred => ToolCallStatus::Pending,
         ToolLifecycleStatus::Running => ToolCallStatus::Running,
         ToolLifecycleStatus::Completed => ToolCallStatus::Completed,
+        ToolLifecycleStatus::Declined => ToolCallStatus::Declined,
+        ToolLifecycleStatus::Cancelled => ToolCallStatus::Cancelled,
         ToolLifecycleStatus::Failed => ToolCallStatus::Failed,
     }
 }
 
 fn terminal_transcript_kind(status: TurnTerminalStatus) -> TranscriptKind {
     match status {
-        TurnTerminalStatus::Failed | TurnTerminalStatus::Interrupted => TranscriptKind::Error,
-        TurnTerminalStatus::Completed | TurnTerminalStatus::AwaitingUser => TranscriptKind::System,
+        TurnTerminalStatus::Failed => TranscriptKind::Error,
+        TurnTerminalStatus::Completed
+        | TurnTerminalStatus::AwaitingUser
+        | TurnTerminalStatus::Interrupted => TranscriptKind::System,
     }
 }
 

@@ -155,7 +155,9 @@ impl Tool for ListTool {
             vec![guarded.absolute.clone()],
             !guarded.inside_workspace && !guarded.trusted_external,
             Vec::new(),
-        )?;
+        )
+        .await?
+        .admit()?;
         if !guarded.absolute.exists() {
             return Ok(missing_directory_result(&guarded.absolute));
         }
@@ -267,7 +269,9 @@ impl Tool for GlobTool {
             vec![guarded.absolute.clone()],
             !guarded.inside_workspace && !guarded.trusted_external,
             Vec::new(),
-        )?;
+        )
+        .await?
+        .admit()?;
 
         let mut builder = GlobSetBuilder::new();
         builder.add(
@@ -360,14 +364,18 @@ impl Tool for GrepTool {
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<GrepInput>(raw_arguments)?;
         let requested = input.path.unwrap_or_else(|| Utf8PathBuf::from("."));
-        let guarded = PathGuard::require_path(ctx.workspace, &requested, AccessKind::Search)?;
+        let guarded =
+            crate::tool::internal_output::resolve_path(&ctx, &requested, AccessKind::Search)
+                .await?;
         ctx.confirm_if_needed(
             AccessKind::Search,
             format!("Grep {}", guarded.absolute),
             vec![guarded.absolute.clone()],
             !guarded.inside_workspace && !guarded.trusted_external,
             Vec::new(),
-        )?;
+        )
+        .await?
+        .admit()?;
 
         let pattern = if input.case_sensitive.unwrap_or(false) {
             input.pattern.clone()
@@ -510,9 +518,11 @@ fn read_grep_candidate(
     if content_inspector::inspect(&bytes).is_binary() {
         return Ok(Err(GrepSkipReason::BinaryContent));
     }
-    String::from_utf8(bytes)
-        .map(Ok)
-        .map_err(|error| ToolError::Message(format!("grep candidate is not UTF-8: {error}")))
+    crate::tool::text_encoding::decode_text(bytes)
+        .map(|decoded| Ok(decoded.text))
+        .map_err(|_| {
+            ToolError::Message("grep candidate is neither UTF-8 nor Shift_JIS".to_string())
+        })
 }
 
 fn render_grep_output(matches: &[String], skipped: &GrepSkipSummary) -> String {
@@ -720,6 +730,21 @@ mod tests {
         assert_eq!(
             read_grep_candidate(&text, &guard).expect("guard result"),
             Ok("needle".to_string())
+        );
+    }
+
+    #[test]
+    fn grep_candidate_decodes_shift_jis_text() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("sjis.txt")).expect("utf8 path");
+        let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode("検索対象です");
+        assert!(!had_errors);
+        fs::write(&path, bytes.as_ref()).expect("write Shift_JIS fixture");
+
+        assert_eq!(
+            read_grep_candidate(&path, &crate::config::ResolvedConfig::default().file_guard)
+                .expect("grep candidate"),
+            Ok("検索対象です".to_string())
         );
     }
 

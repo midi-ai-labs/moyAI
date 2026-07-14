@@ -6,7 +6,7 @@ import {
   finishConfigMutation,
   type ConfigValueInput,
 } from "./config_mutation.ts";
-import { finishLocalDecision } from "./decision_state.ts";
+import { finishLocalDecision, type PermissionReviewDecision } from "./decision_state.ts";
 import {
   navigationIsIdle,
   sessionMemoryActions,
@@ -52,9 +52,9 @@ export interface ActionContext {
   rerender: () => void;
   mutate: (name: string, args?: Record<string, unknown>) => Promise<void>;
   recoverCommandConflict: (error: unknown) => boolean;
-  reportError: (message: string) => void;
+  reportError: (error: unknown) => void;
   prepareConfigMutation: (target: ConfigMutationTarget) => ConfigValueInput[] | null;
-  submitPermissionDecision: (allow: boolean) => Promise<void>;
+  submitPermissionDecision: (decision: PermissionReviewDecision) => Promise<void>;
   setWindowMaximized: (maximized: boolean) => void;
 }
 
@@ -165,7 +165,7 @@ async function runConfigMutation(
     if (context.recoverCommandConflict(error)) return;
     if (!finished) return;
     context.rerender();
-    context.reportError(String(error));
+    context.reportError(error);
     return;
   }
   if (!finishConfigMutation(context.uiState, request, succeeded, context.getViewState()?.config_target ?? null)) return;
@@ -595,8 +595,8 @@ export const ACTIONS: ActionDefinition[] = [
   { id: "set-image", label: "画像を添付", palette: true, enabled: (state) => state.image_input_enabled, run: (state, context) => context.mutate("attach_image", { text: state.image_input, expectedTarget: draftMutationTarget(state) }) },
   { id: "browse-image", label: "画像を参照", palette: true, enabled: (state) => state.image_input_enabled, run: (state, context) => context.mutate("browse_image", { expectedTarget: draftMutationTarget(state) }) },
   { id: "clear-images", label: "添付を解除", palette: true, enabled: (state) => state.attached_images.length > 0, run: (state, context) => context.mutate("clear_images", { expectedTarget: draftMutationTarget(state) }) },
-  { id: "allow", label: "確認を許可", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision(true) },
-  { id: "deny", label: "確認を拒否", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision(false) },
+  { id: "approve-permission", label: "確認した操作を実行", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision("approved") },
+  { id: "abort-permission", label: "操作を実行せず指示を変更", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision("abort") },
   { id: "minimize-window", label: "最小化", enabled: always, run: () => command("minimize_window") },
   {
     id: "toggle-maximize-window",

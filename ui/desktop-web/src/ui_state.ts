@@ -1,5 +1,6 @@
 import type { LocalConfirmation } from "./render.ts";
 import type { ConfigMutationTarget, DesktopWebState } from "./types.ts";
+import type { PermissionDecisionState } from "./decision_state.ts";
 
 export interface ProviderDraft {
   baseUrl: string;
@@ -67,10 +68,8 @@ export interface UiLocalState {
   agentPaneOwnerIdentity: string;
   focusSelectedAgentAfterRender: boolean;
   attachmentTrayOpen: boolean;
-  permissionDecisionPending: boolean;
-  permissionDecisionAllow: boolean | null;
-  permissionDecisionConfirmationId: string | null;
-  permissionDecisionError: string;
+  permissionDecision: PermissionDecisionState | null;
+  nextPermissionSubmissionId: number;
   localConfirmationDecisionPending: boolean;
   localConfirmationDecisionError: string;
   recoverableError: UiRecoverableError | null;
@@ -125,10 +124,8 @@ export function createUiLocalState(): UiLocalState {
     agentPaneOwnerIdentity: "",
     focusSelectedAgentAfterRender: false,
     attachmentTrayOpen: false,
-    permissionDecisionPending: false,
-    permissionDecisionAllow: null,
-    permissionDecisionConfirmationId: null,
-    permissionDecisionError: "",
+    permissionDecision: null,
+    nextPermissionSubmissionId: 1,
     localConfirmationDecisionPending: false,
     localConfirmationDecisionError: "",
     recoverableError: null,

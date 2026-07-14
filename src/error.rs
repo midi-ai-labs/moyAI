@@ -80,6 +80,8 @@ pub enum CliRenderError {
 pub enum CliPromptError {
     #[error("prompt io error: {0}")]
     Io(#[from] io::Error),
+    #[error("permission confirmation was interrupted")]
+    Interrupted,
     #[error("{0}")]
     Message(String),
 }
@@ -92,6 +94,15 @@ pub enum LlmError {
     Json(#[from] serde_json::Error),
     #[error("llm io error: {0}")]
     Io(#[from] io::Error),
+    #[error(
+        "{operation} expected a complete tool-less text response, but provider finish reason was {finish_reason:?}"
+    )]
+    ToollessTextFinish {
+        operation: String,
+        finish_reason: crate::session::FinishReason,
+    },
+    #[error("{operation} received a tool call in a tool-less text response")]
+    ToollessTextShape { operation: String },
     #[error("{0}")]
     Message(String),
 }
@@ -126,6 +137,14 @@ pub enum ToolError {
     Edit(#[from] EditError),
     #[error("tool patch error: {0}")]
     Patch(#[from] PatchError),
+    #[error("permission denied by user")]
+    PermissionDenied {
+        settlement: Option<crate::runtime::ToolSettlementReservation>,
+    },
+    #[error("permission request aborted by user")]
+    PermissionAborted,
+    #[error("run interrupted while waiting for permission")]
+    RunInterrupted,
     #[error("{0}")]
     Message(String),
 }
@@ -155,6 +174,17 @@ pub enum AgentError {
     Storage(#[from] StorageError),
     #[error("agent runtime error: {0}")]
     Runtime(#[from] RuntimeError),
+    #[error("provider stopped because the output token limit was reached")]
+    ProviderOutputLimit,
+    #[error("provider reported an error finish reason")]
+    ProviderFinishError,
+    #[error(
+        "provider finish reason `{finish_reason:?}` did not match the tool-call payload (has_tool_calls={has_tool_calls})"
+    )]
+    ProviderFinishShape {
+        finish_reason: crate::session::FinishReason,
+        has_tool_calls: bool,
+    },
     #[error("{0}")]
     Message(String),
 }

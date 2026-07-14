@@ -74,7 +74,9 @@ impl Tool for InspectDirectoryTool {
             vec![guarded.absolute.clone()],
             !guarded.inside_workspace && !guarded.trusted_external,
             Vec::new(),
-        )?;
+        )
+        .await?
+        .admit()?;
 
         if !guarded.absolute.exists() {
             return Ok(corrective_result(

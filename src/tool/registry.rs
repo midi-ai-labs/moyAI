@@ -53,8 +53,8 @@ impl ToolRegistry {
             Arc::new(crate::tool::mcp_call::McpCallTool),
         );
         tools.insert(
-            "todowrite".to_string(),
-            Arc::new(crate::tool::todo_write::TodoWriteTool),
+            "update_plan".to_string(),
+            Arc::new(crate::tool::todo_write::UpdatePlanTool),
         );
         insert_goal_tools(&mut tools);
         Self { tools }
@@ -129,6 +129,11 @@ impl ToolRegistry {
         names
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_tool_for_test(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.insert(tool.spec().name.to_string(), tool);
+    }
+
     pub(crate) fn unknown_tool_message(&self, name: &str) -> String {
         let available = self.available_tool_names().join(", ");
         format!(
@@ -146,11 +151,22 @@ impl ToolRegistry {
         raw_arguments: serde_json::Value,
         ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        // `todowrite` was the public name before the plan projection was aligned with
+        // Codex. Keep it as an execution-only compatibility alias without advertising a
+        // duplicate schema to the model.
+        let name = canonical_tool_lookup_name(name);
         let tool = self
             .tools
             .get(name)
             .ok_or_else(|| self.unknown_tool_error(name))?;
         tool.execute(raw_arguments, ctx).await
+    }
+}
+
+fn canonical_tool_lookup_name(name: &str) -> &str {
+    match name {
+        "todowrite" | "todo_write" => "update_plan",
+        other => other,
     }
 }
 
@@ -169,8 +185,8 @@ fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
         Arc::new(crate::tool::apply_patch::ApplyPatchTool),
     );
     tools.insert(
-        "todowrite".to_string(),
-        Arc::new(crate::tool::todo_write::TodoWriteTool),
+        "update_plan".to_string(),
+        Arc::new(crate::tool::todo_write::UpdatePlanTool),
     );
     tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
     tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
@@ -252,7 +268,7 @@ mod tests {
                 "list",
                 "read",
                 "shell",
-                "todowrite",
+                "update_plan",
                 "update_goal",
                 "write"
             ]
@@ -276,11 +292,17 @@ mod tests {
     }
 
     #[test]
-    fn core_agent_registry_includes_todowrite_surface() {
-        assert!(
-            super::ToolRegistry::core_agent()
-                .available_tool_names()
-                .contains(&"todowrite".to_string())
+    fn core_agent_registry_exposes_only_the_canonical_update_plan_surface() {
+        let names = super::ToolRegistry::core_agent().available_tool_names();
+        assert!(names.contains(&"update_plan".to_string()));
+        assert!(!names.contains(&"todowrite".to_string()));
+        assert_eq!(
+            super::canonical_tool_lookup_name("todowrite"),
+            "update_plan"
+        );
+        assert_eq!(
+            super::canonical_tool_lookup_name("todo_write"),
+            "update_plan"
         );
     }
 

@@ -9,7 +9,7 @@ pub use contract::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary, ModelCapabilities,
     ModelContentPart, ModelMessage, ModelProfile, ModelToolCall, ProviderToolChoice, ToolSchema,
     control_plane_parallel_tool_calls_projection, effective_parallel_tool_calls,
-    tool_surface_scoped_parallel_tool_calls_projection,
+    tool_surface_scoped_parallel_tool_calls_projection, validate_toolless_text_response,
 };
 pub use model_probe::{
     ModelAvailabilityReport, ModelAvailabilityStatus, ProviderModelInfo, ToolCallProbeReport,

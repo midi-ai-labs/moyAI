@@ -64,15 +64,19 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
             mode: AccessMode::AutoReview,
             id: "auto_review".to_string(),
             label: "Auto Review".to_string(),
-            summary: "Automatically allows workspace read/search/list and non-risky edits."
+            summary: "Uses an independent AI reviewer for requests that deterministic permission rules do not already allow."
                 .to_string(),
-            auto_allowed: strings(&["workspace list/search/read", "non-risky workspace edits"]),
+            auto_allowed: strings(&[
+                "workspace list/search/read",
+                "non-risky workspace edits",
+                "non-risky configured-boundary shell",
+                "configured Docling uploads",
+                "actions approved by the independent AI reviewer",
+            ]),
             requires_review: vec![
-                "shell",
-                "destructive edits",
-                "workspace authority files",
-                "detected outside configured boundary",
-                "network or external connections",
+                "actions denied by the AI reviewer",
+                "actions the AI reviewer cannot decide",
+                "reviewer transport, timeout, or response failures",
             ]
             .into_iter()
             .map(ToString::to_string)
@@ -84,17 +88,14 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
             mode: AccessMode::FullAccess,
             id: "full_access".to_string(),
             label: "Full Access".to_string(),
-            summary: "Automatically allows ordinary configured-boundary operations. Shell review uses detected targets and risks; it is not an OS sandbox."
+            summary: "Automatically allows operations accepted by the configured boundary, including detected shell risks. It is not an OS sandbox."
                 .to_string(),
-            auto_allowed: strings(&["workspace list/search/read", "workspace edits", "shell"]),
-            requires_review: vec![
-                "workspace authority files",
-                "detected outside configured boundary",
-                "network or external connections",
-            ]
-            .into_iter()
-            .map(ToString::to_string)
-            .collect(),
+            auto_allowed: strings(&[
+                "configured-boundary list/search/read",
+                "configured-boundary edits",
+                "configured-boundary shell including detected risks",
+            ]),
+            requires_review: strings(&["detected outside configured boundary"]),
             selected: false,
             available: true,
         },
@@ -127,22 +128,25 @@ mod tests {
         let profiles = super::builtin_permission_profiles();
 
         assert_eq!(profiles[0].auto_allowed, vec!["workspace list/search/read"]);
-        assert_eq!(
-            profiles[1].auto_allowed,
-            vec!["workspace list/search/read", "non-risky workspace edits"]
+        assert!(
+            profiles[1]
+                .auto_allowed
+                .iter()
+                .any(|value| value == "non-risky configured-boundary shell")
         );
         assert_eq!(
             profiles[2].auto_allowed,
-            vec!["workspace list/search/read", "workspace edits", "shell"]
+            vec![
+                "configured-boundary list/search/read",
+                "configured-boundary edits",
+                "configured-boundary shell including detected risks"
+            ]
         );
         assert_eq!(profiles[0].requires_review[0], "workspace edits");
         assert_eq!(profiles[0].requires_review[1], "shell");
-        assert_eq!(profiles[1].requires_review[0], "shell");
-        assert!(
-            profiles[2]
-                .requires_review
-                .iter()
-                .any(|value| value == "network or external connections")
+        assert_eq!(
+            profiles[1].requires_review[0],
+            "actions denied by the AI reviewer"
         );
         assert!(profiles[2].summary.contains("not an OS sandbox"));
         assert!(

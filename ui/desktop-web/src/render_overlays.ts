@@ -1,4 +1,5 @@
 import type { DesktopWebState, RowMutationTarget } from "./types.ts";
+import type { PermissionDecisionState } from "./decision_state.ts";
 import { renderPermissionAgentIdentity } from "./render_agent_activity.ts";
 import { escapeHtml } from "./utils.ts";
 
@@ -10,7 +11,10 @@ export type LocalConfirmation = {
   expectedTarget: RowMutationTarget;
 };
 
-export function renderConfirmation(state: DesktopWebState): string {
+export function renderConfirmation(
+  state: DesktopWebState,
+  decisionState: PermissionDecisionState | null = null,
+): string {
   const confirmation = state.confirmation ?? {
     summary: state.confirmation_text || "権限確認が必要です",
     details: [],
@@ -23,9 +27,27 @@ export function renderConfirmation(state: DesktopWebState): string {
   const details = confirmation.details.length > 0 ? confirmation.details.join("\n") : "なし";
   const agentPath = state.confirmation?.agent_path?.trim() ?? "";
   const agentTaskName = state.confirmation?.agent_task_name?.trim() ?? "";
+  const requestId = state.confirmation_id ?? "unknown";
+  const currentDecision = decisionState?.requestId === requestId
+    ? decisionState
+    : { phase: "ready" as const, requestId };
+  const pending = currentDecision.phase === "submitting";
+  const status = currentDecision.phase === "submitting"
+    ? currentDecision.decision === "approved"
+      ? "承認を反映しています。"
+      : "現在のタスクを停止しています。"
+    : currentDecision.phase === "failed"
+      ? currentDecision.error
+      : "実行しない場合、現在のタスクを停止し、次の指示を待ちます。";
+  const abortLabel = pending && currentDecision.decision === "abort"
+    ? "停止しています…"
+    : "実行せず、指示を変更する";
+  const approveLabel = pending && currentDecision.decision === "approved"
+    ? "承認しています…"
+    : "実行する";
   return `
     <div class="modal-backdrop">
-      <section class="modal confirmation" role="alertdialog" aria-modal="true" aria-labelledby="permission-title" aria-describedby="permission-summary" tabindex="-1">
+      <section class="modal confirmation" role="alertdialog" aria-modal="true" aria-labelledby="permission-title" aria-describedby="permission-summary" tabindex="-1" data-permission-id="${escapeHtml(requestId)}" ${pending ? 'aria-busy="true"' : ""}>
         <h2 id="permission-title">確認が必要です</h2>
         <div class="confirm-summary" id="permission-summary">${escapeHtml(confirmation.summary)}</div>
         <div class="confirm-command" aria-label="実行内容">${escapeHtml(details)}</div>
@@ -35,10 +57,10 @@ export function renderConfirmation(state: DesktopWebState): string {
           <dt>ワークスペース外</dt><dd>${escapeHtml(confirmation.outside_workspace ? "はい" : "いいえ")}</dd>
           <dt>リスク</dt><dd>${escapeHtml(risks)}</dd>
         </dl>
-        <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1"></div>
+        <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1" data-focus-key="permission:${escapeHtml(requestId)}:status">${escapeHtml(status)}</div>
         <div class="modal-actions">
-          <button data-action="deny" data-permission-action autofocus>拒否</button>
-          <button class="send wide-send" data-action="allow" data-permission-action>許可</button>
+          <button data-action="abort-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:abort" ${pending ? "disabled" : "autofocus"}>${abortLabel}</button>
+          <button class="send wide-send" data-action="approve-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:approve" ${pending ? "disabled" : ""}>${approveLabel}</button>
         </div>
       </section>
     </div>

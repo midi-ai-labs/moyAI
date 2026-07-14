@@ -109,7 +109,7 @@ impl Tool for DoclingConvertTool {
         };
         let page_range = parse_page_range(input.page_range)?;
 
-        let path = match (
+        let (path, effect_admission) = match (
             input.path,
             input
                 .source_url
@@ -119,13 +119,15 @@ impl Tool for DoclingConvertTool {
         ) {
             (Some(path), None) => {
                 let guarded = PathGuard::require_path(ctx.workspace, &path, AccessKind::Read)?;
-                ctx.confirm_if_needed(
-                    AccessKind::Read,
-                    format!("Upload {} to Docling Serve", guarded.absolute),
-                    vec![guarded.absolute.clone()],
-                    !guarded.inside_workspace && !guarded.trusted_external,
-                    vec![PermissionRisk::Network],
-                )?;
+                let effect_admission = ctx
+                    .confirm_if_needed(
+                        AccessKind::Read,
+                        format!("Upload {} to Docling Serve", guarded.absolute),
+                        vec![guarded.absolute.clone()],
+                        !guarded.inside_workspace && !guarded.trusted_external,
+                        vec![PermissionRisk::ConfiguredLocalService],
+                    )
+                    .await?;
                 if !guarded.absolute.exists() {
                     return Ok(missing_input_result(
                         &guarded.absolute,
@@ -135,17 +137,19 @@ impl Tool for DoclingConvertTool {
                 if guarded.absolute.is_dir() {
                     return Ok(directory_input_result(&guarded.absolute));
                 }
-                Some(guarded.absolute)
+                (Some(guarded.absolute), effect_admission)
             }
             (None, Some(source_url)) => {
-                ctx.confirm_if_needed(
-                    AccessKind::Read,
-                    format!("Fetch {} through Docling Serve", source_url),
-                    Vec::new(),
-                    false,
-                    vec![PermissionRisk::Network],
-                )?;
-                None
+                let effect_admission = ctx
+                    .confirm_if_needed(
+                        AccessKind::Read,
+                        format!("Fetch {} through Docling Serve", source_url),
+                        Vec::new(),
+                        false,
+                        vec![PermissionRisk::Network],
+                    )
+                    .await?;
+                (None, effect_admission)
             }
             (Some(_), Some(_)) => {
                 return Err(ToolError::Message(
@@ -160,15 +164,18 @@ impl Tool for DoclingConvertTool {
         };
 
         let result = crate::docling::DoclingClient::new(ctx.config.docling.clone())
-            .convert(DoclingConvertRequest {
-                path,
-                source_url: input.source_url,
-                from_formats,
-                to_formats,
-                do_ocr: input.do_ocr,
-                include_images: input.include_images.or(Some(false)),
-                page_range,
-            })
+            .convert(
+                DoclingConvertRequest {
+                    path,
+                    source_url: input.source_url,
+                    from_formats,
+                    to_formats,
+                    do_ocr: input.do_ocr,
+                    include_images: input.include_images.or(Some(false)),
+                    page_range,
+                },
+                || effect_admission.admit(),
+            )
             .await?;
 
         let output_text = render_convert_output(&result);
