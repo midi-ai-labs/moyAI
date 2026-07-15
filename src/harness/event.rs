@@ -12,7 +12,6 @@ pub enum HarnessEventKind {
     AttachmentRegistered,
     ContractVersionSelected,
     StateSnapshotRecorded,
-    ActiveWorkContractSelected,
     ControlEnvelopePrepared,
     ModelProjectionBuilt,
     ModelRequestSent,

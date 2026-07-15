@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand, error::ErrorKind};
 
 use crate::config::AccessMode;
 use crate::error::CliUsageError;
-use crate::session::{SessionId, SessionMemoryMode, ThreadGoalStatus};
+use crate::session::{SessionId, ThreadGoalStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,7 +22,7 @@ pub struct RunArgs {
     pub model_override: Option<String>,
     pub base_url_override: Option<String>,
     pub output_mode: OutputMode,
-    pub show_reasoning: bool,
+    pub show_reasoning_summary: bool,
     pub review_uncommitted: bool,
     pub review_branch: Option<String>,
     pub active_file: Option<Utf8PathBuf>,
@@ -92,20 +92,6 @@ pub struct SessionInterruptArgs {
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionCompactArgs {
-    pub session_id: SessionId,
-    pub keep_recent: usize,
-    pub output_mode: OutputMode,
-}
-
-#[derive(Debug, Clone)]
-pub struct SessionMemoryArgs {
-    pub session_id: SessionId,
-    pub mode: SessionMemoryMode,
-    pub output_mode: OutputMode,
-}
-
-#[derive(Debug, Clone)]
 pub struct SessionGoalGetArgs {
     pub session_id: SessionId,
     pub output_mode: OutputMode,
@@ -130,7 +116,6 @@ pub struct SessionGoalClearArgs {
 pub struct SessionShowArgs {
     pub session_id: SessionId,
     pub output_mode: OutputMode,
-    pub show_reasoning: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -272,8 +257,6 @@ pub enum CliCommand {
     SessionSettings(SessionSettingsArgs),
     SessionTitle(SessionTitleArgs),
     SessionInterrupt(SessionInterruptArgs),
-    SessionCompact(SessionCompactArgs),
-    SessionMemory(SessionMemoryArgs),
     SessionGoalGet(SessionGoalGetArgs),
     SessionGoalSet(SessionGoalSetArgs),
     SessionGoalClear(SessionGoalClearArgs),
@@ -337,7 +320,7 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                 model_override: args.model_override,
                 base_url_override: args.base_url_override,
                 output_mode: args.output_mode,
-                show_reasoning: args.show_reasoning,
+                show_reasoning_summary: args.show_reasoning_summary,
                 review_uncommitted: args.review_uncommitted,
                 review_branch: args.review_branch,
                 active_file: args.active_file,
@@ -499,29 +482,6 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                     output_mode: args.output_mode,
                 }))
             }
-            SessionCommand::Compact(_) => Err(CliUsageError::Message(
-                "semantic session compaction is unavailable; history was left unchanged. Start a new session, reduce attached context, or split the task instead"
-                    .to_string(),
-            )),
-            SessionCommand::Memory(args) => {
-                let requested_mode = args
-                    .mode
-                    .as_deref()
-                    .map(parse_cli_memory_mode)
-                    .transpose()?;
-                if requested_mode.is_some() == args.reset {
-                    return Err(CliUsageError::Message(
-                        "session memory requires exactly one of --mode or --reset".to_string(),
-                    ));
-                }
-                Ok(CliCommand::SessionMemory(SessionMemoryArgs {
-                    session_id: args.session_id.parse().map_err(|error| {
-                        CliUsageError::Message(format!("invalid session id: {error}"))
-                    })?,
-                    mode: requested_mode.unwrap_or(SessionMemoryMode::Enabled),
-                    output_mode: args.output_mode,
-                }))
-            }
             SessionCommand::Goal { command } => match command {
                 SessionGoalCommand::Get(args) => {
                     Ok(CliCommand::SessionGoalGet(SessionGoalGetArgs {
@@ -588,7 +548,6 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                     CliUsageError::Message(format!("invalid session id: {error}"))
                 })?,
                 output_mode: args.output_mode,
-                show_reasoning: args.show_reasoning,
             })),
             SessionCommand::History(args) => Ok(CliCommand::SessionHistory(SessionHistoryArgs {
                 session_id: args.session_id.parse().map_err(|error| {
@@ -734,14 +693,6 @@ fn parse_cli_access_mode(value: &str) -> Result<AccessMode, CliUsageError> {
     })
 }
 
-fn parse_cli_memory_mode(value: &str) -> Result<SessionMemoryMode, CliUsageError> {
-    SessionMemoryMode::parse(value).ok_or_else(|| {
-        CliUsageError::Message(format!(
-            "invalid memory mode `{value}`; expected enabled or disabled"
-        ))
-    })
-}
-
 fn parse_cli_goal_status(value: &str) -> Result<ThreadGoalStatus, CliUsageError> {
     match value {
         "active" => Ok(ThreadGoalStatus::Active),
@@ -831,8 +782,8 @@ struct RunCommand {
     base_url_override: Option<String>,
     #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
     output_mode: OutputMode,
-    #[arg(long = "show-reasoning")]
-    show_reasoning: bool,
+    #[arg(long = "show-reasoning-summary")]
+    show_reasoning_summary: bool,
     #[arg(long = "review-uncommitted", conflicts_with = "review_branch")]
     review_uncommitted: bool,
     #[arg(
@@ -880,9 +831,6 @@ enum SessionCommand {
     Settings(SessionSettingsCommand),
     Title(SessionTitleCommand),
     Interrupt(SessionInterruptCommand),
-    #[command(about = "Unavailable: semantic compaction is not implemented; history is preserved")]
-    Compact(SessionCompactCommand),
-    Memory(SessionMemoryCommand),
     Goal {
         #[command(subcommand)]
         command: SessionGoalCommand,
@@ -1021,28 +969,6 @@ struct SessionInterruptCommand {
 }
 
 #[derive(Args)]
-struct SessionCompactCommand {
-    #[arg()]
-    session_id: String,
-    #[arg(long = "keep-recent", default_value_t = 20)]
-    keep_recent: usize,
-    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
-    output_mode: OutputMode,
-}
-
-#[derive(Args)]
-struct SessionMemoryCommand {
-    #[arg()]
-    session_id: String,
-    #[arg(long = "mode", value_parser = ["enabled", "disabled"])]
-    mode: Option<String>,
-    #[arg(long = "reset", conflicts_with = "mode")]
-    reset: bool,
-    #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
-    output_mode: OutputMode,
-}
-
-#[derive(Args)]
 struct SessionGoalGetCommand {
     #[arg()]
     session_id: String,
@@ -1083,8 +1009,6 @@ struct SessionShowCommand {
     session_id: String,
     #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
     output_mode: OutputMode,
-    #[arg(long = "show-reasoning")]
-    show_reasoning: bool,
 }
 
 #[derive(Args)]

@@ -16,6 +16,8 @@ use crate::llm::{
     tool_surface_scoped_parallel_tool_calls_projection,
 };
 
+const PROVIDER_READINESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Debug, Deserialize)]
 struct OpenAiModelsResponse {
     #[serde(default)]
@@ -482,7 +484,6 @@ async fn run_vision_probe(
         .post(&endpoint)
         .headers(headers)
         .json(&body)
-        .timeout(Duration::from_secs(120))
         .send()
         .await
     {
@@ -700,7 +701,6 @@ async fn run_tool_call_probe(
         .post(&endpoint)
         .headers(headers)
         .json(&body)
-        .timeout(Duration::from_secs(120))
         .send()
         .await
     {
@@ -954,7 +954,7 @@ fn failed_tool_call_probe_report(
 fn build_probe_client(config: &ResolvedConfig) -> Result<reqwest::Client, LlmError> {
     Ok(reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(config.model.connect_timeout_ms))
-        .timeout(Duration::from_millis(config.model.request_timeout_ms))
+        .timeout(PROVIDER_READINESS_REQUEST_TIMEOUT)
         .build()?)
 }
 
@@ -1009,9 +1009,10 @@ pub fn apply_provider_model_info_to_config(
     }
 }
 
-pub fn apply_model_availability_report_to_config(
-    config: &mut crate::config::model::ModelConfig,
+pub fn validate_model_availability_report(
+    config: &crate::config::model::ModelConfig,
     report: &ModelAvailabilityReport,
+    require_vision: bool,
 ) -> Result<(), LlmError> {
     if !matches!(report.status, ModelAvailabilityStatus::Pass) {
         return Err(LlmError::Message(format!(
@@ -1021,38 +1022,35 @@ pub fn apply_model_availability_report_to_config(
     }
     if config.model.trim() != report.model {
         return Err(LlmError::Message(format!(
-            "model availability report for `{}` cannot hydrate configured model `{}`",
+            "model availability report for `{}` does not match configured model `{}`",
             report.model, config.model
         )));
     }
-    let Some(model) = report.matched_model.as_ref() else {
+    let configured_base_url = normalize_provider_base_url(&config.base_url);
+    let report_base_url = normalize_provider_base_url(&report.base_url);
+    if configured_base_url != report_base_url {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` does not match configured provider `{}`",
+            report.base_url, config.base_url
+        )));
+    }
+    if config.provider_metadata_mode != report.provider_metadata_mode {
+        return Err(LlmError::Message(format!(
+            "model availability report metadata mode {:?} does not match configured mode {:?}",
+            report.provider_metadata_mode, config.provider_metadata_mode
+        )));
+    }
+    if report.require_vision != require_vision {
+        return Err(LlmError::Message(format!(
+            "model availability report vision requirement {} does not match run requirement {}",
+            report.require_vision, require_vision
+        )));
+    }
+    if report.matched_model.is_none() {
         return Err(LlmError::Message(format!(
             "model availability report passed without matched model metadata for `{}`",
             report.model
         )));
-    };
-    apply_provider_model_info_to_config(config, model);
-    if report.tool_use_capable == Some(true) {
-        config.supports_tools = true;
-    }
-    if report.vision_capable {
-        config.supports_images = true;
-    }
-    if let Some(reasoning_capable) = report.reasoning_capable {
-        config.supports_reasoning = reasoning_capable;
-    }
-    if let Some(context_window) = report.context {
-        config.context_window = context_window;
-        config.extra_body_json = Some(extra_body_with_num_ctx(
-            config.extra_body_json.clone(),
-            context_window,
-        ));
-    }
-    if let Some(max_output_tokens) = report.max_output_tokens {
-        config.max_output_tokens = max_output_tokens;
-    }
-    if let Some(max_parallel_predictions) = report.max_parallel_predictions {
-        config.max_parallel_predictions = max_parallel_predictions.max(1);
     }
     Ok(())
 }
@@ -1518,6 +1516,113 @@ fn summarize_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn passing_availability_report(
+        config: &crate::config::model::ModelConfig,
+        require_vision: bool,
+    ) -> ModelAvailabilityReport {
+        let matched_model = ProviderModelInfo {
+            id: config.model.clone(),
+            display_name: Some("runtime provider model".to_string()),
+            context_window: Some(config.context_window.saturating_mul(2)),
+            max_output_tokens: Some(config.max_output_tokens.saturating_mul(2)),
+            supports_images: Some(true),
+            supports_tools: Some(true),
+            supports_reasoning: Some(true),
+            max_parallel_predictions: Some(config.max_parallel_predictions.saturating_add(3)),
+            loaded: true,
+            source: "test".to_string(),
+        };
+        ModelAvailabilityReport {
+            gate: "model_availability".to_string(),
+            status: ModelAvailabilityStatus::Pass,
+            generated_by: "test".to_string(),
+            model: config.model.trim().to_string(),
+            base_url: normalize_provider_base_url(&config.base_url),
+            provider_metadata_mode: config.provider_metadata_mode,
+            v1_present: true,
+            native_present: true,
+            require_vision,
+            vision_capable: require_vision,
+            vision_probe_passed: require_vision,
+            vision_probes: Vec::new(),
+            tool_use_capable: Some(true),
+            capability_overrides: Vec::new(),
+            tool_call_probe_passed: true,
+            tool_call_probes: Vec::new(),
+            reasoning_capable: Some(true),
+            context: matched_model.context_window,
+            max_output_tokens: matched_model.max_output_tokens,
+            max_parallel_predictions: matched_model.max_parallel_predictions,
+            matched_model: Some(matched_model),
+            v1_models: vec![config.model.trim().to_string()],
+            native_models: vec![config.model.trim().to_string()],
+            openai_error: None,
+            native_error: None,
+            checked_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn availability_report_validation_never_hydrates_product_config() {
+        let mut config = ResolvedConfig::default().model;
+        config.base_url = "http://provider.local/v1".to_string();
+        config.model = "configured-model".to_string();
+        config.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+        config.context_window = 4_096;
+        config.max_output_tokens = 512;
+        config.supports_tools = false;
+        config.supports_reasoning = false;
+        config.supports_images = false;
+        config.max_parallel_predictions = 1;
+        let before = serde_json::to_value(&config).expect("serialize config");
+        let report = passing_availability_report(&config, false);
+
+        validate_model_availability_report(&config, &report, false)
+            .expect("passing runtime projection");
+
+        assert_eq!(
+            serde_json::to_value(&config).expect("serialize config"),
+            before
+        );
+        assert_eq!(config.context_window, 4_096);
+        assert_eq!(config.max_output_tokens, 512);
+        assert!(!config.supports_tools);
+        assert!(!config.supports_reasoning);
+        assert!(!config.supports_images);
+        assert_eq!(config.max_parallel_predictions, 1);
+    }
+
+    #[test]
+    fn availability_report_validation_rejects_stale_or_incomplete_projection() {
+        let mut config = ResolvedConfig::default().model;
+        config.base_url = "http://provider.local".to_string();
+        config.model = "configured-model".to_string();
+        config.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+        let report = passing_availability_report(&config, false);
+
+        let mut stale_model = report.clone();
+        stale_model.model = "other-model".to_string();
+        assert!(validate_model_availability_report(&config, &stale_model, false).is_err());
+
+        let mut stale_provider = report.clone();
+        stale_provider.base_url = "http://other-provider.local".to_string();
+        assert!(validate_model_availability_report(&config, &stale_provider, false).is_err());
+
+        let mut stale_mode = report.clone();
+        stale_mode.provider_metadata_mode = ProviderMetadataMode::LmStudioNativeRequired;
+        assert!(validate_model_availability_report(&config, &stale_mode, false).is_err());
+
+        assert!(validate_model_availability_report(&config, &report, true).is_err());
+
+        let mut incomplete = report.clone();
+        incomplete.matched_model = None;
+        assert!(validate_model_availability_report(&config, &incomplete, false).is_err());
+
+        let mut failed = report;
+        failed.status = ModelAvailabilityStatus::Fail;
+        assert!(validate_model_availability_report(&config, &failed, false).is_err());
+    }
 
     #[test]
     fn lmstudio_parser_does_not_treat_model_max_context_as_hosting_context() {

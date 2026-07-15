@@ -180,8 +180,6 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             rollback_session,
             fork_session,
             interrupt_session,
-            enable_session_memory,
-            disable_session_memory,
             delete_project,
             delete_session,
             delete_chat_session,
@@ -647,7 +645,6 @@ async fn desktop_state(
 ) -> Result<DesktopWebState, String> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
-    controller.drive_startup_readiness();
     apply_native_window_opacity(&window, controller.state.view.window_opacity_percent)?;
     controller.next_web_state()
 }
@@ -1090,60 +1087,6 @@ async fn interrupt_session(
             return Err(rejected_action(
                 controller,
                 "chat interrupt was not started",
-            ));
-        }
-        Ok(())
-    })
-    .await
-}
-
-#[tauri::command]
-async fn enable_session_memory(
-    controller: State<'_, SharedController>,
-    index: usize,
-    expected_target: DesktopRowMutationTarget,
-) -> Result<DesktopWebState, DesktopCommandError> {
-    mutate_controller_checked(controller, |controller| {
-        ensure_indexed_row_mutation_target(
-            controller,
-            &expected_target,
-            DesktopRowCollection::Session,
-            index,
-        )?;
-        let session_id = validated_session_id(controller, index)?;
-        if !controller
-            .set_session_memory_mode(session_id, crate::session::SessionMemoryMode::Enabled)
-        {
-            return Err(rejected_action(
-                controller,
-                "chat memory update was not started",
-            ));
-        }
-        Ok(())
-    })
-    .await
-}
-
-#[tauri::command]
-async fn disable_session_memory(
-    controller: State<'_, SharedController>,
-    index: usize,
-    expected_target: DesktopRowMutationTarget,
-) -> Result<DesktopWebState, DesktopCommandError> {
-    mutate_controller_checked(controller, |controller| {
-        ensure_indexed_row_mutation_target(
-            controller,
-            &expected_target,
-            DesktopRowCollection::Session,
-            index,
-        )?;
-        let session_id = validated_session_id(controller, index)?;
-        if !controller
-            .set_session_memory_mode(session_id, crate::session::SessionMemoryMode::Disabled)
-        {
-            return Err(rejected_action(
-                controller,
-                "chat memory update was not started",
             ));
         }
         Ok(())

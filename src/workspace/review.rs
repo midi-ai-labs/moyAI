@@ -1,11 +1,41 @@
 use std::process::Command;
 
 use camino::Utf8PathBuf;
+use serde::{Deserialize, Serialize};
 
 use crate::error::WorkspaceError;
-use crate::session::{ReviewScope, ReviewScopeMode};
 
 use super::{VcsKind, Workspace};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewScopeMode {
+    Uncommitted,
+    Branch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewScope {
+    pub mode: ReviewScopeMode,
+    pub base_ref: Option<String>,
+    pub head_ref: Option<String>,
+    #[serde(default)]
+    pub changed_files: Vec<Utf8PathBuf>,
+    pub summary: String,
+}
+
+impl ReviewScope {
+    pub fn label(&self) -> String {
+        match self.mode {
+            ReviewScopeMode::Uncommitted => "review_uncommitted".to_string(),
+            ReviewScopeMode::Branch => match (&self.base_ref, &self.head_ref) {
+                (Some(base), Some(head)) => format!("review_branch:{base}...{head}"),
+                (Some(base), None) => format!("review_branch:{base}"),
+                _ => "review_branch".to_string(),
+            },
+        }
+    }
+}
 
 pub fn uncommitted_review_scope(workspace: &Workspace) -> Result<ReviewScope, WorkspaceError> {
     ensure_git_workspace(workspace)?;

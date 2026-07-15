@@ -55,6 +55,7 @@ impl Tool for ShellTool {
         };
         ToolSpec {
             name: ToolName::Shell,
+            effect: crate::tool::ToolEffectPolicy::destructive(),
             description,
             input_schema: json!({
                 "type": "object",
@@ -195,7 +196,7 @@ impl Tool for ShellTool {
             .services
             .store
             .change_repo()
-            .insert_changes(ctx.session.session.id, &changes)
+            .insert_changes(&changes)
             .await
         {
             Ok(change_ids) => change_ids,
@@ -246,7 +247,6 @@ impl Tool for ShellTool {
                 "truncated": preview.truncated,
                 "changed_files": change_ids,
                 "success": output.exit_code == Some(0) && !output.timed_out && !output.cancelled,
-                "progress_effect": if output.exit_code == Some(0) && !output.timed_out && !output.cancelled { "made_progress" } else { "blocked" },
                 "shell_output_projection": {
                     "command": input.command.clone(),
                     "stdout_present": !output.stdout.trim().is_empty(),
@@ -256,39 +256,7 @@ impl Tool for ShellTool {
                     "cancelled": output.cancelled,
                     "stdout_capture_truncated": output.stdout_truncated,
                     "stderr_capture_truncated": output.stderr_truncated,
-                    "command_text_encoding_review": encoding_review.metadata(),
-                    "retry_guidance": if output.exit_code == Some(0) && !output.timed_out && !output.cancelled {
-                        "command_succeeded"
-                    } else {
-                        "review_stdout_stderr_and_retry_corrected_command_when_the_command_was_malformed"
-                    }
-                },
-                "tool_feedback_envelope": {
-                    "kind": "shell_execution_result",
-                    "success": output.exit_code == Some(0) && !output.timed_out && !output.cancelled,
-                    "progress_effect": if output.exit_code == Some(0) && !output.timed_out && !output.cancelled { "made_progress" } else { "blocked" },
-                    "submitted_command": input.command.clone(),
-                    "exit_code": output.exit_code,
-                    "timeout": output.timed_out,
-                    "cancelled": output.cancelled,
-                    "stdout_capture_truncated": output.stdout_truncated,
-                    "stderr_capture_truncated": output.stderr_truncated,
-                    "stdout_present": !output.stdout.trim().is_empty(),
-                    "stderr_present": !output.stderr.trim().is_empty(),
-                    "command_text_encoding_review": encoding_review.metadata(),
-                    "next_action_guidance": if output.exit_code == Some(0) && !output.timed_out && !output.cancelled {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::Value::String("If the command was malformed, inspect stdout/stderr, correct the command, and retry once with the native shell syntax. Do not stop solely because one shell command failed.".to_string())
-                    },
-                    "result_hash": crate::harness::artifact::hash_bytes(format!(
-                        "shell|{}|{:?}|{}|{}|{}",
-                        input.command.clone(),
-                        output.exit_code,
-                        output.timed_out,
-                        output.cancelled,
-                        output.stderr
-                    ).as_bytes())
+                    "command_text_encoding_review": encoding_review.metadata()
                 }
             }),
             truncated_output_path: preview.truncated_output_path,
@@ -299,13 +267,6 @@ impl Tool for ShellTool {
 }
 
 fn shell_contract_violation_result(command: &str, violation: ShellContractViolation) -> ToolResult {
-    let result_hash = crate::harness::artifact::hash_bytes(
-        format!(
-            "shell_contract_violation|{}|{}|{}",
-            violation.kind, command, violation.output_text
-        )
-        .as_bytes(),
-    );
     let encoding_review = violation.encoding_review.clone();
     ToolResult {
         title: violation.title,
@@ -315,25 +276,11 @@ fn shell_contract_violation_result(command: &str, violation: ShellContractViolat
             "timeout": false,
             "truncated": false,
             "changed_files": [],
-            "corrective_result": true,
+            "submitted_command": command,
             "contract_violation": violation.kind,
             "command_text_encoding_review": encoding_review,
             "success": false,
-            "progress_effect": "no_progress",
-            "result_hash": result_hash,
-            "tool_feedback_envelope": {
-                "kind": "shell_contract_violation",
-                "success": false,
-                "progress_effect": "no_progress",
-                "tool": "shell",
-                "submitted_command": command,
-                "contract_violation": violation.kind,
-                "command_text_encoding_review": violation.encoding_review,
-                "side_effects_applied": false,
-                "blocked_action": violation.kind,
-                "required_next_action": "submit_corrected_native_shell_command",
-                "result_hash": result_hash,
-            },
+            "side_effects_applied": false
         }),
         truncated_output_path: None,
         recorded_changes: Vec::new(),
@@ -540,23 +487,15 @@ fn shell_snapshot_limit_metadata(
         "cancelled": cancelled,
         "changed_files": [],
         "success": false,
-        "progress_effect": "blocked",
         "snapshot_blocked": true,
         "snapshot_phase": phase.as_str(),
         "snapshot_owner": plan.owner_root,
         "snapshot_scopes": plan.scopes,
         "snapshot_limits": limits.metadata(),
         "blocked_reason": diagnostic,
-        "tool_feedback_envelope": {
-            "kind": "shell_snapshot_limit",
-            "success": false,
-            "progress_effect": "blocked",
-            "side_effects_applied": phase.side_effects_applied(),
-            "snapshot_phase": phase.as_str(),
-            "stdout_present": stdout_present,
-            "stderr_present": stderr_present,
-            "required_next_action": "retry_with_narrower_workdir_or_explicit_target_paths",
-        }
+        "side_effects_applied": phase.side_effects_applied(),
+        "stdout_present": stdout_present,
+        "stderr_present": stderr_present
     })
 }
 
@@ -2371,15 +2310,11 @@ mod tests {
             None,
         );
         assert_eq!(metadata["success"].as_bool(), Some(false));
-        assert_eq!(metadata["progress_effect"].as_str(), Some("blocked"));
         assert_eq!(
             metadata["snapshot_phase"].as_str(),
             Some("before_execution")
         );
-        assert_eq!(
-            metadata["tool_feedback_envelope"]["side_effects_applied"].as_bool(),
-            Some(false)
-        );
+        assert_eq!(metadata["side_effects_applied"].as_bool(), Some(false));
     }
 
     #[test]
@@ -2432,14 +2367,8 @@ mod tests {
 
         assert_eq!(metadata["success"].as_bool(), Some(false));
         assert_eq!(metadata["snapshot_phase"].as_str(), Some("after_execution"));
-        assert_eq!(
-            metadata["tool_feedback_envelope"]["side_effects_applied"].as_bool(),
-            Some(true)
-        );
-        assert_eq!(
-            metadata["tool_feedback_envelope"]["stdout_present"].as_bool(),
-            Some(true)
-        );
+        assert_eq!(metadata["side_effects_applied"].as_bool(), Some(true));
+        assert_eq!(metadata["stdout_present"].as_bool(), Some(true));
     }
 
     #[tokio::test]

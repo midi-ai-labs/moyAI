@@ -304,17 +304,17 @@ mod tests {
                 .expect("insert session");
             connection
                 .execute(
-                    "INSERT INTO messages
-                     (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
-                     VALUES ('message', 'session', NULL, 'assistant', 1, '{}', 1)",
+                    "INSERT INTO protocol_history_items
+                     (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                     VALUES ('history', 'session', 'turn', 1, '{}', 'fixture', 1)",
                     [],
                 )
-                .expect("insert message");
+                .expect("insert canonical history owner");
             connection
                 .execute(
                     "INSERT INTO tool_calls
-                     (id, session_id, message_id, tool_name, status, arguments_json, title, metadata_json, output_text, truncated_output_path, error_text, started_at_ms, finished_at_ms)
-                     VALUES ('tool', 'session', 'message', 'shell', 'completed', '{}', NULL, '{}', 'preview', ?1, NULL, 1, 1)",
+                     (id, history_item_id, status, truncated_output_path, started_at_ms, finished_at_ms)
+                     VALUES ('tool', 'history', 'completed', ?1, 1, 1)",
                     params![referenced_truncation.as_str()],
                 )
                 .expect("insert tool call");

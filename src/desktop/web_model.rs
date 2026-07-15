@@ -27,6 +27,12 @@ pub struct DesktopPermissionProjection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopPlanProjection {
+    pub explanation: Option<String>,
+    pub steps: Vec<crate::protocol::PlanStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopStartupCheckProjection {
     pub key: String,
     pub label: String,
@@ -203,6 +209,7 @@ pub struct DesktopWebState {
     pub run_phase: String,
     pub run_active_step: String,
     pub latest_tool_summary: String,
+    pub plan: Option<DesktopPlanProjection>,
     pub progress_text: String,
     pub tool_status_text: String,
     pub token_meter_label: String,
@@ -219,6 +226,7 @@ pub struct DesktopWebState {
     pub image_input: String,
     pub attached_images: Vec<String>,
     pub can_submit: bool,
+    pub can_cancel_run: bool,
     pub busy: bool,
     pub async_polling_required: bool,
     pub pending_async_operations: Vec<String>,
@@ -444,13 +452,21 @@ pub(crate) fn desktop_web_state_with_permission(
             display_run_phase(&state.app_state.progress.current_phase)
         },
         run_active_step: if pre_admission_active {
-            "Providerとモデルの利用可否を確認しています".to_string()
+            "durable run admissionを確定しています".to_string()
         } else {
             display_run_step(&state.app_state.progress.active_step)
         },
         latest_tool_summary: display_tool_summary(&latest_tool_summary),
+        plan: state
+            .app_state
+            .current_plan
+            .as_ref()
+            .map(|plan| DesktopPlanProjection {
+                explanation: plan.explanation.clone(),
+                steps: plan.steps.clone(),
+            }),
         progress_text: if pre_admission_active {
-            "実行準備中\nフェーズ: 実行準備\n手順: Providerとモデルの利用可否を確認しています"
+            "実行準備中\nフェーズ: 実行準備\n手順: durable run admissionを確定しています"
                 .to_string()
         } else {
             detail.progress_text
@@ -493,6 +509,7 @@ pub(crate) fn desktop_web_state_with_permission(
             .map(|path| path.to_string())
             .collect(),
         can_submit: composer_admission_open,
+        can_cancel_run: busy || pending_permission.is_some() || runtime.agent_tree_active,
         busy,
         async_polling_required: state.async_polling_required()
             || root_run_active
@@ -629,13 +646,11 @@ struct ConfigFieldMetadata {
 
 fn config_field_metadata(field: ConfigField) -> ConfigFieldMetadata {
     const NONE: &[&str] = &[];
-    const PROMPT_PROFILES: &[&str] = &["auto", "default", "qwen_coder"];
     const PROVIDER_MODES: &[&str] = &["lm_studio_native_required", "openai_compatible_only"];
     const ACCESS_MODES: &[&str] = &["default", "auto_review", "full_access"];
     const MULTI_AGENT_MODES: &[&str] = &["explicit_request_only", "proactive"];
 
     let (value_type, min_value, max_value, options) = match field {
-        ConfigField::PromptProfile => ("enum", None, None, PROMPT_PROFILES),
         ConfigField::ProviderMetadataMode => ("enum", None, None, PROVIDER_MODES),
         ConfigField::AccessMode => ("enum", None, None, ACCESS_MODES),
         ConfigField::MultiAgentMode => ("enum", None, None, MULTI_AGENT_MODES),
@@ -665,11 +680,8 @@ fn config_field_metadata(field: ConfigField) -> ConfigFieldMetadata {
         | ConfigField::MaxParallelPredictions => {
             ("integer", Some(0.0), Some(u32::MAX as f64), NONE)
         }
-        ConfigField::MaxRetries | ConfigField::StreamMaxRetries => {
-            ("integer", Some(0.0), Some(u8::MAX as f64), NONE)
-        }
-        ConfigField::SessionMaxStepsPerTurn
-        | ConfigField::InspectionDefaultMaxDepth
+        ConfigField::MaxRetries => ("integer", Some(0.0), Some(u8::MAX as f64), NONE),
+        ConfigField::InspectionDefaultMaxDepth
         | ConfigField::InspectionDefaultMaxEntriesPerDir
         | ConfigField::InspectionMaxExtensionsReported => ("integer", Some(0.0), None, NONE),
         ConfigField::RequestTimeoutMs
@@ -765,7 +777,6 @@ fn startup_projection(state: &DesktopState) -> DesktopStartupProjection {
 
 fn startup_status_key(status: DesktopStartupStatus) -> &'static str {
     match status {
-        DesktopStartupStatus::Loading => "loading",
         DesktopStartupStatus::Ready => "ready",
         DesktopStartupStatus::RequiresConfig => "requires_config",
         DesktopStartupStatus::RequiresProvider => "requires_provider",
@@ -774,7 +785,6 @@ fn startup_status_key(status: DesktopStartupStatus) -> &'static str {
 
 fn startup_check_status_key(status: DesktopStartupCheckStatus) -> &'static str {
     match status {
-        DesktopStartupCheckStatus::Pending => "pending",
         DesktopStartupCheckStatus::Pass => "pass",
         DesktopStartupCheckStatus::Warning => "warning",
         DesktopStartupCheckStatus::Fail => "fail",
@@ -785,9 +795,7 @@ fn run_status_key(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Idle => "idle",
         RunStatus::Running => "running",
-        RunStatus::Confirming => "confirming",
         RunStatus::Completed => "completed",
-        RunStatus::AwaitingUser => "awaiting_user",
         RunStatus::Cancelled => "cancelled",
         RunStatus::Failed => "failed",
     }
@@ -1155,9 +1163,6 @@ fn display_run_step(step: &str) -> String {
     if let Some(rest) = trimmed.strip_prefix("Running ") {
         return format!("実行中: {}", rest.trim());
     }
-    if let Some(rest) = trimmed.strip_prefix("Confirming ") {
-        return format!("確認待ち: {}", rest.trim());
-    }
     trimmed.to_string()
 }
 
@@ -1449,7 +1454,66 @@ mod tests {
         assert!(!projection.can_submit);
         assert!(!projection.navigation_admission_open);
         assert!(projection.async_polling_required);
+        assert!(projection.can_cancel_run);
         assert_eq!(projection.access_target.runtime_owner_token, "root:9");
+    }
+
+    #[test]
+    fn cancel_capability_is_owned_by_the_rust_runtime_projection() {
+        let state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            crate::config::ResolvedConfig::default(),
+        );
+        assert!(!desktop_web_state(&state, &DesktopRuntimeProjection::default()).can_cancel_run);
+        assert!(
+            desktop_web_state(
+                &state,
+                &DesktopRuntimeProjection {
+                    root_run_generation: Some(1),
+                    ..DesktopRuntimeProjection::default()
+                }
+            )
+            .can_cancel_run
+        );
+        assert!(
+            desktop_web_state(
+                &state,
+                &DesktopRuntimeProjection {
+                    agent_tree_active: true,
+                    ..DesktopRuntimeProjection::default()
+                }
+            )
+            .can_cancel_run
+        );
+        let permission = PermissionRequest {
+            access: crate::workspace::AccessKind::Shell,
+            summary: "confirm".to_string(),
+            details: Vec::new(),
+            targets: Vec::new(),
+            outside_workspace: false,
+            risks: Vec::new(),
+            agent_path: None,
+            agent_task_name: None,
+        };
+        assert!(
+            desktop_web_state_with_permission(
+                &state,
+                &DesktopRuntimeProjection::default(),
+                Some((7, &permission)),
+            )
+            .can_cancel_run
+        );
     }
 
     #[test]

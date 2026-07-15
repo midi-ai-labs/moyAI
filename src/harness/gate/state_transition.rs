@@ -5,9 +5,7 @@ pub fn evaluate(events: &[HarnessEvent]) -> GateEvaluation {
     let has_state = events.iter().any(|event| {
         matches!(
             event.kind,
-            HarnessEventKind::StateSnapshotRecorded
-                | HarnessEventKind::StateTransitionRecorded
-                | HarnessEventKind::ActiveWorkContractSelected
+            HarnessEventKind::StateSnapshotRecorded | HarnessEventKind::StateTransitionRecorded
         )
     });
     let result = if has_state {

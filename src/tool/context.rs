@@ -514,17 +514,12 @@ mod tests {
     async fn run_mutation_fence_rejects_cancelled_and_expired_owners_before_mutation() {
         let (store, session_id) = fence_test_session().await;
         let repo = store.session_repo();
+        let turn_id = TurnId::new();
         let admission_id = repo
-            .admit_session_run(session_id)
+            .admit_session_turn(session_id, turn_id)
             .await
             .expect("admission")
             .expect("admitted");
-        let turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &admission_id, turn_id)
-                .await
-                .expect("activate turn")
-        );
         let control = RunControl::new();
         let fence = RunMutationFence::new(repo, session_id, admission_id, turn_id, control.clone());
         fence.assert_owned().await.expect("fresh owner");
@@ -537,8 +532,9 @@ mod tests {
 
         let (expired_store, expired_session_id) = fence_test_session().await;
         let expired_repo = expired_store.session_repo();
+        let expired_turn_id = TurnId::new();
         let expired_admission_id = expired_repo
-            .admit_session_run_at(expired_session_id, 0, 1)
+            .admit_session_turn_at(expired_session_id, expired_turn_id, 0, 1)
             .await
             .expect("expired admission")
             .expect("admitted");
@@ -547,7 +543,7 @@ mod tests {
             expired_repo,
             expired_session_id,
             expired_admission_id,
-            TurnId::new(),
+            expired_turn_id,
             expired_control.clone(),
         );
         let mut expired_mutation_ran = false;

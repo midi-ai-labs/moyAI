@@ -77,29 +77,6 @@ pub enum LogVerbosity {
     Trace,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptProfile {
-    Auto,
-    Default,
-    QwenCoder,
-}
-
-impl PromptProfile {
-    pub fn resolved_for_model(self, model_name: &str) -> Self {
-        match self {
-            PromptProfile::Auto => {
-                if model_name.to_ascii_lowercase().contains("qwen") {
-                    PromptProfile::QwenCoder
-                } else {
-                    PromptProfile::Default
-                }
-            }
-            other => other,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderMetadataMode {
@@ -288,7 +265,6 @@ pub struct FormatterRule {
 pub struct ModelConfig {
     pub base_url: String,
     pub model: String,
-    pub prompt_profile: PromptProfile,
     pub provider_metadata_mode: ProviderMetadataMode,
     pub provider_api_mode: ProviderApiMode,
     pub chat_completions_reasoning_parameters: Option<ChatCompletionsReasoningParameters>,
@@ -300,7 +276,6 @@ pub struct ModelConfig {
     pub stream_idle_timeout_ms: u64,
     pub connect_timeout_ms: u64,
     pub max_retries: u8,
-    pub stream_max_retries: u8,
     pub context_window: u32,
     pub max_output_tokens: u32,
     pub temperature: Option<f64>,
@@ -320,10 +295,6 @@ pub struct ModelConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
-    pub default_title_max_len: usize,
-    pub transcript_limit_messages: usize,
-    pub auto_resume_last: bool,
-    pub max_steps_per_turn: usize,
     pub overflow_margin_tokens: usize,
 }
 
@@ -401,15 +372,23 @@ pub enum McpTransportKind {
     Http,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolRouteConfig {
+    pub name: String,
+    pub effect: crate::tool::ToolEffectClass,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub id: String,
     pub enabled: bool,
     pub transport: McpTransportKind,
     pub base_url: String,
     pub timeout_ms: u64,
-    pub route_allowlist: Vec<String>,
-    pub tool_allowlist: Vec<String>,
+    #[serde(default)]
+    pub tool_routes: Vec<McpToolRouteConfig>,
     pub headers: BTreeMap<String, String>,
 }
 
@@ -498,7 +477,6 @@ impl Default for ResolvedConfig {
             model: ModelConfig {
                 base_url: DEFAULT_MODEL_BASE_URL.to_string(),
                 model: DEFAULT_MODEL_NAME.to_string(),
-                prompt_profile: PromptProfile::Auto,
                 provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
                 provider_api_mode: ProviderApiMode::Auto,
                 chat_completions_reasoning_parameters: None,
@@ -506,11 +484,10 @@ impl Default for ResolvedConfig {
                 reasoning_summary: ReasoningSummary::None,
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
                 extra_headers: BTreeMap::new(),
-                request_timeout_ms: 600_000,
+                request_timeout_ms: 300_000,
                 stream_idle_timeout_ms: 300_000,
                 connect_timeout_ms: 10_000,
                 max_retries: 2,
-                stream_max_retries: 2,
                 context_window: DEFAULT_MODEL_CONTEXT_WINDOW,
                 max_output_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
                 temperature: None,
@@ -530,10 +507,6 @@ impl Default for ResolvedConfig {
                 ),
             },
             session: SessionConfig {
-                default_title_max_len: 80,
-                transcript_limit_messages: 200,
-                auto_resume_last: false,
-                max_steps_per_turn: 128,
                 overflow_margin_tokens: 1_024,
             },
             multi_agent: MultiAgentConfig {
@@ -614,12 +587,7 @@ impl Default for ResolvedConfig {
                     transport: McpTransportKind::Http,
                     base_url: "http://127.0.0.1:8123/mcp".to_string(),
                     timeout_ms: 120_000,
-                    route_allowlist: vec![
-                        "ask".to_string(),
-                        "docs".to_string(),
-                        "review".to_string(),
-                    ],
-                    tool_allowlist: Vec::new(),
+                    tool_routes: Vec::new(),
                     headers: BTreeMap::new(),
                 }],
             },
@@ -659,7 +627,6 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
         model: Some(PartialModelConfig {
             base_url: Some(config.model.base_url.clone()),
             model: Some(config.model.model.clone()),
-            prompt_profile: Some(config.model.prompt_profile),
             provider_metadata_mode: Some(config.model.provider_metadata_mode),
             provider_api_mode: Some(config.model.provider_api_mode),
             chat_completions_reasoning_parameters: config
@@ -673,7 +640,6 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
             stream_idle_timeout_ms: Some(config.model.stream_idle_timeout_ms),
             connect_timeout_ms: Some(config.model.connect_timeout_ms),
             max_retries: Some(config.model.max_retries),
-            stream_max_retries: Some(config.model.stream_max_retries),
             context_window: Some(config.model.context_window),
             max_output_tokens: Some(config.model.max_output_tokens),
             temperature: config.model.temperature,
@@ -690,13 +656,7 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
             max_parallel_predictions: Some(config.model.max_parallel_predictions),
             extra_body_json: config.model.extra_body_json.clone(),
         }),
-        session: Some(PartialSessionConfig {
-            default_title_max_len: None,
-            transcript_limit_messages: None,
-            auto_resume_last: None,
-            max_steps_per_turn: Some(config.session.max_steps_per_turn),
-            overflow_margin_tokens: None,
-        }),
+        session: None,
         multi_agent: Some(PartialMultiAgentConfig {
             enabled: Some(config.multi_agent.enabled),
             mode: Some(config.multi_agent.mode),
@@ -750,6 +710,7 @@ pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialResolvedConfig {
     pub model: Option<PartialModelConfig>,
     pub session: Option<PartialSessionConfig>,
@@ -768,10 +729,10 @@ pub struct PartialResolvedConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialModelConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
-    pub prompt_profile: Option<PromptProfile>,
     pub provider_metadata_mode: Option<ProviderMetadataMode>,
     pub provider_api_mode: Option<ProviderApiMode>,
     pub chat_completions_reasoning_parameters: Option<ChatCompletionsReasoningParameters>,
@@ -783,7 +744,6 @@ pub struct PartialModelConfig {
     pub stream_idle_timeout_ms: Option<u64>,
     pub connect_timeout_ms: Option<u64>,
     pub max_retries: Option<u8>,
-    pub stream_max_retries: Option<u8>,
     pub context_window: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f64>,
@@ -802,15 +762,13 @@ pub struct PartialModelConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialSessionConfig {
-    pub default_title_max_len: Option<usize>,
-    pub transcript_limit_messages: Option<usize>,
-    pub auto_resume_last: Option<bool>,
-    pub max_steps_per_turn: Option<usize>,
     pub overflow_margin_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialMultiAgentConfig {
     pub enabled: Option<bool>,
     pub mode: Option<MultiAgentMode>,
@@ -819,6 +777,7 @@ pub struct PartialMultiAgentConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialPermissionsConfig {
     pub access_mode: Option<AccessMode>,
     pub additional_read_roots: Option<Vec<Utf8PathBuf>>,
@@ -826,6 +785,7 @@ pub struct PartialPermissionsConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialShellConfig {
     pub program: Option<Option<Utf8PathBuf>>,
     pub family: Option<Option<ShellFamily>>,
@@ -836,6 +796,7 @@ pub struct PartialShellConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialFormatConfig {
     pub default_newline: Option<NewlineStyle>,
     pub ensure_trailing_newline: Option<bool>,
@@ -843,17 +804,20 @@ pub struct PartialFormatConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialInstructionConfig {
     pub additional_files: Option<Vec<Utf8PathBuf>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialWorkspaceConfig {
     pub extra_ignore_globs: Option<Vec<String>>,
     pub protected_paths: Option<Vec<Utf8PathBuf>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialInspectionConfig {
     pub default_max_depth: Option<usize>,
     pub default_max_entries_per_dir: Option<usize>,
@@ -862,6 +826,7 @@ pub struct PartialInspectionConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialFileGuardConfig {
     pub max_inline_read_bytes: Option<u64>,
     pub large_file_warning_bytes: Option<u64>,
@@ -870,6 +835,7 @@ pub struct PartialFileGuardConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialDoclingConfig {
     pub enabled: Option<bool>,
     pub base_url: Option<String>,
@@ -879,12 +845,14 @@ pub struct PartialDoclingConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialMcpConfig {
     pub enabled: Option<bool>,
     pub servers: Option<Vec<McpServerConfig>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialToolOutputConfig {
     pub max_lines: Option<usize>,
     pub max_bytes: Option<usize>,
@@ -892,9 +860,109 @@ pub struct PartialToolOutputConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialLoggingConfig {
     pub verbosity: Option<LogVerbosity>,
     pub json_logs: Option<bool>,
+}
+
+#[cfg(test)]
+mod config_contract_tests {
+    use super::{McpServerConfig, PartialResolvedConfig, ResolvedConfig, full_effective_override};
+    use crate::tool::ToolEffectClass;
+
+    #[test]
+    fn effective_override_has_no_empty_session_patch() {
+        let patch = full_effective_override(&ResolvedConfig::default());
+
+        assert!(patch.session.is_none());
+    }
+
+    #[test]
+    fn current_effective_and_session_overrides_round_trip_strictly() {
+        let patch = full_effective_override(&ResolvedConfig::default());
+        let encoded = toml::to_string(&patch).expect("serialize current effective override");
+        let decoded = toml::from_str::<PartialResolvedConfig>(&encoded)
+            .expect("current effective override is accepted");
+        assert_eq!(
+            decoded
+                .model
+                .as_ref()
+                .and_then(|model| model.model.as_deref()),
+            Some("qwen/qwen3.6-35b-a3b")
+        );
+
+        let session =
+            toml::from_str::<PartialResolvedConfig>("[session]\noverflow_margin_tokens = 2048\n")
+                .expect("current session override is accepted");
+        assert_eq!(
+            session
+                .session
+                .and_then(|session| session.overflow_margin_tokens),
+            Some(2048)
+        );
+    }
+
+    #[test]
+    fn every_partial_config_boundary_rejects_unknown_or_retired_keys() {
+        for (input, field) in [
+            ("[agent]\nretired = true\n", "agent"),
+            ("[model]\nprompt_profile = \"auto\"\n", "prompt_profile"),
+            ("[session]\nmax_steps_per_turn = 8\n", "max_steps_per_turn"),
+            ("[multi_agent]\nmax_depth = 2\n", "max_depth"),
+            ("[permissions]\nallow_all = true\n", "allow_all"),
+            ("[shell]\ntimeout = 1\n", "timeout"),
+            ("[format]\nformatter = \"rustfmt\"\n", "formatter"),
+            ("[instructions]\nfiles = []\n", "files"),
+            ("[workspace]\nignore = []\n", "ignore"),
+            ("[inspection]\nmax_depth = 2\n", "max_depth"),
+            ("[file_guard]\ninline_limit = 1\n", "inline_limit"),
+            ("[docling]\nurl = \"http://invalid\"\n", "url"),
+            ("[mcp]\nroute_allowlist = []\n", "route_allowlist"),
+            ("[tool_output]\nmax_chars = 1\n", "max_chars"),
+            ("[logging]\nlevel = \"info\"\n", "level"),
+        ] {
+            let error = toml::from_str::<PartialResolvedConfig>(input)
+                .expect_err("unknown config key must fail closed");
+            assert!(
+                error.to_string().contains(field),
+                "error `{error}` did not identify `{field}`"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_routes_require_typed_effects_and_reject_retired_allowlists() {
+        let server = toml::from_str::<McpServerConfig>(
+            r#"
+id = "fixture"
+enabled = true
+transport = "http"
+base_url = "http://127.0.0.1:8123/mcp"
+timeout_ms = 1000
+headers = {}
+
+[[tool_routes]]
+name = "inspect"
+effect = "read"
+"#,
+        )
+        .expect("typed MCP route");
+        assert_eq!(server.tool_routes[0].effect, ToolEffectClass::Read);
+
+        let retired = toml::from_str::<McpServerConfig>(
+            r#"
+id = "fixture"
+enabled = true
+transport = "http"
+base_url = "http://127.0.0.1:8123/mcp"
+timeout_ms = 1000
+tool_allowlist = ["inspect"]
+headers = {}
+"#,
+        );
+        assert!(retired.is_err());
+    }
 }
 
 #[cfg(test)]

@@ -44,6 +44,7 @@ impl Tool for GetGoalTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::GetGoal,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "Get the current goal for this thread, including status, budgets, token and elapsed usage, and remaining token budget.",
             input_schema: json!({
                 "type": "object",
@@ -72,6 +73,7 @@ impl Tool for CreateGoalTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::CreateGoal,
+            effect: crate::tool::ToolEffectPolicy::mutation(),
             description: "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Set token_budget only when an explicit token budget is requested. Fails if an unfinished goal exists; use update_goal only for status.",
             input_schema: json!({
                 "type": "object",
@@ -125,6 +127,7 @@ impl Tool for UpdateGoalTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::UpdateGoal,
+            effect: crate::tool::ToolEffectPolicy::mutation(),
             description: "Use only to mark the existing goal achieved or genuinely blocked. Set status to complete only when the objective is achieved and no required work remains. Set status to blocked only after the same blocking condition has repeated for at least three consecutive goal turns and meaningful progress requires user input or an external-state change. Pause, resume, budget-limited, and usage-limited states are controlled by user/system surfaces, not this tool.",
             input_schema: json!({
                 "type": "object",

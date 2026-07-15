@@ -8,6 +8,7 @@ fn model_availability_cli_writes_fail_closed_report() {
 
     Command::cargo_bin("moyai")
         .expect("binary")
+        .env("MOYAI_CONFIG_PATH", temp.path().join("config.toml"))
         .args([
             "model",
             "availability",

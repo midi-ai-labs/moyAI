@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use eventsource_stream::{EventStreamError, Eventsource};
+use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
@@ -30,8 +30,7 @@ use crate::tool::truncate::clip_text_with_ellipsis;
 
 const RETRY_INITIAL_DELAY_MS: u64 = 2_000;
 const RETRY_BACKOFF_FACTOR: u64 = 2;
-const RETRY_MAX_DELAY_NO_HEADERS_MS: u64 = 30_000;
-const RETRY_MAX_DELAY_MS: u64 = 2_147_483_647;
+const RETRY_MAX_DELAY_MS: u64 = 30_000;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
@@ -43,7 +42,6 @@ pub struct OpenAiCompatClient {
 impl OpenAiCompatClient {
     pub fn new(
         connect_timeout_ms: u64,
-        _request_timeout_ms: u64,
         max_retries: u8,
         api_key: Option<String>,
     ) -> Result<Self, LlmError> {
@@ -77,209 +75,154 @@ impl LlmClient for OpenAiCompatClient {
                 ));
             }
         }
-        let mut stream_retry_attempt = 0_u8;
         let body = to_openai_request(&request)?;
 
-        'stream_attempt: loop {
-            let Some(response) = self
-                .send_request(&request, "v1/chat/completions", &body, &cancel)
-                .await?
-            else {
-                return Ok(LlmResponseSummary {
-                    finish_reason: FinishReason::Cancelled,
-                    usage: None,
-                    response_id: None,
-                });
-            };
+        let Some(response) = self
+            .send_request(&request, "v1/chat/completions", &body, &cancel)
+            .await?
+        else {
+            return Ok(LlmResponseSummary {
+                finish_reason: FinishReason::Cancelled,
+                usage: None,
+                response_id: None,
+            });
+        };
 
-            let mut stream = response.bytes_stream().eventsource();
-            let mut usage = None;
-            let mut finish_reason = None;
-            let mut saw_terminal_signal = false;
-            let mut ended_by_eof = false;
-            let mut emitted_events = 0_usize;
-            let mut tool_calls: HashMap<usize, PartialToolCall> = HashMap::new();
+        let mut stream = response.bytes_stream().eventsource();
+        let mut usage = None;
+        let mut finish_reason = None;
+        let mut saw_terminal_signal = false;
+        let mut ended_by_eof = false;
+        let mut tool_calls: HashMap<usize, PartialToolCall> = HashMap::new();
 
-            loop {
-                let next_event =
-                    if let Some(timeout) = stream_idle_timeout(request.stream_idle_timeout_ms) {
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                return Ok(LlmResponseSummary {
-                                    finish_reason: FinishReason::Cancelled,
-                                    usage,
-                                    response_id: None,
-                                });
-                            }
-                            result = tokio::time::timeout(timeout, stream.next()) => {
-                                match result {
-                                    Ok(event) => event,
-                                    Err(_) if should_retry_stream_idle_timeout_before_first_event(
-                                        emitted_events,
-                                        stream_retry_attempt,
-                                        request.stream_max_retries,
-                                    ) =>
-                                    {
-                                        stream_retry_attempt += 1;
-                                        if !sleep_retry_delay(
-                                            retry_delay_ms(stream_retry_attempt, None),
-                                            &cancel,
-                                        )
-                                        .await
-                                        {
-                                            return Ok(LlmResponseSummary {
-                                                finish_reason: FinishReason::Cancelled,
-                                                usage,
-                                                response_id: None,
-                                            });
-                                        }
-                                        continue 'stream_attempt;
-                                    }
-                                    Err(_) => {
-                                        return Err(stream_idle_timeout_error(
-                                            request.stream_idle_timeout_ms,
-                                            stream_retry_attempt,
-                                            request.stream_max_retries,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                return Ok(LlmResponseSummary {
-                                    finish_reason: FinishReason::Cancelled,
-                                    usage,
-                                    response_id: None,
-                                });
-                            }
-                            result = stream.next() => result,
-                        }
-                    };
-
-                let Some(event) = next_event else {
-                    ended_by_eof = true;
-                    break;
-                };
-
-                let event = match event {
-                    Ok(event) => event,
-                    Err(error)
-                        if emitted_events == 0
-                            && should_retry_stream_event_error(&error)
-                            && stream_retry_attempt < request.stream_max_retries =>
-                    {
-                        stream_retry_attempt += 1;
-                        if !sleep_retry_delay(retry_delay_ms(stream_retry_attempt, None), &cancel)
-                            .await
-                        {
+        loop {
+            let next_event =
+                if let Some(timeout) = stream_idle_timeout(request.stream_idle_timeout_ms) {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
                             return Ok(LlmResponseSummary {
                                 finish_reason: FinishReason::Cancelled,
                                 usage,
                                 response_id: None,
                             });
                         }
-                        continue 'stream_attempt;
-                    }
-                    Err(error) => {
-                        return Err(LlmError::Message(format!("SSE stream error: {error}")));
-                    }
-                };
-                if event.data == "[DONE]" {
-                    saw_terminal_signal = true;
-                    break;
-                }
-
-                let chunk =
-                    serde_json::from_str::<OpenAiChatChunk>(&event.data).map_err(|error| {
-                        LlmError::Message(format!(
-                            "failed to parse openai-compatible stream chunk: {}. Raw chunk: {}",
-                            error,
-                            summarize_stream_chunk(&event.data)
-                        ))
-                    })?;
-                if let Some(error) = chunk.error.as_ref() {
-                    return Err(LlmError::Message(format!(
-                        "openai-compatible stream error: {}",
-                        summarize_stream_error(error)
-                    )));
-                }
-                if let Some(value) = chunk.usage.as_ref() {
-                    usage = Some(to_usage(value));
-                }
-                if chunk.choices.is_empty() {
-                    continue;
-                }
-
-                for choice in chunk.choices {
-                    if let Some(value) = choice.delta.content {
-                        sink.push(LlmEvent::TextDelta(value))?;
-                        emitted_events += 1;
-                    }
-                    if let Some(value) = choice.delta.reasoning {
-                        sink.push(LlmEvent::ReasoningDelta(value))?;
-                        emitted_events += 1;
-                    }
-                    if let Some(deltas) = choice.delta.tool_calls {
-                        for delta in deltas {
-                            let delta_index = delta.index;
-                            let entry = tool_calls.entry(delta_index).or_default();
-                            if let Some(id) = delta.id {
-                                entry.call_id = Some(id);
-                            }
-                            if let Some(function) = delta.function {
-                                if let Some(name) = function.name {
-                                    entry.tool_name = Some(name);
+                        result = tokio::time::timeout(timeout, stream.next()) => {
+                            match result {
+                                Ok(event) => event,
+                                Err(_) => {
+                                    return Err(stream_idle_timeout_error(
+                                        request.stream_idle_timeout_ms,
+                                    ));
                                 }
-                                if let Some(arguments) = function.arguments {
-                                    entry.arguments.push_str(&arguments);
-                                }
-                            }
-                            let call_id = entry.stable_call_id(delta_index);
-                            if !entry.started {
-                                if let Some(tool_name) = entry.typed_tool_name() {
-                                    sink.push(LlmEvent::ToolCallStart {
-                                        call_id: call_id.clone(),
-                                        tool_name,
-                                    })?;
-                                    emitted_events += 1;
-                                    entry.started = true;
-                                }
-                            }
-                            if entry.started && !entry.arguments.is_empty() {
-                                sink.push(LlmEvent::ToolCallArgsDelta {
-                                    call_id,
-                                    delta: entry.arguments_delta(),
-                                })?;
-                                emitted_events += 1;
                             }
                         }
                     }
-                    if let Some(value) = choice.finish_reason {
-                        saw_terminal_signal = true;
-                        finish_reason = Some(parse_finish_reason(&value)?);
+                } else {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            return Ok(LlmResponseSummary {
+                                finish_reason: FinishReason::Cancelled,
+                                usage,
+                                response_id: None,
+                            });
+                        }
+                        result = stream.next() => result,
+                    }
+                };
+
+            let Some(event) = next_event else {
+                ended_by_eof = true;
+                break;
+            };
+
+            let event = match event {
+                Ok(event) => event,
+                Err(error) => {
+                    return Err(LlmError::Message(format!("SSE stream error: {error}")));
+                }
+            };
+            if event.data == "[DONE]" {
+                saw_terminal_signal = true;
+                break;
+            }
+
+            let chunk = serde_json::from_str::<OpenAiChatChunk>(&event.data).map_err(|error| {
+                LlmError::Message(format!(
+                    "failed to parse openai-compatible stream chunk: {}. Raw chunk: {}",
+                    error,
+                    summarize_stream_chunk(&event.data)
+                ))
+            })?;
+            if let Some(error) = chunk.error.as_ref() {
+                return Err(LlmError::Message(format!(
+                    "openai-compatible stream error: {}",
+                    summarize_stream_error(error)
+                )));
+            }
+            if let Some(value) = chunk.usage.as_ref() {
+                usage = Some(to_usage(value));
+            }
+            if chunk.choices.is_empty() {
+                continue;
+            }
+
+            for choice in chunk.choices {
+                if let Some(value) = choice.delta.content {
+                    sink.push(LlmEvent::TextDelta(value))?;
+                }
+                if let Some(deltas) = choice.delta.tool_calls {
+                    for delta in deltas {
+                        let delta_index = delta.index;
+                        let entry = tool_calls.entry(delta_index).or_default();
+                        if let Some(id) = delta.id {
+                            entry.record_call_id(id, delta_index)?;
+                        }
+                        if let Some(function) = delta.function {
+                            if let Some(name) = function.name {
+                                entry.record_tool_name(name, delta_index)?;
+                            }
+                            if let Some(arguments) = function.arguments {
+                                entry.saw_arguments_field = true;
+                                entry.arguments.push_str(&arguments);
+                            }
+                        }
+                        if !entry.started {
+                            if let Some((call_id, tool_name)) = entry.identity() {
+                                sink.push(LlmEvent::ToolCallStart { call_id, tool_name })?;
+                                entry.started = true;
+                            }
+                        }
+                        if entry.started && entry.emitted_len < entry.arguments.len() {
+                            sink.push(LlmEvent::ToolCallArgsDelta {
+                                call_id: entry.call_id.clone().unwrap_or_default(),
+                                delta: entry.arguments_delta(),
+                            })?;
+                        }
                     }
                 }
+                if let Some(value) = choice.finish_reason {
+                    saw_terminal_signal = true;
+                    finish_reason = Some(parse_finish_reason(&value)?);
+                }
             }
-
-            if ended_by_eof && !saw_terminal_signal {
-                return Err(stream_missing_terminal_signal_error());
-            }
-
-            let has_complete_tool_calls = validate_streamed_tool_calls(&tool_calls)?;
-            let finish_reason = resolve_finish_reason(finish_reason, has_complete_tool_calls)?;
-
-            sink.push(LlmEvent::Finished {
-                finish_reason,
-                usage: usage.clone(),
-            })?;
-            return Ok(LlmResponseSummary {
-                finish_reason,
-                usage,
-                response_id: None,
-            });
         }
+
+        if ended_by_eof && !saw_terminal_signal {
+            return Err(stream_missing_terminal_signal_error());
+        }
+
+        let has_complete_tool_calls = validate_streamed_tool_calls(&tool_calls)?;
+        let finish_reason = resolve_finish_reason(finish_reason, has_complete_tool_calls)?;
+
+        sink.push(LlmEvent::Finished {
+            finish_reason,
+            usage: usage.clone(),
+        })?;
+        Ok(LlmResponseSummary {
+            finish_reason,
+            usage,
+            response_id: None,
+        })
     }
 }
 
@@ -291,175 +234,110 @@ impl OpenAiCompatClient {
         sink: &mut dyn LlmEventSink,
     ) -> Result<LlmResponseSummary, LlmError> {
         let body = to_responses_request(&request, ResponsesRequestOptions::from_request(&request))?;
-        let mut stream_retry_attempt = 0_u8;
-        let mut event_retry_attempt = 0_u8;
+        let Some(response) = self
+            .send_request(&request, "v1/responses", &body, &cancel)
+            .await?
+        else {
+            return Ok(LlmResponseSummary {
+                finish_reason: FinishReason::Cancelled,
+                usage: None,
+                response_id: None,
+            });
+        };
 
-        'stream_attempt: loop {
-            let Some(response) = self
-                .send_request(&request, "v1/responses", &body, &cancel)
-                .await?
-            else {
-                return Ok(LlmResponseSummary {
-                    finish_reason: FinishReason::Cancelled,
-                    usage: None,
-                    response_id: None,
-                });
-            };
+        let mut stream = response.bytes_stream().eventsource();
+        let mut accumulator = ResponsesStreamAccumulator::default();
 
-            let mut stream = response.bytes_stream().eventsource();
-            let mut accumulator = ResponsesStreamAccumulator::default();
-            let mut received_sse_events = 0_usize;
-            let mut emitted_model_events = 0_usize;
-
-            loop {
-                let next_event =
-                    if let Some(timeout) = stream_idle_timeout(request.stream_idle_timeout_ms) {
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                return Ok(LlmResponseSummary {
-                                    finish_reason: FinishReason::Cancelled,
-                                    usage: None,
-                                    response_id: None,
-                                });
-                            }
-                            result = tokio::time::timeout(timeout, stream.next()) => {
-                                match result {
-                                    Ok(event) => event,
-                                    Err(_) if should_retry_stream_idle_timeout_before_first_event(
-                                        received_sse_events,
-                                        stream_retry_attempt,
-                                        request.stream_max_retries,
-                                    ) => {
-                                        stream_retry_attempt += 1;
-                                        if !sleep_retry_delay(
-                                            retry_delay_ms(stream_retry_attempt, None),
-                                            &cancel,
-                                        )
-                                        .await
-                                        {
-                                            return Ok(LlmResponseSummary {
-                                                finish_reason: FinishReason::Cancelled,
-                                                usage: None,
-                                                response_id: None,
-                                            });
-                                        }
-                                        continue 'stream_attempt;
-                                    }
-                                    Err(_) => {
-                                        return Err(stream_idle_timeout_error(
-                                            request.stream_idle_timeout_ms,
-                                            stream_retry_attempt,
-                                            request.stream_max_retries,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                return Ok(LlmResponseSummary {
-                                    finish_reason: FinishReason::Cancelled,
-                                    usage: None,
-                                    response_id: None,
-                                });
-                            }
-                            result = stream.next() => result,
-                        }
-                    };
-
-                let Some(event) = next_event else {
-                    return Err(LlmError::Message(
-                        "Responses stream closed before response.completed".to_string(),
-                    ));
-                };
-                let event = match event {
-                    Ok(event) => event,
-                    Err(error)
-                        if received_sse_events == 0
-                            && should_retry_stream_event_error(&error)
-                            && stream_retry_attempt < request.stream_max_retries =>
-                    {
-                        stream_retry_attempt += 1;
-                        if !sleep_retry_delay(retry_delay_ms(stream_retry_attempt, None), &cancel)
-                            .await
-                        {
+        loop {
+            let next_event =
+                if let Some(timeout) = stream_idle_timeout(request.stream_idle_timeout_ms) {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
                             return Ok(LlmResponseSummary {
                                 finish_reason: FinishReason::Cancelled,
                                 usage: None,
                                 response_id: None,
                             });
                         }
-                        continue 'stream_attempt;
+                        result = tokio::time::timeout(timeout, stream.next()) => {
+                            match result {
+                                Ok(event) => event,
+                                Err(_) => {
+                                    return Err(stream_idle_timeout_error(
+                                        request.stream_idle_timeout_ms,
+                                    ));
+                                }
+                            }
+                        }
                     }
-                    Err(error) => {
-                        return Err(LlmError::Message(format!(
-                            "Responses SSE stream error: {error}"
-                        )));
+                } else {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            return Ok(LlmResponseSummary {
+                                finish_reason: FinishReason::Cancelled,
+                                usage: None,
+                                response_id: None,
+                            });
+                        }
+                        result = stream.next() => result,
                     }
                 };
-                received_sse_events += 1;
 
-                if event.data == "[DONE]" {
-                    return Err(LlmError::Message(
-                        "Responses stream ended with [DONE] before response.completed".to_string(),
-                    ));
+            let Some(event) = next_event else {
+                return Err(LlmError::Message(
+                    "Responses stream closed before response.completed".to_string(),
+                ));
+            };
+            let event = match event {
+                Ok(event) => event,
+                Err(error) => {
+                    return Err(LlmError::Message(format!(
+                        "Responses SSE stream error: {error}"
+                    )));
                 }
+            };
 
-                let update = accumulator.push_json(&event.data).map_err(|error| {
-                    LlmError::Message(format!(
-                        "failed to parse Responses stream event: {error}. Raw event: {}",
-                        summarize_stream_chunk(&event.data)
-                    ))
-                })?;
-                match update.terminal {
-                    Some(ResponsesTerminal::Completed {
-                        response_id,
+            if event.data == "[DONE]" {
+                return Err(LlmError::Message(
+                    "Responses stream ended with [DONE] before response.completed".to_string(),
+                ));
+            }
+
+            let update = accumulator.push_json(&event.data).map_err(|error| {
+                LlmError::Message(format!(
+                    "failed to parse Responses stream event: {error}. Raw event: {}",
+                    summarize_stream_chunk(&event.data)
+                ))
+            })?;
+            match update.terminal {
+                Some(ResponsesTerminal::Completed {
+                    response_id,
+                    finish_reason,
+                    usage,
+                }) => {
+                    for event in update.events {
+                        sink.push(event)?;
+                    }
+                    return Ok(LlmResponseSummary {
                         finish_reason,
                         usage,
-                    }) => {
-                        for event in update.events {
-                            sink.push(event)?;
-                        }
-                        return Ok(LlmResponseSummary {
-                            finish_reason,
-                            usage,
-                            response_id: Some(response_id),
-                        });
-                    }
-                    Some(ResponsesTerminal::Failed { code, message, .. }) => {
-                        if emitted_model_events == 0
-                            && is_retryable_responses_event_code(code.as_deref())
-                            && event_retry_attempt < self.max_retries
-                        {
-                            event_retry_attempt += 1;
-                            if !sleep_retry_delay(
-                                retry_delay_ms(event_retry_attempt, None),
-                                &cancel,
-                            )
-                            .await
-                            {
-                                return Ok(LlmResponseSummary {
-                                    finish_reason: FinishReason::Cancelled,
-                                    usage: None,
-                                    response_id: None,
-                                });
-                            }
-                            continue 'stream_attempt;
-                        }
-                        let code = code.map(|code| format!(" ({code})")).unwrap_or_default();
-                        return Err(LlmError::Message(format!(
-                            "Responses request failed{code}: {message}"
-                        )));
-                    }
-                    Some(ResponsesTerminal::Incomplete { reason, usage, .. }) => {
-                        return Err(LlmError::IncompleteResponse { reason, usage });
-                    }
-                    None => {
-                        emitted_model_events += update.events.len();
-                        for event in update.events {
-                            sink.push(event)?;
-                        }
+                        response_id: Some(response_id),
+                    });
+                }
+                Some(ResponsesTerminal::Failed { code, message, .. }) => {
+                    return Err(LlmError::ProviderRejected {
+                        status: None,
+                        code,
+                        param: None,
+                        message,
+                    });
+                }
+                Some(ResponsesTerminal::Incomplete { reason, usage, .. }) => {
+                    return Err(LlmError::IncompleteResponse { reason, usage });
+                }
+                None => {
+                    for event in update.events {
+                        sink.push(event)?;
                     }
                 }
             }
@@ -502,13 +380,6 @@ impl OpenAiCompatClient {
                     result = tokio::time::timeout(timeout, request_builder.send()) => result,
                 } {
                     Ok(result) => result,
-                    Err(_) if attempt < self.max_retries => {
-                        attempt += 1;
-                        if !sleep_retry_delay(retry_delay_ms(attempt, None), cancel).await {
-                            return Ok(None);
-                        }
-                        continue;
-                    }
                     Err(_) => {
                         return Err(LlmError::Message(format!(
                             "provider request timeout after {}ms before response headers",
@@ -526,7 +397,15 @@ impl OpenAiCompatClient {
             match result {
                 Ok(response) if response.status().is_success() => return Ok(Some(response)),
                 Ok(response) => {
-                    let failure = parse_response_failure(response).await?;
+                    let Some(failure) = parse_response_failure_until_cancelled(
+                        response,
+                        cancel,
+                        request.timeout_ms,
+                    )
+                    .await?
+                    else {
+                        return Ok(None);
+                    };
                     if failure.retryable && attempt < self.max_retries {
                         attempt += 1;
                         if !sleep_retry_delay(
@@ -539,10 +418,12 @@ impl OpenAiCompatClient {
                         }
                         continue;
                     }
-                    return Err(LlmError::Message(format!(
-                        "openai-compatible request failed with status {}: {}",
-                        failure.status, failure.message
-                    )));
+                    return Err(LlmError::ProviderRejected {
+                        status: Some(failure.status.as_u16()),
+                        code: failure.code,
+                        param: failure.param,
+                        message: failure.message,
+                    });
                 }
                 Err(error)
                     if should_retry_transport_error(&error) && attempt < self.max_retries =>
@@ -561,6 +442,8 @@ impl OpenAiCompatClient {
 #[derive(Debug)]
 struct ResponseFailure {
     status: StatusCode,
+    code: Option<String>,
+    param: Option<String>,
     message: String,
     retryable: bool,
     retry_after_ms: Option<u64>,
@@ -570,26 +453,63 @@ async fn parse_response_failure(response: reqwest::Response) -> Result<ResponseF
     let status = response.status();
     let headers = response.headers().clone();
     let body = response.text().await.unwrap_or_default();
+    let parsed = serde_json::from_str::<Value>(&body).ok();
+    let error = parsed.as_ref().and_then(|value| value.get("error"));
+    let code = error
+        .and_then(|value| value.get("code").or_else(|| value.get("type")))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let param = error
+        .and_then(|value| value.get("param"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let message = error
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| summarize_failure_body(&body));
     Ok(ResponseFailure {
         status,
-        message: summarize_failure_body(&body),
+        code,
+        param,
+        message,
         retryable: is_retryable_status(status),
         retry_after_ms: retry_after_ms(&headers),
     })
+}
+
+async fn parse_response_failure_until_cancelled(
+    response: reqwest::Response,
+    cancel: &CancellationToken,
+    timeout_ms: u64,
+) -> Result<Option<ResponseFailure>, LlmError> {
+    let parse = parse_response_failure(response);
+    tokio::pin!(parse);
+    if let Some(timeout) = request_header_timeout(timeout_ms) {
+        tokio::select! {
+            _ = cancel.cancelled() => Ok(None),
+            result = tokio::time::timeout(timeout, &mut parse) => match result {
+                Ok(result) => result.map(Some),
+                Err(_) => Err(LlmError::Message(format!(
+                    "provider error response body timeout after {timeout_ms}ms"
+                ))),
+            },
+        }
+    } else {
+        tokio::select! {
+            _ = cancel.cancelled() => Ok(None),
+            result = &mut parse => result.map(Some),
+        }
+    }
 }
 
 fn stream_idle_timeout(timeout_ms: u64) -> Option<Duration> {
     (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
 }
 
-fn stream_idle_timeout_error(
-    timeout_ms: u64,
-    completed_retries: u8,
-    stream_max_retries: u8,
-) -> LlmError {
-    let total_attempts = u16::from(completed_retries) + 1;
+fn stream_idle_timeout_error(timeout_ms: u64) -> LlmError {
     LlmError::Message(format!(
-        "provider stream idle timeout after {timeout_ms}ms without any SSE event; stream retries exhausted after {total_attempts} attempt(s) with stream_max_retries={stream_max_retries}"
+        "provider stream idle timeout after {timeout_ms}ms without an SSE event"
     ))
 }
 
@@ -604,11 +524,18 @@ fn resolve_finish_reason(
     has_tool_calls: bool,
 ) -> Result<FinishReason, LlmError> {
     match (finish_reason, has_tool_calls) {
-        (Some(finish_reason), _) => Ok(finish_reason),
-        (None, true) => Ok(FinishReason::ToolCall),
-        (None, false) => Err(LlmError::Message(
+        (None, _) => Err(LlmError::Message(
             "openai-compatible stream ended without a finish_reason".to_string(),
         )),
+        (Some(FinishReason::ToolCall), false) => Err(LlmError::Message(
+            "openai-compatible stream ended with finish_reason=tool_calls but no complete tool call"
+                .to_string(),
+        )),
+        (Some(FinishReason::ToolCall), true) => Ok(FinishReason::ToolCall),
+        (Some(finish_reason), true) => Err(LlmError::Message(format!(
+            "openai-compatible stream ended with finish_reason={finish_reason:?} and a tool-call payload"
+        ))),
+        (Some(finish_reason), _) => Ok(finish_reason),
     }
 }
 
@@ -619,6 +546,15 @@ fn validate_streamed_tool_calls(
         return Ok(false);
     }
     for (delta_index, entry) in tool_calls {
+        if entry
+            .call_id
+            .as_deref()
+            .is_none_or(|call_id| call_id.trim().is_empty())
+        {
+            return Err(LlmError::Message(format!(
+                "openai-compatible stream ended with a tool call that has no call id at delta index {delta_index}"
+            )));
+        }
         let Some(tool_name) = entry
             .tool_name
             .as_deref()
@@ -626,16 +562,11 @@ fn validate_streamed_tool_calls(
         else {
             return Err(stream_missing_tool_name_error(*delta_index));
         };
-        if entry.arguments.trim().is_empty() {
+        if !entry.saw_arguments_field {
             return Err(LlmError::Message(format!(
-                "openai-compatible stream ended with incomplete arguments for tool `{tool_name}` at delta index {delta_index}"
+                "openai-compatible stream ended without an arguments field for tool `{tool_name}` at delta index {delta_index}"
             )));
         }
-        serde_json::from_str::<Value>(&entry.arguments).map_err(|error| {
-            LlmError::Message(format!(
-                "openai-compatible stream ended with malformed arguments for tool `{tool_name}` at delta index {delta_index}: {error}"
-            ))
-        })?;
     }
     Ok(true)
 }
@@ -665,35 +596,11 @@ fn summarize_failure_body(body: &str) -> String {
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::REQUEST_TIMEOUT
-        || status.is_server_error()
-}
-
-fn is_retryable_responses_event_code(code: Option<&str>) -> bool {
-    matches!(
-        code,
-        Some(
-            "rate_limit_exceeded"
-                | "rate_limit_error"
-                | "server_error"
-                | "internal_server_error"
-                | "server_overloaded"
-                | "overloaded"
-                | "timeout"
-        )
-    )
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 fn should_retry_transport_error(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
-}
-
-fn should_retry_stream_event_error(error: &EventStreamError<reqwest::Error>) -> bool {
-    matches!(
-        error,
-        EventStreamError::Transport(error) if should_retry_transport_error(error)
-    )
+    error.is_connect()
 }
 
 fn request_header_timeout(timeout_ms: u64) -> Option<Duration> {
@@ -702,14 +609,6 @@ fn request_header_timeout(timeout_ms: u64) -> Option<Duration> {
     } else {
         Some(Duration::from_millis(timeout_ms))
     }
-}
-
-fn should_retry_stream_idle_timeout_before_first_event(
-    emitted_events: usize,
-    stream_retry_attempt: u8,
-    stream_max_retries: u8,
-) -> bool {
-    emitted_events == 0 && stream_retry_attempt < stream_max_retries
 }
 
 fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
@@ -724,14 +623,15 @@ fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
 
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
     if let Some(parsed_seconds) = parse_seconds_header(value) {
-        return Some((parsed_seconds * 1_000).min(RETRY_MAX_DELAY_MS));
+        return Some(parsed_seconds.saturating_mul(1_000).min(RETRY_MAX_DELAY_MS));
     }
     let retry_at = httpdate::parse_http_date(value).ok()?;
     let delta = retry_at
         .duration_since(std::time::SystemTime::now())
         .ok()?
-        .as_millis() as u64;
-    Some(delta.min(RETRY_MAX_DELAY_MS))
+        .as_millis()
+        .min(u128::from(RETRY_MAX_DELAY_MS)) as u64;
+    Some(delta)
 }
 
 fn parse_ms_header(value: &str) -> Option<u64> {
@@ -756,7 +656,7 @@ fn retry_delay_ms(attempt: u8, header_delay_ms: Option<u64>) -> u64 {
     }
 
     let pow = RETRY_BACKOFF_FACTOR.saturating_pow(u32::from(attempt.saturating_sub(1)));
-    (RETRY_INITIAL_DELAY_MS.saturating_mul(pow)).min(RETRY_MAX_DELAY_NO_HEADERS_MS)
+    (RETRY_INITIAL_DELAY_MS.saturating_mul(pow)).min(RETRY_MAX_DELAY_MS)
 }
 
 #[derive(Default)]
@@ -764,31 +664,47 @@ struct PartialToolCall {
     call_id: Option<String>,
     tool_name: Option<String>,
     arguments: String,
+    saw_arguments_field: bool,
     emitted_len: usize,
     started: bool,
-    projected_call_id: Option<String>,
-    projected_tool_name: Option<String>,
 }
 
 impl PartialToolCall {
-    fn stable_call_id(&mut self, delta_index: usize) -> String {
-        if self.projected_call_id.is_none() {
-            self.projected_call_id = Some(
-                self.call_id
-                    .clone()
-                    .unwrap_or_else(|| format!("tool_call_{delta_index}")),
-            );
+    fn record_call_id(&mut self, call_id: String, delta_index: usize) -> Result<(), LlmError> {
+        if self
+            .call_id
+            .as_ref()
+            .is_some_and(|existing| existing != &call_id)
+        {
+            return Err(LlmError::Message(format!(
+                "openai-compatible stream changed the call id for tool delta index {delta_index}"
+            )));
         }
-        self.projected_call_id.clone().unwrap_or_default()
+        self.call_id = Some(call_id);
+        Ok(())
     }
 
-    fn typed_tool_name(&mut self) -> Option<String> {
-        if self.projected_tool_name.is_none() {
-            if let Some(tool_name) = self.tool_name.clone() {
-                self.projected_tool_name = Some(tool_name);
-            }
+    fn record_tool_name(&mut self, tool_name: String, delta_index: usize) -> Result<(), LlmError> {
+        if self
+            .tool_name
+            .as_ref()
+            .is_some_and(|existing| existing != &tool_name)
+        {
+            return Err(LlmError::Message(format!(
+                "openai-compatible stream changed the tool name for delta index {delta_index}"
+            )));
         }
-        self.projected_tool_name.clone()
+        self.tool_name = Some(tool_name);
+        Ok(())
+    }
+
+    fn identity(&self) -> Option<(String, String)> {
+        let call_id = self.call_id.as_deref()?.trim();
+        let tool_name = self.tool_name.as_deref()?.trim();
+        if call_id.is_empty() || tool_name.is_empty() {
+            return None;
+        }
+        Some((call_id.to_string(), tool_name.to_string()))
     }
 
     fn arguments_delta(&mut self) -> String {
@@ -801,18 +717,21 @@ impl PartialToolCall {
 pub fn streaming_tool_call_late_name_preserves_typed_tool_identity_fixture_passes() -> bool {
     let mut call = PartialToolCall::default();
     call.arguments.push_str("{\"path\":\"src/main.rs\"}");
-    let early_call_id = call.stable_call_id(0);
-    let no_typed_name_before_name_delta = call.typed_tool_name().is_none();
+    call.saw_arguments_field = true;
+    let no_identity_before_provider_id = call.identity().is_none();
+    call.record_call_id("provider_call_0".to_string(), 0)
+        .expect("first provider call id");
+    let no_identity_before_name_delta = call.identity().is_none();
     let buffered_without_emission = call.emitted_len == 0;
-    call.tool_name = Some("write".to_string());
-    let typed_name = call.typed_tool_name();
+    call.record_tool_name("write".to_string(), 0)
+        .expect("first provider tool name");
+    let identity = call.identity();
     let flushed_delta = call.arguments_delta();
 
-    early_call_id == "tool_call_0"
-        && no_typed_name_before_name_delta
+    no_identity_before_provider_id
+        && no_identity_before_name_delta
         && buffered_without_emission
-        && typed_name.as_deref() == Some("write")
-        && call.stable_call_id(0) == early_call_id
+        && identity == Some(("provider_call_0".to_string(), "write".to_string()))
         && flushed_delta == "{\"path\":\"src/main.rs\"}"
         && stream_missing_tool_name_error(0)
             .to_string()
@@ -1131,10 +1050,12 @@ fn summarize_stream_error(error: &OpenAiErrorPayload) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::extract::State;
     use axum::http::header::CONTENT_TYPE;
     use axum::response::Response;
@@ -1144,9 +1065,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        OpenAiCompatClient, PartialToolCall, is_retryable_responses_event_code,
-        is_retryable_status, parse_finish_reason, resolve_finish_reason,
-        should_retry_stream_event_error, to_openai_request, to_openai_request_with_reasoning,
+        OpenAiCompatClient, PartialToolCall, is_retryable_status, parse_finish_reason,
+        resolve_finish_reason, retry_delay_ms, to_openai_request, to_openai_request_with_reasoning,
         validate_streamed_tool_calls,
     };
     use crate::config::ProviderMetadataMode;
@@ -1187,7 +1107,6 @@ mod tests {
             parallel_tool_calls: false,
             timeout_ms: 30_000,
             stream_idle_timeout_ms: 300_000,
-            stream_max_retries: 0,
             extra_headers: BTreeMap::new(),
             temperature: None,
             top_p: None,
@@ -1246,7 +1165,6 @@ mod tests {
             parallel_tool_calls: true,
             timeout_ms: 30_000,
             stream_idle_timeout_ms: 300_000,
-            stream_max_retries: 0,
             extra_headers: BTreeMap::new(),
             temperature: None,
             top_p: None,
@@ -1388,46 +1306,61 @@ mod tests {
             crate::session::FinishReason::Error
         );
         assert!(parse_finish_reason("provider_specific_success").is_err());
+        assert!(resolve_finish_reason(None, true).is_err());
+        assert!(resolve_finish_reason(None, false).is_err());
         assert_eq!(
-            resolve_finish_reason(None, true).expect("complete tool calls provide one safe type"),
+            resolve_finish_reason(Some(FinishReason::ToolCall), true)
+                .expect("typed tool-call terminal"),
             crate::session::FinishReason::ToolCall
         );
-        assert!(resolve_finish_reason(None, false).is_err());
+        assert_eq!(
+            resolve_finish_reason(Some(FinishReason::Stop), false).expect("typed stop terminal"),
+            crate::session::FinishReason::Stop
+        );
+        assert!(resolve_finish_reason(Some(FinishReason::ToolCall), false).is_err());
+        assert!(resolve_finish_reason(Some(FinishReason::Stop), true).is_err());
+        assert!(resolve_finish_reason(Some(FinishReason::Length), true).is_err());
     }
 
     #[test]
-    fn missing_finish_reason_requires_every_tool_call_to_be_complete_and_parseable() {
+    fn tool_calls_require_provider_identity_and_preserve_raw_arguments() {
         let complete = std::collections::HashMap::from([(
             0,
             PartialToolCall {
                 call_id: Some("call_0".to_string()),
                 tool_name: Some("read".to_string()),
-                arguments: "{}".to_string(),
+                arguments: "{\"path\":".to_string(),
+                saw_arguments_field: true,
                 ..PartialToolCall::default()
             },
         )]);
-        assert!(validate_streamed_tool_calls(&complete).expect("complete call"));
+        assert!(
+            validate_streamed_tool_calls(&complete)
+                .expect("transport preserves malformed provider arguments for runtime parsing")
+        );
         assert_eq!(
             resolve_finish_reason(
-                None,
+                Some(FinishReason::ToolCall),
                 validate_streamed_tool_calls(&complete).expect("complete call")
             )
-            .expect("safe inference"),
+            .expect("typed terminal"),
             crate::session::FinishReason::ToolCall
         );
 
         for partial in [
             PartialToolCall {
                 call_id: Some("id_only".to_string()),
+                saw_arguments_field: true,
                 ..PartialToolCall::default()
             },
             PartialToolCall {
                 tool_name: Some("read".to_string()),
+                saw_arguments_field: true,
                 ..PartialToolCall::default()
             },
             PartialToolCall {
+                call_id: Some("call_without_arguments".to_string()),
                 tool_name: Some("read".to_string()),
-                arguments: "{\"path\":".to_string(),
                 ..PartialToolCall::default()
             },
         ] {
@@ -1437,22 +1370,66 @@ mod tests {
     }
 
     #[test]
-    fn retry_classification_uses_status_and_typed_stream_errors() {
+    fn retry_classification_is_limited_to_rate_limits_and_server_failures() {
         assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
         assert!(is_retryable_status(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
         ));
+        assert!(!is_retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT));
         assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
-        assert!(is_retryable_responses_event_code(Some("server_error")));
-        assert!(is_retryable_responses_event_code(Some(
-            "rate_limit_exceeded"
-        )));
-        assert!(!is_retryable_responses_event_code(Some("invalid_request")));
-        assert!(!is_retryable_responses_event_code(None));
+        assert_eq!(retry_delay_ms(1, Some(u64::MAX)), 30_000);
+        assert_eq!(retry_delay_ms(u8::MAX, None), 30_000);
+    }
 
-        let utf8_error = String::from_utf8(vec![0xff]).expect_err("invalid utf8");
-        let stream_error = eventsource_stream::EventStreamError::<reqwest::Error>::Utf8(utf8_error);
-        assert!(!should_retry_stream_event_error(&stream_error));
+    #[tokio::test]
+    async fn chat_completions_raw_reasoning_fields_are_not_client_projection() {
+        let response = [
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"reasoning_content": "raw provider trace"},
+                        "finish_reason": null
+                    }]
+                })
+            ),
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "visible answer"},
+                        "finish_reason": "stop"
+                    }]
+                })
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        request.base_url = base_url;
+        let client = OpenAiCompatClient::new(1_000, 0, None).expect("fixture client");
+        let mut sink = RecordingLlmEventSink::default();
+
+        let summary = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect("completed Chat Completions stream");
+        server.abort();
+
+        assert_eq!(summary.finish_reason, FinishReason::Stop);
+        assert!(matches!(
+            sink.events.as_slice(),
+            [
+                LlmEvent::TextDelta(text),
+                LlmEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                },
+            ] if text == "visible answer"
+        ));
     }
 
     #[tokio::test]
@@ -1496,7 +1473,7 @@ mod tests {
             effort: Some(ReasoningEffort::High),
             summary: ReasoningSummary::Detailed,
         });
-        let client = OpenAiCompatClient::new(1_000, 5_000, 0, None).expect("fixture client");
+        let client = OpenAiCompatClient::new(1_000, 0, None).expect("fixture client");
         let mut sink = RecordingLlmEventSink::default();
 
         let summary = client
@@ -1519,7 +1496,7 @@ mod tests {
         assert!(matches!(
             sink.events.as_slice(),
             [
-                LlmEvent::ReasoningDelta(reasoning),
+                LlmEvent::ReasoningSummaryDelta(reasoning),
                 LlmEvent::TextDelta(text),
                 LlmEvent::Finished {
                     finish_reason: FinishReason::Stop,
@@ -1612,7 +1589,7 @@ mod tests {
         }];
         first_request.tool_choice = Some(ProviderToolChoice::Required);
         first_request.extra_body = Some(json!({ "num_ctx": 131_072 }));
-        let client = OpenAiCompatClient::new(1_000, 5_000, 0, None).expect("fixture client");
+        let client = OpenAiCompatClient::new(1_000, 0, None).expect("fixture client");
         let mut first_sink = RecordingLlmEventSink::default();
 
         let first_summary = client
@@ -1715,7 +1692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_transport_retries_typed_transient_failure_before_visible_output() {
+    async fn responses_transport_does_not_retry_failure_after_response_started() {
         let failed = responses_sse([json!({
             "type": "response.failed",
             "response": {
@@ -1741,27 +1718,78 @@ mod tests {
                 content: "Retry transient failure".to_string(),
             }],
         );
-        let client = OpenAiCompatClient::new(1_000, 5_000, 1, None).expect("fixture client");
+        let client = OpenAiCompatClient::new(1_000, 1, None).expect("fixture client");
         let mut sink = RecordingLlmEventSink::default();
 
-        let summary = client
+        let error = client
             .stream_chat(request, CancellationToken::new(), &mut sink)
             .await
-            .expect("retryable Responses event should recover");
+            .expect_err("a typed stream failure must not re-post the request");
         server.abort();
 
-        assert_eq!(summary.response_id.as_deref(), Some("resp_recovered"));
-        assert_eq!(requests.lock().expect("request capture").len(), 2);
-        assert!(matches!(
-            sink.events.as_slice(),
-            [
-                LlmEvent::TextDelta(text),
-                LlmEvent::Finished {
-                    finish_reason: FinishReason::Stop,
-                    ..
-                }
-            ] if text == "Recovered."
-        ));
+        assert!(error.to_string().contains("try again"));
+        assert_eq!(requests.lock().expect("request capture").len(), 1);
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_header_timeout_is_not_retried() {
+        let response = responses_sse([json!({
+            "type": "response.completed",
+            "response": { "id": "resp_too_late" }
+        })]);
+        let (base_url, request_count, server) =
+            start_delayed_fixture(response, Duration::from_millis(200), true).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Do not retry a timed out generation".to_string(),
+            }],
+        );
+        request.timeout_ms = 30;
+        request.stream_idle_timeout_ms = 1_000;
+        let client = OpenAiCompatClient::new(1_000, 2, None).expect("fixture client");
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("header timeout must terminate the generation request");
+        server.abort();
+
+        assert!(error.to_string().contains("before response headers"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_is_not_retried() {
+        let response = responses_sse([json!({
+            "type": "response.completed",
+            "response": { "id": "resp_too_late" }
+        })]);
+        let (base_url, request_count, server) =
+            start_delayed_fixture(response, Duration::from_millis(200), false).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Do not retry an idle generation stream".to_string(),
+            }],
+        );
+        request.timeout_ms = 1_000;
+        request.stream_idle_timeout_ms = 30;
+        let client = OpenAiCompatClient::new(1_000, 2, None).expect("fixture client");
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("stream idle timeout must terminate the generation request");
+        server.abort();
+
+        assert!(error.to_string().contains("stream idle timeout"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(sink.events.is_empty());
     }
 
     #[tokio::test]
@@ -1798,10 +1826,10 @@ mod tests {
                 content: "Run the failure fixture".to_string(),
             }],
         );
-        let client = OpenAiCompatClient::new(1_000, 5_000, 0, None).expect("fixture client");
+        let client = OpenAiCompatClient::new(1_000, 0, None).expect("fixture client");
 
         for (index, expected) in [
-            "Responses request failed (server_error): unavailable",
+            "provider rejected the request (server_error): unavailable",
             "provider returned an incomplete response: max_output_tokens",
             "Responses stream closed before response.completed",
         ]
@@ -1849,6 +1877,14 @@ mod tests {
         next_response: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone)]
+    struct DelayedFixtureState {
+        request_count: Arc<AtomicUsize>,
+        response: Arc<String>,
+        delay: Duration,
+        delay_before_headers: bool,
+    }
+
     #[derive(Default)]
     struct RecordingLlmEventSink {
         events: Vec<LlmEvent>,
@@ -1872,6 +1908,7 @@ mod tests {
         };
         let app = Router::new()
             .route("/v1/responses", post(responses_fixture_handler))
+            .route("/v1/chat/completions", post(responses_fixture_handler))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1911,6 +1948,59 @@ mod tests {
             .expect("Responses fixture SSE response")
     }
 
+    async fn start_delayed_fixture(
+        response: String,
+        delay: Duration,
+        delay_before_headers: bool,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let state = DelayedFixtureState {
+            request_count: request_count.clone(),
+            response: Arc::new(response),
+            delay,
+            delay_before_headers,
+        };
+        let app = Router::new()
+            .route("/v1/responses", post(delayed_fixture_handler))
+            .route("/v1/chat/completions", post(delayed_fixture_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed fixture");
+        let address = listener.local_addr().expect("delayed fixture address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve delayed fixture");
+        });
+        (format!("http://{address}"), request_count, server)
+    }
+
+    async fn delayed_fixture_handler(
+        State(state): State<DelayedFixtureState>,
+        Json(_request): Json<Value>,
+    ) -> Response {
+        state.request_count.fetch_add(1, Ordering::SeqCst);
+        if state.delay_before_headers {
+            tokio::time::sleep(state.delay).await;
+            return Response::builder()
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(state.response.as_str().to_string()))
+                .expect("delayed-header fixture response");
+        }
+
+        let response = state.response.as_str().to_string();
+        let delay = state.delay;
+        let body = Body::from_stream(futures_util::stream::once(async move {
+            tokio::time::sleep(delay).await;
+            Ok::<Bytes, Infallible>(Bytes::from(response))
+        }));
+        Response::builder()
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(body)
+            .expect("delayed-stream fixture response")
+    }
+
     fn responses_sse(events: impl IntoIterator<Item = Value>) -> String {
         events
             .into_iter()
@@ -1947,7 +2037,6 @@ mod tests {
             parallel_tool_calls: false,
             timeout_ms: 5_000,
             stream_idle_timeout_ms: 5_000,
-            stream_max_retries: 0,
             extra_headers: BTreeMap::new(),
             temperature: None,
             top_p: None,
@@ -1987,7 +2076,6 @@ mod tests {
             parallel_tool_calls: false,
             timeout_ms: 30_000,
             stream_idle_timeout_ms: 300_000,
-            stream_max_retries: 0,
             extra_headers: BTreeMap::new(),
             temperature: None,
             top_p: None,

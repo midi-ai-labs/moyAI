@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
@@ -7,48 +7,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ulid::Ulid;
 
-use crate::config::{AccessMode, ShellFamily};
 use crate::session::{
-    ChangeId, ChangeKind, ContinuationContract, EditorContext, FinishReason, ImagePart, MessageId,
-    MessageRole, ProcessPhase, PromptDispatchPart, RequestDiagnosticsPart, SessionId,
-    SessionStateSnapshot, SessionStatus, TaskRoute, ToolCallId, TurnDecisionDiagnostic,
-    VerificationFailureCluster,
+    ChangeId, ChangeKind, EditorContext, ImagePart, PromptDispatchPart, RequestDiagnosticsPart,
+    SessionId, SessionStatus, ToolCallId,
 };
 use crate::tool::ToolName;
 
-mod legacy_control;
 mod projection;
 mod recording;
 mod store;
 
-const CURRENT_PROTOCOL_FIXTURE_MODEL: &str = "qwen/qwen3.6-35b-a3b";
-const CURRENT_PROTOCOL_FIXTURE_BASE_URL: &str = "http://127.0.0.1:1234";
-const CURRENT_PROTOCOL_FIXTURE_CONTEXT_WINDOW: u32 = 131_072;
-const CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS: u32 = 8_192;
-const PROTOCOL_MOD_PROJECTION_PROVIDER_PROFILE_MARKER: &str =
-    "protocol_mod_projection_fixture_current_provider_profile";
-const PROTOCOL_TOOL_CALL_TYPED_ARGUMENT_AUTHORITY_MARKER: &str =
-    "protocol_tool_call_typed_arguments_authority";
-
-pub use legacy_control::{
-    ActionAuthority, ControlEnvelopeIssue, ControlEnvelopeIssueCode, ControlEnvelopeIssueSeverity,
-    ControlEnvelopeValidation, DispatchPolicy, EvidenceRef, ObligationKind, ObligationSet,
-    ObligationStatus, ProjectionBundle, ProjectionSurface, ProjectionSurfaceKind,
-    RenderedProjectionSurface, RequiredAction, RequiredActionConflict, RequiredActionKind,
-    TurnControlEnvelope, TurnObligation,
-};
 pub use projection::{
-    ProtocolRunEventProjection, filechange_item_projection_preserves_call_id_fixture_passes,
-    pending_tool_lifecycle_does_not_fabricate_blocked_action_fixture_passes,
-    project_inter_agent_communication, project_protocol_run_event, project_sub_agent_activity,
-    project_turn_item_for_run_event,
-    tool_output_projection_preserves_blocked_action_fixture_passes,
+    ProtocolRunEventProjection, project_inter_agent_communication, project_protocol_run_event,
+    project_sub_agent_activity, project_turn_item_for_run_event,
 };
 pub use recording::ProtocolRecordingSink;
 pub use store::{ProtocolEventStore, SqliteProtocolEventStore};
 pub(crate) use store::{
-    fork_canonical_items_in_transaction, insert_event_bundle_in_transaction,
-    latest_turn_position_for_session,
+    fork_canonical_items_in_transaction, insert_session_owned_event_bundle_in_transaction,
+    latest_protocol_turn_ids_in_transaction, latest_turn_position_for_session,
 };
 
 macro_rules! protocol_id {
@@ -85,59 +62,31 @@ macro_rules! protocol_id {
     };
 }
 
-protocol_id!(ThreadOpId);
 protocol_id!(TurnId);
 protocol_id!(RuntimeEventId);
 protocol_id!(HistoryItemId);
 protocol_id!(TurnItemId);
-protocol_id!(ProjectionId);
-protocol_id!(TurnControlEnvelopeId);
-protocol_id!(ToolProposalId);
-protocol_id!(CandidateRepairId);
+protocol_id!(ModelResponseId);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThreadSubmission {
-    pub id: ThreadOpId,
-    pub session_id: SessionId,
-    pub op: ThreadOp,
-    pub submitted_at_ms: i64,
+/// Durable collaboration mode selected for a thread.
+///
+/// The canonical history stream owns this value. Runtime turn policy resolves a
+/// [`crate::agent::mode::CollaborationMode`] from the latest stored value rather
+/// than maintaining a separate planner flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModeKind {
+    #[default]
+    Default,
+    Plan,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ThreadOp {
-    UserTurn(UserTurn),
-    SteerTurn(SteerTurn),
-    Interrupt {
-        turn_id: TurnId,
-        reason: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cause: Option<TurnInterruptionCause>,
-    },
-    ApproveTool {
-        turn_id: TurnId,
-        call_id: ToolCallId,
-        decision: ToolApprovalDecision,
-    },
-    Compact {
-        turn_id: TurnId,
-        mode: CompactionMode,
-    },
-    Rollback {
-        target_item_id: HistoryItemId,
-    },
-    SetThreadTitle {
-        title: String,
-    },
-}
-
-impl ThreadOp {
-    pub fn user_turn(turn: UserTurn) -> Self {
-        Self::UserTurn(turn)
-    }
-
-    pub fn steer_turn(turn: SteerTurn) -> Self {
-        Self::SteerTurn(turn)
+impl ModeKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Plan => "plan",
+        }
     }
 }
 
@@ -149,17 +98,11 @@ pub struct UserTurn {
     pub prompt_dispatch: Option<PromptDispatchPart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_context: Option<EditorContext>,
-    pub context: TurnContext,
 }
 
 impl UserTurn {
     pub fn requires_image_capability(&self) -> bool {
-        self.context.requires_image_capability()
-            || self.items.iter().any(UserInputItem::contains_image)
-    }
-
-    pub fn is_dispatchable(&self) -> bool {
-        !self.requires_image_capability() || self.context.model_capabilities.supports_images
+        self.items.iter().any(UserInputItem::contains_image)
     }
 
     pub fn text(&self) -> String {
@@ -270,16 +213,13 @@ pub fn steer_turn_is_active_turn_mailbox_contract_fixture_passes() -> bool {
         )]),
         client_user_message_id: Some("client-message-1".to_string()),
     };
-    let op = ThreadOp::steer_turn(steer.clone());
-
-    matches!(op, ThreadOp::SteerTurn(turn)
-        if turn.expected_turn_id == expected_turn_id
-            && !turn.is_empty()
-            && !turn.requires_image_capability()
-            && turn.text().contains("current work")
-            && turn.content_parts().len() == 1
-            && turn.additional_context.contains_key("desktop.composer")
-            && turn.client_user_message_id.as_deref() == Some("client-message-1"))
+    steer.expected_turn_id == expected_turn_id
+        && !steer.is_empty()
+        && !steer.requires_image_capability()
+        && steer.text().contains("current work")
+        && steer.content_parts().len() == 1
+        && steer.additional_context.contains_key("desktop.composer")
+        && steer.client_user_message_id.as_deref() == Some("client-message-1")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,115 +235,12 @@ impl UserInputItem {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnContext {
-    pub session_id: SessionId,
-    pub cwd: Utf8PathBuf,
-    pub workspace_root: Utf8PathBuf,
-    pub provider: String,
-    pub model: String,
-    pub base_url: String,
-    pub access_mode: AccessMode,
-    pub sandbox: SandboxProfile,
-    pub shell_family: ShellFamily,
-    pub model_capabilities: ModelCapabilities,
-    pub route: TaskRoute,
-    pub process_phase: ProcessPhase,
-    pub active_contract: ActiveWorkContractProjection,
-    pub allowed_tools: Vec<ToolName>,
-    pub tool_choice: ToolChoice,
-    #[serde(default)]
-    pub images: Vec<ImagePart>,
-    pub output_contract: OutputContract,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuation: Option<ContinuationContract>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_decision_projection: Option<TurnDecisionDiagnostic>,
-}
-
-impl TurnContext {
-    pub fn requires_image_capability(&self) -> bool {
-        !self.images.is_empty()
-    }
-
-    pub fn tool_surface_matches_active_contract(&self) -> bool {
-        self.allowed_tools == self.active_contract.allowed_tools
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelCapabilities {
-    pub supports_tools: bool,
-    pub supports_reasoning: bool,
-    pub supports_images: bool,
-    pub parallel_tool_calls: bool,
-    pub context_window: u32,
-    pub max_output_tokens: u32,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxProfile {
     ReadOnly,
     WorkspaceWrite,
     FullAccess,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolChoice {
-    Auto,
-    Required,
-    None,
-    Named(ToolName),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutputContract {
-    pub final_answer_required: bool,
-    pub structured_schema_name: Option<String>,
-    pub history_markdown_projection: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationIntent {
-    ContentChangingAuthoringRequired,
-}
-
-impl OperationIntent {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ContentChangingAuthoringRequired => "content_changing_authoring_required",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ActiveWorkContractProjection {
-    pub route: TaskRoute,
-    pub process_phase: ProcessPhase,
-    pub active_work_kind: Option<String>,
-    pub summary: String,
-    pub active_targets: Vec<Utf8PathBuf>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub operation_intents: Vec<OperationIntent>,
-    pub required_verification_commands: Vec<String>,
-    pub allowed_tools: Vec<ToolName>,
-    pub forbidden_tools: Vec<ToolName>,
-    pub projection_id: ProjectionId,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LifecycleGuardSnapshot {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub counters: BTreeMap<String, usize>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub active_flags: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub scoped_targets: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub payloads: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,9 +286,7 @@ impl TurnInterruptionCause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionMode {
-    Manual,
-    PreTurn,
-    MidTurn,
+    Automatic,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -483,12 +318,17 @@ pub struct InterAgentCommunication {
 impl RuntimeEvent {
     pub fn terminal_status(&self) -> Option<TurnTerminalStatus> {
         match &self.msg {
-            RuntimeEventMsg::TurnCompleted { .. } => Some(TurnTerminalStatus::Completed),
-            RuntimeEventMsg::TurnAwaitingUser { .. } => Some(TurnTerminalStatus::AwaitingUser),
-            RuntimeEventMsg::TurnFailed { .. } => Some(TurnTerminalStatus::Failed),
-            RuntimeEventMsg::TurnInterrupted { .. } => Some(TurnTerminalStatus::Interrupted),
+            RuntimeEventMsg::TurnTerminal { terminal } => Some(terminal.status),
             _ => None,
         }
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.terminal_status().is_some()
     }
 }
 
@@ -498,9 +338,6 @@ pub enum RuntimeEventMsg {
     ThreadConfigured {
         model: String,
         base_url: String,
-    },
-    TurnStarted {
-        context: TurnContext,
     },
     UserInputAccepted {
         item_count: usize,
@@ -519,19 +356,17 @@ pub enum RuntimeEventMsg {
         agent_path: String,
         activity_kind: SubAgentActivityKind,
     },
-    UserMessageStored {
-        message_id: MessageId,
-    },
-    AssistantStarted {
-        message_id: MessageId,
-        model: String,
-    },
     AssistantTextDelta {
-        message_id: MessageId,
+        response_id: ModelResponseId,
         delta: String,
     },
-    ReasoningDelta {
-        message_id: MessageId,
+    AssistantMessageCommitted {
+        response_id: ModelResponseId,
+        text: String,
+    },
+    /// Provider-confirmed reasoning summary streamed to clients only.
+    ReasoningSummaryDelta {
+        response_id: ModelResponseId,
         delta: String,
     },
     ModelRequestPrepared {
@@ -545,12 +380,6 @@ pub enum RuntimeEventMsg {
     },
     ToolLifecycle {
         envelope: ToolLifecycleEnvelope,
-    },
-    ToolProposalRejected {
-        proposal: RejectedToolProposal,
-    },
-    CandidateRepairEditRecorded {
-        candidate: CandidateRepairEdit,
     },
     ApprovalRequested {
         call_id: ToolCallId,
@@ -566,15 +395,6 @@ pub enum RuntimeEventMsg {
         item_id: HistoryItemId,
         mode: CompactionMode,
     },
-    StateProjected {
-        projection: TurnDecisionDiagnostic,
-    },
-    ControlEnvelopePrepared {
-        envelope: TurnControlEnvelope,
-    },
-    LifecycleGuardUpdated {
-        snapshot: LifecycleGuardSnapshot,
-    },
     FileChangesRecorded {
         call_id: ToolCallId,
         change_ids: Vec<ChangeId>,
@@ -588,19 +408,8 @@ pub enum RuntimeEventMsg {
         message: String,
         next_retry_at_ms: i64,
     },
-    TurnCompleted {
-        finish_reason: Option<FinishReason>,
-    },
-    TurnAwaitingUser {
-        reason: String,
-    },
-    TurnFailed {
-        message: String,
-    },
-    TurnInterrupted {
-        reason: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cause: Option<TurnInterruptionCause>,
+    TurnTerminal {
+        terminal: Box<crate::session::model::DurableTurnTerminal>,
     },
 }
 
@@ -608,7 +417,6 @@ pub enum RuntimeEventMsg {
 #[serde(rename_all = "snake_case")]
 pub enum TurnTerminalStatus {
     Completed,
-    AwaitingUser,
     Failed,
     Interrupted,
 }
@@ -617,7 +425,6 @@ impl TurnTerminalStatus {
     pub fn as_session_status(self) -> SessionStatus {
         match self {
             Self::Completed => SessionStatus::Completed,
-            Self::AwaitingUser => SessionStatus::AwaitingUser,
             Self::Interrupted => SessionStatus::Cancelled,
             Self::Failed => SessionStatus::Failed,
         }
@@ -640,18 +447,35 @@ impl HistoryItem {
     }
 }
 
+/// Canonical history items hidden by committed semantic compaction.
+///
+/// This derivation lives with the durable payload contract so every consumer
+/// (model projection, compaction selection, and filtered agent-context fork)
+/// observes the same active-history boundary.
+pub(crate) fn compacted_history_item_ids(items: &[HistoryItem]) -> HashSet<HistoryItemId> {
+    items
+        .iter()
+        .filter_map(|item| match &item.payload {
+            HistoryItemPayload::Compaction {
+                replacement_item_ids,
+                ..
+            } => Some(replacement_item_ids.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HistoryItemPayload {
     UserTurn {
-        message_id: Option<MessageId>,
         content: Vec<ContentPart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_dispatch: Option<PromptDispatchPart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         editor_context: Option<EditorContext>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        turn_context: Option<Box<TurnContext>>,
     },
     SteerTurn {
         expected_turn_id: TurnId,
@@ -670,45 +494,32 @@ pub enum HistoryItemPayload {
         agent_path: String,
         activity_kind: SubAgentActivityKind,
     },
-    Message {
-        message_id: Option<MessageId>,
-        role: MessageRole,
+    /// A typed developer-instruction boundary for subsequent turns.
+    ///
+    /// The effective instruction text is resolved once when constructing the
+    /// immutable turn context. This item is state/replay evidence and is not
+    /// independently projected into model messages.
+    CollaborationModeInstruction {
+        mode: ModeKind,
+    },
+    AssistantMessage {
+        response_id: ModelResponseId,
         content: Vec<ContentPart>,
     },
     Error {
-        message_id: Option<MessageId>,
         message: String,
-    },
-    PromptDispatch {
-        dispatch: PromptDispatchPart,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        editor_context: Option<EditorContext>,
-    },
-    Reasoning {
-        text: String,
     },
     ToolCall {
         call_id: ToolCallId,
-        tool: ToolName,
-        /// Display/materialized snapshot only; canonical argument authority is
-        /// resolved from `effective_arguments` or `model_arguments`.
-        arguments: Value,
-        #[serde(default, skip_serializing_if = "Value::is_null")]
-        model_arguments: Value,
-        #[serde(default, skip_serializing_if = "Value::is_null")]
-        effective_arguments: Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        adjusted_arguments: Option<Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        permission_decision: Option<PermissionDecision>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sandbox_decision: Option<SandboxDecision>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        allowed_surface: Vec<ToolName>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        retry_policy: Option<Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        terminal_guard_policy: Option<Value>,
+        response_id: ModelResponseId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        model_call_id: String,
+        /// The exact provider-emitted tool name. Execution routing derives a
+        /// typed `ToolName` from this value without replacing the durable text.
+        tool_name: String,
+        /// The exact provider-emitted JSON text. Parsing and schema validation
+        /// are transient execution concerns and never rewrite canonical history.
+        arguments_json: String,
     },
     ToolOutput {
         call_id: ToolCallId,
@@ -718,20 +529,6 @@ pub enum HistoryItemPayload {
         metadata: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         success: Option<bool>,
-        #[serde(default)]
-        progress_effect: ToolProgressEffect,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        blocked_action: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        result_hash: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        verification_run: Option<VerificationRunResult>,
-    },
-    RejectedToolProposal {
-        proposal: RejectedToolProposal,
-    },
-    CandidateRepairEdit {
-        candidate: CandidateRepairEdit,
     },
     RequestDiagnostics {
         diagnostics: RequestDiagnosticsPart,
@@ -739,15 +536,6 @@ pub enum HistoryItemPayload {
     WorldState {
         snapshot: crate::context::WorldStateSnapshot,
         rendered: String,
-    },
-    Continuation {
-        contract: ContinuationContract,
-    },
-    StateProjection {
-        projection: TurnDecisionDiagnostic,
-    },
-    SessionState {
-        state: SessionStateSnapshot,
     },
     ApprovalDecision {
         call_id: ToolCallId,
@@ -758,17 +546,10 @@ pub enum HistoryItemPayload {
         message: String,
         next_retry_at_ms: i64,
     },
-    ControlEnvelope {
-        envelope: TurnControlEnvelope,
-    },
-    LifecycleGuard {
-        snapshot: LifecycleGuardSnapshot,
-    },
     Compaction {
         mode: CompactionMode,
         summary: String,
         replacement_item_ids: Vec<HistoryItemId>,
-        continuation: Option<ContinuationContract>,
     },
     FileChange {
         call_id: ToolCallId,
@@ -779,380 +560,11 @@ pub enum HistoryItemPayload {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HistoryItemAuthorityRole {
-    UserInput,
-    AssistantOutput,
-    ToolCall,
-    ToolOutput,
-    RejectedModelAction,
-    CandidateRepairEvidence,
-    RuntimeDiagnostic,
-    RuntimeProjection,
-    RuntimeControl,
-    StateCache,
-    ApprovalEvidence,
-    RetryEvidence,
-    LifecycleGuard,
-    MemoryContinuity,
-    FileEvidence,
-    RuntimeError,
-    ReasoningTrace,
-}
-
-impl HistoryItemPayload {
-    pub fn authority_role(&self) -> HistoryItemAuthorityRole {
-        match self {
-            Self::UserTurn { .. }
-            | Self::SteerTurn { .. }
-            | Self::Message {
-                role: MessageRole::User,
-                ..
-            }
-            | Self::PromptDispatch { .. } => HistoryItemAuthorityRole::UserInput,
-            Self::Message {
-                role: MessageRole::Assistant,
-                ..
-            }
-            | Self::InterAgentCommunication { .. } => HistoryItemAuthorityRole::AssistantOutput,
-            Self::Reasoning { .. } => HistoryItemAuthorityRole::ReasoningTrace,
-            Self::Error { .. } => HistoryItemAuthorityRole::RuntimeError,
-            Self::ToolCall { .. } => HistoryItemAuthorityRole::ToolCall,
-            Self::ToolOutput { .. } => HistoryItemAuthorityRole::ToolOutput,
-            Self::RejectedToolProposal { .. } => HistoryItemAuthorityRole::RejectedModelAction,
-            Self::CandidateRepairEdit { .. } => HistoryItemAuthorityRole::CandidateRepairEvidence,
-            Self::RequestDiagnostics { .. } | Self::WorldState { .. } => {
-                HistoryItemAuthorityRole::RuntimeDiagnostic
-            }
-            Self::Continuation { .. } => HistoryItemAuthorityRole::RuntimeControl,
-            Self::SubAgentActivity { .. } => HistoryItemAuthorityRole::RuntimeControl,
-            Self::StateProjection { .. } => HistoryItemAuthorityRole::RuntimeProjection,
-            Self::SessionState { .. } => HistoryItemAuthorityRole::StateCache,
-            Self::ApprovalDecision { .. } => HistoryItemAuthorityRole::ApprovalEvidence,
-            Self::RetryDecision { .. } => HistoryItemAuthorityRole::RetryEvidence,
-            Self::ControlEnvelope { .. } => HistoryItemAuthorityRole::RuntimeControl,
-            Self::LifecycleGuard { .. } => HistoryItemAuthorityRole::LifecycleGuard,
-            Self::Compaction { .. } => HistoryItemAuthorityRole::MemoryContinuity,
-            Self::FileChange { .. } => HistoryItemAuthorityRole::FileEvidence,
-        }
-    }
-
-    pub fn is_provider_replay_candidate(&self) -> bool {
-        match self {
-            Self::UserTurn { .. }
-            | Self::SteerTurn { .. }
-            | Self::Message { .. }
-            | Self::InterAgentCommunication { .. }
-            | Self::ToolCall { .. }
-            | Self::ToolOutput { .. } => true,
-            Self::RejectedToolProposal { proposal } => {
-                proposal.semantic_class == "text_final_while_obligations_open"
-            }
-            _ => false,
-        }
-    }
-
-    pub fn is_materialized_projection_only(&self) -> bool {
-        matches!(
-            self.authority_role(),
-            HistoryItemAuthorityRole::RuntimeDiagnostic
-                | HistoryItemAuthorityRole::RuntimeProjection
-                | HistoryItemAuthorityRole::RuntimeControl
-                | HistoryItemAuthorityRole::StateCache
-                | HistoryItemAuthorityRole::LifecycleGuard
-                | HistoryItemAuthorityRole::RetryEvidence
-        )
-    }
-
-    pub fn is_state_reducer_authority(&self) -> bool {
-        matches!(
-            self.authority_role(),
-            HistoryItemAuthorityRole::UserInput
-                | HistoryItemAuthorityRole::ToolOutput
-                | HistoryItemAuthorityRole::RejectedModelAction
-                | HistoryItemAuthorityRole::CandidateRepairEvidence
-                | HistoryItemAuthorityRole::FileEvidence
-                | HistoryItemAuthorityRole::MemoryContinuity
-                | HistoryItemAuthorityRole::RuntimeError
-        )
-    }
-}
-
-pub fn history_item_projection_roles_are_not_authority_fixture_passes() -> bool {
-    let projection_id = ProjectionId::new();
-    let session_id = SessionId::new();
-    let turn_id = TurnId::new();
-    let context = TurnContext {
-        session_id,
-        cwd: Utf8PathBuf::from("C:/workspace/project"),
-        workspace_root: Utf8PathBuf::from("C:/workspace/project"),
-        provider: "lm_studio".to_string(),
-        model: CURRENT_PROTOCOL_FIXTURE_MODEL.to_string(),
-        base_url: CURRENT_PROTOCOL_FIXTURE_BASE_URL.to_string(),
-        access_mode: AccessMode::AutoReview,
-        sandbox: SandboxProfile::WorkspaceWrite,
-        shell_family: ShellFamily::PowerShell,
-        model_capabilities: ModelCapabilities {
-            supports_tools: true,
-            supports_reasoning: false,
-            supports_images: false,
-            parallel_tool_calls: false,
-            context_window: CURRENT_PROTOCOL_FIXTURE_CONTEXT_WINDOW,
-            max_output_tokens: CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS,
-        },
-        route: TaskRoute::Code,
-        process_phase: ProcessPhase::Author,
-        active_contract: ActiveWorkContractProjection {
-            route: TaskRoute::Code,
-            process_phase: ProcessPhase::Author,
-            active_work_kind: Some("fixture".to_string()),
-            summary: "create active artifact".to_string(),
-            active_targets: vec![Utf8PathBuf::from("active.rs")],
-            operation_intents: vec![OperationIntent::ContentChangingAuthoringRequired],
-            required_verification_commands: Vec::new(),
-            allowed_tools: vec![ToolName::ApplyPatch],
-            forbidden_tools: Vec::new(),
-            projection_id,
-        },
-        allowed_tools: vec![ToolName::ApplyPatch],
-        tool_choice: ToolChoice::Auto,
-        images: Vec::new(),
-        output_contract: OutputContract {
-            final_answer_required: true,
-            structured_schema_name: None,
-            history_markdown_projection: true,
-        },
-        continuation: None,
-        turn_decision_projection: None,
-    };
-    let provider_profile_is_current = context.model == CURRENT_PROTOCOL_FIXTURE_MODEL
-        && context.base_url == CURRENT_PROTOCOL_FIXTURE_BASE_URL
-        && context.model_capabilities.context_window == CURRENT_PROTOCOL_FIXTURE_CONTEXT_WINDOW
-        && context.model_capabilities.max_output_tokens
-            == CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS;
-    let envelope = TurnControlEnvelope::new(
-        turn_id,
-        context,
-        ObligationSet::empty(),
-        ActionAuthority {
-            projection_id,
-            required_action: None,
-            required_action_conflicts: Vec::new(),
-            required_verification_commands: Vec::new(),
-            operation_intents: Vec::new(),
-            allowed_tools: vec![ToolName::ApplyPatch],
-            forbidden_tools: Vec::new(),
-            tool_choice: ToolChoice::Auto,
-        },
-        ProjectionBundle::from_authority_and_obligations(
-            &ActionAuthority {
-                projection_id,
-                required_action: None,
-                required_action_conflicts: Vec::new(),
-                required_verification_commands: Vec::new(),
-                operation_intents: Vec::new(),
-                allowed_tools: vec![ToolName::ApplyPatch],
-                forbidden_tools: Vec::new(),
-                tool_choice: ToolChoice::Auto,
-            },
-            &ObligationSet::empty(),
-        ),
-        DispatchPolicy::Dispatch,
-        Vec::new(),
-    );
-    let projection_items = vec![
-        HistoryItemPayload::RequestDiagnostics {
-            diagnostics: RequestDiagnosticsPart {
-                provider: "lm_studio".to_string(),
-                model_name: CURRENT_PROTOCOL_FIXTURE_MODEL.to_string(),
-                base_url: CURRENT_PROTOCOL_FIXTURE_BASE_URL.to_string(),
-                request_timeout_ms: 30_000,
-                stream_idle_timeout_ms: 30_000,
-                stream_max_retries: 0,
-                configured_max_output_tokens: Some(CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS),
-                effective_max_output_tokens: Some(CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS),
-                output_budget_reason: None,
-                supports_tools: Some(true),
-                supports_reasoning: Some(false),
-                supports_images: Some(false),
-                system_prompt_chars: 0,
-                tool_count: 1,
-                tool_choice: Some("auto".to_string()),
-                parallel_tool_calls: Some(false),
-                provider_message_count: 0,
-                image_count: 0,
-                image_bytes: 0,
-                tool_names: vec!["apply_patch".to_string()],
-                tool_schemas: Vec::new(),
-                turn_decision: None,
-                control_envelope: None,
-                replay_policies: Vec::new(),
-                context_window: None,
-                messages: Vec::new(),
-            },
-        },
-        HistoryItemPayload::StateProjection {
-            projection: TurnDecisionDiagnostic {
-                route: "code".to_string(),
-                process_phase: "author".to_string(),
-                active_work_kind: None,
-                active_work_summary: None,
-                active_targets: Vec::new(),
-                verification_pending: false,
-                closeout_ready: false,
-                required_verification_commands: Vec::new(),
-                policy_targets: Vec::new(),
-                allowed_tools: Vec::new(),
-                tool_choice: None,
-                warnings: Vec::new(),
-                repair_lane: None,
-            },
-        },
-        HistoryItemPayload::SessionState {
-            state: SessionStateSnapshot::default(),
-        },
-        HistoryItemPayload::ControlEnvelope { envelope },
-        HistoryItemPayload::LifecycleGuard {
-            snapshot: LifecycleGuardSnapshot::default(),
-        },
-    ];
-
-    projection_items.iter().all(|payload| {
-        payload.is_materialized_projection_only()
-            && !payload.is_provider_replay_candidate()
-            && !payload.is_state_reducer_authority()
-    }) && provider_profile_is_current
-        && projection_items.iter().any(|payload| {
-            matches!(
-                payload,
-                HistoryItemPayload::RequestDiagnostics { diagnostics }
-                    if diagnostics.model_name == CURRENT_PROTOCOL_FIXTURE_MODEL
-                        && diagnostics.base_url == CURRENT_PROTOCOL_FIXTURE_BASE_URL
-                        && diagnostics.configured_max_output_tokens
-                            == Some(CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS)
-                        && diagnostics.effective_max_output_tokens
-                            == Some(CURRENT_PROTOCOL_FIXTURE_MAX_OUTPUT_TOKENS)
-            )
-        })
-        && PROTOCOL_MOD_PROJECTION_PROVIDER_PROFILE_MARKER
-            == "protocol_mod_projection_fixture_current_provider_profile"
-}
-
-pub fn canonical_tool_call_arguments<'a>(
-    _arguments: &'a Value,
-    model_arguments: &'a Value,
-    effective_arguments: &'a Value,
-) -> &'a Value {
-    if !effective_arguments.is_null() {
-        effective_arguments
-    } else if !model_arguments.is_null() {
-        model_arguments
-    } else {
-        model_arguments
-    }
-}
-
-pub fn protocol_tool_call_arguments_do_not_fallback_to_legacy_display_projection_fixture_passes()
--> bool {
-    let legacy_display_arguments = serde_json::json!({
-        "target": "legacy-display-only.rs",
-        "operation": "write"
-    });
-    let model_arguments = serde_json::Value::Null;
-    let effective_arguments = serde_json::Value::Null;
-    let selected = canonical_tool_call_arguments(
-        &legacy_display_arguments,
-        &model_arguments,
-        &effective_arguments,
-    );
-    let typed_model_arguments = serde_json::json!({
-        "target": "typed-model.rs",
-        "operation": "write"
-    });
-    let selected_model = canonical_tool_call_arguments(
-        &legacy_display_arguments,
-        &typed_model_arguments,
-        &effective_arguments,
-    );
-    let typed_effective_arguments = serde_json::json!({
-        "target": "typed-effective.rs",
-        "operation": "write"
-    });
-    let selected_effective = canonical_tool_call_arguments(
-        &legacy_display_arguments,
-        &typed_model_arguments,
-        &typed_effective_arguments,
-    );
-
-    selected.is_null()
-        && selected_model == &typed_model_arguments
-        && selected_effective == &typed_effective_arguments
-        && selected != &legacy_display_arguments
-        && PROTOCOL_TOOL_CALL_TYPED_ARGUMENT_AUTHORITY_MARKER
-            == "protocol_tool_call_typed_arguments_authority"
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ContentPart {
     Text { text: String },
     Image { image: ImagePart },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RejectedToolProposal {
-    pub proposal_id: ToolProposalId,
-    pub source_call_id: ToolCallId,
-    pub requested_tool: String,
-    pub effective_tool: String,
-    pub resolved_tool: ToolName,
-    pub original_arguments: Value,
-    pub adjusted_arguments: Option<Value>,
-    pub allowed_surface: Vec<ToolName>,
-    pub blocked_reason: String,
-    pub projection_id: ProjectionId,
-    pub semantic_class: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_repair_id: Option<CandidateRepairId>,
-    pub payload_hash: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub contract_refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CandidateRepairEdit {
-    pub candidate_id: CandidateRepairId,
-    pub proposal_id: ToolProposalId,
-    pub source_call_id: ToolCallId,
-    pub proposed_tool: ToolName,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_path: Option<Utf8PathBuf>,
-    pub original_arguments: Value,
-    pub normalized_edit_intent: String,
-    pub semantic_class: String,
-    pub validity: CandidateRepairValidity,
-    pub payload_hash: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aligned_failure_refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CandidateRepairValidity {
-    Unverified,
-    Tentative,
-    ContractDeltaVerified,
-    Admitted,
-    Contradicted,
-    Rejected,
-    Superseded,
-    Expired,
-    Unsafe,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1183,6 +595,21 @@ pub fn turn_items_in_projection_order(turn_items: &[TurnItem]) -> Vec<&TurnItem>
     ordered
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanStep {
+    pub step: String,
+    pub status: PlanStepStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnItemPayload {
@@ -1204,22 +631,12 @@ pub enum TurnItemPayload {
     AgentMessage {
         text: String,
     },
-    Reasoning {
-        text: String,
-    },
     Plan {
-        summary: String,
-    },
-    PromptDispatch {
-        summary: String,
-    },
-    State {
-        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explanation: Option<String>,
+        plan: Vec<PlanStep>,
     },
     WorldState {
-        summary: String,
-    },
-    LifecycleGuard {
         summary: String,
     },
     ToolStatus {
@@ -1263,7 +680,6 @@ pub enum TurnItemPayload {
 pub enum TurnItemProjectionRole {
     UserVisibleMessage,
     AssistantVisibleMessage,
-    ReasoningTrace,
     RuntimeProjection,
     RuntimeControl,
     ToolLifecycleEvidence,
@@ -1284,14 +700,10 @@ impl TurnItemPayload {
             Self::AgentMessage { .. } | Self::InterAgentCommunication { .. } => {
                 TurnItemProjectionRole::AssistantVisibleMessage
             }
-            Self::Reasoning { .. } => TurnItemProjectionRole::ReasoningTrace,
-            Self::Plan { .. }
-            | Self::PromptDispatch { .. }
-            | Self::State { .. }
-            | Self::WorldState { .. } => TurnItemProjectionRole::RuntimeProjection,
-            Self::LifecycleGuard { .. } | Self::SubAgentActivity { .. } => {
-                TurnItemProjectionRole::RuntimeControl
+            Self::Plan { .. } | Self::WorldState { .. } => {
+                TurnItemProjectionRole::RuntimeProjection
             }
+            Self::SubAgentActivity { .. } => TurnItemProjectionRole::RuntimeControl,
             Self::ToolStatus { .. } => TurnItemProjectionRole::ToolLifecycleEvidence,
             Self::FileChange { .. } => TurnItemProjectionRole::FileEvidence,
             Self::ContextCompaction { .. } => TurnItemProjectionRole::MemoryContinuity,
@@ -1313,16 +725,14 @@ impl TurnItemPayload {
 pub fn turn_item_internal_projection_roles_are_not_primary_display_fixture_passes() -> bool {
     let internal = [
         TurnItemPayload::Plan {
-            summary: "plan cache".to_string(),
+            explanation: Some("plan cache".to_string()),
+            plan: vec![PlanStep {
+                step: "inspect the relevant contract".to_string(),
+                status: PlanStepStatus::InProgress,
+            }],
         },
-        TurnItemPayload::PromptDispatch {
-            summary: "prompt dispatch cache".to_string(),
-        },
-        TurnItemPayload::State {
-            summary: "state cache".to_string(),
-        },
-        TurnItemPayload::LifecycleGuard {
-            summary: "guard cache".to_string(),
+        TurnItemPayload::WorldState {
+            summary: "captured world state".to_string(),
         },
     ];
     let visible = [
@@ -1354,44 +764,12 @@ pub fn turn_item_internal_projection_roles_are_not_primary_display_fixture_passe
 pub struct ToolLifecycleEnvelope {
     pub call_id: ToolCallId,
     pub tool: ToolName,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proposal_id: Option<ToolProposalId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_repair_id: Option<CandidateRepairId>,
-    pub original_arguments: Value,
-    pub adjusted_arguments: Option<Value>,
-    pub allowed_surface: Vec<ToolName>,
-    pub permission_decision: PermissionDecision,
-    pub sandbox_decision: SandboxDecision,
     pub status: ToolLifecycleStatus,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rejection_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic_class: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_validity: Option<CandidateRepairValidity>,
-    pub result_hash: Option<String>,
-    pub blocked_action: Option<String>,
-    pub projection_id: ProjectionId,
-    pub contract_refs: Vec<String>,
-    pub artifact_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolProgressEffect {
-    MadeProgress,
-    NoProgress,
-    Blocked,
-    VerificationPassed,
-    VerificationFailed,
-    Unknown,
-}
-
-impl Default for ToolProgressEffect {
-    fn default() -> Self {
-        Self::Unknown
-    }
+    pub success: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1403,39 +781,6 @@ pub struct FileChangeEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_after: Option<Utf8PathBuf>,
     pub summary: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VerificationRunStatus {
-    Passed,
-    Failed,
-    TimedOut,
-    NotVerification,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerificationRunResult {
-    pub command: String,
-    pub status: VerificationRunStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i64>,
-    pub timed_out: bool,
-    pub output_summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure_cluster: Option<VerificationFailureCluster>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub satisfies_command_identities: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifact_refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requirement_refs: Vec<String>,
-}
-
-impl ToolLifecycleEnvelope {
-    pub fn projects_required_action(&self) -> bool {
-        self.result_hash.is_some()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1463,7 +808,4 @@ pub enum ToolLifecycleStatus {
     Declined,
     Cancelled,
     Failed,
-    Blocked,
-    Rejected,
-    Deferred,
 }

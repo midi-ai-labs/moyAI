@@ -78,7 +78,7 @@ export function renderLocalConfirmation(confirm: LocalConfirmation, pending = fa
     : unarchive
       ? "このチャットを通常の一覧に戻します。履歴、実行証跡、ワークスペース内の実ファイルは変更しません。"
     : rollback
-      ? "canonical history の最新 turn を削除し、session state / todo を残った履歴へ戻します。ワークスペース内の実ファイルは変更しません。"
+      ? "canonical history の最新 turn を削除し、session lifecycle と表示projectionを残った履歴から再構成します。ワークスペース内の実ファイルは変更しません。"
     : confirm.kind === "project"
       ? "履歴とセッション情報を削除します。ワークスペース内の実ファイルは削除しません。"
       : "このチャット履歴を削除します。ワークスペース内の実ファイルは削除しません。";

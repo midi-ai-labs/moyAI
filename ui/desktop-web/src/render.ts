@@ -95,13 +95,11 @@ export function setRenderContext(context: RenderContext): void {
 export function renderStartupSplash(state: DesktopWebState, elapsedMs: number, minVisibleMs: number): string {
   const remainingMs = Math.max(0, minVisibleMs - elapsedMs);
   const progressLabel =
-    state.startup.status === "loading"
-      ? "確認中"
-      : remainingMs > 0
-        ? "起動中"
-        : state.startup.status === "ready"
-          ? "準備完了"
-          : "確認が必要";
+    remainingMs > 0
+      ? "起動中"
+      : state.startup.status === "ready"
+        ? "準備完了"
+        : "確認が必要";
   return `
     <div class="splash-screen">
       <div class="splash-core">
@@ -436,16 +434,15 @@ function renderEmptyThread(state: DesktopWebState): string {
 }
 
 function renderTranscriptCard(row: TranscriptRow): string {
-  const rowKind = transcriptRowKind(row);
+  const rowKind = row.row_kind;
   if (rowKind.startsWith("work_summary")) {
     return renderWorkSummaryCard(row);
   }
   if (rowKind === "file_changes") {
     return renderFileChangesTranscriptCard(row);
   }
-  const legacyClass = row.kind && row.kind !== rowKind ? ` ${escapeHtml(row.kind)}` : "";
   return `
-    <article class="message ${escapeHtml(rowKind)}${legacyClass}">
+    <article class="message ${escapeHtml(rowKind)}">
       <div class="message-step">${escapeHtml(row.step)}</div>
       <div class="message-body">
         <h2>${escapeHtml(row.title)}</h2>
@@ -494,10 +491,11 @@ function renderTranscriptFileChangeTable(changes: FileChangeRow[]): string {
 }
 
 function renderWorkSummaryCard(row: TranscriptRow): string {
-  const rowKind = transcriptRowKind(row);
+  const rowKind = row.row_kind;
   const running = rowKind === "work_summary_running";
-  const open = running ? "open" : "";
-  const statusText = running ? "実行中" : "作業サマリ";
+  const incomplete = rowKind === "work_summary_incomplete";
+  const open = running || incomplete ? "open" : "";
+  const statusText = running ? "実行中" : incomplete ? "状態未確定" : "作業サマリ";
   const summary = extractMarkdownSections(row.body, ["作業サマリ", "完了"]);
   const history = removeMarkdownSections(row.body, ["作業サマリ", "完了"]);
   const visibleSummary = !running && summary.trim().length > 0 ? summary : "";
@@ -660,6 +658,33 @@ function attachmentThumbnailSrc(path: string): string {
   }
 }
 
+function planStepStatusLabel(status: "pending" | "in_progress" | "completed"): string {
+  if (status === "completed") return "完了";
+  if (status === "in_progress") return "進行中";
+  return "未着手";
+}
+
+export function renderPlanProjection(state: DesktopWebState): string {
+  const plan = state.plan;
+  if (!plan || (plan.steps.length === 0 && !(plan.explanation ?? "").trim())) return "";
+  return `
+    <section class="output-file-section" aria-label="作業計画">
+      <div class="output-section-heading">
+        <strong>計画</strong>
+        <small>${plan.steps.length}件</small>
+      </div>
+      ${plan.explanation?.trim() ? `<p>${escapeHtml(plan.explanation.trim())}</p>` : ""}
+      <ol class="plan-list">
+        ${plan.steps
+          .map(
+            (step) => `<li data-plan-status="${step.status}"><span>${escapeHtml(planStepStatusLabel(step.status))}</span> ${escapeHtml(step.step)}</li>`,
+          )
+          .join("")}
+      </ol>
+    </section>
+  `;
+}
+
 export function renderArtifactPane(state: DesktopWebState): string {
   if (artifactPaneCollapsed) {
     return `
@@ -699,6 +724,7 @@ export function renderArtifactPane(state: DesktopWebState): string {
         </div>
       </div>
       ${renderSubAgentSummaryTrigger(state)}
+      ${renderPlanProjection(state)}
       <section class="output-file-section" aria-label="ファイル出力">
         <div class="output-section-heading">
           <strong>ファイル</strong>
@@ -860,10 +886,6 @@ function providerStatusView(state: DesktopWebState): { kind: string; title: stri
     hint: typed.hint,
     details: typed.details,
   };
-}
-
-function transcriptRowKind(row: TranscriptRow): TranscriptRow["row_kind"] {
-  return row.row_kind || (row.kind as TranscriptRow["row_kind"]);
 }
 
 function renderConfigOverlay(state: DesktopWebState): string {

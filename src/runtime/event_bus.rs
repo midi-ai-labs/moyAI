@@ -39,7 +39,11 @@ pub trait RunEventSink {
         None
     }
 
-    fn emit_pre_recorded(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
+    fn emit_committed(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
+        self.emit(event)
+    }
+
+    fn emit_runtime_only(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
         self.emit(event)
     }
 }

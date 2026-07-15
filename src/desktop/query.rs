@@ -8,8 +8,8 @@ use crate::desktop::models::{
 use crate::error::AppRunError;
 use crate::harness::ReplayReport;
 use crate::session::{
-    ChangeKind, LoadedSessionSummary, ProjectId, ProjectRecord, SessionId, SessionRecord,
-    SessionStateSnapshot, SessionStatus, TodoItem, TodoStatus, ToolCallStatus, Transcript,
+    CanonicalSessionRead, ChangeKind, LoadedSessionSummary, ProjectId, ProjectRecord, SessionId,
+    SessionRecord, SessionStatus, ToolCallStatus,
 };
 use crate::tui::state::{AppState, RunStatus, TranscriptKind};
 
@@ -22,15 +22,7 @@ pub use super::artifact_projection::{file_change_rows_from_turn_items, format_ar
 pub const DESKTOP_TURN_PAGE_LIMIT: usize = 80;
 
 pub struct LoadedSessionDetail {
-    pub session: SessionRecord,
-    pub transcript: Transcript,
-    pub turn_items: Vec<crate::protocol::TurnItem>,
-    pub state: SessionStateSnapshot,
-    pub todos: Vec<TodoItem>,
-    pub turn_page_offset: usize,
-    pub turn_page_limit: usize,
-    pub turn_page_total: usize,
-    pub turn_page_has_more: bool,
+    pub read: CanonicalSessionRead,
 }
 
 pub async fn load_snapshot(app: &App, args: &DesktopArgs) -> Result<DesktopSnapshot, AppRunError> {
@@ -120,8 +112,8 @@ pub async fn load_latest_session_detail(
         let offset = latest_turn_page_offset(total, DESKTOP_TURN_PAGE_LIMIT);
         let detail = load_session_detail_at(app, session_id, offset).await?;
         let stable_offset =
-            latest_turn_page_offset(detail.turn_page_total, DESKTOP_TURN_PAGE_LIMIT);
-        if detail.turn_page_offset == stable_offset {
+            latest_turn_page_offset(detail.read.turns.total, DESKTOP_TURN_PAGE_LIMIT);
+        if detail.read.turns.offset == stable_offset {
             return Ok(detail);
         }
     }
@@ -136,32 +128,35 @@ async fn load_session_detail_at(
     turn_page_offset: usize,
 ) -> Result<LoadedSessionDetail, AppRunError> {
     for _ in 0..3 {
-        let page = app
+        let read = app
             .session_service
-            .canonical_turn_page(session_id, turn_page_offset, DESKTOP_TURN_PAGE_LIMIT)
+            .canonical_session_read(
+                session_id,
+                0,
+                usize::MAX,
+                turn_page_offset,
+                DESKTOP_TURN_PAGE_LIMIT,
+            )
             .await?;
-        let transcript = app.session_service.canonical_transcript(session_id).await?;
-        let state = app.session_service.load_state(session_id).await?;
-        let todos = app.session_service.list_todos(session_id).await?;
         let fence = app
             .session_service
-            .canonical_turn_page(session_id, turn_page_offset, DESKTOP_TURN_PAGE_LIMIT)
+            .canonical_session_read(
+                session_id,
+                0,
+                usize::MAX,
+                turn_page_offset,
+                DESKTOP_TURN_PAGE_LIMIT,
+            )
             .await?;
-        let stable = page.session.updated_at_ms == fence.session.updated_at_ms
-            && page.session.status == fence.session.status
-            && page.total == fence.total
-            && page.items.last().map(|item| item.id) == fence.items.last().map(|item| item.id);
-        let detail = LoadedSessionDetail {
-            session: fence.session,
-            transcript,
-            turn_items: fence.items,
-            state,
-            todos,
-            turn_page_offset: fence.offset,
-            turn_page_limit: fence.limit,
-            turn_page_total: fence.total,
-            turn_page_has_more: fence.has_more,
-        };
+        let stable = read.session.updated_at_ms == fence.session.updated_at_ms
+            && read.session.status == fence.session.status
+            && read.history.total == fence.history.total
+            && read.history.items.last().map(|item| item.id)
+                == fence.history.items.last().map(|item| item.id)
+            && read.turns.total == fence.turns.total
+            && read.turns.items.last().map(|item| item.id)
+                == fence.turns.items.last().map(|item| item.id);
+        let detail = LoadedSessionDetail { read: fence };
         if stable {
             return Ok(detail);
         }
@@ -352,58 +347,30 @@ pub fn select_session_index(
 }
 
 pub fn build_session_detail(
-    session: &SessionRecord,
-    state: SessionStateSnapshot,
-    todos: Vec<TodoItem>,
-    _transcript: Transcript,
-    turn_items: Vec<crate::protocol::TurnItem>,
+    read: &CanonicalSessionRead,
     replay_report: Option<ReplayReport>,
 ) -> DesktopSessionDetail {
-    build_session_detail_with_page(
-        session,
-        state,
-        todos,
-        _transcript,
-        turn_items,
-        0,
-        0,
-        0,
-        false,
-        replay_report,
-    )
-}
-
-pub fn build_session_detail_with_page(
-    session: &SessionRecord,
-    state: SessionStateSnapshot,
-    todos: Vec<TodoItem>,
-    _transcript: Transcript,
-    turn_items: Vec<crate::protocol::TurnItem>,
-    turn_page_offset: usize,
-    turn_page_limit: usize,
-    turn_page_total: usize,
-    turn_page_has_more: bool,
-    replay_report: Option<ReplayReport>,
-) -> DesktopSessionDetail {
+    let session = &read.session;
+    let turn_items = &read.turns.items;
     let mut ui_state = AppState::default();
-    ui_state.load_turn_items(session, &turn_items, state.clone(), todos.clone());
+    ui_state.load_turn_items(session, turn_items);
     let file_changes =
-        file_change_rows_from_turn_items_with_root(&turn_items, Some(session.cwd.as_path()));
+        file_change_rows_from_turn_items_with_root(turn_items, Some(session.cwd.as_path()));
     let mut detail = build_session_detail_from_app_state(&ui_state);
-    detail.turn_page_offset = turn_page_offset;
-    detail.turn_page_limit = if turn_page_limit == 0 {
+    detail.turn_page_offset = read.turns.offset;
+    detail.turn_page_limit = if read.turns.limit == 0 {
         turn_items.len()
     } else {
-        turn_page_limit
+        read.turns.limit
     };
-    detail.turn_page_total = if turn_page_total == 0 {
+    detail.turn_page_total = if read.turns.total == 0 {
         turn_items.len()
     } else {
-        turn_page_total
+        read.turns.total
     };
-    detail.turn_page_has_more = turn_page_has_more;
+    detail.turn_page_has_more = read.turns.has_more;
     detail.session_id = session.id;
-    detail.transcript_rows = transcript_rows_from_turn_items_with_context(session, &turn_items);
+    detail.transcript_rows = transcript_rows_from_turn_items_with_context(session, turn_items);
     detail.thread_empty = transcript_rows_are_empty_placeholder(&detail.transcript_rows);
     detail.artifacts = artifact_rows_from_file_changes(&file_changes);
     detail.file_change_summary_text = format_file_change_summary(&file_changes);
@@ -466,6 +433,7 @@ fn transcript_rows_from_turn_items_with_context(
                     session,
                     &mut current,
                     show_session_elapsed_on_work_summary,
+                    None,
                 );
                 current.user_body = text.clone();
             }
@@ -475,6 +443,7 @@ fn transcript_rows_from_turn_items_with_context(
                     session,
                     &mut current,
                     show_session_elapsed_on_work_summary,
+                    None,
                 );
                 current.user_body = text.clone();
             }
@@ -550,13 +519,9 @@ fn transcript_rows_from_turn_items_with_context(
                 current.terminal_status = Some(*status);
                 current.terminal_cause = *cause;
             }
-            crate::protocol::TurnItemPayload::Reasoning { .. }
-            | crate::protocol::TurnItemPayload::SubAgentActivity { .. }
+            crate::protocol::TurnItemPayload::SubAgentActivity { .. }
             | crate::protocol::TurnItemPayload::Plan { .. }
-            | crate::protocol::TurnItemPayload::PromptDispatch { .. }
-            | crate::protocol::TurnItemPayload::State { .. }
-            | crate::protocol::TurnItemPayload::WorldState { .. }
-            | crate::protocol::TurnItemPayload::LifecycleGuard { .. } => {}
+            | crate::protocol::TurnItemPayload::WorldState { .. } => {}
         }
     }
     flush_turn_transcript_group(
@@ -564,6 +529,7 @@ fn transcript_rows_from_turn_items_with_context(
         session,
         &mut current,
         show_session_elapsed_on_work_summary,
+        Some(session.status),
     );
     if rows.is_empty() {
         rows.push(desktop_transcript_row(
@@ -587,7 +553,6 @@ fn desktop_transcript_row(
 ) -> DesktopTranscriptRow {
     DesktopTranscriptRow {
         row_kind,
-        kind: row_kind.key().to_string(),
         step,
         title,
         body,
@@ -606,6 +571,7 @@ fn flush_turn_transcript_group(
     session: &SessionRecord,
     group: &mut TurnTranscriptGroup,
     show_session_elapsed_on_work_summary: bool,
+    lifecycle_status: Option<SessionStatus>,
 ) {
     if !group.has_content() {
         return;
@@ -627,18 +593,12 @@ fn flush_turn_transcript_group(
     );
     let has_work_summary = turn_group_has_work_summary(group, &file_changes);
     if has_work_summary {
-        let row_kind = turn_work_summary_kind(group);
+        let row_kind = turn_work_summary_kind(group, lifecycle_status);
         rows.push(desktop_transcript_row(
             row_kind,
             String::new(),
-            if show_session_elapsed_on_work_summary {
-                session_elapsed_label(session)
-                    .map(|value| format!("{value}作業しました"))
-                    .unwrap_or_else(|| "作業履歴 / 作業サマリ".to_string())
-            } else {
-                "作業履歴 / 作業サマリ".to_string()
-            },
-            turn_work_summary_body(group, &file_changes),
+            stored_turn_work_summary_title(session, row_kind, show_session_elapsed_on_work_summary),
+            turn_work_summary_body(group, &file_changes, lifecycle_status),
             Vec::new(),
         ));
     }
@@ -673,7 +633,10 @@ fn flush_turn_transcript_group(
     group.terminal_cause = None;
 }
 
-fn turn_work_summary_kind(group: &TurnTranscriptGroup) -> DesktopTranscriptRowKind {
+fn turn_work_summary_kind(
+    group: &TurnTranscriptGroup,
+    lifecycle_status: Option<SessionStatus>,
+) -> DesktopTranscriptRowKind {
     match group.terminal_status {
         Some(crate::protocol::TurnTerminalStatus::Failed) => {
             DesktopTranscriptRowKind::WorkSummaryFailed
@@ -681,12 +644,47 @@ fn turn_work_summary_kind(group: &TurnTranscriptGroup) -> DesktopTranscriptRowKi
         Some(crate::protocol::TurnTerminalStatus::Interrupted) => {
             DesktopTranscriptRowKind::WorkSummaryCancelled
         }
-        Some(crate::protocol::TurnTerminalStatus::AwaitingUser) => {
-            DesktopTranscriptRowKind::WorkSummaryAwaitingUser
-        }
-        Some(crate::protocol::TurnTerminalStatus::Completed) | None => {
+        Some(crate::protocol::TurnTerminalStatus::Completed) => {
             DesktopTranscriptRowKind::WorkSummaryCompleted
         }
+        None => match lifecycle_status {
+            Some(SessionStatus::Running) => DesktopTranscriptRowKind::WorkSummaryRunning,
+            Some(SessionStatus::Completed) => DesktopTranscriptRowKind::WorkSummaryCompleted,
+            Some(SessionStatus::Cancelled) => DesktopTranscriptRowKind::WorkSummaryCancelled,
+            Some(SessionStatus::Failed) => DesktopTranscriptRowKind::WorkSummaryFailed,
+            Some(SessionStatus::Idle) | None => DesktopTranscriptRowKind::WorkSummaryIncomplete,
+        },
+    }
+}
+
+fn stored_turn_work_summary_title(
+    session: &SessionRecord,
+    row_kind: DesktopTranscriptRowKind,
+    show_session_elapsed: bool,
+) -> String {
+    let base = match row_kind {
+        DesktopTranscriptRowKind::WorkSummaryRunning => "作業中",
+        DesktopTranscriptRowKind::WorkSummaryIncomplete => "状態未確定の作業履歴",
+        DesktopTranscriptRowKind::WorkSummaryFailed => "失敗した作業",
+        DesktopTranscriptRowKind::WorkSummaryCancelled => "停止した作業",
+        DesktopTranscriptRowKind::WorkSummaryCompleted => "作業履歴 / 作業サマリ",
+        _ => "作業履歴 / 作業サマリ",
+    };
+    if !show_session_elapsed {
+        return base.to_string();
+    }
+    let Some(elapsed) = session_elapsed_label(session) else {
+        return base.to_string();
+    };
+    match row_kind {
+        DesktopTranscriptRowKind::WorkSummaryRunning => format!("{elapsed} 作業中"),
+        DesktopTranscriptRowKind::WorkSummaryIncomplete => {
+            format!("{elapsed} 状態未確定の作業履歴")
+        }
+        DesktopTranscriptRowKind::WorkSummaryFailed => format!("{elapsed}で失敗しました"),
+        DesktopTranscriptRowKind::WorkSummaryCancelled => format!("{elapsed}で停止しました"),
+        DesktopTranscriptRowKind::WorkSummaryCompleted => format!("{elapsed}作業しました"),
+        _ => base.to_string(),
     }
 }
 
@@ -719,11 +717,12 @@ fn primary_assistant_bodies_for_turn_group(
 fn turn_work_summary_body(
     group: &TurnTranscriptGroup,
     file_changes: &[DesktopFileChangeRow],
+    lifecycle_status: Option<SessionStatus>,
 ) -> String {
     let mut sections = Vec::new();
     sections.push(format!(
         "### 作業サマリ\n{}",
-        completed_turn_summary_text(group, file_changes)
+        turn_summary_text(group, file_changes, lifecycle_status)
     ));
     if !group.tool_rows.is_empty() || !folded_intermediate_assistant_history_rows(group).is_empty()
     {
@@ -761,9 +760,10 @@ fn folded_intermediate_assistant_history_rows(group: &TurnTranscriptGroup) -> Ve
         .collect()
 }
 
-fn completed_turn_summary_text(
+fn turn_summary_text(
     group: &TurnTranscriptGroup,
     file_changes: &[DesktopFileChangeRow],
+    lifecycle_status: Option<SessionStatus>,
 ) -> String {
     let status = group
         .terminal_cause
@@ -774,7 +774,13 @@ fn completed_turn_summary_text(
                 .as_ref()
                 .map(|summary| terminal_summary_label(summary))
         })
-        .unwrap_or_else(|| "作業履歴を記録しました。".to_string());
+        .unwrap_or_else(|| match lifecycle_status {
+            Some(SessionStatus::Running) => "セッションは実行中です。".to_string(),
+            Some(SessionStatus::Completed) => "セッション状態は完了です。".to_string(),
+            Some(SessionStatus::Cancelled) => "セッション状態は停止済みです。".to_string(),
+            Some(SessionStatus::Failed) => "セッション状態は失敗です。".to_string(),
+            Some(SessionStatus::Idle) | None => "この turn の完了状態は未確定です。".to_string(),
+        });
     let mut lines = vec![format!("- 結果: {status}")];
     if !file_changes.is_empty() {
         lines.push(format!(
@@ -798,7 +804,6 @@ fn terminal_summary_label(summary: &str) -> String {
     let trimmed = summary.trim();
     match trimmed {
         "session completed" => "セッションは完了しました。".to_string(),
-        "session awaiting user" => "ユーザー確認待ちで停止しました。".to_string(),
         other if other.is_empty() => "作業履歴を記録しました。".to_string(),
         other => other.to_string(),
     }
@@ -843,10 +848,7 @@ fn file_change_transcript_body(file_changes: &[DesktopFileChangeRow]) -> String 
 
 fn turn_tool_status_label(status: crate::protocol::ToolLifecycleStatus) -> &'static str {
     match status {
-        crate::protocol::ToolLifecycleStatus::Pending
-        | crate::protocol::ToolLifecycleStatus::Blocked
-        | crate::protocol::ToolLifecycleStatus::Rejected
-        | crate::protocol::ToolLifecycleStatus::Deferred => "待機",
+        crate::protocol::ToolLifecycleStatus::Pending => "待機",
         crate::protocol::ToolLifecycleStatus::Running => "実行中",
         crate::protocol::ToolLifecycleStatus::Completed => "完了",
         crate::protocol::ToolLifecycleStatus::Declined => "拒否",
@@ -863,7 +865,6 @@ pub fn build_session_detail_from_app_state_with_session(
     state: &AppState,
     session: Option<&SessionRecord>,
 ) -> DesktopSessionDetail {
-    let session_state = state.session_state.clone().unwrap_or_default();
     let transcript_rows = transcript_rows_with_context(state, session, &[]);
     DesktopSessionDetail {
         session_id: state.current_session_id.unwrap_or_else(SessionId::new),
@@ -874,11 +875,9 @@ pub fn build_session_detail_from_app_state_with_session(
         turn_page_limit: 0,
         turn_page_total: 0,
         turn_page_has_more: false,
-        tool_status_text: format_tool_status_text(state, &session_state, &state.sidebar_todos),
+        tool_status_text: format_tool_status_text(state),
         progress_text: format_progress_text(state),
-        run_status_text: format_run_status_text(state, &session_state),
-        confirmation_text: format_confirmation_text(state),
-        confirmation_visible: state.permission.is_some(),
+        run_status_text: format_run_status_text(state),
         artifacts: Vec::new(),
         file_changes: Vec::new(),
         file_change_summary_text: "ファイル変更はまだありません。".to_string(),
@@ -1020,7 +1019,6 @@ fn fold_intermediate_assistant_rows(
     let should_fold = terminal
         && has_work_summary
         && (!state.tool_statuses.is_empty()
-            || !state.sidebar_todos.is_empty()
             || !file_changes.is_empty()
             || state.last_summary.is_some());
     if !should_fold {
@@ -1157,15 +1155,19 @@ pub fn completed_desktop_transcript_primary_reading_fixture_passes() -> bool {
 
     let assistant_rows = rows
         .iter()
-        .filter(|row| row.kind == "assistant")
+        .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
         .collect::<Vec<_>>();
     assistant_rows.len() == 1
         && assistant_rows[0].body.contains("完了しました")
-        && rows.iter().any(|row| row.kind == "work_summary_completed")
-        && rows.iter().any(|row| row.kind == "file_changes")
+        && rows
+            .iter()
+            .any(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+        && rows
+            .iter()
+            .any(|row| row.row_kind == DesktopTranscriptRowKind::FileChanges)
         && fixture_language_neutral_ref == "desktop_transcript_fixture_language_neutral"
         && !rows.iter().any(|row| {
-            row.kind == "assistant"
+            row.row_kind == DesktopTranscriptRowKind::Assistant
                 && (row.body.contains("Turn control projection surface")
                     || row.body.contains("Invalid tool arguments")
                     || row.body.contains("context mismatch"))
@@ -1177,7 +1179,8 @@ pub fn desktop_pseudo_tool_call_closeout_evidence_preserved_fixture_passes() -> 
     state.run_status = RunStatus::Completed;
     state.last_summary = Some(crate::session::RunSummary {
         session_id: SessionId::new(),
-        assistant_message_id: None,
+        turn_id: None,
+        final_response_id: None,
         status: SessionStatus::Completed,
         finish_reason: None,
         interruption_cause: None,
@@ -1191,7 +1194,7 @@ pub fn desktop_pseudo_tool_call_closeout_evidence_preserved_fixture_passes() -> 
             kind: TranscriptKind::User,
             title: "User".to_string(),
             body: "workflow artifact を作成".to_string(),
-            message_id: None,
+            response_id: None,
             tool_call_id: None,
         },
         crate::tui::state::TranscriptEntry {
@@ -1199,7 +1202,7 @@ pub fn desktop_pseudo_tool_call_closeout_evidence_preserved_fixture_passes() -> 
             title: "Assistant".to_string(),
             body: "検証済みです。\n<tool_call>\n<function=shell>\n<parameter=command>\nverify-contract --behavior\n</parameter>\n</function>\n</tool_call>"
                 .to_string(),
-            message_id: None,
+            response_id: None,
             tool_call_id: None,
         },
     ];
@@ -1207,23 +1210,22 @@ pub fn desktop_pseudo_tool_call_closeout_evidence_preserved_fixture_passes() -> 
     let rows = transcript_rows_with_context(&state, None, &[]);
     let assistant_rows = rows
         .iter()
-        .filter(|row| row.kind == "assistant")
+        .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
         .collect::<Vec<_>>();
 
     assistant_rows.len() == 1
         && assistant_rows[0].body.contains("<tool_call>")
         && assistant_rows[0].body.contains("<parameter=command>")
         && assistant_rows[0].body != "完了しました。"
-        && rows.iter().any(|row| row.kind == "work_summary_completed")
+        && rows
+            .iter()
+            .any(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
 }
 
 fn session_status_is_terminal(status: SessionStatus) -> bool {
     matches!(
         status,
-        SessionStatus::Completed
-            | SessionStatus::AwaitingUser
-            | SessionStatus::Cancelled
-            | SessionStatus::Failed
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
     )
 }
 
@@ -1231,9 +1233,8 @@ fn is_internal_transcript_projection(kind: DesktopTranscriptRowKind, title: &str
     matches!(
         kind,
         DesktopTranscriptRowKind::Tool
-            | DesktopTranscriptRowKind::Summary
             | DesktopTranscriptRowKind::Diff
-            | DesktopTranscriptRowKind::Reasoning
+            | DesktopTranscriptRowKind::ReasoningSummary
             | DesktopTranscriptRowKind::Editing
     ) || matches!(kind, DesktopTranscriptRowKind::System)
         && !title.eq_ignore_ascii_case("User")
@@ -1246,19 +1247,17 @@ fn work_summary_row(
     file_changes: &[DesktopFileChangeRow],
 ) -> Option<DesktopTranscriptRow> {
     let has_work = !state.tool_statuses.is_empty()
-        || !state.sidebar_todos.is_empty()
         || !file_changes.is_empty()
         || state.last_summary.is_some()
-        || matches!(state.run_status, RunStatus::Running | RunStatus::Confirming);
+        || matches!(state.run_status, RunStatus::Running);
     if !has_work {
         return None;
     }
 
     let kind = match state.run_status {
-        RunStatus::Running | RunStatus::Confirming => DesktopTranscriptRowKind::WorkSummaryRunning,
+        RunStatus::Running => DesktopTranscriptRowKind::WorkSummaryRunning,
         RunStatus::Failed => DesktopTranscriptRowKind::WorkSummaryFailed,
         RunStatus::Cancelled => DesktopTranscriptRowKind::WorkSummaryCancelled,
-        RunStatus::AwaitingUser => DesktopTranscriptRowKind::WorkSummaryAwaitingUser,
         _ => DesktopTranscriptRowKind::WorkSummaryCompleted,
     };
     Some(desktop_transcript_row(
@@ -1276,9 +1275,6 @@ fn work_summary_title(state: &AppState, session: Option<&SessionRecord>) -> Stri
         RunStatus::Running => elapsed
             .map(|value| format!("{value} 作業中"))
             .unwrap_or_else(|| "作業中".to_string()),
-        RunStatus::Confirming => elapsed
-            .map(|value| format!("{value} 確認待ち"))
-            .unwrap_or_else(|| "確認待ち".to_string()),
         RunStatus::Failed => elapsed
             .map(|value| format!("{value}で失敗しました"))
             .unwrap_or_else(|| "失敗しました".to_string()),
@@ -1319,17 +1315,10 @@ fn work_summary_body(state: &AppState, file_changes: &[DesktopFileChangeRow]) ->
             current_run_summary_text(state, file_changes)
         ));
     }
-    if matches!(state.run_status, RunStatus::Running | RunStatus::Confirming) {
+    if matches!(state.run_status, RunStatus::Running) {
         sections.push(format!(
             "### 現在\n- フェーズ: {}\n- 手順: {}\n- モデル要求: {}",
             state.progress.current_phase, state.progress.active_step, state.progress.model_requests
-        ));
-    }
-    if !state.sidebar_todos.is_empty() {
-        sections.push(format!(
-            "### タスク\n{}\n{}",
-            task_summary_title(&state.sidebar_todos),
-            format_todo_rows(&state.sidebar_todos)
         ));
     }
     if !state.tool_statuses.is_empty() {
@@ -1455,41 +1444,6 @@ fn renumber_rows(mut rows: Vec<DesktopTranscriptRow>) -> Vec<DesktopTranscriptRo
     rows
 }
 
-fn task_summary_title(todos: &[TodoItem]) -> String {
-    let completed = todos
-        .iter()
-        .filter(|todo| matches!(todo.status, TodoStatus::Completed))
-        .count();
-    let blocked = todos
-        .iter()
-        .filter(|todo| matches!(todo.status, TodoStatus::Blocked))
-        .count();
-    if blocked > 0 {
-        format!(
-            "タスク進捗 {completed}/{} 完了, {blocked}件ブロック",
-            todos.len()
-        )
-    } else {
-        format!("タスク進捗 {completed}/{} 完了", todos.len())
-    }
-}
-
-fn format_todo_rows(todos: &[TodoItem]) -> String {
-    todos
-        .iter()
-        .map(|todo| {
-            let marker = todo_status_marker(todo.status);
-            format!(
-                "{marker} {}  (状態: {} / 種別: {:?})",
-                todo.content,
-                todo_status_label(todo.status),
-                todo.kind
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn format_command_summary_title(tools: &[crate::tui::state::ToolStatusView]) -> String {
     let completed = tools
         .iter()
@@ -1536,21 +1490,16 @@ fn transcript_row_kind_from_entry(kind: TranscriptKind) -> DesktopTranscriptRowK
     match kind {
         TranscriptKind::User => DesktopTranscriptRowKind::User,
         TranscriptKind::Assistant => DesktopTranscriptRowKind::Assistant,
-        TranscriptKind::Reasoning => DesktopTranscriptRowKind::Reasoning,
+        TranscriptKind::ReasoningSummary => DesktopTranscriptRowKind::ReasoningSummary,
         TranscriptKind::Editing => DesktopTranscriptRowKind::Editing,
         TranscriptKind::Tool => DesktopTranscriptRowKind::Tool,
-        TranscriptKind::CommandSummary => DesktopTranscriptRowKind::Summary,
         TranscriptKind::Diff => DesktopTranscriptRowKind::Diff,
         TranscriptKind::System => DesktopTranscriptRowKind::System,
         TranscriptKind::Error => DesktopTranscriptRowKind::Error,
     }
 }
 
-fn format_tool_status_text(
-    state: &AppState,
-    session_state: &SessionStateSnapshot,
-    todos: &[TodoItem],
-) -> String {
+fn format_tool_status_text(state: &AppState) -> String {
     let mut lines = Vec::new();
     if state.tool_statuses.is_empty() {
         lines.push("ツール: 実行履歴はまだありません。".to_string());
@@ -1573,36 +1522,6 @@ fn format_tool_status_text(
                 )
             }
         }));
-    }
-    if !todos.is_empty() {
-        lines.push(String::new());
-        lines.push("タスク:".to_string());
-        lines.extend(
-            todos
-                .iter()
-                .map(|todo| format!("- [{}] {}", todo_status_label(todo.status), todo.content)),
-        );
-    }
-    if let Some(summary) = &session_state.completion.route_contract_summary {
-        lines.push(String::new());
-        lines.push(format!("契約: {summary}"));
-    }
-    if let Some(handoff) = &session_state.implementation_handoff {
-        if !handoff.next_actions.is_empty() {
-            lines.push(String::new());
-            lines.push("次の操作:".to_string());
-            lines.extend(
-                handoff
-                    .next_actions
-                    .iter()
-                    .take(3)
-                    .map(|value| format!("- {value}")),
-            );
-        }
-    }
-    if let Some(failure) = &session_state.failure {
-        lines.push(String::new());
-        lines.push(format!("失敗: {}", failure.summary));
     }
     lines.join("\n")
 }
@@ -1630,22 +1549,10 @@ fn append_replay_summary(tool_status_text: &mut String, report: &ReplayReport) {
     }
 }
 
-fn format_run_status_text(state: &AppState, session_state: &SessionStateSnapshot) -> String {
+fn format_run_status_text(state: &AppState) -> String {
     let mut lines = vec![run_status_label(state.run_status).to_string()];
-    lines.push(format!("ルート: {:?}", session_state.route).to_lowercase());
-    lines.push(format!("フェーズ: {:?}", session_state.process_phase).to_lowercase());
     if let Some(message) = &state.status_message {
         lines.push(format!("状態: {message}"));
-    }
-    lines.push(format!(
-        "未完了作業: {}",
-        session_state.completion.open_work_count
-    ));
-    if session_state.completion.verification_pending {
-        lines.push("検証: 未実行".to_string());
-    }
-    if let Some(blocked) = &session_state.completion.blocked_reason {
-        lines.push(format!("ブロック: {blocked}"));
     }
     lines.join("\n")
 }
@@ -1665,50 +1572,17 @@ fn format_progress_text(state: &AppState) -> String {
             progress.tool_calls_cancelled,
             progress.tool_calls_failed
         ),
-        format!("拒否した提案: {}", progress.rejected_tool_proposals),
         format!("圧縮: {}", progress.compactions),
         format!("再試行: {}", progress.retries),
     ]
     .join("\n")
 }
 
-fn format_confirmation_text(state: &AppState) -> String {
-    let Some(permission) = &state.permission else {
-        return String::new();
-    };
-    let targets = if permission.targets.is_empty() {
-        "(なし)".to_string()
-    } else {
-        permission.targets.join(", ")
-    };
-    let risks = if permission.risks.is_empty() {
-        "なし".to_string()
-    } else {
-        permission.risks.join(", ")
-    };
-    let details = if permission.details.is_empty() {
-        "なし".to_string()
-    } else {
-        permission.details.join("\n")
-    };
-    format!(
-        "{}\n\n実行内容:\n{details}\n\n対象: {targets}\nワークスペース外: {}\nリスク: {risks}",
-        permission.summary,
-        if permission.outside_workspace {
-            "はい"
-        } else {
-            "いいえ"
-        }
-    )
-}
-
 fn run_status_label(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Idle => "待機中",
         RunStatus::Running => "実行中",
-        RunStatus::Confirming => "確認待ち",
         RunStatus::Completed => "完了",
-        RunStatus::AwaitingUser => "ユーザー確認待ち",
         RunStatus::Cancelled => "停止済み",
         RunStatus::Failed => "失敗",
     }
@@ -1718,32 +1592,12 @@ fn entry_heading(kind: TranscriptKind, title: &str) -> String {
     match kind {
         TranscriptKind::User => "ユーザー依頼".to_string(),
         TranscriptKind::Assistant => "応答".to_string(),
-        TranscriptKind::Reasoning => "推論".to_string(),
+        TranscriptKind::ReasoningSummary => "推論要約".to_string(),
         TranscriptKind::Editing => "編集中".to_string(),
         TranscriptKind::Tool => format!("コマンド / ツール - {title}"),
-        TranscriptKind::CommandSummary => title.to_string(),
         TranscriptKind::Diff => format!("ファイル変更 - {title}"),
         TranscriptKind::System => format!("システム - {title}"),
         TranscriptKind::Error => format!("エラー - {title}"),
-    }
-}
-
-fn todo_status_marker(status: TodoStatus) -> &'static str {
-    match status {
-        TodoStatus::Completed => "✓",
-        TodoStatus::InProgress => "●",
-        TodoStatus::Blocked => "!",
-        TodoStatus::Pending | TodoStatus::Cancelled => "○",
-    }
-}
-
-fn todo_status_label(status: TodoStatus) -> &'static str {
-    match status {
-        TodoStatus::Completed => "完了",
-        TodoStatus::InProgress => "進行中",
-        TodoStatus::Blocked => "ブロック",
-        TodoStatus::Pending => "未着手",
-        TodoStatus::Cancelled => "停止",
     }
 }
 
@@ -1805,7 +1659,7 @@ mod tests {
         );
         let interrupted_summary = interrupted
             .iter()
-            .find(|row| row.kind == "work_summary_cancelled")
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCancelled)
             .expect("typed interrupted row");
         assert!(interrupted_summary.body.contains("指示を入力してください"));
         assert!(!interrupted_summary.body.contains("unrelated failure"));
@@ -1827,7 +1681,7 @@ mod tests {
         );
         let failed_summary = failed
             .iter()
-            .find(|row| row.kind == "work_summary_failed")
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryFailed)
             .expect("typed failed row");
         assert!(
             failed_summary
@@ -1835,6 +1689,106 @@ mod tests {
                 .contains("permission approval aborted by user")
         );
         assert!(!failed_summary.body.contains("指示を入力してください"));
+    }
+
+    #[test]
+    fn missing_terminal_uses_only_the_latest_session_lifecycle_owner() {
+        let mut session = session_record(ProjectId::new(), "missing terminal");
+        session.status = SessionStatus::Completed;
+        let session_id = session.id;
+        let first_turn = crate::protocol::TurnId::new();
+        let second_turn = crate::protocol::TurnId::new();
+        let items = vec![
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: first_turn,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::UserMessage {
+                    text: "first".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: first_turn,
+                source_item_id: None,
+                sequence_no: 2,
+                payload: TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "first tool".to_string(),
+                    summary: "done".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: second_turn,
+                source_item_id: None,
+                sequence_no: 3,
+                payload: TurnItemPayload::UserMessage {
+                    text: "second".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: second_turn,
+                source_item_id: None,
+                sequence_no: 4,
+                payload: TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "second tool".to_string(),
+                    summary: "done".to_string(),
+                },
+            },
+        ];
+
+        let rows = transcript_rows_from_turn_items_with_context(&session, &items);
+        let summaries = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.row_kind,
+                    DesktopTranscriptRowKind::WorkSummaryIncomplete
+                        | DesktopTranscriptRowKind::WorkSummaryCompleted
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(
+            summaries[0].row_kind,
+            DesktopTranscriptRowKind::WorkSummaryIncomplete
+        );
+        assert!(summaries[0].body.contains("完了状態は未確定"));
+        assert_eq!(
+            summaries[1].row_kind,
+            DesktopTranscriptRowKind::WorkSummaryCompleted
+        );
+        assert!(summaries[1].body.contains("セッション状態は完了"));
+    }
+
+    #[test]
+    fn latest_missing_terminal_distinguishes_running_from_idle() {
+        let group = TurnTranscriptGroup::default();
+        assert_eq!(
+            turn_work_summary_kind(&group, Some(SessionStatus::Running)),
+            DesktopTranscriptRowKind::WorkSummaryRunning
+        );
+        assert_eq!(
+            turn_work_summary_kind(&group, Some(SessionStatus::Idle)),
+            DesktopTranscriptRowKind::WorkSummaryIncomplete
+        );
+        assert_eq!(
+            turn_work_summary_kind(&group, None),
+            DesktopTranscriptRowKind::WorkSummaryIncomplete
+        );
     }
 
     #[test]
@@ -2118,31 +2072,43 @@ mod tests {
         let rows = transcript_rows_from_turn_items_with_context(&session, &turn_items);
         let index_user_a = rows
             .iter()
-            .position(|row| row.kind == "user" && row.body.contains("指示プロンプトA"))
+            .position(|row| {
+                row.row_kind == DesktopTranscriptRowKind::User
+                    && row.body.contains("指示プロンプトA")
+            })
             .expect("user A row");
         let index_change_a = rows
             .iter()
             .position(|row| {
-                row.kind == "file_changes" && row.body.contains("docs/workflow-notes.md")
+                row.row_kind == DesktopTranscriptRowKind::FileChanges
+                    && row.body.contains("docs/workflow-notes.md")
             })
             .expect("file change A row");
         let index_assistant_a = rows
             .iter()
-            .position(|row| row.kind == "assistant" && row.body.contains("応答A"))
+            .position(|row| {
+                row.row_kind == DesktopTranscriptRowKind::Assistant && row.body.contains("応答A")
+            })
             .expect("assistant A row");
         let index_user_b = rows
             .iter()
-            .position(|row| row.kind == "user" && row.body.contains("指示プロンプトB"))
+            .position(|row| {
+                row.row_kind == DesktopTranscriptRowKind::User
+                    && row.body.contains("指示プロンプトB")
+            })
             .expect("user B row");
         let index_change_b = rows
             .iter()
             .position(|row| {
-                row.kind == "file_changes" && row.body.contains("tests/workflow.contract")
+                row.row_kind == DesktopTranscriptRowKind::FileChanges
+                    && row.body.contains("tests/workflow.contract")
             })
             .expect("file change B row");
         let index_assistant_b = rows
             .iter()
-            .position(|row| row.kind == "assistant" && row.body.contains("応答B"))
+            .position(|row| {
+                row.row_kind == DesktopTranscriptRowKind::Assistant && row.body.contains("応答B")
+            })
             .expect("assistant B row");
 
         assert!(index_user_a < index_assistant_a);
@@ -2153,7 +2119,9 @@ mod tests {
         assert!(index_assistant_b < index_change_b);
         assert!(index_user_b < index_change_b);
         assert_eq!(
-            rows.iter().filter(|row| row.kind == "file_changes").count(),
+            rows.iter()
+                .filter(|row| row.row_kind == DesktopTranscriptRowKind::FileChanges)
+                .count(),
             2
         );
         assert_eq!(rows[index_change_a].file_changes.len(), 1);
@@ -2170,7 +2138,16 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .filter(|row| row.kind.starts_with("work_summary"))
+                .filter(|row| {
+                    matches!(
+                        row.row_kind,
+                        DesktopTranscriptRowKind::WorkSummaryRunning
+                            | DesktopTranscriptRowKind::WorkSummaryIncomplete
+                            | DesktopTranscriptRowKind::WorkSummaryCompleted
+                            | DesktopTranscriptRowKind::WorkSummaryFailed
+                            | DesktopTranscriptRowKind::WorkSummaryCancelled
+                    )
+                })
                 .count()
                 >= 2
         );
@@ -2321,28 +2298,28 @@ mod tests {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
                 body: "create src/workflow.rs".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Tool,
                 title: "write".to_string(),
                 body: "src/workflow.rs [Completed]".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Diff,
                 title: "File changes".to_string(),
                 body: "Added src/workflow.rs".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::System,
                 title: "Context Compaction".to_string(),
                 body: "圧縮しました\n\nCompactionContinuity".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
         ];
@@ -2372,29 +2349,29 @@ mod tests {
         let rows = transcript_rows(&state);
         let summary = rows
             .iter()
-            .find(|row| row.kind == "work_summary_completed")
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
             .expect("tool status should be projected into a work summary");
         assert!(summary.body.contains("1件のコマンドを実行"));
-        assert!(!rows.iter().any(|row| row.kind == "tool"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.row_kind == DesktopTranscriptRowKind::Tool)
+        );
 
         state.run_status = RunStatus::Running;
         state.progress.active_step = "Running verify-contract --behavior".to_string();
         state.progress.current_phase = "tool".to_string();
-        state.sidebar_todos = vec![
-            TodoItem::simple(
-                "src/workflow.rsを作成",
-                crate::session::TodoStatus::Completed,
-                crate::session::TodoPriority::High,
-            ),
-            TodoItem::simple(
-                "contract verificationを実行",
-                crate::session::TodoStatus::InProgress,
-                crate::session::TodoPriority::High,
-            ),
-        ];
+        state.current_plan = Some(crate::tui::state::PlanView {
+            explanation: Some("canonical plan".to_string()),
+            steps: vec![crate::protocol::PlanStep {
+                step: "contract verificationを実行".to_string(),
+                status: crate::protocol::PlanStepStatus::InProgress,
+            }],
+        });
         state.last_summary = Some(crate::session::RunSummary {
             session_id: SessionId::new(),
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
             interruption_cause: None,
@@ -2407,10 +2384,11 @@ mod tests {
         let rows = transcript_rows(&state);
         let summary = rows
             .iter()
-            .find(|row| row.kind == "work_summary_running")
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryRunning)
             .expect("running state should be projected into an expanded work summary");
         assert_eq!(summary.title, "作業中");
-        assert!(summary.body.contains("タスク進捗"));
+        assert!(!summary.body.contains("canonical plan"));
+        assert!(!summary.body.contains("contract verificationを実行"));
         assert!(summary.body.contains("完了サマリ") || summary.body.contains("### 完了"));
         assert!(!rows.iter().any(|row| row.title == "完了サマリ"));
     }
@@ -2422,7 +2400,6 @@ mod tests {
         session.created_at_ms = 1_000;
         session.updated_at_ms = 108_000;
         session.completed_at_ms = Some(108_000);
-        let state = SessionStateSnapshot::default();
         let turn_id = crate::protocol::TurnId::new();
         let turn_items = vec![
             TurnItem {
@@ -2488,34 +2465,44 @@ mod tests {
         ];
 
         let detail = build_session_detail(
-            &session,
-            state,
-            Vec::new(),
-            Transcript {
+            &CanonicalSessionRead {
                 session: session.clone(),
-                messages: Vec::new(),
+                history: crate::session::CanonicalHistoryPage {
+                    session: session.clone(),
+                    offset: 0,
+                    limit: usize::MAX,
+                    total: 0,
+                    has_more: false,
+                    items: Vec::new(),
+                },
+                turns: crate::session::CanonicalTurnPage {
+                    session,
+                    offset: 0,
+                    limit: DESKTOP_TURN_PAGE_LIMIT,
+                    total: turn_items.len(),
+                    has_more: false,
+                    items: turn_items,
+                },
+                active_turn_id: None,
+                active_turn_sequence_no: None,
             },
-            turn_items,
             None,
         );
 
-        assert!(
-            detail.transcript_rows.iter().any(
-                |row| row.kind == "work_summary_completed" && row.title == "1m 47s作業しました"
-            )
-        );
+        assert!(detail.transcript_rows.iter().any(|row| {
+            row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted
+                && row.title == "1m 47s作業しました"
+        }));
         assert!(!detail.transcript_rows.iter().any(|row| {
             row.title.contains("Terminal")
                 || row.title.contains("編集中")
-                || row.kind == "tool"
-                || row.kind == "editing"
+                || row.row_kind == DesktopTranscriptRowKind::Tool
+                || row.row_kind == DesktopTranscriptRowKind::Editing
         }));
-        assert!(
-            detail
-                .transcript_rows
-                .iter()
-                .any(|row| row.kind == "assistant" && row.body.contains("src/workflow.rs"))
-        );
+        assert!(detail.transcript_rows.iter().any(|row| {
+            row.row_kind == DesktopTranscriptRowKind::Assistant
+                && row.body.contains("src/workflow.rs")
+        }));
     }
 
     #[test]
@@ -2605,22 +2592,25 @@ mod tests {
         let rows = transcript_rows_from_turn_items_with_context(&session, &turn_items);
         let assistant_rows = rows
             .iter()
-            .filter(|row| row.kind == "assistant")
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
             .collect::<Vec<_>>();
         let primary_text = rows
             .iter()
-            .filter(|row| row.kind != "work_summary_completed")
+            .filter(|row| row.row_kind != DesktopTranscriptRowKind::WorkSummaryCompleted)
             .map(|row| row.body.as_str())
             .collect::<Vec<_>>()
             .join("\n");
         let work_summary = rows
             .iter()
-            .find(|row| row.kind == "work_summary_completed")
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
             .expect("work summary row");
 
         assert_eq!(assistant_rows.len(), 1);
         assert!(assistant_rows[0].body.contains("完了しました"));
-        assert!(rows.iter().any(|row| row.kind == "file_changes"));
+        assert!(
+            rows.iter()
+                .any(|row| row.row_kind == DesktopTranscriptRowKind::FileChanges)
+        );
         assert!(!primary_text.contains("Turn control projection surface"));
         assert!(!primary_text.contains("Invalid tool arguments"));
         assert!(work_summary.body.contains("中間応答"));
@@ -2633,7 +2623,8 @@ mod tests {
         state.run_status = RunStatus::Completed;
         state.last_summary = Some(crate::session::RunSummary {
             session_id: SessionId::new(),
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
             interruption_cause: None,
@@ -2647,21 +2638,21 @@ mod tests {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
                 body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
                 body: "まず tests/workflow.contract を作成します。".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
                 body: "次に src/workflow.rs を作成します。".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
@@ -2670,7 +2661,7 @@ mod tests {
                 body:
                     "完了しました。src/workflow.rs と tests/workflow.contract を作成し、検証も通りました。"
                         .to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
         ];
@@ -2686,12 +2677,15 @@ mod tests {
         let rows = transcript_rows(&state);
         let assistant_rows = rows
             .iter()
-            .filter(|row| row.kind == "assistant")
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
             .collect::<Vec<_>>();
 
         assert_eq!(assistant_rows.len(), 1);
         assert!(assistant_rows[0].body.contains("完了しました"));
-        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+        assert!(
+            rows.iter()
+                .any(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+        );
         assert!(
             !rows
                 .iter()
@@ -2705,7 +2699,8 @@ mod tests {
         state.run_status = RunStatus::Completed;
         state.last_summary = Some(crate::session::RunSummary {
             session_id: SessionId::new(),
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
             interruption_cause: None,
@@ -2719,14 +2714,14 @@ mod tests {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
                 body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
                 body: "検証は成功しました。\n<tool_call>\n<function=shell>\n<parameter=command>\nverify-contract --behavior\n</parameter>\n</function>\n</tool_call>".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
         ];
@@ -2742,14 +2737,17 @@ mod tests {
         let rows = transcript_rows(&state);
         let assistant_rows = rows
             .iter()
-            .filter(|row| row.kind == "assistant")
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
             .collect::<Vec<_>>();
 
         assert_eq!(assistant_rows.len(), 1);
         assert!(assistant_rows[0].body.contains("<tool_call>"));
         assert!(assistant_rows[0].body.contains("<parameter=command>"));
         assert_ne!(assistant_rows[0].body, "完了しました。");
-        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+        assert!(
+            rows.iter()
+                .any(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+        );
     }
 
     #[test]
@@ -2758,7 +2756,8 @@ mod tests {
         state.run_status = RunStatus::Completed;
         state.last_summary = Some(crate::session::RunSummary {
             session_id: SessionId::new(),
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
             interruption_cause: None,
@@ -2772,14 +2771,14 @@ mod tests {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
                 body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
                 body: "作業中です。verification evidence を確認しています。".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
@@ -2787,7 +2786,7 @@ mod tests {
                 title: "Assistant".to_string(),
                 body: "完了しました。src/workflow.rs と tests/workflow.contract を作成しました。"
                     .to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
         ];
@@ -2803,7 +2802,7 @@ mod tests {
         let rows = transcript_rows(&state);
         let assistant_rows = rows
             .iter()
-            .filter(|row| row.kind == "assistant")
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
             .collect::<Vec<_>>();
 
         assert_eq!(assistant_rows.len(), 1);
@@ -2813,7 +2812,10 @@ mod tests {
                 .iter()
                 .any(|row| row.body.contains("verification evidence を確認"))
         );
-        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+        assert!(
+            rows.iter()
+                .any(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+        );
     }
 
     #[test]
@@ -2822,7 +2824,8 @@ mod tests {
         state.run_status = RunStatus::Completed;
         state.last_summary = Some(crate::session::RunSummary {
             session_id: SessionId::new(),
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
             interruption_cause: None,
@@ -2836,7 +2839,7 @@ mod tests {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
                 body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
@@ -2844,7 +2847,7 @@ mod tests {
                 title: "Assistant".to_string(),
                 body: "workflow_state.ready = true\n</parameter> <parameter=path> src/workflow.rs </parameter> </function> </tool_call>"
                     .to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
         ];
@@ -2860,14 +2863,17 @@ mod tests {
         let rows = transcript_rows(&state);
         let assistant_rows = rows
             .iter()
-            .filter(|row| row.kind == "assistant")
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
             .collect::<Vec<_>>();
 
         assert_eq!(assistant_rows.len(), 1);
         assert!(assistant_rows[0].body.contains("</tool_call>"));
         assert!(assistant_rows[0].body.contains("<parameter=path>"));
         assert_ne!(assistant_rows[0].body, "完了しました。");
-        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+        assert!(
+            rows.iter()
+                .any(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+        );
     }
 
     #[test]
@@ -2876,7 +2882,8 @@ mod tests {
         state.run_status = RunStatus::Completed;
         state.last_summary = Some(crate::session::RunSummary {
             session_id: SessionId::new(),
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
             interruption_cause: None,
@@ -2890,7 +2897,7 @@ mod tests {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
                 body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
@@ -2898,7 +2905,7 @@ mod tests {
                 title: "Assistant".to_string(),
                 body: "workflow_state.ready = true\n&lt;/parameter&gt; &lt;parameter=path&gt; src/workflow.rs &lt;/parameter&gt; &lt;/function&gt; &lt;/tool_call&gt;"
                     .to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
         ];
@@ -2914,14 +2921,17 @@ mod tests {
         let rows = transcript_rows(&state);
         let assistant_rows = rows
             .iter()
-            .filter(|row| row.kind == "assistant")
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
             .collect::<Vec<_>>();
 
         assert_eq!(assistant_rows.len(), 1);
         assert!(assistant_rows[0].body.contains("&lt;/tool_call"));
         assert!(assistant_rows[0].body.contains("&lt;parameter=path"));
         assert_ne!(assistant_rows[0].body, "完了しました。");
-        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+        assert!(
+            rows.iter()
+                .any(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+        );
     }
 
     #[test]
@@ -2932,7 +2942,8 @@ mod tests {
         state.run_status = RunStatus::Idle;
         state.last_summary = Some(crate::session::RunSummary {
             session_id: session.id,
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
             interruption_cause: None,
@@ -2946,7 +2957,7 @@ mod tests {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
                 body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
@@ -2954,7 +2965,7 @@ mod tests {
                 title: "Assistant".to_string(),
                 body: "workflow_state.ready = true\n&lt;/parameter&gt; &lt;parameter=path&gt; src/workflow.rs &lt;/parameter&gt; &lt;/function&gt; &lt;/tool_call&gt;"
                     .to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
         ];
@@ -2970,14 +2981,17 @@ mod tests {
         let rows = transcript_rows_with_context(&state, Some(&session), &[]);
         let assistant_rows = rows
             .iter()
-            .filter(|row| row.kind == "assistant")
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
             .collect::<Vec<_>>();
 
         assert_eq!(assistant_rows.len(), 1);
         assert!(assistant_rows[0].body.contains("&lt;/tool_call"));
         assert!(assistant_rows[0].body.contains("&lt;parameter=path"));
         assert_ne!(assistant_rows[0].body, "完了しました。");
-        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+        assert!(
+            rows.iter()
+                .any(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+        );
     }
 
     #[test]
@@ -2986,7 +3000,8 @@ mod tests {
         state.run_status = RunStatus::Idle;
         state.last_summary = Some(crate::session::RunSummary {
             session_id: SessionId::new(),
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
             interruption_cause: None,
@@ -3000,33 +3015,41 @@ mod tests {
                 kind: TranscriptKind::User,
                 title: "User".to_string(),
                 body: "src/workflow.rs と tests/workflow.contract を作成".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
                 body: "テスト失敗を修正します。".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
             crate::tui::state::TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
                 body: "完了しました。".to_string(),
-                message_id: None,
+                response_id: None,
                 tool_call_id: None,
             },
         ];
 
         let rows = transcript_rows_with_context(&state, None, &[]);
 
-        assert_eq!(rows.iter().filter(|row| row.kind == "assistant").count(), 1);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
+                .count(),
+            1
+        );
         assert!(
             !rows
                 .iter()
                 .any(|row| row.body.contains("テスト失敗を修正します"))
         );
-        assert!(rows.iter().any(|row| row.kind == "work_summary_completed"));
+        assert!(
+            rows.iter()
+                .any(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+        );
     }
 }

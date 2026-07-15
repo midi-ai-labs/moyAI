@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::config::{McpConfig, McpServerConfig};
 use crate::error::ToolError;
+use crate::tool::ToolEffectClass;
 use crate::tool::truncate::clip_text_with_ellipsis;
 
 pub const MCP_TOOLS_LIST_DESCRIPTOR_SCHEMA_VALIDATION_MARKER: &str =
@@ -15,10 +16,74 @@ const MAX_MCP_RESPONSE_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolDescriptor {
     pub name: String,
+    pub effect: ToolEffectClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<McpToolAnnotations>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolAnnotations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+}
+
+/// Returns the configured effect for a concrete MCP call. Listing tools is a
+/// read operation. A call is read-capable only when its exact server/tool route
+/// says so; missing or malformed routing information fails closed.
+pub fn effect_for_raw_call(config: &McpConfig, raw_arguments: &Value) -> ToolEffectClass {
+    let Some(server_id) = raw_arguments.get("server_id").and_then(Value::as_str) else {
+        return ToolEffectClass::Destructive;
+    };
+    let tool_name = raw_arguments
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let Some(tool_name) = tool_name else {
+        return ToolEffectClass::Read;
+    };
+    config
+        .servers
+        .iter()
+        .find(|server| server.id == server_id && server.enabled)
+        .map(|server| configured_tool_effect(server, tool_name))
+        .unwrap_or(ToolEffectClass::Destructive)
+}
+
+fn configured_tool_effect(server: &McpServerConfig, tool_name: &str) -> ToolEffectClass {
+    let mut matches = server
+        .tool_routes
+        .iter()
+        .filter(|route| route.name == tool_name);
+    let Some(route) = matches.next() else {
+        return ToolEffectClass::Destructive;
+    };
+    if matches.next().is_some() {
+        return ToolEffectClass::Destructive;
+    }
+    route.effect
+}
+
+pub fn can_route_effect(config: &McpConfig, effect: ToolEffectClass) -> bool {
+    config
+        .servers
+        .iter()
+        .filter(|server| server.enabled)
+        .any(|server| {
+            effect == ToolEffectClass::Read
+                || server
+                    .tool_routes
+                    .iter()
+                    .any(|route| configured_tool_effect(server, &route.name) == effect)
+                || (effect == ToolEffectClass::Destructive && server.tool_routes.is_empty())
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -58,14 +123,12 @@ impl McpClient {
     pub async fn list_tools(
         &self,
         server_id: &str,
-        route: &str,
         mut effect_checkpoint: impl FnMut() -> Result<(), ToolError>,
     ) -> Result<McpOperationResult, ToolError> {
         if !self.config.enabled {
             return Err(ToolError::Message("mcp is disabled by config".to_string()));
         }
         let server = self.server(server_id)?;
-        self.ensure_route_allowed(server, route)?;
 
         let (endpoint, response) = self
             .post_json_with_fallback(
@@ -79,13 +142,21 @@ impl McpClient {
                 &mut effect_checkpoint,
             )
             .await?;
-        let tools = parse_tools(&response)?;
-        let filtered = if server.tool_allowlist.is_empty() {
+        let mut tools = parse_tools(&response)?;
+        for tool in &mut tools {
+            tool.effect = configured_tool_effect(server, &tool.name);
+        }
+        let filtered = if server.tool_routes.is_empty() {
             tools
         } else {
             tools
                 .into_iter()
-                .filter(|tool| server.tool_allowlist.iter().any(|name| name == &tool.name))
+                .filter(|tool| {
+                    server
+                        .tool_routes
+                        .iter()
+                        .any(|route| route.name == tool.name)
+                })
                 .collect()
         };
         Ok(McpOperationResult::ToolsListed {
@@ -98,7 +169,6 @@ impl McpClient {
     pub async fn call_tool(
         &self,
         server_id: &str,
-        route: &str,
         tool_name: &str,
         arguments: Value,
         mut effect_checkpoint: impl FnMut() -> Result<(), ToolError>,
@@ -107,9 +177,11 @@ impl McpClient {
             return Err(ToolError::Message("mcp is disabled by config".to_string()));
         }
         let server = self.server(server_id)?;
-        self.ensure_route_allowed(server, route)?;
-        if !server.tool_allowlist.is_empty()
-            && !server.tool_allowlist.iter().any(|name| name == tool_name)
+        if !server.tool_routes.is_empty()
+            && !server
+                .tool_routes
+                .iter()
+                .any(|route| route.name == tool_name)
         {
             return Err(ToolError::Message(format!(
                 "mcp server `{}` does not allow tool `{tool_name}` in current config",
@@ -164,21 +236,6 @@ impl McpClient {
             )));
         }
         Ok(server)
-    }
-
-    fn ensure_route_allowed(&self, server: &McpServerConfig, route: &str) -> Result<(), ToolError> {
-        if server.route_allowlist.is_empty()
-            || server
-                .route_allowlist
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(route))
-        {
-            return Ok(());
-        }
-        Err(ToolError::Message(format!(
-            "mcp server `{}` is not enabled for route `{route}`",
-            server.id
-        )))
     }
 
     async fn post_json(
@@ -372,8 +429,17 @@ fn parse_tool_descriptor(index: usize, tool: &Value) -> Result<McpToolDescriptor
     };
     Ok(McpToolDescriptor {
         name: name.to_string(),
+        effect: ToolEffectClass::Destructive,
         description: description.map(str::to_string),
         input_schema: tool.get("inputSchema").cloned(),
+        annotations: match tool.get("annotations") {
+            Some(value) => Some(serde_json::from_value(value.clone()).map_err(|error| {
+                ToolError::Message(format!(
+                    "mcp tools/list descriptor `{name}` has invalid `annotations`: {error}"
+                ))
+            })?),
+            None => None,
+        },
     })
 }
 
@@ -499,6 +565,105 @@ mod tests {
 
     use super::*;
 
+    fn routed_config() -> McpConfig {
+        McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                id: "fixture".to_string(),
+                enabled: true,
+                transport: crate::config::McpTransportKind::Http,
+                base_url: "http://mcp.invalid".to_string(),
+                timeout_ms: 2_000,
+                tool_routes: vec![
+                    crate::config::McpToolRouteConfig {
+                        name: "inspect".to_string(),
+                        effect: ToolEffectClass::Read,
+                    },
+                    crate::config::McpToolRouteConfig {
+                        name: "change".to_string(),
+                        effect: ToolEffectClass::Mutation,
+                    },
+                ],
+                headers: BTreeMap::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn configured_routes_are_the_only_read_authority_for_mcp_calls() {
+        let config = routed_config();
+        assert_eq!(
+            effect_for_raw_call(
+                &config,
+                &json!({"server_id": "fixture", "tool_name": "inspect"}),
+            ),
+            ToolEffectClass::Read
+        );
+        assert_eq!(
+            effect_for_raw_call(
+                &config,
+                &json!({"server_id": "fixture", "tool_name": "change"}),
+            ),
+            ToolEffectClass::Mutation
+        );
+        for arguments in [
+            json!({"server_id": "fixture", "tool_name": "unknown"}),
+            json!({"server_id": "missing", "tool_name": "inspect"}),
+            json!({"tool_name": "inspect"}),
+        ] {
+            assert_eq!(
+                effect_for_raw_call(&config, &arguments),
+                ToolEffectClass::Destructive
+            );
+        }
+        assert_eq!(
+            effect_for_raw_call(&config, &json!({"server_id": "fixture"})),
+            ToolEffectClass::Read
+        );
+
+        let mut ambiguous = config;
+        ambiguous.servers[0]
+            .tool_routes
+            .push(crate::config::McpToolRouteConfig {
+                name: "inspect".to_string(),
+                effect: ToolEffectClass::Destructive,
+            });
+        assert_eq!(
+            effect_for_raw_call(
+                &ambiguous,
+                &json!({"server_id": "fixture", "tool_name": "inspect"}),
+            ),
+            ToolEffectClass::Destructive
+        );
+    }
+
+    #[test]
+    fn remote_read_only_hint_does_not_promote_an_unconfigured_route() {
+        let tools = parse_tools(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [{
+                    "name": "remote_claims_read",
+                    "annotations": {
+                        "readOnlyHint": true,
+                        "destructiveHint": false
+                    }
+                }]
+            }
+        }))
+        .expect("descriptor");
+
+        assert_eq!(tools[0].effect, ToolEffectClass::Destructive);
+        assert_eq!(
+            tools[0]
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint),
+            Some(true)
+        );
+    }
+
     #[test]
     fn streamed_response_limit_is_enforced_without_content_length() {
         let mut body = vec![b'a'; MAX_MCP_RESPONSE_BYTES - 1];
@@ -537,14 +702,13 @@ mod tests {
                 transport: crate::config::McpTransportKind::Http,
                 base_url: format!("http://{address}"),
                 timeout_ms: 2_000,
-                route_allowlist: Vec::new(),
-                tool_allowlist: Vec::new(),
+                tool_routes: Vec::new(),
                 headers: BTreeMap::new(),
             }],
         });
         let mut checkpoints = 0;
         let error = client
-            .list_tools("fixture", "code", || {
+            .list_tools("fixture", || {
                 checkpoints += 1;
                 if checkpoints == 1 {
                     Ok(())

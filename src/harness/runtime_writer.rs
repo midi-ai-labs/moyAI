@@ -225,23 +225,17 @@ fn harness_kind_for_run_event(event: &RunEvent) -> HarnessEventKind {
     match event {
         RunEvent::SessionStarted { .. } => HarnessEventKind::RunStarted,
         RunEvent::SessionTitleUpdated { .. } => HarnessEventKind::StateSnapshotRecorded,
-        RunEvent::UserMessageStored { .. } | RunEvent::UserTurnStored { .. } => {
-            HarnessEventKind::UserTurnAccepted
-        }
-        RunEvent::AssistantStarted { .. } => HarnessEventKind::ModelProjectionBuilt,
-        RunEvent::ControlEnvelopePrepared { .. } => HarnessEventKind::ControlEnvelopePrepared,
+        RunEvent::UserTurnStored { .. } => HarnessEventKind::UserTurnAccepted,
         RunEvent::WorldStateUpdated { .. } => HarnessEventKind::StateSnapshotRecorded,
         RunEvent::ModelRequestPrepared { .. } => HarnessEventKind::ModelRequestSent,
-        RunEvent::TextDelta { .. } | RunEvent::ReasoningDelta { .. } => {
-            HarnessEventKind::ModelResponseReceived
-        }
+        RunEvent::TextDelta { .. }
+        | RunEvent::AssistantMessageCommitted { .. }
+        | RunEvent::ReasoningSummaryDelta { .. } => HarnessEventKind::ModelResponseReceived,
         RunEvent::ToolCallPending { .. } => HarnessEventKind::ToolDispatchRequested,
         RunEvent::ToolCallCompleted { .. } => HarnessEventKind::ToolExecuted,
         RunEvent::ToolCallDeclined { .. } => HarnessEventKind::ToolDeclined,
         RunEvent::ToolCallCancelled { .. } => HarnessEventKind::ToolCancelled,
         RunEvent::ToolCallFailed { .. } => HarnessEventKind::ToolFailed,
-        RunEvent::ToolProposalRejected { .. } => HarnessEventKind::ToolDispatchDenied,
-        RunEvent::CandidateRepairEditRecorded { .. } => HarnessEventKind::StateSnapshotRecorded,
         RunEvent::FileChangesRecorded { .. } => HarnessEventKind::ArtifactRegistered,
         RunEvent::CompactionCompleted { .. } => HarnessEventKind::StateSnapshotRecorded,
         RunEvent::PermissionRequested { .. } => HarnessEventKind::PermissionRequested,
@@ -249,13 +243,7 @@ fn harness_kind_for_run_event(event: &RunEvent) -> HarnessEventKind {
         RunEvent::RetryScheduled { .. } | RunEvent::RecoverableRuntimeFeedback { .. } => {
             HarnessEventKind::CorrectiveResultEmitted
         }
-        RunEvent::StateUpdated { .. } | RunEvent::LifecycleGuardUpdated { .. } => {
-            HarnessEventKind::StateSnapshotRecorded
-        }
-        RunEvent::SessionCompleted { .. }
-        | RunEvent::SessionAwaitingUser { .. }
-        | RunEvent::SessionInterrupted { .. }
-        | RunEvent::SessionFailed { .. } => HarnessEventKind::RunTerminalized,
+        RunEvent::TurnTerminal { .. } => HarnessEventKind::RunTerminalized,
     }
 }
 
@@ -306,7 +294,6 @@ fn event_kind_file_label(kind: HarnessEventKind) -> &'static str {
         HarnessEventKind::AttachmentRegistered => "attachment_registered",
         HarnessEventKind::ContractVersionSelected => "contract_version_selected",
         HarnessEventKind::StateSnapshotRecorded => "state_snapshot_recorded",
-        HarnessEventKind::ActiveWorkContractSelected => "active_work_contract_selected",
         HarnessEventKind::ControlEnvelopePrepared => "turn_control_envelope",
         HarnessEventKind::ModelProjectionBuilt => "model_projection_built",
         HarnessEventKind::ModelRequestSent => "model_request_sent",
@@ -332,10 +319,11 @@ fn event_kind_file_label(kind: HarnessEventKind) -> &'static str {
 
 fn terminal_status_for_run_event(event: &RunEvent) -> Option<HarnessRunStatus> {
     match event {
-        RunEvent::SessionCompleted { .. } => Some(HarnessRunStatus::Pass),
-        RunEvent::SessionAwaitingUser { .. } => Some(HarnessRunStatus::Blocked),
-        RunEvent::SessionInterrupted { .. } => Some(HarnessRunStatus::Blocked),
-        RunEvent::SessionFailed { .. } => Some(HarnessRunStatus::Fail),
+        RunEvent::TurnTerminal { terminal, .. } => Some(match terminal.status {
+            crate::protocol::TurnTerminalStatus::Completed => HarnessRunStatus::Pass,
+            crate::protocol::TurnTerminalStatus::Interrupted => HarnessRunStatus::Blocked,
+            crate::protocol::TurnTerminalStatus::Failed => HarnessRunStatus::Fail,
+        }),
         _ => None,
     }
 }
@@ -348,7 +336,8 @@ fn runtime_error(error: impl std::fmt::Display) -> RuntimeError {
 mod tests {
     use super::*;
     use crate::harness::HarnessEventStore;
-    use crate::session::{MessageId, ToolCallId};
+    use crate::protocol::ModelResponseId;
+    use crate::session::{RunMetrics, SessionId, ToolCallId};
     use crate::storage::{SqliteStore, StoragePaths};
     use crate::tool::ToolName;
 
@@ -392,6 +381,47 @@ mod tests {
     }
 
     #[test]
+    fn durable_terminal_status_owns_harness_run_outcome() {
+        let cases = [
+            (
+                crate::protocol::TurnTerminalStatus::Completed,
+                HarnessRunStatus::Pass,
+            ),
+            (
+                crate::protocol::TurnTerminalStatus::Interrupted,
+                HarnessRunStatus::Blocked,
+            ),
+            (
+                crate::protocol::TurnTerminalStatus::Failed,
+                HarnessRunStatus::Fail,
+            ),
+        ];
+
+        for (status, expected) in cases {
+            let event = RunEvent::TurnTerminal {
+                session_id: SessionId::new(),
+                terminal: Box::new(crate::session::model::DurableTurnTerminal {
+                    status,
+                    finish_reason: None,
+                    interruption_cause: None,
+                    final_response_id: None,
+                    summary: "terminal".to_string(),
+                    tool_call_count: 0,
+                    failed_tool_count: 0,
+                    change_count: 0,
+                    metrics: RunMetrics::default(),
+                }),
+            };
+
+            assert_eq!(
+                harness_kind_for_run_event(&event),
+                HarnessEventKind::RunTerminalized
+            );
+            assert_eq!(terminal_status_for_run_event(&event), Some(expected));
+        }
+    }
+
+    #[test]
     fn records_only_the_runtime_event_without_synthetic_contracts() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 path");
@@ -408,7 +438,7 @@ mod tests {
             NativeHarnessRecorder::start_harness_only(&bundle, None, workspace).expect("recorder");
         let run_id = recorder.run_id();
         let event = RunEvent::TextDelta {
-            message_id: MessageId::new(),
+            response_id: ModelResponseId::new(),
             delta: "visible text".to_string(),
         };
 

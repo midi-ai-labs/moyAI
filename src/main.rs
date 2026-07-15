@@ -4,11 +4,10 @@ use std::process::ExitCode;
 use camino::Utf8PathBuf;
 use moyai::app::{
     AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest,
-    SessionCompactRequest, SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest,
-    SessionGoalGetRequest, SessionGoalSetRequest, SessionHistoryRequest, SessionInterruptRequest,
-    SessionListRequest, SessionLoadedRequest, SessionMemoryRequest, SessionReadRequest,
-    SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
-    SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,
+    SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest, SessionGoalGetRequest,
+    SessionGoalSetRequest, SessionHistoryRequest, SessionInterruptRequest, SessionListRequest,
+    SessionLoadedRequest, SessionReadRequest, SessionRejoinRequest, SessionRollbackRequest,
+    SessionSearchRequest, SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,
     SessionTitleUpdateRequest, SessionTurnsRequest,
 };
 use moyai::cli::parse::parse as parse_cli;
@@ -57,8 +56,6 @@ fn run() -> Result<(), (u8, String)> {
         | CliCommand::SessionSettings(_)
         | CliCommand::SessionTitle(_)
         | CliCommand::SessionInterrupt(_)
-        | CliCommand::SessionCompact(_)
-        | CliCommand::SessionMemory(_)
         | CliCommand::SessionGoalGet(_)
         | CliCommand::SessionGoalSet(_)
         | CliCommand::SessionGoalClear(_)
@@ -219,7 +216,7 @@ fn terminal_run_exit(
     interruption_cause: Option<TurnInterruptionCause>,
 ) -> Option<(u8, String)> {
     match status {
-        SessionStatus::Completed | SessionStatus::AwaitingUser => None,
+        SessionStatus::Completed => None,
         SessionStatus::Cancelled => Some(cancelled_run_exit(interruption_cause)),
         SessionStatus::Failed => Some((4, "run failed".to_string())),
         SessionStatus::Idle | SessionStatus::Running => Some((
@@ -306,7 +303,7 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             base_url: args.base_url_override.clone().unwrap_or_default(),
             config_override: None,
             output_mode: args.output_mode,
-            show_reasoning: args.show_reasoning,
+            show_reasoning_summary: args.show_reasoning_summary,
             prompt_dispatch: None,
             editor_context: Some(EditorContext {
                 active_file: args.active_file.clone(),
@@ -379,14 +376,6 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
                 reason: args.reason.clone(),
             })
         }
-        CliCommand::SessionCompact(args) => AppCommand::SessionCompact(SessionCompactRequest {
-            session_id: args.session_id,
-            keep_recent: args.keep_recent,
-        }),
-        CliCommand::SessionMemory(args) => AppCommand::SessionMemory(SessionMemoryRequest {
-            session_id: args.session_id,
-            mode: args.mode,
-        }),
         CliCommand::SessionGoalGet(args) => AppCommand::SessionGoalGet(SessionGoalGetRequest {
             session_id: args.session_id,
         }),
@@ -403,7 +392,6 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
         }
         CliCommand::SessionShow(args) => AppCommand::SessionShow(SessionShowRequest {
             session_id: args.session_id,
-            show_reasoning: args.show_reasoning,
         }),
         CliCommand::SessionHistory(args) => AppCommand::SessionHistory(SessionHistoryRequest {
             session_id: args.session_id,
@@ -483,8 +471,6 @@ fn command_output_mode(command: &CliCommand) -> OutputMode {
         CliCommand::SessionSettings(args) => args.output_mode,
         CliCommand::SessionTitle(args) => args.output_mode,
         CliCommand::SessionInterrupt(args) => args.output_mode,
-        CliCommand::SessionCompact(args) => args.output_mode,
-        CliCommand::SessionMemory(args) => args.output_mode,
         CliCommand::SessionGoalGet(args) => args.output_mode,
         CliCommand::SessionGoalSet(args) => args.output_mode,
         CliCommand::SessionGoalClear(args) => args.output_mode,
@@ -527,7 +513,7 @@ async fn run_model_availability_command(args: ModelAvailabilityArgs) -> Result<(
         model_override: args.model_override.clone(),
         base_url_override: args.base_url_override.clone(),
         output_mode: OutputMode::Json,
-        show_reasoning: false,
+        show_reasoning_summary: false,
         review_uncommitted: false,
         review_branch: None,
         active_file: None,
@@ -787,7 +773,6 @@ mod tests {
     #[test]
     fn terminal_cli_exit_never_reports_failed_or_non_terminal_runs_as_success() {
         assert_eq!(terminal_run_exit(SessionStatus::Completed, None), None);
-        assert_eq!(terminal_run_exit(SessionStatus::AwaitingUser, None), None);
         assert_eq!(
             terminal_run_exit(SessionStatus::Failed, None),
             Some((4, "run failed".to_string()))

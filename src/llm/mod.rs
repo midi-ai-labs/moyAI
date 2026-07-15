@@ -1,9 +1,11 @@
 pub mod catalog;
 pub mod contract;
 pub mod dto;
+pub mod model_policy;
 pub mod model_probe;
 pub mod openai_compat;
 pub mod responses;
+pub mod turn_session;
 
 pub use catalog::{ConfigModelCatalog, ModelCatalog};
 pub use contract::{
@@ -15,8 +17,8 @@ pub use contract::{
 };
 pub use model_probe::{
     ModelAvailabilityReport, ModelAvailabilityStatus, ProviderModelInfo, ToolCallProbeReport,
-    apply_model_availability_report_to_config, apply_provider_model_info_to_config,
-    check_model_availability, extra_body_with_num_ctx, fetch_openai_models,
-    fetch_provider_model_infos, normalize_provider_base_url,
+    apply_provider_model_info_to_config, check_model_availability, extra_body_with_num_ctx,
+    fetch_openai_models, fetch_provider_model_infos, normalize_provider_base_url,
+    validate_model_availability_report,
 };
 pub use openai_compat::OpenAiCompatClient;

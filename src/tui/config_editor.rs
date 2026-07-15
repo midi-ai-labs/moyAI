@@ -8,8 +8,8 @@ use crate::config::loader::{acquire_global_config_write_lease, global_config_pat
 use crate::config::model::{
     AccessMode, McpServerConfig, MultiAgentMode, PartialDoclingConfig, PartialFileGuardConfig,
     PartialInspectionConfig, PartialMcpConfig, PartialModelConfig, PartialMultiAgentConfig,
-    PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig, PartialShellConfig,
-    PromptProfile, ProviderMetadataMode, ResolvedConfig,
+    PartialPermissionsConfig, PartialResolvedConfig, PartialShellConfig, ProviderMetadataMode,
+    ResolvedConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,6 @@ pub enum ConfigSaveScope {
 pub enum ConfigField {
     BaseUrl,
     Model,
-    PromptProfile,
     ProviderMetadataMode,
     AccessMode,
     MultiAgentEnabled,
@@ -38,12 +37,10 @@ pub enum ConfigField {
     StopSequences,
     ContextWindow,
     MaxOutputTokens,
-    SessionMaxStepsPerTurn,
     RequestTimeoutMs,
     StreamIdleTimeoutMs,
     ConnectTimeoutMs,
     MaxRetries,
-    StreamMaxRetries,
     SupportsTools,
     SupportsReasoning,
     SupportsImages,
@@ -70,10 +67,9 @@ pub enum ConfigField {
 }
 
 impl ConfigField {
-    pub const ALL: [ConfigField; 47] = [
+    pub const ALL: [ConfigField; 44] = [
         ConfigField::BaseUrl,
         ConfigField::Model,
-        ConfigField::PromptProfile,
         ConfigField::ProviderMetadataMode,
         ConfigField::AccessMode,
         ConfigField::MultiAgentEnabled,
@@ -89,12 +85,10 @@ impl ConfigField {
         ConfigField::StopSequences,
         ConfigField::ContextWindow,
         ConfigField::MaxOutputTokens,
-        ConfigField::SessionMaxStepsPerTurn,
         ConfigField::RequestTimeoutMs,
         ConfigField::StreamIdleTimeoutMs,
         ConfigField::ConnectTimeoutMs,
         ConfigField::MaxRetries,
-        ConfigField::StreamMaxRetries,
         ConfigField::SupportsTools,
         ConfigField::SupportsReasoning,
         ConfigField::SupportsImages,
@@ -124,7 +118,6 @@ impl ConfigField {
         match self {
             ConfigField::BaseUrl => "model.base_url",
             ConfigField::Model => "model.model",
-            ConfigField::PromptProfile => "model.prompt_profile",
             ConfigField::ProviderMetadataMode => "model.provider_metadata_mode",
             ConfigField::AccessMode => "permissions.access_mode",
             ConfigField::MultiAgentEnabled => "multi_agent.enabled",
@@ -140,12 +133,10 @@ impl ConfigField {
             ConfigField::StopSequences => "model.stop_sequences",
             ConfigField::ContextWindow => "model.context_window",
             ConfigField::MaxOutputTokens => "model.max_output_tokens",
-            ConfigField::SessionMaxStepsPerTurn => "session.max_steps_per_turn",
             ConfigField::RequestTimeoutMs => "model.request_timeout_ms",
             ConfigField::StreamIdleTimeoutMs => "model.stream_idle_timeout_ms",
             ConfigField::ConnectTimeoutMs => "model.connect_timeout_ms",
             ConfigField::MaxRetries => "model.max_retries",
-            ConfigField::StreamMaxRetries => "model.stream_max_retries",
             ConfigField::SupportsTools => "model.supports_tools",
             ConfigField::SupportsReasoning => "model.supports_reasoning",
             ConfigField::SupportsImages => "model.supports_images",
@@ -180,7 +171,6 @@ impl ConfigField {
         match self {
             ConfigField::BaseUrl => Some("MOYAI_BASE_URL"),
             ConfigField::Model => Some("MOYAI_MODEL"),
-            ConfigField::PromptProfile => Some("MOYAI_PROMPT_PROFILE"),
             ConfigField::ProviderMetadataMode => Some("MOYAI_PROVIDER_METADATA_MODE"),
             ConfigField::AccessMode => Some("MOYAI_ACCESS_MODE"),
             ConfigField::MultiAgentEnabled => Some("MOYAI_MULTI_AGENT_ENABLED"),
@@ -196,12 +186,10 @@ impl ConfigField {
             ConfigField::StopSequences => Some("MOYAI_STOP_SEQUENCES"),
             ConfigField::ContextWindow => Some("MOYAI_CONTEXT_WINDOW"),
             ConfigField::MaxOutputTokens => Some("MOYAI_MAX_OUTPUT_TOKENS"),
-            ConfigField::SessionMaxStepsPerTurn => Some("MOYAI_MAX_STEPS_PER_TURN"),
             ConfigField::RequestTimeoutMs => Some("MOYAI_REQUEST_TIMEOUT_MS"),
             ConfigField::StreamIdleTimeoutMs => Some("MOYAI_STREAM_IDLE_TIMEOUT_MS"),
             ConfigField::ConnectTimeoutMs => Some("MOYAI_CONNECT_TIMEOUT_MS"),
             ConfigField::MaxRetries => Some("MOYAI_MAX_RETRIES"),
-            ConfigField::StreamMaxRetries => Some("MOYAI_STREAM_MAX_RETRIES"),
             ConfigField::SupportsTools => Some("MOYAI_SUPPORTS_TOOLS"),
             ConfigField::SupportsReasoning => Some("MOYAI_SUPPORTS_REASONING"),
             ConfigField::SupportsImages => Some("MOYAI_SUPPORTS_IMAGES"),
@@ -499,7 +487,6 @@ fn parse_editor_patch_matching(
     let mut model = PartialModelConfig::default();
     let mut permissions = PartialPermissionsConfig::default();
     let mut multi_agent = PartialMultiAgentConfig::default();
-    let mut session = PartialSessionConfig::default();
     let mut shell = PartialShellConfig::default();
     let mut inspection = PartialInspectionConfig::default();
     let mut file_guard = PartialFileGuardConfig::default();
@@ -514,12 +501,6 @@ fn parse_editor_patch_matching(
         match field.key {
             ConfigField::BaseUrl => model.base_url = parse_string(text),
             ConfigField::Model => model.model = parse_string(text),
-            ConfigField::PromptProfile => {
-                model.prompt_profile = match parse_string(text) {
-                    Some(value) => Some(parse_prompt_profile(&value)?),
-                    None => None,
-                }
-            }
             ConfigField::ProviderMetadataMode => {
                 model.provider_metadata_mode = match parse_string(text) {
                     Some(value) => Some(parse_provider_metadata_mode(&value)?),
@@ -554,12 +535,10 @@ fn parse_editor_patch_matching(
             ConfigField::StopSequences => model.stop_sequences = Some(parse_csv(text)),
             ConfigField::ContextWindow => model.context_window = parse_number(text)?,
             ConfigField::MaxOutputTokens => model.max_output_tokens = parse_number(text)?,
-            ConfigField::SessionMaxStepsPerTurn => session.max_steps_per_turn = parse_number(text)?,
             ConfigField::RequestTimeoutMs => model.request_timeout_ms = parse_number(text)?,
             ConfigField::StreamIdleTimeoutMs => model.stream_idle_timeout_ms = parse_number(text)?,
             ConfigField::ConnectTimeoutMs => model.connect_timeout_ms = parse_number(text)?,
             ConfigField::MaxRetries => model.max_retries = parse_number(text)?,
-            ConfigField::StreamMaxRetries => model.stream_max_retries = parse_number(text)?,
             ConfigField::SupportsTools => model.supports_tools = parse_bool(text)?,
             ConfigField::SupportsReasoning => model.supports_reasoning = parse_bool(text)?,
             ConfigField::SupportsImages => model.supports_images = parse_bool(text)?,
@@ -639,22 +618,12 @@ fn parse_editor_patch_matching(
     patch.model = Some(model);
     patch.permissions = Some(permissions);
     patch.multi_agent = Some(multi_agent);
-    patch.session = Some(session);
     patch.shell = Some(shell);
     patch.inspection = Some(inspection);
     patch.file_guard = Some(file_guard);
     patch.docling = Some(docling);
     patch.mcp = Some(mcp);
     Ok(patch)
-}
-
-fn parse_prompt_profile(value: &str) -> Result<PromptProfile, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "auto" => Ok(PromptProfile::Auto),
-        "default" => Ok(PromptProfile::Default),
-        "qwen" | "qwen_coder" | "qwen-coder" => Ok(PromptProfile::QwenCoder),
-        other => Err(format!("unsupported prompt_profile `{other}`")),
-    }
 }
 
 fn parse_provider_metadata_mode(value: &str) -> Result<ProviderMetadataMode, String> {
@@ -735,11 +704,6 @@ fn field_value(key: ConfigField, config: &ResolvedConfig) -> String {
     match key {
         ConfigField::BaseUrl => config.model.base_url.clone(),
         ConfigField::Model => config.model.model.clone(),
-        ConfigField::PromptProfile => match config.model.prompt_profile {
-            PromptProfile::Auto => "auto".to_string(),
-            PromptProfile::Default => "default".to_string(),
-            PromptProfile::QwenCoder => "qwen_coder".to_string(),
-        },
         ConfigField::ProviderMetadataMode => match config.model.provider_metadata_mode {
             ProviderMetadataMode::LmStudioNativeRequired => "lm_studio_native_required".to_string(),
             ProviderMetadataMode::OpenAiCompatibleOnly => "openai_compatible_only".to_string(),
@@ -788,12 +752,10 @@ fn field_value(key: ConfigField, config: &ResolvedConfig) -> String {
         ConfigField::StopSequences => config.model.stop_sequences.join(", "),
         ConfigField::ContextWindow => config.model.context_window.to_string(),
         ConfigField::MaxOutputTokens => config.model.max_output_tokens.to_string(),
-        ConfigField::SessionMaxStepsPerTurn => config.session.max_steps_per_turn.to_string(),
         ConfigField::RequestTimeoutMs => config.model.request_timeout_ms.to_string(),
         ConfigField::StreamIdleTimeoutMs => config.model.stream_idle_timeout_ms.to_string(),
         ConfigField::ConnectTimeoutMs => config.model.connect_timeout_ms.to_string(),
         ConfigField::MaxRetries => config.model.max_retries.to_string(),
-        ConfigField::StreamMaxRetries => config.model.stream_max_retries.to_string(),
         ConfigField::SupportsTools => config.model.supports_tools.to_string(),
         ConfigField::SupportsReasoning => config.model.supports_reasoning.to_string(),
         ConfigField::SupportsImages => config.model.supports_images.to_string(),
@@ -868,6 +830,19 @@ mod tests {
         save_access_mode, save_config_sections,
     };
     use crate::config::{AccessMode, ProviderMetadataMode, ResolvedConfig};
+
+    #[test]
+    fn config_editor_excludes_removed_model_behavior_guards() {
+        let editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let labels = editor
+            .fields
+            .iter()
+            .map(|field| field.key.label())
+            .collect::<Vec<_>>();
+
+        assert!(!labels.contains(&"model.prompt_profile"));
+        assert!(!labels.contains(&"session.max_steps_per_turn"));
+    }
 
     #[test]
     fn config_editor_projects_provider_metadata_mode_patch() {

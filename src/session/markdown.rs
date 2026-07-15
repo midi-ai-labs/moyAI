@@ -1,82 +1,31 @@
 use serde_json::Value;
 
-use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload, ToolLifecycleStatus};
-use crate::session::{
-    MessageMetadata, MessagePart, MessageRole, PartRecord, RequestDiagnosticsPart, SessionId,
-    SessionStatus, ToolCallStatus, Transcript, TranscriptMessage,
+use crate::protocol::{
+    ContentPart, HistoryItem, HistoryItemPayload, ToolLifecycleStatus, TurnItemPayload,
+    TurnTerminalStatus, turn_items_in_projection_order,
 };
+use crate::session::{CanonicalSessionRead, RequestDiagnosticsPart, SessionId, ToolCallId};
 
-pub fn transcript_to_markdown(transcript: &Transcript) -> String {
-    let session = &transcript.session;
-    let mut output = String::new();
-    output.push_str("# ");
-    output.push_str(&session.title);
-    output.push_str("\n\n");
-    push_metadata_line(&mut output, "Session ID", &session.id.to_string());
-    push_metadata_line(&mut output, "Status", &format!("{:?}", session.status));
-    push_metadata_line(&mut output, "Workspace", session.cwd.as_str());
-    push_metadata_line(&mut output, "Model", &session.model);
-    push_metadata_line(&mut output, "Base URL", &session.base_url);
-    push_metadata_line(
-        &mut output,
-        "Created At (ms)",
-        &session.created_at_ms.to_string(),
-    );
-    push_metadata_line(
-        &mut output,
-        "Updated At (ms)",
-        &session.updated_at_ms.to_string(),
-    );
-    if let Some(completed_at_ms) = session.completed_at_ms {
-        push_metadata_line(
-            &mut output,
-            "Completed At (ms)",
-            &completed_at_ms.to_string(),
-        );
-    }
-    output.push('\n');
-
-    for message in &transcript.messages {
-        push_message(&mut output, message);
-    }
-
-    output
-}
-
-pub fn history_items_to_markdown(
-    session: &crate::session::SessionRecord,
-    items: &[HistoryItem],
-) -> String {
+pub fn canonical_session_read_to_markdown(read: &CanonicalSessionRead) -> String {
+    let session = &read.session;
     let mut events = Vec::new();
-    for item in items {
+    for item in &read.history.items {
         match &item.payload {
-            HistoryItemPayload::UserTurn { .. }
-            | HistoryItemPayload::SteerTurn { .. }
-            | HistoryItemPayload::Message {
-                role: MessageRole::User,
-                ..
-            } => {
+            HistoryItemPayload::UserTurn { .. } | HistoryItemPayload::SteerTurn { .. } => {
                 let mut body = String::new();
                 push_history_user_quote_body(&mut body, item);
                 events.push(MarkdownExportEvent::user(body));
             }
-            HistoryItemPayload::Message {
-                role: MessageRole::Assistant,
-                ..
-            }
+            HistoryItemPayload::AssistantMessage { .. }
             | HistoryItemPayload::InterAgentCommunication { .. } => {
                 let mut body = String::new();
                 push_history_payload(&mut body, &item.payload);
                 events.push(MarkdownExportEvent::assistant(body));
             }
-            HistoryItemPayload::Error { message, .. } => {
+            HistoryItemPayload::Error { .. } => {
                 events.push(MarkdownExportEvent::detail(
                     "Error",
                     render_history_item_detail(item),
-                ));
-                events.push(MarkdownExportEvent::terminal(
-                    MarkdownTerminalStatus::Failed,
-                    message,
                 ));
             }
             _ => {
@@ -87,20 +36,43 @@ pub fn history_items_to_markdown(
             }
         }
     }
-    if let Some(status) = markdown_terminal_status_from_session_status(session.status) {
-        events.push(MarkdownExportEvent::terminal(
-            status,
-            markdown_session_terminal_summary(session.status),
-        ));
+    if let Some((status, summary)) = latest_canonical_terminal(read) {
+        events.push(MarkdownExportEvent::terminal(status, summary));
     }
     let metadata = history_metadata_lines(session);
     render_codex_turn_block_markdown(&session.title, &events, &metadata)
 }
 
+fn latest_canonical_terminal(
+    read: &CanonicalSessionRead,
+) -> Option<(MarkdownTerminalStatus, String)> {
+    turn_items_in_projection_order(&read.turns.items)
+        .into_iter()
+        .rev()
+        .find_map(|item| match &item.payload {
+            TurnItemPayload::Terminal {
+                status,
+                summary,
+                cause,
+            } => Some((
+                match status {
+                    TurnTerminalStatus::Completed => MarkdownTerminalStatus::Completed,
+                    TurnTerminalStatus::Failed => MarkdownTerminalStatus::Failed,
+                    TurnTerminalStatus::Interrupted => MarkdownTerminalStatus::Interrupted,
+                },
+                if summary.trim().is_empty() {
+                    cause.map(|cause| format!("{cause:?}")).unwrap_or_default()
+                } else {
+                    summary.clone()
+                },
+            )),
+            _ => None,
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkdownTerminalStatus {
     Completed,
-    AwaitingUser,
     Failed,
     Interrupted,
 }
@@ -360,14 +332,6 @@ fn terminal_outcome_text(status: MarkdownTerminalStatus, summary: &str) -> Strin
             "完了しました。".to_string()
         }
         MarkdownTerminalStatus::Completed => summary.to_string(),
-        MarkdownTerminalStatus::AwaitingUser
-            if summary.is_empty() || summary == "session awaiting user" =>
-        {
-            "ユーザー確認待ちで停止しました。".to_string()
-        }
-        MarkdownTerminalStatus::AwaitingUser => {
-            format!("ユーザー確認待ちで停止しました: {summary}")
-        }
         MarkdownTerminalStatus::Failed if summary.is_empty() => "失敗しました。".to_string(),
         MarkdownTerminalStatus::Failed => format!("失敗しました: {summary}"),
         MarkdownTerminalStatus::Interrupted if summary.is_empty() => "停止しました。".to_string(),
@@ -401,89 +365,10 @@ pub fn history_markdown_file_name(title: &str, session_id: SessionId) -> String 
     format!("moyai-history-{slug}-{short_id}.md")
 }
 
-fn push_message(output: &mut String, message: &TranscriptMessage) {
-    let role = match message.record.role {
-        MessageRole::User => "User",
-        MessageRole::Assistant => "Assistant",
-    };
-    output.push_str("## ");
-    output.push_str(role);
-    output.push_str(" Message ");
-    output.push_str(&message.record.sequence_no.to_string());
-    output.push_str("\n\n");
-
-    if message.parts.is_empty() {
-        output.push_str("_No recorded parts._\n\n");
-        return;
-    }
-
-    for part in &message.parts {
-        if let Some(payload) = materialized_history_payload_for_part(message, part) {
-            push_history_payload(output, &payload);
-            continue;
-        }
-        match &part.payload {
-            MessagePart::Error(value) => {
-                output.push_str("### Error\n\n");
-                output.push_str("- Category: `");
-                output.push_str(&format!("{:?}", value.category));
-                output.push_str("`\n\n");
-                output.push_str(&value.message);
-                output.push_str("\n\n");
-            }
-            MessagePart::DiffSummary(value) => {
-                output.push_str("### Diff Summary\n\n");
-                if let Some(call_id) = value.tool_call_id {
-                    push_metadata_line(output, "Tool Call ID", &call_id.to_string());
-                    output.push('\n');
-                }
-                output.push_str(&value.summary);
-                output.push_str("\n\n");
-            }
-            MessagePart::PromptDispatch(value) => {
-                output.push_str("### Prompt Dispatch\n\n");
-                push_labeled_text(output, "Raw prompt", &value.raw_prompt_text);
-                push_labeled_text(output, "Dispatched prompt", &value.dispatch_prompt_text);
-                if let Some(draft) = &value.enhanced_draft_text {
-                    push_labeled_text(output, "Enhanced draft", draft);
-                }
-                if !value.transforms.is_empty() {
-                    output.push_str("Transforms:\n");
-                    for transform in &value.transforms {
-                        output.push_str("- `");
-                        output.push_str(&format!("{:?}", transform.kind));
-                        output.push('`');
-                        if let Some(label) = &transform.label {
-                            output.push_str(": ");
-                            output.push_str(label);
-                        }
-                        output.push('\n');
-                    }
-                    output.push('\n');
-                }
-                if let Some(error) = &value.transform_error {
-                    push_labeled_text(output, "Transform error", error);
-                }
-            }
-            MessagePart::RequestDiagnostics(value) => {
-                push_request_diagnostics(output, value);
-            }
-            MessagePart::Text(_)
-            | MessagePart::Image(_)
-            | MessagePart::Reasoning(_)
-            | MessagePart::ToolCall(_)
-            | MessagePart::ToolResult(_) => {}
-        }
-    }
-}
-
 fn push_history_item(output: &mut String, item: &HistoryItem) {
     let role = match &item.payload {
         HistoryItemPayload::UserTurn { .. } | HistoryItemPayload::SteerTurn { .. } => Some("User"),
-        HistoryItemPayload::Message { role, .. } => Some(match role {
-            MessageRole::User => "User",
-            MessageRole::Assistant => "Assistant",
-        }),
+        HistoryItemPayload::AssistantMessage { .. } => Some("Assistant"),
         HistoryItemPayload::InterAgentCommunication { .. } => Some("Assistant"),
         _ => None,
     };
@@ -509,38 +394,24 @@ fn history_item_detail_title(item: &HistoryItem) -> &'static str {
         HistoryItemPayload::ToolOutput { .. } => "Tool Result",
         HistoryItemPayload::RequestDiagnostics { .. } => "Request Diagnostics",
         HistoryItemPayload::FileChange { .. } => "File Changes",
-        HistoryItemPayload::Reasoning { .. } => "Reasoning",
-        HistoryItemPayload::PromptDispatch { .. } => "Prompt Dispatch",
-        HistoryItemPayload::RejectedToolProposal { .. } => "Rejected Tool Proposal",
-        HistoryItemPayload::CandidateRepairEdit { .. } => "Candidate Repair Edit",
-        HistoryItemPayload::Continuation { .. } => "Continuation",
         HistoryItemPayload::WorldState { .. } => "World State",
-        HistoryItemPayload::StateProjection { .. } | HistoryItemPayload::SessionState { .. } => {
-            "State"
-        }
-        HistoryItemPayload::LifecycleGuard { .. } => "Lifecycle Guard",
         HistoryItemPayload::ApprovalDecision { .. } => "Approval Decision",
         HistoryItemPayload::RetryDecision { .. } => "Retry Decision",
-        HistoryItemPayload::ControlEnvelope { .. } => "Control Envelope",
         HistoryItemPayload::InterAgentCommunication { .. } => "Sub-agent Message",
         HistoryItemPayload::SubAgentActivity { .. } => "Sub-agent Activity",
+        HistoryItemPayload::CollaborationModeInstruction { .. } => "Collaboration Mode",
         HistoryItemPayload::Compaction { .. } => "Compaction",
         HistoryItemPayload::Error { .. } => "Error",
         HistoryItemPayload::UserTurn { .. }
         | HistoryItemPayload::SteerTurn { .. }
-        | HistoryItemPayload::Message { .. } => "Message",
+        | HistoryItemPayload::AssistantMessage { .. } => "Message",
     }
 }
 
 fn push_history_user_quote_body(output: &mut String, item: &HistoryItem) {
     match &item.payload {
         HistoryItemPayload::UserTurn { content, .. }
-        | HistoryItemPayload::SteerTurn { content, .. }
-        | HistoryItemPayload::Message {
-            role: MessageRole::User,
-            content,
-            ..
-        } => push_content_parts(output, content),
+        | HistoryItemPayload::SteerTurn { content, .. } => push_content_parts(output, content),
         _ => {}
     }
 }
@@ -564,117 +435,12 @@ fn history_metadata_lines(session: &crate::session::SessionRecord) -> Vec<Markdo
     lines
 }
 
-fn markdown_terminal_status_from_session_status(
-    status: SessionStatus,
-) -> Option<MarkdownTerminalStatus> {
-    match status {
-        SessionStatus::Completed => Some(MarkdownTerminalStatus::Completed),
-        SessionStatus::AwaitingUser => Some(MarkdownTerminalStatus::AwaitingUser),
-        SessionStatus::Cancelled => Some(MarkdownTerminalStatus::Interrupted),
-        SessionStatus::Failed => Some(MarkdownTerminalStatus::Failed),
-        SessionStatus::Running | SessionStatus::Idle => None,
-    }
-}
-
-fn markdown_session_terminal_summary(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Completed => "session completed",
-        SessionStatus::AwaitingUser => "session awaiting user",
-        SessionStatus::Cancelled => "run cancelled",
-        SessionStatus::Failed => "session failed",
-        SessionStatus::Running | SessionStatus::Idle => "",
-    }
-}
-
-fn materialized_history_payload_for_part(
-    message: &TranscriptMessage,
-    part: &PartRecord,
-) -> Option<HistoryItemPayload> {
-    match &part.payload {
-        MessagePart::Text(value) => Some(HistoryItemPayload::Message {
-            message_id: Some(message.record.id),
-            role: message.record.role,
-            content: vec![ContentPart::Text {
-                text: value.text.clone(),
-            }],
-        }),
-        MessagePart::Image(value) => Some(HistoryItemPayload::Message {
-            message_id: Some(message.record.id),
-            role: message.record.role,
-            content: vec![ContentPart::Image {
-                image: value.clone(),
-            }],
-        }),
-        MessagePart::Reasoning(value) => Some(HistoryItemPayload::Reasoning {
-            text: value.text.clone(),
-        }),
-        MessagePart::ToolCall(value) => Some(HistoryItemPayload::ToolCall {
-            call_id: value.tool_call_id,
-            tool: value.tool_name.clone(),
-            arguments: serde_json::from_str(&value.arguments_json)
-                .unwrap_or_else(|_| Value::String(value.arguments_json.clone())),
-            model_arguments: value
-                .model_arguments_json
-                .as_deref()
-                .and_then(|text| serde_json::from_str(text).ok())
-                .unwrap_or(Value::Null),
-            effective_arguments: value
-                .effective_arguments_json
-                .as_deref()
-                .and_then(|text| serde_json::from_str(text).ok())
-                .unwrap_or(Value::Null),
-            adjusted_arguments: None,
-            permission_decision: None,
-            sandbox_decision: None,
-            allowed_surface: Vec::new(),
-            retry_policy: None,
-            terminal_guard_policy: None,
-        }),
-        MessagePart::ToolResult(value) => Some(HistoryItemPayload::ToolOutput {
-            call_id: value.tool_call_id,
-            status: tool_lifecycle_status_from_session_status(value.status),
-            title: value.title.clone(),
-            output_text: value.summary.clone(),
-            metadata: Value::Null,
-            success: value.success,
-            progress_effect: value.progress_effect.clone(),
-            blocked_action: value.blocked_action.clone(),
-            result_hash: value.result_hash.clone(),
-            verification_run: None,
-        }),
-        MessagePart::RequestDiagnostics(value) => Some(HistoryItemPayload::RequestDiagnostics {
-            diagnostics: value.clone(),
-        }),
-        MessagePart::DiffSummary(value) => {
-            let call_id = value.tool_call_id?;
-            Some(HistoryItemPayload::FileChange {
-                call_id,
-                change_ids: value.change_ids.clone(),
-                changes: value.changes.clone(),
-                summary: value.summary.clone(),
-            })
-        }
-        MessagePart::PromptDispatch(value) => Some(HistoryItemPayload::PromptDispatch {
-            dispatch: value.clone(),
-            editor_context: match &message.record.metadata {
-                MessageMetadata::User(meta) => meta.editor_context.clone(),
-                _ => None,
-            },
-        }),
-        MessagePart::Error(value) => Some(HistoryItemPayload::Error {
-            message_id: Some(message.record.id),
-            message: value.message.clone(),
-        }),
-    }
-}
-
 fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
     match payload {
         HistoryItemPayload::UserTurn {
             content,
             prompt_dispatch,
             editor_context,
-            turn_context,
             ..
         } => {
             push_content_parts(output, content);
@@ -692,14 +458,6 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
                     output,
                     "json",
                     &serde_json::to_string_pretty(editor_context).unwrap_or_default(),
-                );
-            }
-            if let Some(turn_context) = turn_context {
-                output.push_str("### Turn Context\n\n");
-                push_fenced(
-                    output,
-                    "json",
-                    &serde_json::to_string_pretty(turn_context).unwrap_or_default(),
                 );
             }
         }
@@ -723,7 +481,7 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
                 );
             }
         }
-        HistoryItemPayload::Message { content, .. } => {
+        HistoryItemPayload::AssistantMessage { content, .. } => {
             push_content_parts(output, content);
         }
         HistoryItemPayload::InterAgentCommunication { communication } => {
@@ -752,145 +510,47 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
             push_metadata_line(output, "Activity", &format!("{activity_kind:?}"));
             output.push('\n');
         }
+        HistoryItemPayload::CollaborationModeInstruction { mode } => {
+            output.push_str("### Collaboration Mode\n\n");
+            push_metadata_line(output, "Mode", mode.as_str());
+            output.push('\n');
+        }
         HistoryItemPayload::Error { message, .. } => {
             output.push_str("### Error\n\n");
             output.push_str(message);
             output.push_str("\n\n");
         }
-        HistoryItemPayload::Reasoning { text } => {
-            output.push_str("### Reasoning\n\n");
-            output.push_str(text);
-            output.push_str("\n\n");
-        }
         HistoryItemPayload::ToolCall {
             call_id,
-            tool,
-            arguments,
-            model_arguments,
-            effective_arguments,
-            adjusted_arguments,
-            permission_decision,
-            sandbox_decision,
-            allowed_surface,
-            retry_policy,
-            terminal_guard_policy,
-        } => {
-            output.push_str("### Tool Call: ");
-            output.push_str(&tool.to_string());
-            output.push_str("\n\n");
-            output.push_str("- Tool call ID: `");
-            output.push_str(&call_id.to_string());
-            output.push_str("`\n\n");
-            let rendered =
-                serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string());
-            push_fenced(output, "json", &rendered);
-            if !model_arguments.is_null()
-                || !effective_arguments.is_null()
-                || adjusted_arguments.is_some()
-            {
-                output.push_str("#### Tool Arguments Projection\n\n");
-                let projection = serde_json::json!({
-                    "model_arguments": model_arguments,
-                    "effective_arguments": effective_arguments,
-                    "adjusted_arguments": adjusted_arguments,
-                });
-                push_fenced(
-                    output,
-                    "json",
-                    &serde_json::to_string_pretty(&projection).unwrap_or_default(),
-                );
-            }
-            if permission_decision.is_some()
-                || sandbox_decision.is_some()
-                || !allowed_surface.is_empty()
-                || retry_policy.is_some()
-                || terminal_guard_policy.is_some()
-            {
-                output.push_str("#### Tool Lifecycle Decisions\n\n");
-                let decisions = serde_json::json!({
-                    "permission_decision": permission_decision,
-                    "sandbox_decision": sandbox_decision,
-                    "allowed_surface": allowed_surface,
-                    "retry_policy": retry_policy,
-                    "terminal_guard_policy": terminal_guard_policy,
-                });
-                push_fenced(
-                    output,
-                    "json",
-                    &serde_json::to_string_pretty(&decisions).unwrap_or_default(),
-                );
-            }
-        }
+            model_call_id,
+            tool_name,
+            arguments_json,
+            ..
+        } => push_tool_call(
+            output,
+            *call_id,
+            Some(model_call_id),
+            tool_name,
+            arguments_json,
+        ),
         HistoryItemPayload::ToolOutput {
             call_id,
             status,
             title,
             output_text,
-            verification_run,
+            metadata,
             success,
-            progress_effect,
-            blocked_action,
-            result_hash,
-            ..
-        } => {
-            output.push_str("### Tool Result: ");
-            output.push_str(title);
-            output.push_str("\n\n");
-            output.push_str("- Tool call ID: `");
-            output.push_str(&call_id.to_string());
-            output.push_str("`\n");
-            output.push_str("- Status: `");
-            output.push_str(&format!("{status:?}"));
-            output.push_str("`\n\n");
-            if let Some(success) = success {
-                output.push_str("- Success: `");
-                output.push_str(&success.to_string());
-                output.push_str("`\n");
-            }
-            output.push_str("- Progress effect: `");
-            output.push_str(&format!("{progress_effect:?}"));
-            output.push_str("`\n");
-            if let Some(blocked_action) = blocked_action {
-                push_metadata_line(output, "Blocked action", blocked_action);
-            }
-            if let Some(hash) = result_hash {
-                output.push_str("- Result hash: `");
-                output.push_str(hash);
-                output.push_str("`\n");
-            }
-            output.push('\n');
-            output.push_str(output_text);
-            output.push_str("\n\n");
-            if let Some(verification_run) = verification_run {
-                output.push_str("#### Verification Run\n\n");
-                push_fenced(
-                    output,
-                    "json",
-                    &serde_json::to_string_pretty(verification_run).unwrap_or_default(),
-                );
-            }
-        }
+        } => push_tool_output(
+            output,
+            *call_id,
+            *status,
+            title,
+            output_text,
+            *success,
+            Some(metadata),
+        ),
         HistoryItemPayload::RequestDiagnostics { diagnostics } => {
             push_request_diagnostics(output, diagnostics);
-        }
-        HistoryItemPayload::PromptDispatch {
-            dispatch,
-            editor_context,
-        } => {
-            output.push_str("### Prompt Dispatch\n\n");
-            push_fenced(
-                output,
-                "json",
-                &serde_json::to_string_pretty(dispatch).unwrap_or_default(),
-            );
-            if let Some(editor_context) = editor_context {
-                output.push_str("### Editor Context\n\n");
-                push_fenced(
-                    output,
-                    "json",
-                    &serde_json::to_string_pretty(editor_context).unwrap_or_default(),
-                );
-            }
         }
         HistoryItemPayload::FileChange {
             call_id,
@@ -911,30 +571,6 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
                 );
             }
         }
-        HistoryItemPayload::RejectedToolProposal { proposal } => {
-            output.push_str("### Rejected Tool Proposal\n\n");
-            push_fenced(
-                output,
-                "json",
-                &serde_json::to_string_pretty(proposal).unwrap_or_default(),
-            );
-        }
-        HistoryItemPayload::CandidateRepairEdit { candidate } => {
-            output.push_str("### Candidate Repair Edit\n\n");
-            push_fenced(
-                output,
-                "json",
-                &serde_json::to_string_pretty(candidate).unwrap_or_default(),
-            );
-        }
-        HistoryItemPayload::Continuation { contract } => {
-            output.push_str("### Continuation\n\n");
-            push_fenced(
-                output,
-                "json",
-                &serde_json::to_string_pretty(contract).unwrap_or_default(),
-            );
-        }
         HistoryItemPayload::WorldState { snapshot, rendered } => {
             output.push_str("### World State\n\n");
             output.push_str(rendered);
@@ -943,22 +579,6 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
                 output,
                 "json",
                 &serde_json::to_string_pretty(snapshot).unwrap_or_default(),
-            );
-        }
-        HistoryItemPayload::StateProjection { projection } => {
-            output.push_str("### State Projection\n\n");
-            push_fenced(
-                output,
-                "json",
-                &serde_json::to_string_pretty(projection).unwrap_or_default(),
-            );
-        }
-        HistoryItemPayload::SessionState { state } => {
-            output.push_str("### Session State\n\n");
-            push_fenced(
-                output,
-                "json",
-                &serde_json::to_string_pretty(state).unwrap_or_default(),
             );
         }
         HistoryItemPayload::ApprovalDecision { call_id, decision } => {
@@ -987,27 +607,76 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
             output.push_str(message);
             output.push_str("\n\n");
         }
-        HistoryItemPayload::ControlEnvelope { envelope } => {
-            output.push_str("### Control Envelope\n\n");
-            push_fenced(
-                output,
-                "json",
-                &serde_json::to_string_pretty(envelope).unwrap_or_default(),
-            );
-        }
-        HistoryItemPayload::LifecycleGuard { snapshot } => {
-            output.push_str("### Lifecycle Guard\n\n");
-            push_fenced(
-                output,
-                "json",
-                &serde_json::to_string_pretty(snapshot).unwrap_or_default(),
-            );
-        }
         HistoryItemPayload::Compaction { summary, .. } => {
             output.push_str("### Compaction\n\n");
             output.push_str(summary);
             output.push_str("\n\n");
         }
+    }
+}
+
+fn push_tool_call(
+    output: &mut String,
+    call_id: ToolCallId,
+    model_call_id: Option<&str>,
+    tool_name: &str,
+    arguments_json: &str,
+) {
+    output.push_str("### Tool Call: ");
+    output.push_str(tool_name);
+    output.push_str("\n\n");
+    output.push_str("- Tool call ID: `");
+    output.push_str(&call_id.to_string());
+    output.push_str("`\n");
+    if let Some(model_call_id) = model_call_id.filter(|value| !value.is_empty()) {
+        output.push_str("- Model call ID: `");
+        output.push_str(model_call_id);
+        output.push_str("`\n");
+    }
+    output.push('\n');
+    let rendered = serde_json::from_str::<Value>(arguments_json)
+        .and_then(|arguments| serde_json::to_string_pretty(&arguments))
+        .unwrap_or_else(|_| arguments_json.to_string());
+    push_fenced(output, "json", &rendered);
+}
+
+fn push_tool_output(
+    output: &mut String,
+    call_id: ToolCallId,
+    status: ToolLifecycleStatus,
+    title: &str,
+    output_text: &str,
+    success: Option<bool>,
+    metadata: Option<&Value>,
+) {
+    output.push_str("### Tool Result: ");
+    output.push_str(title);
+    output.push_str("\n\n");
+    output.push_str("- Tool call ID: `");
+    output.push_str(&call_id.to_string());
+    output.push_str("`\n");
+    output.push_str("- Status: `");
+    output.push_str(&format!("{status:?}"));
+    output.push_str("`\n");
+    if let Some(success) = success {
+        output.push_str("- Success: `");
+        output.push_str(&success.to_string());
+        output.push_str("`\n");
+    }
+    output.push('\n');
+    output.push_str(output_text);
+    output.push_str("\n\n");
+    if let Some(metadata) = metadata.filter(|value| match value {
+        Value::Null => false,
+        Value::Object(values) => !values.is_empty(),
+        _ => true,
+    }) {
+        output.push_str("#### Metadata\n\n");
+        push_fenced(
+            output,
+            "json",
+            &serde_json::to_string_pretty(metadata).unwrap_or_else(|_| metadata.to_string()),
+        );
     }
 }
 
@@ -1031,17 +700,6 @@ fn push_content_parts(output: &mut String, content: &[ContentPart]) {
     }
 }
 
-fn tool_lifecycle_status_from_session_status(status: ToolCallStatus) -> ToolLifecycleStatus {
-    match status {
-        ToolCallStatus::Pending => ToolLifecycleStatus::Pending,
-        ToolCallStatus::Running => ToolLifecycleStatus::Running,
-        ToolCallStatus::Completed => ToolLifecycleStatus::Completed,
-        ToolCallStatus::Declined => ToolLifecycleStatus::Declined,
-        ToolCallStatus::Cancelled => ToolLifecycleStatus::Cancelled,
-        ToolCallStatus::Failed => ToolLifecycleStatus::Failed,
-    }
-}
-
 fn push_request_diagnostics(output: &mut String, value: &RequestDiagnosticsPart) {
     output.push_str("### Request Diagnostics\n\n");
     push_metadata_line(output, "Provider", &value.provider);
@@ -1056,11 +714,6 @@ fn push_request_diagnostics(output: &mut String, value: &RequestDiagnosticsPart)
         output,
         "Stream Idle Timeout (ms)",
         &value.stream_idle_timeout_ms.to_string(),
-    );
-    push_metadata_line(
-        output,
-        "Stream Max Retries",
-        &value.stream_max_retries.to_string(),
     );
     if let Some(supports_tools) = value.supports_tools {
         push_metadata_line(output, "Supports Tools", &supports_tools.to_string());
@@ -1112,27 +765,7 @@ fn push_request_diagnostics(output: &mut String, value: &RequestDiagnosticsPart)
             &context_window.token_limit_reached.to_string(),
         );
     }
-    if let Some(control) = &value.control_envelope {
-        push_metadata_line(output, "Control Projection ID", &control.projection_id);
-        push_metadata_line(output, "Control Policy", &control.dispatch_policy);
-        push_metadata_line(output, "Control Validation", &control.validation_status);
-        if !control.allowed_tools.is_empty() {
-            push_metadata_line(
-                output,
-                "Allowed Control Tools",
-                &control.allowed_tools.join(", "),
-            );
-        }
-    }
     output.push('\n');
-}
-
-fn push_labeled_text(output: &mut String, label: &str, value: &str) {
-    output.push_str("**");
-    output.push_str(label);
-    output.push_str("**\n\n");
-    output.push_str(value);
-    output.push_str("\n\n");
 }
 
 fn push_metadata_line(output: &mut String, label: &str, value: &str) {
@@ -1214,21 +847,24 @@ mod tests {
     use super::*;
     use crate::config::AccessMode;
     use crate::protocol::{
-        ContentPart, HistoryItemId, InterAgentCommunication, SubAgentActivityKind, TurnId,
+        ContentPart, HistoryItemId, InterAgentCommunication, ModelResponseId, SubAgentActivityKind,
+        TurnId, TurnItem, TurnItemId,
     };
     use crate::session::{
-        ProjectId, SessionId, SessionModelParameters, SessionRecord, SessionStatus,
+        CanonicalHistoryPage, CanonicalTurnPage, ProjectId, SessionId, SessionModelParameters,
+        SessionRecord, SessionStatus,
     };
-
-    #[test]
-    fn tooloutput_markdown_export_preserves_blocked_action() {}
 
     #[test]
     fn history_markdown_preserves_canonical_cross_turn_order() {
         let session = test_session();
         let older = message_item(&session, TurnId::new(), 29, 100, "older-stage");
         let newer = message_item(&session, TurnId::new(), 15, 200, "newer-stage");
-        let markdown = history_items_to_markdown(&session, &[older, newer]);
+        let markdown = canonical_session_read_to_markdown(&canonical_read(
+            &session,
+            vec![older, newer],
+            Vec::new(),
+        ));
 
         let older_position = markdown
             .find("older-stage")
@@ -1275,13 +911,112 @@ mod tests {
             },
         };
 
-        let markdown = history_items_to_markdown(&session, &[communication, activity]);
+        let markdown = canonical_session_read_to_markdown(&canonical_read(
+            &session,
+            vec![communication, activity],
+            Vec::new(),
+        ));
 
         assert!(markdown.contains("### Sub-agent Message"));
         assert!(markdown.contains("review complete"));
         assert!(markdown.contains("### Sub-agent Activity"));
         assert!(markdown.contains("activity-1"));
         assert!(!markdown.contains("### Reasoning"));
+    }
+
+    #[test]
+    fn history_markdown_pretty_prints_valid_raw_tool_arguments() {
+        let session = test_session();
+        let turn_id = TurnId::new();
+        let tool_call = tool_call_item(
+            &session,
+            turn_id,
+            "vendor.custom_tool",
+            r#"{"path":"C:\\workspace","nested":{"value":1}}"#,
+        );
+
+        let markdown = canonical_session_read_to_markdown(&canonical_read(
+            &session,
+            vec![tool_call],
+            Vec::new(),
+        ));
+
+        assert!(markdown.contains("### Tool Call: vendor.custom_tool"));
+        assert!(markdown.contains("\n  \"nested\": {\n    \"value\": 1\n  },"));
+        assert!(markdown.contains("\n  \"path\": \"C:\\\\workspace\"\n"));
+    }
+
+    #[test]
+    fn history_markdown_preserves_invalid_raw_tool_arguments_verbatim() {
+        let session = test_session();
+        let turn_id = TurnId::new();
+        let invalid_arguments = r#"{"path":"unterminated"#;
+        let tool_call = tool_call_item(&session, turn_id, "vendor.invalid_tool", invalid_arguments);
+
+        let markdown = canonical_session_read_to_markdown(&canonical_read(
+            &session,
+            vec![tool_call],
+            Vec::new(),
+        ));
+
+        assert!(markdown.contains("### Tool Call: vendor.invalid_tool"));
+        assert!(markdown.contains(&format!("```json\n{invalid_arguments}\n```")));
+    }
+
+    #[test]
+    fn history_markdown_uses_canonical_turn_terminal() {
+        let mut session = test_session();
+        session.status = SessionStatus::Cancelled;
+        let turn_id = TurnId::new();
+        let terminal = TurnItem {
+            id: TurnItemId::new(),
+            session_id: session.id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 2,
+            payload: TurnItemPayload::Terminal {
+                status: TurnTerminalStatus::Interrupted,
+                summary: "run cancelled by user".to_string(),
+                cause: Some(crate::protocol::TurnInterruptionCause::UserStop),
+            },
+        };
+        let read = canonical_read(
+            &session,
+            vec![message_item(&session, turn_id, 1, 100, "stop this")],
+            vec![terminal],
+        );
+
+        let markdown = canonical_session_read_to_markdown(&read);
+
+        assert!(markdown.contains("停止しました: run cancelled by user"));
+    }
+
+    fn canonical_read(
+        session: &SessionRecord,
+        history_items: Vec<HistoryItem>,
+        turn_items: Vec<TurnItem>,
+    ) -> CanonicalSessionRead {
+        CanonicalSessionRead {
+            session: session.clone(),
+            history: CanonicalHistoryPage {
+                session: session.clone(),
+                offset: 0,
+                limit: usize::MAX,
+                total: history_items.len(),
+                has_more: false,
+                items: history_items,
+            },
+            turns: CanonicalTurnPage {
+                session: session.clone(),
+                offset: 0,
+                limit: usize::MAX,
+                total: turn_items.len(),
+                has_more: false,
+                items: turn_items,
+            },
+            active_turn_id: None,
+            active_turn_sequence_no: None,
+        }
     }
 
     fn message_item(
@@ -1297,12 +1032,34 @@ mod tests {
             turn_id,
             sequence_no,
             created_at_ms,
-            payload: HistoryItemPayload::Message {
-                message_id: None,
-                role: MessageRole::User,
+            payload: HistoryItemPayload::UserTurn {
                 content: vec![ContentPart::Text {
                     text: text.to_string(),
                 }],
+                prompt_dispatch: None,
+                editor_context: None,
+            },
+        }
+    }
+
+    fn tool_call_item(
+        session: &SessionRecord,
+        turn_id: TurnId,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> HistoryItem {
+        HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: session.id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 100,
+            payload: HistoryItemPayload::ToolCall {
+                call_id: ToolCallId::new(),
+                response_id: ModelResponseId::new(),
+                model_call_id: "provider-call-1".to_string(),
+                tool_name: tool_name.to_string(),
+                arguments_json: arguments_json.to_string(),
             },
         }
     }

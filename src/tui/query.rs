@@ -1,16 +1,5 @@
 use crate::error::SessionError;
-use crate::protocol::TurnItem;
-use crate::session::{
-    ProjectId, SessionId, SessionRecord, SessionService, SessionStateSnapshot, TodoItem, Transcript,
-};
-
-pub struct SessionView {
-    pub session: SessionRecord,
-    pub transcript: Transcript,
-    pub turn_items: Vec<TurnItem>,
-    pub state: SessionStateSnapshot,
-    pub todos: Vec<TodoItem>,
-}
+use crate::session::{CanonicalSessionRead, ProjectId, SessionId, SessionRecord, SessionService};
 
 pub async fn recent_sessions(
     service: &SessionService,
@@ -55,17 +44,10 @@ pub async fn latest_session(
 pub async fn session_view(
     service: &SessionService,
     session_id: SessionId,
-) -> Result<SessionView, SessionError> {
-    let session = service.get_session(session_id).await?;
-    let turn_items = service.canonical_turn_items(session_id).await?;
-    let transcript = service.canonical_transcript(session_id).await?;
-    Ok(SessionView {
-        session,
-        transcript,
-        turn_items,
-        state: service.load_state(session_id).await?,
-        todos: service.list_todos(session_id).await?,
-    })
+) -> Result<CanonicalSessionRead, SessionError> {
+    service
+        .canonical_session_read(session_id, 0, usize::MAX, 0, usize::MAX)
+        .await
 }
 
 #[cfg(test)]

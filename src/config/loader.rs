@@ -137,7 +137,6 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
         model: Some(PartialModelConfig {
             base_url: Some(config.model.base_url.clone()),
             model: Some(config.model.model.clone()),
-            prompt_profile: Some(config.model.prompt_profile),
             provider_metadata_mode: Some(config.model.provider_metadata_mode),
             provider_api_mode: Some(config.model.provider_api_mode),
             chat_completions_reasoning_parameters: config
@@ -151,7 +150,6 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             stream_idle_timeout_ms: Some(config.model.stream_idle_timeout_ms),
             connect_timeout_ms: Some(config.model.connect_timeout_ms),
             max_retries: Some(config.model.max_retries),
-            stream_max_retries: Some(config.model.stream_max_retries),
             context_window: Some(config.model.context_window),
             max_output_tokens: Some(config.model.max_output_tokens),
             temperature: config.model.temperature,
@@ -169,10 +167,6 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             extra_body_json: config.model.extra_body_json.clone(),
         }),
         session: Some(PartialSessionConfig {
-            default_title_max_len: Some(config.session.default_title_max_len),
-            transcript_limit_messages: Some(config.session.transcript_limit_messages),
-            auto_resume_last: Some(config.session.auto_resume_last),
-            max_steps_per_turn: Some(config.session.max_steps_per_turn),
             overflow_margin_tokens: Some(config.session.overflow_margin_tokens),
         }),
         multi_agent: Some(PartialMultiAgentConfig {
@@ -288,11 +282,6 @@ fn env_patch() -> PartialResolvedConfig {
             patch.shell.get_or_insert_default().hide_windows = Some(parsed);
         }
     }
-    if let Ok(value) = env::var("MOYAI_PROMPT_PROFILE") {
-        if let Some(parsed) = parse_prompt_profile(&value) {
-            patch.model.get_or_insert_default().prompt_profile = Some(parsed);
-        }
-    }
     if let Ok(value) = env::var("MOYAI_PROVIDER_METADATA_MODE") {
         if let Some(parsed) = parse_provider_metadata_mode(&value) {
             patch.model.get_or_insert_default().provider_metadata_mode = Some(parsed);
@@ -331,11 +320,6 @@ fn env_patch() -> PartialResolvedConfig {
     if let Ok(value) = env::var("MOYAI_MAX_RETRIES") {
         if let Ok(parsed) = value.parse() {
             patch.model.get_or_insert_default().max_retries = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_STREAM_MAX_RETRIES") {
-        if let Ok(parsed) = value.parse() {
-            patch.model.get_or_insert_default().stream_max_retries = Some(parsed);
         }
     }
     if let Ok(value) = env::var("MOYAI_CONTEXT_WINDOW") {
@@ -415,19 +399,6 @@ fn env_patch() -> PartialResolvedConfig {
     if let Ok(value) = env::var("MOYAI_EXTRA_BODY_JSON") {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&value) {
             patch.model.get_or_insert_default().extra_body_json = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_TRANSCRIPT_LIMIT_MESSAGES") {
-        if let Ok(parsed) = value.parse() {
-            patch
-                .session
-                .get_or_insert_default()
-                .transcript_limit_messages = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_MAX_STEPS_PER_TURN") {
-        if let Ok(parsed) = value.parse() {
-            patch.session.get_or_insert_default().max_steps_per_turn = Some(parsed);
         }
     }
     if let Ok(value) = env::var("MOYAI_INSPECTION_MAX_DEPTH") {
@@ -590,7 +561,11 @@ mod tests {
         assert!(text.contains("reasoning_summary = \"none\""));
         assert!(!text.contains("chat_completions_reasoning_parameters"));
         assert!(!text.contains("reasoning_effort"));
+        assert!(text.contains("request_timeout_ms = 300000"));
+        assert!(text.contains("stream_idle_timeout_ms = 300000"));
         assert!(text.contains("max_output_tokens = 8192"));
+        assert!(!text.contains("prompt_profile"));
+        assert!(!text.contains("max_steps_per_turn"));
         assert!(text.contains("[docling]"));
         assert!(text.contains("enabled = false"));
         assert!(text.contains("base_url = \"http://127.0.0.1:8123\""));
@@ -642,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_agent_section_is_ignored_when_loading_config() {
+    fn removed_agent_section_is_rejected_instead_of_becoming_a_noop_contract() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 path");
         fs::write(
@@ -651,9 +626,26 @@ mod tests {
         )
         .expect("legacy config");
 
-        let config = ConfigLoader::load_with_global_path(path, None).expect("load legacy config");
+        let error = ConfigLoader::load_with_global_path(path, None)
+            .expect_err("removed config section must fail closed");
 
-        assert_eq!(config.model.model, "current-model");
+        assert!(error.to_string().contains("agent"));
+    }
+
+    #[test]
+    fn removed_stream_retry_setting_is_rejected_instead_of_silently_ignored() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 path");
+        fs::write(
+            &path,
+            "[model]\nmodel = \"current-model\"\nstream_max_retries = 2\n",
+        )
+        .expect("obsolete config");
+
+        let error = ConfigLoader::load_with_global_path(path, None)
+            .expect_err("removed transport contract must fail closed");
+
+        assert!(error.to_string().contains("stream_max_retries"));
     }
 
     #[test]
@@ -733,17 +725,6 @@ mod tests {
         assert_eq!(parse_chat_completions_reasoning_parameters("invalid"), None);
         assert_eq!(parse_reasoning_effort("  "), None);
         assert_eq!(parse_reasoning_summary("invalid"), None);
-    }
-}
-
-fn parse_prompt_profile(value: &str) -> Option<crate::config::model::PromptProfile> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "auto" => Some(crate::config::model::PromptProfile::Auto),
-        "default" => Some(crate::config::model::PromptProfile::Default),
-        "qwen_coder" | "qwen-coder" | "qwen" => {
-            Some(crate::config::model::PromptProfile::QwenCoder)
-        }
-        _ => None,
     }
 }
 

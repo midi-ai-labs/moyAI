@@ -46,10 +46,19 @@ pub struct WorldState {
 
 impl WorldState {
     pub fn build(workspace: &Workspace, config: &ResolvedConfig, tools: &[String]) -> Self {
+        Self::build_at(workspace, config, tools, CurrentTimeSnapshot::now())
+    }
+
+    pub fn build_at(
+        workspace: &Workspace,
+        config: &ResolvedConfig,
+        tools: &[String],
+        current_time: CurrentTimeSnapshot,
+    ) -> Self {
         let environment = EnvironmentSection::new(workspace, config, tools);
         let instructions = InstructionsSection::load(workspace, config);
         let time = CurrentTimeSection {
-            snapshot: CurrentTimeSnapshot::now(),
+            snapshot: current_time,
         };
         let sections: Vec<&dyn WorldStateSection> = vec![&environment, &instructions, &time];
         let snapshot = WorldStateSnapshot::from_sections(&sections);

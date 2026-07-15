@@ -95,6 +95,18 @@ pub enum LlmError {
     #[error("llm io error: {0}")]
     Io(#[from] io::Error),
     #[error(
+        "provider rejected the request{status_text}{code_text}{param_text}: {message}",
+        status_text = status.map(|value| format!(" with status {value}")).unwrap_or_default(),
+        code_text = code.as_ref().map(|value| format!(" ({value})")).unwrap_or_default(),
+        param_text = param.as_ref().map(|value| format!(" for {value}")).unwrap_or_default()
+    )]
+    ProviderRejected {
+        status: Option<u16>,
+        code: Option<String>,
+        param: Option<String>,
+        message: String,
+    },
+    #[error(
         "{operation} expected a complete tool-less text response, but provider finish reason was {finish_reason:?}"
     )]
     ToollessTextFinish {
@@ -118,6 +130,66 @@ impl LlmError {
             Self::IncompleteResponse { usage, .. } => usage.as_ref(),
             _ => None,
         }
+    }
+
+    /// Returns true only when the provider explicitly identifies the Responses
+    /// continuation cursor as the rejected part of the request. This is kept
+    /// separate from transport retries: callers may retry once with full
+    /// canonical history, never by replaying a stale cursor.
+    pub fn rejects_previous_response_id(&self) -> bool {
+        let Self::ProviderRejected {
+            status,
+            code,
+            param,
+            message: _,
+        } = self
+        else {
+            return false;
+        };
+        if status.is_some_and(|status| !(400..500).contains(&status)) {
+            return false;
+        }
+        let param_is_cursor = param.as_deref().is_some_and(|value| {
+            value.eq_ignore_ascii_case("previous_response_id")
+                || value.eq_ignore_ascii_case("previous_response")
+        });
+        let code_is_cursor = code.as_deref().is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("previous_response") || value.contains("response_not_found")
+        });
+        param_is_cursor || code_is_cursor
+    }
+}
+
+#[cfg(test)]
+mod llm_error_tests {
+    use super::LlmError;
+
+    #[test]
+    fn previous_response_rejection_is_typed_and_narrow() {
+        let rejected = LlmError::ProviderRejected {
+            status: Some(400),
+            code: Some("invalid_previous_response_id".to_string()),
+            param: Some("previous_response_id".to_string()),
+            message: "previous response was not found".to_string(),
+        };
+        assert!(rejected.rejects_previous_response_id());
+
+        let ordinary = LlmError::ProviderRejected {
+            status: Some(400),
+            code: Some("invalid_request".to_string()),
+            param: Some("tools".to_string()),
+            message: "tool schema is invalid".to_string(),
+        };
+        assert!(!ordinary.rejects_previous_response_id());
+
+        let message_only = LlmError::ProviderRejected {
+            status: Some(400),
+            code: None,
+            param: None,
+            message: "previous_response_id was not found".to_string(),
+        };
+        assert!(!message_only.rejects_previous_response_id());
     }
 }
 

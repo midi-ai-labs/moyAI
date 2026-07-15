@@ -104,7 +104,6 @@ impl PermissionReviewer<'_> {
             parallel_tool_calls: false,
             timeout_ms: self.config.model.request_timeout_ms,
             stream_idle_timeout_ms: self.config.model.stream_idle_timeout_ms,
-            stream_max_retries: self.config.model.stream_max_retries,
             extra_headers: self.config.model.extra_headers.clone(),
             temperature: Some(0.0),
             top_p: self.config.model.top_p,
@@ -160,7 +159,7 @@ impl LlmEventSink for PermissionReviewSink {
             LlmEvent::ToolCallStart { .. } | LlmEvent::ToolCallArgsDelta { .. } => {
                 self.saw_tool_call = true;
             }
-            LlmEvent::ReasoningDelta(_) | LlmEvent::Finished { .. } => {}
+            LlmEvent::ReasoningSummaryDelta(_) | LlmEvent::Finished { .. } => {}
         }
         Ok(())
     }

@@ -7,9 +7,7 @@ use crate::protocol::ProtocolEventStore;
 use crate::runtime::{
     LiveConfigOverrides, SessionRuntimeEventHub, SessionRuntimeEventSubscription,
 };
-use crate::session::{
-    EditorContext, PromptDispatchPart, SessionId, SessionMemoryMode, ThreadGoalStatus,
-};
+use crate::session::{EditorContext, PromptDispatchPart, SessionId, ThreadGoalStatus};
 
 #[derive(Debug, Clone)]
 pub enum ReviewRequest {
@@ -59,7 +57,7 @@ pub struct RunRequest {
     pub base_url: String,
     pub config_override: Option<crate::config::model::PartialResolvedConfig>,
     pub output_mode: OutputMode,
-    pub show_reasoning: bool,
+    pub show_reasoning_summary: bool,
     pub prompt_dispatch: Option<PromptDispatchPart>,
     pub editor_context: Option<EditorContext>,
     pub review_request: Option<ReviewRequest>,
@@ -126,18 +124,6 @@ pub struct SessionInterruptRequest {
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionCompactRequest {
-    pub session_id: SessionId,
-    pub keep_recent: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct SessionMemoryRequest {
-    pub session_id: SessionId,
-    pub mode: SessionMemoryMode,
-}
-
-#[derive(Debug, Clone)]
 pub struct SessionGoalGetRequest {
     pub session_id: SessionId,
 }
@@ -159,13 +145,11 @@ pub struct SessionGoalClearRequest {
 pub struct SessionIdleAdmissionRequest {
     pub session_id: SessionId,
     pub pending_trigger_turn: bool,
-    pub plan_mode: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionShowRequest {
     pub session_id: SessionId,
-    pub show_reasoning: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -247,8 +231,6 @@ pub enum AppCommand {
     SessionSettingsUpdate(SessionSettingsUpdateRequest),
     SessionTitleUpdate(SessionTitleUpdateRequest),
     SessionInterrupt(SessionInterruptRequest),
-    SessionCompact(SessionCompactRequest),
-    SessionMemory(SessionMemoryRequest),
     SessionGoalGet(SessionGoalGetRequest),
     SessionGoalSet(SessionGoalSetRequest),
     SessionGoalClear(SessionGoalClearRequest),

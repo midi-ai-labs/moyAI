@@ -50,19 +50,6 @@ export function quickChatDeleteAction(loadedStatus: string): string {
   return loadedStatus === "active" ? "" : "delete-chat-session";
 }
 
-export function sessionMemoryActions(
-  loadedStatus: string,
-  memoryMode: "enabled" | "disabled",
-): { enable: boolean; disable: boolean } {
-  if (loadedStatus === "active") {
-    return { enable: false, disable: false };
-  }
-  return {
-    enable: memoryMode === "disabled",
-    disable: memoryMode === "enabled",
-  };
-}
-
 export function configCommitEnabled(
   setupRequired: boolean,
   dirty: boolean,

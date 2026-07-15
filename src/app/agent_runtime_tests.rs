@@ -20,19 +20,19 @@ use crate::llm::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary, ModelMessage,
 };
 use crate::protocol::{
-    ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, ProtocolEventStore,
-    SubAgentActivityKind, TurnId, project_protocol_run_event, project_sub_agent_activity,
+    ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, ModelResponseId,
+    ProtocolEventStore, SubAgentActivityKind, TurnId, TurnTerminalStatus,
+    project_sub_agent_activity,
 };
 use crate::runtime::{
     AgentStatus, LiveConfigOverrides, RunCancelOutcome, RunCancellationCause, RunControl,
     SessionRuntimeEventHub, SystemClock,
 };
 use crate::session::{
-    FinishReason, MessageId, MessageRole, ProjectRepository, RunEvent, SessionSelector,
+    DurableTurnTerminal, FinishReason, ProjectRepository, RunEvent, SessionSelector,
     SessionStartRequest, SessionStatus, ThreadGoalStatus, TokenUsage,
 };
 use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
-use crate::tool::ToolName;
 use crate::tool::context::ToolServices;
 use crate::tool::registry::ToolRegistry;
 use crate::tool::truncate::ToolTruncator;
@@ -528,6 +528,13 @@ async fn child_finish_fixture(
     crate::session::SessionContext,
 ) {
     let (runtime, root_session, config) = direct_runtime_fixture(test_name, 2).await;
+    runtime
+        .store
+        .session_repo()
+        .admit_session_turn(root_session.session.id, TurnId::new())
+        .await
+        .expect("admit root mail recipient")
+        .expect("root mail recipient admission");
     let root_execution = runtime
         .begin_root(
             &root_session,
@@ -582,10 +589,11 @@ fn terminal_summary(
 ) -> RunSummary {
     RunSummary {
         session_id,
-        assistant_message_id: None,
+        turn_id: None,
+        final_response_id: None,
         status,
         finish_reason: Some(match status {
-            SessionStatus::Completed | SessionStatus::AwaitingUser => FinishReason::Stop,
+            SessionStatus::Completed => FinishReason::Stop,
             SessionStatus::Cancelled => FinishReason::Cancelled,
             SessionStatus::Failed | SessionStatus::Idle | SessionStatus::Running => {
                 FinishReason::Error
@@ -599,6 +607,67 @@ fn terminal_summary(
     }
 }
 
+fn terminal_event(
+    session_id: SessionId,
+    status: TurnTerminalStatus,
+    final_response_id: Option<ModelResponseId>,
+    summary: impl Into<String>,
+    interruption_cause: Option<TurnInterruptionCause>,
+) -> RunEvent {
+    let finish_reason = match status {
+        TurnTerminalStatus::Completed => Some(FinishReason::Stop),
+        TurnTerminalStatus::Failed => Some(FinishReason::Error),
+        TurnTerminalStatus::Interrupted => Some(FinishReason::Cancelled),
+    };
+    RunEvent::TurnTerminal {
+        session_id,
+        terminal: Box::new(DurableTurnTerminal {
+            status,
+            finish_reason,
+            interruption_cause,
+            final_response_id,
+            summary: summary.into(),
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        }),
+    }
+}
+
+async fn terminalize_test_session(
+    runtime: &AgentRuntime,
+    session_id: SessionId,
+    turn_id: TurnId,
+    event: &RunEvent,
+) {
+    let admission_id = runtime
+        .store
+        .session_repo()
+        .admit_session_turn(session_id, turn_id)
+        .await
+        .expect("admit terminal fixture")
+        .expect("terminal fixture admission");
+    assert!(
+        runtime
+            .store
+            .session_repo()
+            .terminalize_admitted_turn_with_protocol_event(
+                session_id,
+                &admission_id,
+                event,
+                turn_id,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("terminalize fixture")
+            .was_applied()
+    );
+}
+
 fn append_child_history(
     runtime: &AgentRuntime,
     session_id: SessionId,
@@ -607,7 +676,7 @@ fn append_child_history(
     runtime
         .store
         .protocol_event_store()
-        .append_history_item(&HistoryItem {
+        .seed_history_item_for_test(&HistoryItem {
             id: HistoryItemId::new(),
             session_id,
             turn_id: TurnId::new(),
@@ -709,9 +778,8 @@ async fn durable_child_failure_uses_latest_error_despite_stale_local_stop() {
     append_child_history(
         &runtime,
         child.session.id,
-        HistoryItemPayload::Message {
-            message_id: Some(MessageId::new()),
-            role: MessageRole::Assistant,
+        HistoryItemPayload::AssistantMessage {
+            response_id: ModelResponseId::new(),
             content: vec![ContentPart::Text {
                 text: "partial assistant text".to_string(),
             }],
@@ -721,7 +789,6 @@ async fn durable_child_failure_uses_latest_error_despite_stale_local_stop() {
         &runtime,
         child.session.id,
         HistoryItemPayload::Error {
-            message_id: None,
             message: "durable final child failure".to_string(),
         },
     );
@@ -766,12 +833,10 @@ async fn durable_child_failure_uses_latest_error_despite_stale_local_stop() {
 async fn durable_failed_child_live_and_restart_projections_are_identical() {
     for (index, history_payloads) in [
         vec![HistoryItemPayload::Error {
-            message_id: None,
             message: "durable failed error".to_string(),
         }],
-        vec![HistoryItemPayload::Message {
-            message_id: Some(MessageId::new()),
-            role: MessageRole::Assistant,
+        vec![HistoryItemPayload::AssistantMessage {
+            response_id: ModelResponseId::new(),
             content: vec![ContentPart::Text {
                 text: "partial durable assistant output".to_string(),
             }],
@@ -826,63 +891,155 @@ async fn durable_failed_child_live_and_restart_projections_are_identical() {
 }
 
 #[tokio::test]
-async fn durable_child_success_without_message_id_matches_rehydrated_history() {
-    for (index, (durable_status, local_cause)) in [
-        (SessionStatus::Completed, RunCancellationCause::Superseded),
-        (
-            SessionStatus::AwaitingUser,
-            RunCancellationCause::Failure("stale local failure".to_string()),
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (runtime, root_execution, context, child_lease, child) =
-            child_finish_fixture(&format!("durable-child-success-{index}")).await;
-        let content = format!("durable assistant result {index}");
-        append_child_history(
-            &runtime,
-            child.session.id,
-            HistoryItemPayload::Message {
-                message_id: Some(MessageId::new()),
-                role: MessageRole::Assistant,
-                content: vec![ContentPart::Text {
-                    text: content.clone(),
-                }],
-            },
-        );
-        let history = runtime
+async fn durable_child_success_matches_rehydrated_canonical_history() {
+    let (runtime, root_execution, context, child_lease, child) =
+        child_finish_fixture("durable-child-success").await;
+    let content = "durable assistant result".to_string();
+    append_child_history(
+        &runtime,
+        child.session.id,
+        HistoryItemPayload::AssistantMessage {
+            response_id: ModelResponseId::new(),
+            content: vec![ContentPart::Text {
+                text: content.clone(),
+            }],
+        },
+    );
+    let history = runtime
+        .store
+        .protocol_event_store()
+        .list_history_items_for_session(child.session.id)
+        .expect("child history");
+    assert_eq!(
+        durable_child_result(SessionStatus::Completed, &history),
+        Some(content.clone())
+    );
+    let result = Ok(terminal_summary(
+        child.session.id,
+        SessionStatus::Completed,
+        None,
+    ));
+
+    let status = runtime
+        .finish_agent_turn(
+            &context,
+            &result,
+            Some(RunCancellationCause::Failure(
+                "stale local failure".to_string(),
+            )),
+        )
+        .await;
+
+    assert_eq!(status, AgentStatus::Completed(Some(content.clone())));
+    let mail = context
+        .tree
+        .control
+        .drain_mailbox(&AgentPath::root())
+        .expect("root mailbox");
+    assert_eq!(mail.len(), 1);
+    assert_eq!(mail[0].content, content);
+    context
+        .tree
+        .control
+        .complete_execution(child_lease, status, None)
+        .expect("complete child");
+    root_execution
+        .complete(AgentStatus::Completed(None))
+        .expect("complete root");
+}
+
+#[tokio::test]
+async fn child_result_delivery_survives_parent_durable_success_before_marker_release() {
+    let (runtime, root_execution, context, child_lease, child) =
+        child_finish_fixture("child-result-parent-success-transition").await;
+    let root_session_id = root_execution.context.session_id;
+    let root_turn_id = runtime
+        .store
+        .session_repo()
+        .active_turn_for_session(root_session_id)
+        .await
+        .expect("active root turn")
+        .expect("root turn remains admitted");
+    assert!(
+        runtime
             .store
-            .protocol_event_store()
-            .list_history_items_for_session(child.session.id)
-            .expect("child history");
-        assert_eq!(
-            durable_child_result(durable_status, &history),
-            Some(content.clone())
-        );
-        let result = Ok(terminal_summary(child.session.id, durable_status, None));
-
-        let status = runtime
-            .finish_agent_turn(&context, &result, Some(local_cause))
-            .await;
-
-        assert_eq!(status, AgentStatus::Completed(Some(content.clone())));
-        let mail = context
-            .tree
-            .control
-            .drain_mailbox(&AgentPath::root())
-            .expect("root mailbox");
-        assert_eq!(mail.len(), 1);
-        assert_eq!(mail[0].content, content);
-        context
-            .tree
-            .control
-            .complete_execution(child_lease, status, None)
-            .expect("complete child");
+            .session_repo()
+            .terminalize_active_session_with_protocol_event(
+                root_session_id,
+                &terminal_event(
+                    root_session_id,
+                    TurnTerminalStatus::Completed,
+                    None,
+                    "root durable success before in-memory handoff",
+                    None,
+                ),
+                root_turn_id,
+                None,
+            )
+            .await
+            .expect("terminalize durable root before marker release")
+    );
+    assert!(
         root_execution
-            .complete(AgentStatus::Completed(None))
-            .expect("complete root");
-    }
+            .context
+            .tree
+            .control
+            .list_agents(Some(&AgentPath::root()))
+            .expect("root snapshot")
+            .into_iter()
+            .find(|agent| agent.path.is_root())
+            .expect("root agent")
+            .is_active,
+        "the regression requires the durable terminal/in-memory active transition"
+    );
+
+    let content = "child result after parent durable success".to_string();
+    append_child_history(
+        &runtime,
+        child.session.id,
+        HistoryItemPayload::AssistantMessage {
+            response_id: ModelResponseId::new(),
+            content: vec![ContentPart::Text {
+                text: content.clone(),
+            }],
+        },
+    );
+    let result = Ok(terminal_summary(
+        child.session.id,
+        SessionStatus::Completed,
+        None,
+    ));
+
+    let status = runtime.finish_agent_turn(&context, &result, None).await;
+
+    assert_eq!(status, AgentStatus::Completed(Some(content.clone())));
+    let root_history = runtime
+        .store
+        .protocol_event_store()
+        .list_history_items_for_session(root_session_id)
+        .expect("root history");
+    assert!(root_history.iter().any(|item| {
+        matches!(
+            &item.payload,
+            HistoryItemPayload::InterAgentCommunication { communication }
+                if communication.content == content
+        )
+    }));
+    let mail = context
+        .tree
+        .control
+        .drain_mailbox(&AgentPath::root())
+        .expect("root mailbox");
+    assert_eq!(mail.len(), 1);
+    assert_eq!(mail[0].content, content);
+    context
+        .tree
+        .control
+        .complete_execution(child_lease, status, None)
+        .expect("complete child");
+    root_execution
+        .complete(AgentStatus::Completed(None))
+        .expect("complete root");
 }
 
 #[tokio::test]
@@ -911,7 +1068,7 @@ async fn durable_child_cancel_without_typed_cause_fails_closed() {
     assert!(message.contains("without a typed interruption cause"));
     child.session.status = SessionStatus::Cancelled;
     let restarted_status = rehydrated_agent_state(&child.session, None, None)
-        .expect("legacy cancelled child must rehydrate fail-closed");
+        .expect("untyped cancelled child must rehydrate fail-closed");
     assert_eq!(status, restarted_status);
     let mail = context
         .tree
@@ -1132,21 +1289,20 @@ async fn process_restart_rehydrates_durable_child_for_listing_followup_and_name_
         )
         .await
         .expect("spawn edge");
-    original_runtime
-        .store
-        .session_repo()
-        .set_status_with_protocol_event(
+    let turn_id = TurnId::new();
+    terminalize_test_session(
+        &original_runtime,
+        child_session.session.id,
+        turn_id,
+        &terminal_event(
             child_session.session.id,
-            SessionStatus::Completed,
-            &RunEvent::SessionCompleted {
-                session_id: child_session.session.id,
-                finish_reason: Some(FinishReason::Stop),
-            },
-            TurnId::new(),
-            Some(0),
-        )
-        .await
-        .expect("terminal child");
+            TurnTerminalStatus::Completed,
+            None,
+            "child completed",
+            None,
+        ),
+    )
+    .await;
 
     let store = original_runtime.store.clone();
     drop(original_runtime);
@@ -1207,7 +1363,8 @@ async fn process_restart_rehydrates_durable_child_for_listing_followup_and_name_
         execution,
         &Ok(RunSummary {
             session_id: root_session.session.id,
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: Some(FinishReason::Stop),
             tool_call_count: 0,
@@ -1260,70 +1417,49 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
         let turn_id = TurnId::new();
         let task = format!("durable task {task_name}");
         let result = format!("durable result {task_name}");
-        let result_message_id = MessageId::new();
+        let response_id = ModelResponseId::new();
         protocol_store
-            .append_history_item(&HistoryItem {
+            .seed_history_item_for_test(&HistoryItem {
                 id: HistoryItemId::new(),
                 session_id: child.session.id,
                 turn_id,
                 sequence_no: 0,
                 created_at_ms: SystemClock::now_ms(),
                 payload: HistoryItemPayload::UserTurn {
-                    message_id: None,
                     content: vec![ContentPart::Text { text: task.clone() }],
                     prompt_dispatch: None,
                     editor_context: None,
-                    turn_context: None,
                 },
             })
             .expect("durable child task");
         protocol_store
-            .append_history_item(&HistoryItem {
+            .seed_history_item_for_test(&HistoryItem {
                 id: HistoryItemId::new(),
                 session_id: child.session.id,
                 turn_id,
                 sequence_no: 1,
                 created_at_ms: SystemClock::now_ms(),
-                payload: HistoryItemPayload::Message {
-                    message_id: Some(result_message_id),
-                    role: MessageRole::Assistant,
+                payload: HistoryItemPayload::AssistantMessage {
+                    response_id,
                     content: vec![ContentPart::Text {
-                        text: "durable result ".to_string(),
+                        text: result.clone(),
                     }],
                 },
             })
-            .expect("durable child result prefix");
-        protocol_store
-            .append_history_item(&HistoryItem {
-                id: HistoryItemId::new(),
-                session_id: child.session.id,
-                turn_id,
-                sequence_no: 2,
-                created_at_ms: SystemClock::now_ms(),
-                payload: HistoryItemPayload::Message {
-                    message_id: Some(result_message_id),
-                    role: MessageRole::Assistant,
-                    content: vec![ContentPart::Text {
-                        text: task_name.to_string(),
-                    }],
-                },
-            })
-            .expect("durable child result suffix");
-        original_runtime
-            .store
-            .session_repo()
-            .set_status_with_protocol_event(
+            .expect("durable child result");
+        terminalize_test_session(
+            &original_runtime,
+            child.session.id,
+            turn_id,
+            &terminal_event(
                 child.session.id,
-                SessionStatus::Completed,
-                &RunEvent::SessionCompleted {
-                    session_id: child.session.id,
-                    finish_reason: Some(FinishReason::Stop),
-                },
-                turn_id,
-                Some(3),
-            )
-            .await
-            .expect("terminal child");
+                TurnTerminalStatus::Completed,
+                Some(response_id),
+                "child completed",
+                None,
+            ),
+        )
+        .await;
         child_sessions.push((
             child.session,
             agent_path,
@@ -1378,14 +1514,11 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
 }
 
 #[tokio::test]
-async fn durable_cancelled_projection_requires_a_corroborated_typed_cause() {
+async fn durable_cancelled_projection_uses_the_canonical_typed_cause() {
     let (runtime, root_session, config) =
         direct_runtime_fixture("durable-cancelled-cause", 3).await;
 
-    for (task_name, cause) in [
-        ("typed_cancel", Some(TurnInterruptionCause::UserStop)),
-        ("legacy_cancel", None),
-    ] {
+    for (task_name, cause) in [("typed_cancel", TurnInterruptionCause::UserStop)] {
         let child = runtime
             .session_service
             .start_or_resume(
@@ -1414,52 +1547,19 @@ async fn durable_cancelled_projection_requires_a_corroborated_typed_cause() {
             .await
             .expect("spawn edge");
         let turn_id = TurnId::new();
-        runtime
-            .store
-            .session_repo()
-            .set_status_with_protocol_event(
+        terminalize_test_session(
+            &runtime,
+            child.session.id,
+            turn_id,
+            &terminal_event(
                 child.session.id,
-                SessionStatus::Cancelled,
-                &RunEvent::SessionInterrupted {
-                    session_id: child.session.id,
-                    reason: cause
-                        .unwrap_or(TurnInterruptionCause::UserStop)
-                        .legacy_reason()
-                        .to_string(),
-                    cause: Some(cause.unwrap_or(TurnInterruptionCause::UserStop)),
-                },
-                turn_id,
-                Some(0),
-            )
-            .await
-            .expect("cancelled child terminal");
-        if cause.is_none() {
-            // Current writers correctly reject an untyped interrupted terminal. Downgrade only
-            // the persisted runtime payload to reproduce a released/legacy database row and
-            // verify that the restart reader fails closed instead of inventing a cause.
-            let legacy_msg = json!({
-                "kind": "turn_interrupted",
-                "reason": "legacy cancellation without a typed cause"
-            })
-            .to_string();
-            let legacy_hash = crate::harness::artifact::hash_bytes(legacy_msg.as_bytes());
-            let connection = rusqlite::Connection::open(&runtime.store.paths().database_path)
-                .expect("open legacy fixture database");
-            let updated = connection
-                .execute(
-                    "UPDATE protocol_runtime_events
-                     SET msg_json = ?1, payload_sha256 = ?2
-                     WHERE session_id = ?3 AND turn_id = ?4",
-                    rusqlite::params![
-                        legacy_msg,
-                        legacy_hash,
-                        child.session.id.to_string(),
-                        turn_id.to_string()
-                    ],
-                )
-                .expect("downgrade terminal payload to legacy shape");
-            assert_eq!(updated, 1);
-        }
+                TurnTerminalStatus::Interrupted,
+                None,
+                cause.legacy_reason(),
+                Some(cause),
+            ),
+        )
+        .await;
     }
 
     let records = runtime
@@ -1471,22 +1571,12 @@ async fn durable_cancelled_projection_requires_a_corroborated_typed_cause() {
         .find(|record| record.task_name == "typed_cancel")
         .expect("typed cancelled child");
     assert_eq!(typed.status, AgentStatus::Interrupted);
-    let legacy = records
-        .iter()
-        .find(|record| record.task_name == "legacy_cancel")
-        .expect("legacy cancelled child");
-    assert!(matches!(
-        &legacy.status,
-        AgentStatus::Errored(message)
-            if message.contains("without a typed interruption cause")
-    ));
 }
 
 #[test]
 fn failed_durable_child_prefers_latest_error_over_partial_assistant_text() {
     let session_id = SessionId::new();
     let turn_id = TurnId::new();
-    let assistant_message_id = MessageId::new();
     let history = vec![
         HistoryItem {
             id: HistoryItemId::new(),
@@ -1494,9 +1584,8 @@ fn failed_durable_child_prefers_latest_error_over_partial_assistant_text() {
             turn_id,
             sequence_no: 0,
             created_at_ms: SystemClock::now_ms(),
-            payload: HistoryItemPayload::Message {
-                message_id: Some(assistant_message_id),
-                role: MessageRole::Assistant,
+            payload: HistoryItemPayload::AssistantMessage {
+                response_id: ModelResponseId::new(),
                 content: vec![ContentPart::Text {
                     text: "partial assistant output".to_string(),
                 }],
@@ -1509,7 +1598,6 @@ fn failed_durable_child_prefers_latest_error_over_partial_assistant_text() {
             sequence_no: 1,
             created_at_ms: SystemClock::now_ms(),
             payload: HistoryItemPayload::Error {
-                message_id: Some(assistant_message_id),
                 message: "recoverable provider error".to_string(),
             },
         },
@@ -1520,7 +1608,6 @@ fn failed_durable_child_prefers_latest_error_over_partial_assistant_text() {
             sequence_no: 2,
             created_at_ms: SystemClock::now_ms(),
             payload: HistoryItemPayload::Error {
-                message_id: None,
                 message: "final child failure".to_string(),
             },
         },
@@ -1634,7 +1721,8 @@ async fn sub_agent_spawn_is_rejected_before_session_or_tree_side_effects() {
         execution,
         &Ok(RunSummary {
             session_id: session.session.id,
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: Some(FinishReason::Stop),
             tool_call_count: 0,
@@ -1712,7 +1800,8 @@ async fn completed_root_raw_interrupt_preserves_success_and_stops_active_childre
     let child_cancel = child_lease.cancel_token();
     let summary = Ok(RunSummary {
         session_id: session.session.id,
-        assistant_message_id: None,
+        turn_id: None,
+        final_response_id: None,
         status: SessionStatus::Completed,
         finish_reason: Some(FinishReason::Stop),
         tool_call_count: 0,
@@ -1883,7 +1972,8 @@ async fn durable_failed_root_cancels_active_and_queued_children() {
         execution,
         &Ok(RunSummary {
             session_id: session.session.id,
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Failed,
             finish_reason: Some(FinishReason::Error),
             tool_call_count: 0,
@@ -1958,7 +2048,8 @@ async fn durable_root_interruption_cause_wins_over_a_conflicting_local_cause() {
         execution,
         &Ok(RunSummary {
             session_id: session.session.id,
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Cancelled,
             finish_reason: Some(FinishReason::Cancelled),
             tool_call_count: 0,
@@ -2040,7 +2131,8 @@ async fn durable_root_success_preserves_root_while_deferred_stop_closes_children
         execution,
         &Ok(RunSummary {
             session_id: session.session.id,
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: Some(FinishReason::Stop),
             tool_call_count: 0,
@@ -2099,7 +2191,8 @@ async fn zero_child_stop_during_success_blocks_idle_root_continuation() {
         execution,
         &Ok(RunSummary {
             session_id: session.session.id,
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: Some(FinishReason::Stop),
             tool_call_count: 0,
@@ -2324,7 +2417,8 @@ async fn root_context_durable_terminal_accessor_cancels_the_whole_tree() {
         execution,
         &Ok(RunSummary {
             session_id: session.session.id,
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Cancelled,
             finish_reason: Some(FinishReason::Cancelled),
             tool_call_count: 0,
@@ -2489,9 +2583,6 @@ impl LlmClient for AgentScriptClient {
 
         match self.state.root_calls.fetch_add(1, Ordering::SeqCst) {
             0 => {
-                sink.push(LlmEvent::ReasoningDelta(
-                    "root private planning must not be forked".to_string(),
-                ))?;
                 sink.push(LlmEvent::TextDelta(ROOT_PLAN.to_string()))?;
                 emit_tool_call(
                     sink,
@@ -2580,7 +2671,6 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
     config.model.request_timeout_ms = 5_000;
     config.model.stream_idle_timeout_ms = 5_000;
     config.model.max_retries = 0;
-    config.model.stream_max_retries = 0;
     config.permissions.access_mode = AccessMode::FullAccess;
     config.multi_agent.enabled = true;
     config.multi_agent.max_concurrent_agents = 0;
@@ -2658,7 +2748,7 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
                 base_url: base_url.clone(),
                 config_override: None,
                 output_mode: OutputMode::Human,
-                show_reasoning: false,
+                show_reasoning_summary: false,
                 prompt_dispatch: None,
                 editor_context: None,
                 review_request: None,
@@ -2707,7 +2797,7 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
                 base_url,
                 config_override: None,
                 output_mode: OutputMode::Human,
-                show_reasoning: false,
+                show_reasoning_summary: false,
                 prompt_dispatch: None,
                 editor_context: None,
                 review_request: None,
@@ -2741,7 +2831,7 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
     assert!(
         store
             .session_repo()
-            .admit_session_run(setup_failure.session.id)
+            .admit_session_turn(setup_failure.session.id, TurnId::new())
             .await
             .expect("readmission after setup failure")
             .is_some()
@@ -2772,7 +2862,6 @@ async fn idle_goal_continuation_waits_for_detached_child_and_loads_its_result() 
     config.model.request_timeout_ms = 5_000;
     config.model.stream_idle_timeout_ms = 5_000;
     config.model.max_retries = 0;
-    config.model.stream_max_retries = 0;
     config.permissions.access_mode = AccessMode::FullAccess;
     config.multi_agent.enabled = true;
     config.multi_agent.mode = MultiAgentMode::ExplicitRequestOnly;
@@ -2855,7 +2944,7 @@ async fn idle_goal_continuation_waits_for_detached_child_and_loads_its_result() 
                 base_url,
                 config_override: None,
                 output_mode: OutputMode::Human,
-                show_reasoning: false,
+                show_reasoning_summary: false,
                 prompt_dispatch: None,
                 editor_context: None,
                 review_request: None,
@@ -2873,7 +2962,28 @@ async fn idle_goal_continuation_waits_for_detached_child_and_loads_its_result() 
     .expect("bounded goal continuation")
     .expect("goal run");
 
-    assert_eq!(summary.status, SessionStatus::Completed);
+    let canonical_history = store
+        .protocol_event_store()
+        .list_history_items_for_session(summary.session_id)
+        .expect("canonical root history");
+    let durable_communications = canonical_history
+        .iter()
+        .filter_map(|item| match &item.payload {
+            HistoryItemPayload::InterAgentCommunication { communication } => {
+                Some(communication.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summary.status,
+        SessionStatus::Completed,
+        "summary={summary:#?}; root_calls={}; child_calls={}; child_finished={}; saw_child_result={}; durable_communications={durable_communications:#?}",
+        script.root_calls.load(Ordering::SeqCst),
+        script.child_calls.load(Ordering::SeqCst),
+        script.child_finished.load(Ordering::SeqCst),
+        script.continuation_saw_child_result.load(Ordering::SeqCst),
+    );
     assert_eq!(script.root_calls.load(Ordering::SeqCst), 4);
     assert_eq!(script.child_calls.load(Ordering::SeqCst), 1);
     assert!(script.child_finished.load(Ordering::SeqCst));
@@ -2917,7 +3027,6 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
     config.model.request_timeout_ms = 5_000;
     config.model.stream_idle_timeout_ms = 5_000;
     config.model.max_retries = 0;
-    config.model.stream_max_retries = 0;
     config.permissions.access_mode = AccessMode::FullAccess;
     config.multi_agent.enabled = true;
     config.multi_agent.mode = MultiAgentMode::ExplicitRequestOnly;
@@ -2950,10 +3059,9 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
         )
         .await
         .expect("precreate root session");
-    let source_turn_id = TurnId::new();
     let source_activity = project_sub_agent_activity(
         root_session.session.id,
-        source_turn_id,
+        TurnId::new(),
         0,
         "preexisting_activity".to_string(),
         root_session.session.id,
@@ -2962,30 +3070,12 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
     );
     store
         .protocol_event_store()
-        .append_event_bundle(
+        .seed_event_bundle_for_test(
             &source_activity.runtime_event,
             source_activity.history_item.as_ref(),
             source_activity.turn_item.as_ref(),
         )
         .expect("seed source activity");
-    let source_reasoning = project_protocol_run_event(
-        &RunEvent::ReasoningDelta {
-            message_id: MessageId::new(),
-            delta: "preexisting reasoning must not be forked".to_string(),
-        },
-        Some(root_session.session.id),
-        source_turn_id,
-        1,
-    )
-    .expect("project source reasoning");
-    store
-        .protocol_event_store()
-        .append_event_bundle(
-            &source_reasoning.runtime_event,
-            source_reasoning.history_item.as_ref(),
-            source_reasoning.turn_item.as_ref(),
-        )
-        .expect("seed source reasoning");
     let agent_runtime = Arc::new(AgentRuntime::new(store.clone(), session_service.clone()));
     let tool_services = ToolServices {
         edit_safety: crate::edit::EditSafety::default(),
@@ -3032,7 +3122,7 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
                 base_url: base_url.clone(),
                 config_override: None,
                 output_mode: OutputMode::Human,
-                show_reasoning: false,
+                show_reasoning_summary: false,
                 prompt_dispatch: None,
                 editor_context: None,
                 review_request: None,
@@ -3118,15 +3208,10 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
     )));
     assert!(root_history.iter().any(|item| matches!(
         &item.payload,
-        HistoryItemPayload::Reasoning { text }
-            if text.contains("preexisting reasoning must not be forked")
-    )));
-    assert!(root_history.iter().any(|item| matches!(
-        &item.payload,
         HistoryItemPayload::ToolCall {
-            tool: ToolName::SpawnAgent,
+            tool_name,
             ..
-        }
+        } if tool_name == "spawn_agent"
     )));
     assert!(root_history.iter().any(|item| {
         matches!(
@@ -3153,11 +3238,8 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
     assert!(child_history.iter().any(|item| {
         matches!(
             &item.payload,
-            HistoryItemPayload::Message {
-                role: MessageRole::Assistant,
-                content,
-                ..
-            } if content_contains(content, ROOT_PLAN)
+            HistoryItemPayload::AssistantMessage { content, .. }
+                if content_contains(content, ROOT_PLAN)
         )
     }));
     assert!(child_history.iter().any(|item| {
@@ -3171,7 +3253,6 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
         item.payload,
         HistoryItemPayload::ToolCall { .. }
             | HistoryItemPayload::ToolOutput { .. }
-            | HistoryItemPayload::Reasoning { .. }
             | HistoryItemPayload::SubAgentActivity { .. }
     )));
 

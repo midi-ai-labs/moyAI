@@ -2,13 +2,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::config::ResolvedConfig;
 use crate::docling::normalize_docling_base_url;
-use crate::llm::{ModelAvailabilityReport, ModelAvailabilityStatus, normalize_provider_base_url};
+use crate::llm::normalize_provider_base_url;
 
 use super::state::DesktopOverlay;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopStartupStatus {
-    Loading,
     Ready,
     RequiresConfig,
     RequiresProvider,
@@ -16,7 +15,6 @@ pub enum DesktopStartupStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopStartupCheckStatus {
-    Pending,
     Pass,
     Warning,
     Fail,
@@ -31,15 +29,6 @@ pub struct DesktopStartupCheck {
 }
 
 impl DesktopStartupCheck {
-    fn pending(key: &'static str, label: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            key,
-            label,
-            status: DesktopStartupCheckStatus::Pending,
-            message: message.into(),
-        }
-    }
-
     fn pass(key: &'static str, label: &'static str, message: impl Into<String>) -> Self {
         Self {
             key,
@@ -131,27 +120,15 @@ impl DesktopStartupState {
             )
         });
 
-        let base_url = normalize_provider_base_url(&config.model.base_url);
-        let model = config.model.model.trim();
-        checks.push(if base_url.is_empty() {
-            DesktopStartupCheck::fail("provider", "LLM 接続", "LLM URL が未設定です。")
-        } else if model.is_empty() {
-            DesktopStartupCheck::fail("provider", "LLM 接続", "model が未設定です。")
-        } else {
-            DesktopStartupCheck::pending(
-                "provider",
-                "LLM 接続",
-                format!("{base_url} / {model} を確認しています。"),
-            )
-        });
-
-        checks.push(Self::docling_check_for_config(config));
+        checks.push(Self::provider_config_check(config));
+        checks.push(Self::docling_config_check(config));
 
         let mut state = Self {
-            status: DesktopStartupStatus::Loading,
-            title: "moyAI を準備しています".to_string(),
-            message: "ローカル設定、LLM 接続、補助サービスを確認しています。".to_string(),
-            detail: "この確認は閉域・ローカル LLM 環境内で完結します。".to_string(),
+            status: DesktopStartupStatus::Ready,
+            title: "moyAI".to_string(),
+            message: "ローカル設定を確認しました。".to_string(),
+            detail: "起動時に provider や Docling への network request は送信しません。"
+                .to_string(),
             action_overlay: None,
             checks,
             config_requires_attention: !global_config_existed_at_launch,
@@ -160,116 +137,9 @@ impl DesktopStartupState {
         state
     }
 
-    pub fn complete_model_availability(&mut self, report: &ModelAvailabilityReport) {
-        if report.model.trim().is_empty() {
-            self.set_provider_check(DesktopStartupCheck::fail(
-                "provider",
-                "LLM 接続",
-                "model が未設定です。",
-            ));
-            self.recompute();
-            return;
-        }
-        if matches!(report.status, ModelAvailabilityStatus::Pass) {
-            let source = report
-                .matched_model
-                .as_ref()
-                .map(|model| {
-                    if model.loaded {
-                        format!("{} / loaded", model.source)
-                    } else {
-                        model.source.clone()
-                    }
-                })
-                .unwrap_or_else(|| "model availability report".to_string());
-            self.set_provider_check(DesktopStartupCheck::pass(
-                "provider",
-                "LLM 接続",
-                format!("接続できました: {} ({source})", report.model),
-            ));
-        } else {
-            let failure = report
-                .tool_call_probes
-                .iter()
-                .find_map(|probe| probe.error.as_deref())
-                .or_else(|| {
-                    report
-                        .vision_probes
-                        .iter()
-                        .find_map(|probe| probe.error.as_deref())
-                })
-                .or(report.openai_error.as_deref())
-                .or(report.native_error.as_deref())
-                .unwrap_or("model availability gate failed");
-            self.set_provider_check(DesktopStartupCheck::fail(
-                "provider",
-                "LLM 接続",
-                format!(
-                    "設定中の model `{}` を利用できません: {failure}",
-                    report.model
-                ),
-            ));
-        }
-        self.recompute();
-    }
-
-    pub fn begin_provider_availability(&mut self, base_url: &str, model: &str) {
-        let base_url = normalize_provider_base_url(base_url);
-        let model = model.trim();
-        if base_url.is_empty() {
-            self.set_provider_check(DesktopStartupCheck::fail(
-                "provider",
-                "LLM 接続",
-                "LLM URL が未設定です。",
-            ));
-        } else if model.is_empty() {
-            self.set_provider_check(DesktopStartupCheck::fail(
-                "provider",
-                "LLM 接続",
-                "model が未設定です。",
-            ));
-        } else {
-            self.set_provider_check(DesktopStartupCheck::pending(
-                "provider",
-                "LLM 接続",
-                format!("{base_url} / {model} を確認しています。"),
-            ));
-        }
-        self.recompute();
-    }
-
-    pub fn fail_provider_availability(&mut self, message: impl Into<String>) {
-        self.set_provider_check(DesktopStartupCheck::fail(
-            "provider",
-            "LLM 接続",
-            message.into(),
-        ));
-        self.recompute();
-    }
-
-    pub fn begin_docling_check(&mut self, config: &ResolvedConfig) -> bool {
-        let check = Self::docling_check_for_config(config);
-        let should_probe = check.status == DesktopStartupCheckStatus::Pending;
-        self.set_check(check);
-        self.recompute();
-        should_probe
-    }
-
-    pub fn complete_docling_check(&mut self, base_url: &str) {
-        self.set_check(DesktopStartupCheck::pass(
-            "docling",
-            "Docling 接続",
-            format!("接続できました: {}", normalize_docling_base_url(base_url)),
-        ));
-        self.recompute();
-    }
-
-    pub fn fail_docling_check(&mut self, message: impl Into<String>) {
-        self.set_check(DesktopStartupCheck::fail(
-            "docling",
-            "Docling 接続",
-            message.into(),
-        ));
+    pub fn refresh_config(&mut self, config: &ResolvedConfig) {
+        self.set_check(Self::provider_config_check(config));
+        self.set_check(Self::docling_config_check(config));
         self.recompute();
     }
 
@@ -282,10 +152,6 @@ impl DesktopStartupState {
         self.config_requires_attention
     }
 
-    fn set_provider_check(&mut self, check: DesktopStartupCheck) {
-        self.set_check(check);
-    }
-
     fn set_check(&mut self, check: DesktopStartupCheck) {
         if let Some(existing) = self.checks.iter_mut().find(|item| item.key == check.key) {
             *existing = check;
@@ -294,11 +160,29 @@ impl DesktopStartupState {
         }
     }
 
-    fn docling_check_for_config(config: &ResolvedConfig) -> DesktopStartupCheck {
+    fn provider_config_check(config: &ResolvedConfig) -> DesktopStartupCheck {
+        let base_url = normalize_provider_base_url(&config.model.base_url);
+        let model = config.model.model.trim();
+        if base_url.is_empty() {
+            return DesktopStartupCheck::fail("provider", "LLM 設定", "LLM URL が未設定です。");
+        }
+        if model.is_empty() {
+            return DesktopStartupCheck::fail("provider", "LLM 設定", "model が未設定です。");
+        }
+        DesktopStartupCheck::pass(
+            "provider",
+            "LLM 設定",
+            format!(
+                "設定済み: {base_url} / {model}。接続は依頼実行時または明示的なモデル読込で確認します。"
+            ),
+        )
+    }
+
+    fn docling_config_check(config: &ResolvedConfig) -> DesktopStartupCheck {
         if !config.docling.enabled {
             return DesktopStartupCheck::pass(
                 "docling",
-                "Docling 接続",
+                "Docling 設定",
                 "無効です。structured document 処理が必要な場合は設定から有効化してください。",
             );
         }
@@ -306,14 +190,14 @@ impl DesktopStartupState {
         if base_url.is_empty() {
             return DesktopStartupCheck::fail(
                 "docling",
-                "Docling 接続",
+                "Docling 設定",
                 "Docling Serve URL が未設定です。",
             );
         }
-        DesktopStartupCheck::pending(
+        DesktopStartupCheck::pass(
             "docling",
-            "Docling 接続",
-            format!("{base_url} の /health と /ready を確認しています。"),
+            "Docling 設定",
+            format!("設定済み: {base_url}。接続はDocling利用時に確認します。"),
         )
     }
 
@@ -325,26 +209,6 @@ impl DesktopStartupState {
             .checks
             .iter()
             .any(|check| check.key == "docling" && check.status == DesktopStartupCheckStatus::Fail);
-        let startup_pending = self
-            .checks
-            .iter()
-            .any(|check| check.status == DesktopStartupCheckStatus::Pending);
-
-        if startup_pending {
-            let pending_labels = self
-                .checks
-                .iter()
-                .filter(|check| check.status == DesktopStartupCheckStatus::Pending)
-                .map(|check| check.label)
-                .collect::<Vec<_>>()
-                .join(" / ");
-            self.status = DesktopStartupStatus::Loading;
-            self.title = "moyAI を準備しています".to_string();
-            self.message = format!("{pending_labels} を確認しています。");
-            self.action_overlay = None;
-            return;
-        }
-
         if self.config_requires_attention {
             self.status = DesktopStartupStatus::RequiresConfig;
             self.title = "設定の確認が必要です".to_string();
@@ -357,31 +221,81 @@ impl DesktopStartupState {
 
         if provider_failed {
             self.status = DesktopStartupStatus::RequiresProvider;
-            self.title = "LLM 接続の確認が必要です".to_string();
+            self.title = "LLM 設定の確認が必要です".to_string();
             self.message = "起動後に LLM URL 画面を開きます。".to_string();
-            self.detail = "provider を起動し、base URL と model を確認してください。".to_string();
+            self.detail = "base URL と model を設定してください。".to_string();
             self.action_overlay = Some(DesktopOverlay::ProviderEditor);
             return;
         }
 
         if docling_failed {
             self.status = DesktopStartupStatus::RequiresConfig;
-            self.title = "Docling 接続の確認が必要です".to_string();
+            self.title = "Docling 設定の確認が必要です".to_string();
             self.message = "起動後に設定画面を開きます。".to_string();
-            self.detail =
-                "Docling Serve を起動し、docling.enabled と docling.base_url を確認してください。"
-                    .to_string();
+            self.detail = "docling.enabled と docling.base_url を確認してください。".to_string();
             self.action_overlay = Some(DesktopOverlay::ConfigEditor);
             return;
         }
 
         self.status = DesktopStartupStatus::Ready;
         self.title = "moyAI".to_string();
-        self.message = "起動準備が完了しました。".to_string();
-        self.detail = "メインウィンドウを表示します。".to_string();
+        self.message = "ローカル設定を確認しました。".to_string();
+        self.detail =
+            "provider catalogとavailability diagnosticsは明示操作時だけnetworkへ接続します。"
+                .to_string();
         self.action_overlay = None;
     }
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_startup_completes_from_local_values_only() {
+        let config = ResolvedConfig::default();
+        let state = DesktopStartupState::begin(true, None, Utf8Path::new("."), &config);
+
+        assert_eq!(state.status, DesktopStartupStatus::Ready);
+        assert_eq!(state.action_overlay, None);
+        assert!(state.checks.iter().all(|check| {
+            matches!(
+                check.status,
+                DesktopStartupCheckStatus::Pass | DesktopStartupCheckStatus::Warning
+            )
+        }));
+    }
+
+    #[test]
+    fn config_refresh_replaces_provider_and_docling_checks_without_pending_state() {
+        let mut invalid = ResolvedConfig::default();
+        invalid.model.base_url.clear();
+        invalid.docling.enabled = true;
+        invalid.docling.base_url.clear();
+        let mut state = DesktopStartupState::begin(true, None, Utf8Path::new("."), &invalid);
+
+        assert_eq!(state.status, DesktopStartupStatus::RequiresProvider);
+        assert_eq!(
+            state
+                .checks
+                .iter()
+                .filter(|check| check.key == "provider" || check.key == "docling")
+                .count(),
+            2
+        );
+        assert!(state.checks.iter().any(|check| {
+            check.key == "provider" && check.status == DesktopStartupCheckStatus::Fail
+        }));
+
+        let mut valid = ResolvedConfig::default();
+        valid.docling.enabled = true;
+        valid.docling.base_url = "http://127.0.0.1:8123".to_string();
+        state.refresh_config(&valid);
+
+        assert_eq!(state.status, DesktopStartupStatus::Ready);
+        assert!(state.checks.iter().all(|check| {
+            check.key != "provider" && check.key != "docling"
+                || check.status == DesktopStartupCheckStatus::Pass
+        }));
+    }
+}

@@ -5,20 +5,18 @@ export interface TranscriptRow {
     | "empty_placeholder"
     | "user"
     | "assistant"
-    | "reasoning"
+    | "reasoning_summary"
     | "editing"
     | "tool"
-    | "summary"
     | "diff"
     | "system"
     | "error"
     | "work_summary_running"
+    | "work_summary_incomplete"
     | "work_summary_completed"
     | "work_summary_failed"
     | "work_summary_cancelled"
-    | "work_summary_awaiting_user"
     | "file_changes";
-  kind: string;
   step: string;
   title: string;
   body: string;
@@ -34,10 +32,9 @@ export interface ProjectRow {
 export interface SessionRow {
   session_id: RowId;
   title: string;
-  status: "idle" | "running" | "completed" | "awaiting_user" | "cancelled" | "failed";
+  status: "idle" | "running" | "completed" | "cancelled" | "failed";
   loaded_status: "not_loaded" | "idle" | "active" | "system_error";
   archived: boolean;
-  memory_mode: "enabled" | "disabled";
   active_turn_id?: RowId | null;
   active_turn_sequence_no?: number | null;
   pending_permission_requests: number;
@@ -81,7 +78,7 @@ export interface AgentActivityRow {
   updated: boolean;
 }
 
-export type RunStatusKey = "idle" | "running" | "confirming" | "completed" | "awaiting_user" | "cancelled" | "failed";
+export type RunStatusKey = "idle" | "running" | "completed" | "cancelled" | "failed";
 
 export interface PermissionProjection {
   summary: string;
@@ -96,12 +93,12 @@ export interface PermissionProjection {
 export interface StartupCheckProjection {
   key: string;
   label: string;
-  status: "pending" | "pass" | "warning" | "fail";
+  status: "pass" | "warning" | "fail";
   message: string;
 }
 
 export interface StartupProjection {
-  status: "loading" | "ready" | "requires_config" | "requires_provider";
+  status: "ready" | "requires_config" | "requires_provider";
   title: string;
   message: string;
   detail: string;
@@ -168,6 +165,18 @@ export interface RowMutationTarget {
   rowId: string;
 }
 
+export type PlanStepStatus = "pending" | "in_progress" | "completed";
+
+export interface PlanStepProjection {
+  step: string;
+  status: PlanStepStatus;
+}
+
+export interface PlanProjection {
+  explanation: string | null;
+  steps: PlanStepProjection[];
+}
+
 export interface DesktopWebState {
   projection_revision: string;
   workspace_path: string;
@@ -190,6 +199,7 @@ export interface DesktopWebState {
   run_phase: string;
   run_active_step: string;
   latest_tool_summary: string;
+  plan: PlanProjection | null;
   progress_text: string;
   tool_status_text: string;
   token_meter_label: string;
@@ -206,6 +216,7 @@ export interface DesktopWebState {
   image_input: string;
   attached_images: string[];
   can_submit: boolean;
+  can_cancel_run: boolean;
   busy: boolean;
   async_polling_required: boolean;
   pending_async_operations: string[];

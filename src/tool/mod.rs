@@ -15,14 +15,16 @@ pub mod registry;
 pub mod search;
 pub mod shell;
 pub mod skill;
+pub mod spec_plan;
 pub(crate) mod text_encoding;
-pub mod todo_write;
 pub mod truncate;
+pub mod update_plan;
 pub mod write;
 pub(crate) mod write_support;
 
 pub use contract::{
-    PermissionRequest, PermissionRisk, ToolName, ToolResult, ToolSpec, TruncatedToolOutput,
+    PermissionRequest, PermissionRisk, ToolEffectClass, ToolEffectPolicy, ToolName, ToolResult,
+    ToolSpec, TruncatedToolOutput,
 };
 
 pub(crate) fn structured_document_suggested_tools(

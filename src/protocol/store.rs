@@ -6,21 +6,15 @@ use sha2::{Digest, Sha256};
 
 use crate::error::StorageError;
 use crate::protocol::{
-    HistoryItem, HistoryItemId, HistoryItemPayload, RuntimeEvent, RuntimeEventId, RuntimeEventMsg,
-    TurnId, TurnItem, TurnItemId, TurnItemPayload,
+    HistoryItem, HistoryItemId, HistoryItemPayload, ModeKind, RuntimeEvent, RuntimeEventId,
+    RuntimeEventMsg, SubAgentActivityKind, TurnId, TurnItem, TurnItemId, TurnItemPayload,
+    compacted_history_item_ids, project_sub_agent_activity,
 };
 use crate::runtime::SystemClock;
 use crate::session::SessionId;
-use crate::storage::session_repo::normalize_run_lease_now_ms;
+use crate::storage::session_repo::{SessionProtocolWriteAuthority, normalize_run_lease_now_ms};
 
 pub trait ProtocolEventStore {
-    fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<(), StorageError>;
-    fn append_event_bundle(
-        &self,
-        event: &RuntimeEvent,
-        history_item: Option<&HistoryItem>,
-        turn_item: Option<&TurnItem>,
-    ) -> Result<(), StorageError>;
     fn list_runtime_events(
         &self,
         session_id: SessionId,
@@ -30,12 +24,6 @@ pub trait ProtocolEventStore {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<RuntimeEvent>, StorageError>;
-    fn append_history_item(&self, item: &HistoryItem) -> Result<(), StorageError>;
-    fn append_history_turn_bundle(
-        &self,
-        history_item: &HistoryItem,
-        turn_item: &TurnItem,
-    ) -> Result<(), StorageError>;
     fn list_history_items(
         &self,
         session_id: SessionId,
@@ -45,7 +33,18 @@ pub trait ProtocolEventStore {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<HistoryItem>, StorageError>;
-    fn append_turn_item(&self, item: &TurnItem) -> Result<(), StorageError>;
+    fn collaboration_mode_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<ModeKind, StorageError>;
+    /// Appends a typed mode instruction when `mode` differs from the latest
+    /// canonical value. Returns `None` for a same-value update.
+    fn set_collaboration_mode(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        mode: ModeKind,
+    ) -> Result<Option<HistoryItem>, StorageError>;
     fn list_turn_items(
         &self,
         session_id: SessionId,
@@ -59,11 +58,6 @@ pub trait ProtocolEventStore {
         &self,
         session_id: SessionId,
     ) -> Result<Option<(TurnId, i64)>, StorageError>;
-    fn rollback_latest_turns(
-        &self,
-        session_id: SessionId,
-        num_turns: usize,
-    ) -> Result<Vec<TurnId>, StorageError>;
     fn fork_canonical_items(
         &self,
         source_session_id: SessionId,
@@ -92,28 +86,28 @@ impl SqliteProtocolEventStore {
         Self { connection }
     }
 
-    pub(crate) fn append_event_bundle_allocating(
+    pub(super) fn append_recording_projection_allocating(
         &self,
         event: &RuntimeEvent,
         history_item: Option<&HistoryItem>,
         turn_item: Option<&TurnItem>,
     ) -> Result<StoredProtocolEventBundle, StorageError> {
+        validate_recording_projection(event, history_item, turn_item)?;
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let stored =
-            insert_event_bundle_in_transaction(&transaction, event, history_item, turn_item)?;
+        let stored = insert_event_bundle_unchecked(&transaction, event, history_item, turn_item)?;
         transaction.commit()?;
         Ok(stored)
     }
 
-    pub(crate) fn append_admitted_event_bundle_allocating(
+    pub(super) fn append_admitted_recording_projection_allocating(
         &self,
         admission_id: &str,
         event: &RuntimeEvent,
         history_item: Option<&HistoryItem>,
         turn_item: Option<&TurnItem>,
     ) -> Result<Option<StoredProtocolEventBundle>, StorageError> {
-        self.append_admitted_event_bundle_allocating_at(
+        self.append_admitted_recording_projection_allocating_at(
             admission_id,
             event,
             history_item,
@@ -122,7 +116,7 @@ impl SqliteProtocolEventStore {
         )
     }
 
-    pub(crate) fn append_admitted_event_bundle_allocating_at(
+    pub(super) fn append_admitted_recording_projection_allocating_at(
         &self,
         admission_id: &str,
         event: &RuntimeEvent,
@@ -130,6 +124,7 @@ impl SqliteProtocolEventStore {
         turn_item: Option<&TurnItem>,
         now_ms: i64,
     ) -> Result<Option<StoredProtocolEventBundle>, StorageError> {
+        validate_recording_projection(event, history_item, turn_item)?;
         let now = normalize_run_lease_now_ms(now_ms);
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -139,9 +134,9 @@ impl SqliteProtocolEventStore {
                  FROM sessions
                  WHERE id = ?1
                    AND active_run_id = ?2
-                   AND (active_turn_id IS NULL OR active_turn_id = ?3)
+                   AND active_turn_id = ?3
                    AND active_run_lease_expires_at_ms > ?4
-                   AND status IN ('running', 'awaiting_user')",
+                   AND status = 'running'",
                 params![
                     event.session_id.to_string(),
                     admission_id,
@@ -156,29 +151,127 @@ impl SqliteProtocolEventStore {
             transaction.commit()?;
             return Ok(None);
         }
-        let stored =
-            insert_event_bundle_in_transaction(&transaction, event, history_item, turn_item)?;
+        let stored = insert_event_bundle_unchecked(&transaction, event, history_item, turn_item)?;
         transaction.commit()?;
         Ok(Some(stored))
     }
-}
 
-impl ProtocolEventStore for SqliteProtocolEventStore {
-    fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<(), StorageError> {
-        self.append_event_bundle_allocating(event, None, None)?;
+    /// Records the runtime/control projection owned by the multi-agent runtime.
+    ///
+    /// Unlike the recording sink this API cannot accept an arbitrary projection,
+    /// so model-response, tool-settlement, and terminal payloads remain reachable
+    /// only through their session-repository transactions.
+    pub(crate) fn append_sub_agent_activity(
+        &self,
+        session_id: SessionId,
+        activity_id: String,
+        agent_session_id: SessionId,
+        agent_path: String,
+        activity_kind: SubAgentActivityKind,
+    ) -> Result<(), StorageError> {
+        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let turn_id = transaction
+            .query_row(
+                "SELECT active_turn_id
+                 FROM sessions
+                 WHERE id = ?1
+                   AND status = 'running'
+                   AND active_run_id IS NOT NULL
+                   AND active_turn_id IS NOT NULL
+                   AND active_run_lease_expires_at_ms > ?2",
+                params![session_id.to_string(), now],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StorageError::Message(format!(
+                    "session {session_id} has no active turn that can own sub-agent activity"
+                ))
+            })?
+            .parse::<TurnId>()
+            .map_err(|error| StorageError::Message(error.to_string()))?;
+        let projection = project_sub_agent_activity(
+            session_id,
+            turn_id,
+            0,
+            activity_id,
+            agent_session_id,
+            agent_path,
+            activity_kind,
+        );
+        insert_event_bundle_unchecked(
+            &transaction,
+            &projection.runtime_event,
+            projection.history_item.as_ref(),
+            projection.turn_item.as_ref(),
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
-    fn append_event_bundle(
+    #[cfg(test)]
+    pub(crate) fn seed_runtime_event_for_test(
+        &self,
+        event: &RuntimeEvent,
+    ) -> Result<(), StorageError> {
+        self.seed_event_bundle_for_test(event, None, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_event_bundle_for_test(
         &self,
         event: &RuntimeEvent,
         history_item: Option<&HistoryItem>,
         turn_item: Option<&TurnItem>,
     ) -> Result<(), StorageError> {
-        self.append_event_bundle_allocating(event, history_item, turn_item)?;
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_event_bundle_unchecked(&transaction, event, history_item, turn_item)?;
+        transaction.commit()?;
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_history_item_for_test(
+        &self,
+        item: &HistoryItem,
+    ) -> Result<(), StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let sequence_no = claim_protocol_sequence_in_transaction(
+            &transaction,
+            item.session_id,
+            item.turn_id,
+            item.sequence_no,
+        )?;
+        let mut stored_item = item.clone();
+        stored_item.sequence_no = sequence_no;
+        insert_history_item(&transaction, &stored_item)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_turn_item_for_test(&self, item: &TurnItem) -> Result<(), StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let sequence_no = claim_protocol_sequence_in_transaction(
+            &transaction,
+            item.session_id,
+            item.turn_id,
+            item.sequence_no,
+        )?;
+        let mut stored_item = item.clone();
+        stored_item.sequence_no = sequence_no;
+        insert_turn_item(&transaction, &stored_item)?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+impl ProtocolEventStore for SqliteProtocolEventStore {
     fn list_runtime_events(
         &self,
         session_id: SessionId,
@@ -252,46 +345,6 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         Ok(events)
     }
 
-    fn append_history_item(&self, item: &HistoryItem) -> Result<(), StorageError> {
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let sequence_no = claim_protocol_sequence_in_transaction(
-            &transaction,
-            item.session_id,
-            item.turn_id,
-            item.sequence_no,
-        )?;
-        let mut stored_item = item.clone();
-        stored_item.sequence_no = sequence_no;
-        insert_history_item(&transaction, &stored_item)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    fn append_history_turn_bundle(
-        &self,
-        history_item: &HistoryItem,
-        turn_item: &TurnItem,
-    ) -> Result<(), StorageError> {
-        validate_history_turn_bundle_coherence(history_item, turn_item)?;
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let sequence_no = claim_protocol_sequence_in_transaction(
-            &transaction,
-            history_item.session_id,
-            history_item.turn_id,
-            history_item.sequence_no.max(turn_item.sequence_no),
-        )?;
-        let mut stored_history_item = history_item.clone();
-        stored_history_item.sequence_no = sequence_no;
-        let mut stored_turn_item = turn_item.clone();
-        stored_turn_item.sequence_no = sequence_no;
-        insert_history_item(&transaction, &stored_history_item)?;
-        insert_turn_item(&transaction, &stored_turn_item)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
     fn list_history_items(
         &self,
         session_id: SessionId,
@@ -338,20 +391,44 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         list_history_items_for_session_from_connection(&connection, session_id)
     }
 
-    fn append_turn_item(&self, item: &TurnItem) -> Result<(), StorageError> {
+    fn collaboration_mode_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<ModeKind, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let items = list_history_items_for_session_from_connection(&connection, session_id)?;
+        Ok(collaboration_mode_from_history(&items))
+    }
+
+    fn set_collaboration_mode(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        mode: ModeKind,
+    ) -> Result<Option<HistoryItem>, StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let sequence_no = claim_protocol_sequence_in_transaction(
-            &transaction,
-            item.session_id,
-            item.turn_id,
-            item.sequence_no,
-        )?;
-        let mut stored_item = item.clone();
-        stored_item.sequence_no = sequence_no;
-        insert_turn_item(&transaction, &stored_item)?;
+        let items = list_history_items_for_session_from_connection(&transaction, session_id)?;
+        if collaboration_mode_from_history(&items) == mode {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let item = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            turn_id,
+            sequence_no: claim_protocol_sequence_in_transaction(
+                &transaction,
+                session_id,
+                turn_id,
+                0,
+            )?,
+            created_at_ms: SystemClock::now_ms(),
+            payload: HistoryItemPayload::CollaborationModeInstruction { mode },
+        };
+        insert_history_item(&transaction, &item)?;
         transaction.commit()?;
-        Ok(())
+        Ok(Some(item))
     }
 
     fn list_turn_items(
@@ -410,52 +487,6 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         latest_turn_position_for_session(&*connection, session_id)
     }
 
-    fn rollback_latest_turns(
-        &self,
-        session_id: SessionId,
-        num_turns: usize,
-    ) -> Result<Vec<TurnId>, StorageError> {
-        if num_turns == 0 {
-            return Err(StorageError::Message(
-                "rollback turn count must be greater than zero".to_string(),
-            ));
-        }
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let turn_ids =
-            latest_protocol_turn_ids_in_transaction(&transaction, session_id, num_turns)?;
-        if turn_ids.len() < num_turns {
-            return Err(StorageError::Message(format!(
-                "cannot rollback {num_turns} turn(s); session {session_id} only has {} canonical turn(s)",
-                turn_ids.len()
-            )));
-        }
-        for turn_id in &turn_ids {
-            transaction.execute(
-                "DELETE FROM protocol_turn_items WHERE session_id = ?1 AND turn_id = ?2",
-                params![session_id.to_string(), turn_id.to_string()],
-            )?;
-            transaction.execute(
-                "DELETE FROM protocol_history_items WHERE session_id = ?1 AND turn_id = ?2",
-                params![session_id.to_string(), turn_id.to_string()],
-            )?;
-            transaction.execute(
-                "DELETE FROM protocol_runtime_events WHERE session_id = ?1 AND turn_id = ?2",
-                params![session_id.to_string(), turn_id.to_string()],
-            )?;
-            transaction.execute(
-                "DELETE FROM protocol_item_append_order WHERE session_id = ?1 AND turn_id = ?2",
-                params![session_id.to_string(), turn_id.to_string()],
-            )?;
-            transaction.execute(
-                "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1 AND turn_id = ?2",
-                params![session_id.to_string(), turn_id.to_string()],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(turn_ids)
-    }
-
     fn fork_canonical_items(
         &self,
         source_session_id: SessionId,
@@ -493,8 +524,10 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
 
         let source_history =
             list_history_items_for_session_from_connection(&transaction, source_session_id)?;
+        let compacted_item_ids = compacted_history_item_ids(&source_history);
         let forked_history = source_history
             .into_iter()
+            .filter(|item| !compacted_item_ids.contains(&item.id))
             .filter_map(|item| {
                 fork_agent_context_payload(item.payload.clone()).map(|payload| HistoryItem {
                     id: HistoryItemId::new(),
@@ -538,11 +571,7 @@ pub(crate) fn fork_canonical_items_in_transaction(
         forked_history.push(HistoryItem {
             id: new_id,
             session_id: target_session_id,
-            payload: fork_history_payload_for_session(
-                item.payload,
-                target_session_id,
-                &history_id_map,
-            )?,
+            payload: fork_history_payload_for_session(item.payload, &history_id_map)?,
             ..item
         });
     }
@@ -639,23 +668,44 @@ fn ensure_empty_protocol_target(
 fn fork_agent_context_payload(payload: HistoryItemPayload) -> Option<HistoryItemPayload> {
     match payload {
         HistoryItemPayload::UserTurn { content, .. } => Some(HistoryItemPayload::UserTurn {
-            message_id: None,
             content,
             prompt_dispatch: None,
             editor_context: None,
-            turn_context: None,
         }),
-        HistoryItemPayload::Message {
-            role: crate::session::MessageRole::Assistant,
+        HistoryItemPayload::AssistantMessage {
+            response_id,
             content,
-            ..
-        } => Some(HistoryItemPayload::Message {
-            message_id: None,
-            role: crate::session::MessageRole::Assistant,
+        } => Some(HistoryItemPayload::AssistantMessage {
+            response_id,
             content,
         }),
+        HistoryItemPayload::CollaborationModeInstruction { mode } => {
+            Some(HistoryItemPayload::CollaborationModeInstruction { mode })
+        }
+        HistoryItemPayload::Compaction { mode, summary, .. } => {
+            // The child receives the parent's current semantic summary, not the
+            // replaced raw history. Empty replacement lineage makes the copied
+            // summary a standalone active context item without inventing an
+            // assistant response or retaining inactive parent details.
+            Some(HistoryItemPayload::Compaction {
+                mode,
+                summary,
+                replacement_item_ids: Vec::new(),
+            })
+        }
         _ => None,
     }
+}
+
+fn collaboration_mode_from_history(items: &[HistoryItem]) -> ModeKind {
+    items
+        .iter()
+        .rev()
+        .find_map(|item| match item.payload {
+            HistoryItemPayload::CollaborationModeInstruction { mode } => Some(mode),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn seed_history_turn_sequence_allocators(
@@ -766,36 +816,22 @@ fn list_turn_items_for_session_from_connection(
 
 fn fork_history_payload_for_session(
     payload: HistoryItemPayload,
-    target_session_id: SessionId,
     history_id_map: &HashMap<HistoryItemId, HistoryItemId>,
 ) -> Result<HistoryItemPayload, StorageError> {
     match payload {
         HistoryItemPayload::UserTurn {
-            message_id,
             content,
             prompt_dispatch,
             editor_context,
-            turn_context,
         } => Ok(HistoryItemPayload::UserTurn {
-            message_id,
             content,
             prompt_dispatch,
             editor_context,
-            turn_context: turn_context.map(|mut context| {
-                context.session_id = target_session_id;
-                Box::new(*context)
-            }),
         }),
-        HistoryItemPayload::ControlEnvelope { mut envelope } => {
-            envelope.session_id = target_session_id;
-            envelope.context.session_id = target_session_id;
-            Ok(HistoryItemPayload::ControlEnvelope { envelope })
-        }
         HistoryItemPayload::Compaction {
             mode,
             summary,
             replacement_item_ids,
-            continuation,
         } => {
             let replacement_item_ids = replacement_item_ids
                 .into_iter()
@@ -811,14 +847,13 @@ fn fork_history_payload_for_session(
                 mode,
                 summary,
                 replacement_item_ids,
-                continuation,
             })
         }
         other => Ok(other),
     }
 }
 
-fn latest_protocol_turn_ids_in_transaction(
+pub(crate) fn latest_protocol_turn_ids_in_transaction(
     transaction: &Transaction<'_>,
     session_id: SessionId,
     limit: usize,
@@ -949,7 +984,17 @@ fn insert_runtime_event(
     Ok(())
 }
 
-pub(crate) fn insert_event_bundle_in_transaction(
+pub(crate) fn insert_session_owned_event_bundle_in_transaction(
+    _authority: &SessionProtocolWriteAuthority,
+    transaction: &Transaction<'_>,
+    event: &RuntimeEvent,
+    history_item: Option<&HistoryItem>,
+    turn_item: Option<&TurnItem>,
+) -> Result<StoredProtocolEventBundle, StorageError> {
+    insert_event_bundle_unchecked(transaction, event, history_item, turn_item)
+}
+
+fn insert_event_bundle_unchecked(
     transaction: &Transaction<'_>,
     event: &RuntimeEvent,
     history_item: Option<&HistoryItem>,
@@ -985,6 +1030,117 @@ pub(crate) fn insert_event_bundle_in_transaction(
         runtime_event,
         history_item,
     })
+}
+
+fn validate_recording_projection(
+    event: &RuntimeEvent,
+    history_item: Option<&HistoryItem>,
+    turn_item: Option<&TurnItem>,
+) -> Result<(), StorageError> {
+    validate_event_bundle_coherence(event, history_item, turn_item)?;
+    let history_payload = history_item.map(|item| &item.payload);
+    let turn_payload = turn_item.map(|item| &item.payload);
+    let allowed = match (&event.msg, history_payload, turn_payload) {
+        // Session lifecycle notices are runtime-only. They do not own canonical
+        // user/model/tool state.
+        (RuntimeEventMsg::Warning { .. }, None, None) => true,
+        (
+            RuntimeEventMsg::Warning { message },
+            Some(HistoryItemPayload::Error {
+                message: history_message,
+            }),
+            Some(TurnItemPayload::Error {
+                message: turn_message,
+            }),
+        ) => message == history_message && message == turn_message,
+        (
+            RuntimeEventMsg::ModelRequestPrepared { .. },
+            Some(HistoryItemPayload::RequestDiagnostics { .. }),
+            None,
+        ) => true,
+        (
+            RuntimeEventMsg::WorldStateUpdated { .. },
+            Some(HistoryItemPayload::WorldState { .. }),
+            Some(TurnItemPayload::WorldState { .. }),
+        ) => true,
+        (
+            RuntimeEventMsg::ApprovalRequested { call_id, .. },
+            None,
+            Some(TurnItemPayload::ApprovalRequest {
+                call_id: turn_call_id,
+                ..
+            }),
+        ) => call_id == turn_call_id,
+        (
+            RuntimeEventMsg::ApprovalResolved { call_id, .. },
+            Some(HistoryItemPayload::ApprovalDecision {
+                call_id: history_call_id,
+                ..
+            }),
+            None,
+        ) => call_id == history_call_id,
+        (
+            RuntimeEventMsg::ContextCompacted { item_id, mode },
+            Some(HistoryItemPayload::Compaction {
+                mode: history_mode, ..
+            }),
+            Some(TurnItemPayload::ContextCompaction { .. }),
+        ) => history_item.is_some_and(|item| item.id == *item_id) && mode == history_mode,
+        (
+            RuntimeEventMsg::RetryScheduled {
+                attempt,
+                message,
+                next_retry_at_ms,
+            },
+            Some(HistoryItemPayload::RetryDecision {
+                attempt: history_attempt,
+                message: history_message,
+                next_retry_at_ms: history_retry_at_ms,
+            }),
+            Some(TurnItemPayload::Warning {
+                message: turn_message,
+            }),
+        ) => {
+            attempt == history_attempt
+                && message == history_message
+                && message == turn_message
+                && next_retry_at_ms == history_retry_at_ms
+        }
+        _ => false,
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err(StorageError::Message(format!(
+        "protocol recording sink cannot own runtime projection `{}`; use its atomic state owner",
+        runtime_event_kind(&event.msg)
+    )))
+}
+
+fn runtime_event_kind(message: &RuntimeEventMsg) -> &'static str {
+    match message {
+        RuntimeEventMsg::ThreadConfigured { .. } => "thread_configured",
+        RuntimeEventMsg::UserInputAccepted { .. } => "user_input_accepted",
+        RuntimeEventMsg::SteerInputAccepted { .. } => "steer_input_accepted",
+        RuntimeEventMsg::InterAgentCommunicationReceived { .. } => {
+            "inter_agent_communication_received"
+        }
+        RuntimeEventMsg::SubAgentActivity { .. } => "sub_agent_activity",
+        RuntimeEventMsg::AssistantTextDelta { .. } => "assistant_text_delta",
+        RuntimeEventMsg::AssistantMessageCommitted { .. } => "assistant_message_committed",
+        RuntimeEventMsg::ReasoningSummaryDelta { .. } => "reasoning_summary_delta",
+        RuntimeEventMsg::ModelRequestPrepared { .. } => "model_request_prepared",
+        RuntimeEventMsg::WorldStateUpdated { .. } => "world_state_updated",
+        RuntimeEventMsg::HistoryItemRecorded { .. } => "history_item_recorded",
+        RuntimeEventMsg::ToolLifecycle { .. } => "tool_lifecycle",
+        RuntimeEventMsg::ApprovalRequested { .. } => "approval_requested",
+        RuntimeEventMsg::ApprovalResolved { .. } => "approval_resolved",
+        RuntimeEventMsg::ContextCompacted { .. } => "context_compacted",
+        RuntimeEventMsg::FileChangesRecorded { .. } => "file_changes_recorded",
+        RuntimeEventMsg::Warning { .. } => "warning",
+        RuntimeEventMsg::RetryScheduled { .. } => "retry_scheduled",
+        RuntimeEventMsg::TurnTerminal { .. } => "turn_terminal",
+    }
 }
 
 fn claim_protocol_sequence_in_transaction(
@@ -1217,6 +1373,85 @@ mod tests {
     use crate::protocol::ContentPart;
 
     #[test]
+    fn collaboration_mode_is_history_owned_noop_safe_and_resume_replayable() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
+        let session_id = SessionId::new();
+
+        assert_eq!(
+            store
+                .collaboration_mode_for_session(session_id)
+                .expect("initial mode"),
+            ModeKind::Default
+        );
+        assert!(
+            store
+                .set_collaboration_mode(session_id, TurnId::new(), ModeKind::Default)
+                .expect("same default")
+                .is_none(),
+            "the protocol default is already effective and must not create state"
+        );
+
+        let plan_turn = TurnId::new();
+        let plan_item = store
+            .set_collaboration_mode(session_id, plan_turn, ModeKind::Plan)
+            .expect("set plan")
+            .expect("new plan instruction");
+        assert!(matches!(
+            plan_item.payload,
+            HistoryItemPayload::CollaborationModeInstruction {
+                mode: ModeKind::Plan
+            }
+        ));
+        assert!(
+            store
+                .set_collaboration_mode(session_id, TurnId::new(), ModeKind::Plan)
+                .expect("same plan")
+                .is_none(),
+            "same-value updates must not append another instruction"
+        );
+
+        let resumed = SqliteProtocolEventStore::new(connection);
+        assert_eq!(
+            resumed
+                .collaboration_mode_for_session(session_id)
+                .expect("replayed mode"),
+            ModeKind::Plan,
+            "a new runtime owner must rehydrate mode solely from durable history"
+        );
+        assert_eq!(
+            resumed
+                .list_history_items_for_session(session_id)
+                .expect("mode history")
+                .iter()
+                .filter(|item| matches!(
+                    &item.payload,
+                    HistoryItemPayload::CollaborationModeInstruction { .. }
+                ))
+                .count(),
+            1
+        );
+
+        let default_turn = TurnId::new();
+        resumed
+            .set_collaboration_mode(session_id, default_turn, ModeKind::Default)
+            .expect("restore default")
+            .expect("default instruction");
+        assert_eq!(
+            resumed
+                .collaboration_mode_for_session(session_id)
+                .expect("restored mode"),
+            ModeKind::Default
+        );
+    }
+
+    #[test]
     fn list_history_items_for_session_uses_append_order_across_turns() {
         let connection = Arc::new(Mutex::new(
             Connection::open_in_memory().expect("in-memory db"),
@@ -1227,11 +1462,15 @@ mod tests {
         }
         let store = SqliteProtocolEventStore::new(connection);
         let session_id = SessionId::new();
-        let older = history_message(session_id, TurnId::new(), 29, 100, "older-stage");
-        let newer = history_message(session_id, TurnId::new(), 15, 200, "newer-stage");
+        let older = history_user_turn(session_id, TurnId::new(), 29, 100, "older-stage");
+        let newer = history_user_turn(session_id, TurnId::new(), 15, 200, "newer-stage");
 
-        store.append_history_item(&older).expect("older insert");
-        store.append_history_item(&newer).expect("newer insert");
+        store
+            .seed_history_item_for_test(&older)
+            .expect("older insert");
+        store
+            .seed_history_item_for_test(&newer)
+            .expect("newer insert");
 
         let listed = store
             .list_history_items_for_session(session_id)
@@ -1255,7 +1494,7 @@ mod tests {
         let source_session_id = SessionId::new();
         let target_session_id = SessionId::new();
         let turn_id = TurnId::new();
-        let replaced = history_message(source_session_id, turn_id, 0, 100, "old detail");
+        let replaced = history_user_turn(source_session_id, turn_id, 0, 100, "old detail");
         let compaction = HistoryItem {
             id: HistoryItemId::new(),
             session_id: source_session_id,
@@ -1263,15 +1502,16 @@ mod tests {
             sequence_no: 1,
             created_at_ms: 200,
             payload: HistoryItemPayload::Compaction {
-                mode: crate::protocol::CompactionMode::Manual,
+                mode: crate::protocol::CompactionMode::Automatic,
                 summary: "old detail summary".to_string(),
                 replacement_item_ids: vec![replaced.id],
-                continuation: None,
             },
         };
-        store.append_history_item(&replaced).expect("replaced item");
         store
-            .append_history_item(&compaction)
+            .seed_history_item_for_test(&replaced)
+            .expect("replaced item");
+        store
+            .seed_history_item_for_test(&compaction)
             .expect("compaction item");
 
         let copied = store
@@ -1314,23 +1554,11 @@ mod tests {
             sequence_no: 0,
             created_at_ms: 10,
             payload: HistoryItemPayload::UserTurn {
-                message_id: Some(crate::session::MessageId::new()),
                 content: vec![ContentPart::Text {
                     text: "investigate the protocol".to_string(),
                 }],
                 prompt_dispatch: None,
                 editor_context: None,
-                turn_context: None,
-            },
-        };
-        let reasoning = HistoryItem {
-            id: HistoryItemId::new(),
-            session_id: source_session_id,
-            turn_id,
-            sequence_no: 1,
-            created_at_ms: 20,
-            payload: HistoryItemPayload::Reasoning {
-                text: "private chain of thought".to_string(),
             },
         };
         let assistant = HistoryItem {
@@ -1339,9 +1567,8 @@ mod tests {
             turn_id,
             sequence_no: 2,
             created_at_ms: 30,
-            payload: HistoryItemPayload::Message {
-                message_id: Some(crate::session::MessageId::new()),
-                role: crate::session::MessageRole::Assistant,
+            payload: HistoryItemPayload::AssistantMessage {
+                response_id: crate::protocol::ModelResponseId::new(),
                 content: vec![ContentPart::Text {
                     text: "parent result".to_string(),
                 }],
@@ -1362,15 +1589,10 @@ mod tests {
                 },
             },
         };
-        let user_message = history_message(source_session_id, turn_id, 4, 50, "legacy user");
-        for item in [
-            &user_turn,
-            &reasoning,
-            &assistant,
-            &communication,
-            &user_message,
-        ] {
-            store.append_history_item(item).expect("source append");
+        for item in [&user_turn, &assistant, &communication] {
+            store
+                .seed_history_item_for_test(item)
+                .expect("source append");
         }
 
         let copied = store
@@ -1389,19 +1611,16 @@ mod tests {
         assert!(matches!(
             &forked[0].payload,
             HistoryItemPayload::UserTurn {
-                message_id: None,
                 content,
                 prompt_dispatch: None,
                 editor_context: None,
-                turn_context: None,
             } if matches!(content.as_slice(), [ContentPart::Text { text }] if text == "investigate the protocol")
         ));
         assert!(matches!(
             &forked[1].payload,
-            HistoryItemPayload::Message {
-                message_id: None,
-                role: crate::session::MessageRole::Assistant,
+            HistoryItemPayload::AssistantMessage {
                 content,
+                ..
             } if matches!(content.as_slice(), [ContentPart::Text { text }] if text == "parent result")
         ));
         assert!(
@@ -1412,7 +1631,12 @@ mod tests {
         );
 
         store
-            .append_runtime_event(&warning_event(target_session_id, turn_id, 0, "after fork"))
+            .seed_runtime_event_for_test(&warning_event(
+                target_session_id,
+                turn_id,
+                0,
+                "after fork",
+            ))
             .expect("post-fork append");
         assert_eq!(
             store
@@ -1421,6 +1645,95 @@ mod tests {
                 .sequence_no,
             3
         );
+    }
+
+    #[test]
+    fn fork_agent_context_preserves_compacted_view_without_resurrecting_replaced_items() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let source_session_id = SessionId::new();
+        let target_session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let old_user = history_user_turn(source_session_id, turn_id, 0, 10, "obsolete detail");
+        let old_assistant = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: source_session_id,
+            turn_id,
+            sequence_no: 1,
+            created_at_ms: 20,
+            payload: HistoryItemPayload::AssistantMessage {
+                response_id: crate::protocol::ModelResponseId::new(),
+                content: vec![ContentPart::Text {
+                    text: "obsolete response".to_string(),
+                }],
+            },
+        };
+        let compaction = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: source_session_id,
+            turn_id,
+            sequence_no: 2,
+            created_at_ms: 30,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                summary: "the earlier exchange established the compacted contract".to_string(),
+                replacement_item_ids: vec![old_user.id, old_assistant.id],
+            },
+        };
+        let current_user = history_user_turn(
+            source_session_id,
+            turn_id,
+            3,
+            40,
+            "continue from the compacted contract",
+        );
+        for item in [&old_user, &old_assistant, &compaction, &current_user] {
+            store
+                .seed_history_item_for_test(item)
+                .expect("source append");
+        }
+
+        assert_eq!(
+            store
+                .fork_agent_context(source_session_id, target_session_id)
+                .expect("agent context fork"),
+            2
+        );
+        let forked = store
+            .list_history_items_for_session(target_session_id)
+            .expect("forked history");
+
+        assert_eq!(forked.len(), 2);
+        assert!(matches!(
+            &forked[0].payload,
+            HistoryItemPayload::Compaction {
+                summary,
+                replacement_item_ids,
+                ..
+            } if summary.contains("compacted contract") && replacement_item_ids.is_empty()
+        ));
+        assert!(matches!(
+            &forked[1].payload,
+            HistoryItemPayload::UserTurn { content, .. }
+                if matches!(content.as_slice(), [ContentPart::Text { text }]
+                    if text == "continue from the compacted contract")
+        ));
+        let messages =
+            crate::agent::context_manager::ContextManager::rehydrate(forked).model_messages(false);
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                crate::llm::ModelMessage::System { content: summary },
+                crate::llm::ModelMessage::User { content: current }
+            ] if summary.contains("compacted contract")
+                && current == "continue from the compacted contract"
+        ));
     }
 
     #[test]
@@ -1437,10 +1750,16 @@ mod tests {
         let target_session_id = SessionId::new();
         let turn_id = TurnId::new();
         store
-            .append_history_item(&history_message(source_session_id, turn_id, 0, 1, "source"))
+            .seed_history_item_for_test(&history_user_turn(
+                source_session_id,
+                turn_id,
+                0,
+                1,
+                "source",
+            ))
             .expect("source append");
         store
-            .append_runtime_event(&warning_event(
+            .seed_runtime_event_for_test(&warning_event(
                 target_session_id,
                 TurnId::new(),
                 0,
@@ -1479,7 +1798,7 @@ mod tests {
         let first = std::thread::spawn(move || {
             first_barrier.wait();
             first_store
-                .append_event_bundle_allocating(&first_event, None, None)
+                .append_recording_projection_allocating(&first_event, None, None)
                 .expect("first append")
                 .runtime_event
         });
@@ -1487,7 +1806,7 @@ mod tests {
         let second = std::thread::spawn(move || {
             second_barrier.wait();
             second_store
-                .append_event_bundle_allocating(&second_event, None, None)
+                .append_recording_projection_allocating(&second_event, None, None)
                 .expect("second append")
                 .runtime_event
         });
@@ -1527,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_append_apis_share_one_turn_allocator() {
+    fn test_seed_helpers_share_one_turn_allocator() {
         let connection = Arc::new(Mutex::new(
             Connection::open_in_memory().expect("in-memory db"),
         ));
@@ -1538,7 +1857,7 @@ mod tests {
         let store = SqliteProtocolEventStore::new(connection);
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
-        let history = history_message(session_id, turn_id, 0, 1, "history");
+        let history = history_user_turn(session_id, turn_id, 0, 1, "history");
         let turn = TurnItem {
             id: TurnItemId::new(),
             session_id,
@@ -1551,9 +1870,13 @@ mod tests {
         };
         let event = warning_event(session_id, turn_id, 0, "runtime");
 
-        store.append_history_item(&history).expect("history append");
-        store.append_turn_item(&turn).expect("turn append");
-        store.append_runtime_event(&event).expect("event append");
+        store
+            .seed_history_item_for_test(&history)
+            .expect("history append");
+        store.seed_turn_item_for_test(&turn).expect("turn append");
+        store
+            .seed_runtime_event_for_test(&event)
+            .expect("event append");
 
         assert_eq!(
             store
@@ -1576,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn external_agent_bundle_appends_without_run_admission() {
+    fn recording_projection_rejects_atomic_owner_payloads_without_writing_any_stream() {
         let connection = Arc::new(Mutex::new(
             Connection::open_in_memory().expect("in-memory db"),
         ));
@@ -1587,25 +1910,205 @@ mod tests {
         let store = SqliteProtocolEventStore::new(connection);
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
-        let projection = crate::protocol::projection::project_inter_agent_communication(
-            session_id,
-            turn_id,
-            0,
-            crate::protocol::InterAgentCommunication {
-                author: "/root/reviewer".to_string(),
-                recipient: "/root".to_string(),
-                content: "review complete".to_string(),
-                trigger_turn: false,
+        let response_id = crate::protocol::ModelResponseId::new();
+        let tool_call_id = crate::session::ToolCallId::new();
+        let forbidden = vec![
+            crate::session::RunEvent::UserTurnStored {
+                session_id,
+                turn: Box::new(crate::protocol::UserTurn {
+                    turn_id,
+                    items: vec![crate::protocol::UserInputItem::Text {
+                        text: "must use the user-turn owner".to_string(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                }),
             },
-        );
+            crate::session::RunEvent::AssistantMessageCommitted {
+                response_id,
+                text: "must use the model-response owner".to_string(),
+            },
+            crate::session::RunEvent::ToolCallPending {
+                tool_call_id,
+                response_id,
+                model_call_id: "provider-call".to_string(),
+                tool_name: "read".to_string(),
+                arguments_json: "{}".to_string(),
+            },
+            crate::session::RunEvent::ToolCallCompleted {
+                tool_call_id,
+                tool: crate::tool::ToolName::Read,
+                title: "read".to_string(),
+                summary: "must use the tool-settlement owner".to_string(),
+                metadata: serde_json::Value::Null,
+            },
+            crate::session::RunEvent::FileChangesRecorded {
+                tool_call_id,
+                changes: Vec::new(),
+            },
+            crate::session::RunEvent::TurnTerminal {
+                session_id,
+                terminal: Box::new(crate::session::DurableTurnTerminal {
+                    status: crate::protocol::TurnTerminalStatus::Completed,
+                    finish_reason: Some(crate::session::FinishReason::Stop),
+                    interruption_cause: None,
+                    final_response_id: Some(response_id),
+                    summary: "must use the terminal owner".to_string(),
+                    tool_call_count: 1,
+                    failed_tool_count: 0,
+                    change_count: 0,
+                    metrics: Default::default(),
+                }),
+            },
+        ];
 
+        for event in forbidden {
+            let projection =
+                crate::protocol::project_protocol_run_event(&event, Some(session_id), turn_id, 0)
+                    .expect("forbidden event still has a projection for its atomic owner");
+            let error = store
+                .append_recording_projection_allocating(
+                    &projection.runtime_event,
+                    projection.history_item.as_ref(),
+                    projection.turn_item.as_ref(),
+                )
+                .expect_err("recording projection must reject atomic-owner payload");
+            assert!(error.to_string().contains("atomic state owner"));
+        }
+
+        assert!(
+            store
+                .list_runtime_events(session_id, turn_id)
+                .expect("runtime events")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_history_items(session_id, turn_id)
+                .expect("history items")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_turn_items(session_id, turn_id)
+                .expect("turn items")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn admitted_recording_requires_the_exact_active_turn_owner() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+            let project_id = crate::session::ProjectId::new();
+            let session_id = SessionId::new();
+            locked
+                .execute(
+                    "INSERT INTO projects
+                     (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                     VALUES (?1, 'C:/fixture', 'fixture', 'none', 1, 1)",
+                    params![project_id.to_string()],
+                )
+                .expect("project fixture");
+            locked
+                .execute(
+                    "INSERT INTO sessions
+                     (id, project_id, title, status, cwd_path, model_name, base_url,
+                      access_mode, model_parameters_json, created_at_ms, updated_at_ms,
+                      completed_at_ms, active_run_id, active_turn_id,
+                      active_run_lease_expires_at_ms)
+                     VALUES (?1, ?2, 'fixture', 'running', 'C:/fixture', 'model',
+                             'http://localhost', 'default', '{}', 1, 1, NULL,
+                             'admission-without-turn', NULL, 1000)",
+                    params![session_id.to_string(), project_id.to_string()],
+                )
+                .expect("legacy null-turn admission fixture");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = {
+            let connection = store.connection.lock().expect("sqlite mutex");
+            connection
+                .query_row("SELECT id FROM sessions", [], |row| row.get::<_, String>(0))
+                .expect("session id")
+                .parse::<SessionId>()
+                .expect("valid session id")
+        };
+        let turn_id = TurnId::new();
+        let event = warning_event(session_id, turn_id, 0, "must have an exact turn owner");
+
+        assert!(
+            store
+                .append_admitted_recording_projection_allocating_at(
+                    "admission-without-turn",
+                    &event,
+                    None,
+                    None,
+                    100,
+                )
+                .expect("ownership query")
+                .is_none(),
+            "a legacy null-turn admission must not own a current protocol turn"
+        );
+        assert!(
+            store
+                .list_runtime_events(session_id, turn_id)
+                .expect("runtime events")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sub_agent_activity_is_limited_to_the_transactionally_active_turn() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+            let project_id = crate::session::ProjectId::new();
+            locked
+                .execute(
+                    "INSERT INTO projects
+                     (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                     VALUES (?1, 'C:/activity-fixture', 'fixture', 'none', 1, 1)",
+                    params![project_id.to_string()],
+                )
+                .expect("project fixture");
+            locked
+                .execute(
+                    "INSERT INTO sessions
+                     (id, project_id, title, status, cwd_path, model_name, base_url,
+                      access_mode, model_parameters_json, created_at_ms, updated_at_ms,
+                      completed_at_ms, active_run_id, active_turn_id,
+                      active_run_lease_expires_at_ms)
+                     VALUES (?1, ?2, 'fixture', 'running', 'C:/activity-fixture', 'model',
+                             'http://localhost', 'default', '{}', 1, 1, NULL,
+                             'active-run', ?3, ?4)",
+                    params![
+                        session_id.to_string(),
+                        project_id.to_string(),
+                        turn_id.to_string(),
+                        i64::MAX
+                    ],
+                )
+                .expect("active turn fixture");
+        }
+        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
         store
-            .append_event_bundle(
-                &projection.runtime_event,
-                projection.history_item.as_ref(),
-                projection.turn_item.as_ref(),
+            .append_sub_agent_activity(
+                session_id,
+                "activity-1".to_string(),
+                SessionId::new(),
+                "/root/reviewer".to_string(),
+                SubAgentActivityKind::Interacted,
             )
-            .expect("external bundle append");
+            .expect("sub-agent activity append");
 
         assert!(matches!(
             store
@@ -1614,7 +2117,7 @@ mod tests {
                 .as_slice(),
             [RuntimeEvent {
                 sequence_no: 0,
-                msg: RuntimeEventMsg::InterAgentCommunicationReceived { .. },
+                msg: RuntimeEventMsg::SubAgentActivity { .. },
                 ..
             }]
         ));
@@ -1623,50 +2126,45 @@ mod tests {
                 .list_history_items(session_id, turn_id)
                 .expect("history items")[0]
                 .payload,
-            HistoryItemPayload::InterAgentCommunication { .. }
+            HistoryItemPayload::SubAgentActivity { .. }
         ));
         assert!(matches!(
             store
                 .list_turn_items(session_id, turn_id)
                 .expect("turn items")[0]
                 .payload,
-            TurnItemPayload::InterAgentCommunication { .. }
+            TurnItemPayload::SubAgentActivity { .. }
         ));
-    }
 
-    #[test]
-    fn rollback_removes_turn_allocator_state() {
-        let connection = Arc::new(Mutex::new(
-            Connection::open_in_memory().expect("in-memory db"),
-        ));
-        {
-            let locked = connection.lock().expect("sqlite mutex");
-            crate::storage::migration::run(&locked).expect("migrations");
-        }
-        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
-        let session_id = SessionId::new();
-        let turn_id = TurnId::new();
-        store
-            .append_runtime_event(&warning_event(session_id, turn_id, 0, "rollback"))
-            .expect("event append");
-
-        assert_eq!(
-            store
-                .rollback_latest_turns(session_id, 1)
-                .expect("rollback"),
-            vec![turn_id]
-        );
-        let allocator_rows = connection
+        connection
             .lock()
             .expect("sqlite mutex")
-            .query_row(
-                "SELECT COUNT(*) FROM protocol_turn_sequence_allocators
-                 WHERE session_id = ?1 AND turn_id = ?2",
-                params![session_id.to_string(), turn_id.to_string()],
-                |row| row.get::<_, i64>(0),
+            .execute(
+                "UPDATE sessions
+                 SET status = 'completed', completed_at_ms = 2,
+                     active_run_id = NULL, active_turn_id = NULL,
+                     active_run_lease_expires_at_ms = NULL
+                 WHERE id = ?1",
+                params![session_id.to_string()],
             )
-            .expect("allocator count");
-        assert_eq!(allocator_rows, 0);
+            .expect("terminalize fixture");
+        let error = store
+            .append_sub_agent_activity(
+                session_id,
+                "activity-after-terminal".to_string(),
+                SessionId::new(),
+                "/root/reviewer".to_string(),
+                SubAgentActivityKind::Interrupted,
+            )
+            .expect_err("terminal turn must reject later activity");
+        assert!(error.to_string().contains("no active turn"));
+        assert_eq!(
+            store
+                .list_history_items(session_id, turn_id)
+                .expect("history after terminal race")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1683,7 +2181,7 @@ mod tests {
         let target_session_id = SessionId::new();
         let turn_id = TurnId::new();
         store
-            .append_history_item(&history_message(
+            .seed_history_item_for_test(&history_user_turn(
                 source_session_id,
                 turn_id,
                 29,
@@ -1695,7 +2193,12 @@ mod tests {
             .fork_canonical_items(source_session_id, target_session_id)
             .expect("fork");
         store
-            .append_runtime_event(&warning_event(target_session_id, turn_id, 0, "after fork"))
+            .seed_runtime_event_for_test(&warning_event(
+                target_session_id,
+                turn_id,
+                0,
+                "after fork",
+            ))
             .expect("post-fork append");
 
         assert_eq!(
@@ -1725,7 +2228,7 @@ mod tests {
         }
     }
 
-    fn history_message(
+    fn history_user_turn(
         session_id: SessionId,
         turn_id: TurnId,
         sequence_no: i64,
@@ -1738,12 +2241,12 @@ mod tests {
             turn_id,
             sequence_no,
             created_at_ms,
-            payload: HistoryItemPayload::Message {
-                message_id: None,
-                role: crate::session::MessageRole::User,
+            payload: HistoryItemPayload::UserTurn {
                 content: vec![ContentPart::Text {
                     text: text.to_string(),
                 }],
+                prompt_dispatch: None,
+                editor_context: None,
             },
         }
     }

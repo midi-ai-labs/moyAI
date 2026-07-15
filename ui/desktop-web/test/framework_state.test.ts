@@ -68,7 +68,6 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
       status: "idle",
       loaded_status: "idle",
       archived: false,
-      memory_mode: "enabled",
       pending_permission_requests: 0,
       pending_user_input_requests: 0,
       short_id: "session-a",
@@ -98,6 +97,7 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
     background_mutation_pending: false,
     agent_tree_active: false,
     can_submit: true,
+    can_cancel_run: false,
     enhance_enabled: true,
     image_input_enabled: true,
     send_enhanced_enabled: true,
@@ -140,6 +140,7 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
     agent_activity_rows: [],
     progress_text: "",
     tool_status_text: "",
+    plan: null,
     session_search_include_archived: false,
     history_export_enabled: true,
     ...overrides,
@@ -220,8 +221,14 @@ test("a run-start command is single-flight in local capability projection", () =
   assert.equal(mutationAdmissionOpen(ui, "enhance_prompt"), false);
   const view = projectViewState(state, ui);
   assert.equal(view.background_mutation_pending, true);
-  assert.equal(view.busy, true, "Stop is available before the Rust command response arrives");
-  assert.equal(actionById("cancel-run")?.enabled?.(view, { index: -1, value: "" }), true);
+  assert.equal(view.busy, true, "the local request remains visibly pending");
+  assert.equal(
+    actionById("cancel-run")?.enabled?.(view, { index: -1, value: "" }),
+    false,
+    "only Rust may publish the cancel capability",
+  );
+  const admitted = projectViewState(projection({ can_cancel_run: true }), ui);
+  assert.equal(actionById("cancel-run")?.enabled?.(admitted, { index: -1, value: "" }), true);
 });
 
 test("an external config owner mutation immediately rejects submit and review dispatch", () => {
@@ -1059,12 +1066,11 @@ test("settings enum controls render only Rust-projected option values", () => {
   assert.doesNotMatch(html, /<option value="proactive"/);
 });
 
-test("canonical row_kind selects specialized transcript rendering over legacy kind", () => {
+test("canonical row_kind selects specialized transcript rendering", () => {
   const html = renderThreadContent(projection({
     thread_empty: false,
     transcript_rows: [{
       row_kind: "work_summary_running",
-      kind: "assistant",
       step: "1",
       title: "Work",
       body: "running",
@@ -1072,5 +1078,21 @@ test("canonical row_kind selects specialized transcript rendering over legacy ki
     }],
   }));
   assert.match(html, /message work-summary work_summary_running/);
+  assert.match(html, /<details[^>]+open>/);
+});
+
+test("incomplete canonical turn is rendered as nonterminal evidence", () => {
+  const html = renderThreadContent(projection({
+    thread_empty: false,
+    transcript_rows: [{
+      row_kind: "work_summary_incomplete",
+      step: "1",
+      title: "状態未確定の作業履歴",
+      body: "### 作業サマリ\n- 結果: この turn の完了状態は未確定です。",
+      file_changes: [],
+    }],
+  }));
+  assert.match(html, /message work-summary work_summary_incomplete/);
+  assert.match(html, /状態未確定/);
   assert.match(html, /<details[^>]+open>/);
 });

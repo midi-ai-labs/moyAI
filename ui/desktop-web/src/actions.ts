@@ -9,7 +9,6 @@ import {
 import { finishLocalDecision, type PermissionReviewDecision } from "./decision_state.ts";
 import {
   navigationIsIdle,
-  sessionMemoryActions,
   sessionActionIndex,
   sessionRowActionAvailable,
 } from "./navigation_state.ts";
@@ -122,18 +121,6 @@ function targetSessionArchiveable(state: DesktopWebState, payload: ActionPayload
 function targetSessionRestorable(state: DesktopWebState, payload: ActionPayload): boolean {
   const row = targetSessionRow(state, payload);
   return targetSessionNotBusy(state, payload) && row?.archived === true;
-}
-
-function targetSessionMemoryEnabled(state: DesktopWebState, payload: ActionPayload): boolean {
-  const row = targetSessionRow(state, payload);
-  return targetSessionNotBusy(state, payload)
-    && Boolean(row && sessionMemoryActions(row.loaded_status, row.memory_mode).disable);
-}
-
-function targetSessionMemoryDisabled(state: DesktopWebState, payload: ActionPayload): boolean {
-  const row = targetSessionRow(state, payload);
-  return targetSessionNotBusy(state, payload)
-    && Boolean(row && sessionMemoryActions(row.loaded_status, row.memory_mode).enable);
 }
 
 function targetQuickChatDeleteAvailable(state: DesktopWebState, payload: ActionPayload): boolean {
@@ -402,20 +389,6 @@ export const ACTIONS: ActionDefinition[] = [
     palette: true,
     enabled: targetSessionActive,
     run: (state, context, payload) => runSessionRowMutation("interrupt_session", state, context, payload),
-  },
-  {
-    id: "enable-session-memory",
-    label: "セッション memory を有効化",
-    palette: true,
-    enabled: targetSessionMemoryDisabled,
-    run: (state, context, payload) => runSessionRowMutation("enable_session_memory", state, context, payload),
-  },
-  {
-    id: "disable-session-memory",
-    label: "セッション memory を無効化",
-    palette: true,
-    enabled: targetSessionMemoryEnabled,
-    run: (state, context, payload) => runSessionRowMutation("disable_session_memory", state, context, payload),
   },
   {
     id: "delete-session",

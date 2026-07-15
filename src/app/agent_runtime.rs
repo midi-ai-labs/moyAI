@@ -12,8 +12,7 @@ use crate::config::model::full_effective_override;
 use crate::error::{AppRunError, CliRenderError};
 use crate::protocol::{
     ContentPart, HistoryItemPayload, InterAgentCommunication, ProtocolEventStore,
-    SubAgentActivityKind, TurnId, TurnInterruptionCause, project_inter_agent_communication,
-    project_sub_agent_activity,
+    SubAgentActivityKind, TurnInterruptionCause,
 };
 use crate::runtime::{
     AgentControl, AgentControlError, AgentExecutionLease, AgentMailDeliveryOutcome,
@@ -22,10 +21,10 @@ use crate::runtime::{
 };
 use crate::session::{
     CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionRead, CanonicalTurnPage,
-    IdleTurnAdmission, LoadedSessionList, MessagePart, RunEvent, RunSummary, RunningSessionRejoin,
-    SessionCompactResult, SessionContext, SessionId, SessionMemoryModeUpdate, SessionRecord,
-    SessionRepository, SessionSettingsPatch, SessionSpawnEdge, SessionStartRequest, SessionStatus,
-    ThreadGoalClearResult, ThreadGoalGetResult, ThreadGoalSetResult, Transcript,
+    IdleTurnAdmission, LoadedSessionList, RunEvent, RunSummary, RunningSessionRejoin,
+    SessionContext, SessionId, SessionRecord, SessionRepository, SessionSettingsPatch,
+    SessionSpawnEdge, SessionStartRequest, SessionStatus, ThreadGoalClearResult,
+    ThreadGoalGetResult, ThreadGoalSetResult,
 };
 use crate::storage::StoreBundle;
 use crate::workspace::Workspace;
@@ -683,11 +682,7 @@ impl AgentRuntime {
         let tree = execution.context.tree.clone();
         let durable_success = matches!(
             result,
-            Ok(summary)
-                if matches!(
-                    summary.status,
-                    SessionStatus::Completed | SessionStatus::AwaitingUser
-                )
+            Ok(summary) if summary.status == SessionStatus::Completed
         );
         let terminal_cause = effective_run_terminal_cause(result, cancellation_cause);
         if !durable_success {
@@ -997,11 +992,16 @@ impl AgentRuntime {
             message,
             trigger_turn,
         );
+        let require_active_recipient = recipient.is_active;
         let delivery = caller
             .tree
             .control
             .enqueue_mail_after_durable_commit(mailbox_message, trigger_turn, || {
-                self.append_communication(recipient.session_id, communication)
+                self.append_communication(
+                    recipient.session_id,
+                    communication,
+                    require_active_recipient,
+                )
             })
             .map_err(agent_control_error)?;
         let scheduled = scheduled_mail_delivery(delivery)?;
@@ -1135,7 +1135,7 @@ impl AgentRuntime {
                         base_url: config.model.base_url.clone(),
                         config_override: Some(full_effective_override(&config)),
                         output_mode: OutputMode::Human,
-                        show_reasoning: false,
+                        show_reasoning_summary: false,
                         prompt_dispatch: None,
                         editor_context: None,
                         review_request: None,
@@ -1213,7 +1213,7 @@ impl AgentRuntime {
             Ok(summary)
                 if matches!(
                     summary.status,
-                    SessionStatus::Completed | SessionStatus::AwaitingUser | SessionStatus::Failed
+                    SessionStatus::Completed | SessionStatus::Failed
                 ) =>
             {
                 durable_child_terminal_status(summary.status, final_content.clone())
@@ -1239,14 +1239,13 @@ impl AgentRuntime {
         let Some(parent) = context.path.parent() else {
             return status;
         };
-        let parent_session_id = context
+        let parent_snapshot = context
             .tree
             .control
             .list_agents(Some(&parent))
             .ok()
-            .and_then(|agents| agents.into_iter().find(|agent| agent.path == parent))
-            .map(|agent| agent.session_id);
-        let Some(parent_session_id) = parent_session_id else {
+            .and_then(|agents| agents.into_iter().find(|agent| agent.path == parent));
+        let Some(parent_snapshot) = parent_snapshot else {
             return status;
         };
         let content = final_content.unwrap_or_else(|| match &status {
@@ -1266,7 +1265,10 @@ impl AgentRuntime {
             .tree
             .control
             .enqueue_mail_after_durable_commit(mailbox_message, false, || {
-                self.append_communication(parent_session_id, communication)
+                // A child can finish after the parent's durable success commit but before the
+                // retained root execution marker is cleared. Result mail is consumed by the next
+                // root turn, so its durable append must not depend on that transient active flag.
+                self.append_communication(parent_snapshot.session_id, communication, false)
             }) {
             Ok(AgentMailDeliveryOutcome::Enqueued { .. }) => {}
             Ok(AgentMailDeliveryOutcome::Suppressed) => {
@@ -1359,27 +1361,19 @@ impl AgentRuntime {
     }
 
     async fn final_assistant_text(&self, summary: &RunSummary) -> Option<String> {
-        let message_id = summary.assistant_message_id?;
-        let transcript = self
-            .store
-            .session_repo()
-            .compatibility_transcript(summary.session_id)
-            .await
-            .ok()?;
-        transcript
-            .messages
+        let response_id = summary.final_response_id?;
+        self.store
+            .protocol_event_store()
+            .list_history_items_for_session(summary.session_id)
+            .ok()?
             .iter()
-            .find(|message| message.record.id == message_id)
-            .map(|message| {
-                message
-                    .parts
-                    .iter()
-                    .filter_map(|part| match &part.payload {
-                        MessagePart::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("")
+            .rev()
+            .find_map(|item| match &item.payload {
+                HistoryItemPayload::AssistantMessage {
+                    response_id: candidate,
+                    content,
+                } if *candidate == response_id => content_parts_text(content, "\n"),
+                _ => None,
             })
             .filter(|text| !text.trim().is_empty())
     }
@@ -1391,7 +1385,7 @@ impl AgentRuntime {
     ) -> Option<String> {
         match result {
             Ok(summary) => match summary.status {
-                SessionStatus::Completed | SessionStatus::AwaitingUser => {
+                SessionStatus::Completed => {
                     self.final_assistant_text(summary).await.or_else(|| {
                         self.store
                             .protocol_event_store()
@@ -1420,10 +1414,17 @@ impl AgentRuntime {
         &self,
         session_id: SessionId,
         communication: InterAgentCommunication,
+        require_active_recipient: bool,
     ) -> Result<(), String> {
-        let turn_id = self.latest_or_new_turn(session_id)?;
-        let projection = project_inter_agent_communication(session_id, turn_id, 0, communication);
-        self.append_projection(projection)
+        self.store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
+                session_id,
+                communication,
+                require_active_recipient,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     fn append_activity(
@@ -1434,42 +1435,15 @@ impl AgentRuntime {
         agent_path: &AgentPath,
         activity_kind: SubAgentActivityKind,
     ) -> Result<(), String> {
-        let turn_id = self.latest_or_new_turn(owner_session_id)?;
-        let projection = project_sub_agent_activity(
-            owner_session_id,
-            turn_id,
-            0,
-            activity_id.to_string(),
-            agent_session_id,
-            agent_path.to_string(),
-            activity_kind,
-        );
-        self.append_projection(projection)
-    }
-
-    fn append_projection(
-        &self,
-        projection: crate::protocol::ProtocolRunEventProjection,
-    ) -> Result<(), String> {
         self.store
             .protocol_event_store()
-            .append_event_bundle(
-                &projection.runtime_event,
-                projection.history_item.as_ref(),
-                projection.turn_item.as_ref(),
+            .append_sub_agent_activity(
+                owner_session_id,
+                activity_id.to_string(),
+                agent_session_id,
+                agent_path.to_string(),
+                activity_kind,
             )
-            .map_err(|error| error.to_string())
-    }
-
-    fn latest_or_new_turn(&self, session_id: SessionId) -> Result<TurnId, String> {
-        self.store
-            .protocol_event_store()
-            .latest_turn_position_for_session(session_id)
-            .map(|position| {
-                position
-                    .map(|(turn_id, _)| turn_id)
-                    .unwrap_or_else(TurnId::new)
-            })
             .map_err(|error| error.to_string())
     }
 }
@@ -1502,7 +1476,7 @@ fn effective_run_terminal_cause(
                     summary.status.key()
                 )))
             }
-            SessionStatus::Completed | SessionStatus::AwaitingUser => None,
+            SessionStatus::Completed => None,
         },
     }
 }
@@ -1575,11 +1549,17 @@ async fn load_durable_agent_children(
                 .latest_turn_position_for_session(edge.child_session_id)
                 .map_err(|error| error.to_string())?
             {
-                Some((turn_id, _)) => repo
-                    .corroborated_terminal_for_turn(edge.child_session_id, turn_id)
-                    .await
+                Some((turn_id, _)) => protocol_store
+                    .list_runtime_events(edge.child_session_id, turn_id)
                     .map_err(|error| error.to_string())?
-                    .and_then(|(_, cause)| cause),
+                    .into_iter()
+                    .rev()
+                    .find_map(|event| match event.msg {
+                        crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } => {
+                            terminal.interruption_cause
+                        }
+                        _ => None,
+                    }),
                 None => None,
             }
         } else {
@@ -1617,35 +1597,10 @@ fn latest_error_history_text(history: &[crate::protocol::HistoryItem]) -> Option
 }
 
 fn latest_assistant_history_text(history: &[crate::protocol::HistoryItem]) -> Option<String> {
-    let (message_id, latest_content) =
-        history.iter().rev().find_map(|item| match &item.payload {
-            HistoryItemPayload::Message {
-                message_id,
-                role: crate::session::MessageRole::Assistant,
-                content,
-            } => Some((*message_id, content.as_slice())),
-            _ => None,
-        })?;
-    if let Some(message_id) = message_id {
-        let text = history
-            .iter()
-            .filter_map(|item| match &item.payload {
-                HistoryItemPayload::Message {
-                    message_id: Some(candidate_id),
-                    role: crate::session::MessageRole::Assistant,
-                    content,
-                } if *candidate_id == message_id => Some(content.as_slice()),
-                _ => None,
-            })
-            .flatten()
-            .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
-                ContentPart::Image { .. } => None,
-            })
-            .collect::<String>();
-        return (!text.trim().is_empty()).then(|| text.trim().to_string());
-    }
-    content_parts_text(latest_content, "\n")
+    history.iter().rev().find_map(|item| match &item.payload {
+        HistoryItemPayload::AssistantMessage { content, .. } => content_parts_text(content, "\n"),
+        _ => None,
+    })
 }
 
 fn latest_history_text<'a>(
@@ -1712,7 +1667,7 @@ fn durable_child_terminal_status(status: SessionStatus, result: Option<String>) 
     match status {
         SessionStatus::Idle => AgentStatus::Shutdown,
         SessionStatus::Running => AgentStatus::Running,
-        SessionStatus::Completed | SessionStatus::AwaitingUser => AgentStatus::Completed(result),
+        SessionStatus::Completed => AgentStatus::Completed(result),
         SessionStatus::Cancelled => AgentStatus::Interrupted,
         SessionStatus::Failed => {
             AgentStatus::Errored(result.unwrap_or_else(|| {
@@ -1738,12 +1693,7 @@ fn agent_status_from_terminal_result(
             }))
         }
         None => match result {
-            Ok(summary)
-                if matches!(
-                    summary.status,
-                    SessionStatus::Completed | SessionStatus::AwaitingUser
-                ) =>
-            {
+            Ok(summary) if summary.status == SessionStatus::Completed => {
                 AgentStatus::Completed(content)
             }
             Ok(summary) => AgentStatus::Errored(format!(
@@ -1795,14 +1745,10 @@ impl EventRenderer for AgentEventRenderer {
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
-    fn render_session_show(&mut self, _transcript: &Transcript) -> Result<(), CliRenderError> {
-        Ok(())
-    }
     fn render_session_history_items(
         &mut self,
         _session: &SessionRecord,
         _history_items: &[crate::protocol::HistoryItem],
-        _show_reasoning: bool,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
@@ -1830,18 +1776,6 @@ impl EventRenderer for AgentEventRenderer {
     fn render_session_runtime_event_page(
         &mut self,
         _page: &CanonicalRuntimeEventPage,
-    ) -> Result<(), CliRenderError> {
-        Ok(())
-    }
-    fn render_session_compact_result(
-        &mut self,
-        _result: &SessionCompactResult,
-    ) -> Result<(), CliRenderError> {
-        Ok(())
-    }
-    fn render_session_memory_mode_update(
-        &mut self,
-        _update: &SessionMemoryModeUpdate,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }

@@ -1,7 +1,6 @@
-use crate::protocol::{TurnInterruptionCause, TurnItem};
+use crate::protocol::{HistoryItem, HistoryItemPayload, TurnInterruptionCause};
 use crate::session::{
-    ProjectId, PromptDispatchPart, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus,
-    TodoItem, Transcript, latest_context_window_from_transcript,
+    CanonicalSessionRead, ProjectId, PromptDispatchPart, SessionId, SessionStatus,
 };
 use crate::tui::state::{AppState, RunStatus};
 
@@ -18,7 +17,7 @@ use super::startup::DesktopStartupState;
 use super::view_state::DesktopViewState;
 use crate::config::ProviderMetadataMode;
 use crate::config::ResolvedConfig;
-use crate::llm::{ModelAvailabilityReport, ProviderModelInfo, normalize_provider_base_url};
+use crate::llm::{ProviderModelInfo, normalize_provider_base_url};
 
 pub const MIN_WINDOW_OPACITY_PERCENT: i32 = 50;
 pub const MAX_WINDOW_OPACITY_PERCENT: i32 = 100;
@@ -116,69 +115,13 @@ impl DesktopState {
             workspace_root,
             &self.provider_config.effective_config,
         );
-        if self.startup.status == super::startup::DesktopStartupStatus::Loading {
-            self.view
-                .async_operations
-                .begin_unique(DesktopAsyncOperationKind::StartupReadinessCheck);
-        } else {
-            self.view
-                .async_operations
-                .finish_kind(DesktopAsyncOperationKind::StartupReadinessCheck);
-        }
         self.apply_startup_overlay();
     }
 
-    pub fn finish_startup_provider_model_load(&mut self, report: &ModelAvailabilityReport) {
-        self.startup.complete_model_availability(report);
-        self.sync_startup_readiness_operation();
-        self.apply_startup_overlay();
-    }
-
-    pub fn fail_startup_provider_model_load(&mut self, message: impl Into<String>) {
-        self.startup.fail_provider_availability(message);
-        self.sync_startup_readiness_operation();
-        self.apply_startup_overlay();
-    }
-
-    pub fn finish_startup_docling_check(&mut self, base_url: &str) {
-        self.startup.complete_docling_check(base_url);
-        self.sync_startup_readiness_operation();
-        self.apply_startup_overlay();
-    }
-
-    pub fn fail_startup_docling_check(&mut self, message: impl Into<String>) {
-        self.startup.fail_docling_check(message);
-        self.sync_startup_readiness_operation();
-        self.apply_startup_overlay();
-    }
-
-    pub fn retarget_startup_readiness_for_config_change(&mut self) -> bool {
-        if self.startup.status == super::startup::DesktopStartupStatus::Ready {
-            return false;
-        }
-        self.startup.begin_provider_availability(
-            &self.provider_config.effective_config.model.base_url,
-            &self.provider_config.effective_config.model.model,
-        );
+    pub fn refresh_startup_config_status(&mut self) {
         self.startup
-            .begin_docling_check(&self.provider_config.effective_config);
-        self.sync_startup_readiness_operation();
+            .refresh_config(&self.provider_config.effective_config);
         self.apply_startup_overlay();
-        true
-    }
-
-    pub fn startup_provider_readiness_pending(&self) -> bool {
-        self.startup.checks.iter().any(|check| {
-            check.key == "provider"
-                && check.status == super::startup::DesktopStartupCheckStatus::Pending
-        })
-    }
-
-    pub fn startup_docling_readiness_pending(&self) -> bool {
-        self.startup.checks.iter().any(|check| {
-            check.key == "docling"
-                && check.status == super::startup::DesktopStartupCheckStatus::Pending
-        })
     }
 
     pub fn replace_snapshot(&mut self, mut snapshot: DesktopSnapshot) {
@@ -596,22 +539,8 @@ impl DesktopState {
             .finish_kind(DesktopAsyncOperationKind::HistoryExport);
     }
 
-    pub fn begin_current_todo_refresh(&mut self) {
-        self.view
-            .async_operations
-            .begin_unique(DesktopAsyncOperationKind::CurrentTodoRefresh);
-    }
-
-    pub fn finish_current_todo_refresh(&mut self) {
-        self.view
-            .async_operations
-            .finish_kind(DesktopAsyncOperationKind::CurrentTodoRefresh);
-    }
-
     pub fn async_polling_required(&self) -> bool {
-        self.view.async_operations.polling_required()
-            || self.is_busy()
-            || self.startup.status == super::startup::DesktopStartupStatus::Loading
+        self.view.async_operations.polling_required() || self.is_busy()
     }
 
     pub fn pending_async_operation_keys(&self) -> Vec<String> {
@@ -634,24 +563,6 @@ impl DesktopState {
         self.view
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::SessionLoad);
-    }
-
-    fn sync_startup_readiness_operation(&mut self) {
-        if self.startup.status == super::startup::DesktopStartupStatus::Loading {
-            if !self
-                .view
-                .async_operations
-                .is_pending(DesktopAsyncOperationKind::StartupReadinessCheck)
-            {
-                self.view
-                    .async_operations
-                    .begin_unique(DesktopAsyncOperationKind::StartupReadinessCheck);
-            }
-        } else {
-            self.view
-                .async_operations
-                .finish_kind(DesktopAsyncOperationKind::StartupReadinessCheck);
-        }
     }
 
     pub fn selected_session_title(&self) -> String {
@@ -706,7 +617,6 @@ impl DesktopState {
                 transcript_text: "チャットはまだありません。".to_string(),
                 transcript_rows: vec![crate::desktop::models::DesktopTranscriptRow {
                     row_kind: crate::desktop::models::DesktopTranscriptRowKind::EmptyPlaceholder,
-                    kind: "empty_placeholder".to_string(),
                     step: "00".to_string(),
                     title: "チャットはありません".to_string(),
                     body: if self.selected_project_id().is_some() {
@@ -724,8 +634,6 @@ impl DesktopState {
                 progress_text: "待機中\nフェーズ: 準備完了\n手順: 実行中の作業はありません"
                     .to_string(),
                 run_status_text: "待機中".to_string(),
-                confirmation_text: String::new(),
-                confirmation_visible: false,
                 artifacts: Vec::new(),
                 file_changes: Vec::new(),
                 file_change_summary_text: "ファイル変更はまだありません。".to_string(),
@@ -869,39 +777,20 @@ impl DesktopState {
         target_changed
     }
 
-    pub fn load_open_session(
-        &mut self,
-        session: &SessionRecord,
-        transcript: &Transcript,
-        turn_items: &[TurnItem],
-        state: SessionStateSnapshot,
-        todos: Vec<TodoItem>,
-        turn_page_offset: usize,
-        turn_page_limit: usize,
-        turn_page_total: usize,
-        turn_page_has_more: bool,
-    ) {
+    pub fn load_open_session(&mut self, read: &CanonicalSessionRead) {
+        let session = &read.session;
+        let turn_items = &read.turns.items;
         self.provider_config.update_access_mode(session.access_mode);
         self.bind_composer_to_loaded_session(session.id);
-        let open_session = OpenSessionView::from_loaded(
-            session,
-            transcript,
-            turn_items,
-            state.clone(),
-            todos.clone(),
-            turn_page_offset,
-            turn_page_limit,
-            turn_page_total,
-            turn_page_has_more,
-        );
-        self.app_state
-            .load_turn_items(session, turn_items, state, todos);
+        let open_session = OpenSessionView::from_loaded(read);
+        self.app_state.load_turn_items(session, turn_items);
         self.status_code = self
             .app_state
             .interruption_cause
             .map(DesktopStatusCode::from_interruption)
             .unwrap_or(DesktopStatusCode::Plain);
-        if let Some(context_window) = latest_context_window_from_transcript(transcript) {
+        if let Some(context_window) = latest_context_window_from_history_items(&read.history.items)
+        {
             self.app_state.latest_context_window = Some(context_window);
         }
         self.open_session = Some(open_session);
@@ -917,30 +806,16 @@ impl DesktopState {
         self.view.artifact_selected_index = 0;
     }
 
-    pub fn refresh_open_session_projection(
-        &mut self,
-        session: &SessionRecord,
-        transcript: &Transcript,
-        turn_items: &[TurnItem],
-        state: SessionStateSnapshot,
-        todos: Vec<TodoItem>,
-        turn_page_offset: usize,
-        turn_page_limit: usize,
-        turn_page_total: usize,
-        turn_page_has_more: bool,
-    ) {
-        let open_session = OpenSessionView::from_loaded(
-            session,
-            transcript,
-            turn_items,
-            state,
-            todos,
-            turn_page_offset,
-            turn_page_limit,
-            turn_page_total,
-            turn_page_has_more,
-        );
+    pub fn refresh_open_session_projection(&mut self, read: &CanonicalSessionRead) {
+        let session = &read.session;
+        let turn_items = &read.turns.items;
+        let open_session = OpenSessionView::from_loaded(read);
         let detail = open_session.stored_detail().clone();
+        self.app_state.refresh_plan_from_turn_items(turn_items);
+        if let Some(context_window) = latest_context_window_from_history_items(&read.history.items)
+        {
+            self.app_state.latest_context_window = Some(context_window);
+        }
         self.open_session = Some(open_session);
         self.snapshot.replace_detail(detail);
         self.update_session_row_title(session.id, &session.title);
@@ -950,9 +825,10 @@ impl DesktopState {
     pub fn apply_run_event(&mut self, event: &crate::session::RunEvent) {
         self.app_state.apply_run_event(event);
         self.status_code = match event {
-            crate::session::RunEvent::SessionInterrupted {
-                cause: Some(cause), ..
-            } => DesktopStatusCode::from_interruption(*cause),
+            crate::session::RunEvent::TurnTerminal { terminal, .. } => terminal
+                .interruption_cause
+                .map(DesktopStatusCode::from_interruption)
+                .unwrap_or(DesktopStatusCode::Plain),
             _ => DesktopStatusCode::Plain,
         };
         match event {
@@ -963,17 +839,11 @@ impl DesktopState {
             crate::session::RunEvent::SessionTitleUpdated { session_id, title } => {
                 self.update_session_row_title(*session_id, title);
             }
-            crate::session::RunEvent::SessionCompleted { session_id, .. } => {
-                self.update_session_row_status(*session_id, SessionStatus::Completed);
-            }
-            crate::session::RunEvent::SessionAwaitingUser { session_id, .. } => {
-                self.update_session_row_status(*session_id, SessionStatus::AwaitingUser);
-            }
-            crate::session::RunEvent::SessionInterrupted { session_id, .. } => {
-                self.update_session_row_status(*session_id, SessionStatus::Cancelled);
-            }
-            crate::session::RunEvent::SessionFailed { session_id, .. } => {
-                self.update_session_row_status(*session_id, SessionStatus::Failed);
+            crate::session::RunEvent::TurnTerminal {
+                session_id,
+                terminal,
+            } => {
+                self.update_session_row_status(*session_id, terminal.status.as_session_status());
             }
             _ => {}
         }
@@ -1027,8 +897,9 @@ impl DesktopState {
         }
     }
 
-    pub fn push_local_prompt_dispatch(&mut self, prompt_dispatch: &PromptDispatchPart) {
-        self.app_state.push_local_prompt_dispatch(prompt_dispatch);
+    pub fn apply_durable_prompt_dispatch(&mut self, prompt_dispatch: &PromptDispatchPart) {
+        self.app_state
+            .apply_durable_prompt_dispatch(prompt_dispatch);
     }
 
     pub fn begin_prompt_enhance(&mut self, request_id: u64, raw_prompt: &str) {
@@ -1499,10 +1370,7 @@ impl DesktopState {
     }
 
     pub fn is_busy(&self) -> bool {
-        matches!(
-            self.app_state.run_status,
-            RunStatus::Running | RunStatus::Confirming
-        )
+        matches!(self.app_state.run_status, RunStatus::Running)
     }
 
     pub fn can_open_session(&self) -> bool {
@@ -1590,6 +1458,17 @@ impl DesktopState {
             self.view.overlay = DesktopOverlay::None;
         }
     }
+}
+
+fn latest_context_window_from_history_items(
+    items: &[HistoryItem],
+) -> Option<crate::context::ContextWindowTokenStatus> {
+    items.iter().rev().find_map(|item| match &item.payload {
+        HistoryItemPayload::RequestDiagnostics { diagnostics } => {
+            diagnostics.context_window.clone()
+        }
+        _ => None,
+    })
 }
 
 fn truncate_for_search(value: &str, max_chars: usize) -> String {
@@ -1682,12 +1561,10 @@ mod tests {
     use super::*;
     use crate::config::AccessMode;
     use crate::desktop::models::{DesktopProjectRow, DesktopSessionRow};
-    use crate::llm::ModelAvailabilityStatus;
     use crate::session::ProjectId;
     use crate::session::{
-        AssistantMessageMeta, MessageId, MessageMetadata, MessagePart, MessageRecord, MessageRole,
-        PartId, PartKind, PartRecord, RequestDiagnosticsPart, SessionModelParameters, TextPart,
-        Transcript, TranscriptMessage,
+        CanonicalHistoryPage, CanonicalTurnPage, RequestDiagnosticsPart, SessionModelParameters,
+        SessionRecord,
     };
 
     fn snapshot(
@@ -1747,122 +1624,92 @@ mod tests {
         }
     }
 
-    fn transcript_with_context_window(
+    fn canonical_read(
         session: &SessionRecord,
-        context_window: crate::context::ContextWindowTokenStatus,
-    ) -> Transcript {
-        let user_message_id = MessageId::new();
-        let diagnostics_message_id = MessageId::new();
-        Transcript {
+        history_items: Vec<HistoryItem>,
+        turn_items: Vec<crate::protocol::TurnItem>,
+    ) -> CanonicalSessionRead {
+        CanonicalSessionRead {
             session: session.clone(),
-            messages: vec![
-                TranscriptMessage {
-                    record: MessageRecord {
-                        id: user_message_id,
-                        session_id: session.id,
-                        role: MessageRole::User,
-                        parent_message_id: None,
-                        sequence_no: 1,
-                        created_at_ms: 1,
-                        metadata: MessageMetadata::User(crate::session::UserMessageMeta {
-                            cwd: session.cwd.clone(),
-                            requested_model: Some(session.model.clone()),
-                            editor_context: None,
-                        }),
-                    },
-                    parts: vec![PartRecord {
-                        id: PartId::new(),
-                        message_id: user_message_id,
-                        sequence_no: 1,
-                        kind: PartKind::Text,
-                        payload: MessagePart::Text(TextPart {
-                            text: "hello".to_string(),
-                        }),
-                    }],
-                },
-                TranscriptMessage {
-                    record: MessageRecord {
-                        id: diagnostics_message_id,
-                        session_id: session.id,
-                        role: MessageRole::Assistant,
-                        parent_message_id: None,
-                        sequence_no: 2,
-                        created_at_ms: 2,
-                        metadata: MessageMetadata::Assistant(AssistantMessageMeta {
-                            model: session.model.clone(),
-                            base_url: session.base_url.clone(),
-                            finish_reason: None,
-                            token_usage: None,
-                            summary: false,
-                        }),
-                    },
-                    parts: vec![PartRecord {
-                        id: PartId::new(),
-                        message_id: diagnostics_message_id,
-                        sequence_no: 1,
-                        kind: PartKind::RequestDiagnostics,
-                        payload: MessagePart::RequestDiagnostics(RequestDiagnosticsPart {
-                            provider: "openai_compat".to_string(),
-                            model_name: session.model.clone(),
-                            base_url: session.base_url.clone(),
-                            request_timeout_ms: 30_000,
-                            stream_idle_timeout_ms: 30_000,
-                            stream_max_retries: 0,
-                            configured_max_output_tokens: Some(8_192),
-                            effective_max_output_tokens: Some(8_192),
-                            output_budget_reason: None,
-                            supports_tools: Some(true),
-                            supports_reasoning: Some(false),
-                            supports_images: Some(false),
-                            system_prompt_chars: 0,
-                            tool_count: 0,
-                            tool_choice: Some("auto".to_string()),
-                            parallel_tool_calls: Some(false),
-                            provider_message_count: 0,
-                            image_count: 0,
-                            image_bytes: 0,
-                            tool_names: Vec::new(),
-                            tool_schemas: Vec::new(),
-                            turn_decision: None,
-                            control_envelope: None,
-                            replay_policies: Vec::new(),
-                            context_window: Some(context_window),
-                            messages: Vec::new(),
-                        }),
-                    }],
-                },
-            ],
+            history: CanonicalHistoryPage {
+                session: session.clone(),
+                offset: 0,
+                limit: usize::MAX,
+                total: history_items.len(),
+                has_more: false,
+                items: history_items,
+            },
+            turns: CanonicalTurnPage {
+                session: session.clone(),
+                offset: 0,
+                limit: 50,
+                total: turn_items.len(),
+                has_more: false,
+                items: turn_items,
+            },
+            active_turn_id: None,
+            active_turn_sequence_no: None,
         }
     }
 
-    fn passing_model_report(config: &ResolvedConfig) -> ModelAvailabilityReport {
-        ModelAvailabilityReport {
-            gate: "model_availability".to_string(),
-            status: ModelAvailabilityStatus::Pass,
-            generated_by: "desktop_state_test".to_string(),
-            model: config.model.model.clone(),
-            base_url: config.model.base_url.clone(),
-            provider_metadata_mode: config.model.provider_metadata_mode,
-            v1_present: true,
-            native_present: true,
-            require_vision: false,
-            vision_capable: false,
-            vision_probe_passed: false,
-            vision_probes: Vec::new(),
-            tool_use_capable: Some(true),
-            capability_overrides: Vec::new(),
-            tool_call_probe_passed: true,
-            tool_call_probes: Vec::new(),
-            reasoning_capable: Some(false),
-            context: Some(config.model.context_window),
-            max_output_tokens: Some(config.model.max_output_tokens),
-            max_parallel_predictions: Some(config.model.max_parallel_predictions),
-            matched_model: None,
-            v1_models: Vec::new(),
-            native_models: Vec::new(),
-            openai_error: None,
-            native_error: None,
-            checked_at_ms: 0,
+    fn terminal_event(
+        session_id: SessionId,
+        status: crate::protocol::TurnTerminalStatus,
+        summary: &str,
+        cause: Option<crate::protocol::TurnInterruptionCause>,
+    ) -> crate::session::RunEvent {
+        crate::session::RunEvent::TurnTerminal {
+            session_id,
+            terminal: Box::new(crate::session::DurableTurnTerminal {
+                status,
+                finish_reason: None,
+                interruption_cause: cause,
+                final_response_id: None,
+                summary: summary.to_string(),
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
+        }
+    }
+
+    fn diagnostics_history_item(
+        session: &SessionRecord,
+        context_window: Option<crate::context::ContextWindowTokenStatus>,
+    ) -> HistoryItem {
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id: session.id,
+            turn_id: crate::protocol::TurnId::new(),
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::RequestDiagnostics {
+                diagnostics: RequestDiagnosticsPart {
+                    provider: "openai_compat".to_string(),
+                    model_name: session.model.clone(),
+                    base_url: session.base_url.clone(),
+                    request_timeout_ms: 30_000,
+                    stream_idle_timeout_ms: 30_000,
+                    configured_max_output_tokens: Some(8_192),
+                    effective_max_output_tokens: Some(8_192),
+                    output_budget_reason: None,
+                    supports_tools: Some(true),
+                    supports_reasoning: Some(false),
+                    supports_images: Some(false),
+                    system_prompt_chars: 0,
+                    tool_count: 0,
+                    tool_choice: Some("auto".to_string()),
+                    parallel_tool_calls: Some(false),
+                    provider_message_count: 0,
+                    image_count: 0,
+                    image_bytes: 0,
+                    tool_names: Vec::new(),
+                    tool_schemas: Vec::new(),
+                    context_window,
+                    messages: Vec::new(),
+                },
+            },
         }
     }
 
@@ -1891,11 +1738,15 @@ mod tests {
     }
 
     #[test]
-    fn load_open_session_restores_latest_context_window_from_transcript() {
+    fn load_open_session_restores_latest_context_window_from_canonical_history() {
         let session_id = SessionId::new();
         let session = session_record(session_id);
         let status = context_window_status(2_100);
-        let transcript = transcript_with_context_window(&session, status.clone());
+        let read = canonical_read(
+            &session,
+            vec![diagnostics_history_item(&session, Some(status.clone()))],
+            Vec::new(),
+        );
         let mut state = DesktopState::new(
             snapshot(
                 vec![session_row(session_id, "opened", SessionStatus::Completed)],
@@ -1904,19 +1755,26 @@ mod tests {
             ResolvedConfig::default(),
         );
 
-        state.load_open_session(
-            &session,
-            &transcript,
-            &[],
-            SessionStateSnapshot::default(),
-            Vec::new(),
-            0,
-            0,
-            0,
-            false,
-        );
+        state.load_open_session(&read);
 
         assert_eq!(state.app_state.latest_context_window, Some(status));
+    }
+
+    #[test]
+    fn canonical_history_context_window_uses_last_measured_diagnostics() {
+        let session = session_record(SessionId::new());
+        let earlier = context_window_status(1_200);
+        let latest_measured = context_window_status(2_400);
+        let items = vec![
+            diagnostics_history_item(&session, Some(earlier)),
+            diagnostics_history_item(&session, Some(latest_measured.clone())),
+            diagnostics_history_item(&session, None),
+        ];
+
+        assert_eq!(
+            latest_context_window_from_history_items(&items),
+            Some(latest_measured)
+        );
     }
 
     #[test]
@@ -1940,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_provider_catalog_does_not_complete_startup_readiness() {
+    fn startup_uses_config_only_and_catalog_remains_an_explicit_operation() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = "http://127.0.0.1:1234".to_string();
         config.model.model = "qwen/qwen3.6-35b-a3b".to_string();
@@ -1948,32 +1806,28 @@ mod tests {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
 
         state.begin_startup(true, None, camino::Utf8Path::new("C:/workspace"));
-        state.fail_startup_provider_model_load("provider failed");
-
-        assert_eq!(state.view.overlay, DesktopOverlay::ProviderEditor);
-        assert!(state.view.startup_overlay_forced);
-
-        state.begin_provider_model_load(config.model.base_url.clone());
-        assert_eq!(
-            state.startup.status,
-            super::super::startup::DesktopStartupStatus::RequiresProvider
-        );
-        state.finish_provider_model_load(initial_provider_model_infos(&config));
-        assert!(state.can_apply_provider_selection());
-        assert_eq!(
-            state.startup.status,
-            super::super::startup::DesktopStartupStatus::RequiresProvider
-        );
-        assert_eq!(state.view.overlay, DesktopOverlay::ProviderEditor);
-
-        state.finish_startup_provider_model_load(&passing_model_report(&config));
-
         assert_eq!(
             state.startup.status,
             super::super::startup::DesktopStartupStatus::Ready
         );
-        assert_eq!(state.view.overlay, DesktopOverlay::None);
-        assert!(!state.view.startup_overlay_forced);
+        assert!(!state.async_polling_required());
+        assert!(
+            !state
+                .pending_async_operation_keys()
+                .iter()
+                .any(|key| key == "startup_readiness_check")
+        );
+
+        state.begin_provider_model_load(config.model.base_url.clone());
+        assert!(state.provider_model_load_pending());
+        assert!(state.async_polling_required());
+        state.finish_provider_model_load(initial_provider_model_infos(&config));
+        assert!(state.can_apply_provider_selection());
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::Ready
+        );
+        assert!(!state.async_polling_required());
     }
 
     #[test]
@@ -2030,13 +1884,14 @@ mod tests {
                 ResolvedConfig::default(),
             );
             live.app_state.current_session_id = Some(session_id);
-            live.apply_run_event(&crate::session::RunEvent::SessionInterrupted {
+            live.apply_run_event(&terminal_event(
                 session_id,
-                reason: "opaque live interruption".to_string(),
-                cause: Some(cause),
-            });
+                crate::protocol::TurnTerminalStatus::Interrupted,
+                "opaque live interruption",
+                Some(cause),
+            ));
 
-            let terminal = TurnItem {
+            let terminal = crate::protocol::TurnItem {
                 id: crate::protocol::TurnItemId::new(),
                 session_id,
                 turn_id: crate::protocol::TurnId::new(),
@@ -2048,10 +1903,7 @@ mod tests {
                     cause: Some(cause),
                 },
             };
-            let transcript = Transcript {
-                session: session.clone(),
-                messages: Vec::new(),
-            };
+            let read = canonical_read(&session, Vec::new(), vec![terminal]);
             let mut rehydrated = DesktopState::new(
                 snapshot(
                     vec![session_row(
@@ -2063,17 +1915,7 @@ mod tests {
                 ),
                 ResolvedConfig::default(),
             );
-            rehydrated.load_open_session(
-                &session,
-                &transcript,
-                &[terminal],
-                SessionStateSnapshot::default(),
-                Vec::new(),
-                0,
-                50,
-                1,
-                false,
-            );
+            rehydrated.load_open_session(&read);
 
             assert_eq!(rehydrated.status_code, live.status_code);
             assert_eq!(
@@ -2117,50 +1959,40 @@ mod tests {
     }
 
     #[test]
-    fn startup_config_retarget_is_pending_without_catalog_and_ready_is_terminal() {
+    fn startup_config_refresh_is_local_and_never_creates_async_work() {
         let mut config = ResolvedConfig::default();
-        config.model.base_url = "http://127.0.0.1:1234".to_string();
+        config.model.base_url = String::new();
         config.model.model = "model-a".to_string();
         config.docling.enabled = false;
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
         state.begin_startup(true, None, camino::Utf8Path::new("C:/workspace"));
-        state.fail_startup_provider_model_load("provider failed");
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::RequiresProvider
+        );
+        assert!(!state.async_polling_required());
 
+        config.model.base_url = "http://127.0.0.1:1234".to_string();
         config.model.model = "model-b".to_string();
         state.reset_effective_config(config.clone());
-        assert!(state.retarget_startup_readiness_for_config_change());
-        assert!(state.startup_provider_readiness_pending());
+        state.refresh_startup_config_status();
         assert!(!state.provider_model_load_pending());
         assert_eq!(
             state.startup.status,
-            super::super::startup::DesktopStartupStatus::Loading
-        );
-
-        state.finish_startup_provider_model_load(&passing_model_report(&config));
-        assert_eq!(
-            state.startup.status,
             super::super::startup::DesktopStartupStatus::Ready
         );
-        let mut later_edit = config;
-        later_edit.model.model = "model-c".to_string();
-        state.reset_effective_config(later_edit);
-        assert!(!state.retarget_startup_readiness_for_config_change());
-        assert_eq!(
-            state.startup.status,
-            super::super::startup::DesktopStartupStatus::Ready
-        );
+        assert!(!state.async_polling_required());
     }
 
     #[test]
     fn configured_provider_startup_overlay_can_be_closed() {
         let mut config = ResolvedConfig::default();
-        config.model.base_url = "http://127.0.0.1:1234".to_string();
+        config.model.base_url = String::new();
         config.model.model = "qwen/qwen3.6-35b-a3b".to_string();
         config.docling.enabled = false;
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config);
 
         state.begin_startup(true, None, camino::Utf8Path::new("C:/workspace"));
-        state.fail_startup_provider_model_load("provider failed");
 
         assert_eq!(state.view.overlay, DesktopOverlay::ProviderEditor);
         assert!(!state.startup.requires_initial_setup());
@@ -2180,7 +2012,6 @@ mod tests {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
 
         state.begin_startup(false, None, camino::Utf8Path::new("C:/workspace"));
-        state.finish_startup_provider_model_load(&passing_model_report(&config));
 
         assert_eq!(
             state.startup.status,
@@ -2322,10 +2153,12 @@ mod tests {
         state.app_state.current_session_title = "docx/xlsx要約".to_string();
         state.app_state.run_status = RunStatus::Running;
 
-        state.apply_run_event(&crate::session::RunEvent::SessionCompleted {
+        state.apply_run_event(&terminal_event(
             session_id,
-            finish_reason: None,
-        });
+            crate::protocol::TurnTerminalStatus::Completed,
+            "run completed",
+            None,
+        ));
 
         assert_eq!(state.app_state.run_status, RunStatus::Completed);
         let short_id = session_id.to_string().chars().take(8).collect::<String>();

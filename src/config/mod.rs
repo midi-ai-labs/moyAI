@@ -8,10 +8,10 @@ pub use model::{
     AccessMode, ChatCompletionsReasoningParameters, DEFAULT_MODEL_BASE_URL,
     DEFAULT_MODEL_CONTEXT_WINDOW, DEFAULT_MODEL_MAX_OUTPUT_TOKENS, DEFAULT_MODEL_NAME,
     DoclingConfig, FormatConfig, FormatterRule, InstructionConfig, LogVerbosity, LoggingConfig,
-    McpConfig, McpServerConfig, McpTransportKind, ModelConfig, MultiAgentConfig, MultiAgentMode,
-    NewlineStyle, PermissionsConfig, PromptProfile, ProviderApiMode, ProviderMetadataMode,
-    ProviderReasoningCapability, ReasoningEffort, ReasoningSummary, ResolvedConfig, SessionConfig,
-    ShellConfig, ShellFamily, ToolOutputConfig, WorkspaceConfig,
+    McpConfig, McpServerConfig, McpToolRouteConfig, McpTransportKind, ModelConfig,
+    MultiAgentConfig, MultiAgentMode, NewlineStyle, PermissionsConfig, ProviderApiMode,
+    ProviderMetadataMode, ProviderReasoningCapability, ReasoningEffort, ReasoningSummary,
+    ResolvedConfig, SessionConfig, ShellConfig, ShellFamily, ToolOutputConfig, WorkspaceConfig,
 };
 pub use permission_profile_catalog::{
     PermissionProfileCatalog, PermissionProfileEntry, builtin_permission_profiles,

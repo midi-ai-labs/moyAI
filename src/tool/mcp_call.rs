@@ -3,10 +3,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::ToolError;
-use crate::session::SessionRepository;
 use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
-use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
+use crate::tool::{ToolName, ToolResult, ToolSpec};
 
 #[derive(Debug, Deserialize)]
 pub struct McpCallInput {
@@ -23,6 +22,7 @@ impl Tool for McpCallTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::McpCall,
+            effect: crate::tool::ToolEffectPolicy::McpCall,
             description: "List tools from a configured MCP server, or call a specific MCP tool. Use this for explicit MCP workflows that are configured in the current environment.",
             input_schema: json!({
                 "type": "object",
@@ -41,6 +41,8 @@ impl Tool for McpCallTool {
         raw_arguments: Value,
         mut ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        let effect =
+            crate::tool::ToolEffectPolicy::McpCall.resolve(&raw_arguments, &ctx.config.mcp);
         let input = serde_json::from_value::<McpCallInput>(raw_arguments)?;
         let summary = match input
             .tool_name
@@ -53,29 +55,13 @@ impl Tool for McpCallTool {
         };
         let effect_admission = ctx
             .confirm_if_needed(
-                crate::workspace::AccessKind::Read,
+                effect.access_kind(),
                 summary,
                 Vec::new(),
                 false,
-                vec![PermissionRisk::Network],
+                effect.permission_risks(),
             )
             .await?;
-        let route = ctx
-            .services
-            .store
-            .session_repo()
-            .get_state(ctx.session.session.id)
-            .await?
-            .route;
-        let route = match route {
-            crate::session::TaskRoute::Code => "code",
-            crate::session::TaskRoute::Docs => "docs",
-            crate::session::TaskRoute::Review => "review",
-            crate::session::TaskRoute::Debug => "debug",
-            crate::session::TaskRoute::Ask => "ask",
-            crate::session::TaskRoute::Summary => "summary",
-        };
-
         let operation = match input
             .tool_name
             .as_deref()
@@ -87,7 +73,6 @@ impl Tool for McpCallTool {
                     .mcp
                     .call_tool(
                         &input.server_id,
-                        route,
                         tool_name,
                         input.arguments.unwrap_or(Value::Object(Default::default())),
                         || effect_admission.admit(),
@@ -97,7 +82,7 @@ impl Tool for McpCallTool {
             None => {
                 ctx.services
                     .mcp
-                    .list_tools(&input.server_id, route, || effect_admission.admit())
+                    .list_tools(&input.server_id, || effect_admission.admit())
                     .await?
             }
         };
@@ -114,13 +99,16 @@ impl Tool for McpCallTool {
                     .collect::<Vec<_>>();
                 let output_text = if tools.is_empty() {
                     format!(
-                        "MCP server `{server_id}` returned no tools. Check the server configuration or route allowlist before retrying."
+                        "MCP server `{server_id}` returned no tools. Check the server configuration or explicit tool routes before retrying."
                     )
                 } else {
                     let mut lines = vec![format!("MCP tools for `{server_id}`:")];
                     for tool in &visible_tools {
                         let description = tool.description.as_deref().unwrap_or("no description");
-                        lines.push(format!("- {}: {}", tool.name, description));
+                        lines.push(format!(
+                            "- {} [{}]: {}",
+                            tool.name, tool.effect, description
+                        ));
                     }
                     if visible_tools.len() < tools.len() {
                         lines.push(format!(
@@ -144,7 +132,9 @@ impl Tool for McpCallTool {
                         "tool_count": tools.len(),
                         "tools": visible_tools.iter().map(|tool| json!({
                             "name": tool.name.clone(),
+                            "effect": tool.effect,
                             "description": tool.description.clone(),
+                            "annotations": tool.annotations.clone(),
                             "input_schema": tool.input_schema.clone(),
                         })).collect::<Vec<_>>(),
                     }),
@@ -177,6 +167,7 @@ impl Tool for McpCallTool {
                         "server_id": server_id,
                         "endpoint": endpoint,
                         "tool_name": tool_name,
+                        "effect": effect,
                         "raw_result_bytes": raw_json.len(),
                         "raw_result_sha256": crate::harness::artifact::hash_bytes(raw_json.as_bytes()),
                         "raw_result_preview": raw_result_preview,

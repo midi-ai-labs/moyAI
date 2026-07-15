@@ -129,6 +129,7 @@ impl Tool for ListTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::List,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "List files and directories under a path",
             input_schema: json!({
                 "type": "object",
@@ -242,6 +243,7 @@ impl Tool for GlobTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::Glob,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "Find files by glob pattern",
             input_schema: json!({
                 "type": "object",
@@ -342,6 +344,7 @@ impl Tool for GrepTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::Grep,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "Search file contents with a regex pattern",
             input_schema: json!({
                 "type": "object",

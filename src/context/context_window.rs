@@ -114,7 +114,6 @@ mod tests {
             parallel_tool_calls: false,
             timeout_ms: 1,
             stream_idle_timeout_ms: 1,
-            stream_max_retries: 0,
             extra_headers: BTreeMap::new(),
             temperature: None,
             top_p: None,

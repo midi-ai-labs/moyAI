@@ -318,10 +318,8 @@ test("permission actions send typed approve and abort decisions", async () => {
 });
 
 test("run cancellation remains available while only the child agent tree is active", () => {
-  assert.equal(runCanBeCancelled({ busy: false, confirmation_visible: false, agent_tree_active: false }), false);
-  assert.equal(runCanBeCancelled({ busy: true, confirmation_visible: false, agent_tree_active: false }), true);
-  assert.equal(runCanBeCancelled({ busy: false, confirmation_visible: true, agent_tree_active: false }), true);
-  assert.equal(runCanBeCancelled({ busy: false, confirmation_visible: false, agent_tree_active: true }), true);
+  assert.equal(runCanBeCancelled({ can_cancel_run: false }), false);
+  assert.equal(runCanBeCancelled({ can_cancel_run: true }), true);
   assert.equal(runSurfaceActive({ busy: false, agent_tree_active: true }), true);
   assert.equal(runSurfaceActive({ busy: false, agent_tree_active: false }), false);
 });

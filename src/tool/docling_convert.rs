@@ -63,6 +63,7 @@ impl Tool for DoclingConvertTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::DoclingConvert,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "Convert a local document file or source URL through the configured Docling Serve API. Prefer this for PDF, DOCX, XLSX, and PPTX when `read` blocks structured documents.",
             input_schema: json!({
                 "type": "object",

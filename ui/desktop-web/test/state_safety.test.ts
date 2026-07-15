@@ -26,7 +26,6 @@ import {
   configCommitEnabled,
   navigationIsIdle,
   quickChatDeleteAction,
-  sessionMemoryActions,
   sessionRowCapabilities,
   sessionRowActionAvailable,
 } from "../src/navigation_state.ts";
@@ -281,25 +280,6 @@ test("session row capabilities use row state rather than the global archived-sea
   assert.equal(quickChatDeleteAction("not_loaded"), "delete-chat-session");
 });
 
-test("session memory actions are mutually exclusive from authoritative row state", () => {
-  assert.deepEqual(sessionMemoryActions("idle", "enabled"), {
-    enable: false,
-    disable: true,
-  });
-  assert.deepEqual(sessionMemoryActions("not_loaded", "disabled"), {
-    enable: true,
-    disable: false,
-  });
-  assert.deepEqual(sessionMemoryActions("system_error", "enabled"), {
-    enable: false,
-    disable: true,
-  });
-  assert.deepEqual(sessionMemoryActions("active", "disabled"), {
-    enable: false,
-    disable: false,
-  });
-});
-
 test("settings commit requires a draft except during initial setup", () => {
   assert.equal(configCommitEnabled(false, false, false), false);
   assert.equal(configCommitEnabled(false, true, false), true);
@@ -456,7 +436,6 @@ function rowState(ownerSessionId: string, sessionIds: string[]): DesktopWebState
       session_id: sessionId,
       loaded_status: "idle",
       archived: false,
-      memory_mode: "enabled",
     })),
     selected_session_index: sessionIds.indexOf(ownerSessionId),
   } as DesktopWebState;

@@ -29,6 +29,7 @@ impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::Read,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "Read a UTF-8 or Shift_JIS text file with line numbers. Directories, binary files, large files, checkpoints, and structured documents are redirected to safer workflows. A write baseline is recorded only for UTF-8 files when one read shows every line from the beginning and its tool output is not truncated.",
             input_schema: json!({
                 "type": "object",

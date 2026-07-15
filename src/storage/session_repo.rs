@@ -7,29 +7,50 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use crate::config::AccessMode;
 use crate::error::StorageError;
 use crate::protocol::{
-    HistoryItem, HistoryItemId, HistoryItemPayload, RuntimeEvent, RuntimeEventId, RuntimeEventMsg,
-    SteerTurn, ToolProgressEffect, TurnId, TurnInterruptionCause, TurnItem, TurnItemId,
-    TurnItemPayload, TurnTerminalStatus, UserTurn, VerificationRunResult, VerificationRunStatus,
-    fork_canonical_items_in_transaction, insert_event_bundle_in_transaction,
-    latest_turn_position_for_session, project_protocol_run_event,
+    HistoryItem, HistoryItemId, HistoryItemPayload, InterAgentCommunication, ModelResponseId,
+    RuntimeEvent, RuntimeEventId, RuntimeEventMsg, SteerTurn, TurnId, TurnItem, TurnItemId,
+    TurnItemPayload, UserTurn, fork_canonical_items_in_transaction,
+    insert_session_owned_event_bundle_in_transaction, latest_protocol_turn_ids_in_transaction,
+    latest_turn_position_for_session, project_inter_agent_communication,
+    project_protocol_run_event,
 };
 use crate::runtime::{Clock, SystemClock};
 use crate::session::{
-    CompletionState, DiffSummaryPart, FailureKind, FailureState, FinishReason, MessageId,
-    MessageMetadata, MessagePart, MessageRecord, MessageRole, NewMessage, NewPart, NewSession,
-    PartKind, PartRecord, ProcessPhase, ProjectId, RunEvent, SessionForkResult, SessionId,
-    SessionMemoryMode, SessionMemoryModeUpdate, SessionModelParameters, SessionRecord,
-    SessionRepository, SessionSettingsPatch, SessionSettingsUpdate, SessionSpawnEdge,
-    SessionStateSnapshot, SessionStatus, SessionTitleUpdate, TaskRoute, ThreadGoal,
-    ThreadGoalStatus, TodoItem, TodoKind, TodoPriority, TodoStatus, ToolCallId, ToolCallPart,
-    ToolCallRecord, ToolCallStatus, ToolResultPart, Transcript, TranscriptMessage,
-    VerificationState, validate_thread_goal_objective,
+    FinishReason, NewSession, ProjectId, RunEvent, SessionForkResult, SessionId,
+    SessionModelParameters, SessionRecord, SessionRepository, SessionSettingsPatch,
+    SessionSettingsUpdate, SessionSpawnEdge, SessionStatus, SessionTitleUpdate, ThreadGoal,
+    ThreadGoalStatus, ToolCallId, ToolCallStatus, validate_thread_goal_objective,
 };
 
 pub const RUN_ADMISSION_LEASE_DURATION_MS: i64 = 15_000;
 pub const RUN_ADMISSION_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 const EXPIRED_RUN_RECOVERY_REASON: &str =
     "run owner lease expired before the owner acknowledged shutdown";
+
+/// Capability proving that a protocol bundle is being inserted from the
+/// session repository's atomic state-owner transaction. Its private field
+/// prevents generic runtime/projection code from constructing this authority.
+pub(crate) struct SessionProtocolWriteAuthority(());
+
+const SESSION_PROTOCOL_WRITE_AUTHORITY: SessionProtocolWriteAuthority =
+    SessionProtocolWriteAuthority(());
+
+#[derive(Debug, Clone)]
+pub struct PendingToolCallWrite {
+    pub id: ToolCallId,
+    pub model_call_id: String,
+    pub tool_name: String,
+    pub arguments_json: String,
+    pub protocol_sequence_no: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelResponseWrite {
+    pub response_id: ModelResponseId,
+    pub assistant_text: Option<String>,
+    pub assistant_protocol_sequence_no: Option<i64>,
+    pub tool_calls: Vec<PendingToolCallWrite>,
+}
 
 #[derive(Clone)]
 pub struct SqliteSessionRepository {
@@ -41,6 +62,7 @@ pub enum AdmittedTerminalCommit {
     Applied,
     AlreadyTerminalizedBySameAdmission,
     UnseenSteer { expected: usize, actual: usize },
+    UnseenAgentCommunication { expected: usize, actual: usize },
     NotOwned,
 }
 
@@ -49,12 +71,6 @@ pub enum RunAdmissionLeaseRenewalOutcome {
     Renewed,
     GracefulTerminal,
     SupersededOrExpired,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TerminalEventDescriptor {
-    session_id: SessionId,
-    status: SessionStatus,
 }
 
 impl AdmittedTerminalCommit {
@@ -236,7 +252,7 @@ impl SqliteSessionRepository {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id FROM sessions
-             WHERE status IN ('running', 'awaiting_user')
+             WHERE status = 'running'
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC",
         )?;
         let ids = statement
@@ -321,32 +337,12 @@ impl SqliteSessionRepository {
             .map_err(StorageError::from)
     }
 
-    pub async fn session_projection_state(
-        &self,
-        session_id: SessionId,
-    ) -> Result<(bool, SessionMemoryMode), StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection
-            .query_row(
-                "SELECT archived_at_ms IS NOT NULL, memory_mode
-                 FROM sessions WHERE id = ?1",
-                params![session_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, bool>(0)?,
-                        parse_memory_mode(&row.get::<_, String>(1)?),
-                    ))
-                },
-            )
-            .map_err(StorageError::from)
-    }
-
     pub async fn list_sessions_with_projection_state(
         &self,
         project_id: ProjectId,
         limit: usize,
         include_archived: bool,
-    ) -> Result<Vec<(SessionRecord, bool, SessionMemoryMode)>, StorageError> {
+    ) -> Result<Vec<(SessionRecord, bool)>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let archived_filter = if include_archived {
             ""
@@ -356,7 +352,7 @@ impl SqliteSessionRepository {
         let sql = format!(
             "SELECT id, title, status, cwd_path, model_name, base_url, access_mode,
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
-                    archived_at_ms IS NOT NULL, memory_mode
+                    archived_at_ms IS NOT NULL
              FROM sessions
              WHERE project_id = ?1{archived_filter}
                AND NOT EXISTS (
@@ -398,7 +394,6 @@ impl SqliteSessionRepository {
                         completed_at_ms: row.get(10)?,
                     },
                     row.get::<_, bool>(11)?,
-                    parse_memory_mode(&row.get::<_, String>(12)?),
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -411,7 +406,7 @@ impl SqliteSessionRepository {
         query: &str,
         limit: usize,
         include_archived: bool,
-    ) -> Result<Vec<(SessionRecord, bool, SessionMemoryMode)>, StorageError> {
+    ) -> Result<Vec<(SessionRecord, bool)>, StorageError> {
         let normalized = format!(
             "%{}%",
             escape_like_literal(&query.trim().to_ascii_lowercase())
@@ -425,7 +420,7 @@ impl SqliteSessionRepository {
         let sql = format!(
             "SELECT id, title, status, cwd_path, model_name, base_url, access_mode,
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
-                    archived_at_ms IS NOT NULL, memory_mode
+                    archived_at_ms IS NOT NULL
              FROM sessions
              WHERE project_id = ?1{archived_filter}
                AND NOT EXISTS (
@@ -476,55 +471,11 @@ impl SqliteSessionRepository {
                             completed_at_ms: row.get(10)?,
                         },
                         row.get::<_, bool>(11)?,
-                        parse_memory_mode(&row.get::<_, String>(12)?),
                     ))
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
-    }
-
-    pub async fn insert_tool_call(
-        &self,
-        session_id: SessionId,
-        message_id: MessageId,
-        tool_name: &str,
-        arguments_json: &str,
-        title: Option<&str>,
-        metadata_json: serde_json::Value,
-    ) -> Result<ToolCallRecord, StorageError> {
-        let id = ToolCallId::new();
-        let started_at_ms = SystemClock::now_ms();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "INSERT INTO tool_calls (id, session_id, message_id, tool_name, status, arguments_json, title, metadata_json, output_text, truncated_output_path, error_text, started_at_ms, finished_at_ms)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, NULL, NULL, NULL, ?8, NULL)",
-            params![
-                id.to_string(),
-                session_id.to_string(),
-                message_id.to_string(),
-                tool_name,
-                arguments_json,
-                title,
-                serde_json::to_string(&metadata_json)?,
-                started_at_ms
-            ],
-        )?;
-        Ok(ToolCallRecord {
-            id,
-            session_id,
-            message_id,
-            tool_name: parse_tool_name(tool_name),
-            status: ToolCallStatus::Pending,
-            arguments_json: arguments_json.to_string(),
-            title: title.map(|value| value.to_string()),
-            metadata_json,
-            output_text: None,
-            truncated_output_path: None,
-            error_text: None,
-            started_at_ms,
-            finished_at_ms: None,
-        })
     }
 
     pub async fn session_owns_truncated_output(
@@ -535,8 +486,12 @@ impl SqliteSessionRepository {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let owned = connection.query_row(
             "SELECT EXISTS(
-                 SELECT 1 FROM tool_calls
-                 WHERE session_id = ?1 AND truncated_output_path = ?2
+                 SELECT 1
+                 FROM tool_calls AS tool
+                 INNER JOIN protocol_history_items AS history
+                    ON history.id = tool.history_item_id
+                 WHERE history.session_id = ?1
+                   AND tool.truncated_output_path = ?2
              )",
             params![session_id.to_string(), path.as_str()],
             |row| row.get::<_, bool>(0),
@@ -544,112 +499,92 @@ impl SqliteSessionRepository {
         Ok(owned)
     }
 
-    pub async fn mark_tool_call_running(
-        &self,
-        tool_call_id: ToolCallId,
-    ) -> Result<(), StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "UPDATE tool_calls
-             SET status = 'running'
-             WHERE id = ?1 AND status = 'pending'",
-            params![tool_call_id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    pub async fn complete_tool_call(
-        &self,
-        tool_call_id: ToolCallId,
-        title: &str,
-        metadata_json: serde_json::Value,
-        output_text: &str,
-        truncated_output_path: Option<&camino::Utf8Path>,
-    ) -> Result<(), StorageError> {
-        let finished_at_ms = SystemClock::now_ms();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "UPDATE tool_calls
-             SET status = 'completed',
-                 title = ?2,
-                 metadata_json = ?3,
-                 output_text = ?4,
-                 truncated_output_path = ?5,
-                 error_text = NULL,
-                 finished_at_ms = ?6
-             WHERE id = ?1 AND status IN ('pending', 'running')",
-            params![
-                tool_call_id.to_string(),
-                title,
-                serde_json::to_string(&metadata_json)?,
-                output_text,
-                truncated_output_path.map(|value| value.as_str()),
-                finished_at_ms
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub async fn fail_tool_call(
-        &self,
-        tool_call_id: ToolCallId,
-        error_text: &str,
-    ) -> Result<(), StorageError> {
-        let finished_at_ms = SystemClock::now_ms();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "UPDATE tool_calls
-             SET status = 'failed',
-                 error_text = ?2,
-                 finished_at_ms = ?3
-             WHERE id = ?1 AND status IN ('pending', 'running')",
-            params![tool_call_id.to_string(), error_text, finished_at_ms],
-        )?;
-        Ok(())
-    }
-
-    pub async fn fail_unfinished_tool_calls(
+    pub async fn rollback_session_transaction(
         &self,
         session_id: SessionId,
-        error_text: &str,
-    ) -> Result<(), StorageError> {
-        let finished_at_ms = SystemClock::now_ms();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        fail_unfinished_tool_calls_in_connection(
-            &connection,
-            session_id,
-            error_text,
-            finished_at_ms,
-        )?;
-        Ok(())
-    }
-
-    pub async fn update_message_metadata(
-        &self,
-        message_id: MessageId,
-        metadata: &MessageMetadata,
-    ) -> Result<(), StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "UPDATE messages SET metadata_json = ?2 WHERE id = ?1",
-            params![message_id.to_string(), serde_json::to_string(metadata)?],
-        )?;
-        Ok(())
-    }
-
-    pub async fn reset_state_after_protocol_rollback(
-        &self,
-        session_id: SessionId,
-        state: &SessionStateSnapshot,
-    ) -> Result<SessionRecord, StorageError> {
+        num_turns: usize,
+    ) -> Result<crate::session::SessionRollbackResult, StorageError> {
+        if num_turns == 0 {
+            return Err(StorageError::Message(
+                "session rollback turn count must be greater than zero".to_string(),
+            ));
+        }
         let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM session_todos WHERE session_id = ?1",
-            params![session_id.to_string()],
-        )?;
-        upsert_session_state_row(&transaction, session_id, state, now)?;
+
+        session_record_from_connection(&transaction, session_id)?;
+        let root_session_id = transaction
+            .query_row(
+                "SELECT root_session_id
+                 FROM session_spawn_edges
+                 WHERE child_session_id = ?1",
+                params![session_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| {
+                value
+                    .parse::<SessionId>()
+                    .map_err(|error| StorageError::Message(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or(session_id);
+        let active_tree_session = transaction
+            .query_row(
+                "SELECT id
+                 FROM sessions
+                 WHERE (
+                     id = ?1
+                     OR id IN (
+                         SELECT child_session_id
+                         FROM session_spawn_edges
+                         WHERE root_session_id = ?1
+                     )
+                 )
+                   AND (status = 'running' OR active_run_id IS NOT NULL)
+                 ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END, id ASC
+                 LIMIT 1",
+                params![root_session_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(active_tree_session) = active_tree_session {
+            return Err(StorageError::Message(format!(
+                "session {session_id} belongs to agent tree {root_session_id}, which still has active session {active_tree_session}; stop the complete agent tree before rollback"
+            )));
+        }
+
+        let dropped_turn_ids =
+            latest_protocol_turn_ids_in_transaction(&transaction, session_id, num_turns)?;
+        if dropped_turn_ids.len() < num_turns {
+            return Err(StorageError::Message(format!(
+                "cannot rollback {num_turns} turn(s); session {session_id} only has {} canonical turn(s)",
+                dropped_turn_ids.len()
+            )));
+        }
+        for turn_id in &dropped_turn_ids {
+            transaction.execute(
+                "DELETE FROM protocol_turn_items WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM protocol_history_items WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM protocol_runtime_events WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM protocol_item_append_order WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+        }
         transaction.execute(
             "UPDATE sessions
              SET status = 'idle', updated_at_ms = ?2, completed_at_ms = NULL,
@@ -658,55 +593,18 @@ impl SqliteSessionRepository {
              WHERE id = ?1",
             params![session_id.to_string(), now],
         )?;
+        let remaining_history_items = transaction.query_row(
+            "SELECT COUNT(*) FROM protocol_history_items WHERE session_id = ?1",
+            params![session_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let session = session_record_from_connection(&transaction, session_id)?;
         transaction.commit()?;
-        drop(connection);
-        self.get_session(session_id).await
-    }
-
-    pub async fn copy_session_state_and_todos(
-        &self,
-        source_session_id: SessionId,
-        target_session_id: SessionId,
-    ) -> Result<(), StorageError> {
-        if source_session_id == target_session_id {
-            return Err(StorageError::Message(
-                "cannot copy session state into the same session".to_string(),
-            ));
-        }
-        let state = self.get_state(source_session_id).await?;
-        let todos = self.list_todos(source_session_id).await?;
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        upsert_session_state_row(&transaction, target_session_id, &state, now)?;
-        transaction.execute(
-            "DELETE FROM session_todos WHERE session_id = ?1",
-            params![target_session_id.to_string()],
-        )?;
-        for (position, todo) in todos.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO session_todos (
-                     session_id, todo_id, position, content, kind, status, priority, targets_json,
-                     depends_on_json, success_criteria_json, blocked_by_json
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    target_session_id.to_string(),
-                    todo.id.to_string(),
-                    position as i64,
-                    todo.content,
-                    todo_kind_text(todo.kind),
-                    todo_status_text(todo.status),
-                    todo_priority_text(todo.priority),
-                    serde_json::to_string(&todo.targets)?,
-                    serde_json::to_string(&todo.depends_on)?,
-                    serde_json::to_string(&todo.success_criteria)?,
-                    serde_json::to_string(&todo.blocked_by)?
-                ],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
+        Ok(crate::session::SessionRollbackResult {
+            session,
+            dropped_turn_ids,
+            remaining_history_items,
+        })
     }
 
     pub async fn fork_session_snapshot(
@@ -717,10 +615,19 @@ impl SqliteSessionRepository {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let source = session_record_from_connection(&transaction, source_session_id)?;
-        let source_was_active = matches!(
-            source.status,
-            SessionStatus::Running | SessionStatus::AwaitingUser
-        );
+        let source_was_active = source.status == SessionStatus::Running;
+        let source_active_turn_id = transaction
+            .query_row(
+                "SELECT active_turn_id FROM sessions WHERE id = ?1",
+                params![source_session_id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .map(|value| {
+                value
+                    .parse::<TurnId>()
+                    .map_err(|error| StorageError::Message(error.to_string()))
+            })
+            .transpose()?;
         let title = title
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().to_string())
@@ -730,10 +637,10 @@ impl SqliteSessionRepository {
         let inserted = transaction.execute(
             "INSERT INTO sessions (
                  id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                 memory_mode, model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms
+                 model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms
              )
              SELECT ?2, project_id, ?3, 'idle', cwd_path, model_name, base_url, access_mode,
-                    memory_mode, model_parameters_json, ?4, ?4, NULL
+                    model_parameters_json, ?4, ?4, NULL
              FROM sessions WHERE id = ?1",
             params![
                 source_session_id.to_string(),
@@ -748,63 +655,22 @@ impl SqliteSessionRepository {
             )));
         }
 
-        let copied_state = transaction.execute(
-            "INSERT INTO session_state (
-                 session_id, task_route, phase, review_scope_json, active_todo_id,
-                 active_targets_json, contract_refs_json, failure_kind, failure_summary,
-                 failure_tool_name, failure_targets_json, verification_todo_id,
-                 verification_commands_json, verification_failures_json,
-                 verification_evidence_summary, completion_closeout_ready,
-                 completion_open_work_count, completion_verification_pending,
-                 completion_route_contract_pending, completion_blocked_reason,
-                 completion_route_contract_summary, docs_route_state_json,
-                 implementation_handoff_json, verification_failure_cluster_json,
-                 verification_requirement_refs_json, token_accounting_json, updated_at_ms
-             )
-             SELECT ?2, task_route, phase, review_scope_json, active_todo_id,
-                    active_targets_json, contract_refs_json, failure_kind, failure_summary,
-                    failure_tool_name, failure_targets_json, verification_todo_id,
-                    verification_commands_json, verification_failures_json,
-                    verification_evidence_summary, completion_closeout_ready,
-                    completion_open_work_count, completion_verification_pending,
-                    completion_route_contract_pending, completion_blocked_reason,
-                    completion_route_contract_summary, docs_route_state_json,
-                    implementation_handoff_json, verification_failure_cluster_json,
-                    verification_requirement_refs_json, token_accounting_json, ?3
-             FROM session_state WHERE session_id = ?1",
-            params![
-                source_session_id.to_string(),
-                target_session_id.to_string(),
-                now
-            ],
-        )?;
-        if copied_state == 0 {
-            upsert_session_state_row(
-                &transaction,
-                target_session_id,
-                &SessionStateSnapshot::default(),
-                now,
-            )?;
-        }
-        transaction.execute(
-            "INSERT INTO session_todos (
-                 session_id, todo_id, position, content, kind, status, priority, targets_json,
-                 depends_on_json, success_criteria_json, blocked_by_json
-             )
-             SELECT ?2, todo_id, position, content, kind, status, priority, targets_json,
-                    depends_on_json, success_criteria_json, blocked_by_json
-             FROM session_todos WHERE session_id = ?1",
-            params![source_session_id.to_string(), target_session_id.to_string()],
-        )?;
         let (copied_history_items, copied_turn_items) = fork_canonical_items_in_transaction(
             &transaction,
             source_session_id,
             target_session_id,
         )?;
         if source_was_active {
+            let snapshot_turn_id = match source_active_turn_id {
+                Some(turn_id) => turn_id,
+                None => latest_turn_position_for_session(&transaction, target_session_id)?
+                    .map(|(turn_id, _)| turn_id)
+                    .unwrap_or_else(TurnId::new),
+            };
             append_interrupted_live_snapshot_marker_in_transaction(
                 &transaction,
                 target_session_id,
+                snapshot_turn_id,
                 "forked from active live session snapshot",
             )?;
         }
@@ -817,19 +683,6 @@ impl SqliteSessionRepository {
             copied_turn_items,
             interrupted_live_snapshot: source_was_active,
         })
-    }
-
-    pub async fn get_session_memory_mode(
-        &self,
-        id: SessionId,
-    ) -> Result<SessionMemoryMode, StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let value: String = connection.query_row(
-            "SELECT memory_mode FROM sessions WHERE id = ?1",
-            params![id.to_string()],
-            |row| row.get(0),
-        )?;
-        Ok(parse_memory_mode(&value))
     }
 
     pub async fn get_thread_goal(
@@ -1132,244 +985,20 @@ impl SqliteSessionRepository {
         row.map(stored_thread_goal_from_row).transpose()
     }
 
-    pub async fn append_user_message_with_protocol_bundle(
-        &self,
-        draft: NewMessage,
-        admission_id: &str,
-        parts: Vec<NewPart>,
-        initial_state: &SessionStateSnapshot,
-        turn: &UserTurn,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: i64,
-    ) -> Result<MessageRecord, StorageError> {
-        let id = MessageId::new();
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-        let metadata_json = serde_json::to_string(&draft.metadata)?;
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let activated = transaction.execute(
-            "UPDATE sessions
-             SET status = 'running',
-                 updated_at_ms = ?4,
-                 completed_at_ms = NULL,
-                 active_turn_id = ?3
-             WHERE id = ?1
-               AND active_run_id = ?2
-               AND status = 'running'
-               AND active_turn_id IS NULL
-               AND active_run_lease_expires_at_ms > ?5",
-            params![
-                draft.session_id.to_string(),
-                admission_id,
-                protocol_turn_id.to_string(),
-                now,
-                now
-            ],
-        )? == 1;
-        if !activated {
-            return Err(StorageError::Message(format!(
-                "run admission {admission_id} no longer owns session {} while storing its user turn",
-                draft.session_id
-            )));
-        }
-        let sequence_no = next_message_sequence_in_transaction(&transaction, draft.session_id)?;
-
-        transaction.execute(
-            "DELETE FROM session_todos WHERE session_id = ?1",
-            params![draft.session_id.to_string()],
-        )?;
-        upsert_session_state_row(&transaction, draft.session_id, initial_state, now)?;
-        transaction.execute(
-            "INSERT INTO messages (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id.to_string(),
-                draft.session_id.to_string(),
-                draft.parent_message_id.map(|value| value.to_string()),
-                match draft.role {
-                    MessageRole::User => "user",
-                    MessageRole::Assistant => "assistant",
-                },
-                sequence_no,
-                metadata_json,
-                now
-            ],
-        )?;
-        for (part_sequence_no, part) in parts.into_iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO message_parts (id, message_id, sequence_no, part_kind, payload_json, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    crate::session::PartId::new().to_string(),
-                    id.to_string(),
-                    part_sequence_no as i64,
-                    part_kind_text(part.kind),
-                    serde_json::to_string(&part.payload)?,
-                    now
-                ],
-            )?;
-        }
-        let run_event = crate::session::RunEvent::UserTurnStored {
-            session_id: draft.session_id,
-            message_id: id,
-            turn: Box::new(turn.clone()),
-        };
-        let projection = project_protocol_run_event(
-            &run_event,
-            Some(draft.session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )
-        .ok_or_else(|| {
-            StorageError::Message("UserTurnStored did not produce protocol projection".to_string())
-        })?;
-        crate::protocol::insert_event_bundle_in_transaction(
-            &transaction,
-            &projection.runtime_event,
-            projection.history_item.as_ref(),
-            projection.turn_item.as_ref(),
-        )?;
-        transaction.commit()?;
-
-        Ok(MessageRecord {
-            id,
-            session_id: draft.session_id,
-            role: draft.role,
-            parent_message_id: draft.parent_message_id,
-            sequence_no,
-            created_at_ms: now,
-            metadata: draft.metadata,
-        })
-    }
-
-    pub async fn append_assistant_message_with_protocol_start(
-        &self,
-        draft: NewMessage,
-        admission_id: &str,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-        model: String,
-    ) -> Result<(MessageRecord, RunEvent), StorageError> {
-        let id = MessageId::new();
-        let now = SystemClock.now_ms();
-        let metadata_json = serde_json::to_string(&draft.metadata)?;
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active_admission_in_transaction(
-            &transaction,
-            draft.session_id,
-            admission_id,
-            protocol_turn_id,
-        )?;
-        let sequence_no = next_message_sequence_in_transaction(&transaction, draft.session_id)?;
-        transaction.execute(
-            "INSERT INTO messages (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id.to_string(),
-                draft.session_id.to_string(),
-                draft.parent_message_id.map(|value| value.to_string()),
-                match draft.role {
-                    MessageRole::User => "user",
-                    MessageRole::Assistant => "assistant",
-                },
-                sequence_no,
-                metadata_json,
-                now
-            ],
-        )?;
-        let event = RunEvent::AssistantStarted {
-            message_id: id,
-            model,
-        };
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &event,
-            Some(draft.session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        transaction.commit()?;
-        Ok((
-            MessageRecord {
-                id,
-                session_id: draft.session_id,
-                role: draft.role,
-                parent_message_id: draft.parent_message_id,
-                sequence_no,
-                created_at_ms: now,
-                metadata: draft.metadata,
-            },
-            event,
-        ))
-    }
-
-    pub async fn append_message_with_parts_and_protocol_event(
-        &self,
-        draft: NewMessage,
-        parts: Vec<NewPart>,
-        event_factory: impl FnOnce(MessageId) -> RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<(MessageRecord, RunEvent), StorageError> {
-        let id = MessageId::new();
-        let now = SystemClock.now_ms();
-        let metadata_json = serde_json::to_string(&draft.metadata)?;
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        let sequence_no = next_message_sequence_in_transaction(&transaction, draft.session_id)?;
-        transaction.execute(
-            "INSERT INTO messages (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id.to_string(),
-                draft.session_id.to_string(),
-                draft.parent_message_id.map(|value| value.to_string()),
-                match draft.role {
-                    MessageRole::User => "user",
-                    MessageRole::Assistant => "assistant",
-                },
-                sequence_no,
-                metadata_json,
-                now
-            ],
-        )?;
-        for part in parts {
-            insert_part_in_transaction(&transaction, id, part)?;
-        }
-        let event = event_factory(id);
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &event,
-            Some(draft.session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        transaction.commit()?;
-        Ok((
-            MessageRecord {
-                id,
-                session_id: draft.session_id,
-                role: draft.role,
-                parent_message_id: draft.parent_message_id,
-                sequence_no,
-                created_at_ms: now,
-                metadata: draft.metadata,
-            },
-            event,
-        ))
-    }
-
-    pub async fn append_part_with_protocol_bundle(
+    pub async fn append_user_turn_with_protocol_bundle(
         &self,
         session_id: SessionId,
         admission_id: &str,
-        message_id: MessageId,
-        part: NewPart,
-        event: &RunEvent,
+        turn: &UserTurn,
         protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<PartRecord, StorageError> {
+        protocol_sequence_no: i64,
+    ) -> Result<(), StorageError> {
+        if turn.turn_id != protocol_turn_id {
+            return Err(StorageError::Message(format!(
+                "user turn identity mismatch: payload turn {} writer turn {protocol_turn_id}",
+                turn.turn_id
+            )));
+        }
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_active_admission_in_transaction(
@@ -1378,101 +1007,130 @@ impl SqliteSessionRepository {
             admission_id,
             protocol_turn_id,
         )?;
-        let record = insert_part_in_transaction(&transaction, message_id, part)?;
-        insert_protocol_projection_if_requested(
-            &transaction,
-            event,
+        let event = RunEvent::UserTurnStored {
+            session_id,
+            turn: Box::new(turn.clone()),
+        };
+        let projection = project_protocol_run_event(
+            &event,
             Some(session_id),
             protocol_turn_id,
             protocol_sequence_no,
-        )?;
-        transaction.commit()?;
-        Ok(record)
-    }
-
-    pub async fn update_state_with_protocol_event(
-        &self,
-        session_id: SessionId,
-        state: &SessionStateSnapshot,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<(), StorageError> {
-        let now = SystemClock.now_ms();
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        upsert_session_state_row(&transaction, session_id, state, now)?;
-        insert_protocol_projection_if_requested(
+        )
+        .ok_or_else(|| {
+            StorageError::Message("UserTurnStored did not produce a protocol bundle".to_string())
+        })?;
+        let stored = insert_session_owned_event_bundle_in_transaction(
+            &SESSION_PROTOCOL_WRITE_AUTHORITY,
             &transaction,
-            event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
+            &projection.runtime_event,
+            projection.history_item.as_ref(),
+            projection.turn_item.as_ref(),
         )?;
+        let _history_item = stored.history_item.ok_or_else(|| {
+            StorageError::Message(
+                "UserTurnStored protocol bundle omitted its canonical history item".to_string(),
+            )
+        })?;
         transaction.commit()?;
         Ok(())
     }
 
-    pub async fn update_session_title_with_protocol_event(
+    pub fn append_inter_agent_communication_with_protocol_bundle(
         &self,
         session_id: SessionId,
-        title: &str,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<(), StorageError> {
-        let now = SystemClock.now_ms();
+        communication: InterAgentCommunication,
+        require_active_recipient: bool,
+    ) -> Result<HistoryItemId, StorageError> {
+        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "UPDATE sessions SET title = ?2, updated_at_ms = ?3 WHERE id = ?1",
-            params![session_id.to_string(), title, now],
-        )?;
-        insert_protocol_projection_if_requested(
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = transaction
+            .query_row(
+                "SELECT status, active_run_id, active_turn_id, active_run_lease_expires_at_ms
+                 FROM sessions WHERE id = ?1",
+                params![session_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((status, active_run_id, active_turn_id, lease_expires_at_ms)) = state else {
+            return Err(StorageError::Message(format!(
+                "inter-agent communication target session {session_id} does not exist"
+            )));
+        };
+        let active_turn_id = if status == "running"
+            && active_run_id.is_some()
+            && run_lease_is_fresh(lease_expires_at_ms, now)
+        {
+            active_turn_id
+                .map(|value| {
+                    value
+                        .parse::<TurnId>()
+                        .map_err(|error| StorageError::Message(error.to_string()))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let has_active_admission = active_turn_id.is_some();
+        if require_active_recipient && !has_active_admission {
+            return Err(StorageError::Message(format!(
+                "recipient session {session_id} became terminal before inter-agent communication could be committed"
+            )));
+        }
+        let turn_id = match active_turn_id {
+            Some(turn_id) => turn_id,
+            None => TurnId::new(),
+        };
+        let projection = project_inter_agent_communication(session_id, turn_id, 0, communication);
+        let stored = insert_session_owned_event_bundle_in_transaction(
+            &SESSION_PROTOCOL_WRITE_AUTHORITY,
             &transaction,
-            event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
+            &projection.runtime_event,
+            projection.history_item.as_ref(),
+            projection.turn_item.as_ref(),
         )?;
+        let history_item_id = stored
+            .history_item
+            .ok_or_else(|| {
+                StorageError::Message(
+                    "inter-agent communication projection omitted canonical history".to_string(),
+                )
+            })?
+            .id;
         transaction.commit()?;
-        Ok(())
+        Ok(history_item_id)
     }
 
-    pub async fn set_status_with_protocol_event(
+    #[cfg(test)]
+    pub(crate) async fn set_status_for_test(
         &self,
         session_id: SessionId,
         status: SessionStatus,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
     ) -> Result<(), StorageError> {
         if status_is_terminal(status) {
-            validate_terminal_event(session_id, status, event)?;
+            return Err(StorageError::Message(
+                "terminal session status must be written by a TurnTerminal event".to_string(),
+            ));
         }
         let now = SystemClock.now_ms();
         let status_text = match status {
             SessionStatus::Idle => "idle",
             SessionStatus::Running => "running",
             SessionStatus::Completed => "completed",
-            SessionStatus::AwaitingUser => "awaiting_user",
             SessionStatus::Cancelled => "cancelled",
             SessionStatus::Failed => "failed",
         };
-        let completed_at_ms = if matches!(
-            status,
-            SessionStatus::Completed
-                | SessionStatus::AwaitingUser
-                | SessionStatus::Cancelled
-                | SessionStatus::Failed
-        ) {
-            Some(now)
-        } else {
-            None
-        };
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        transaction.execute(
+        let completed_at_ms: Option<i64> = None;
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
             "UPDATE sessions
              SET status = ?2,
                  updated_at_ms = ?3,
@@ -1480,32 +1138,27 @@ impl SqliteSessionRepository {
              WHERE id = ?1",
             params![session_id.to_string(), status_text, now, completed_at_ms],
         )?;
-        insert_protocol_projection_if_requested(
-            &transaction,
-            event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        transaction.commit()?;
         Ok(())
     }
 
-    pub async fn admit_session_run(
+    pub async fn admit_session_turn(
         &self,
         session_id: SessionId,
+        turn_id: TurnId,
     ) -> Result<Option<String>, StorageError> {
-        self.admit_session_run_at(
+        self.admit_session_turn_at(
             session_id,
+            turn_id,
             SystemClock::now_ms(),
             RUN_ADMISSION_LEASE_DURATION_MS,
         )
         .await
     }
 
-    pub async fn admit_session_run_at(
+    pub async fn admit_session_turn_at(
         &self,
         session_id: SessionId,
+        turn_id: TurnId,
         now_ms: i64,
         lease_duration_ms: i64,
     ) -> Result<Option<String>, StorageError> {
@@ -1548,7 +1201,7 @@ impl SqliteSessionRepository {
                 active_turn_id.as_deref(),
                 now,
             )?;
-        } else if matches!(status.as_str(), "running" | "awaiting_user") {
+        } else if status == "running" {
             recover_expired_run_admission_in_transaction(
                 &transaction,
                 session_id,
@@ -1561,17 +1214,18 @@ impl SqliteSessionRepository {
             "UPDATE sessions
              SET status = 'running',
                  updated_at_ms = ?2,
-                 completed_at_ms = NULL,
-                 active_run_id = ?3,
-                 active_turn_id = NULL,
-                 active_run_lease_expires_at_ms = ?4
-             WHERE id = ?1
-               AND active_run_id IS NULL
-               AND status IN ('idle', 'completed', 'cancelled', 'failed')",
+                  completed_at_ms = NULL,
+                  active_run_id = ?3,
+                  active_turn_id = ?4,
+                  active_run_lease_expires_at_ms = ?5
+              WHERE id = ?1
+                AND active_run_id IS NULL
+                AND status IN ('idle', 'completed', 'cancelled', 'failed')",
             params![
                 session_id.to_string(),
                 now,
                 admission_id,
+                turn_id.to_string(),
                 lease_expires_at_ms
             ],
         )? == 1;
@@ -1605,6 +1259,7 @@ impl SqliteSessionRepository {
     ) -> Result<RunAdmissionLeaseRenewalOutcome, StorageError> {
         let now = normalize_run_lease_now_ms(now_ms);
         let requested_expiry = run_lease_expiry_ms(now, lease_duration_ms);
+        let turn_id_text = turn_id.to_string();
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let state = transaction
@@ -1627,11 +1282,9 @@ impl SqliteSessionRepository {
         let outcome = match state {
             Some((status, active_run_id, active_turn_id, lease_expires_at_ms))
                 if active_run_id.as_deref() == Some(admission_id)
-                    && active_turn_id
-                        .as_deref()
-                        .is_none_or(|active_turn_id| active_turn_id == turn_id.to_string())
+                    && active_turn_id.as_deref() == Some(turn_id_text.as_str())
                     && run_lease_is_fresh(lease_expires_at_ms, now)
-                    && matches!(status.as_str(), "running" | "awaiting_user") =>
+                    && status == "running" =>
             {
                 let renewed = transaction.execute(
                     "UPDATE sessions
@@ -1639,15 +1292,15 @@ impl SqliteSessionRepository {
                              active_run_lease_expires_at_ms,
                              ?4
                          )
-                     WHERE id = ?1
-                       AND active_run_id = ?2
-                       AND (active_turn_id IS NULL OR active_turn_id = ?3)
-                       AND active_run_lease_expires_at_ms > ?5
-                       AND status IN ('running', 'awaiting_user')",
+                      WHERE id = ?1
+                        AND active_run_id = ?2
+                        AND active_turn_id = ?3
+                        AND active_run_lease_expires_at_ms > ?5
+                        AND status = 'running'",
                     params![
                         session_id.to_string(),
                         admission_id,
-                        turn_id.to_string(),
+                        turn_id_text,
                         requested_expiry,
                         now
                     ],
@@ -1661,9 +1314,7 @@ impl SqliteSessionRepository {
             Some((status, active_run_id, active_turn_id, lease_expires_at_ms))
                 if matches!(status.as_str(), "completed" | "cancelled" | "failed")
                     && ((active_run_id.as_deref() == Some(admission_id)
-                        && active_turn_id.as_deref().is_none_or(|active_turn_id| {
-                            active_turn_id == turn_id.to_string()
-                        })
+                        && active_turn_id.as_deref() == Some(turn_id_text.as_str())
                         && run_lease_is_fresh(lease_expires_at_ms, now))
                         || active_run_id.is_none()) =>
             {
@@ -1673,37 +1324,6 @@ impl SqliteSessionRepository {
         };
         transaction.commit()?;
         Ok(outcome)
-    }
-
-    pub async fn try_admit_session_run(&self, session_id: SessionId) -> Result<bool, StorageError> {
-        Ok(self.admit_session_run(session_id).await?.is_some())
-    }
-
-    pub async fn activate_admitted_turn(
-        &self,
-        session_id: SessionId,
-        admission_id: &str,
-        turn_id: TurnId,
-    ) -> Result<bool, StorageError> {
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let activated = connection.execute(
-            "UPDATE sessions
-             SET active_turn_id = ?3, updated_at_ms = ?4
-             WHERE id = ?1
-               AND active_run_id = ?2
-               AND status = 'running'
-               AND (active_turn_id IS NULL OR active_turn_id = ?3)
-               AND active_run_lease_expires_at_ms > ?5",
-            params![
-                session_id.to_string(),
-                admission_id,
-                turn_id.to_string(),
-                now,
-                now
-            ],
-        )? == 1;
-        Ok(activated)
     }
 
     pub async fn admitted_run_status(
@@ -1747,73 +1367,44 @@ impl SqliteSessionRepository {
         Ok(status)
     }
 
-    pub async fn corroborated_terminal_status_for_turn(
+    pub async fn durable_terminal_for_turn(
         &self,
         session_id: SessionId,
         turn_id: TurnId,
-    ) -> Result<Option<SessionStatus>, StorageError> {
-        Ok(self
-            .corroborated_terminal_for_turn(session_id, turn_id)
-            .await?
-            .map(|(status, _)| status))
-    }
-
-    pub async fn corroborated_terminal_for_turn(
-        &self,
-        session_id: SessionId,
-        turn_id: TurnId,
-    ) -> Result<Option<(SessionStatus, Option<TurnInterruptionCause>)>, StorageError> {
+    ) -> Result<Option<crate::session::model::DurableTurnTerminal>, StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction()?;
-        let session_status = transaction
-            .query_row(
-                "SELECT status FROM sessions WHERE id = ?1",
-                params![session_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|status| parse_status(&status))
-            .transpose()?;
-        let Some(session_status) = session_status else {
+        let session_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            params![session_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !session_exists {
             transaction.commit()?;
             return Ok(None);
-        };
+        }
         let mut statement = transaction.prepare(
-            "SELECT turn_id, msg_json
+            "SELECT msg_json
              FROM protocol_runtime_events
-             WHERE session_id = ?1
-             ORDER BY rowid DESC",
+             WHERE session_id = ?1 AND turn_id = ?2
+             ORDER BY sequence_no DESC, rowid DESC",
         )?;
-        let rows = statement.query_map(params![session_id.to_string()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let rows = statement.query_map(
+            params![session_id.to_string(), turn_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
         let mut protocol_terminal = None;
         for row in rows {
-            let (terminal_turn_id, msg_json) = row?;
+            let msg_json = row?;
             let msg = serde_json::from_str::<RuntimeEventMsg>(&msg_json)?;
-            let terminal = match msg {
-                RuntimeEventMsg::TurnCompleted { .. } => Some((SessionStatus::Completed, None)),
-                RuntimeEventMsg::TurnAwaitingUser { .. } => {
-                    Some((SessionStatus::AwaitingUser, None))
-                }
-                RuntimeEventMsg::TurnInterrupted { cause, .. } => {
-                    Some((SessionStatus::Cancelled, cause))
-                }
-                RuntimeEventMsg::TurnFailed { .. } => Some((SessionStatus::Failed, None)),
-                _ => None,
-            };
-            if let Some(terminal) = terminal {
-                protocol_terminal = Some((terminal_turn_id, terminal));
+            if let RuntimeEventMsg::TurnTerminal { terminal } = msg {
+                protocol_terminal = Some(*terminal);
                 break;
             }
         }
         drop(statement);
         transaction.commit()?;
-        Ok(protocol_terminal
-            .filter(|(terminal_turn_id, (status, _))| {
-                terminal_turn_id == &turn_id.to_string() && *status == session_status
-            })
-            .map(|(_, terminal)| terminal))
+        Ok(protocol_terminal)
     }
 
     pub async fn active_turn_for_session(
@@ -1830,7 +1421,7 @@ impl SqliteSessionRepository {
                    AND active_run_id IS NOT NULL
                    AND active_turn_id IS NOT NULL
                    AND active_run_lease_expires_at_ms > ?2
-                   AND status IN ('running', 'awaiting_user')",
+                    AND status = 'running'",
                 params![session_id.to_string(), now],
                 |row| row.get::<_, String>(0),
             )
@@ -1902,7 +1493,7 @@ impl SqliteSessionRepository {
                    AND active_run_id = ?2
                    AND active_turn_id = ?3
                    AND active_run_lease_expires_at_ms > ?4
-                   AND status IN ('running', 'awaiting_user')",
+                    AND status = 'running'",
                 params![
                     session_id.to_string(),
                     admission_id,
@@ -1969,7 +1560,7 @@ impl SqliteSessionRepository {
                  active_run_lease_expires_at_ms = NULL
              WHERE id = ?1
                AND active_run_id = ?2
-               AND status NOT IN ('running', 'awaiting_user')",
+               AND status != 'running'",
             params![session_id.to_string(), admission_id],
         )? == 1;
         Ok(released)
@@ -2002,7 +1593,7 @@ impl SqliteSessionRepository {
             .optional()?
             .ok_or_else(|| StorageError::Message(format!("session {session_id} was not found")))?;
         let (status, active_run_id, active_turn_id, lease_expires_at_ms) = state;
-        if !matches!(status.as_str(), "running" | "awaiting_user") {
+        if status != "running" {
             return Err(StorageError::Message(format!(
                 "no active running turn to steer for session {session_id}; current status is {status}"
             )));
@@ -2064,7 +1655,8 @@ impl SqliteSessionRepository {
                 client_user_message_id: steer.client_user_message_id.clone(),
             },
         };
-        let stored = insert_event_bundle_in_transaction(
+        let stored = insert_session_owned_event_bundle_in_transaction(
+            &SESSION_PROTOCOL_WRITE_AUTHORITY,
             &transaction,
             &event,
             Some(&history_item),
@@ -2087,7 +1679,7 @@ impl SqliteSessionRepository {
             .query_row(
                 "SELECT id FROM sessions
                  WHERE project_id = ?1
-                   AND status IN ('running', 'awaiting_user')
+                   AND status = 'running'
                    AND active_run_lease_expires_at_ms > ?2
                  ORDER BY updated_at_ms DESC, id DESC
                  LIMIT 1",
@@ -2107,231 +1699,248 @@ impl SqliteSessionRepository {
     pub async fn terminalize_active_session_with_protocol_event(
         &self,
         session_id: SessionId,
-        status: SessionStatus,
         event: &RunEvent,
         protocol_turn_id: TurnId,
         protocol_sequence_no: Option<i64>,
     ) -> Result<bool, StorageError> {
-        self.terminalize_active_session_with_protocol_event_inner(
-            session_id,
-            status,
-            event,
-            protocol_turn_id,
-            protocol_sequence_no,
-            false,
-        )
-        .await
+        Ok(self
+            .terminalize_turn_with_protocol_event_guarded(
+                session_id,
+                event,
+                protocol_turn_id,
+                protocol_sequence_no,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await?
+            .was_applied())
     }
 
-    /// Recovers an active session after its process owner is known to be gone.
-    ///
-    /// The caller must hold the session process lease. Unlike an external stop,
-    /// orphan recovery clears the durable run admission in the same transaction
-    /// so the recovered session can be admitted again immediately.
     pub async fn recover_orphaned_active_session_with_protocol_event(
         &self,
         session_id: SessionId,
-        status: SessionStatus,
         event: &RunEvent,
         protocol_turn_id: TurnId,
         protocol_sequence_no: Option<i64>,
     ) -> Result<bool, StorageError> {
-        if status == SessionStatus::AwaitingUser {
-            return Err(StorageError::Message(
-                "orphan recovery requires a terminal status".to_string(),
-            ));
-        }
-        self.terminalize_active_session_with_protocol_event_inner(
+        Ok(self
+            .terminalize_turn_with_protocol_event_guarded(
+                session_id,
+                event,
+                protocol_turn_id,
+                protocol_sequence_no,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await?
+            .was_applied())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn terminalize_admitted_turn_with_protocol_event(
+        &self,
+        session_id: SessionId,
+        admission_id: &str,
+        event: &RunEvent,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+        expected_seen_steer_count: Option<usize>,
+        expected_seen_agent_communication_count: Option<usize>,
+        expected_active_goal_id_to_block: Option<&str>,
+    ) -> Result<AdmittedTerminalCommit, StorageError> {
+        self.terminalize_turn_with_protocol_event_guarded(
             session_id,
-            status,
             event,
             protocol_turn_id,
             protocol_sequence_no,
-            true,
+            Some(admission_id),
+            false,
+            expected_seen_steer_count,
+            expected_seen_agent_communication_count,
+            expected_active_goal_id_to_block,
         )
         .await
     }
 
-    async fn terminalize_active_session_with_protocol_event_inner(
+    #[allow(clippy::too_many_arguments)]
+    async fn terminalize_turn_with_protocol_event_guarded(
         &self,
         session_id: SessionId,
-        status: SessionStatus,
         event: &RunEvent,
         protocol_turn_id: TurnId,
         protocol_sequence_no: Option<i64>,
-        clear_run_admission: bool,
-    ) -> Result<bool, StorageError> {
-        validate_terminal_event(session_id, status, event)?;
+        admission_id: Option<&str>,
+        retain_active_admission: bool,
+        expected_seen_steer_count: Option<usize>,
+        expected_seen_agent_communication_count: Option<usize>,
+        expected_active_goal_id_to_block: Option<&str>,
+    ) -> Result<AdmittedTerminalCommit, StorageError> {
+        let terminal = validate_terminal_event(session_id, event)?;
+        let status = terminal.status.as_session_status();
         let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-        let status_text = match status {
-            SessionStatus::Completed => "completed",
-            SessionStatus::AwaitingUser => "awaiting_user",
-            SessionStatus::Cancelled => "cancelled",
-            SessionStatus::Failed => "failed",
-            SessionStatus::Idle | SessionStatus::Running => {
-                return Err(StorageError::Message(
-                    "active session terminalization requires a terminal status".to_string(),
-                ));
-            }
-        };
+        let protocol_turn_id_text = protocol_turn_id.to_string();
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let state = transaction
+            .query_row(
+                "SELECT status, active_run_id, active_turn_id, active_run_lease_expires_at_ms
+                 FROM sessions WHERE id = ?1",
+                params![session_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((current_status, active_run_id, active_turn_id, lease_expires_at_ms)) = state
+        else {
+            transaction.commit()?;
+            return Ok(AdmittedTerminalCommit::NotOwned);
+        };
+
+        if let Some(admission_id) = admission_id {
+            if active_run_id.as_deref() != Some(admission_id)
+                || active_turn_id.as_deref() != Some(protocol_turn_id_text.as_str())
+                || !run_lease_is_fresh(lease_expires_at_ms, now)
+            {
+                transaction.commit()?;
+                return Ok(AdmittedTerminalCommit::NotOwned);
+            }
+            if current_status != "running" {
+                let already_terminal =
+                    terminal_for_turn_in_transaction(&transaction, session_id, protocol_turn_id)?
+                        .is_some();
+                if already_terminal {
+                    transaction.execute(
+                        "UPDATE sessions
+                         SET active_run_id = NULL,
+                             active_turn_id = NULL,
+                             active_run_lease_expires_at_ms = NULL
+                         WHERE id = ?1 AND active_run_id = ?2 AND active_turn_id = ?3",
+                        params![
+                            session_id.to_string(),
+                            admission_id,
+                            protocol_turn_id.to_string(),
+                        ],
+                    )?;
+                    transaction.commit()?;
+                    return Ok(AdmittedTerminalCommit::AlreadyTerminalizedBySameAdmission);
+                }
+                transaction.commit()?;
+                return Ok(AdmittedTerminalCommit::NotOwned);
+            }
+        } else {
+            if active_turn_id
+                .as_deref()
+                .is_some_and(|active_turn_id| active_turn_id != protocol_turn_id.to_string())
+                || current_status != "running"
+            {
+                transaction.commit()?;
+                return Ok(AdmittedTerminalCommit::NotOwned);
+            }
+        }
+
+        if terminal_for_turn_in_transaction(&transaction, session_id, protocol_turn_id)?.is_some() {
+            transaction.commit()?;
+            return Ok(AdmittedTerminalCommit::AlreadyTerminalizedBySameAdmission);
+        }
+
+        if let Some(expected) = expected_seen_steer_count {
+            let actual = count_steer_history_items(&transaction, session_id)?;
+            if actual != expected {
+                transaction.commit()?;
+                return Ok(AdmittedTerminalCommit::UnseenSteer { expected, actual });
+            }
+        }
+        if let Some(expected) = expected_seen_agent_communication_count {
+            let actual = count_agent_communication_history_items(&transaction, session_id)?;
+            if actual != expected {
+                transaction.commit()?;
+                return Ok(AdmittedTerminalCommit::UnseenAgentCommunication { expected, actual });
+            }
+        }
+
+        let status_text = session_status_text(status);
+        let clear_admission = !retain_active_admission;
+        let terminalized = if clear_admission {
+            transaction.execute(
+                "UPDATE sessions
+                 SET status = ?4,
+                     updated_at_ms = ?5,
+                     completed_at_ms = ?5,
+                     active_run_id = NULL,
+                     active_turn_id = NULL,
+                     active_run_lease_expires_at_ms = NULL
+                 WHERE id = ?1
+                   AND (?2 IS NULL OR active_run_id = ?2)
+                   AND (active_turn_id IS NULL OR active_turn_id = ?3)
+                   AND status = 'running'",
+                params![
+                    session_id.to_string(),
+                    admission_id,
+                    protocol_turn_id.to_string(),
+                    status_text,
+                    now,
+                ],
+            )? == 1
+        } else {
+            transaction.execute(
+                "UPDATE sessions
+                 SET status = ?4, updated_at_ms = ?5, completed_at_ms = ?5
+                 WHERE id = ?1
+                   AND (?2 IS NULL OR active_run_id = ?2)
+                   AND (active_turn_id IS NULL OR active_turn_id = ?3)
+                   AND status = 'running'",
+                params![
+                    session_id.to_string(),
+                    admission_id,
+                    protocol_turn_id.to_string(),
+                    status_text,
+                    now,
+                ],
+            )? == 1
+        };
+        if !terminalized {
+            transaction.commit()?;
+            return Ok(AdmittedTerminalCommit::NotOwned);
+        }
+
+        if status == SessionStatus::Failed
+            && let Some(expected_goal_id) = expected_active_goal_id_to_block
+        {
+            transaction.execute(
+                "UPDATE thread_goals
+                 SET status = 'blocked', updated_at_ms = MAX(updated_at_ms + 1, ?3)
+                 WHERE thread_id = ?1 AND goal_id = ?2 AND status = 'active'",
+                params![session_id.to_string(), expected_goal_id, now],
+            )?;
+        }
+
         let protocol_sequence_no = resolve_terminal_protocol_sequence_in_transaction(
             &transaction,
             session_id,
             protocol_turn_id,
             protocol_sequence_no,
         )?;
-        let terminalized = if clear_run_admission {
-            transaction.execute(
-                "UPDATE sessions
-                 SET status = ?2,
-                     updated_at_ms = ?3,
-                     completed_at_ms = ?3,
-                     active_run_id = NULL,
-                     active_turn_id = NULL,
-                     active_run_lease_expires_at_ms = NULL
-                 WHERE id = ?1
-                   AND status IN ('running', 'awaiting_user')
-                   AND (active_turn_id IS NULL OR active_turn_id = ?4)",
-                params![
-                    session_id.to_string(),
-                    status_text,
-                    now,
-                    protocol_turn_id.to_string()
-                ],
-            )?
-        } else {
-            transaction.execute(
-                "UPDATE sessions
-                 SET status = ?2, updated_at_ms = ?3, completed_at_ms = ?3
-                 WHERE id = ?1
-                   AND status IN ('running', 'awaiting_user')
-                   AND (active_turn_id IS NULL OR active_turn_id = ?4)",
-                params![
-                    session_id.to_string(),
-                    status_text,
-                    now,
-                    protocol_turn_id.to_string()
-                ],
-            )?
-        } == 1;
-        if terminalized {
-            let terminal_sequence_no = if status != SessionStatus::AwaitingUser {
-                settle_unfinished_tool_calls_for_terminal_event(
-                    &transaction,
-                    session_id,
-                    event,
-                    protocol_turn_id,
-                    protocol_sequence_no,
-                    now,
-                )?
-            } else {
-                protocol_sequence_no
-            };
-            insert_protocol_projection_if_requested(
-                &transaction,
-                event,
-                Some(session_id),
-                protocol_turn_id,
-                Some(terminal_sequence_no),
-            )?;
-        }
-        transaction.commit()?;
-        Ok(terminalized)
-    }
-
-    pub async fn terminalize_admitted_session_with_protocol_event(
-        &self,
-        session_id: SessionId,
-        admission_id: &str,
-        status: SessionStatus,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<bool, StorageError> {
-        validate_terminal_event(session_id, status, event)?;
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-        let status_text = terminal_status_text(status)?;
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current_state = transaction
-            .query_row(
-                "SELECT status, active_turn_id, active_run_lease_expires_at_ms
-                 FROM sessions
-                 WHERE id = ?1 AND active_run_id = ?2",
-                params![session_id.to_string(), admission_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((current_status, active_turn_id, lease_expires_at_ms)) = current_state else {
-            transaction.commit()?;
-            return Ok(false);
-        };
-        if !run_lease_is_fresh(lease_expires_at_ms, now) {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        if active_turn_id
-            .as_deref()
-            .is_some_and(|active_turn_id| active_turn_id != protocol_turn_id.to_string())
-        {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        let was_active = matches!(current_status.as_str(), "running" | "awaiting_user");
-        if !was_active {
-            let released = transaction.execute(
-                "UPDATE sessions
-                 SET active_run_id = NULL,
-                     active_turn_id = NULL,
-                     active_run_lease_expires_at_ms = NULL
-                 WHERE id = ?1 AND active_run_id = ?2",
-                params![session_id.to_string(), admission_id],
-            )? == 1;
-            transaction.commit()?;
-            return Ok(released);
-        }
-        let mut terminal_sequence_no = resolve_terminal_protocol_sequence_in_transaction(
+        let terminal_sequence_no = settle_unfinished_tool_calls_for_terminal_event(
             &transaction,
             session_id,
+            event,
             protocol_turn_id,
             protocol_sequence_no,
+            now,
         )?;
-        if status == SessionStatus::AwaitingUser {
-            transaction.execute(
-                "UPDATE sessions
-                 SET status = ?3, updated_at_ms = ?4, completed_at_ms = ?4
-                 WHERE id = ?1 AND active_run_id = ?2",
-                params![session_id.to_string(), admission_id, status_text, now],
-            )?;
-        } else {
-            transaction.execute(
-                "UPDATE sessions
-                 SET status = ?3,
-                     updated_at_ms = ?4,
-                     completed_at_ms = ?4,
-                     active_run_id = NULL,
-                     active_turn_id = NULL,
-                     active_run_lease_expires_at_ms = NULL
-                 WHERE id = ?1 AND active_run_id = ?2",
-                params![session_id.to_string(), admission_id, status_text, now],
-            )?;
-            terminal_sequence_no = settle_unfinished_tool_calls_for_terminal_event(
-                &transaction,
-                session_id,
-                event,
-                protocol_turn_id,
-                terminal_sequence_no,
-                now,
-            )?;
-        }
         insert_protocol_projection_if_requested(
             &transaction,
             event,
@@ -2340,22 +1949,16 @@ impl SqliteSessionRepository {
             Some(terminal_sequence_no),
         )?;
         transaction.commit()?;
-        Ok(true)
+        Ok(AdmittedTerminalCommit::Applied)
     }
 
-    pub async fn record_pending_tool_call_with_protocol_bundle(
+    pub async fn record_model_response_with_protocol_bundle(
         &self,
         session_id: SessionId,
         admission_id: &str,
-        message_id: MessageId,
-        tool_name: &str,
-        arguments_json: &str,
-        title: Option<&str>,
-        metadata_json: serde_json::Value,
         protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<(ToolCallRecord, RunEvent), StorageError> {
-        let id = ToolCallId::new();
+        response: ModelResponseWrite,
+    ) -> Result<Vec<RunEvent>, StorageError> {
         let started_at_ms = SystemClock::now_ms();
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2365,78 +1968,87 @@ impl SqliteSessionRepository {
             admission_id,
             protocol_turn_id,
         )?;
-        transaction.execute(
-            "INSERT INTO tool_calls (id, session_id, message_id, tool_name, status, arguments_json, title, metadata_json, output_text, truncated_output_path, error_text, started_at_ms, finished_at_ms)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, NULL, NULL, NULL, ?8, NULL)",
-            params![
-                id.to_string(),
-                session_id.to_string(),
-                message_id.to_string(),
-                tool_name,
-                arguments_json,
-                title,
-                serde_json::to_string(&metadata_json)?,
-                started_at_ms
-            ],
-        )?;
-        let parsed_tool_name = parse_tool_name(tool_name);
-        let event = RunEvent::ToolCallPending {
-            tool_call_id: id,
-            tool: parsed_tool_name,
-            title: title.unwrap_or(tool_name).to_string(),
-            metadata: metadata_json.clone(),
-        };
-        insert_protocol_projection_if_requested(
+        let mut next_fallback_sequence_no = resolve_terminal_protocol_sequence_in_transaction(
             &transaction,
-            &event,
-            Some(session_id),
+            session_id,
             protocol_turn_id,
-            protocol_sequence_no,
+            None,
         )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::ToolCall,
-                payload: MessagePart::ToolCall(ToolCallPart {
-                    tool_call_id: id,
-                    tool_name: parsed_tool_name,
-                    arguments_json: arguments_json.to_string(),
-                    model_arguments_json: metadata_json
-                        .get("tool_route")
-                        .and_then(|route| route.get("original_arguments_json"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string),
-                    effective_arguments_json: Some(arguments_json.to_string()),
-                }),
-            },
-        )?;
+        let mut events = Vec::with_capacity(response.tool_calls.len().saturating_add(1));
+        if let Some(text) = response.assistant_text.filter(|text| !text.is_empty()) {
+            let sequence_no = response
+                .assistant_protocol_sequence_no
+                .unwrap_or(next_fallback_sequence_no);
+            next_fallback_sequence_no =
+                next_fallback_sequence_no.max(sequence_no.saturating_add(1));
+            let event = RunEvent::AssistantMessageCommitted {
+                response_id: response.response_id,
+                text,
+            };
+            insert_protocol_projection_if_requested(
+                &transaction,
+                &event,
+                Some(session_id),
+                protocol_turn_id,
+                Some(sequence_no),
+            )?;
+            events.push(event);
+        }
+        for call in response.tool_calls {
+            let sequence_no = call
+                .protocol_sequence_no
+                .unwrap_or(next_fallback_sequence_no);
+            next_fallback_sequence_no =
+                next_fallback_sequence_no.max(sequence_no.saturating_add(1));
+            let event = RunEvent::ToolCallPending {
+                tool_call_id: call.id,
+                response_id: response.response_id,
+                model_call_id: call.model_call_id,
+                tool_name: call.tool_name,
+                arguments_json: call.arguments_json,
+            };
+            let projection =
+                project_protocol_run_event(&event, Some(session_id), protocol_turn_id, sequence_no)
+                    .ok_or_else(|| {
+                        StorageError::Message(
+                            "ToolCallPending did not produce a protocol bundle".to_string(),
+                        )
+                    })?;
+            let stored = insert_session_owned_event_bundle_in_transaction(
+                &SESSION_PROTOCOL_WRITE_AUTHORITY,
+                &transaction,
+                &projection.runtime_event,
+                projection.history_item.as_ref(),
+                projection.turn_item.as_ref(),
+            )?;
+            let history_item = stored.history_item.ok_or_else(|| {
+                StorageError::Message(
+                    "ToolCallPending protocol bundle omitted its canonical history item"
+                        .to_string(),
+                )
+            })?;
+            validate_canonical_tool_call_payload(&history_item, call.id)?;
+            transaction.execute(
+                "INSERT INTO tool_calls
+                 (id, history_item_id, status, truncated_output_path, started_at_ms, finished_at_ms)
+                 VALUES (?1, ?2, 'pending', NULL, ?3, NULL)",
+                params![
+                    call.id.to_string(),
+                    history_item.id.to_string(),
+                    started_at_ms,
+                ],
+            )?;
+            events.push(event);
+        }
         transaction.commit()?;
-        Ok((
-            ToolCallRecord {
-                id,
-                session_id,
-                message_id,
-                tool_name: parsed_tool_name,
-                status: ToolCallStatus::Pending,
-                arguments_json: arguments_json.to_string(),
-                title: title.map(|value| value.to_string()),
-                metadata_json,
-                output_text: None,
-                truncated_output_path: None,
-                error_text: None,
-                started_at_ms,
-                finished_at_ms: None,
-            },
-            event,
-        ))
+        Ok(events)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn complete_tool_call_with_protocol_bundle(
         &self,
         session_id: SessionId,
         admission_id: &str,
-        message_id: MessageId,
         tool_call_id: ToolCallId,
         tool_name: crate::tool::ToolName,
         title: &str,
@@ -2446,193 +2058,67 @@ impl SqliteSessionRepository {
         protocol_turn_id: TurnId,
         protocol_sequence_no: Option<i64>,
     ) -> Result<Option<RunEvent>, StorageError> {
-        let finished_at_ms = SystemClock::now_ms();
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active_admission_in_transaction(
-            &transaction,
-            session_id,
-            admission_id,
-            protocol_turn_id,
-        )?;
-        let applied = transaction.execute(
-            "UPDATE tool_calls
-             SET status = 'completed',
-                 title = ?2,
-                 metadata_json = ?3,
-                 output_text = ?4,
-                 truncated_output_path = ?5,
-                 error_text = NULL,
-                 finished_at_ms = ?6
-             WHERE id = ?1
-               AND session_id = ?7
-               AND message_id = ?8
-               AND status IN ('pending', 'running')",
-            params![
-                tool_call_id.to_string(),
+        Ok(self
+            .settle_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                tool_call_id,
+                tool_name,
+                ToolCallStatus::Completed,
                 title,
-                serde_json::to_string(&metadata_json)?,
+                metadata_json,
                 output_text,
-                truncated_output_path.map(|value| value.as_str()),
-                finished_at_ms,
-                session_id.to_string(),
-                message_id.to_string()
-            ],
-        )? == 1;
-        if !applied {
-            transaction.commit()?;
-            return Ok(None);
-        }
-        let event = RunEvent::ToolCallCompleted {
-            tool_call_id,
-            tool: tool_name,
-            title: title.to_string(),
-            summary: output_text.to_string(),
-            metadata: metadata_json.clone(),
-        };
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::ToolResult,
-                payload: MessagePart::ToolResult(ToolResultPart {
-                    tool_call_id,
-                    status: ToolCallStatus::Completed,
-                    title: title.to_string(),
-                    summary: output_text.to_string(),
-                    success: tool_success_from_metadata(&metadata_json),
-                    progress_effect: tool_progress_effect_from_metadata(&metadata_json),
-                    blocked_action: metadata_string(&metadata_json, &["blocked_action"]),
-                    result_hash: metadata_string(
-                        &metadata_json,
-                        &["tool_feedback_envelope", "result_hash"],
-                    )
-                    .or_else(|| metadata_string(&metadata_json, &["result_hash"])),
-                }),
-            },
-        )?;
-        transaction.commit()?;
-        Ok(Some(event))
+                truncated_output_path,
+                None,
+                Vec::new(),
+                protocol_turn_id,
+                protocol_sequence_no,
+                None,
+            )
+            .await?
+            .map(|(tool_event, _)| tool_event))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn complete_tool_call_with_file_changes_protocol_bundle(
         &self,
         session_id: SessionId,
         admission_id: &str,
-        message_id: MessageId,
         tool_call_id: ToolCallId,
         tool_name: crate::tool::ToolName,
         title: &str,
         metadata_json: serde_json::Value,
         output_text: &str,
         truncated_output_path: Option<&camino::Utf8Path>,
-        diff_summary: DiffSummaryPart,
         file_changes: Vec<crate::edit::ChangeSummary>,
         protocol_turn_id: TurnId,
         tool_output_sequence_no: Option<i64>,
         file_changes_sequence_no: Option<i64>,
     ) -> Result<Option<(RunEvent, RunEvent)>, StorageError> {
-        validate_file_change_protocol_bundle(tool_call_id, &diff_summary, &file_changes)?;
-        let finished_at_ms = SystemClock::now_ms();
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active_admission_in_transaction(
-            &transaction,
-            session_id,
-            admission_id,
-            protocol_turn_id,
-        )?;
-        let applied = transaction.execute(
-            "UPDATE tool_calls
-             SET status = 'completed',
-                 title = ?2,
-                 metadata_json = ?3,
-                 output_text = ?4,
-                 truncated_output_path = ?5,
-                 error_text = NULL,
-                 finished_at_ms = ?6
-             WHERE id = ?1
-               AND session_id = ?7
-               AND message_id = ?8
-               AND status IN ('pending', 'running')",
-            params![
-                tool_call_id.to_string(),
+        Ok(self
+            .settle_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                tool_call_id,
+                tool_name,
+                ToolCallStatus::Completed,
                 title,
-                serde_json::to_string(&metadata_json)?,
+                metadata_json,
                 output_text,
-                truncated_output_path.map(|value| value.as_str()),
-                finished_at_ms,
-                session_id.to_string(),
-                message_id.to_string()
-            ],
-        )? == 1;
-        if !applied {
-            transaction.commit()?;
-            return Ok(None);
-        }
-        let tool_output_event = RunEvent::ToolCallCompleted {
-            tool_call_id,
-            tool: tool_name,
-            title: title.to_string(),
-            summary: output_text.to_string(),
-            metadata: metadata_json.clone(),
-        };
-        let file_changes_event = RunEvent::FileChangesRecorded {
-            tool_call_id,
-            changes: file_changes,
-        };
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &tool_output_event,
-            Some(session_id),
-            protocol_turn_id,
-            tool_output_sequence_no,
-        )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::ToolResult,
-                payload: MessagePart::ToolResult(ToolResultPart {
-                    tool_call_id,
-                    status: ToolCallStatus::Completed,
-                    title: title.to_string(),
-                    summary: output_text.to_string(),
-                    success: tool_success_from_metadata(&metadata_json),
-                    progress_effect: tool_progress_effect_from_metadata(&metadata_json),
-                    blocked_action: metadata_string(&metadata_json, &["blocked_action"]),
-                    result_hash: metadata_string(
-                        &metadata_json,
-                        &["tool_feedback_envelope", "result_hash"],
-                    )
-                    .or_else(|| metadata_string(&metadata_json, &["result_hash"])),
-                }),
-            },
-        )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::DiffSummary,
-                payload: MessagePart::DiffSummary(diff_summary),
-            },
-        )?;
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &file_changes_event,
-            Some(session_id),
-            protocol_turn_id,
-            file_changes_sequence_no,
-        )?;
-        transaction.commit()?;
-        Ok(Some((tool_output_event, file_changes_event)))
+                truncated_output_path,
+                None,
+                file_changes,
+                protocol_turn_id,
+                tool_output_sequence_no,
+                file_changes_sequence_no,
+            )
+            .await?
+            .map(|(tool_event, file_event)| {
+                (
+                    tool_event,
+                    file_event.expect("file-change settlement includes file event"),
+                )
+            }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2640,7 +2126,6 @@ impl SqliteSessionRepository {
         &self,
         session_id: SessionId,
         admission_id: &str,
-        message_id: MessageId,
         tool_call_id: ToolCallId,
         tool_name: crate::tool::ToolName,
         title: &str,
@@ -2649,7 +2134,6 @@ impl SqliteSessionRepository {
         truncated_output_path: Option<&camino::Utf8Path>,
         status: ToolCallStatus,
         reason: &str,
-        diff_summary: DiffSummaryPart,
         file_changes: Vec<crate::edit::ChangeSummary>,
         protocol_turn_id: TurnId,
         tool_output_sequence_no: Option<i64>,
@@ -2661,118 +2145,37 @@ impl SqliteSessionRepository {
                 status.key()
             )));
         }
-        validate_file_change_protocol_bundle(tool_call_id, &diff_summary, &file_changes)?;
-        let finished_at_ms = SystemClock::now_ms();
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active_admission_in_transaction(
-            &transaction,
-            session_id,
-            admission_id,
-            protocol_turn_id,
-        )?;
-        let error_text = (status == ToolCallStatus::Failed).then_some(reason);
-        let applied = transaction.execute(
-            "UPDATE tool_calls
-             SET status = ?2,
-                 title = ?3,
-                 metadata_json = ?4,
-                 output_text = ?5,
-                 truncated_output_path = ?6,
-                 error_text = ?7,
-                 finished_at_ms = ?8
-             WHERE id = ?1
-               AND session_id = ?9
-               AND message_id = ?10
-               AND status IN ('pending', 'running')",
-            params![
-                tool_call_id.to_string(),
-                status.key(),
+        Ok(self
+            .settle_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                tool_call_id,
+                tool_name,
+                status,
                 title,
-                serde_json::to_string(&metadata_json)?,
+                metadata_json,
                 output_text,
-                truncated_output_path.map(|value| value.as_str()),
-                error_text,
-                finished_at_ms,
-                session_id.to_string(),
-                message_id.to_string()
-            ],
-        )? == 1;
-        if !applied {
-            transaction.commit()?;
-            return Ok(None);
-        }
-        let tool_output_event = match status {
-            ToolCallStatus::Cancelled => RunEvent::ToolCallCancelled {
-                tool_call_id,
-                tool: tool_name,
-                reason: reason.to_string(),
-                metadata: metadata_json.clone(),
-            },
-            ToolCallStatus::Failed => RunEvent::ToolCallFailed {
-                tool_call_id,
-                tool: tool_name,
-                error: reason.to_string(),
-                metadata: metadata_json.clone(),
-            },
-            _ => unreachable!("validated executed terminal status"),
-        };
-        let file_changes_event = RunEvent::FileChangesRecorded {
-            tool_call_id,
-            changes: file_changes,
-        };
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &tool_output_event,
-            Some(session_id),
-            protocol_turn_id,
-            tool_output_sequence_no,
-        )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::ToolResult,
-                payload: MessagePart::ToolResult(ToolResultPart {
-                    tool_call_id,
-                    status,
-                    title: title.to_string(),
-                    summary: output_text.to_string(),
-                    success: (status == ToolCallStatus::Failed).then_some(false),
-                    progress_effect: tool_progress_effect_from_metadata(&metadata_json),
-                    blocked_action: metadata_string(&metadata_json, &["blocked_action"]),
-                    result_hash: metadata_string(
-                        &metadata_json,
-                        &["tool_feedback_envelope", "result_hash"],
-                    )
-                    .or_else(|| metadata_string(&metadata_json, &["result_hash"])),
-                }),
-            },
-        )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::DiffSummary,
-                payload: MessagePart::DiffSummary(diff_summary),
-            },
-        )?;
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &file_changes_event,
-            Some(session_id),
-            protocol_turn_id,
-            file_changes_sequence_no,
-        )?;
-        transaction.commit()?;
-        Ok(Some((tool_output_event, file_changes_event)))
+                truncated_output_path,
+                Some(reason),
+                file_changes,
+                protocol_turn_id,
+                tool_output_sequence_no,
+                file_changes_sequence_no,
+            )
+            .await?
+            .map(|(tool_event, file_event)| {
+                (
+                    tool_event,
+                    file_event.expect("file-change settlement includes file event"),
+                )
+            }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn fail_tool_call_with_protocol_bundle(
         &self,
         session_id: SessionId,
         admission_id: &str,
-        message_id: MessageId,
         tool_call_id: ToolCallId,
         tool_name: crate::tool::ToolName,
         error_text: &str,
@@ -2780,79 +2183,32 @@ impl SqliteSessionRepository {
         protocol_turn_id: TurnId,
         protocol_sequence_no: Option<i64>,
     ) -> Result<Option<RunEvent>, StorageError> {
-        let finished_at_ms = SystemClock::now_ms();
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active_admission_in_transaction(
-            &transaction,
-            session_id,
-            admission_id,
-            protocol_turn_id,
-        )?;
-        let applied = transaction.execute(
-            "UPDATE tool_calls
-             SET status = 'failed',
-                 error_text = ?2,
-                 finished_at_ms = ?3
-             WHERE id = ?1
-               AND session_id = ?4
-               AND message_id = ?5
-               AND status IN ('pending', 'running')",
-            params![
-                tool_call_id.to_string(),
+        Ok(self
+            .settle_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                tool_call_id,
+                tool_name,
+                ToolCallStatus::Failed,
+                "Tool failed",
+                metadata_json,
                 error_text,
-                finished_at_ms,
-                session_id.to_string(),
-                message_id.to_string()
-            ],
-        )? == 1;
-        if !applied {
-            transaction.commit()?;
-            return Ok(None);
-        }
-        let event = RunEvent::ToolCallFailed {
-            tool_call_id,
-            tool: tool_name,
-            error: error_text.to_string(),
-            metadata: metadata_json.clone(),
-        };
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::ToolResult,
-                payload: MessagePart::ToolResult(ToolResultPart {
-                    tool_call_id,
-                    status: ToolCallStatus::Failed,
-                    title: "Tool failed".to_string(),
-                    summary: error_text.to_string(),
-                    success: Some(false),
-                    progress_effect: ToolProgressEffect::Blocked,
-                    blocked_action: metadata_string(&metadata_json, &["blocked_action"]),
-                    result_hash: metadata_string(
-                        &metadata_json,
-                        &["tool_feedback_envelope", "result_hash"],
-                    )
-                    .or_else(|| metadata_string(&metadata_json, &["result_hash"])),
-                }),
-            },
-        )?;
-        transaction.commit()?;
-        Ok(Some(event))
+                None,
+                Some(error_text),
+                Vec::new(),
+                protocol_turn_id,
+                protocol_sequence_no,
+                None,
+            )
+            .await?
+            .map(|(tool_event, _)| tool_event))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn settle_tool_call_without_execution_with_protocol_bundle(
         &self,
         session_id: SessionId,
         admission_id: &str,
-        message_id: MessageId,
         tool_call_id: ToolCallId,
         tool_name: crate::tool::ToolName,
         status: ToolCallStatus,
@@ -2867,6 +2223,62 @@ impl SqliteSessionRepository {
                 status.key()
             )));
         }
+        let title = match status {
+            ToolCallStatus::Declined => "Tool declined",
+            ToolCallStatus::Cancelled => "Tool cancelled",
+            _ => unreachable!(),
+        };
+        Ok(self
+            .settle_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                tool_call_id,
+                tool_name,
+                status,
+                title,
+                metadata_json,
+                reason,
+                None,
+                None,
+                Vec::new(),
+                protocol_turn_id,
+                protocol_sequence_no,
+                None,
+            )
+            .await?
+            .map(|(tool_event, _)| tool_event))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_tool_call_with_protocol_bundle(
+        &self,
+        session_id: SessionId,
+        admission_id: &str,
+        tool_call_id: ToolCallId,
+        tool_name: crate::tool::ToolName,
+        status: ToolCallStatus,
+        title: &str,
+        metadata_json: serde_json::Value,
+        output_text: &str,
+        truncated_output_path: Option<&camino::Utf8Path>,
+        error_text: Option<&str>,
+        file_changes: Vec<crate::edit::ChangeSummary>,
+        protocol_turn_id: TurnId,
+        tool_output_sequence_no: Option<i64>,
+        file_changes_sequence_no: Option<i64>,
+    ) -> Result<Option<(RunEvent, Option<RunEvent>)>, StorageError> {
+        if !matches!(
+            status,
+            ToolCallStatus::Completed
+                | ToolCallStatus::Declined
+                | ToolCallStatus::Cancelled
+                | ToolCallStatus::Failed
+        ) {
+            return Err(StorageError::Message(format!(
+                "tool settlement requires a terminal status, got {}",
+                status.key()
+            )));
+        }
         let finished_at_ms = SystemClock::now_ms();
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2876,440 +2288,91 @@ impl SqliteSessionRepository {
             admission_id,
             protocol_turn_id,
         )?;
+        validate_canonical_tool_call_in_transaction(
+            &transaction,
+            session_id,
+            protocol_turn_id,
+            tool_call_id,
+            tool_name,
+        )?;
+        validate_persisted_file_change_ownership(&transaction, tool_call_id, &file_changes)?;
         let applied = transaction.execute(
             "UPDATE tool_calls
              SET status = ?2,
-                 metadata_json = ?3,
-                 output_text = ?4,
-                 error_text = NULL,
-                 finished_at_ms = ?5
+                 truncated_output_path = ?3,
+                 finished_at_ms = ?4
              WHERE id = ?1
-               AND session_id = ?6
-               AND message_id = ?7
+               AND history_item_id IN (
+                   SELECT id FROM protocol_history_items
+                   WHERE session_id = ?5 AND turn_id = ?6
+               )
                AND status IN ('pending', 'running')",
             params![
                 tool_call_id.to_string(),
                 status.key(),
-                serde_json::to_string(&metadata_json)?,
-                reason,
+                truncated_output_path.map(|value| value.as_str()),
                 finished_at_ms,
                 session_id.to_string(),
-                message_id.to_string(),
+                protocol_turn_id.to_string(),
             ],
         )? == 1;
         if !applied {
             transaction.commit()?;
             return Ok(None);
         }
-        let event = match status {
+        let tool_event = match status {
+            ToolCallStatus::Completed => RunEvent::ToolCallCompleted {
+                tool_call_id,
+                tool: tool_name,
+                title: title.to_string(),
+                summary: output_text.to_string(),
+                metadata: metadata_json,
+            },
             ToolCallStatus::Declined => RunEvent::ToolCallDeclined {
                 tool_call_id,
                 tool: tool_name,
-                reason: reason.to_string(),
+                reason: output_text.to_string(),
                 metadata: metadata_json,
             },
             ToolCallStatus::Cancelled => RunEvent::ToolCallCancelled {
                 tool_call_id,
                 tool: tool_name,
-                reason: reason.to_string(),
+                reason: error_text.unwrap_or(output_text).to_string(),
                 metadata: metadata_json,
             },
-            _ => unreachable!(),
-        };
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::ToolResult,
-                payload: MessagePart::ToolResult(ToolResultPart {
-                    tool_call_id,
-                    status,
-                    title: match status {
-                        ToolCallStatus::Declined => "Tool declined".to_string(),
-                        ToolCallStatus::Cancelled => "Tool cancelled".to_string(),
-                        _ => unreachable!(),
-                    },
-                    summary: reason.to_string(),
-                    success: None,
-                    progress_effect: ToolProgressEffect::Unknown,
-                    blocked_action: None,
-                    result_hash: None,
-                }),
+            ToolCallStatus::Failed => RunEvent::ToolCallFailed {
+                tool_call_id,
+                tool: tool_name,
+                error: error_text.unwrap_or(output_text).to_string(),
+                metadata: metadata_json,
             },
-        )?;
-        transaction.commit()?;
-        Ok(Some(event))
-    }
-
-    pub async fn update_message_metadata_and_status_with_protocol_event(
-        &self,
-        session_id: SessionId,
-        message_id: MessageId,
-        metadata: &MessageMetadata,
-        status: SessionStatus,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<bool, StorageError> {
-        Ok(self
-            .update_message_metadata_and_status_with_protocol_event_guarded(
-                session_id,
-                message_id,
-                metadata,
-                status,
-                event,
-                protocol_turn_id,
-                protocol_sequence_no,
-                None,
-                None,
-                None,
-            )
-            .await?
-            .was_applied())
-    }
-
-    pub async fn update_admitted_message_metadata_and_status_with_protocol_event(
-        &self,
-        session_id: SessionId,
-        admission_id: &str,
-        message_id: MessageId,
-        metadata: &MessageMetadata,
-        status: SessionStatus,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-        expected_seen_steer_count: Option<usize>,
-        expected_active_goal_id_to_block: Option<&str>,
-    ) -> Result<AdmittedTerminalCommit, StorageError> {
-        self.update_message_metadata_and_status_with_protocol_event_guarded(
-            session_id,
-            message_id,
-            metadata,
-            status,
-            event,
-            protocol_turn_id,
-            protocol_sequence_no,
-            Some(admission_id),
-            expected_seen_steer_count,
-            expected_active_goal_id_to_block,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn update_message_metadata_and_status_with_protocol_event_guarded(
-        &self,
-        session_id: SessionId,
-        message_id: MessageId,
-        metadata: &MessageMetadata,
-        status: SessionStatus,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-        admission_id: Option<&str>,
-        expected_seen_steer_count: Option<usize>,
-        expected_active_goal_id_to_block: Option<&str>,
-    ) -> Result<AdmittedTerminalCommit, StorageError> {
-        validate_terminal_message_update(session_id, status, event, metadata)?;
-        let now = SystemClock.now_ms();
-        let status_text = session_status_text(status);
-        let completed_at_ms = if matches!(
-            status,
-            SessionStatus::Completed
-                | SessionStatus::AwaitingUser
-                | SessionStatus::Cancelled
-                | SessionStatus::Failed
-        ) {
-            Some(now)
-        } else {
-            None
-        };
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current_status = if let Some(admission_id) = admission_id {
-            let owned_state = transaction
-                .query_row(
-                    "SELECT status, active_run_lease_expires_at_ms
-                     FROM sessions
-                     WHERE id = ?1 AND active_run_id = ?2 AND active_turn_id = ?3",
-                    params![
-                        session_id.to_string(),
-                        admission_id,
-                        protocol_turn_id.to_string()
-                    ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
-                )
-                .optional()?;
-            let Some((owned_status, lease_expires_at_ms)) = owned_state else {
-                transaction.commit()?;
-                return Ok(AdmittedTerminalCommit::NotOwned);
-            };
-            if !run_lease_is_fresh(lease_expires_at_ms, now) {
-                transaction.commit()?;
-                return Ok(AdmittedTerminalCommit::NotOwned);
-            }
-            if !matches!(owned_status.as_str(), "running" | "awaiting_user") {
-                transaction.execute(
-                    "UPDATE sessions
-                     SET active_run_id = NULL,
-                         active_turn_id = NULL,
-                         active_run_lease_expires_at_ms = NULL
-                     WHERE id = ?1 AND active_run_id = ?2 AND active_turn_id = ?3",
-                    params![
-                        session_id.to_string(),
-                        admission_id,
-                        protocol_turn_id.to_string()
-                    ],
-                )?;
-                transaction.commit()?;
-                return Ok(AdmittedTerminalCommit::AlreadyTerminalizedBySameAdmission);
-            }
-            Some(owned_status)
-        } else {
-            transaction
-                .query_row(
-                    "SELECT status FROM sessions WHERE id = ?1",
-                    params![session_id.to_string()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-        };
-        if !current_status
-            .as_deref()
-            .is_some_and(|value| matches!(value, "running" | "awaiting_user"))
-        {
-            transaction.commit()?;
-            return Ok(AdmittedTerminalCommit::NotOwned);
-        }
-        let steer_count_mismatch = match expected_seen_steer_count {
-            Some(expected) => {
-                let actual = count_steer_history_items(&transaction, session_id)?;
-                (actual != expected).then_some((expected, actual))
-            }
-            None => None,
-        };
-        if let Some((expected, actual)) = steer_count_mismatch {
-            transaction.commit()?;
-            return Ok(AdmittedTerminalCommit::UnseenSteer { expected, actual });
-        }
-        validate_assistant_message_target_in_transaction(&transaction, session_id, message_id)?;
-        let terminalized = if let Some(admission_id) = admission_id {
-            if status == SessionStatus::AwaitingUser {
-                transaction.execute(
-                    "UPDATE sessions
-                     SET status = ?4, updated_at_ms = ?5, completed_at_ms = ?6
-                     WHERE id = ?1
-                       AND active_run_id = ?2
-                       AND active_turn_id = ?3
-                       AND active_run_lease_expires_at_ms > ?7
-                       AND status IN ('running', 'awaiting_user')",
-                    params![
-                        session_id.to_string(),
-                        admission_id,
-                        protocol_turn_id.to_string(),
-                        status_text,
-                        now,
-                        completed_at_ms,
-                        now
-                    ],
-                )? == 1
-            } else {
-                transaction.execute(
-                    "UPDATE sessions
-                     SET status = ?4,
-                         updated_at_ms = ?5,
-                         completed_at_ms = ?6,
-                         active_run_id = NULL,
-                         active_turn_id = NULL,
-                         active_run_lease_expires_at_ms = NULL
-                     WHERE id = ?1
-                       AND active_run_id = ?2
-                       AND active_turn_id = ?3
-                       AND active_run_lease_expires_at_ms > ?7
-                       AND status IN ('running', 'awaiting_user')",
-                    params![
-                        session_id.to_string(),
-                        admission_id,
-                        protocol_turn_id.to_string(),
-                        status_text,
-                        now,
-                        completed_at_ms,
-                        now
-                    ],
-                )? == 1
-            }
-        } else {
-            transaction.execute(
-                "UPDATE sessions
-                 SET status = ?2,
-                     updated_at_ms = ?3,
-                     completed_at_ms = ?4,
-                     active_run_id = NULL,
-                     active_turn_id = NULL,
-                     active_run_lease_expires_at_ms = NULL
-                 WHERE id = ?1 AND status IN ('running', 'awaiting_user')",
-                params![session_id.to_string(), status_text, now, completed_at_ms],
-            )? == 1
-        };
-        if !terminalized {
-            transaction.commit()?;
-            return Ok(AdmittedTerminalCommit::NotOwned);
-        }
-        let metadata_updated = transaction.execute(
-            "UPDATE messages
-             SET metadata_json = ?4
-             WHERE id = ?1 AND session_id = ?2 AND role = ?3",
-            params![
-                message_id.to_string(),
-                session_id.to_string(),
-                "assistant",
-                serde_json::to_string(metadata)?
-            ],
-        )?;
-        if metadata_updated != 1 {
-            return Err(StorageError::Message(format!(
-                "assistant message {message_id} is no longer owned by session {session_id}"
-            )));
-        }
-        if status == SessionStatus::Failed
-            && let Some(expected_goal_id) = expected_active_goal_id_to_block
-        {
-            transaction.execute(
-                "UPDATE thread_goals
-                 SET status = 'blocked',
-                     updated_at_ms = MAX(updated_at_ms + 1, ?3)
-                 WHERE thread_id = ?1
-                   AND goal_id = ?2
-                   AND status = 'active'",
-                params![session_id.to_string(), expected_goal_id, now],
-            )?;
-        }
-        let protocol_sequence_no = resolve_terminal_protocol_sequence_in_transaction(
-            &transaction,
-            session_id,
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        let terminal_sequence_no = if status != SessionStatus::AwaitingUser {
-            settle_unfinished_tool_calls_for_terminal_event(
-                &transaction,
-                session_id,
-                event,
-                protocol_turn_id,
-                protocol_sequence_no,
-                now,
-            )?
-        } else {
-            protocol_sequence_no
+            ToolCallStatus::Pending | ToolCallStatus::Running => unreachable!(),
         };
         insert_protocol_projection_if_requested(
             &transaction,
-            event,
+            &tool_event,
             Some(session_id),
             protocol_turn_id,
-            Some(terminal_sequence_no),
+            tool_output_sequence_no,
         )?;
-        transaction.commit()?;
-        Ok(AdmittedTerminalCommit::Applied)
-    }
-
-    pub async fn compatibility_transcript(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Transcript, StorageError> {
-        let session = self.get_session(session_id).await?;
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let mut stmt = connection.prepare(
-            "SELECT id, role, parent_message_id, sequence_no, metadata_json, created_at_ms
-             FROM messages WHERE session_id = ?1 ORDER BY sequence_no ASC",
-        )?;
-        let message_rows = stmt
-            .query_map(params![session_id.to_string()], |row| {
-                let id_text: String = row.get(0)?;
-                let role_text: String = row.get(1)?;
-                let metadata_json: String = row.get(4)?;
-                Ok(MessageRecord {
-                    id: id_text.parse().map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    session_id,
-                    role: if role_text == "user" {
-                        MessageRole::User
-                    } else {
-                        MessageRole::Assistant
-                    },
-                    parent_message_id: row
-                        .get::<_, Option<String>>(2)?
-                        .map(|value| value.parse())
-                        .transpose()
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?,
-                    sequence_no: row.get(3)?,
-                    metadata: serde_json::from_str(&metadata_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            4,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    created_at_ms: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut messages = Vec::new();
-        for record in message_rows {
-            let mut part_stmt = connection.prepare(
-                "SELECT id, sequence_no, part_kind, payload_json
-                 FROM message_parts WHERE message_id = ?1 ORDER BY sequence_no ASC",
+        let file_event = if file_changes.is_empty() {
+            None
+        } else {
+            let event = RunEvent::FileChangesRecorded {
+                tool_call_id,
+                changes: file_changes,
+            };
+            insert_protocol_projection_if_requested(
+                &transaction,
+                &event,
+                Some(session_id),
+                protocol_turn_id,
+                file_changes_sequence_no,
             )?;
-            let parts = part_stmt
-                .query_map(params![record.id.to_string()], |row| {
-                    let id_text: String = row.get(0)?;
-                    let kind_text: String = row.get(2)?;
-                    let payload_json: String = row.get(3)?;
-                    let payload = serde_json::from_str(&payload_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                    Ok(PartRecord {
-                        id: id_text.parse().map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?,
-                        message_id: record.id,
-                        sequence_no: row.get(1)?,
-                        kind: parse_part_kind(&kind_text),
-                        payload,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            messages.push(TranscriptMessage { record, parts });
-        }
-
-        Ok(Transcript { session, messages })
+            Some(event)
+        };
+        transaction.commit()?;
+        Ok(Some((tool_event, file_event)))
     }
 }
 
@@ -3320,8 +2383,8 @@ impl SessionRepository for SqliteSessionRepository {
         let now = SystemClock.now_ms();
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection.execute(
-            "INSERT INTO sessions (id, project_id, title, status, cwd_path, model_name, base_url, access_mode, memory_mode, model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'enabled', '{}', ?9, ?10, NULL)",
+            "INSERT INTO sessions (id, project_id, title, status, cwd_path, model_name, base_url, access_mode, model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{}', ?9, ?10, NULL)",
             params![
                 id.to_string(),
                 draft.project_id.to_string(),
@@ -3335,7 +2398,6 @@ impl SessionRepository for SqliteSessionRepository {
                 now
             ],
         )?;
-        upsert_session_state_row(&connection, id, &SessionStateSnapshot::default(), now)?;
         drop(connection);
         self.get_session(id).await
     }
@@ -3531,7 +2593,7 @@ impl SessionRepository for SqliteSessionRepository {
             connection.execute(
                 "UPDATE sessions
                  SET archived_at_ms = ?2, updated_at_ms = ?3
-                 WHERE id = ?1 AND status NOT IN ('running', 'awaiting_user')",
+                 WHERE id = ?1 AND status != 'running'",
                 params![id.to_string(), archived_at_ms, now],
             )?
         } else {
@@ -3543,10 +2605,7 @@ impl SessionRepository for SqliteSessionRepository {
         drop(connection);
         if changed == 0 && archived {
             let current = self.get_session(id).await?;
-            if matches!(
-                current.status,
-                SessionStatus::Running | SessionStatus::AwaitingUser
-            ) {
+            if current.status == SessionStatus::Running {
                 return Err(StorageError::Message(format!(
                     "session {} is active; stop it before archiving it",
                     current.id
@@ -3582,10 +2641,7 @@ impl SessionRepository for SqliteSessionRepository {
                     changed: false,
                 });
             }
-            if matches!(
-                current.status,
-                SessionStatus::Running | SessionStatus::AwaitingUser
-            ) {
+            if current.status == SessionStatus::Running {
                 return Err(StorageError::Message(format!(
                     "session {} is {}; settings update requires an idle or terminal session",
                     current.id,
@@ -3600,7 +2656,7 @@ impl SessionRepository for SqliteSessionRepository {
                      model_parameters_json = ?6, updated_at_ms = ?7
                  WHERE id = ?1
                    AND updated_at_ms = ?8
-                   AND status NOT IN ('running', 'awaiting_user')",
+                   AND status != 'running'",
                 params![
                     id.to_string(),
                     next_cwd.as_str(),
@@ -3651,330 +2707,9 @@ impl SessionRepository for SqliteSessionRepository {
         })
     }
 
-    async fn update_session_memory_mode(
-        &self,
-        id: SessionId,
-        mode: SessionMemoryMode,
-    ) -> Result<SessionMemoryModeUpdate, StorageError> {
-        let current = self.get_session(id).await?;
-        let current_mode = self.get_session_memory_mode(id).await?;
-        if current_mode == mode {
-            return Ok(SessionMemoryModeUpdate {
-                session: current,
-                mode,
-                changed: false,
-            });
-        }
-        let now = SystemClock::now_ms();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "UPDATE sessions SET memory_mode = ?2, updated_at_ms = ?3 WHERE id = ?1",
-            params![id.to_string(), mode.key(), now],
-        )?;
-        drop(connection);
-        Ok(SessionMemoryModeUpdate {
-            session: self.get_session(id).await?,
-            mode,
-            changed: true,
-        })
-    }
-
     async fn delete_session(&self, id: SessionId) -> Result<(), StorageError> {
         self.delete_session_tree(id).await?;
         Ok(())
-    }
-
-    async fn get_state(&self, session_id: SessionId) -> Result<SessionStateSnapshot, StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let row = connection
-            .query_row(
-                "SELECT task_route, phase, review_scope_json, active_todo_id, active_targets_json, contract_refs_json, failure_kind, failure_summary, failure_tool_name, failure_targets_json,
-                        verification_todo_id, verification_commands_json, verification_failures_json, verification_evidence_summary,
-                        completion_closeout_ready, completion_open_work_count, completion_verification_pending, completion_route_contract_pending,
-                        completion_blocked_reason, completion_route_contract_summary, docs_route_state_json, implementation_handoff_json,
-                        verification_failure_cluster_json, verification_requirement_refs_json, token_accounting_json
-                 FROM session_state
-                 WHERE session_id = ?1",
-                params![session_id.to_string()],
-                |row| {
-                    let active_todo_id = row
-                        .get::<_, Option<String>>(3)?
-                        .map(|value| value.parse())
-                        .transpose()
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                3,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                    let failure_kind = row
-                        .get::<_, Option<String>>(6)?
-                        .map(|value| parse_failure_kind(&value))
-                        .transpose()?;
-                    let failure_tool_name = row
-                        .get::<_, Option<String>>(8)?
-                        .map(|value| parse_tool_name(&value));
-                    let verification_todo_id = row
-                        .get::<_, Option<String>>(10)?
-                        .map(|value| value.parse())
-                        .transpose()
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                10,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                    let review_scope_json: String = row.get(2)?;
-                    let active_targets_json: String = row.get(4)?;
-                    let contract_refs_json: String = row.get(5)?;
-                    let failure_targets_json: String = row.get(9)?;
-                    let verification_commands_json: String = row.get(11)?;
-                    let verification_failures_json: String = row.get(12)?;
-                    let docs_route_state_json: String = row.get(20)?;
-                    let implementation_handoff_json: String = row.get(21)?;
-                    let verification_failure_cluster_json: String = row.get(22)?;
-                    let verification_requirement_refs_json: String = row.get(23)?;
-                    let token_accounting_json: String = row.get(24)?;
-                    let failure = match failure_kind {
-                        Some(kind) => Some(FailureState {
-                            kind,
-                            summary: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                            tool_name: failure_tool_name,
-                            targets: serde_json::from_str(&failure_targets_json).map_err(
-                                |error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        9,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(error),
-                                    )
-                                },
-                            )?,
-                        }),
-                        None => None,
-                    };
-                    Ok(SessionStateSnapshot {
-                        route: parse_task_route(&row.get::<_, String>(0)?)?,
-                        process_phase: parse_process_phase(&row.get::<_, String>(1)?)?,
-                        review_scope: serde_json::from_str(&review_scope_json).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?,
-                        active_todo_id,
-                        active_targets: serde_json::from_str(&active_targets_json).map_err(
-                            |error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    4,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            },
-                        )?,
-                        contract_refs: serde_json::from_str(&contract_refs_json).map_err(
-                            |error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    5,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            },
-                        )?,
-                        failure,
-                        verification: VerificationState {
-                            pending_todo_id: verification_todo_id,
-                            required_commands: serde_json::from_str(&verification_commands_json)
-                                .map_err(|error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        11,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(error),
-                                    )
-                                })?,
-                            failing_labels: serde_json::from_str(&verification_failures_json)
-                                .map_err(|error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        12,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(error),
-                                    )
-                                })?,
-                            last_evidence_summary: row.get(13)?,
-                            failure_cluster: serde_json::from_str(
-                                &verification_failure_cluster_json,
-                            )
-                            .map_err(|error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    22,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            })?,
-                            requirement_refs: serde_json::from_str(
-                                &verification_requirement_refs_json,
-                            )
-                            .map_err(|error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    23,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            })?,
-                        },
-                        completion: CompletionState {
-                            closeout_ready: row.get::<_, i64>(14)? != 0,
-                            open_work_count: row.get::<_, i64>(15)? as usize,
-                            verification_pending: row.get::<_, i64>(16)? != 0,
-                            route_contract_pending: row.get::<_, i64>(17)? != 0,
-                            blocked_reason: row.get(18)?,
-                            route_contract_summary: row.get(19)?,
-                        },
-                        token_accounting: serde_json::from_str(&token_accounting_json).map_err(
-                            |error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    24,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            },
-                        )?,
-                        docs_route: serde_json::from_str(&docs_route_state_json).map_err(
-                            |error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    20,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            },
-                        )?,
-                        implementation_handoff: serde_json::from_str(&implementation_handoff_json)
-                            .map_err(|error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    21,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            })?,
-                    })
-                },
-            )
-            .optional()?;
-
-        match row {
-            Some(state) => Ok(state),
-            None => {
-                let state = SessionStateSnapshot::default();
-                upsert_session_state_row(&connection, session_id, &state, SystemClock::now_ms())?;
-                Ok(state)
-            }
-        }
-    }
-
-    async fn update_todos(
-        &self,
-        session_id: SessionId,
-        todos: &[TodoItem],
-    ) -> Result<(), StorageError> {
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM session_todos WHERE session_id = ?1",
-            params![session_id.to_string()],
-        )?;
-        for (position, todo) in todos.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO session_todos (
-                     session_id, todo_id, position, content, kind, status, priority, targets_json,
-                     depends_on_json, success_criteria_json, blocked_by_json
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    session_id.to_string(),
-                    todo.id.to_string(),
-                    position as i64,
-                    todo.content,
-                    todo_kind_text(todo.kind),
-                    todo_status_text(todo.status),
-                    todo_priority_text(todo.priority),
-                    serde_json::to_string(&todo.targets)?,
-                    serde_json::to_string(&todo.depends_on)?,
-                    serde_json::to_string(&todo.success_criteria)?,
-                    serde_json::to_string(&todo.blocked_by)?
-                ],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
-    async fn list_todos(&self, session_id: SessionId) -> Result<Vec<TodoItem>, StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let mut statement = connection.prepare(
-            "SELECT todo_id, content, kind, status, priority, targets_json, depends_on_json,
-                    success_criteria_json, blocked_by_json
-             FROM session_todos
-             WHERE session_id = ?1
-             ORDER BY position ASC",
-        )?;
-        let todos = statement
-            .query_map(params![session_id.to_string()], |row| {
-                let todo_id_text: String = row.get(0)?;
-                let kind_text: String = row.get(2)?;
-                let status_text: String = row.get(3)?;
-                let priority_text: String = row.get(4)?;
-                let targets_json: String = row.get(5)?;
-                let depends_on_json: String = row.get(6)?;
-                let success_criteria_json: String = row.get(7)?;
-                let blocked_by_json: String = row.get(8)?;
-                Ok(TodoItem {
-                    id: todo_id_text.parse().map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    content: row.get(1)?,
-                    kind: parse_todo_kind(&kind_text),
-                    status: parse_todo_status(&status_text),
-                    priority: parse_todo_priority(&priority_text),
-                    targets: serde_json::from_str(&targets_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            5,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    depends_on: serde_json::from_str(&depends_on_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            6,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    success_criteria: serde_json::from_str(&success_criteria_json).map_err(
-                        |error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                7,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        },
-                    )?,
-                    blocked_by: serde_json::from_str(&blocked_by_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            8,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(todos)
     }
 }
 
@@ -4032,47 +2767,133 @@ fn session_record_from_connection(
 fn append_interrupted_live_snapshot_marker_in_transaction(
     transaction: &Transaction<'_>,
     session_id: SessionId,
+    turn_id: TurnId,
     reason: &str,
 ) -> Result<(), StorageError> {
-    let (turn_id, sequence_no) = latest_turn_position_for_session(transaction, session_id)?
-        .unwrap_or_else(|| (TurnId::new(), 0));
-    let now = SystemClock::now_ms();
-    let history_item = HistoryItem {
-        id: HistoryItemId::new(),
-        session_id,
-        turn_id,
-        sequence_no,
-        created_at_ms: now,
-        payload: HistoryItemPayload::Error {
-            message_id: None,
-            message: reason.to_string(),
-        },
-    };
-    let turn_item = TurnItem {
-        id: TurnItemId::new(),
-        session_id,
-        turn_id,
-        source_item_id: Some(history_item.id),
-        sequence_no,
-        payload: TurnItemPayload::Terminal {
-            status: TurnTerminalStatus::Interrupted,
-            summary: reason.to_string(),
-            cause: None,
-        },
-    };
-    let event = RuntimeEvent {
-        id: RuntimeEventId::new(),
-        session_id,
-        turn_id,
-        sequence_no,
-        created_at_ms: now,
-        msg: RuntimeEventMsg::TurnInterrupted {
+    let snapshot = canonical_turn_snapshot_in_transaction(transaction, session_id, turn_id)?;
+    let mut sequence_no =
+        resolve_terminal_protocol_sequence_in_transaction(transaction, session_id, turn_id, None)?;
+    for (call_id, tool) in snapshot.unsettled_tool_calls {
+        let event = RunEvent::ToolCallCancelled {
+            tool_call_id: call_id,
+            tool,
             reason: reason.to_string(),
-            cause: None,
-        },
+            metadata: serde_json::Value::Null,
+        };
+        insert_protocol_projection_if_requested(
+            transaction,
+            &event,
+            Some(session_id),
+            turn_id,
+            Some(sequence_no),
+        )?;
+        sequence_no = sequence_no.saturating_add(1);
+    }
+    let event = RunEvent::TurnTerminal {
+        session_id,
+        terminal: Box::new(crate::session::model::DurableTurnTerminal {
+            status: crate::protocol::TurnTerminalStatus::Interrupted,
+            finish_reason: Some(FinishReason::Cancelled),
+            interruption_cause: Some(crate::protocol::TurnInterruptionCause::AgentInterrupted),
+            final_response_id: snapshot.final_response_id,
+            summary: reason.to_string(),
+            tool_call_count: snapshot.tool_call_count,
+            failed_tool_count: snapshot.failed_tool_count,
+            change_count: snapshot.change_count,
+            metrics: Default::default(),
+        }),
     };
-    insert_event_bundle_in_transaction(transaction, &event, Some(&history_item), Some(&turn_item))?;
+    let projection = project_protocol_run_event(&event, Some(session_id), turn_id, sequence_no)
+        .ok_or_else(|| {
+            StorageError::Message("fork terminal marker did not produce a protocol bundle".into())
+        })?;
+    insert_session_owned_event_bundle_in_transaction(
+        &SESSION_PROTOCOL_WRITE_AUTHORITY,
+        transaction,
+        &projection.runtime_event,
+        projection.history_item.as_ref(),
+        projection.turn_item.as_ref(),
+    )?;
     Ok(())
+}
+
+#[derive(Debug)]
+struct CanonicalTurnSnapshot {
+    final_response_id: Option<ModelResponseId>,
+    tool_call_count: usize,
+    failed_tool_count: usize,
+    change_count: usize,
+    unsettled_tool_calls: Vec<(ToolCallId, crate::tool::ToolName)>,
+}
+
+fn canonical_turn_snapshot_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> Result<CanonicalTurnSnapshot, StorageError> {
+    let payloads = {
+        let mut statement = transaction.prepare(
+            "SELECT payload_json
+             FROM protocol_history_items
+             WHERE session_id = ?1 AND turn_id = ?2
+             ORDER BY sequence_no ASC, id ASC",
+        )?;
+        statement
+            .query_map(
+                params![session_id.to_string(), turn_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut final_response_id = None;
+    let mut tool_calls = Vec::<(ToolCallId, crate::tool::ToolName)>::new();
+    let mut settled_tool_calls = HashSet::<ToolCallId>::new();
+    let mut failed_tool_count = 0usize;
+    let mut change_count = 0usize;
+    for payload_json in payloads {
+        match serde_json::from_str::<HistoryItemPayload>(&payload_json)? {
+            HistoryItemPayload::AssistantMessage { response_id, .. } => {
+                final_response_id = Some(response_id);
+            }
+            HistoryItemPayload::ToolCall {
+                call_id,
+                response_id,
+                tool_name,
+                ..
+            } => {
+                final_response_id = Some(response_id);
+                tool_calls.push((call_id, crate::tool::ToolName::parse(&tool_name)));
+            }
+            HistoryItemPayload::ToolOutput {
+                call_id, status, ..
+            } => {
+                settled_tool_calls.insert(call_id);
+                if status == crate::protocol::ToolLifecycleStatus::Failed {
+                    failed_tool_count = failed_tool_count.saturating_add(1);
+                }
+            }
+            HistoryItemPayload::FileChange {
+                change_ids,
+                changes,
+                ..
+            } => {
+                change_count = change_count.saturating_add(change_ids.len().max(changes.len()));
+            }
+            _ => {}
+        }
+    }
+    let tool_call_count = tool_calls.len();
+    let unsettled_tool_calls = tool_calls
+        .into_iter()
+        .filter(|(call_id, _)| !settled_tool_calls.contains(call_id))
+        .collect();
+    Ok(CanonicalTurnSnapshot {
+        final_response_id,
+        tool_call_count,
+        failed_tool_count,
+        change_count,
+        unsettled_tool_calls,
+    })
 }
 
 fn session_spawn_edge_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSpawnEdge> {
@@ -4157,216 +2978,87 @@ fn delete_session_rows(
         "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1",
         params![session_id],
     )?;
-    transaction.execute(
-        "DELETE FROM file_changes WHERE session_id = ?1",
-        params![session_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM tool_calls WHERE session_id = ?1",
-        params![session_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM message_parts
-         WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
-        params![session_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM messages WHERE session_id = ?1",
-        params![session_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM session_todos WHERE session_id = ?1",
-        params![session_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM session_state WHERE session_id = ?1",
-        params![session_id],
-    )?;
     transaction.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
     Ok(())
 }
 
+#[cfg(test)]
 fn status_is_terminal(status: SessionStatus) -> bool {
     matches!(
         status,
-        SessionStatus::Completed
-            | SessionStatus::AwaitingUser
-            | SessionStatus::Cancelled
-            | SessionStatus::Failed
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
     )
-}
-
-fn terminal_event_descriptor(event: &RunEvent) -> Result<TerminalEventDescriptor, StorageError> {
-    let descriptor = match event {
-        RunEvent::SessionCompleted { session_id, .. } => TerminalEventDescriptor {
-            session_id: *session_id,
-            status: SessionStatus::Completed,
-        },
-        RunEvent::SessionAwaitingUser { session_id, .. } => TerminalEventDescriptor {
-            session_id: *session_id,
-            status: SessionStatus::AwaitingUser,
-        },
-        RunEvent::SessionInterrupted {
-            session_id,
-            cause: Some(_),
-            ..
-        } => TerminalEventDescriptor {
-            session_id: *session_id,
-            status: SessionStatus::Cancelled,
-        },
-        RunEvent::SessionInterrupted { cause: None, .. } => {
-            return Err(StorageError::Message(
-                "current SessionInterrupted writers must persist a typed interruption cause"
-                    .to_string(),
-            ));
-        }
-        RunEvent::SessionFailed { session_id, .. } => TerminalEventDescriptor {
-            session_id: *session_id,
-            status: SessionStatus::Failed,
-        },
-        _ => {
-            return Err(StorageError::Message(
-                "terminal session mutation requires a terminal RunEvent".to_string(),
-            ));
-        }
-    };
-    Ok(descriptor)
 }
 
 fn validate_terminal_event(
     target_session_id: SessionId,
-    target_status: SessionStatus,
     event: &RunEvent,
-) -> Result<(), StorageError> {
-    if !status_is_terminal(target_status) {
-        return Err(StorageError::Message(format!(
-            "terminal session mutation requires a terminal status, got {target_status:?}"
-        )));
-    }
-    let descriptor = terminal_event_descriptor(event)?;
-    if descriptor.session_id != target_session_id {
-        return Err(StorageError::Message(format!(
-            "terminal event belongs to session {}, not target session {target_session_id}",
-            descriptor.session_id
-        )));
-    }
-    if descriptor.status != target_status {
-        return Err(StorageError::Message(format!(
-            "terminal event status {:?} does not match target status {target_status:?}",
-            descriptor.status
-        )));
-    }
-    Ok(())
-}
-
-fn validate_terminal_message_update(
-    target_session_id: SessionId,
-    target_status: SessionStatus,
-    event: &RunEvent,
-    metadata: &MessageMetadata,
-) -> Result<(), StorageError> {
-    validate_terminal_event(target_session_id, target_status, event)?;
-    let MessageMetadata::Assistant(assistant) = metadata else {
+) -> Result<&crate::session::model::DurableTurnTerminal, StorageError> {
+    let RunEvent::TurnTerminal {
+        session_id,
+        terminal,
+    } = event
+    else {
         return Err(StorageError::Message(
-            "terminal assistant message mutation requires assistant metadata".to_string(),
+            "terminal session mutation requires RunEvent::TurnTerminal".to_string(),
         ));
     };
-
-    let event_finish_reason = match event {
-        RunEvent::SessionCompleted { finish_reason, .. } => {
-            if !matches!(finish_reason, None | Some(FinishReason::Stop)) {
-                return Err(StorageError::Message(format!(
-                    "completed terminal event requires no finish reason or stop, got {finish_reason:?}"
-                )));
-            }
-            *finish_reason
-        }
-        RunEvent::SessionAwaitingUser { finish_reason, .. } => {
-            if !matches!(finish_reason, None | Some(FinishReason::ToolCall)) {
-                return Err(StorageError::Message(format!(
-                    "awaiting-user terminal event requires no finish reason or tool call, got {finish_reason:?}"
-                )));
-            }
-            *finish_reason
-        }
-        RunEvent::SessionInterrupted { .. } | RunEvent::SessionFailed { .. } => None,
-        _ => {
-            return Err(StorageError::Message(
-                "terminal assistant message mutation requires a terminal RunEvent".to_string(),
-            ));
-        }
-    };
-
-    let metadata_finish_reason_is_valid = match target_status {
-        SessionStatus::Completed => {
-            matches!(assistant.finish_reason, None | Some(FinishReason::Stop))
-        }
-        SessionStatus::AwaitingUser => {
-            matches!(assistant.finish_reason, None | Some(FinishReason::ToolCall))
-        }
-        SessionStatus::Cancelled => assistant.finish_reason == Some(FinishReason::Cancelled),
-        SessionStatus::Failed => assistant.finish_reason == Some(FinishReason::Error),
-        SessionStatus::Idle | SessionStatus::Running => false,
-    };
-    if !metadata_finish_reason_is_valid {
+    if *session_id != target_session_id {
         return Err(StorageError::Message(format!(
-            "assistant finish reason {:?} does not match terminal status {target_status:?}",
-            assistant.finish_reason
+            "terminal event belongs to session {session_id}, not target session {target_session_id}"
         )));
     }
-    if let (Some(event_finish_reason), Some(metadata_finish_reason)) =
-        (event_finish_reason, assistant.finish_reason)
-        && event_finish_reason != metadata_finish_reason
-    {
+    let valid_shape = match terminal.status {
+        crate::protocol::TurnTerminalStatus::Completed => {
+            terminal.interruption_cause.is_none()
+                && matches!(terminal.finish_reason, None | Some(FinishReason::Stop))
+        }
+        crate::protocol::TurnTerminalStatus::Interrupted => {
+            terminal.interruption_cause.is_some()
+                && terminal.finish_reason == Some(FinishReason::Cancelled)
+        }
+        crate::protocol::TurnTerminalStatus::Failed => {
+            terminal.interruption_cause.is_none()
+                && terminal.finish_reason == Some(FinishReason::Error)
+        }
+    };
+    if !valid_shape {
         return Err(StorageError::Message(format!(
-            "terminal event finish reason {event_finish_reason:?} does not match assistant metadata finish reason {metadata_finish_reason:?}"
+            "TurnTerminal fields contradict status {:?}",
+            terminal.status
         )));
     }
-    Ok(())
+    if terminal.failed_tool_count > terminal.tool_call_count {
+        return Err(StorageError::Message(format!(
+            "TurnTerminal failed tool count {} exceeds total tool count {}",
+            terminal.failed_tool_count, terminal.tool_call_count
+        )));
+    }
+    Ok(terminal)
 }
 
-fn validate_assistant_message_target_in_transaction(
+fn terminal_for_turn_in_transaction(
     transaction: &Transaction<'_>,
-    target_session_id: SessionId,
-    message_id: MessageId,
-) -> Result<(), StorageError> {
-    let stored = transaction
-        .query_row(
-            "SELECT session_id, role, metadata_json FROM messages WHERE id = ?1",
-            params![message_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((stored_session_id, role, metadata_json)) = stored else {
-        return Err(StorageError::Message(format!(
-            "terminal metadata target message {message_id} does not exist"
-        )));
-    };
-    if stored_session_id != target_session_id.to_string() {
-        return Err(StorageError::Message(format!(
-            "message {message_id} belongs to session {stored_session_id}, not target session {target_session_id}"
-        )));
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> Result<Option<crate::session::model::DurableTurnTerminal>, StorageError> {
+    let mut statement = transaction.prepare(
+        "SELECT msg_json
+         FROM protocol_runtime_events
+         WHERE session_id = ?1 AND turn_id = ?2
+         ORDER BY sequence_no DESC, rowid DESC",
+    )?;
+    let rows = statement.query_map(
+        params![session_id.to_string(), turn_id.to_string()],
+        |row| row.get::<_, String>(0),
+    )?;
+    for row in rows {
+        let msg = serde_json::from_str::<RuntimeEventMsg>(&row?)?;
+        if let RuntimeEventMsg::TurnTerminal { terminal } = msg {
+            return Ok(Some(*terminal));
+        }
     }
-    if role != "assistant" {
-        return Err(StorageError::Message(format!(
-            "terminal metadata target message {message_id} has role {role}, not assistant"
-        )));
-    }
-    if !matches!(
-        serde_json::from_str::<MessageMetadata>(&metadata_json)?,
-        MessageMetadata::Assistant(_)
-    ) {
-        return Err(StorageError::Message(format!(
-            "terminal metadata target message {message_id} does not contain assistant metadata"
-        )));
-    }
-    Ok(())
+    Ok(None)
 }
 
 fn parse_status(value: &str) -> Result<SessionStatus, StorageError> {
@@ -4374,7 +3066,6 @@ fn parse_status(value: &str) -> Result<SessionStatus, StorageError> {
         "idle" => Ok(SessionStatus::Idle),
         "running" => Ok(SessionStatus::Running),
         "completed" => Ok(SessionStatus::Completed),
-        "awaiting_user" => Ok(SessionStatus::AwaitingUser),
         "cancelled" => Ok(SessionStatus::Cancelled),
         "failed" => Ok(SessionStatus::Failed),
         _ => Err(StorageError::Message(format!(
@@ -4475,10 +3166,6 @@ fn parse_access_mode(value: &str) -> AccessMode {
     AccessMode::parse(value).unwrap_or(AccessMode::Default)
 }
 
-fn parse_memory_mode(value: &str) -> SessionMemoryMode {
-    SessionMemoryMode::parse(value).unwrap_or(SessionMemoryMode::Enabled)
-}
-
 fn parse_session_model_parameters(
     value: &str,
     column: usize,
@@ -4492,88 +3179,6 @@ fn parse_session_model_parameters(
     })
 }
 
-fn parse_part_kind(value: &str) -> PartKind {
-    match value {
-        "text" => PartKind::Text,
-        "reasoning" => PartKind::Reasoning,
-        "tool_call" => PartKind::ToolCall,
-        "tool_result" => PartKind::ToolResult,
-        "image" => PartKind::Image,
-        "error" => PartKind::Error,
-        "diff_summary" => PartKind::DiffSummary,
-        "prompt_dispatch" => PartKind::PromptDispatch,
-        "request_diagnostics" => PartKind::RequestDiagnostics,
-        _ => PartKind::Error,
-    }
-}
-
-fn part_kind_text(value: PartKind) -> &'static str {
-    match value {
-        PartKind::Text => "text",
-        PartKind::Reasoning => "reasoning",
-        PartKind::ToolCall => "tool_call",
-        PartKind::ToolResult => "tool_result",
-        PartKind::Image => "image",
-        PartKind::Error => "error",
-        PartKind::DiffSummary => "diff_summary",
-        PartKind::PromptDispatch => "prompt_dispatch",
-        PartKind::RequestDiagnostics => "request_diagnostics",
-    }
-}
-
-fn next_message_sequence_in_transaction(
-    transaction: &rusqlite::Transaction<'_>,
-    session_id: SessionId,
-) -> Result<i64, StorageError> {
-    let value: Option<i64> = transaction.query_row(
-        "SELECT MAX(sequence_no) FROM messages WHERE session_id = ?1",
-        params![session_id.to_string()],
-        |row| row.get::<_, Option<i64>>(0),
-    )?;
-    Ok(value.unwrap_or(0) + 1)
-}
-
-fn next_part_sequence_in_transaction(
-    transaction: &rusqlite::Transaction<'_>,
-    message_id: MessageId,
-) -> Result<i64, StorageError> {
-    let value: Option<i64> = transaction.query_row(
-        "SELECT MAX(sequence_no) FROM message_parts WHERE message_id = ?1",
-        params![message_id.to_string()],
-        |row| row.get::<_, Option<i64>>(0),
-    )?;
-    Ok(value.unwrap_or(0) + 1)
-}
-
-fn insert_part_in_transaction(
-    transaction: &rusqlite::Transaction<'_>,
-    message_id: MessageId,
-    part: NewPart,
-) -> Result<PartRecord, StorageError> {
-    let id = crate::session::PartId::new();
-    let now = SystemClock.now_ms();
-    let sequence_no = next_part_sequence_in_transaction(transaction, message_id)?;
-    transaction.execute(
-        "INSERT INTO message_parts (id, message_id, sequence_no, part_kind, payload_json, created_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            id.to_string(),
-            message_id.to_string(),
-            sequence_no,
-            part_kind_text(part.kind),
-            serde_json::to_string(&part.payload)?,
-            now
-        ],
-    )?;
-    Ok(PartRecord {
-        id,
-        message_id,
-        sequence_no,
-        kind: part.kind,
-        payload: part.payload,
-    })
-}
-
 fn insert_protocol_projection_if_requested(
     transaction: &rusqlite::Transaction<'_>,
     event: &RunEvent,
@@ -4581,9 +3186,7 @@ fn insert_protocol_projection_if_requested(
     protocol_turn_id: TurnId,
     protocol_sequence_no: Option<i64>,
 ) -> Result<(), StorageError> {
-    let Some(protocol_sequence_no) = protocol_sequence_no else {
-        return Ok(());
-    };
+    let protocol_sequence_no = protocol_sequence_no.unwrap_or(0);
     let Some(projection) = project_protocol_run_event(
         event,
         fallback_session_id,
@@ -4592,7 +3195,8 @@ fn insert_protocol_projection_if_requested(
     ) else {
         return Ok(());
     };
-    crate::protocol::insert_event_bundle_in_transaction(
+    crate::protocol::insert_session_owned_event_bundle_in_transaction(
+        &SESSION_PROTOCOL_WRITE_AUTHORITY,
         transaction,
         &projection.runtime_event,
         projection.history_item.as_ref(),
@@ -4601,4249 +3205,111 @@ fn insert_protocol_projection_if_requested(
     Ok(())
 }
 
-fn tool_success_from_metadata(metadata: &serde_json::Value) -> Option<bool> {
-    if let Some(success) = metadata
-        .get("success")
-        .or_else(|| {
-            metadata
-                .get("tool_feedback_envelope")
-                .and_then(|feedback| feedback.get("success"))
-        })
-        .and_then(serde_json::Value::as_bool)
-    {
-        return Some(success);
-    }
-    if let Some(run) = metadata
-        .get("verification_run_result")
-        .and_then(|value| serde_json::from_value::<VerificationRunResult>(value.clone()).ok())
-    {
-        return Some(matches!(run.status, VerificationRunStatus::Passed));
-    }
-    Some(!matches!(
-        tool_progress_effect_from_metadata(metadata),
-        ToolProgressEffect::NoProgress
-            | ToolProgressEffect::Blocked
-            | ToolProgressEffect::VerificationFailed
-    ))
-}
-
-fn tool_progress_effect_from_metadata(metadata: &serde_json::Value) -> ToolProgressEffect {
-    if let Some(run) = metadata
-        .get("verification_run_result")
-        .and_then(|value| serde_json::from_value::<VerificationRunResult>(value.clone()).ok())
-    {
-        return match run.status {
-            VerificationRunStatus::Passed => ToolProgressEffect::VerificationPassed,
-            VerificationRunStatus::Failed | VerificationRunStatus::TimedOut => {
-                ToolProgressEffect::VerificationFailed
-            }
-            VerificationRunStatus::NotVerification => ToolProgressEffect::Unknown,
-        };
-    }
-    metadata
-        .get("tool_feedback_envelope")
-        .and_then(|feedback| feedback.get("progress_effect"))
-        .or_else(|| metadata.get("progress_effect"))
-        .and_then(serde_json::Value::as_str)
-        .map(|value| match value {
-            "made_progress" | "progress" => ToolProgressEffect::MadeProgress,
-            "no_progress" => ToolProgressEffect::NoProgress,
-            "blocked" => ToolProgressEffect::Blocked,
-            "verification_passed" => ToolProgressEffect::VerificationPassed,
-            "verification_failed" => ToolProgressEffect::VerificationFailed,
-            _ => ToolProgressEffect::Unknown,
-        })
-        .unwrap_or(ToolProgressEffect::Unknown)
-}
-
-fn metadata_string(metadata: &serde_json::Value, path: &[&str]) -> Option<String> {
-    let mut value = metadata;
-    for key in path {
-        value = value.get(*key)?;
-    }
-    value.as_str().map(ToString::to_string)
-}
-
-fn upsert_session_state_row(
-    connection: &Connection,
-    session_id: SessionId,
-    state: &SessionStateSnapshot,
-    updated_at_ms: i64,
-) -> Result<(), StorageError> {
-    let failure_kind = state
-        .failure
-        .as_ref()
-        .map(|value| failure_kind_text(value.kind));
-    let failure_summary = state.failure.as_ref().map(|value| value.summary.as_str());
-    let failure_tool_name = state
-        .failure
-        .as_ref()
-        .and_then(|value| value.tool_name)
-        .map(tool_name_text);
-    let failure_targets_json = serde_json::to_string(
-        &state
-            .failure
-            .as_ref()
-            .map(|value| value.targets.as_slice())
-            .unwrap_or(&[]),
-    )?;
-    let contract_refs_json = serde_json::to_string(&state.contract_refs)?;
-    let review_scope_json = serde_json::to_string(&state.review_scope)?;
-    let docs_route_state_json = serde_json::to_string(&state.docs_route)?;
-    let implementation_handoff_json = serde_json::to_string(&state.implementation_handoff)?;
-    let verification_failure_cluster_json =
-        serde_json::to_string(&state.verification.failure_cluster)?;
-    let verification_requirement_refs_json =
-        serde_json::to_string(&state.verification.requirement_refs)?;
-    let token_accounting_json = serde_json::to_string(&state.token_accounting)?;
-    connection.execute(
-        "INSERT INTO session_state (
-             session_id, task_route, phase, review_scope_json, active_todo_id, active_targets_json, contract_refs_json, failure_kind, failure_summary, failure_tool_name,
-             failure_targets_json, verification_todo_id, verification_commands_json, verification_failures_json,
-             verification_evidence_summary, completion_closeout_ready, completion_open_work_count,
-             completion_verification_pending, completion_route_contract_pending, completion_blocked_reason, completion_route_contract_summary,
-             docs_route_state_json, implementation_handoff_json, verification_failure_cluster_json, verification_requirement_refs_json, token_accounting_json, updated_at_ms
-         )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
-         ON CONFLICT(session_id) DO UPDATE SET
-             task_route = excluded.task_route,
-             phase = excluded.phase,
-             review_scope_json = excluded.review_scope_json,
-             active_todo_id = excluded.active_todo_id,
-             active_targets_json = excluded.active_targets_json,
-             contract_refs_json = excluded.contract_refs_json,
-             failure_kind = excluded.failure_kind,
-             failure_summary = excluded.failure_summary,
-             failure_tool_name = excluded.failure_tool_name,
-             failure_targets_json = excluded.failure_targets_json,
-             verification_todo_id = excluded.verification_todo_id,
-             verification_commands_json = excluded.verification_commands_json,
-             verification_failures_json = excluded.verification_failures_json,
-             verification_evidence_summary = excluded.verification_evidence_summary,
-             completion_closeout_ready = excluded.completion_closeout_ready,
-             completion_open_work_count = excluded.completion_open_work_count,
-             completion_verification_pending = excluded.completion_verification_pending,
-             completion_route_contract_pending = excluded.completion_route_contract_pending,
-             completion_blocked_reason = excluded.completion_blocked_reason,
-             completion_route_contract_summary = excluded.completion_route_contract_summary,
-             docs_route_state_json = excluded.docs_route_state_json,
-             implementation_handoff_json = excluded.implementation_handoff_json,
-             verification_failure_cluster_json = excluded.verification_failure_cluster_json,
-             verification_requirement_refs_json = excluded.verification_requirement_refs_json,
-             token_accounting_json = excluded.token_accounting_json,
-             updated_at_ms = excluded.updated_at_ms",
-        params![
-            session_id.to_string(),
-            task_route_text(state.route),
-            process_phase_text(state.process_phase),
-            review_scope_json,
-            state.active_todo_id.map(|value| value.to_string()),
-            serde_json::to_string(&state.active_targets)?,
-            contract_refs_json,
-            failure_kind,
-            failure_summary,
-            failure_tool_name,
-            failure_targets_json,
-            state.verification.pending_todo_id.map(|value| value.to_string()),
-            serde_json::to_string(&state.verification.required_commands)?,
-            serde_json::to_string(&state.verification.failing_labels)?,
-            state.verification.last_evidence_summary,
-            state.completion.closeout_ready as i64,
-            state.completion.open_work_count as i64,
-            state.completion.verification_pending as i64,
-            state.completion.route_contract_pending as i64,
-            state.completion.blocked_reason,
-            state.completion.route_contract_summary,
-            docs_route_state_json,
-            implementation_handoff_json,
-            verification_failure_cluster_json,
-            verification_requirement_refs_json,
-            token_accounting_json,
-            updated_at_ms
-        ],
-    )?;
-    Ok(())
-}
-
-fn validate_file_change_protocol_bundle(
+fn validate_canonical_tool_call_payload(
+    history_item: &HistoryItem,
     tool_call_id: ToolCallId,
-    diff_summary: &DiffSummaryPart,
+) -> Result<(), StorageError> {
+    match &history_item.payload {
+        HistoryItemPayload::ToolCall { call_id, .. } if *call_id == tool_call_id => Ok(()),
+        HistoryItemPayload::ToolCall { call_id, .. } => Err(StorageError::Message(format!(
+            "canonical tool call identity mismatch: expected {tool_call_id} got {call_id}",
+        ))),
+        _ => Err(StorageError::Message(
+            "tool sidecar must reference a canonical ToolCall history item".to_string(),
+        )),
+    }
+}
+
+fn validate_canonical_tool_call_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    turn_id: TurnId,
+    tool_call_id: ToolCallId,
+    tool_name: crate::tool::ToolName,
+) -> Result<HistoryItemId, StorageError> {
+    let stored = transaction
+        .query_row(
+            "SELECT history.id, history.sequence_no, history.payload_json, history.created_at_ms
+             FROM tool_calls AS tool
+             INNER JOIN protocol_history_items AS history
+                ON history.id = tool.history_item_id
+             WHERE tool.id = ?1 AND history.session_id = ?2 AND history.turn_id = ?3",
+            params![
+                tool_call_id.to_string(),
+                session_id.to_string(),
+                turn_id.to_string(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((history_item_id, sequence_no, payload_json, created_at_ms)) = stored else {
+        return Err(StorageError::Message(format!(
+            "tool call {tool_call_id} is not owned by session {session_id} turn {turn_id}"
+        )));
+    };
+    let history_item = HistoryItem {
+        id: history_item_id.parse::<HistoryItemId>().map_err(|error| {
+            StorageError::Message(format!("invalid tool history item id: {error}"))
+        })?,
+        session_id,
+        turn_id,
+        sequence_no,
+        created_at_ms,
+        payload: serde_json::from_str(&payload_json)?,
+    };
+    validate_canonical_tool_call_payload(&history_item, tool_call_id)?;
+    let HistoryItemPayload::ToolCall {
+        tool_name: stored_tool_name,
+        ..
+    } = &history_item.payload
+    else {
+        unreachable!("canonical payload validation accepted a non-tool-call item");
+    };
+    let stored_tool = crate::tool::ToolName::parse(stored_tool_name);
+    if stored_tool != tool_name {
+        return Err(StorageError::Message(format!(
+            "canonical tool call name mismatch: expected {tool_name} got raw `{stored_tool_name}` ({stored_tool})"
+        )));
+    }
+    Ok(history_item.id)
+}
+
+fn validate_persisted_file_change_ownership(
+    transaction: &Transaction<'_>,
+    tool_call_id: ToolCallId,
     file_changes: &[crate::edit::ChangeSummary],
 ) -> Result<(), StorageError> {
-    if file_changes.is_empty() {
-        return Err(StorageError::Message(
-            "content-changing tool completion requires file change evidence".to_string(),
-        ));
-    }
-    if diff_summary.summary.trim().is_empty() {
-        return Err(StorageError::Message(
-            "content-changing tool completion requires a diff summary".to_string(),
-        ));
-    }
-    if diff_summary.tool_call_id != Some(tool_call_id) {
-        return Err(StorageError::Message(
-            "diff summary tool call id must match tool completion owner".to_string(),
-        ));
-    }
-    let change_ids = file_changes
-        .iter()
-        .map(|change| change.change_id)
-        .collect::<Vec<_>>();
-    if diff_summary.change_ids != change_ids {
-        return Err(StorageError::Message(
-            "diff summary change ids must match file change evidence".to_string(),
-        ));
-    }
-    if diff_summary.changes.len() != file_changes.len() {
-        return Err(StorageError::Message(
-            "diff summary evidence count must match file change evidence".to_string(),
-        ));
-    }
-    for (index, (evidence, change)) in diff_summary
-        .changes
-        .iter()
-        .zip(file_changes.iter())
-        .enumerate()
-    {
-        if evidence.change_id != change.change_id
-            || evidence.kind != change.kind
-            || evidence.path_before != change.path_before
-            || evidence.path_after != change.path_after
-        {
+    let mut seen = HashSet::with_capacity(file_changes.len());
+    let tool_call_id_text = tool_call_id.to_string();
+    for change in file_changes {
+        if !seen.insert(change.change_id) {
             return Err(StorageError::Message(format!(
-                "diff summary evidence at index {index} must match file change evidence"
+                "file change {} is duplicated in one tool settlement",
+                change.change_id
             )));
         }
-        if evidence.summary.trim().is_empty() {
+        let owner = transaction
+            .query_row(
+                "SELECT tool_call_id FROM file_changes WHERE id = ?1",
+                params![change.change_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if owner.as_deref() != Some(tool_call_id_text.as_str()) {
             return Err(StorageError::Message(format!(
-                "diff summary evidence at index {index} requires a summary"
+                "file change {} is not durable evidence for tool call {tool_call_id}",
+                change.change_id
             )));
         }
     }
     Ok(())
-}
-
-fn parse_tool_name(value: &str) -> crate::tool::ToolName {
-    match value {
-        "list" => crate::tool::ToolName::List,
-        "glob" => crate::tool::ToolName::Glob,
-        "grep" => crate::tool::ToolName::Grep,
-        "read" => crate::tool::ToolName::Read,
-        "inspect_directory" => crate::tool::ToolName::InspectDirectory,
-        "apply_patch" => crate::tool::ToolName::ApplyPatch,
-        "write" => crate::tool::ToolName::Write,
-        "shell" => crate::tool::ToolName::Shell,
-        "current_time" => crate::tool::ToolName::CurrentTime,
-        "skill" => crate::tool::ToolName::Skill,
-        "docling_convert" => crate::tool::ToolName::DoclingConvert,
-        "mcp_call" => crate::tool::ToolName::McpCall,
-        "update_plan" | "todowrite" | "todo_write" => crate::tool::ToolName::UpdatePlan,
-        "get_goal" => crate::tool::ToolName::GetGoal,
-        "create_goal" => crate::tool::ToolName::CreateGoal,
-        "update_goal" => crate::tool::ToolName::UpdateGoal,
-        "spawn_agent" => crate::tool::ToolName::SpawnAgent,
-        "send_message" => crate::tool::ToolName::SendMessage,
-        "followup_task" => crate::tool::ToolName::FollowupTask,
-        "wait_agent" => crate::tool::ToolName::WaitAgent,
-        "interrupt_agent" => crate::tool::ToolName::InterruptAgent,
-        "list_agents" => crate::tool::ToolName::ListAgents,
-        "invalid" => crate::tool::ToolName::Invalid,
-        _ => crate::tool::ToolName::Invalid,
-    }
-}
-
-fn tool_name_text(value: crate::tool::ToolName) -> &'static str {
-    match value {
-        crate::tool::ToolName::List => "list",
-        crate::tool::ToolName::Glob => "glob",
-        crate::tool::ToolName::Grep => "grep",
-        crate::tool::ToolName::Read => "read",
-        crate::tool::ToolName::InspectDirectory => "inspect_directory",
-        crate::tool::ToolName::ApplyPatch => "apply_patch",
-        crate::tool::ToolName::Write => "write",
-        crate::tool::ToolName::Shell => "shell",
-        crate::tool::ToolName::CurrentTime => "current_time",
-        crate::tool::ToolName::Skill => "skill",
-        crate::tool::ToolName::DoclingConvert => "docling_convert",
-        crate::tool::ToolName::McpCall => "mcp_call",
-        crate::tool::ToolName::UpdatePlan => "update_plan",
-        crate::tool::ToolName::GetGoal => "get_goal",
-        crate::tool::ToolName::CreateGoal => "create_goal",
-        crate::tool::ToolName::UpdateGoal => "update_goal",
-        crate::tool::ToolName::SpawnAgent => "spawn_agent",
-        crate::tool::ToolName::SendMessage => "send_message",
-        crate::tool::ToolName::FollowupTask => "followup_task",
-        crate::tool::ToolName::WaitAgent => "wait_agent",
-        crate::tool::ToolName::InterruptAgent => "interrupt_agent",
-        crate::tool::ToolName::ListAgents => "list_agents",
-        crate::tool::ToolName::Invalid => "invalid",
-    }
-}
-
-fn parse_task_route(value: &str) -> Result<TaskRoute, rusqlite::Error> {
-    match value {
-        "code" => Ok(TaskRoute::Code),
-        "docs" => Ok(TaskRoute::Docs),
-        "review" => Ok(TaskRoute::Review),
-        "debug" => Ok(TaskRoute::Debug),
-        "ask" => Ok(TaskRoute::Ask),
-        "summary" => Ok(TaskRoute::Summary),
-        _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                "invalid task route `{value}`"
-            )),
-        )),
-    }
-}
-
-fn task_route_text(value: TaskRoute) -> &'static str {
-    match value {
-        TaskRoute::Code => "code",
-        TaskRoute::Docs => "docs",
-        TaskRoute::Review => "review",
-        TaskRoute::Debug => "debug",
-        TaskRoute::Ask => "ask",
-        TaskRoute::Summary => "summary",
-    }
-}
-
-fn parse_process_phase(value: &str) -> Result<ProcessPhase, rusqlite::Error> {
-    match value {
-        "discovery" | "planning" => Ok(ProcessPhase::Discover),
-        "editing" => Ok(ProcessPhase::Author),
-        "verifying" => Ok(ProcessPhase::Verify),
-        "repairing" => Ok(ProcessPhase::Repair),
-        "completing" => Ok(ProcessPhase::Closeout),
-        _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                "invalid process phase `{value}`"
-            )),
-        )),
-    }
-}
-
-fn process_phase_text(value: ProcessPhase) -> &'static str {
-    match value {
-        ProcessPhase::Discover => "discovery",
-        ProcessPhase::Author => "editing",
-        ProcessPhase::Verify => "verifying",
-        ProcessPhase::Repair => "repairing",
-        ProcessPhase::Closeout => "completing",
-    }
-}
-
-fn parse_failure_kind(value: &str) -> Result<FailureKind, rusqlite::Error> {
-    match value {
-        "invalid_tool" => Ok(FailureKind::InvalidTool),
-        "tool_execution" => Ok(FailureKind::ToolExecution),
-        "patch_mismatch" => Ok(FailureKind::PatchMismatch),
-        "verification_failed" => Ok(FailureKind::VerificationFailed),
-        "context_overflow" => Ok(FailureKind::ContextOverflow),
-        "provider_retryable" => Ok(FailureKind::ProviderRetryable),
-        "provider_fatal" => Ok(FailureKind::ProviderFatal),
-        "completion_drift" => Ok(FailureKind::CompletionDrift),
-        _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            3,
-            rusqlite::types::Type::Text,
-            Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                "invalid failure kind `{value}`"
-            )),
-        )),
-    }
-}
-
-fn failure_kind_text(value: FailureKind) -> &'static str {
-    match value {
-        FailureKind::InvalidTool => "invalid_tool",
-        FailureKind::ToolExecution => "tool_execution",
-        FailureKind::PatchMismatch => "patch_mismatch",
-        FailureKind::VerificationFailed => "verification_failed",
-        FailureKind::ContextOverflow => "context_overflow",
-        FailureKind::ProviderRetryable => "provider_retryable",
-        FailureKind::ProviderFatal => "provider_fatal",
-        FailureKind::CompletionDrift => "completion_drift",
-    }
-}
-
-fn parse_todo_status(value: &str) -> TodoStatus {
-    match value {
-        "pending" => TodoStatus::Pending,
-        "in_progress" => TodoStatus::InProgress,
-        "blocked" => TodoStatus::Blocked,
-        "completed" => TodoStatus::Completed,
-        "cancelled" => TodoStatus::Cancelled,
-        _ => TodoStatus::Pending,
-    }
-}
-
-fn todo_status_text(value: TodoStatus) -> &'static str {
-    match value {
-        TodoStatus::Pending => "pending",
-        TodoStatus::InProgress => "in_progress",
-        TodoStatus::Blocked => "blocked",
-        TodoStatus::Completed => "completed",
-        TodoStatus::Cancelled => "cancelled",
-    }
-}
-
-fn parse_todo_kind(value: &str) -> TodoKind {
-    match value {
-        "verification" => TodoKind::Verification,
-        "repair" => TodoKind::Repair,
-        "completion" => TodoKind::Completion,
-        _ => TodoKind::Work,
-    }
-}
-
-fn todo_kind_text(value: TodoKind) -> &'static str {
-    match value {
-        TodoKind::Work => "work",
-        TodoKind::Verification => "verification",
-        TodoKind::Repair => "repair",
-        TodoKind::Completion => "completion",
-    }
-}
-
-fn parse_todo_priority(value: &str) -> TodoPriority {
-    match value {
-        "high" => TodoPriority::High,
-        "medium" => TodoPriority::Medium,
-        "low" => TodoPriority::Low,
-        _ => TodoPriority::Medium,
-    }
-}
-
-fn todo_priority_text(value: TodoPriority) -> &'static str {
-    match value {
-        TodoPriority::High => "high",
-        TodoPriority::Medium => "medium",
-        TodoPriority::Low => "low",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use camino::Utf8PathBuf;
-    use std::sync::{Arc, Barrier};
-
-    use super::*;
-    use crate::config::AccessMode;
-    use crate::protocol::{ContentPart, ProtocolEventStore, UserInputItem};
-    use crate::session::{
-        AssistantMessageMeta, FinishReason, NewSession, ProjectId, ProjectRepository,
-        SessionRepository,
-    };
-    use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
-
-    async fn test_repo() -> (StoreBundle, SessionId) {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
-        let paths = StoragePaths {
-            database_path: data_dir.join("moyai.sqlite3"),
-            truncation_dir: data_dir.join("truncation"),
-            data_dir: data_dir.clone(),
-        };
-        let sqlite = SqliteStore::open(&paths).expect("store");
-        sqlite.migrate().expect("migrate");
-        let store = StoreBundle::new(sqlite);
-        let project_id = ProjectId::new();
-        store
-            .project_repo()
-            .upsert_project(project_id, &data_dir, "test", "none")
-            .await
-            .expect("project");
-        let session = store
-            .session_repo()
-            .create_session(NewSession {
-                project_id,
-                title: "test".to_string(),
-                cwd: data_dir,
-                model: "model".to_string(),
-                base_url: "http://localhost:1234".to_string(),
-                access_mode: AccessMode::Default,
-            })
-            .await
-            .expect("session");
-        (store, session.id)
-    }
-
-    fn session_draft_from(template: &SessionRecord, title: &str) -> NewSession {
-        NewSession {
-            project_id: template.project_id,
-            title: title.to_string(),
-            cwd: template.cwd.clone(),
-            model: template.model.clone(),
-            base_url: template.base_url.clone(),
-            access_mode: template.access_mode,
-        }
-    }
-
-    #[tokio::test]
-    async fn unknown_persisted_session_status_is_a_storage_error() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        {
-            let connection = repo.connection.lock().expect("sqlite mutex");
-            connection
-                .pragma_update(None, "ignore_check_constraints", "ON")
-                .expect("allow corruption fixture");
-            connection
-                .execute(
-                    "UPDATE sessions SET status = 'mystery_terminal' WHERE id = ?1",
-                    params![session_id.to_string()],
-                )
-                .expect("write corruption fixture");
-            connection
-                .pragma_update(None, "ignore_check_constraints", "OFF")
-                .expect("restore check constraints");
-        }
-
-        let error = repo
-            .get_session(session_id)
-            .await
-            .expect_err("unknown status must not impersonate failure");
-        assert!(
-            error
-                .to_string()
-                .contains("unknown persisted session status `mystery_terminal`")
-        );
-        assert!(parse_status("mystery_terminal").is_err());
-    }
-
-    async fn active_turn_fixture() -> (StoreBundle, SessionId, String, TurnId, MessageRecord) {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let admission_id = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("admit run")
-            .expect("run admitted");
-        let turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &admission_id, turn_id)
-                .await
-                .expect("activate turn")
-        );
-        store
-            .protocol_event_store()
-            .append_history_item(&HistoryItem {
-                id: HistoryItemId::new(),
-                session_id,
-                turn_id,
-                sequence_no: 0,
-                created_at_ms: SystemClock.now_ms(),
-                payload: HistoryItemPayload::Message {
-                    message_id: None,
-                    role: MessageRole::User,
-                    content: vec![ContentPart::Text {
-                        text: "initial request".to_string(),
-                    }],
-                },
-            })
-            .expect("record active turn");
-        let (assistant, _) = repo
-            .append_assistant_message_with_protocol_start(
-                NewMessage {
-                    session_id,
-                    parent_message_id: None,
-                    role: MessageRole::Assistant,
-                    metadata: MessageMetadata::Assistant(AssistantMessageMeta {
-                        model: "model".to_string(),
-                        base_url: "http://localhost:1234".to_string(),
-                        finish_reason: None,
-                        token_usage: None,
-                        summary: false,
-                    }),
-                },
-                &admission_id,
-                turn_id,
-                None,
-                "model".to_string(),
-            )
-            .await
-            .expect("assistant");
-        (store, session_id, admission_id, turn_id, assistant)
-    }
-
-    fn test_assistant_metadata(finish_reason: Option<FinishReason>) -> MessageMetadata {
-        MessageMetadata::Assistant(AssistantMessageMeta {
-            model: "model".to_string(),
-            base_url: "http://localhost:1234".to_string(),
-            finish_reason,
-            token_usage: None,
-            summary: false,
-        })
-    }
-
-    fn protocol_bundle_counts(
-        repo: &SqliteSessionRepository,
-        session_id: SessionId,
-        turn_id: TurnId,
-    ) -> (i64, i64, i64) {
-        let connection = repo.connection.lock().expect("sqlite mutex");
-        let count = |table: &str| {
-            connection
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1 AND turn_id = ?2"),
-                    params![session_id.to_string(), turn_id.to_string()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("protocol row count")
-        };
-        (
-            count("protocol_runtime_events"),
-            count("protocol_history_items"),
-            count("protocol_turn_items"),
-        )
-    }
-
-    fn stored_message_metadata_json(
-        repo: &SqliteSessionRepository,
-        message_id: MessageId,
-    ) -> String {
-        repo.connection
-            .lock()
-            .expect("sqlite mutex")
-            .query_row(
-                "SELECT metadata_json FROM messages WHERE id = ?1",
-                params![message_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("stored message metadata")
-    }
-
-    fn stored_active_run_id(
-        repo: &SqliteSessionRepository,
-        session_id: SessionId,
-    ) -> Option<String> {
-        repo.connection
-            .lock()
-            .expect("sqlite mutex")
-            .query_row(
-                "SELECT active_run_id FROM sessions WHERE id = ?1",
-                params![session_id.to_string()],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .expect("stored active run id")
-    }
-
-    #[tokio::test]
-    async fn terminal_message_update_rejects_a_cross_session_assistant_atomically() {
-        let (store, session_id, admission_id, turn_id, _) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let session = repo.get_session(session_id).await.expect("target session");
-        let other_session = repo
-            .create_session(session_draft_from(&session, "other session"))
-            .await
-            .expect("other session");
-        let other_message_id = MessageId::new();
-        let original_metadata =
-            serde_json::to_string(&test_assistant_metadata(None)).expect("assistant metadata");
-        {
-            let connection = repo.connection.lock().expect("sqlite mutex");
-            connection
-                .execute(
-                    "INSERT INTO messages
-                     (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
-                     VALUES (?1, ?2, NULL, 'assistant', 0, ?3, ?4)",
-                    params![
-                        other_message_id.to_string(),
-                        other_session.id.to_string(),
-                        original_metadata.as_str(),
-                        SystemClock.now_ms()
-                    ],
-                )
-                .expect("other session assistant");
-        }
-        let protocol_counts_before = protocol_bundle_counts(&repo, session_id, turn_id);
-
-        let error = repo
-            .update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                other_message_id,
-                &test_assistant_metadata(Some(FinishReason::Stop)),
-                SessionStatus::Completed,
-                &RunEvent::SessionCompleted {
-                    session_id,
-                    finish_reason: Some(FinishReason::Stop),
-                },
-                turn_id,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect_err("cross-session metadata target must be rejected");
-        assert!(error.to_string().contains("belongs to session"));
-        assert_eq!(
-            repo.get_session(session_id)
-                .await
-                .expect("target session after rejection")
-                .status,
-            SessionStatus::Running
-        );
-        assert_eq!(stored_active_run_id(&repo, session_id), Some(admission_id));
-        assert_eq!(
-            repo.get_session(other_session.id)
-                .await
-                .expect("other session after rejection")
-                .status,
-            SessionStatus::Idle
-        );
-        assert_eq!(
-            stored_message_metadata_json(&repo, other_message_id),
-            original_metadata
-        );
-        assert_eq!(
-            protocol_bundle_counts(&repo, session_id, turn_id),
-            protocol_counts_before
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_message_update_rejects_a_user_message_atomically() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let session = repo.get_session(session_id).await.expect("target session");
-        let user_message_id = MessageId::new();
-        let original_metadata =
-            serde_json::to_string(&MessageMetadata::User(crate::session::UserMessageMeta {
-                cwd: session.cwd,
-                requested_model: None,
-                editor_context: None,
-            }))
-            .expect("user metadata");
-        {
-            let connection = repo.connection.lock().expect("sqlite mutex");
-            connection
-                .execute(
-                    "INSERT INTO messages
-                     (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
-                     VALUES (?1, ?2, NULL, 'user', ?3, ?4, ?5)",
-                    params![
-                        user_message_id.to_string(),
-                        session_id.to_string(),
-                        assistant.sequence_no + 1,
-                        original_metadata.as_str(),
-                        SystemClock.now_ms()
-                    ],
-                )
-                .expect("user message");
-        }
-        let protocol_counts_before = protocol_bundle_counts(&repo, session_id, turn_id);
-
-        let error = repo
-            .update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                user_message_id,
-                &test_assistant_metadata(Some(FinishReason::Stop)),
-                SessionStatus::Completed,
-                &RunEvent::SessionCompleted {
-                    session_id,
-                    finish_reason: Some(FinishReason::Stop),
-                },
-                turn_id,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect_err("user metadata target must be rejected");
-        assert!(error.to_string().contains("not assistant"));
-        assert_eq!(
-            repo.get_session(session_id)
-                .await
-                .expect("session after rejection")
-                .status,
-            SessionStatus::Running
-        );
-        assert_eq!(stored_active_run_id(&repo, session_id), Some(admission_id));
-        assert_eq!(
-            stored_message_metadata_json(&repo, user_message_id),
-            original_metadata
-        );
-        assert_eq!(
-            protocol_bundle_counts(&repo, session_id, turn_id),
-            protocol_counts_before
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_message_update_rejects_non_assistant_stored_metadata_atomically() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let session = repo.get_session(session_id).await.expect("target session");
-        let invalid_stored_metadata =
-            serde_json::to_string(&MessageMetadata::User(crate::session::UserMessageMeta {
-                cwd: session.cwd,
-                requested_model: None,
-                editor_context: None,
-            }))
-            .expect("user metadata");
-        {
-            let connection = repo.connection.lock().expect("sqlite mutex");
-            connection
-                .execute(
-                    "UPDATE messages SET metadata_json = ?2 WHERE id = ?1",
-                    params![assistant.id.to_string(), invalid_stored_metadata.as_str()],
-                )
-                .expect("corrupt assistant metadata fixture");
-        }
-        let protocol_counts_before = protocol_bundle_counts(&repo, session_id, turn_id);
-
-        let error = repo
-            .update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                assistant.id,
-                &test_assistant_metadata(Some(FinishReason::Stop)),
-                SessionStatus::Completed,
-                &RunEvent::SessionCompleted {
-                    session_id,
-                    finish_reason: Some(FinishReason::Stop),
-                },
-                turn_id,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect_err("non-assistant stored metadata must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("does not contain assistant metadata")
-        );
-        assert_eq!(
-            repo.get_session(session_id)
-                .await
-                .expect("session after rejection")
-                .status,
-            SessionStatus::Running
-        );
-        assert_eq!(stored_active_run_id(&repo, session_id), Some(admission_id));
-        assert_eq!(
-            stored_message_metadata_json(&repo, assistant.id),
-            invalid_stored_metadata
-        );
-        assert_eq!(
-            protocol_bundle_counts(&repo, session_id, turn_id),
-            protocol_counts_before
-        );
-    }
-
-    #[test]
-    fn terminal_message_finish_reason_validator_accepts_the_supported_pairs() {
-        let session_id = SessionId::new();
-        for (status, event, metadata) in [
-            (
-                SessionStatus::Completed,
-                RunEvent::SessionCompleted {
-                    session_id,
-                    finish_reason: None,
-                },
-                test_assistant_metadata(None),
-            ),
-            (
-                SessionStatus::Completed,
-                RunEvent::SessionCompleted {
-                    session_id,
-                    finish_reason: Some(FinishReason::Stop),
-                },
-                test_assistant_metadata(Some(FinishReason::Stop)),
-            ),
-            (
-                SessionStatus::AwaitingUser,
-                RunEvent::SessionAwaitingUser {
-                    session_id,
-                    finish_reason: None,
-                },
-                test_assistant_metadata(None),
-            ),
-            (
-                SessionStatus::AwaitingUser,
-                RunEvent::SessionAwaitingUser {
-                    session_id,
-                    finish_reason: Some(FinishReason::ToolCall),
-                },
-                test_assistant_metadata(Some(FinishReason::ToolCall)),
-            ),
-            (
-                SessionStatus::Cancelled,
-                RunEvent::SessionInterrupted {
-                    session_id,
-                    reason: "stop".to_string(),
-                    cause: Some(TurnInterruptionCause::UserStop),
-                },
-                test_assistant_metadata(Some(FinishReason::Cancelled)),
-            ),
-            (
-                SessionStatus::Failed,
-                RunEvent::SessionFailed {
-                    session_id,
-                    message: "failure".to_string(),
-                },
-                test_assistant_metadata(Some(FinishReason::Error)),
-            ),
-        ] {
-            validate_terminal_message_update(session_id, status, &event, &metadata)
-                .expect("supported terminal finish reason pair");
-        }
-    }
-
-    #[tokio::test]
-    async fn terminal_message_finish_reason_contradictions_roll_back_the_bundle() {
-        for case in 0..9 {
-            let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-            let repo = store.session_repo();
-            let session = repo.get_session(session_id).await.expect("target session");
-            let (label, status, event, metadata) = match case {
-                0 => (
-                    "completed event length",
-                    SessionStatus::Completed,
-                    RunEvent::SessionCompleted {
-                        session_id,
-                        finish_reason: Some(FinishReason::Length),
-                    },
-                    test_assistant_metadata(Some(FinishReason::Stop)),
-                ),
-                1 => (
-                    "completed metadata tool call",
-                    SessionStatus::Completed,
-                    RunEvent::SessionCompleted {
-                        session_id,
-                        finish_reason: Some(FinishReason::Stop),
-                    },
-                    test_assistant_metadata(Some(FinishReason::ToolCall)),
-                ),
-                2 => (
-                    "awaiting event stop",
-                    SessionStatus::AwaitingUser,
-                    RunEvent::SessionAwaitingUser {
-                        session_id,
-                        finish_reason: Some(FinishReason::Stop),
-                    },
-                    test_assistant_metadata(Some(FinishReason::ToolCall)),
-                ),
-                3 => (
-                    "awaiting metadata stop",
-                    SessionStatus::AwaitingUser,
-                    RunEvent::SessionAwaitingUser {
-                        session_id,
-                        finish_reason: Some(FinishReason::ToolCall),
-                    },
-                    test_assistant_metadata(Some(FinishReason::Stop)),
-                ),
-                4 => (
-                    "cancelled metadata missing",
-                    SessionStatus::Cancelled,
-                    RunEvent::SessionInterrupted {
-                        session_id,
-                        reason: "stop".to_string(),
-                        cause: Some(TurnInterruptionCause::UserStop),
-                    },
-                    test_assistant_metadata(None),
-                ),
-                5 => (
-                    "cancelled metadata error",
-                    SessionStatus::Cancelled,
-                    RunEvent::SessionInterrupted {
-                        session_id,
-                        reason: "stop".to_string(),
-                        cause: Some(TurnInterruptionCause::UserStop),
-                    },
-                    test_assistant_metadata(Some(FinishReason::Error)),
-                ),
-                6 => (
-                    "failed metadata missing",
-                    SessionStatus::Failed,
-                    RunEvent::SessionFailed {
-                        session_id,
-                        message: "failure".to_string(),
-                    },
-                    test_assistant_metadata(None),
-                ),
-                7 => (
-                    "failed metadata cancelled",
-                    SessionStatus::Failed,
-                    RunEvent::SessionFailed {
-                        session_id,
-                        message: "failure".to_string(),
-                    },
-                    test_assistant_metadata(Some(FinishReason::Cancelled)),
-                ),
-                8 => (
-                    "user metadata",
-                    SessionStatus::Completed,
-                    RunEvent::SessionCompleted {
-                        session_id,
-                        finish_reason: Some(FinishReason::Stop),
-                    },
-                    MessageMetadata::User(crate::session::UserMessageMeta {
-                        cwd: session.cwd,
-                        requested_model: None,
-                        editor_context: None,
-                    }),
-                ),
-                _ => unreachable!(),
-            };
-            let original_metadata = stored_message_metadata_json(&repo, assistant.id);
-            let protocol_counts_before = protocol_bundle_counts(&repo, session_id, turn_id);
-
-            let error = repo
-                .update_admitted_message_metadata_and_status_with_protocol_event(
-                    session_id,
-                    &admission_id,
-                    assistant.id,
-                    &metadata,
-                    status,
-                    &event,
-                    turn_id,
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .expect_err(label);
-            assert!(!error.to_string().is_empty(), "case={label}");
-            assert_eq!(
-                repo.get_session(session_id)
-                    .await
-                    .expect("session after contradiction")
-                    .status,
-                SessionStatus::Running,
-                "case={label}"
-            );
-            assert_eq!(
-                stored_active_run_id(&repo, session_id),
-                Some(admission_id),
-                "case={label}"
-            );
-            assert_eq!(
-                stored_message_metadata_json(&repo, assistant.id),
-                original_metadata,
-                "case={label}"
-            );
-            assert_eq!(
-                protocol_bundle_counts(&repo, session_id, turn_id),
-                protocol_counts_before,
-                "case={label}"
-            );
-        }
-    }
-
-    fn stored_run_lease_expiry(repo: &SqliteSessionRepository, session_id: SessionId) -> i64 {
-        repo.connection
-            .lock()
-            .expect("sqlite mutex")
-            .query_row(
-                "SELECT active_run_lease_expires_at_ms FROM sessions WHERE id = ?1",
-                params![session_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("stored run lease expiry")
-    }
-
-    #[tokio::test]
-    async fn heartbeat_extends_lease_without_shortening_on_clock_rollback() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let turn_id = TurnId::new();
-        let admission_id = repo
-            .admit_session_run_at(session_id, 1_000, 100)
-            .await
-            .expect("admit")
-            .expect("admitted");
-        assert_eq!(stored_run_lease_expiry(&repo, session_id), 1_100);
-        assert_eq!(
-            repo.renew_admitted_run_lease_at(session_id, &admission_id, turn_id, 1_050, 100,)
-                .await
-                .expect("heartbeat"),
-            RunAdmissionLeaseRenewalOutcome::Renewed
-        );
-        assert_eq!(stored_run_lease_expiry(&repo, session_id), 1_150);
-        assert_eq!(
-            repo.renew_admitted_run_lease_at(session_id, &admission_id, turn_id, 900, 100,)
-                .await
-                .expect("rollback heartbeat"),
-            RunAdmissionLeaseRenewalOutcome::Renewed
-        );
-        assert_eq!(stored_run_lease_expiry(&repo, session_id), 1_150);
-        assert!(
-            repo.admit_session_run_at(session_id, 1_149, 100)
-                .await
-                .expect("pre-expiry admission")
-                .is_none()
-        );
-        assert!(
-            repo.admit_session_run_at(session_id, 1_150, 100)
-                .await
-                .expect("post-expiry admission")
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_owner_clear_is_a_graceful_heartbeat_outcome() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        assert_eq!(
-            repo.update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                assistant.id,
-                &test_assistant_metadata(Some(FinishReason::Stop)),
-                SessionStatus::Completed,
-                &RunEvent::SessionCompleted {
-                    session_id,
-                    finish_reason: Some(FinishReason::Stop),
-                },
-                turn_id,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("terminal commit"),
-            AdmittedTerminalCommit::Applied
-        );
-        assert_eq!(
-            repo.renew_admitted_run_lease(session_id, &admission_id, turn_id)
-                .await
-                .expect("post-terminal heartbeat"),
-            RunAdmissionLeaseRenewalOutcome::GracefulTerminal
-        );
-    }
-
-    #[tokio::test]
-    async fn lease_clock_edges_are_clamped_and_overflow_safe() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let first_admission = repo
-            .admit_session_run_at(session_id, -10, 0)
-            .await
-            .expect("negative clock admission")
-            .expect("admitted");
-        assert_eq!(stored_run_lease_expiry(&repo, session_id), 1);
-        assert!(
-            repo.has_fresh_run_admission_at(session_id, 0)
-                .await
-                .expect("fresh at clamped zero")
-        );
-        assert!(
-            !repo
-                .has_fresh_run_admission_at(session_id, 1)
-                .await
-                .expect("expired at exact boundary")
-        );
-        assert_eq!(
-            repo.renew_admitted_run_lease_at(session_id, &first_admission, TurnId::new(), 1, 100,)
-                .await
-                .expect("expired heartbeat rejected"),
-            RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
-        );
-        repo.admit_session_run_at(session_id, i64::MAX, i64::MAX)
-            .await
-            .expect("overflow-safe reclaim")
-            .expect("reclaimed");
-        assert_eq!(stored_run_lease_expiry(&repo, session_id), i64::MAX);
-        assert!(
-            repo.has_fresh_run_admission_at(session_id, i64::MAX)
-                .await
-                .expect("saturated lease remains fresh")
-        );
-    }
-
-    #[tokio::test]
-    async fn expired_owner_recovery_covers_active_and_terminal_statuses() {
-        for expired_status in [
-            SessionStatus::Running,
-            SessionStatus::AwaitingUser,
-            SessionStatus::Cancelled,
-            SessionStatus::Failed,
-        ] {
-            let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-            let repo = store.session_repo();
-            let (tool_call, _) = repo
-                .record_pending_tool_call_with_protocol_bundle(
-                    session_id,
-                    &admission_id,
-                    assistant.id,
-                    "shell",
-                    "{}",
-                    Some("crashed tool"),
-                    serde_json::Value::Null,
-                    turn_id,
-                    Some(1),
-                )
-                .await
-                .expect("pending tool");
-            match expired_status {
-                SessionStatus::Running => {}
-                SessionStatus::AwaitingUser => {
-                    assert!(
-                        repo.terminalize_admitted_session_with_protocol_event(
-                            session_id,
-                            &admission_id,
-                            SessionStatus::AwaitingUser,
-                            &RunEvent::SessionAwaitingUser {
-                                session_id,
-                                finish_reason: Some(FinishReason::ToolCall),
-                            },
-                            turn_id,
-                            None,
-                        )
-                        .await
-                        .expect("awaiting user")
-                    );
-                }
-                SessionStatus::Cancelled => {
-                    assert!(
-                        repo.terminalize_active_session_with_protocol_event(
-                            session_id,
-                            SessionStatus::Cancelled,
-                            &RunEvent::SessionInterrupted {
-                                session_id,
-                                reason: "external cancellation".to_string(),
-                                cause: Some(TurnInterruptionCause::UserStop),
-                            },
-                            turn_id,
-                            None,
-                        )
-                        .await
-                        .expect("external cancellation")
-                    );
-                }
-                SessionStatus::Failed => {
-                    assert!(
-                        repo.terminalize_active_session_with_protocol_event(
-                            session_id,
-                            SessionStatus::Failed,
-                            &RunEvent::SessionFailed {
-                                session_id,
-                                message: "external failure".to_string(),
-                            },
-                            turn_id,
-                            None,
-                        )
-                        .await
-                        .expect("external failure")
-                    );
-                }
-                SessionStatus::Idle | SessionStatus::Completed => unreachable!(),
-            }
-            let lease_expiry = stored_run_lease_expiry(&repo, session_id);
-            assert!(
-                repo.admit_session_run_at(
-                    session_id,
-                    lease_expiry.saturating_sub(1),
-                    RUN_ADMISSION_LEASE_DURATION_MS,
-                )
-                .await
-                .expect("pre-expiry admission")
-                .is_none(),
-                "fresh {expired_status:?} owner must not be reclaimed"
-            );
-            let replacement = repo
-                .admit_session_run_at(session_id, lease_expiry, RUN_ADMISSION_LEASE_DURATION_MS)
-                .await
-                .expect("expired owner recovery")
-                .expect("replacement admission");
-            assert_ne!(replacement, admission_id);
-            assert_eq!(
-                repo.get_session(session_id)
-                    .await
-                    .expect("recovered session")
-                    .status,
-                SessionStatus::Running
-            );
-            let tool_status = repo
-                .connection
-                .lock()
-                .expect("sqlite mutex")
-                .query_row(
-                    "SELECT status FROM tool_calls WHERE id = ?1",
-                    params![tool_call.id.to_string()],
-                    |row| row.get::<_, String>(0),
-                )
-                .expect("tool status");
-            let expected_tool_status = if expired_status == SessionStatus::Cancelled {
-                "cancelled"
-            } else {
-                "failed"
-            };
-            assert_eq!(tool_status, expected_tool_status);
-            let expired_interrupts = store
-                .protocol_event_store()
-                .list_runtime_events(session_id, turn_id)
-                .expect("runtime events")
-                .into_iter()
-                .filter(|event| {
-                    matches!(
-                        &event.msg,
-                        RuntimeEventMsg::TurnFailed { message }
-                            if message == EXPIRED_RUN_RECOVERY_REASON
-                    )
-                })
-                .count();
-            let expected_expired_interrupts = usize::from(matches!(
-                expired_status,
-                SessionStatus::Running | SessionStatus::AwaitingUser
-            ));
-            assert_eq!(expired_interrupts, expected_expired_interrupts);
-        }
-    }
-
-    #[tokio::test]
-    async fn expired_current_turn_records_tool_failure_before_session_failure() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let (tool_call, _) = repo
-            .record_pending_tool_call_with_protocol_bundle(
-                session_id,
-                &admission_id,
-                assistant.id,
-                "shell",
-                r#"{"command":"long-running"}"#,
-                Some("long-running tool"),
-                serde_json::Value::Null,
-                turn_id,
-                Some(1),
-            )
-            .await
-            .expect("pending tool");
-        let lease_expiry = stored_run_lease_expiry(&repo, session_id);
-
-        repo.admit_session_run_at(session_id, lease_expiry, RUN_ADMISSION_LEASE_DURATION_MS)
-            .await
-            .expect("expired owner recovery")
-            .expect("replacement admission");
-
-        let tool_status = repo
-            .connection
-            .lock()
-            .expect("sqlite mutex")
-            .query_row(
-                "SELECT status FROM tool_calls WHERE id = ?1",
-                params![tool_call.id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("tool status");
-        assert_eq!(tool_status, "failed");
-        let events = store
-            .protocol_event_store()
-            .list_runtime_events(session_id, turn_id)
-            .expect("runtime events");
-        let tool_failure_sequence = events
-            .iter()
-            .find_map(|event| match &event.msg {
-                RuntimeEventMsg::ToolLifecycle { envelope }
-                    if envelope.call_id == tool_call.id
-                        && envelope.status == crate::protocol::ToolLifecycleStatus::Failed =>
-                {
-                    Some(event.sequence_no)
-                }
-                _ => None,
-            })
-            .expect("tool failure projection");
-        let session_failure_sequence = events
-            .iter()
-            .find_map(|event| match &event.msg {
-                RuntimeEventMsg::TurnFailed { message }
-                    if message == EXPIRED_RUN_RECOVERY_REASON =>
-                {
-                    Some(event.sequence_no)
-                }
-                _ => None,
-            })
-            .expect("session failure projection");
-        assert!(tool_failure_sequence < session_failure_sequence);
-
-        let transcript = repo
-            .compatibility_transcript(session_id)
-            .await
-            .expect("transcript");
-        assert_eq!(
-            transcript
-                .messages
-                .iter()
-                .flat_map(|message| message.parts.iter())
-                .filter(|part| {
-                    matches!(
-                        &part.payload,
-                        MessagePart::ToolResult(ToolResultPart {
-                            tool_call_id,
-                            status: ToolCallStatus::Failed,
-                            ..
-                        }) if *tool_call_id == tool_call.id
-                    )
-                })
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn truncated_output_ownership_is_scoped_to_the_recording_session_and_path() {
-        let (store, session_id, _admission_id, _turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        std::fs::create_dir_all(&store.paths().truncation_dir).expect("truncation dir");
-        let output_path = store.paths().truncation_dir.join("owned.txt");
-        std::fs::write(&output_path, "owned output").expect("truncated output");
-        let tool_call = repo
-            .insert_tool_call(
-                session_id,
-                assistant.id,
-                "docling_convert",
-                "{}",
-                Some("docling"),
-                serde_json::Value::Null,
-            )
-            .await
-            .expect("tool call");
-        repo.complete_tool_call(
-            tool_call.id,
-            "docling",
-            serde_json::Value::Null,
-            "preview",
-            Some(&output_path),
-        )
-        .await
-        .expect("complete tool call");
-
-        assert!(
-            repo.session_owns_truncated_output(session_id, &output_path)
-                .await
-                .expect("owned path")
-        );
-        assert!(
-            !repo
-                .session_owns_truncated_output(SessionId::new(), &output_path)
-                .await
-                .expect("other session")
-        );
-        assert!(
-            !repo
-                .session_owns_truncated_output(
-                    session_id,
-                    &store.paths().truncation_dir.join("other.txt"),
-                )
-                .await
-                .expect("other path")
-        );
-    }
-
-    #[tokio::test]
-    async fn pre_turn_expiry_does_not_attribute_recovery_to_the_previous_turn() {
-        let (store, session_id) = test_repo().await;
-        let previous_turn_id = TurnId::new();
-        let previous_event = RuntimeEvent {
-            id: RuntimeEventId::new(),
-            session_id,
-            turn_id: previous_turn_id,
-            sequence_no: 0,
-            created_at_ms: 900,
-            msg: RuntimeEventMsg::Warning {
-                message: "previous turn is complete".to_string(),
-            },
-        };
-        store
-            .protocol_event_store()
-            .append_runtime_event(&previous_event)
-            .expect("previous turn event");
-        let repo = store.session_repo();
-        let crashed_admission = repo
-            .admit_session_run_at(session_id, 1_000, 100)
-            .await
-            .expect("crashed admission")
-            .expect("admitted before publishing a turn");
-        let replacement = repo
-            .admit_session_run_at(session_id, 1_100, 100)
-            .await
-            .expect("expired recovery")
-            .expect("replacement admission");
-
-        assert_ne!(replacement, crashed_admission);
-        let previous_turn_events = store
-            .protocol_event_store()
-            .list_runtime_events(session_id, previous_turn_id)
-            .expect("previous turn events");
-        assert_eq!(previous_turn_events.len(), 1);
-        assert_eq!(previous_turn_events[0].id, previous_event.id);
-        assert!(matches!(
-            &previous_turn_events[0].msg,
-            RuntimeEventMsg::Warning { message } if message == "previous turn is complete"
-        ));
-    }
-
-    #[tokio::test]
-    async fn expired_lease_fences_owner_reads_heartbeats_and_protocol_writes() {
-        let (store, session_id, admission_id, turn_id, _) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let lease_expiry = stored_run_lease_expiry(&repo, session_id);
-        assert_eq!(
-            repo.admitted_run_status_at(session_id, &admission_id, turn_id, lease_expiry)
-                .await
-                .expect("status guard"),
-            None
-        );
-        assert!(
-            repo.list_admitted_turn_steers_at(session_id, &admission_id, turn_id, lease_expiry,)
-                .await
-                .expect("mailbox guard")
-                .is_none()
-        );
-        assert_eq!(
-            repo.renew_admitted_run_lease_at(
-                session_id,
-                &admission_id,
-                turn_id,
-                lease_expiry,
-                RUN_ADMISSION_LEASE_DURATION_MS,
-            )
-            .await
-            .expect("heartbeat guard"),
-            RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
-        );
-        let late_event = RuntimeEvent {
-            id: RuntimeEventId::new(),
-            session_id,
-            turn_id,
-            sequence_no: 0,
-            created_at_ms: lease_expiry,
-            msg: RuntimeEventMsg::Warning {
-                message: "late expired owner write".to_string(),
-            },
-        };
-        assert!(
-            store
-                .protocol_event_store()
-                .append_admitted_event_bundle_allocating_at(
-                    &admission_id,
-                    &late_event,
-                    None,
-                    None,
-                    lease_expiry,
-                )
-                .expect("protocol write guard")
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn deleting_session_removes_protocol_allocator_rows() {
-        let (store, session_id) = test_repo().await;
-        let turn_id = TurnId::new();
-        store
-            .protocol_event_store()
-            .append_runtime_event(&RuntimeEvent {
-                id: RuntimeEventId::new(),
-                session_id,
-                turn_id,
-                sequence_no: 0,
-                created_at_ms: SystemClock.now_ms(),
-                msg: RuntimeEventMsg::Warning {
-                    message: "delete allocator".to_string(),
-                },
-            })
-            .expect("event");
-        let repo = store.session_repo();
-        repo.delete_session(session_id)
-            .await
-            .expect("delete session");
-        let allocator_rows = repo
-            .connection
-            .lock()
-            .expect("sqlite mutex")
-            .query_row(
-                "SELECT COUNT(*) FROM protocol_turn_sequence_allocators WHERE session_id = ?1",
-                params![session_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("allocator count");
-        assert_eq!(allocator_rows, 0);
-    }
-
-    #[tokio::test]
-    async fn thread_goal_insert_replaces_only_completed_goal() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-
-        let first = repo
-            .insert_thread_goal(
-                session_id,
-                "ship the goal",
-                ThreadGoalStatus::Active,
-                Some(100),
-            )
-            .await
-            .expect("insert first")
-            .expect("first goal");
-        assert_eq!(first.status, ThreadGoalStatus::Active);
-        assert_eq!(first.token_budget, Some(100));
-
-        let refused = repo
-            .insert_thread_goal(
-                session_id,
-                "replace too early",
-                ThreadGoalStatus::Active,
-                None,
-            )
-            .await
-            .expect("insert unfinished");
-        assert!(refused.is_none());
-
-        repo.update_thread_goal(session_id, None, Some(ThreadGoalStatus::Complete), None)
-            .await
-            .expect("complete")
-            .expect("completed goal");
-        let replaced = repo
-            .insert_thread_goal(session_id, "next goal", ThreadGoalStatus::Active, None)
-            .await
-            .expect("insert next")
-            .expect("next goal");
-        assert_eq!(replaced.objective, "next goal");
-        assert_eq!(replaced.tokens_used, 0);
-        assert_eq!(replaced.token_budget, None);
-    }
-
-    #[tokio::test]
-    async fn thread_goal_accounting_marks_budget_limited() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        repo.replace_thread_goal(
-            session_id,
-            "stay within budget",
-            ThreadGoalStatus::Active,
-            Some(5),
-        )
-        .await
-        .expect("replace");
-
-        let updated = repo
-            .account_thread_goal_usage(session_id, 7)
-            .await
-            .expect("account")
-            .expect("goal");
-
-        assert_eq!(updated.tokens_used, 7);
-        assert_eq!(updated.status, ThreadGoalStatus::BudgetLimited);
-    }
-
-    #[tokio::test]
-    async fn thread_goal_expected_id_prevents_stale_accounting_and_update() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        repo.replace_thread_goal(session_id, "first", ThreadGoalStatus::Active, Some(100))
-            .await
-            .expect("first");
-        let (_first_goal, first_goal_id) = repo
-            .get_thread_goal_with_id(session_id)
-            .await
-            .expect("first id")
-            .expect("first goal");
-
-        repo.replace_thread_goal(session_id, "second", ThreadGoalStatus::Active, Some(100))
-            .await
-            .expect("second");
-        repo.account_thread_goal_usage_for_goal(session_id, 10, Some(first_goal_id.as_str()))
-            .await
-            .expect("stale account");
-        repo.update_thread_goal_for_goal(
-            session_id,
-            None,
-            Some(ThreadGoalStatus::Blocked),
-            None,
-            Some(first_goal_id.as_str()),
-        )
-        .await
-        .expect("stale update");
-
-        let current = repo
-            .get_thread_goal(session_id)
-            .await
-            .expect("current")
-            .expect("goal");
-        assert_eq!(current.objective, "second");
-        assert_eq!(current.status, ThreadGoalStatus::Active);
-        assert_eq!(current.tokens_used, 0);
-    }
-
-    #[tokio::test]
-    async fn session_search_treats_like_wildcards_as_literal_text() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let session = repo.get_session(session_id).await.expect("session");
-        repo.update_session_title(session_id, "100%_literal")
-            .await
-            .expect("title");
-        repo.create_session(NewSession {
-            project_id: session.project_id,
-            title: "plain title".to_string(),
-            cwd: session.cwd,
-            model: session.model,
-            base_url: session.base_url,
-            access_mode: session.access_mode,
-        })
-        .await
-        .expect("plain session");
-
-        let matches = repo
-            .search_sessions(session.project_id, "%_", 10, true)
-            .await
-            .expect("search");
-
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].id, session_id);
-    }
-
-    #[tokio::test]
-    async fn spawn_edges_preserve_explicit_child_access_but_hide_children_from_discovery() {
-        let (store, root_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let root = repo
-            .get_session(root_session_id)
-            .await
-            .expect("root session");
-        let child = repo
-            .create_session(session_draft_from(&root, "child research"))
-            .await
-            .expect("child session");
-        let grandchild = repo
-            .create_session(session_draft_from(&root, "child nested review"))
-            .await
-            .expect("grandchild session");
-        repo.insert_session_spawn_edge(root.id, root.id, child.id, "/root/research", "research")
-            .await
-            .expect("child edge");
-        repo.insert_session_spawn_edge(
-            root.id,
-            child.id,
-            grandchild.id,
-            "/root/research/review",
-            "review",
-        )
-        .await
-        .expect("grandchild edge");
-
-        let tree = repo.list_session_spawn_edges(root.id).await.expect("tree");
-        assert_eq!(tree.len(), 2);
-        assert!(tree.iter().any(|edge| edge.child_session_id == child.id));
-        assert!(
-            tree.iter()
-                .any(|edge| edge.child_session_id == grandchild.id)
-        );
-        let direct_children = repo
-            .list_direct_child_spawn_edges(root.id)
-            .await
-            .expect("direct children");
-        assert_eq!(direct_children.len(), 1);
-        assert_eq!(direct_children[0].child_session_id, child.id);
-        assert_eq!(
-            repo.session_spawn_edge_for_child(grandchild.id)
-                .await
-                .expect("edge lookup")
-                .expect("grandchild edge")
-                .agent_path,
-            "/root/research/review"
-        );
-
-        assert_eq!(
-            repo.get_session(child.id).await.expect("explicit child").id,
-            child.id
-        );
-        assert_eq!(
-            repo.latest_session(root.project_id)
-                .await
-                .expect("latest")
-                .expect("root latest")
-                .id,
-            root.id
-        );
-        assert_eq!(
-            repo.list_sessions(root.project_id, 10)
-                .await
-                .expect("list")
-                .iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>(),
-            vec![root.id]
-        );
-        assert_eq!(
-            repo.list_recent_sessions(10)
-                .await
-                .expect("recent")
-                .iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>(),
-            vec![root.id]
-        );
-        assert!(
-            repo.search_sessions(root.project_id, "child", 10, true)
-                .await
-                .expect("search")
-                .is_empty()
-        );
-        assert_eq!(
-            repo.list_sessions_with_projection_state(root.project_id, 10, true)
-                .await
-                .expect("projected list")
-                .len(),
-            1
-        );
-        assert!(
-            repo.search_sessions_with_projection_state(root.project_id, "child", 10, true)
-                .await
-                .expect("projected search")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_session_tree_deletes_descendants_postorder_and_preserves_other_sessions() {
-        let (store, root_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let root = repo
-            .get_session(root_session_id)
-            .await
-            .expect("root session");
-        let child = repo
-            .create_session(session_draft_from(&root, "child"))
-            .await
-            .expect("child session");
-        let grandchild = repo
-            .create_session(session_draft_from(&root, "grandchild"))
-            .await
-            .expect("grandchild session");
-        let unrelated = repo
-            .create_session(session_draft_from(&root, "unrelated"))
-            .await
-            .expect("unrelated session");
-        repo.insert_session_spawn_edge(root.id, root.id, child.id, "/root/child", "child")
-            .await
-            .expect("child edge");
-        repo.insert_session_spawn_edge(
-            root.id,
-            child.id,
-            grandchild.id,
-            "/root/child/grandchild",
-            "grandchild",
-        )
-        .await
-        .expect("grandchild edge");
-
-        let deleted = repo
-            .delete_session_tree(root.id)
-            .await
-            .expect("delete tree");
-
-        assert_eq!(deleted, vec![grandchild.id, child.id, root.id]);
-        assert!(repo.get_session(root.id).await.is_err());
-        assert!(repo.get_session(child.id).await.is_err());
-        assert!(repo.get_session(grandchild.id).await.is_err());
-        assert_eq!(
-            repo.get_session(unrelated.id)
-                .await
-                .expect("unrelated remains")
-                .id,
-            unrelated.id
-        );
-        assert!(
-            repo.list_session_spawn_edges(root.id)
-                .await
-                .expect("empty tree")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn multi_agent_tool_names_round_trip_through_storage_text() {
-        let tools = [
-            crate::tool::ToolName::SpawnAgent,
-            crate::tool::ToolName::SendMessage,
-            crate::tool::ToolName::FollowupTask,
-            crate::tool::ToolName::WaitAgent,
-            crate::tool::ToolName::InterruptAgent,
-            crate::tool::ToolName::ListAgents,
-        ];
-
-        for tool in tools {
-            assert_eq!(parse_tool_name(tool_name_text(tool)), tool);
-        }
-    }
-
-    #[test]
-    fn update_plan_writes_canonical_name_and_reads_legacy_names() {
-        assert_eq!(
-            tool_name_text(crate::tool::ToolName::UpdatePlan),
-            "update_plan"
-        );
-        for stored in ["update_plan", "todowrite", "todo_write"] {
-            assert_eq!(parse_tool_name(stored), crate::tool::ToolName::UpdatePlan);
-        }
-    }
-
-    #[test]
-    fn concurrent_goal_update_and_usage_accounting_do_not_lose_each_other() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id) = runtime.block_on(test_repo());
-        runtime
-            .block_on(store.session_repo().replace_thread_goal(
-                session_id,
-                "initial objective",
-                ThreadGoalStatus::Active,
-                Some(100),
-            ))
-            .expect("goal");
-        let initial_updated_at = store
-            .session_repo()
-            .get_stored_thread_goal(session_id)
-            .expect("stored goal")
-            .expect("goal")
-            .updated_at_ms;
-        let paths = store.paths().clone();
-        drop(store);
-        let barrier = Arc::new(Barrier::new(3));
-        let final_paths = paths.clone();
-        let update_paths = paths.clone();
-        let update_barrier = Arc::clone(&barrier);
-        let update = std::thread::spawn(move || {
-            let store = SqliteStore::open(&update_paths).expect("update store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("update runtime");
-            update_barrier.wait();
-            runtime
-                .block_on(store.session_repo().update_thread_goal(
-                    session_id,
-                    Some("updated objective"),
-                    None,
-                    None,
-                ))
-                .expect("update goal");
-        });
-        let usage_barrier = Arc::clone(&barrier);
-        let usage = std::thread::spawn(move || {
-            let store = SqliteStore::open(&paths).expect("usage store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("usage runtime");
-            usage_barrier.wait();
-            runtime
-                .block_on(
-                    store
-                        .session_repo()
-                        .account_thread_goal_usage(session_id, 7),
-                )
-                .expect("account usage");
-        });
-        barrier.wait();
-        update.join().expect("update thread");
-        usage.join().expect("usage thread");
-        let store = SqliteStore::open(&final_paths).expect("final store");
-        let stored = store
-            .session_repo()
-            .get_stored_thread_goal(session_id)
-            .expect("final goal")
-            .expect("goal");
-
-        assert_eq!(stored.goal.objective, "updated objective");
-        assert_eq!(stored.goal.tokens_used, 7);
-        assert!(stored.updated_at_ms >= initial_updated_at.saturating_add(2));
-    }
-
-    #[test]
-    fn concurrent_disjoint_session_settings_updates_are_merged() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
-        let paths = StoragePaths {
-            database_path: data_dir.join("moyai.sqlite3"),
-            truncation_dir: data_dir.join("truncation"),
-            data_dir: data_dir.clone(),
-        };
-        let sqlite = SqliteStore::open(&paths).expect("store");
-        sqlite.migrate().expect("migrate");
-        let store = StoreBundle::new(sqlite);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (session_id, initial_updated_at) = runtime.block_on(async {
-            let project_id = ProjectId::new();
-            store
-                .project_repo()
-                .upsert_project(project_id, &data_dir, "test", "none")
-                .await
-                .expect("project");
-            let session = store
-                .session_repo()
-                .create_session(NewSession {
-                    project_id,
-                    title: "settings race".to_string(),
-                    cwd: data_dir,
-                    model: "initial-model".to_string(),
-                    base_url: "http://initial".to_string(),
-                    access_mode: AccessMode::Default,
-                })
-                .await
-                .expect("session");
-            (session.id, session.updated_at_ms)
-        });
-        drop(store);
-        let barrier = Arc::new(Barrier::new(3));
-        let final_paths = paths.clone();
-        let model_paths = paths.clone();
-        let model_barrier = Arc::clone(&barrier);
-        let model_update = std::thread::spawn(move || {
-            let store = SqliteStore::open(&model_paths).expect("model store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("model runtime");
-            model_barrier.wait();
-            runtime
-                .block_on(store.session_repo().update_session_settings(
-                    session_id,
-                    &SessionSettingsPatch {
-                        model: Some("updated-model".to_string()),
-                        ..SessionSettingsPatch::default()
-                    },
-                ))
-                .expect("model update");
-        });
-        let base_barrier = Arc::clone(&barrier);
-        let base_update = std::thread::spawn(move || {
-            let store = SqliteStore::open(&paths).expect("base store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("base runtime");
-            base_barrier.wait();
-            runtime
-                .block_on(store.session_repo().update_session_settings(
-                    session_id,
-                    &SessionSettingsPatch {
-                        base_url: Some("http://updated".to_string()),
-                        ..SessionSettingsPatch::default()
-                    },
-                ))
-                .expect("base update");
-        });
-        barrier.wait();
-        model_update.join().expect("model thread");
-        base_update.join().expect("base thread");
-        let store = SqliteStore::open(&final_paths).expect("final store");
-        let final_session = runtime
-            .block_on(store.session_repo().get_session(session_id))
-            .expect("final session");
-
-        assert_eq!(final_session.model, "updated-model");
-        assert_eq!(final_session.base_url, "http://updated");
-        assert!(final_session.updated_at_ms >= initial_updated_at.saturating_add(2));
-    }
-
-    #[test]
-    fn concurrent_database_admission_allows_one_run_across_connections() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
-        let paths = StoragePaths {
-            database_path: data_dir.join("moyai.sqlite3"),
-            truncation_dir: data_dir.join("truncation"),
-            data_dir: data_dir.clone(),
-        };
-        let sqlite = SqliteStore::open(&paths).expect("store");
-        sqlite.migrate().expect("migrate");
-        let setup = StoreBundle::new(sqlite);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let session_id = runtime.block_on(async {
-            let project_id = ProjectId::new();
-            setup
-                .project_repo()
-                .upsert_project(project_id, &data_dir, "test", "none")
-                .await
-                .expect("project");
-            setup
-                .session_repo()
-                .create_session(NewSession {
-                    project_id,
-                    title: "race".to_string(),
-                    cwd: data_dir,
-                    model: "model".to_string(),
-                    base_url: "http://localhost:1234".to_string(),
-                    access_mode: AccessMode::Default,
-                })
-                .await
-                .expect("session")
-                .id
-        });
-        drop(setup);
-        let barrier = Arc::new(Barrier::new(3));
-        let mut workers = Vec::new();
-        for _ in 0..2 {
-            let paths = paths.clone();
-            let barrier = Arc::clone(&barrier);
-            workers.push(std::thread::spawn(move || {
-                let store = SqliteStore::open(&paths).expect("worker store");
-                let repo = store.session_repo();
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("worker runtime");
-                barrier.wait();
-                runtime
-                    .block_on(repo.try_admit_session_run(session_id))
-                    .expect("admission")
-            }));
-        }
-        barrier.wait();
-        let admitted = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("worker"))
-            .filter(|admitted| *admitted)
-            .count();
-
-        assert_eq!(admitted, 1);
-    }
-
-    #[test]
-    fn lease_reclaim_is_linearized_across_connections() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id) = runtime.block_on(test_repo());
-        let paths = store.paths().clone();
-        let repo = store.session_repo();
-        runtime
-            .block_on(repo.admit_session_run_at(session_id, 10_000, 100))
-            .expect("initial admission")
-            .expect("initial owner");
-
-        let fresh_barrier = Arc::new(Barrier::new(3));
-        let mut fresh_workers = Vec::new();
-        for _ in 0..2 {
-            let paths = paths.clone();
-            let barrier = Arc::clone(&fresh_barrier);
-            fresh_workers.push(std::thread::spawn(move || {
-                let store = SqliteStore::open(&paths).expect("fresh worker store");
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("fresh worker runtime");
-                barrier.wait();
-                runtime
-                    .block_on(
-                        store
-                            .session_repo()
-                            .admit_session_run_at(session_id, 10_099, 100),
-                    )
-                    .expect("fresh admission result")
-            }));
-        }
-        fresh_barrier.wait();
-        assert!(
-            fresh_workers
-                .into_iter()
-                .all(|worker| worker.join().expect("fresh worker").is_none())
-        );
-
-        let expired_barrier = Arc::new(Barrier::new(3));
-        let mut expired_workers = Vec::new();
-        for _ in 0..2 {
-            let paths = paths.clone();
-            let barrier = Arc::clone(&expired_barrier);
-            expired_workers.push(std::thread::spawn(move || {
-                let store = SqliteStore::open(&paths).expect("expired worker store");
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("expired worker runtime");
-                barrier.wait();
-                runtime
-                    .block_on(
-                        store
-                            .session_repo()
-                            .admit_session_run_at(session_id, 10_100, 100),
-                    )
-                    .expect("expired admission result")
-            }));
-        }
-        expired_barrier.wait();
-        let reclaimed = expired_workers
-            .into_iter()
-            .map(|worker| worker.join().expect("expired worker"))
-            .filter(Option::is_some)
-            .count();
-        assert_eq!(reclaimed, 1);
-    }
-
-    #[test]
-    fn live_process_lock_blocks_reclaim_even_after_database_lease_expiry() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id) = runtime.block_on(test_repo());
-        let paths = store.paths().clone();
-        let live_process_guard = store
-            .try_acquire_run_process_lease(session_id)
-            .expect("live process lock");
-        runtime
-            .block_on(
-                store
-                    .session_repo()
-                    .admit_session_run_at(session_id, 5_000, 100),
-            )
-            .expect("database admission")
-            .expect("database owner");
-        let other_process = StoreBundle::new(SqliteStore::open(&paths).expect("other store"));
-
-        assert!(
-            other_process
-                .try_acquire_run_process_lease(session_id)
-                .is_err()
-        );
-        drop(live_process_guard);
-        let _replacement_process_guard = other_process
-            .try_acquire_run_process_lease(session_id)
-            .expect("lock released after owner exit");
-        assert!(
-            runtime
-                .block_on(
-                    other_process
-                        .session_repo()
-                        .admit_session_run_at(session_id, 5_100, 100),
-                )
-                .expect("expired database reclaim")
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn completion_waits_for_an_accepted_unseen_steer() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let steer = SteerTurn {
-            expected_turn_id: turn_id,
-            items: vec![UserInputItem::Text {
-                text: "change the final answer".to_string(),
-            }],
-            additional_context: Default::default(),
-            client_user_message_id: Some("accepted-before-complete".to_string()),
-        };
-        repo.accept_active_turn_steer(session_id, &steer)
-            .await
-            .expect("accept steer");
-        let completed = RunEvent::SessionCompleted {
-            session_id,
-            finish_reason: Some(FinishReason::Stop),
-        };
-        let metadata = MessageMetadata::Assistant(AssistantMessageMeta {
-            model: "model".to_string(),
-            base_url: "http://localhost:1234".to_string(),
-            finish_reason: Some(FinishReason::Stop),
-            token_usage: None,
-            summary: false,
-        });
-
-        assert_eq!(
-            repo.update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                assistant.id,
-                &metadata,
-                SessionStatus::Completed,
-                &completed,
-                turn_id,
-                Some(1),
-                Some(0),
-                None,
-            )
-            .await
-            .expect("reject completion before steer drain"),
-            AdmittedTerminalCommit::UnseenSteer {
-                expected: 0,
-                actual: 1,
-            }
-        );
-        assert_eq!(
-            repo.get_session(session_id).await.expect("running").status,
-            SessionStatus::Running
-        );
-        assert_eq!(
-            repo.update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                assistant.id,
-                &metadata,
-                SessionStatus::Completed,
-                &completed,
-                turn_id,
-                Some(2),
-                Some(1),
-                None,
-            )
-            .await
-            .expect("complete after steer drain"),
-            AdmittedTerminalCommit::Applied
-        );
-    }
-
-    #[test]
-    fn concurrent_steer_acceptance_and_completion_have_one_linearized_winner() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id, admission_id, turn_id, assistant) =
-            runtime.block_on(active_turn_fixture());
-        let paths = store.paths().clone();
-        drop(store);
-        let barrier = Arc::new(Barrier::new(3));
-
-        let completion_paths = paths.clone();
-        let completion_barrier = Arc::clone(&barrier);
-        let completion_admission_id = admission_id.clone();
-        let completion = std::thread::spawn(move || {
-            let store = SqliteStore::open(&completion_paths).expect("completion store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("completion runtime");
-            let event = RunEvent::SessionCompleted {
-                session_id,
-                finish_reason: Some(FinishReason::Stop),
-            };
-            let metadata = MessageMetadata::Assistant(AssistantMessageMeta {
-                model: "model".to_string(),
-                base_url: "http://localhost:1234".to_string(),
-                finish_reason: Some(FinishReason::Stop),
-                token_usage: None,
-                summary: false,
-            });
-            completion_barrier.wait();
-            runtime.block_on(
-                store
-                    .session_repo()
-                    .update_admitted_message_metadata_and_status_with_protocol_event(
-                        session_id,
-                        &completion_admission_id,
-                        assistant.id,
-                        &metadata,
-                        SessionStatus::Completed,
-                        &event,
-                        turn_id,
-                        Some(1),
-                        Some(0),
-                        None,
-                    ),
-            )
-        });
-
-        let steer_paths = paths.clone();
-        let steer_barrier = Arc::clone(&barrier);
-        let steer = std::thread::spawn(move || {
-            let store = SqliteStore::open(&steer_paths).expect("steer store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("steer runtime");
-            let steer = SteerTurn {
-                expected_turn_id: turn_id,
-                items: vec![UserInputItem::Text {
-                    text: "race the final answer".to_string(),
-                }],
-                additional_context: Default::default(),
-                client_user_message_id: Some("barrier-race".to_string()),
-            };
-            steer_barrier.wait();
-            runtime.block_on(
-                store
-                    .session_repo()
-                    .accept_active_turn_steer(session_id, &steer),
-            )
-        });
-
-        barrier.wait();
-        let completion_applied = completion
-            .join()
-            .expect("completion thread")
-            .expect("completion result");
-        let steer_result = steer.join().expect("steer thread");
-        let final_store = SqliteStore::open(&paths).expect("final store");
-        let final_repo = final_store.session_repo();
-        let final_session = runtime
-            .block_on(final_repo.get_session(session_id))
-            .expect("final session");
-        let history = final_store
-            .protocol_event_store()
-            .list_history_items_for_session(session_id)
-            .expect("final history");
-        let accepted_steer_count = history
-            .iter()
-            .filter(|item| matches!(&item.payload, HistoryItemPayload::SteerTurn { .. }))
-            .count();
-
-        match (completion_applied, steer_result) {
-            (AdmittedTerminalCommit::Applied, Err(_)) => {
-                assert_eq!(final_session.status, SessionStatus::Completed);
-                assert_eq!(accepted_steer_count, 0);
-            }
-            (AdmittedTerminalCommit::UnseenSteer { .. }, Ok(_)) => {
-                assert_eq!(final_session.status, SessionStatus::Running);
-                assert_eq!(accepted_steer_count, 1);
-            }
-            (completion_applied, steer_result) => panic!(
-                "completion and steer were not linearized: completion={completion_applied:?}, steer={steer_result:?}"
-            ),
-        }
-    }
-
-    #[tokio::test]
-    async fn admission_does_not_publish_an_old_turn_as_steer_target() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let old_turn_id = TurnId::new();
-        store
-            .protocol_event_store()
-            .append_history_item(&HistoryItem {
-                id: HistoryItemId::new(),
-                session_id,
-                turn_id: old_turn_id,
-                sequence_no: 0,
-                created_at_ms: SystemClock.now_ms(),
-                payload: HistoryItemPayload::Message {
-                    message_id: None,
-                    role: MessageRole::User,
-                    content: vec![ContentPart::Text {
-                        text: "old turn".to_string(),
-                    }],
-                },
-            })
-            .expect("old turn history");
-        let admission_id = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("admit")
-            .expect("admitted");
-        let old_turn_steer = SteerTurn {
-            expected_turn_id: old_turn_id,
-            items: vec![UserInputItem::Text {
-                text: "must not attach to old turn".to_string(),
-            }],
-            additional_context: Default::default(),
-            client_user_message_id: None,
-        };
-        assert!(
-            repo.accept_active_turn_steer(session_id, &old_turn_steer)
-                .await
-                .is_err()
-        );
-
-        let new_turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &admission_id, new_turn_id)
-                .await
-                .expect("activate new turn")
-        );
-        assert!(
-            repo.accept_active_turn_steer(session_id, &old_turn_steer)
-                .await
-                .is_err()
-        );
-        let new_turn_steer = SteerTurn {
-            expected_turn_id: new_turn_id,
-            ..old_turn_steer
-        };
-        repo.accept_active_turn_steer(session_id, &new_turn_steer)
-            .await
-            .expect("new turn steer");
-    }
-
-    #[tokio::test]
-    async fn awaiting_user_retains_owner_and_blocks_replacement_admission() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let admission_id = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("admit")
-            .expect("admitted");
-        let turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &admission_id, turn_id)
-                .await
-                .expect("activate turn")
-        );
-        assert!(
-            repo.terminalize_admitted_session_with_protocol_event(
-                session_id,
-                &admission_id,
-                SessionStatus::AwaitingUser,
-                &RunEvent::SessionAwaitingUser {
-                    session_id,
-                    finish_reason: Some(FinishReason::ToolCall),
-                },
-                turn_id,
-                None,
-            )
-            .await
-            .expect("awaiting user")
-        );
-        assert!(
-            repo.admit_session_run(session_id)
-                .await
-                .expect("replacement admission")
-                .is_none()
-        );
-        assert_eq!(
-            repo.admitted_run_status(session_id, &admission_id, turn_id)
-                .await
-                .expect("owned status"),
-            Some(SessionStatus::AwaitingUser)
-        );
-    }
-
-    #[tokio::test]
-    async fn admitted_terminalization_rejects_a_different_turn() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let admission_id = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("admit")
-            .expect("admitted");
-        let turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &admission_id, turn_id)
-                .await
-                .expect("activate turn")
-        );
-        assert!(
-            !repo
-                .terminalize_admitted_session_with_protocol_event(
-                    session_id,
-                    &admission_id,
-                    SessionStatus::Failed,
-                    &RunEvent::SessionFailed {
-                        session_id,
-                        message: "wrong turn".to_string(),
-                    },
-                    TurnId::new(),
-                    None,
-                )
-                .await
-                .expect("wrong turn rejected")
-        );
-        assert_eq!(
-            repo.get_session(session_id).await.expect("session").status,
-            SessionStatus::Running
-        );
-    }
-
-    #[tokio::test]
-    async fn every_terminal_entry_rejects_status_event_owner_and_untyped_cause_mismatches() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let (tool_call, _) = repo
-            .record_pending_tool_call_with_protocol_bundle(
-                session_id,
-                &admission_id,
-                assistant.id,
-                "shell",
-                "{}",
-                Some("must remain pending"),
-                serde_json::Value::Null,
-                turn_id,
-                Some(1),
-            )
-            .await
-            .expect("pending current-turn tool");
-        let metadata = test_assistant_metadata(Some(FinishReason::Error));
-        let other_session_id = SessionId::new();
-        let failed = RunEvent::SessionFailed {
-            session_id,
-            message: "mismatched terminal".to_string(),
-        };
-        let wrong_owner = RunEvent::SessionInterrupted {
-            session_id: other_session_id,
-            reason: "wrong owner".to_string(),
-            cause: Some(TurnInterruptionCause::UserStop),
-        };
-        let untyped_interrupt = RunEvent::SessionInterrupted {
-            session_id,
-            reason: "legacy-only untyped cause".to_string(),
-            cause: None,
-        };
-
-        assert!(
-            repo.terminalize_active_session_with_protocol_event(
-                session_id,
-                SessionStatus::Cancelled,
-                &failed,
-                turn_id,
-                None,
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            repo.recover_orphaned_active_session_with_protocol_event(
-                session_id,
-                SessionStatus::Cancelled,
-                &wrong_owner,
-                turn_id,
-                None,
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            repo.terminalize_admitted_session_with_protocol_event(
-                session_id,
-                &admission_id,
-                SessionStatus::Cancelled,
-                &untyped_interrupt,
-                turn_id,
-                None,
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            repo.update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                assistant.id,
-                &metadata,
-                SessionStatus::Completed,
-                &failed,
-                turn_id,
-                None,
-                None,
-                None,
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            repo.update_message_metadata_and_status_with_protocol_event(
-                session_id,
-                assistant.id,
-                &metadata,
-                SessionStatus::Cancelled,
-                &wrong_owner,
-                turn_id,
-                None,
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            repo.set_status_with_protocol_event(
-                session_id,
-                SessionStatus::Completed,
-                &failed,
-                turn_id,
-                None,
-            )
-            .await
-            .is_err()
-        );
-
-        assert_eq!(
-            repo.get_session(session_id).await.expect("session").status,
-            SessionStatus::Running
-        );
-        assert_eq!(
-            repo.admitted_run_status(session_id, &admission_id, turn_id)
-                .await
-                .expect("admission status"),
-            Some(SessionStatus::Running)
-        );
-        let tool_status = repo
-            .connection
-            .lock()
-            .expect("sqlite mutex")
-            .query_row(
-                "SELECT status FROM tool_calls WHERE id = ?1",
-                params![tool_call.id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("tool status");
-        assert_eq!(tool_status, "pending");
-        assert_eq!(
-            repo.corroborated_terminal_for_turn(session_id, turn_id)
-                .await
-                .expect("terminal corroboration"),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_sweep_closes_only_current_turn_tools_before_turn_terminal() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let orphan = repo
-            .insert_tool_call(
-                session_id,
-                assistant.id,
-                "read",
-                r#"{"path":"old.txt"}"#,
-                Some("old orphan"),
-                serde_json::Value::Null,
-            )
-            .await
-            .expect("old orphan tool");
-        let (first, _) = repo
-            .record_pending_tool_call_with_protocol_bundle(
-                session_id,
-                &admission_id,
-                assistant.id,
-                "write",
-                r#"{"path":"first.txt","content":"one"}"#,
-                Some("first current tool"),
-                serde_json::Value::Null,
-                turn_id,
-                Some(1),
-            )
-            .await
-            .expect("first current tool");
-        let (second, _) = repo
-            .record_pending_tool_call_with_protocol_bundle(
-                session_id,
-                &admission_id,
-                assistant.id,
-                "shell",
-                r#"{"command":"echo two"}"#,
-                Some("second current tool"),
-                serde_json::Value::Null,
-                turn_id,
-                Some(2),
-            )
-            .await
-            .expect("second current tool");
-        let terminal = RunEvent::SessionInterrupted {
-            session_id,
-            reason: TurnInterruptionCause::UserStop.legacy_reason().to_string(),
-            cause: Some(TurnInterruptionCause::UserStop),
-        };
-
-        assert!(
-            repo.terminalize_admitted_session_with_protocol_event(
-                session_id,
-                &admission_id,
-                SessionStatus::Cancelled,
-                &terminal,
-                turn_id,
-                Some(3),
-            )
-            .await
-            .expect("terminalize current turn")
-        );
-
-        let statuses = {
-            let connection = repo.connection.lock().expect("sqlite mutex");
-            let mut statement = connection
-                .prepare("SELECT id, status FROM tool_calls WHERE session_id = ?1")
-                .expect("tool status statement");
-            statement
-                .query_map(params![session_id.to_string()], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .expect("tool status rows")
-                .collect::<Result<HashMap<_, _>, _>>()
-                .expect("tool statuses")
-        };
-        assert_eq!(
-            statuses.get(&first.id.to_string()).map(String::as_str),
-            Some("cancelled")
-        );
-        assert_eq!(
-            statuses.get(&second.id.to_string()).map(String::as_str),
-            Some("cancelled")
-        );
-        assert_eq!(
-            statuses.get(&orphan.id.to_string()).map(String::as_str),
-            Some("pending")
-        );
-
-        let turn_items = store
-            .protocol_event_store()
-            .list_turn_items(session_id, turn_id)
-            .expect("turn items");
-        let cancelled_sequences = turn_items
-            .iter()
-            .filter_map(|item| match &item.payload {
-                TurnItemPayload::ToolStatus {
-                    call_id,
-                    status: crate::protocol::ToolLifecycleStatus::Cancelled,
-                    ..
-                } if *call_id == first.id || *call_id == second.id => Some(item.sequence_no),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let terminal_sequence = turn_items
-            .iter()
-            .find_map(|item| match item.payload {
-                TurnItemPayload::Terminal {
-                    status: TurnTerminalStatus::Interrupted,
-                    ..
-                } => Some(item.sequence_no),
-                _ => None,
-            })
-            .expect("turn terminal");
-        assert_eq!(cancelled_sequences.len(), 2);
-        assert!(cancelled_sequences.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(
-            cancelled_sequences
-                .iter()
-                .all(|sequence| *sequence < terminal_sequence)
-        );
-
-        let transcript = repo
-            .compatibility_transcript(session_id)
-            .await
-            .expect("transcript");
-        let cancelled_parts = transcript
-            .messages
-            .iter()
-            .flat_map(|message| message.parts.iter())
-            .filter(|part| {
-                matches!(
-                    &part.payload,
-                    MessagePart::ToolResult(ToolResultPart {
-                        status: ToolCallStatus::Cancelled,
-                        ..
-                    })
-                )
-            })
-            .count();
-        assert_eq!(cancelled_parts, 2);
-    }
-
-    #[tokio::test]
-    async fn terminal_none_sequence_allocates_after_existing_turn_events_for_every_admitted_path() {
-        for guarded_message_update in [false, true] {
-            let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-            let repo = store.session_repo();
-            for (sequence_no, tool_name) in [(7, "write"), (11, "shell")] {
-                repo.record_pending_tool_call_with_protocol_bundle(
-                    session_id,
-                    &admission_id,
-                    assistant.id,
-                    tool_name,
-                    "{}",
-                    Some(tool_name),
-                    serde_json::Value::Null,
-                    turn_id,
-                    Some(sequence_no),
-                )
-                .await
-                .expect("current-turn pending tool");
-            }
-            let newer_turn_id = TurnId::new();
-            store
-                .protocol_event_store()
-                .append_history_item(&HistoryItem {
-                    id: HistoryItemId::new(),
-                    session_id,
-                    turn_id: newer_turn_id,
-                    sequence_no: 100,
-                    created_at_ms: SystemClock.now_ms(),
-                    payload: HistoryItemPayload::Message {
-                        message_id: None,
-                        role: MessageRole::User,
-                        content: vec![ContentPart::Text {
-                            text: "newer unrelated turn projection".to_string(),
-                        }],
-                    },
-                })
-                .expect("newer unrelated turn");
-            let terminal = RunEvent::SessionInterrupted {
-                session_id,
-                reason: TurnInterruptionCause::UserStop.legacy_reason().to_string(),
-                cause: Some(TurnInterruptionCause::UserStop),
-            };
-
-            if guarded_message_update {
-                assert_eq!(
-                    repo.update_admitted_message_metadata_and_status_with_protocol_event(
-                        session_id,
-                        &admission_id,
-                        assistant.id,
-                        &test_assistant_metadata(Some(FinishReason::Cancelled)),
-                        SessionStatus::Cancelled,
-                        &terminal,
-                        turn_id,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    .expect("guarded terminalization"),
-                    AdmittedTerminalCommit::Applied
-                );
-            } else {
-                assert!(
-                    repo.terminalize_admitted_session_with_protocol_event(
-                        session_id,
-                        &admission_id,
-                        SessionStatus::Cancelled,
-                        &terminal,
-                        turn_id,
-                        None,
-                    )
-                    .await
-                    .expect("admitted terminalization")
-                );
-            }
-
-            let terminal_items = store
-                .protocol_event_store()
-                .list_turn_items(session_id, turn_id)
-                .expect("turn items")
-                .into_iter()
-                .filter(|item| {
-                    matches!(
-                        item.payload,
-                        TurnItemPayload::ToolStatus {
-                            status: crate::protocol::ToolLifecycleStatus::Cancelled,
-                            ..
-                        } | TurnItemPayload::Terminal {
-                            status: TurnTerminalStatus::Interrupted,
-                            ..
-                        }
-                    )
-                })
-                .collect::<Vec<_>>();
-            let sequences = terminal_items
-                .iter()
-                .map(|item| item.sequence_no)
-                .collect::<Vec<_>>();
-            assert_eq!(sequences.len(), 3, "guarded={guarded_message_update}");
-            assert_eq!(
-                sequences,
-                vec![12, 13, 14],
-                "the requested turn must allocate from its own max even when another turn is session-wide latest; guarded={guarded_message_update}"
-            );
-            assert!(
-                sequences.windows(2).all(|pair| pair[0] < pair[1]),
-                "guarded={guarded_message_update}, sequences={sequences:?}"
-            );
-            let terminal_sequence = terminal_items
-                .iter()
-                .find_map(|item| {
-                    matches!(item.payload, TurnItemPayload::Terminal { .. })
-                        .then_some(item.sequence_no)
-                })
-                .expect("terminal sequence");
-            assert!(
-                terminal_items.iter().all(|item| {
-                    matches!(item.payload, TurnItemPayload::Terminal { .. })
-                        || item.sequence_no < terminal_sequence
-                }),
-                "guarded={guarded_message_update}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn tool_terminal_bundle_is_first_writer_wins_for_every_terminal_status() {
-        #[derive(Debug, Clone, Copy)]
-        enum FirstTerminal {
-            Completed,
-            Declined,
-            Cancelled,
-            Failed,
-        }
-
-        for first_terminal in [
-            FirstTerminal::Completed,
-            FirstTerminal::Declined,
-            FirstTerminal::Cancelled,
-            FirstTerminal::Failed,
-        ] {
-            let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-            let repo = store.session_repo();
-            let (tool_call, _) = repo
-                .record_pending_tool_call_with_protocol_bundle(
-                    session_id,
-                    &admission_id,
-                    assistant.id,
-                    "read",
-                    r#"{"path":"race.txt"}"#,
-                    Some("racing tool"),
-                    serde_json::Value::Null,
-                    turn_id,
-                    Some(1),
-                )
-                .await
-                .expect("pending tool");
-            let expected_status = match first_terminal {
-                FirstTerminal::Completed => {
-                    assert!(
-                        repo.complete_tool_call_with_protocol_bundle(
-                            session_id,
-                            &admission_id,
-                            assistant.id,
-                            tool_call.id,
-                            tool_call.tool_name,
-                            "completed",
-                            serde_json::Value::Null,
-                            "completed first",
-                            None,
-                            turn_id,
-                            Some(2),
-                        )
-                        .await
-                        .expect("complete bundle")
-                        .is_some()
-                    );
-                    ToolCallStatus::Completed
-                }
-                FirstTerminal::Declined => {
-                    assert!(
-                        repo.settle_tool_call_without_execution_with_protocol_bundle(
-                            session_id,
-                            &admission_id,
-                            assistant.id,
-                            tool_call.id,
-                            tool_call.tool_name,
-                            ToolCallStatus::Declined,
-                            "declined first",
-                            serde_json::Value::Null,
-                            turn_id,
-                            Some(2),
-                        )
-                        .await
-                        .expect("decline bundle")
-                        .is_some()
-                    );
-                    ToolCallStatus::Declined
-                }
-                FirstTerminal::Cancelled => {
-                    assert!(
-                        repo.settle_tool_call_without_execution_with_protocol_bundle(
-                            session_id,
-                            &admission_id,
-                            assistant.id,
-                            tool_call.id,
-                            tool_call.tool_name,
-                            ToolCallStatus::Cancelled,
-                            "cancelled first",
-                            serde_json::Value::Null,
-                            turn_id,
-                            Some(2),
-                        )
-                        .await
-                        .expect("cancel bundle")
-                        .is_some()
-                    );
-                    ToolCallStatus::Cancelled
-                }
-                FirstTerminal::Failed => {
-                    assert!(
-                        repo.fail_tool_call_with_protocol_bundle(
-                            session_id,
-                            &admission_id,
-                            assistant.id,
-                            tool_call.id,
-                            tool_call.tool_name,
-                            "failed first",
-                            serde_json::Value::Null,
-                            turn_id,
-                            Some(2),
-                        )
-                        .await
-                        .expect("fail bundle")
-                        .is_some()
-                    );
-                    ToolCallStatus::Failed
-                }
-            };
-
-            assert!(
-                repo.complete_tool_call_with_protocol_bundle(
-                    session_id,
-                    &admission_id,
-                    assistant.id,
-                    tool_call.id,
-                    tool_call.tool_name,
-                    "late completed",
-                    serde_json::Value::Null,
-                    "late completed",
-                    None,
-                    turn_id,
-                    Some(3),
-                )
-                .await
-                .expect("late complete")
-                .is_none()
-            );
-            assert!(
-                repo.fail_tool_call_with_protocol_bundle(
-                    session_id,
-                    &admission_id,
-                    assistant.id,
-                    tool_call.id,
-                    tool_call.tool_name,
-                    "late failed",
-                    serde_json::Value::Null,
-                    turn_id,
-                    Some(3),
-                )
-                .await
-                .expect("late fail")
-                .is_none()
-            );
-            for late_status in [ToolCallStatus::Declined, ToolCallStatus::Cancelled] {
-                assert!(
-                    repo.settle_tool_call_without_execution_with_protocol_bundle(
-                        session_id,
-                        &admission_id,
-                        assistant.id,
-                        tool_call.id,
-                        tool_call.tool_name,
-                        late_status,
-                        "late non-execution settlement",
-                        serde_json::Value::Null,
-                        turn_id,
-                        Some(3),
-                    )
-                    .await
-                    .expect("late non-execution settlement")
-                    .is_none()
-                );
-            }
-
-            let row_status = repo
-                .connection
-                .lock()
-                .expect("sqlite mutex")
-                .query_row(
-                    "SELECT status FROM tool_calls WHERE id = ?1",
-                    params![tool_call.id.to_string()],
-                    |row| row.get::<_, String>(0),
-                )
-                .expect("tool status");
-            assert_eq!(
-                row_status,
-                expected_status.key(),
-                "first={first_terminal:?}"
-            );
-            let history_terminal_count = store
-                .protocol_event_store()
-                .list_history_items_for_session(session_id)
-                .expect("history")
-                .into_iter()
-                .filter(|item| {
-                    matches!(
-                        item.payload,
-                        HistoryItemPayload::ToolOutput { call_id, .. }
-                            if call_id == tool_call.id
-                    )
-                })
-                .count();
-            assert_eq!(history_terminal_count, 1, "first={first_terminal:?}");
-            let transcript = repo
-                .compatibility_transcript(session_id)
-                .await
-                .expect("transcript");
-            let part_count = transcript
-                .messages
-                .iter()
-                .flat_map(|message| message.parts.iter())
-                .filter(|part| {
-                    matches!(
-                        &part.payload,
-                        MessagePart::ToolResult(ToolResultPart { tool_call_id, .. })
-                            if *tool_call_id == tool_call.id
-                    )
-                })
-                .count();
-            assert_eq!(part_count, 1, "first={first_terminal:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn executed_tool_terminal_keeps_file_change_evidence_for_cancel_and_failure() {
-        for status in [ToolCallStatus::Cancelled, ToolCallStatus::Failed] {
-            let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-            let repo = store.session_repo();
-            let (tool_call, _) = repo
-                .record_pending_tool_call_with_protocol_bundle(
-                    session_id,
-                    &admission_id,
-                    assistant.id,
-                    "write",
-                    r#"{"path":"late.txt","content":"changed"}"#,
-                    Some("late write"),
-                    serde_json::Value::Null,
-                    turn_id,
-                    Some(1),
-                )
-                .await
-                .expect("pending executed tool");
-            let change_id = crate::session::ChangeId::new();
-            let path = Utf8PathBuf::from("late.txt");
-            let change = crate::edit::ChangeSummary {
-                change_id,
-                kind: crate::session::ChangeKind::Add,
-                path_before: None,
-                path_after: Some(path.clone()),
-            };
-            let evidence = crate::protocol::FileChangeEvidence {
-                change_id,
-                kind: crate::session::ChangeKind::Add,
-                path_before: None,
-                path_after: Some(path),
-                summary: "Added late.txt".to_string(),
-            };
-            let diff_summary = DiffSummaryPart {
-                tool_call_id: Some(tool_call.id),
-                change_ids: vec![change_id],
-                changes: vec![evidence],
-                summary: "Added late.txt".to_string(),
-            };
-
-            let (terminal, file_changes) = repo
-                .settle_executed_tool_call_with_file_changes_protocol_bundle(
-                    session_id,
-                    &admission_id,
-                    assistant.id,
-                    tool_call.id,
-                    tool_call.tool_name,
-                    "late write result",
-                    serde_json::json!({"progress_effect": "made_progress"}),
-                    "side effect completed",
-                    None,
-                    status,
-                    "typed terminal won after the side effect",
-                    diff_summary,
-                    vec![change],
-                    turn_id,
-                    Some(2),
-                    Some(3),
-                )
-                .await
-                .expect("executed terminal bundle")
-                .expect("first terminal wins");
-
-            assert!(matches!(
-                (&terminal, status),
-                (
-                    RunEvent::ToolCallCancelled { .. },
-                    ToolCallStatus::Cancelled
-                ) | (RunEvent::ToolCallFailed { .. }, ToolCallStatus::Failed)
-            ));
-            assert!(matches!(
-                file_changes,
-                RunEvent::FileChangesRecorded { ref changes, .. }
-                    if changes.len() == 1 && changes[0].change_id == change_id
-            ));
-            let row_status = repo
-                .connection
-                .lock()
-                .expect("sqlite mutex")
-                .query_row(
-                    "SELECT status FROM tool_calls WHERE id = ?1",
-                    params![tool_call.id.to_string()],
-                    |row| row.get::<_, String>(0),
-                )
-                .expect("tool status");
-            assert_eq!(row_status, status.key());
-
-            let history = store
-                .protocol_event_store()
-                .list_history_items_for_session(session_id)
-                .expect("history");
-            assert!(history.iter().any(|item| {
-                matches!(
-                    &item.payload,
-                    HistoryItemPayload::ToolOutput {
-                        call_id,
-                        status: history_status,
-                        ..
-                    } if *call_id == tool_call.id
-                        && matches!(
-                            (history_status, status),
-                            (
-                                crate::protocol::ToolLifecycleStatus::Cancelled,
-                                ToolCallStatus::Cancelled
-                            ) | (
-                                crate::protocol::ToolLifecycleStatus::Failed,
-                                ToolCallStatus::Failed
-                            )
-                        )
-                )
-            }));
-            assert!(history.iter().any(|item| {
-                matches!(
-                    &item.payload,
-                    HistoryItemPayload::FileChange {
-                        call_id,
-                        change_ids,
-                        ..
-                    } if *call_id == tool_call.id && change_ids.as_slice() == [change_id]
-                )
-            }));
-
-            let transcript = repo
-                .compatibility_transcript(session_id)
-                .await
-                .expect("transcript");
-            assert!(transcript.messages.iter().any(|message| {
-                message.parts.iter().any(|part| {
-                    matches!(
-                        &part.payload,
-                        MessagePart::ToolResult(result)
-                            if result.tool_call_id == tool_call.id && result.status == status
-                    )
-                })
-            }));
-            assert!(transcript.messages.iter().any(|message| {
-                message.parts.iter().any(|part| {
-                    matches!(
-                        &part.payload,
-                        MessagePart::DiffSummary(summary)
-                            if summary.tool_call_id == Some(tool_call.id)
-                                && summary.change_ids.as_slice() == [change_id]
-                    )
-                })
-            }));
-        }
-    }
-
-    #[tokio::test]
-    async fn corroborated_terminal_rejects_same_status_from_an_older_turn() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let older_turn = TurnId::new();
-        let latest_turn = TurnId::new();
-        {
-            let mut connection = repo.connection.lock().expect("sqlite mutex");
-            let transaction = connection.transaction().expect("transaction");
-            let completed = RunEvent::SessionCompleted {
-                session_id,
-                finish_reason: Some(FinishReason::Stop),
-            };
-            insert_protocol_projection_if_requested(
-                &transaction,
-                &completed,
-                Some(session_id),
-                older_turn,
-                Some(0),
-            )
-            .expect("older terminal");
-            insert_protocol_projection_if_requested(
-                &transaction,
-                &completed,
-                Some(session_id),
-                latest_turn,
-                Some(0),
-            )
-            .expect("latest terminal");
-            transaction
-                .execute(
-                    "UPDATE sessions SET status = 'completed' WHERE id = ?1",
-                    params![session_id.to_string()],
-                )
-                .expect("session status");
-            transaction.commit().expect("commit");
-        }
-
-        assert_eq!(
-            repo.corroborated_terminal_for_turn(session_id, older_turn)
-                .await
-                .expect("older corroboration"),
-            None
-        );
-        assert_eq!(
-            repo.corroborated_terminal_for_turn(session_id, latest_turn)
-                .await
-                .expect("latest corroboration"),
-            Some((SessionStatus::Completed, None))
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_commit_fails_unfinished_tools_before_releasing_owner() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let (tool_call, _) = repo
-            .record_pending_tool_call_with_protocol_bundle(
-                session_id,
-                &admission_id,
-                assistant.id,
-                "shell",
-                "{}",
-                Some("pending"),
-                serde_json::Value::Null,
-                turn_id,
-                Some(1),
-            )
-            .await
-            .expect("pending tool");
-        let event = RunEvent::SessionFailed {
-            session_id,
-            message: "agent failure".to_string(),
-        };
-        assert_eq!(
-            repo.update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                assistant.id,
-                &test_assistant_metadata(Some(FinishReason::Error)),
-                SessionStatus::Failed,
-                &event,
-                turn_id,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("terminal commit"),
-            AdmittedTerminalCommit::Applied
-        );
-        let tool_status = repo
-            .connection
-            .lock()
-            .expect("sqlite mutex")
-            .query_row(
-                "SELECT status FROM tool_calls WHERE id = ?1",
-                params![tool_call.id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("tool status");
-        assert_eq!(tool_status, "failed");
-    }
-
-    #[tokio::test]
-    async fn externally_stopped_admission_cannot_block_the_active_goal() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        repo.replace_thread_goal(
-            session_id,
-            "keep goal active after external stop",
-            ThreadGoalStatus::Active,
-            None,
-        )
-        .await
-        .expect("goal");
-        let (_, goal_id) = repo
-            .get_thread_goal_with_id(session_id)
-            .await
-            .expect("goal read")
-            .expect("stored goal");
-        assert!(
-            repo.terminalize_active_session_with_protocol_event(
-                session_id,
-                SessionStatus::Cancelled,
-                &RunEvent::SessionInterrupted {
-                    session_id,
-                    reason: "external stop".to_string(),
-                    cause: Some(TurnInterruptionCause::UserStop),
-                },
-                turn_id,
-                None,
-            )
-            .await
-            .expect("external stop")
-        );
-
-        assert_eq!(
-            repo.update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                assistant.id,
-                &test_assistant_metadata(Some(FinishReason::Error)),
-                SessionStatus::Failed,
-                &RunEvent::SessionFailed {
-                    session_id,
-                    message: "late agent failure".to_string(),
-                },
-                turn_id,
-                None,
-                None,
-                Some(&goal_id),
-            )
-            .await
-            .expect("late failure acknowledgement"),
-            AdmittedTerminalCommit::AlreadyTerminalizedBySameAdmission
-        );
-        assert_eq!(
-            repo.get_thread_goal(session_id)
-                .await
-                .expect("goal after stop")
-                .expect("goal remains")
-                .status,
-            ThreadGoalStatus::Active
-        );
-    }
-
-    #[tokio::test]
-    async fn stopped_owner_cannot_drain_a_later_turn_steer() {
-        let (store, session_id, first_admission, first_turn_id, _) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        assert!(
-            repo.terminalize_active_session_with_protocol_event(
-                session_id,
-                SessionStatus::Cancelled,
-                &RunEvent::SessionInterrupted {
-                    session_id,
-                    reason: "stop first".to_string(),
-                    cause: Some(TurnInterruptionCause::UserStop),
-                },
-                first_turn_id,
-                None,
-            )
-            .await
-            .expect("interrupt first")
-        );
-        assert!(
-            repo.list_admitted_turn_steers(session_id, &first_admission, first_turn_id)
-                .await
-                .expect("old mailbox")
-                .is_none()
-        );
-        assert!(
-            store
-                .protocol_event_store()
-                .append_admitted_event_bundle_allocating(
-                    &first_admission,
-                    &RuntimeEvent {
-                        id: RuntimeEventId::new(),
-                        session_id,
-                        turn_id: first_turn_id,
-                        sequence_no: 0,
-                        created_at_ms: SystemClock.now_ms(),
-                        msg: RuntimeEventMsg::Warning {
-                            message: "late old-owner event".to_string(),
-                        },
-                    },
-                    None,
-                    None,
-                )
-                .expect("late event guard")
-                .is_none()
-        );
-        assert!(
-            repo.admit_session_run(session_id)
-                .await
-                .expect("blocked admission")
-                .is_none()
-        );
-        assert!(
-            repo.release_stopped_run_admission(session_id, &first_admission)
-                .await
-                .expect("release stopped owner")
-        );
-        let second_admission = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("second admission")
-            .expect("second admitted");
-        let second_turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &second_admission, second_turn_id)
-                .await
-                .expect("activate second turn")
-        );
-        repo.accept_active_turn_steer(
-            session_id,
-            &SteerTurn {
-                expected_turn_id: second_turn_id,
-                items: vec![UserInputItem::Text {
-                    text: "second steer".to_string(),
-                }],
-                additional_context: Default::default(),
-                client_user_message_id: None,
-            },
-        )
-        .await
-        .expect("second steer");
-        assert!(
-            repo.list_admitted_turn_steers(session_id, &first_admission, first_turn_id)
-                .await
-                .expect("old mailbox after readmit")
-                .is_none()
-        );
-        assert_eq!(
-            repo.list_admitted_turn_steers(session_id, &second_admission, second_turn_id)
-                .await
-                .expect("new mailbox")
-                .expect("new owner")
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn concurrent_interrupt_never_allows_readmission_before_owner_acknowledgement() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id, admission_id, turn_id, _) = runtime.block_on(active_turn_fixture());
-        let paths = store.paths().clone();
-        drop(store);
-        let barrier = Arc::new(Barrier::new(3));
-
-        let interrupt_paths = paths.clone();
-        let interrupt_barrier = Arc::clone(&barrier);
-        let interrupt = std::thread::spawn(move || {
-            let store = SqliteStore::open(&interrupt_paths).expect("interrupt store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("interrupt runtime");
-            interrupt_barrier.wait();
-            runtime.block_on(
-                store
-                    .session_repo()
-                    .terminalize_active_session_with_protocol_event(
-                        session_id,
-                        SessionStatus::Cancelled,
-                        &RunEvent::SessionInterrupted {
-                            session_id,
-                            reason: "cross-process stop".to_string(),
-                            cause: Some(TurnInterruptionCause::UserStop),
-                        },
-                        turn_id,
-                        None,
-                    ),
-            )
-        });
-        let admission_paths = paths.clone();
-        let admission_barrier = Arc::clone(&barrier);
-        let replacement = std::thread::spawn(move || {
-            let store = SqliteStore::open(&admission_paths).expect("admission store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("admission runtime");
-            admission_barrier.wait();
-            runtime.block_on(store.session_repo().admit_session_run(session_id))
-        });
-        barrier.wait();
-        assert!(
-            interrupt
-                .join()
-                .expect("interrupt worker")
-                .expect("interrupt result")
-        );
-        assert!(
-            replacement
-                .join()
-                .expect("admission worker")
-                .expect("admission result")
-                .is_none()
-        );
-
-        let final_store = SqliteStore::open(&paths).expect("final store");
-        let final_repo = final_store.session_repo();
-        assert!(
-            runtime
-                .block_on(final_repo.release_stopped_run_admission(session_id, &admission_id))
-                .expect("owner acknowledgement")
-        );
-        assert!(
-            runtime
-                .block_on(final_repo.admit_session_run(session_id))
-                .expect("post-ack admission")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn concurrent_steer_and_runtime_event_share_the_database_allocator() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id, _, turn_id, _) = runtime.block_on(active_turn_fixture());
-        let paths = store.paths().clone();
-        drop(store);
-        let warning = RuntimeEvent {
-            id: RuntimeEventId::new(),
-            session_id,
-            turn_id,
-            sequence_no: 0,
-            created_at_ms: SystemClock.now_ms(),
-            msg: RuntimeEventMsg::Warning {
-                message: "race with steer".to_string(),
-            },
-        };
-        let warning_id = warning.id;
-        let barrier = Arc::new(Barrier::new(3));
-
-        let event_paths = paths.clone();
-        let event_barrier = Arc::clone(&barrier);
-        let event_worker = std::thread::spawn(move || {
-            let store = SqliteStore::open(&event_paths).expect("event store");
-            event_barrier.wait();
-            store.protocol_event_store().append_runtime_event(&warning)
-        });
-        let steer_paths = paths.clone();
-        let steer_barrier = Arc::clone(&barrier);
-        let steer_worker = std::thread::spawn(move || {
-            let store = SqliteStore::open(&steer_paths).expect("steer store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("steer runtime");
-            steer_barrier.wait();
-            runtime.block_on(store.session_repo().accept_active_turn_steer(
-                session_id,
-                &SteerTurn {
-                    expected_turn_id: turn_id,
-                    items: vec![UserInputItem::Text {
-                        text: "allocator race".to_string(),
-                    }],
-                    additional_context: Default::default(),
-                    client_user_message_id: Some("allocator-race".to_string()),
-                },
-            ))
-        });
-        barrier.wait();
-        event_worker
-            .join()
-            .expect("event worker")
-            .expect("event append");
-        steer_worker
-            .join()
-            .expect("steer worker")
-            .expect("steer append");
-
-        let final_store = SqliteStore::open(&paths).expect("final store");
-        let events = final_store
-            .protocol_event_store()
-            .list_runtime_events(session_id, turn_id)
-            .expect("events");
-        let warning_sequence = events
-            .iter()
-            .find(|event| event.id == warning_id)
-            .expect("warning id preserved")
-            .sequence_no;
-        let steer_sequence = events
-            .iter()
-            .find(|event| matches!(event.msg, RuntimeEventMsg::SteerInputAccepted { .. }))
-            .expect("steer event")
-            .sequence_no;
-        assert_ne!(warning_sequence, steer_sequence);
-    }
-
-    #[tokio::test]
-    async fn stale_admission_cannot_terminalize_a_newer_run() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let first_admission = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("first admission")
-            .expect("first admitted");
-        let first_turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &first_admission, first_turn_id)
-                .await
-                .expect("activate first turn")
-        );
-        assert!(
-            repo.terminalize_active_session_with_protocol_event(
-                session_id,
-                SessionStatus::Cancelled,
-                &RunEvent::SessionInterrupted {
-                    session_id,
-                    reason: "replace run".to_string(),
-                    cause: Some(TurnInterruptionCause::UserStop),
-                },
-                first_turn_id,
-                None,
-            )
-            .await
-            .expect("cancel first")
-        );
-        assert!(
-            repo.admit_session_run(session_id)
-                .await
-                .expect("blocked second admission")
-                .is_none(),
-            "an interrupted run retains its admission until the matching owner acknowledges stop"
-        );
-
-        assert!(
-            repo.terminalize_admitted_session_with_protocol_event(
-                session_id,
-                &first_admission,
-                SessionStatus::Cancelled,
-                &RunEvent::SessionInterrupted {
-                    session_id,
-                    reason: "owner acknowledged stop".to_string(),
-                    cause: Some(TurnInterruptionCause::UserStop),
-                },
-                first_turn_id,
-                None,
-            )
-            .await
-            .expect("first owner acknowledgement")
-        );
-        let second_admission = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("second admission")
-            .expect("second admitted after acknowledgement");
-        let second_turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &second_admission, second_turn_id)
-                .await
-                .expect("activate second turn")
-        );
-        assert!(
-            !repo
-                .terminalize_admitted_session_with_protocol_event(
-                    session_id,
-                    &first_admission,
-                    SessionStatus::Failed,
-                    &RunEvent::SessionFailed {
-                        session_id,
-                        message: "stale cleanup".to_string(),
-                    },
-                    first_turn_id,
-                    None,
-                )
-                .await
-                .expect("stale cleanup rejected")
-        );
-        assert_eq!(
-            repo.get_session(session_id).await.expect("new run").status,
-            SessionStatus::Running
-        );
-        assert!(
-            repo.terminalize_admitted_session_with_protocol_event(
-                session_id,
-                &second_admission,
-                SessionStatus::Failed,
-                &RunEvent::SessionFailed {
-                    session_id,
-                    message: "current cleanup".to_string(),
-                },
-                second_turn_id,
-                None,
-            )
-            .await
-            .expect("current cleanup")
-        );
-    }
-
-    #[tokio::test]
-    async fn completed_commit_cannot_overwrite_an_interrupted_session() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let admission_id = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("admit")
-            .expect("admitted");
-        let turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &admission_id, turn_id)
-                .await
-                .expect("activate turn")
-        );
-        let (assistant, _) = repo
-            .append_assistant_message_with_protocol_start(
-                NewMessage {
-                    session_id,
-                    parent_message_id: None,
-                    role: MessageRole::Assistant,
-                    metadata: MessageMetadata::Assistant(AssistantMessageMeta {
-                        model: "model".to_string(),
-                        base_url: "http://localhost:1234".to_string(),
-                        finish_reason: None,
-                        token_usage: None,
-                        summary: false,
-                    }),
-                },
-                &admission_id,
-                turn_id,
-                None,
-                "model".to_string(),
-            )
-            .await
-            .expect("assistant");
-        let interrupted = RunEvent::SessionInterrupted {
-            session_id,
-            reason: "stop".to_string(),
-            cause: Some(TurnInterruptionCause::UserStop),
-        };
-        assert!(
-            repo.terminalize_active_session_with_protocol_event(
-                session_id,
-                SessionStatus::Cancelled,
-                &interrupted,
-                turn_id,
-                None,
-            )
-            .await
-            .expect("interrupt")
-        );
-        let completed = RunEvent::SessionCompleted {
-            session_id,
-            finish_reason: Some(FinishReason::Stop),
-        };
-        let completion_applied = repo
-            .update_message_metadata_and_status_with_protocol_event(
-                session_id,
-                assistant.id,
-                &MessageMetadata::Assistant(AssistantMessageMeta {
-                    model: "model".to_string(),
-                    base_url: "http://localhost:1234".to_string(),
-                    finish_reason: Some(FinishReason::Stop),
-                    token_usage: None,
-                    summary: false,
-                }),
-                SessionStatus::Completed,
-                &completed,
-                turn_id,
-                None,
-            )
-            .await
-            .expect("complete attempt");
-
-        assert!(!completion_applied);
-        assert_eq!(
-            repo.get_session(session_id).await.expect("session").status,
-            SessionStatus::Cancelled
-        );
-    }
-
-    #[tokio::test]
-    async fn fork_snapshot_rolls_back_the_target_when_a_late_copy_step_fails() {
-        let (store, source_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        repo.connection
-            .lock()
-            .expect("sqlite mutex poisoned")
-            .execute_batch(&format!(
-                "CREATE TRIGGER abort_fork_state
-                 BEFORE INSERT ON session_state
-                 WHEN NEW.session_id <> '{}'
-                 BEGIN
-                     SELECT RAISE(ABORT, 'injected fork state failure');
-                 END;",
-                source_session_id
-            ))
-            .expect("failure trigger");
-
-        let error = repo
-            .fork_session_snapshot(source_session_id, Some("atomic fork".to_string()))
-            .await
-            .expect_err("late fork failure must abort the transaction");
-
-        assert!(error.to_string().contains("injected fork state failure"));
-        let session_count = repo
-            .connection
-            .lock()
-            .expect("sqlite mutex poisoned")
-            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("session count");
-        assert_eq!(session_count, 1, "the target session must not leak");
-    }
-
-    #[tokio::test]
-    async fn fork_snapshot_rolls_back_when_the_final_active_marker_fails() {
-        let (store, source_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        repo.admit_session_run(source_session_id)
-            .await
-            .expect("admit source")
-            .expect("source admission");
-        store
-            .protocol_event_store()
-            .append_history_item(&HistoryItem {
-                id: HistoryItemId::new(),
-                session_id: source_session_id,
-                turn_id: TurnId::new(),
-                sequence_no: 0,
-                created_at_ms: 1,
-                payload: HistoryItemPayload::Message {
-                    message_id: None,
-                    role: MessageRole::User,
-                    content: vec![ContentPart::Text {
-                        text: "copy before final marker".to_string(),
-                    }],
-                },
-            })
-            .expect("source history");
-        repo.connection
-            .lock()
-            .expect("sqlite mutex poisoned")
-            .execute_batch(&format!(
-                "CREATE TRIGGER abort_fork_terminal_marker
-                 BEFORE INSERT ON protocol_runtime_events
-                 WHEN NEW.session_id <> '{}'
-                 BEGIN
-                     SELECT RAISE(ABORT, 'injected final marker failure');
-                 END;",
-                source_session_id
-            ))
-            .expect("marker failure trigger");
-
-        let error = repo
-            .fork_session_snapshot(source_session_id, Some("active fork".to_string()))
-            .await
-            .expect_err("final marker failure must abort the entire fork");
-
-        assert!(error.to_string().contains("injected final marker failure"));
-        let connection = repo.connection.lock().expect("sqlite mutex poisoned");
-        let session_count = connection
-            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("session count");
-        let leaked_history = connection
-            .query_row(
-                "SELECT COUNT(*) FROM protocol_history_items WHERE session_id <> ?1",
-                params![source_session_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("leaked history count");
-        let leaked_allocators = connection
-            .query_row(
-                "SELECT COUNT(*) FROM protocol_turn_sequence_allocators WHERE session_id <> ?1",
-                params![source_session_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("leaked allocator count");
-        assert_eq!(session_count, 1, "the target session must roll back");
-        assert_eq!(leaked_history, 0, "copied history must roll back");
-        assert_eq!(leaked_allocators, 0, "fork allocators must roll back");
-    }
-
-    #[tokio::test]
-    async fn fork_snapshot_copies_session_settings_memory_and_protocol_together() {
-        let (store, source_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        repo.update_session_settings(
-            source_session_id,
-            &SessionSettingsPatch {
-                temperature: Some(0.25),
-                max_output_tokens: Some(2048),
-                ..SessionSettingsPatch::default()
-            },
-        )
-        .await
-        .expect("source settings");
-        repo.update_session_memory_mode(source_session_id, SessionMemoryMode::Disabled)
-            .await
-            .expect("source memory mode");
-        let turn_id = TurnId::new();
-        store
-            .protocol_event_store()
-            .append_history_item(&HistoryItem {
-                id: HistoryItemId::new(),
-                session_id: source_session_id,
-                turn_id,
-                sequence_no: 0,
-                created_at_ms: 1,
-                payload: HistoryItemPayload::Message {
-                    message_id: None,
-                    role: MessageRole::User,
-                    content: vec![ContentPart::Text {
-                        text: "snapshot source".to_string(),
-                    }],
-                },
-            })
-            .expect("source history");
-
-        let fork = repo
-            .fork_session_snapshot(source_session_id, Some("snapshot fork".to_string()))
-            .await
-            .expect("fork snapshot");
-
-        assert_eq!(fork.forked_session.title, "snapshot fork");
-        assert_eq!(fork.forked_session.status, SessionStatus::Idle);
-        assert_eq!(fork.forked_session.model_parameters.temperature, Some(0.25));
-        assert_eq!(
-            fork.forked_session.model_parameters.max_output_tokens,
-            Some(2048)
-        );
-        assert_eq!(
-            repo.get_session_memory_mode(fork.forked_session.id)
-                .await
-                .expect("fork memory mode"),
-            SessionMemoryMode::Disabled
-        );
-        assert_eq!(fork.copied_history_items, 1);
-        assert_eq!(fork.copied_turn_items, 0);
-        assert_eq!(
-            store
-                .protocol_event_store()
-                .list_history_items_for_session(fork.forked_session.id)
-                .expect("fork history")
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn active_root_access_cas_preserves_run_and_unrelated_settings_and_rejects_stale_child() {
-        let (store, root_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let prepared = repo
-            .update_session_settings(
-                root_session_id,
-                &SessionSettingsPatch {
-                    model: Some("root-model".to_string()),
-                    base_url: Some("http://root-provider.invalid".to_string()),
-                    access_mode: Some(AccessMode::Default),
-                    temperature: Some(0.25),
-                    max_output_tokens: Some(2048),
-                    ..SessionSettingsPatch::default()
-                },
-            )
-            .await
-            .expect("prepare root settings")
-            .session;
-        repo.update_session_memory_mode(root_session_id, SessionMemoryMode::Disabled)
-            .await
-            .expect("prepare root memory mode");
-        let admission_id = repo
-            .admit_session_run(root_session_id)
-            .await
-            .expect("admit root")
-            .expect("root admitted");
-
-        let update = repo
-            .compare_and_set_root_session_access_mode(
-                root_session_id,
-                AccessMode::Default,
-                AccessMode::FullAccess,
-            )
-            .await
-            .expect("active root access update")
-            .expect("expected access owner");
-        assert!(update.changed);
-        assert_eq!(update.session.status, SessionStatus::Running);
-        assert_eq!(update.session.access_mode, AccessMode::FullAccess);
-        assert_eq!(update.session.project_id, prepared.project_id);
-        assert_eq!(update.session.title, prepared.title);
-        assert_eq!(update.session.cwd, prepared.cwd);
-        assert_eq!(update.session.model, prepared.model);
-        assert_eq!(update.session.base_url, prepared.base_url);
-        assert_eq!(
-            update.session.model_parameters, prepared.model_parameters,
-            "the access-only boundary must not rewrite model settings"
-        );
-        assert_eq!(
-            repo.get_session_memory_mode(root_session_id)
-                .await
-                .expect("root memory mode"),
-            SessionMemoryMode::Disabled
-        );
-        assert!(
-            repo.has_fresh_run_admission(root_session_id)
-                .await
-                .expect("root admission retained")
-        );
-        assert_eq!(
-            repo.admitted_run_status_at(
-                root_session_id,
-                &admission_id,
-                TurnId::new(),
-                SystemClock::now_ms(),
-            )
-            .await
-            .expect("admission status before turn"),
-            None,
-            "a pre-turn admission remains owned but has no active turn identity"
-        );
-
-        assert!(
-            repo.compare_and_set_root_session_access_mode(
-                root_session_id,
-                AccessMode::Default,
-                AccessMode::AutoReview,
-            )
-            .await
-            .expect("stale access CAS")
-            .is_none(),
-            "a stale expected access owner must not overwrite the active root"
-        );
-        assert_eq!(
-            repo.get_session(root_session_id)
-                .await
-                .expect("root after stale CAS")
-                .access_mode,
-            AccessMode::FullAccess
-        );
-        assert!(
-            repo.update_session_settings(
-                root_session_id,
-                &SessionSettingsPatch {
-                    model: Some("forbidden-active-model-change".to_string()),
-                    ..SessionSettingsPatch::default()
-                },
-            )
-            .await
-            .is_err(),
-            "general settings remain forbidden while the root is active"
-        );
-
-        let child = repo
-            .create_session(NewSession {
-                project_id: prepared.project_id,
-                title: "child".to_string(),
-                cwd: prepared.cwd,
-                model: prepared.model,
-                base_url: prepared.base_url,
-                access_mode: AccessMode::Default,
-            })
-            .await
-            .expect("child session");
-        repo.insert_session_spawn_edge(
-            root_session_id,
-            root_session_id,
-            child.id,
-            "/root/child",
-            "child",
-        )
-        .await
-        .expect("child edge");
-        let child_error = repo
-            .compare_and_set_root_session_access_mode(
-                child.id,
-                AccessMode::Default,
-                AccessMode::FullAccess,
-            )
-            .await
-            .expect_err("child cannot impersonate the root access owner");
-        assert!(child_error.to_string().contains("child agent session"));
-        assert_eq!(
-            repo.get_session(child.id)
-                .await
-                .expect("unchanged child")
-                .access_mode,
-            AccessMode::Default
-        );
-    }
 }
 
 fn session_status_text(status: SessionStatus) -> &'static str {
@@ -8851,21 +3317,8 @@ fn session_status_text(status: SessionStatus) -> &'static str {
         SessionStatus::Idle => "idle",
         SessionStatus::Running => "running",
         SessionStatus::Completed => "completed",
-        SessionStatus::AwaitingUser => "awaiting_user",
         SessionStatus::Cancelled => "cancelled",
         SessionStatus::Failed => "failed",
-    }
-}
-
-fn terminal_status_text(status: SessionStatus) -> Result<&'static str, StorageError> {
-    match status {
-        SessionStatus::Completed => Ok("completed"),
-        SessionStatus::AwaitingUser => Ok("awaiting_user"),
-        SessionStatus::Cancelled => Ok("cancelled"),
-        SessionStatus::Failed => Ok("failed"),
-        SessionStatus::Idle | SessionStatus::Running => Err(StorageError::Message(
-            "active session terminalization requires a terminal status".to_string(),
-        )),
     }
 }
 
@@ -8882,6 +3335,25 @@ fn count_steer_history_items(
     for row in rows {
         let payload = serde_json::from_str::<HistoryItemPayload>(&row?)?;
         if matches!(payload, HistoryItemPayload::SteerTurn { .. }) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn count_agent_communication_history_items(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+) -> Result<usize, StorageError> {
+    let mut statement = transaction
+        .prepare("SELECT payload_json FROM protocol_history_items WHERE session_id = ?1")?;
+    let rows = statement.query_map(params![session_id.to_string()], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut count = 0;
+    for row in rows {
+        let payload = serde_json::from_str::<HistoryItemPayload>(&row?)?;
+        if matches!(payload, HistoryItemPayload::InterAgentCommunication { .. }) {
             count += 1;
         }
     }
@@ -8908,7 +3380,7 @@ fn recover_expired_run_admission_in_transaction(
     active_turn_id: Option<&str>,
     now_ms: i64,
 ) -> Result<(), StorageError> {
-    let was_active = matches!(current_status, "running" | "awaiting_user");
+    let was_active = current_status == "running";
     let active_turn_id = active_turn_id
         .map(|value| {
             value
@@ -8942,9 +3414,28 @@ fn recover_expired_run_admission_in_transaction(
     }
     if let Some(turn_id) = recovery_turn_id {
         if was_active {
-            let event = RunEvent::SessionFailed {
+            let snapshot =
+                canonical_turn_snapshot_in_transaction(transaction, session_id, turn_id)?;
+            let recoverable_unfinished_count = count_unfinished_tool_calls_for_turn_in_transaction(
+                transaction,
                 session_id,
-                message: EXPIRED_RUN_RECOVERY_REASON.to_string(),
+                turn_id,
+            )?;
+            let event = RunEvent::TurnTerminal {
+                session_id,
+                terminal: Box::new(crate::session::model::DurableTurnTerminal {
+                    status: crate::protocol::TurnTerminalStatus::Failed,
+                    finish_reason: Some(FinishReason::Error),
+                    interruption_cause: None,
+                    final_response_id: snapshot.final_response_id,
+                    summary: EXPIRED_RUN_RECOVERY_REASON.to_string(),
+                    tool_call_count: snapshot.tool_call_count,
+                    failed_tool_count: snapshot
+                        .failed_tool_count
+                        .saturating_add(recoverable_unfinished_count),
+                    change_count: snapshot.change_count,
+                    metrics: Default::default(),
+                }),
             };
             let recovery_sequence_no = resolve_terminal_protocol_sequence_in_transaction(
                 transaction,
@@ -8975,12 +3466,7 @@ fn recover_expired_run_admission_in_transaction(
         // Legacy admissions without a turn owner cannot safely attribute their unfinished tools
         // to a canonical turn. Settle their rows only; current-turn recovery above records the
         // complete tool and terminal projection bundle.
-        fail_unfinished_tool_calls_in_connection(
-            transaction,
-            session_id,
-            EXPIRED_RUN_RECOVERY_REASON,
-            now_ms,
-        )?;
+        fail_unfinished_tool_calls_in_transaction(transaction, session_id, now_ms)?;
     }
     Ok(())
 }
@@ -9000,7 +3486,7 @@ fn require_active_admission_in_transaction(
                AND active_run_id = ?2
                AND active_turn_id = ?3
                AND active_run_lease_expires_at_ms > ?4
-               AND status IN ('running', 'awaiting_user')",
+               AND status = 'running'",
             params![
                 session_id.to_string(),
                 admission_id,
@@ -9020,21 +3506,41 @@ fn require_active_admission_in_transaction(
     }
 }
 
-fn fail_unfinished_tool_calls_in_connection(
-    connection: &Connection,
+fn fail_unfinished_tool_calls_in_transaction(
+    transaction: &Transaction<'_>,
     session_id: SessionId,
-    error_text: &str,
     finished_at_ms: i64,
 ) -> Result<(), StorageError> {
-    connection.execute(
+    transaction.execute(
         "UPDATE tool_calls
          SET status = 'failed',
-             error_text = COALESCE(error_text, ?2),
-             finished_at_ms = COALESCE(finished_at_ms, ?3)
-         WHERE session_id = ?1 AND status IN ('pending', 'running')",
-        params![session_id.to_string(), error_text, finished_at_ms],
+             finished_at_ms = COALESCE(finished_at_ms, ?2)
+         WHERE history_item_id IN (
+             SELECT id FROM protocol_history_items WHERE session_id = ?1
+         )
+           AND status IN ('pending', 'running')",
+        params![session_id.to_string(), finished_at_ms],
     )?;
     Ok(())
+}
+
+fn count_unfinished_tool_calls_for_turn_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> Result<usize, StorageError> {
+    let count = transaction.query_row(
+        "SELECT COUNT(*)
+         FROM tool_calls AS tool
+         INNER JOIN protocol_history_items AS history
+            ON history.id = tool.history_item_id
+         WHERE history.session_id = ?1
+           AND history.turn_id = ?2
+           AND tool.status IN ('pending', 'running')",
+        params![session_id.to_string(), turn_id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count as usize)
 }
 
 fn resolve_terminal_protocol_sequence_in_transaction(
@@ -9075,141 +3581,100 @@ fn settle_unfinished_tool_calls_for_terminal_event(
     protocol_sequence_no: i64,
     finished_at_ms: i64,
 ) -> Result<i64, StorageError> {
-    let (status, reason) = match event {
-        RunEvent::SessionInterrupted { reason, .. } => (ToolCallStatus::Cancelled, reason.as_str()),
-        RunEvent::SessionFailed { message, .. } => (ToolCallStatus::Failed, message.as_str()),
-        RunEvent::SessionCompleted { .. } => (
+    let terminal = validate_terminal_event(session_id, event)?;
+    let (status, reason) = match terminal.status {
+        crate::protocol::TurnTerminalStatus::Interrupted => (
             ToolCallStatus::Cancelled,
-            "run completed before the tool call was executed",
+            if terminal.summary.trim().is_empty() {
+                "turn interrupted before the tool call finished"
+            } else {
+                terminal.summary.as_str()
+            },
         ),
-        RunEvent::SessionAwaitingUser { .. } => return Ok(protocol_sequence_no),
-        _ => (
+        crate::protocol::TurnTerminalStatus::Failed => (
             ToolCallStatus::Failed,
-            unfinished_tool_reason_for_event(event),
+            if terminal.summary.trim().is_empty() {
+                "turn failed before the tool call finished"
+            } else {
+                terminal.summary.as_str()
+            },
+        ),
+        crate::protocol::TurnTerminalStatus::Completed => (
+            ToolCallStatus::Cancelled,
+            "turn completed before the tool call finished",
         ),
     };
-
-    let current_turn_unfinished_call_ids = {
-        let mut statement = transaction.prepare(
-            "SELECT msg_json
-             FROM protocol_runtime_events
-             WHERE session_id = ?1 AND turn_id = ?2
-             ORDER BY sequence_no ASC, rowid ASC",
-        )?;
-        let rows = statement.query_map(
-            params![session_id.to_string(), protocol_turn_id.to_string()],
-            |row| row.get::<_, String>(0),
-        )?;
-        let mut lifecycle_by_call = HashMap::new();
-        for row in rows {
-            if let RuntimeEventMsg::ToolLifecycle { envelope } =
-                serde_json::from_str::<RuntimeEventMsg>(&row?)?
-            {
-                lifecycle_by_call.insert(envelope.call_id, envelope.status);
-            }
-        }
-        lifecycle_by_call
-            .into_iter()
-            .filter_map(|(call_id, lifecycle_status)| {
-                matches!(
-                    lifecycle_status,
-                    crate::protocol::ToolLifecycleStatus::Pending
-                        | crate::protocol::ToolLifecycleStatus::Running
-                )
-                .then_some(call_id)
-            })
-            .collect::<HashSet<_>>()
-    };
-    if current_turn_unfinished_call_ids.is_empty() {
-        return Ok(protocol_sequence_no);
-    }
 
     let unfinished = {
         let mut statement = transaction.prepare(
-            "SELECT id, message_id, tool_name, metadata_json
-             FROM tool_calls
-             WHERE session_id = ?1 AND status IN ('pending', 'running')
-             ORDER BY started_at_ms ASC, id ASC",
+            "SELECT tool.id, history.payload_json
+             FROM tool_calls AS tool
+             INNER JOIN protocol_history_items AS history
+                ON history.id = tool.history_item_id
+             WHERE history.session_id = ?1
+               AND history.turn_id = ?2
+               AND tool.status IN ('pending', 'running')
+             ORDER BY tool.started_at_ms ASC, tool.id ASC",
         )?;
-        let rows = statement
-            .query_map(params![session_id.to_string()], |row| {
-                let tool_call_id =
-                    row.get::<_, String>(0)?
-                        .parse::<ToolCallId>()
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                let message_id =
-                    row.get::<_, String>(1)?
-                        .parse::<MessageId>()
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                1,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                let tool_name = parse_tool_name(&row.get::<_, String>(2)?);
-                let metadata_json = serde_json::from_str::<serde_json::Value>(
-                    &row.get::<_, String>(3)?,
-                )
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
-                Ok((tool_call_id, message_id, tool_name, metadata_json))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .filter(|(tool_call_id, _, _, _)| {
-                current_turn_unfinished_call_ids.contains(tool_call_id)
-            })
-            .collect::<Vec<_>>()
+        statement
+            .query_map(
+                params![session_id.to_string(), protocol_turn_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
     };
 
     let mut next_sequence_no = protocol_sequence_no;
-    for (tool_call_id, message_id, tool_name, metadata_json) in unfinished {
+    for (tool_call_id, payload_json) in unfinished {
+        let tool_call_id = tool_call_id.parse::<ToolCallId>().map_err(|error| {
+            StorageError::Message(format!("invalid durable tool call id: {error}"))
+        })?;
+        let payload = serde_json::from_str::<HistoryItemPayload>(&payload_json)?;
+        let HistoryItemPayload::ToolCall {
+            call_id, tool_name, ..
+        } = payload
+        else {
+            return Err(StorageError::Message(format!(
+                "tool sidecar {tool_call_id} does not reference a canonical ToolCall item"
+            )));
+        };
+        if call_id != tool_call_id {
+            return Err(StorageError::Message(format!(
+                "tool sidecar id {tool_call_id} contradicts canonical call id {call_id}"
+            )));
+        }
+        let tool = crate::tool::ToolName::parse(&tool_name);
         let applied = match status {
             ToolCallStatus::Cancelled => transaction.execute(
                 "UPDATE tool_calls
-                 SET status = 'cancelled',
-                     output_text = ?2,
-                     error_text = NULL,
-                     finished_at_ms = ?3
+                 SET status = 'cancelled', finished_at_ms = ?2
                  WHERE id = ?1
-                   AND session_id = ?4
-                   AND message_id = ?5
+                   AND history_item_id IN (
+                       SELECT id FROM protocol_history_items
+                       WHERE session_id = ?3 AND turn_id = ?4
+                   )
                    AND status IN ('pending', 'running')",
                 params![
                     tool_call_id.to_string(),
-                    reason,
                     finished_at_ms,
                     session_id.to_string(),
-                    message_id.to_string(),
+                    protocol_turn_id.to_string(),
                 ],
             )?,
             ToolCallStatus::Failed => transaction.execute(
                 "UPDATE tool_calls
-                 SET status = 'failed',
-                     error_text = ?2,
-                     finished_at_ms = ?3
+                 SET status = 'failed', finished_at_ms = ?2
                  WHERE id = ?1
-                   AND session_id = ?4
-                   AND message_id = ?5
+                   AND history_item_id IN (
+                       SELECT id FROM protocol_history_items
+                       WHERE session_id = ?3 AND turn_id = ?4
+                   )
                    AND status IN ('pending', 'running')",
                 params![
                     tool_call_id.to_string(),
-                    reason,
                     finished_at_ms,
                     session_id.to_string(),
-                    message_id.to_string(),
+                    protocol_turn_id.to_string(),
                 ],
             )?,
             _ => unreachable!("terminal sweep only cancels or fails unfinished tools"),
@@ -9217,19 +3682,18 @@ fn settle_unfinished_tool_calls_for_terminal_event(
         if !applied {
             continue;
         }
-
         let tool_event = match status {
             ToolCallStatus::Cancelled => RunEvent::ToolCallCancelled {
                 tool_call_id,
-                tool: tool_name,
+                tool,
                 reason: reason.to_string(),
-                metadata: metadata_json,
+                metadata: serde_json::Value::Null,
             },
             ToolCallStatus::Failed => RunEvent::ToolCallFailed {
                 tool_call_id,
-                tool: tool_name,
+                tool,
                 error: reason.to_string(),
-                metadata: metadata_json,
+                metadata: serde_json::Value::Null,
             },
             _ => unreachable!("terminal sweep only cancels or fails unfinished tools"),
         };
@@ -9241,43 +3705,8 @@ fn settle_unfinished_tool_calls_for_terminal_event(
             Some(next_sequence_no),
         )?;
         next_sequence_no = next_sequence_no.saturating_add(1);
-        insert_part_in_transaction(
-            transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::ToolResult,
-                payload: MessagePart::ToolResult(ToolResultPart {
-                    tool_call_id,
-                    status,
-                    title: match status {
-                        ToolCallStatus::Cancelled => "Tool cancelled".to_string(),
-                        ToolCallStatus::Failed => "Tool failed".to_string(),
-                        _ => unreachable!("terminal sweep only cancels or fails unfinished tools"),
-                    },
-                    summary: reason.to_string(),
-                    success: (status == ToolCallStatus::Failed).then_some(false),
-                    progress_effect: if status == ToolCallStatus::Failed {
-                        ToolProgressEffect::Blocked
-                    } else {
-                        ToolProgressEffect::Unknown
-                    },
-                    blocked_action: None,
-                    result_hash: None,
-                }),
-            },
-        )?;
     }
     Ok(next_sequence_no)
-}
-
-fn unfinished_tool_reason_for_event(event: &RunEvent) -> &str {
-    match event {
-        RunEvent::SessionInterrupted { reason, .. } => reason,
-        RunEvent::SessionFailed { message, .. } => message,
-        RunEvent::SessionCompleted { .. } => "run completed before a tool call finished",
-        RunEvent::SessionAwaitingUser { .. } => "run paused before a tool call finished",
-        _ => "run terminalized before a tool call finished",
-    }
 }
 
 fn escape_like_literal(value: &str) -> String {
@@ -9289,4 +3718,1280 @@ fn escape_like_literal(value: &str) -> String {
         escaped.push(character);
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use camino::Utf8PathBuf;
+
+    use super::*;
+    use crate::config::AccessMode;
+    use crate::protocol::{
+        ContentPart, InterAgentCommunication, ModeKind, ProtocolEventStore, ToolLifecycleStatus,
+        UserInputItem,
+    };
+    use crate::session::{ChangeId, ChangeKind, ChangeRepository, NewSession, ProjectRepository};
+    use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+
+    async fn test_repo() -> (StoreBundle, SessionId) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 path");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir: data_dir.clone(),
+        };
+        let sqlite = SqliteStore::open(&paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "test", "none")
+            .await
+            .expect("project");
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "test".to_string(),
+                cwd: data_dir,
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("session");
+        (store, session.id)
+    }
+
+    async fn active_turn(store: &StoreBundle, session_id: SessionId) -> (String, TurnId) {
+        let repo = store.session_repo();
+        let turn_id = TurnId::new();
+        let admission_id = repo
+            .admit_session_turn(session_id, turn_id)
+            .await
+            .expect("admit")
+            .expect("admitted");
+        repo.append_user_turn_with_protocol_bundle(
+            session_id,
+            &admission_id,
+            &UserTurn {
+                turn_id,
+                items: vec![UserInputItem::Text {
+                    text: "canonical request".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+            },
+            turn_id,
+            0,
+        )
+        .await
+        .expect("user turn");
+        (admission_id, turn_id)
+    }
+
+    async fn expire_and_recover_run(store: &StoreBundle, session_id: SessionId) -> String {
+        let recovery_now = SystemClock::now_ms()
+            .saturating_add(RUN_ADMISSION_LEASE_DURATION_MS)
+            .saturating_add(1_000);
+        store
+            .session_repo()
+            .admit_session_turn_at(
+                session_id,
+                TurnId::new(),
+                recovery_now,
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
+            .await
+            .expect("recover expired admission")
+            .expect("admit replacement run")
+    }
+
+    fn completed_terminal(session_id: SessionId, summary: &str) -> RunEvent {
+        RunEvent::TurnTerminal {
+            session_id,
+            terminal: Box::new(crate::session::model::DurableTurnTerminal {
+                status: crate::protocol::TurnTerminalStatus::Completed,
+                finish_reason: Some(FinishReason::Stop),
+                interruption_cause: None,
+                final_response_id: Some(ModelResponseId::new()),
+                summary: summary.to_string(),
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
+        }
+    }
+
+    fn stored_admission_state(
+        store: &StoreBundle,
+        session_id: SessionId,
+    ) -> (String, Option<String>, Option<String>, Option<i64>) {
+        store
+            .session_repo()
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .query_row(
+                "SELECT status, active_run_id, active_turn_id, active_run_lease_expires_at_ms
+                 FROM sessions WHERE id = ?1",
+                params![session_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .expect("stored admission state")
+    }
+
+    #[tokio::test]
+    async fn new_and_resumed_turns_admit_run_and_turn_as_one_owner() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let first_turn_id = TurnId::new();
+        let first_admission_id = repository
+            .admit_session_turn(session_id, first_turn_id)
+            .await
+            .expect("first admission")
+            .expect("first turn admitted");
+
+        let first_state = stored_admission_state(&store, session_id);
+        assert_eq!(first_state.0, "running");
+        assert_eq!(first_state.1.as_deref(), Some(first_admission_id.as_str()));
+        assert_eq!(first_state.2, Some(first_turn_id.to_string()));
+        assert!(first_state.3.is_some());
+
+        let terminal = completed_terminal(session_id, "first turn complete");
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    &first_admission_id,
+                    &terminal,
+                    first_turn_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("terminal commit"),
+            AdmittedTerminalCommit::Applied
+        );
+
+        let resumed_turn_id = TurnId::new();
+        let resumed_admission_id = repository
+            .admit_session_turn(session_id, resumed_turn_id)
+            .await
+            .expect("resumed admission")
+            .expect("resumed turn admitted");
+        let resumed_state = stored_admission_state(&store, session_id);
+        assert_eq!(resumed_state.0, "running");
+        assert_eq!(
+            resumed_state.1.as_deref(),
+            Some(resumed_admission_id.as_str())
+        );
+        assert_eq!(resumed_state.2, Some(resumed_turn_id.to_string()));
+        assert!(resumed_state.3.is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_admission_commits_exactly_one_run_and_turn_owner() {
+        let (store, session_id) = test_repo().await;
+        let first_repository = store.session_repo();
+        let second_repository = store.session_repo();
+        let first_turn_id = TurnId::new();
+        let second_turn_id = TurnId::new();
+        let (first, second) = tokio::join!(
+            first_repository.admit_session_turn(session_id, first_turn_id),
+            second_repository.admit_session_turn(session_id, second_turn_id),
+        );
+        let first = first.expect("first admission attempt");
+        let second = second.expect("second admission attempt");
+        let (winning_admission_id, winning_turn_id) = match (first, second) {
+            (Some(admission_id), None) => (admission_id, first_turn_id),
+            (None, Some(admission_id)) => (admission_id, second_turn_id),
+            outcome => panic!("expected one admitted turn, got {outcome:?}"),
+        };
+
+        let state = stored_admission_state(&store, session_id);
+        assert_eq!(state.0, "running");
+        assert_eq!(state.1.as_deref(), Some(winning_admission_id.as_str()));
+        assert_eq!(state.2, Some(winning_turn_id.to_string()));
+        assert!(state.3.is_some());
+    }
+
+    #[tokio::test]
+    async fn expired_owner_is_recovered_before_atomic_replacement_admission() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let admitted_at_ms = SystemClock::now_ms();
+        let expired_turn_id = TurnId::new();
+        let expired_admission_id = repository
+            .admit_session_turn_at(session_id, expired_turn_id, admitted_at_ms, 100)
+            .await
+            .expect("expired owner setup")
+            .expect("expired owner admitted");
+        let replacement_turn_id = TurnId::new();
+        let replacement_admission_id = repository
+            .admit_session_turn_at(
+                session_id,
+                replacement_turn_id,
+                admitted_at_ms.saturating_add(101),
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
+            .await
+            .expect("replacement admission")
+            .expect("replacement admitted");
+
+        let state = stored_admission_state(&store, session_id);
+        assert_eq!(state.0, "running");
+        assert_eq!(state.1.as_deref(), Some(replacement_admission_id.as_str()));
+        assert_eq!(state.2, Some(replacement_turn_id.to_string()));
+        assert_eq!(
+            repository
+                .renew_admitted_run_lease_at(
+                    session_id,
+                    &expired_admission_id,
+                    expired_turn_id,
+                    admitted_at_ms.saturating_add(102),
+                    RUN_ADMISSION_LEASE_DURATION_MS,
+                )
+                .await
+                .expect("stale owner renewal"),
+            RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
+        );
+        assert_eq!(
+            repository
+                .durable_terminal_for_turn(session_id, expired_turn_id)
+                .await
+                .expect("recovery terminal")
+                .map(|terminal| terminal.status.as_session_status()),
+            Some(SessionStatus::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_legacy_null_turn_is_not_an_active_inter_agent_recipient() {
+        let (store, session_id) = test_repo().await;
+        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
+        store
+            .session_repo()
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute(
+                "UPDATE sessions
+                 SET status = 'running', active_run_id = 'legacy-owner', active_turn_id = NULL,
+                     active_run_lease_expires_at_ms = ?2
+                 WHERE id = ?1",
+                params![
+                    session_id.to_string(),
+                    now.saturating_add(RUN_ADMISSION_LEASE_DURATION_MS)
+                ],
+            )
+            .expect("legacy null-turn fixture");
+
+        let error = store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
+                session_id,
+                InterAgentCommunication {
+                    author: "/root".to_string(),
+                    recipient: "/root/worker".to_string(),
+                    content: "do not commit to an ownerless turn".to_string(),
+                    trigger_turn: true,
+                },
+                true,
+            )
+            .expect_err("null-turn recipient must not be active");
+        assert!(error.to_string().contains("became terminal"));
+        assert!(
+            store
+                .protocol_event_store()
+                .list_history_items_for_session(session_id)
+                .expect("canonical history")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_user_turn_is_the_only_durable_message_contract() {
+        let (store, session_id) = test_repo().await;
+        let (_, turn_id) = active_turn(&store, session_id).await;
+        let history = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("history");
+        assert!(matches!(
+            history.as_slice(),
+            [HistoryItem {
+                payload: HistoryItemPayload::UserTurn { content, .. },
+                ..
+            }] if matches!(content.as_slice(), [ContentPart::Text { text }] if text == "canonical request")
+        ));
+        let repo = store.session_repo();
+        let connection = repo.connection.lock().expect("sqlite mutex");
+        for retired in ["messages", "message_parts"] {
+            let exists = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    params![retired],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("schema query");
+            assert!(!exists, "retired table {retired} must not exist after V33");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_tool_sidecar_and_canonical_history_are_one_atomic_bundle() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let repo = store.session_repo();
+        repo.connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute_batch(
+                "CREATE TRIGGER abort_tool_sidecar
+                 BEFORE INSERT ON tool_calls
+                 BEGIN SELECT RAISE(ABORT, 'injected sidecar failure'); END;",
+            )
+            .expect("trigger");
+        let result = repo
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                &admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id: ModelResponseId::new(),
+                    assistant_text: Some("I will run the command.".to_string()),
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: ToolCallId::new(),
+                        model_call_id: "model-call-1".to_string(),
+                        tool_name: "shell".to_string(),
+                        arguments_json: serde_json::json!({"command": "echo ok"}).to_string(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        let history = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.payload,
+                        HistoryItemPayload::AssistantMessage { .. }
+                            | HistoryItemPayload::ToolCall { .. }
+                    )
+                })
+                .count(),
+            0,
+            "failed sidecar insert must roll back the complete model response bundle"
+        );
+        assert_eq!(
+            store
+                .protocol_event_store()
+                .list_runtime_events(session_id, turn_id)
+                .expect("runtime events")
+                .iter()
+                .filter(|event| matches!(event.msg, RuntimeEventMsg::ToolLifecycle { .. }))
+                .count(),
+            0,
+            "failed sidecar insert must roll back its runtime projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_tool_call_preserves_unknown_name_and_invalid_provider_json_verbatim() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        let raw_tool_name = "provider_tool_not_in_router".to_string();
+        let raw_arguments_json = "{not-json}".to_string();
+        let events = store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                &admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id,
+                    assistant_text: None,
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: call_id,
+                        model_call_id: "provider-call-raw".to_string(),
+                        tool_name: raw_tool_name.clone(),
+                        arguments_json: raw_arguments_json.clone(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .expect("raw pending tool call");
+
+        assert!(matches!(
+            events.as_slice(),
+            [RunEvent::ToolCallPending {
+                tool_call_id: stored_call_id,
+                response_id: stored_response_id,
+                model_call_id,
+                tool_name,
+                arguments_json,
+            }] if *stored_call_id == call_id
+                && *stored_response_id == response_id
+                && model_call_id == "provider-call-raw"
+                && tool_name == &raw_tool_name
+                && arguments_json == &raw_arguments_json
+        ));
+        let history = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("canonical raw history");
+        assert!(history.iter().any(|item| matches!(
+            &item.payload,
+            HistoryItemPayload::ToolCall {
+                call_id: stored_call_id,
+                response_id: stored_response_id,
+                model_call_id,
+                tool_name,
+                arguments_json,
+            } if *stored_call_id == call_id
+                && *stored_response_id == response_id
+                && model_call_id == "provider-call-raw"
+                && tool_name == &raw_tool_name
+                && arguments_json == &raw_arguments_json
+        )));
+        let sidecar = store
+            .session_repo()
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .query_row(
+                "SELECT status, history_item_id FROM tool_calls WHERE id = ?1",
+                [call_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("minimal pending sidecar");
+        assert_eq!(sidecar.0, "pending");
+        assert!(history.iter().any(|item| item.id.to_string() == sidecar.1));
+    }
+
+    #[tokio::test]
+    async fn complete_model_response_bundle_commits_all_calls_before_execution() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let response_id = ModelResponseId::new();
+        let first_call_id = ToolCallId::new();
+        let second_call_id = ToolCallId::new();
+        let events = store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                &admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id,
+                    assistant_text: Some("I will inspect both inputs.".to_string()),
+                    assistant_protocol_sequence_no: Some(0),
+                    tool_calls: vec![
+                        PendingToolCallWrite {
+                            id: first_call_id,
+                            model_call_id: "provider-call-a".to_string(),
+                            tool_name: "read".to_string(),
+                            arguments_json: serde_json::json!({"path": "a.txt"}).to_string(),
+                            protocol_sequence_no: Some(1),
+                        },
+                        PendingToolCallWrite {
+                            id: second_call_id,
+                            model_call_id: "provider-call-b".to_string(),
+                            tool_name: "read".to_string(),
+                            arguments_json: serde_json::json!({"path": "b.txt"}).to_string(),
+                            protocol_sequence_no: Some(2),
+                        },
+                    ],
+                },
+            )
+            .await
+            .expect("model response bundle");
+        assert_eq!(events.len(), 3);
+
+        let history = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("history");
+        let response_history = history
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.payload,
+                    HistoryItemPayload::AssistantMessage { .. }
+                        | HistoryItemPayload::ToolCall { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            response_history.as_slice(),
+            [
+                HistoryItem {
+                    payload: HistoryItemPayload::AssistantMessage { response_id: stored, .. },
+                    ..
+                },
+                HistoryItem {
+                    payload: HistoryItemPayload::ToolCall { call_id: first, response_id: first_response, .. },
+                    ..
+                },
+                HistoryItem {
+                    payload: HistoryItemPayload::ToolCall { call_id: second, response_id: second_response, .. },
+                    ..
+                }
+            ] if *stored == response_id
+                && *first == first_call_id
+                && *second == second_call_id
+                && *first_response == response_id
+                && *second_response == response_id
+        ));
+        let sidecar_count = store
+            .session_repo()
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .query_row("SELECT COUNT(*) FROM tool_calls", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("sidecar count");
+        assert_eq!(sidecar_count, 2);
+    }
+
+    #[tokio::test]
+    async fn rollback_is_one_transaction_and_removes_allocator_state() {
+        let (store, session_id) = test_repo().await;
+        let protocol = store.protocol_event_store();
+        let plan_turn = TurnId::new();
+        protocol
+            .set_collaboration_mode(session_id, plan_turn, ModeKind::Plan)
+            .expect("store plan mode")
+            .expect("plan instruction");
+        let default_turn = TurnId::new();
+        protocol
+            .set_collaboration_mode(session_id, default_turn, ModeKind::Default)
+            .expect("store default mode")
+            .expect("default instruction");
+
+        store
+            .session_repo()
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute_batch(
+                "CREATE TRIGGER abort_session_rollback
+                 BEFORE UPDATE OF status ON sessions
+                 BEGIN SELECT RAISE(ABORT, 'injected rollback reset failure'); END;",
+            )
+            .expect("rollback failure trigger");
+        assert!(
+            store
+                .session_repo()
+                .rollback_session_transaction(session_id, 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            protocol
+                .list_history_items_for_session(session_id)
+                .expect("history after failed rollback")
+                .len(),
+            2,
+            "a reset failure must roll protocol deletion back"
+        );
+        store
+            .session_repo()
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute_batch("DROP TRIGGER abort_session_rollback;")
+            .expect("drop rollback failure trigger");
+
+        let result = store
+            .session_repo()
+            .rollback_session_transaction(session_id, 1)
+            .await
+            .expect("rollback latest turn");
+        assert_eq!(result.dropped_turn_ids, vec![default_turn]);
+        assert_eq!(result.remaining_history_items, 1);
+        assert_eq!(result.session.status, SessionStatus::Idle);
+        assert_eq!(
+            protocol
+                .collaboration_mode_for_session(session_id)
+                .expect("mode after rollback"),
+            ModeKind::Plan
+        );
+        let repository = store.session_repo();
+        let connection = repository.connection.lock().expect("sqlite mutex");
+        for table in [
+            "protocol_runtime_events",
+            "protocol_history_items",
+            "protocol_turn_items",
+            "protocol_item_append_order",
+            "protocol_turn_sequence_allocators",
+        ] {
+            let sql =
+                format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1 AND turn_id = ?2");
+            let count = connection
+                .query_row(
+                    &sql,
+                    params![session_id.to_string(), default_turn.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("rolled-back table count");
+            assert_eq!(count, 0, "{table} retained rolled-back turn state");
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_rejects_an_active_admission_anywhere_in_the_root_tree() {
+        let (store, root_session_id) = test_repo().await;
+        let root = store
+            .session_repo()
+            .get_session(root_session_id)
+            .await
+            .expect("root session");
+        let child = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: root.project_id,
+                title: "child".to_string(),
+                cwd: root.cwd.clone(),
+                model: root.model.clone(),
+                base_url: root.base_url.clone(),
+                access_mode: root.access_mode,
+            })
+            .await
+            .expect("child session");
+        store
+            .session_repo()
+            .insert_session_spawn_edge(
+                root_session_id,
+                root_session_id,
+                child.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("spawn edge");
+        let root_turn = TurnId::new();
+        store
+            .protocol_event_store()
+            .set_collaboration_mode(root_session_id, root_turn, ModeKind::Plan)
+            .expect("root history")
+            .expect("root mode item");
+        store
+            .session_repo()
+            .admit_session_turn(child.id, TurnId::new())
+            .await
+            .expect("child admission")
+            .expect("child admitted");
+
+        let error = store
+            .session_repo()
+            .rollback_session_transaction(root_session_id, 1)
+            .await
+            .expect_err("active child must block root rollback");
+        assert!(error.to_string().contains(&child.id.to_string()));
+        assert_eq!(
+            store
+                .protocol_event_store()
+                .list_history_items_for_session(root_session_id)
+                .expect("retained root history")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn active_fork_settles_unfinished_calls_before_its_interrupted_terminal() {
+        let (store, source_session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, source_session_id).await;
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                source_session_id,
+                &admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id,
+                    assistant_text: Some("I will inspect the file.".to_string()),
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: call_id,
+                        model_call_id: "provider-call".to_string(),
+                        tool_name: "read".to_string(),
+                        arguments_json: serde_json::json!({"path": "README.md"}).to_string(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .expect("pending response");
+
+        let fork = store
+            .session_repo()
+            .fork_session_snapshot(source_session_id, Some("snapshot".to_string()))
+            .await
+            .expect("active snapshot fork");
+        assert!(fork.interrupted_live_snapshot);
+        let forked_history = store
+            .protocol_event_store()
+            .list_history_items(fork.forked_session.id, turn_id)
+            .expect("forked history");
+        assert!(forked_history.iter().any(|item| matches!(
+            item.payload,
+            HistoryItemPayload::ToolOutput {
+                call_id: stored_call_id,
+                status: ToolLifecycleStatus::Cancelled,
+                ..
+            } if stored_call_id == call_id
+        )));
+        let terminal = store
+            .session_repo()
+            .durable_terminal_for_turn(fork.forked_session.id, turn_id)
+            .await
+            .expect("fork terminal read")
+            .expect("fork terminal");
+        assert_eq!(
+            terminal.status,
+            crate::protocol::TurnTerminalStatus::Interrupted
+        );
+        assert_eq!(terminal.final_response_id, Some(response_id));
+        assert_eq!(terminal.tool_call_count, 1);
+        assert_eq!(terminal.failed_tool_count, 0);
+        assert_eq!(terminal.change_count, 0);
+        let forked_turn_items = store
+            .protocol_event_store()
+            .list_turn_items(fork.forked_session.id, turn_id)
+            .expect("forked turn items");
+        let cancelled_position = forked_turn_items
+            .iter()
+            .position(|item| {
+                matches!(
+                    item.payload,
+                    TurnItemPayload::ToolStatus {
+                        call_id: stored_call_id,
+                        status: ToolLifecycleStatus::Cancelled,
+                        ..
+                    } if stored_call_id == call_id
+                )
+            })
+            .expect("cancelled projection");
+        let terminal_position = forked_turn_items
+            .iter()
+            .position(|item| matches!(item.payload, TurnItemPayload::Terminal { .. }))
+            .expect("terminal projection");
+        assert!(cancelled_position < terminal_position);
+    }
+
+    #[tokio::test]
+    async fn expired_admission_recovery_derives_terminal_after_user_turn_crash() {
+        let (store, session_id) = test_repo().await;
+        let (_, turn_id) = active_turn(&store, session_id).await;
+        expire_and_recover_run(&store, session_id).await;
+
+        let terminal = store
+            .session_repo()
+            .durable_terminal_for_turn(session_id, turn_id)
+            .await
+            .expect("terminal read")
+            .expect("recovery terminal");
+        assert_eq!(terminal.final_response_id, None);
+        assert_eq!(terminal.tool_call_count, 0);
+        assert_eq!(terminal.failed_tool_count, 0);
+        assert_eq!(terminal.change_count, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_admission_recovery_derives_response_and_failed_pending_call() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                &admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id,
+                    assistant_text: Some("Calling the tool.".to_string()),
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: call_id,
+                        model_call_id: "provider-call".to_string(),
+                        tool_name: "read".to_string(),
+                        arguments_json: serde_json::json!({"path": "README.md"}).to_string(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .expect("model response");
+        expire_and_recover_run(&store, session_id).await;
+
+        let terminal = store
+            .session_repo()
+            .durable_terminal_for_turn(session_id, turn_id)
+            .await
+            .expect("terminal read")
+            .expect("recovery terminal");
+        assert_eq!(terminal.final_response_id, Some(response_id));
+        assert_eq!(terminal.tool_call_count, 1);
+        assert_eq!(terminal.failed_tool_count, 1);
+        assert_eq!(terminal.change_count, 0);
+        assert!(
+            store
+                .protocol_event_store()
+                .list_history_items(session_id, turn_id)
+                .expect("recovered history")
+                .iter()
+                .any(|item| matches!(
+                    item.payload,
+                    HistoryItemPayload::ToolOutput {
+                        call_id: stored_call_id,
+                        status: ToolLifecycleStatus::Failed,
+                        ..
+                    } if stored_call_id == call_id
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_admission_recovery_derives_completed_tool_and_change_counts() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                &admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id,
+                    assistant_text: None,
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: call_id,
+                        model_call_id: "provider-call".to_string(),
+                        tool_name: "apply_patch".to_string(),
+                        arguments_json: serde_json::json!({"patch": "test"}).to_string(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .expect("model response");
+        let durable_changes = vec![
+            crate::edit::FileChange {
+                id: ChangeId::new(),
+                tool_call_id: call_id,
+                kind: ChangeKind::Update,
+                path_before: Some("a.txt".into()),
+                path_after: Some("a.txt".into()),
+                before_sha256: Some("before-a".to_string()),
+                after_sha256: Some("after-a".to_string()),
+                diff_text: "a changed".to_string(),
+                summary: "updated a.txt".to_string(),
+                created_at_ms: 1,
+            },
+            crate::edit::FileChange {
+                id: ChangeId::new(),
+                tool_call_id: call_id,
+                kind: ChangeKind::Add,
+                path_before: None,
+                path_after: Some("b.txt".into()),
+                before_sha256: None,
+                after_sha256: Some("after-b".to_string()),
+                diff_text: "b added".to_string(),
+                summary: "added b.txt".to_string(),
+                created_at_ms: 1,
+            },
+        ];
+        store
+            .change_repo()
+            .insert_changes(&durable_changes)
+            .await
+            .expect("durable file-change evidence");
+        let changes = durable_changes
+            .iter()
+            .map(|change| crate::edit::ChangeSummary {
+                change_id: change.id,
+                kind: change.kind,
+                path_before: change.path_before.clone(),
+                path_after: change.path_after.clone(),
+            })
+            .collect();
+        store
+            .session_repo()
+            .complete_tool_call_with_file_changes_protocol_bundle(
+                session_id,
+                &admission_id,
+                call_id,
+                crate::tool::ToolName::ApplyPatch,
+                "apply_patch",
+                serde_json::json!({"success": true}),
+                "updated files",
+                None,
+                changes,
+                turn_id,
+                None,
+                None,
+            )
+            .await
+            .expect("tool settlement")
+            .expect("tool settled with canonical changes");
+        expire_and_recover_run(&store, session_id).await;
+
+        let terminal = store
+            .session_repo()
+            .durable_terminal_for_turn(session_id, turn_id)
+            .await
+            .expect("terminal read")
+            .expect("recovery terminal");
+        assert_eq!(terminal.final_response_id, Some(response_id));
+        assert_eq!(terminal.tool_call_count, 1);
+        assert_eq!(terminal.failed_tool_count, 0);
+        assert_eq!(terminal.change_count, 2);
+    }
+
+    #[tokio::test]
+    async fn terminal_cas_observes_committed_agent_mail_and_active_append_loses_to_terminal() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
+                session_id,
+                InterAgentCommunication {
+                    author: "/root/worker".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "new evidence".to_string(),
+                    trigger_turn: false,
+                },
+                true,
+            )
+            .expect("active mail append");
+        let terminal = completed_terminal(session_id, "done");
+        assert_eq!(
+            store
+                .session_repo()
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    &admission_id,
+                    &terminal,
+                    turn_id,
+                    None,
+                    Some(0),
+                    Some(0),
+                    None,
+                )
+                .await
+                .expect("terminal CAS"),
+            AdmittedTerminalCommit::UnseenAgentCommunication {
+                expected: 0,
+                actual: 1,
+            }
+        );
+        assert_eq!(
+            store
+                .session_repo()
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    &admission_id,
+                    &terminal,
+                    turn_id,
+                    None,
+                    Some(0),
+                    Some(1),
+                    None,
+                )
+                .await
+                .expect("terminal retry"),
+            AdmittedTerminalCommit::Applied
+        );
+        let append_after_terminal = store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
+                session_id,
+                InterAgentCommunication {
+                    author: "/root/worker".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "too late".to_string(),
+                    trigger_turn: false,
+                },
+                true,
+            );
+        assert!(append_after_terminal.is_err());
+        assert_eq!(
+            store
+                .protocol_event_store()
+                .list_history_items_for_session(session_id)
+                .expect("history")
+                .iter()
+                .filter(|item| matches!(
+                    item.payload,
+                    HistoryItemPayload::InterAgentCommunication { .. }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn communication_for_an_inactive_recipient_starts_a_new_turn() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, completed_turn_id) = active_turn(&store, session_id).await;
+        assert_eq!(
+            store
+                .session_repo()
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    &admission_id,
+                    &completed_terminal(session_id, "done"),
+                    completed_turn_id,
+                    None,
+                    Some(0),
+                    Some(0),
+                    None,
+                )
+                .await
+                .expect("terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+
+        let communication_id = store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
+                session_id,
+                InterAgentCommunication {
+                    author: "/root/worker".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "evidence for a future continuation".to_string(),
+                    trigger_turn: false,
+                },
+                false,
+            )
+            .expect("inactive recipient communication");
+        let communication = store
+            .protocol_event_store()
+            .list_history_items_for_session(session_id)
+            .expect("history")
+            .into_iter()
+            .find(|item| item.id == communication_id)
+            .expect("communication item");
+
+        assert_ne!(communication.turn_id, completed_turn_id);
+        assert!(matches!(
+            communication.payload,
+            HistoryItemPayload::InterAgentCommunication { .. }
+        ));
+        assert!(
+            store
+                .session_repo()
+                .durable_terminal_for_turn(session_id, completed_turn_id)
+                .await
+                .expect("terminal read")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_of_a_mail_only_future_turn_preserves_completed_turn_and_older_mail() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, completed_turn_id) = active_turn(&store, session_id).await;
+        assert_eq!(
+            store
+                .session_repo()
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    &admission_id,
+                    &completed_terminal(session_id, "done"),
+                    completed_turn_id,
+                    None,
+                    Some(0),
+                    Some(0),
+                    None,
+                )
+                .await
+                .expect("terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+        let first_mail_id = store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
+                session_id,
+                InterAgentCommunication {
+                    author: "/root/worker-a".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "first future evidence".to_string(),
+                    trigger_turn: false,
+                },
+                false,
+            )
+            .expect("first inactive mail");
+        let second_mail_id = store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
+                session_id,
+                InterAgentCommunication {
+                    author: "/root/worker-b".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "second future evidence".to_string(),
+                    trigger_turn: false,
+                },
+                false,
+            )
+            .expect("second inactive mail");
+        let before = store
+            .protocol_event_store()
+            .list_history_items_for_session(session_id)
+            .expect("history before rollback");
+        let second_mail_turn = before
+            .iter()
+            .find(|item| item.id == second_mail_id)
+            .expect("second mail")
+            .turn_id;
+
+        let rolled_back = store
+            .session_repo()
+            .rollback_session_transaction(session_id, 1)
+            .await
+            .expect("rollback latest mail-only turn");
+        let after = store
+            .protocol_event_store()
+            .list_history_items_for_session(session_id)
+            .expect("history after rollback");
+
+        assert_eq!(rolled_back.dropped_turn_ids, vec![second_mail_turn]);
+        assert!(after.iter().any(|item| item.id == first_mail_id));
+        assert!(!after.iter().any(|item| item.id == second_mail_id));
+        assert!(
+            store
+                .session_repo()
+                .durable_terminal_for_turn(session_id, completed_turn_id)
+                .await
+                .expect("completed terminal read")
+                .is_some(),
+            "rolling back future mail must not rewrite the completed turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_terminal_is_first_writer_and_is_rehydrated_as_one_typed_value() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let repo = store.session_repo();
+        let event = completed_terminal(session_id, "done");
+        assert_eq!(
+            repo.terminalize_admitted_turn_with_protocol_event(
+                session_id,
+                &admission_id,
+                &event,
+                turn_id,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("terminalize"),
+            AdmittedTerminalCommit::Applied
+        );
+        let durable = repo
+            .durable_terminal_for_turn(session_id, turn_id)
+            .await
+            .expect("read terminal")
+            .expect("terminal");
+        assert_eq!(
+            durable.status,
+            crate::protocol::TurnTerminalStatus::Completed
+        );
+        assert_eq!(durable.summary, "done");
+        assert_eq!(
+            store
+                .protocol_event_store()
+                .list_runtime_events(session_id, turn_id)
+                .expect("events")
+                .iter()
+                .filter(|event| matches!(event.msg, RuntimeEventMsg::TurnTerminal { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            repo.terminalize_admitted_turn_with_protocol_event(
+                session_id,
+                &admission_id,
+                &completed_terminal(session_id, "replacement"),
+                turn_id,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("second terminal attempt"),
+            AdmittedTerminalCommit::NotOwned
+        );
+        assert_eq!(
+            repo.durable_terminal_for_turn(session_id, turn_id)
+                .await
+                .expect("read terminal")
+                .expect("terminal")
+                .summary,
+            "done"
+        );
+    }
+
+    #[test]
+    fn terminal_writer_rejects_non_terminal_events_and_contradictory_payloads() {
+        let session_id = SessionId::new();
+        let non_terminal = RunEvent::SessionStarted {
+            session_id,
+            title: "test".to_string(),
+        };
+        assert!(validate_terminal_event(session_id, &non_terminal).is_err());
+        let contradictory = RunEvent::TurnTerminal {
+            session_id,
+            terminal: Box::new(crate::session::model::DurableTurnTerminal {
+                status: crate::protocol::TurnTerminalStatus::Interrupted,
+                finish_reason: Some(FinishReason::Stop),
+                interruption_cause: None,
+                final_response_id: None,
+                summary: "invalid".to_string(),
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
+        };
+        assert!(validate_terminal_event(session_id, &contradictory).is_err());
+    }
 }

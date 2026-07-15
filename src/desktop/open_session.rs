@@ -1,11 +1,8 @@
-use crate::protocol::TurnItem;
-use crate::session::{SessionRecord, SessionStateSnapshot, TodoItem, Transcript};
+use crate::session::{CanonicalSessionRead, SessionRecord};
 use crate::tui::state::{AppState, RunStatus};
 
 use super::models::{DesktopSessionDetail, DesktopTranscriptRowKind};
-use super::query::{
-    build_session_detail_from_app_state_with_session, build_session_detail_with_page,
-};
+use super::query::{build_session_detail, build_session_detail_from_app_state_with_session};
 
 #[derive(Debug, Clone)]
 pub struct OpenSessionView {
@@ -14,31 +11,10 @@ pub struct OpenSessionView {
 }
 
 impl OpenSessionView {
-    pub fn from_loaded(
-        session: &SessionRecord,
-        transcript: &Transcript,
-        turn_items: &[TurnItem],
-        state: SessionStateSnapshot,
-        todos: Vec<TodoItem>,
-        turn_page_offset: usize,
-        turn_page_limit: usize,
-        turn_page_total: usize,
-        turn_page_has_more: bool,
-    ) -> Self {
-        let stored_detail = build_session_detail_with_page(
-            session,
-            state,
-            todos,
-            transcript.clone(),
-            turn_items.to_vec(),
-            turn_page_offset,
-            turn_page_limit,
-            turn_page_total,
-            turn_page_has_more,
-            None,
-        );
+    pub fn from_loaded(read: &CanonicalSessionRead) -> Self {
+        let stored_detail = build_session_detail(read, None);
         Self {
-            session: session.clone(),
+            session: read.session.clone(),
             stored_detail,
         }
     }

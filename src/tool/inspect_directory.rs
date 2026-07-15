@@ -47,6 +47,7 @@ impl Tool for InspectDirectoryTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::InspectDirectory,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "Inspect a directory tree without reading file contents. Returns a tree preview, extension distribution, and large-file candidates.",
             input_schema: json!({
                 "type": "object",

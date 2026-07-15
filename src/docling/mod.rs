@@ -85,36 +85,6 @@ impl DoclingClient {
         }
     }
 
-    pub async fn probe_readiness(&self) -> Result<(), ToolError> {
-        if !self.config.enabled {
-            return Err(ToolError::Message(
-                "docling is disabled by config".to_string(),
-            ));
-        }
-        let base_url = normalize_docling_base_url(&self.config.base_url);
-        if base_url.is_empty() {
-            return Err(ToolError::Message("docling base_url is empty".to_string()));
-        }
-        for suffix in ["/health", "/ready"] {
-            let endpoint = endpoint(&base_url, suffix);
-            let response = self
-                .request_builder(&endpoint, reqwest::Method::GET)?
-                .send()
-                .await
-                .map_err(|error| ToolError::Message(format!("docling probe failed: {error}")))?;
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            if !status.is_success() {
-                return Err(ToolError::Message(format!(
-                    "docling probe `{endpoint}` failed with HTTP {}: {}",
-                    status.as_u16(),
-                    compact_body(&body)
-                )));
-            }
-        }
-        Ok(())
-    }
-
     async fn convert_file(
         &self,
         path: &Utf8Path,
@@ -236,10 +206,6 @@ impl DoclingClient {
 
 pub fn normalize_docling_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
-}
-
-pub async fn probe_docling_readiness(config: DoclingConfig) -> Result<(), ToolError> {
-    DoclingClient::new(config).probe_readiness().await
 }
 
 fn append_convert_form_fields(mut form: Form, request: &DoclingConvertRequest) -> Form {

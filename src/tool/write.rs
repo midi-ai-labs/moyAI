@@ -34,6 +34,7 @@ impl Tool for WriteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::Write,
+            effect: crate::tool::ToolEffectPolicy::mutation(),
             description: "Create a new text file or replace the full contents of one existing text file. Prefer this for new files or clean whole-file rewrites. For existing files, read once before the first overwrite in this session. After a successful write, the written contents become the current edit baseline for later write/apply_patch calls unless another tool changes the file.",
             input_schema: json!({
                 "type": "object",
@@ -263,7 +264,7 @@ async fn commit_write_change(
     match services
         .store
         .change_repo()
-        .insert_changes(session_id, &[change.clone()])
+        .insert_changes(&[change.clone()])
         .await
     {
         Ok(change_ids) => {
@@ -355,15 +356,7 @@ fn no_content_write_result(path: String) -> ToolResult {
         metadata: json!({
             "no_content_change": true,
             "path": path,
-            "success": false,
-            "progress_effect": "no_progress",
-            "tool_feedback_envelope": {
-                "success": false,
-                "progress_effect": "no_progress",
-                "tool": "write",
-                "target": path,
-                "side_effects_applied": false,
-            },
+            "success": false
         }),
         truncated_output_path: None,
         recorded_changes: Vec::new(),

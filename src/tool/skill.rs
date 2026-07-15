@@ -20,6 +20,7 @@ impl Tool for SkillTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::Skill,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "Load a local SKILL.md by name when the current task matches an available workspace skill.",
             input_schema: json!({
                 "type": "object",

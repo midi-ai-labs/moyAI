@@ -241,6 +241,7 @@ function requiresRenderForStateChange(previous: DesktopWebState, state: DesktopW
     previous.run_phase !== state.run_phase ||
     previous.run_active_step !== state.run_active_step ||
     previous.latest_tool_summary !== state.latest_tool_summary ||
+    JSON.stringify(previous.plan) !== JSON.stringify(state.plan) ||
     previous.progress_text !== state.progress_text ||
     previous.tool_status_text !== state.tool_status_text ||
     previous.token_meter_label !== state.token_meter_label ||
@@ -356,9 +357,9 @@ function applyStateUpdate(update: StateUpdate): void {
 
 function renderCommitted(state: DesktopWebState, mutationName: string | null): void {
   const elapsedSplashMs = performance.now() - splashStartedAt;
-  if (!splashDismissed && shouldShowSplash(state, elapsedSplashMs)) {
+  if (!splashDismissed && shouldShowSplash(elapsedSplashMs)) {
     appRoot.innerHTML = renderStartupSplash(state, elapsedSplashMs, SPLASH_MIN_VISIBLE_MS);
-    scheduleSplashReveal(state, elapsedSplashMs);
+    scheduleSplashReveal(elapsedSplashMs);
     lastRenderedState = state;
     return;
   }
@@ -508,12 +509,12 @@ function focusSelectedAgentAfterRender(): void {
   });
 }
 
-function shouldShowSplash(state: DesktopWebState, elapsedMs: number): boolean {
-  return state.startup.status === "loading" || elapsedMs < SPLASH_MIN_VISIBLE_MS;
+function shouldShowSplash(elapsedMs: number): boolean {
+  return elapsedMs < SPLASH_MIN_VISIBLE_MS;
 }
 
-function scheduleSplashReveal(state: DesktopWebState, elapsedMs: number): void {
-  if (state.startup.status === "loading" || elapsedMs >= SPLASH_MIN_VISIBLE_MS || splashTimer !== null) {
+function scheduleSplashReveal(elapsedMs: number): void {
+  if (elapsedMs >= SPLASH_MIN_VISIBLE_MS || splashTimer !== null) {
     return;
   }
   splashTimer = window.setTimeout(() => {
@@ -947,7 +948,7 @@ function localConfirmationStillTargetsRow(
 }
 
 function isTerminalRunStatus(status: DesktopWebState["run_status_key"]): boolean {
-  return status === "completed" || status === "awaiting_user" || status === "cancelled" || status === "failed";
+  return status === "completed" || status === "cancelled" || status === "failed";
 }
 
 function isThreadNearEnd(thread: HTMLElement): boolean {

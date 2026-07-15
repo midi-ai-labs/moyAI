@@ -21,12 +21,10 @@ use crate::config::loader::global_config_path;
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::{PartialModelConfig, PartialResolvedConfig, full_effective_override};
 use crate::config::{ConfigLoader, ProviderMetadataMode, ResolvedConfig, ShellFamily};
-use crate::docling::{normalize_docling_base_url, probe_docling_readiness};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 use crate::llm::{
-    ModelAvailabilityReport, ProviderModelInfo, apply_provider_model_info_to_config,
-    check_model_availability, extra_body_with_num_ctx, fetch_provider_model_infos,
-    normalize_provider_base_url,
+    ProviderModelInfo, apply_provider_model_info_to_config, extra_body_with_num_ctx,
+    fetch_provider_model_infos, normalize_provider_base_url,
 };
 use crate::protocol::{ToolApprovalDecision, TurnInterruptionCause};
 use crate::runtime::{
@@ -39,8 +37,7 @@ use crate::session::markdown::{
 };
 use crate::session::{
     EditorContext, LoadedSessionStatus, ProjectId, ProjectRecord, RunEvent, RunSummary, SessionId,
-    SessionMemoryMode, SessionRecord, SessionStatus, TodoItem, history_items_to_markdown,
-    history_markdown_file_name,
+    SessionRecord, SessionStatus, canonical_session_read_to_markdown, history_markdown_file_name,
 };
 use crate::tool::PermissionRequest;
 use crate::tui::config_editor::{ConfigEditorState, ConfigField};
@@ -53,7 +50,7 @@ use super::async_ops::{
     DesktopAsyncOperationId, LatestRequestId, LatestRequestTracker, SessionSearchRequestId,
     SessionSearchRequestTracker,
 };
-use super::models::{DesktopSnapshot, DesktopTranscriptRow};
+use super::models::{DesktopSnapshot, DesktopTranscriptRow, DesktopTranscriptRowKind};
 use super::navigation::NavigationRequestId;
 use super::preferences::DesktopPreferences;
 use super::query::{
@@ -150,25 +147,10 @@ enum RuntimeMessage {
         target: ProjectDeleteRequestTarget,
         result: Result<WorkspaceLoadResult, String>,
     },
-    CurrentTodosLoaded {
-        request_id: LatestRequestId,
-        target: SessionRefreshRequestTarget,
-        result: Result<Vec<TodoItem>, String>,
-    },
     ModelCatalogLoaded {
         request_id: LatestRequestId,
         target: ProviderCatalogRequestTarget,
         result: Result<Vec<ProviderModelInfo>, String>,
-    },
-    StartupProviderChecked {
-        request_id: LatestRequestId,
-        target: ProviderReadinessRequestTarget,
-        report: ModelAvailabilityReport,
-    },
-    StartupDoclingChecked {
-        request_id: LatestRequestId,
-        target: DoclingRequestTarget,
-        result: Result<(), String>,
     },
     HistoryExported {
         request_id: LatestRequestId,
@@ -383,25 +365,6 @@ struct ProviderCatalogRequestTarget {
     selected_model_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProviderReadinessRequestTarget {
-    base_url: String,
-    model_id: String,
-    metadata_mode: ProviderMetadataMode,
-    supports_tools: bool,
-    supports_reasoning: bool,
-    supports_images: bool,
-    parallel_tool_calls: bool,
-    max_parallel_predictions: u32,
-    config_generation: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DoclingRequestTarget {
-    base_url: String,
-    config_generation: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeMessageAsyncContract {
     RunStream,
@@ -465,14 +428,7 @@ impl RuntimeMessage {
             RuntimeMessage::ProjectDeleted { .. } => {
                 RuntimeMessageAsyncContract::BackgroundOperation
             }
-            RuntimeMessage::CurrentTodosLoaded { .. } => {
-                RuntimeMessageAsyncContract::BackgroundOperation
-            }
-            RuntimeMessage::ModelCatalogLoaded { .. }
-            | RuntimeMessage::StartupProviderChecked { .. } => {
-                RuntimeMessageAsyncContract::ProviderOperation
-            }
-            RuntimeMessage::StartupDoclingChecked { .. } => {
+            RuntimeMessage::ModelCatalogLoaded { .. } => {
                 RuntimeMessageAsyncContract::ProviderOperation
             }
             RuntimeMessage::HistoryExported { .. } => {
@@ -505,9 +461,6 @@ fn stop_settlement_status_message(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Completed => "root run completed; any remaining agent work was stopped",
         SessionStatus::Failed => "root run failed; any remaining agent work was stopped",
-        SessionStatus::AwaitingUser => {
-            "root run is awaiting user; any remaining agent work was stopped"
-        }
         SessionStatus::Idle | SessionStatus::Running | SessionStatus::Cancelled => {
             "stopped the active agent tree"
         }
@@ -515,15 +468,7 @@ fn stop_settlement_status_message(status: SessionStatus) -> &'static str {
 }
 
 struct LoadedSession {
-    session: crate::session::SessionRecord,
-    transcript: crate::session::Transcript,
-    turn_items: Vec<crate::protocol::TurnItem>,
-    state: crate::session::SessionStateSnapshot,
-    todos: Vec<TodoItem>,
-    turn_page_offset: usize,
-    turn_page_limit: usize,
-    turn_page_total: usize,
-    turn_page_has_more: bool,
+    read: crate::session::CanonicalSessionRead,
     agent_activity_records: Option<Vec<AgentActivityRecord>>,
 }
 
@@ -662,7 +607,7 @@ fn finish_steer_submission(
 ) -> bool {
     match result {
         Ok(()) => {
-            state.push_local_prompt_dispatch(prompt_dispatch);
+            state.apply_durable_prompt_dispatch(prompt_dispatch);
             state
                 .composer
                 .image_attachment_paths
@@ -950,6 +895,100 @@ fn finish_navigation_failure(
 #[cfg(test)]
 mod command_projection_owner_tests {
     use super::*;
+
+    async fn build_test_app(root: &Utf8Path, store: crate::storage::StoreBundle) -> App {
+        build_test_app_with_config(root, store, ResolvedConfig::default()).await
+    }
+
+    async fn build_test_app_with_config(
+        root: &Utf8Path,
+        store: crate::storage::StoreBundle,
+        config: ResolvedConfig,
+    ) -> App {
+        AppBootstrap::rebuild_for_directory_as_workspace_root_with_config(root, store, config)
+            .await
+            .expect("app")
+    }
+
+    #[tokio::test]
+    async fn desktop_cold_start_sends_no_provider_or_docling_requests() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking probe listener");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let request_count = request_count.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            request_count.fetch_add(1, Ordering::SeqCst);
+                            let _ =
+                                stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+                            let mut request = [0_u8; 4096];
+                            let _ = stream.read(&mut request);
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = endpoint.clone();
+        config.model.model = "cold-start-model".to_string();
+        config.docling.enabled = true;
+        config.docling.base_url = endpoint;
+        let app = build_test_app_with_config(&root, store, config).await;
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+
+        let _controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        stop.store(true, Ordering::SeqCst);
+        server.join().expect("probe server");
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn terminal_event_moves_root_run_to_finalizing_without_admitting_steer() {
@@ -1382,9 +1421,7 @@ mod command_projection_owner_tests {
         let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
         sqlite.migrate().expect("migrate");
         let store = crate::storage::StoreBundle::new(sqlite);
-        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
-            .await
-            .expect("app");
+        let app = build_test_app(&root, store).await;
         let initial_access_mode = crate::config::AccessMode::Default;
         let args = DesktopArgs {
             directory: Some(root.clone()),
@@ -1514,9 +1551,7 @@ mod command_projection_owner_tests {
         let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
         sqlite.migrate().expect("migrate");
         let store = crate::storage::StoreBundle::new(sqlite);
-        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
-            .await
-            .expect("app");
+        let app = build_test_app(&root, store).await;
         let initial_access_mode = crate::config::AccessMode::Default;
         let args = DesktopArgs {
             directory: Some(root.clone()),
@@ -1550,7 +1585,7 @@ mod command_projection_owner_tests {
             .app
             .store
             .session_repo()
-            .admit_session_run(session.id)
+            .admit_session_turn(session.id, crate::protocol::TurnId::new())
             .await
             .expect("active root admission")
             .expect("active root admitted");
@@ -1681,9 +1716,7 @@ mod command_projection_owner_tests {
         let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
         sqlite.migrate().expect("migrate");
         let store = crate::storage::StoreBundle::new(sqlite);
-        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
-            .await
-            .expect("app");
+        let app = build_test_app(&root, store).await;
         let initial_access_mode = crate::config::AccessMode::Default;
         let args = DesktopArgs {
             directory: Some(root.clone()),
@@ -1717,7 +1750,7 @@ mod command_projection_owner_tests {
             .app
             .store
             .session_repo()
-            .admit_session_run(session.id)
+            .admit_session_turn(session.id, crate::protocol::TurnId::new())
             .await
             .expect("late active root admission")
             .expect("late active root admitted");
@@ -1829,9 +1862,7 @@ mod command_projection_owner_tests {
         let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
         sqlite.migrate().expect("migrate");
         let store = crate::storage::StoreBundle::new(sqlite);
-        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
-            .await
-            .expect("app");
+        let app = build_test_app(&root, store).await;
         let args = DesktopArgs {
             directory: Some(root.clone()),
             session_id: None,
@@ -1870,10 +1901,7 @@ mod command_projection_owner_tests {
             updated_at_ms: 2,
             completed_at_ms: matches!(
                 status,
-                SessionStatus::Completed
-                    | SessionStatus::AwaitingUser
-                    | SessionStatus::Cancelled
-                    | SessionStatus::Failed
+                SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
             )
             .then_some(2),
         };
@@ -1893,18 +1921,27 @@ mod command_projection_owner_tests {
             .into_iter()
             .collect::<Vec<_>>();
         LoadedSession {
-            transcript: crate::session::Transcript {
+            read: crate::session::CanonicalSessionRead {
                 session: session.clone(),
-                messages: Vec::new(),
+                history: crate::session::CanonicalHistoryPage {
+                    session: session.clone(),
+                    offset: 0,
+                    limit: usize::MAX,
+                    total: 0,
+                    has_more: false,
+                    items: Vec::new(),
+                },
+                turns: crate::session::CanonicalTurnPage {
+                    session,
+                    offset: 0,
+                    limit: DESKTOP_TURN_PAGE_LIMIT,
+                    total: turn_items.len(),
+                    has_more: false,
+                    items: turn_items,
+                },
+                active_turn_id: None,
+                active_turn_sequence_no: None,
             },
-            session,
-            turn_page_total: turn_items.len(),
-            turn_items,
-            state: crate::session::SessionStateSnapshot::default(),
-            todos: Vec::new(),
-            turn_page_offset: 0,
-            turn_page_limit: DESKTOP_TURN_PAGE_LIMIT,
-            turn_page_has_more: false,
             agent_activity_records: None,
         }
     }
@@ -2334,7 +2371,6 @@ mod command_projection_owner_tests {
 
     #[tokio::test]
     async fn durable_only_agent_tree_stop_dispatches_session_owner_and_preserves_root_result() {
-        use crate::protocol::ProtocolEventStore as _;
         use crate::session::{NewSession, SessionRepository as _};
 
         let (_temp, workspace_root, mut controller) = empty_access_test_controller().await;
@@ -2365,34 +2401,28 @@ mod command_projection_owner_tests {
             )
             .await
             .expect("spawn edge");
-        let root_admission = repository
-            .admit_session_run(root.id)
+        let root_turn = crate::protocol::TurnId::new();
+        repository
+            .admit_session_turn(root.id, root_turn)
             .await
             .expect("root admission")
             .expect("root admitted");
-        let root_turn = crate::protocol::TurnId::new();
-        assert!(
-            repository
-                .activate_admitted_turn(root.id, &root_admission, root_turn)
-                .await
-                .expect("activate root")
-        );
         controller
             .app
             .store
             .protocol_event_store()
-            .append_history_item(&crate::protocol::HistoryItem {
+            .seed_history_item_for_test(&crate::protocol::HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id: root.id,
                 turn_id: root_turn,
                 sequence_no: 1,
                 created_at_ms: 1,
-                payload: crate::protocol::HistoryItemPayload::Message {
-                    message_id: None,
-                    role: crate::session::MessageRole::User,
+                payload: crate::protocol::HistoryItemPayload::UserTurn {
                     content: vec![crate::protocol::ContentPart::Text {
                         text: "run detached work".to_string(),
                     }],
+                    prompt_dispatch: None,
+                    editor_context: None,
                 },
             })
             .expect("root history");
@@ -2400,10 +2430,19 @@ mod command_projection_owner_tests {
             repository
                 .terminalize_active_session_with_protocol_event(
                     root.id,
-                    SessionStatus::Completed,
-                    &RunEvent::SessionCompleted {
+                    &RunEvent::TurnTerminal {
                         session_id: root.id,
-                        finish_reason: None,
+                        terminal: Box::new(crate::session::DurableTurnTerminal {
+                            status: crate::protocol::TurnTerminalStatus::Completed,
+                            finish_reason: None,
+                            interruption_cause: None,
+                            final_response_id: None,
+                            summary: "run completed".to_string(),
+                            tool_call_count: 0,
+                            failed_tool_count: 0,
+                            change_count: 0,
+                            metrics: Default::default(),
+                        }),
                     },
                     root_turn,
                     None,
@@ -2411,18 +2450,11 @@ mod command_projection_owner_tests {
                 .await
                 .expect("complete root")
         );
-        let child_admission = repository
-            .admit_session_run(child.id)
+        repository
+            .admit_session_turn(child.id, crate::protocol::TurnId::new())
             .await
             .expect("child admission")
             .expect("child admitted");
-        let child_turn = crate::protocol::TurnId::new();
-        assert!(
-            repository
-                .activate_admitted_turn(child.id, &child_admission, child_turn)
-                .await
-                .expect("activate child")
-        );
         controller.state.app_state.current_session_id = Some(root.id);
         controller.loaded_agent_activity_records = Some((
             root.id,
@@ -2707,7 +2739,6 @@ mod command_projection_owner_tests {
 
     #[tokio::test]
     async fn desktop_reopen_uses_durable_session_access_for_run_config_and_new_chat_uses_global() {
-        use crate::protocol::ProtocolEventStore as _;
         use crate::session::{NewSession, SessionRepository as _};
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2722,9 +2753,7 @@ mod command_projection_owner_tests {
         let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
         sqlite.migrate().expect("migrate");
         let store = crate::storage::StoreBundle::new(sqlite);
-        let mut app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
-            .await
-            .expect("app");
+        let mut app = build_test_app(&root, store).await;
         let global_access_mode = crate::config::AccessMode::Default;
         let session_access_mode = crate::config::AccessMode::FullAccess;
         app.config.permissions.access_mode = global_access_mode;
@@ -2744,18 +2773,18 @@ mod command_projection_owner_tests {
         let turn_id = crate::protocol::TurnId::new();
         app.store
             .protocol_event_store()
-            .append_history_item(&crate::protocol::HistoryItem {
+            .seed_history_item_for_test(&crate::protocol::HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id: session.id,
                 turn_id,
                 sequence_no: 1,
                 created_at_ms: 1,
-                payload: crate::protocol::HistoryItemPayload::Message {
-                    message_id: None,
-                    role: crate::session::MessageRole::User,
+                payload: crate::protocol::HistoryItemPayload::UserTurn {
                     content: vec![crate::protocol::ContentPart::Text {
                         text: "reopen".to_string(),
                     }],
+                    prompt_dispatch: None,
+                    editor_context: None,
                 },
             })
             .expect("history item");
@@ -2804,7 +2833,6 @@ mod command_projection_owner_tests {
 
     #[tokio::test]
     async fn archiving_the_only_current_session_restores_global_access_for_the_new_chat() {
-        use crate::protocol::ProtocolEventStore as _;
         use crate::session::{NewSession, SessionRepository as _};
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2819,9 +2847,7 @@ mod command_projection_owner_tests {
         let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
         sqlite.migrate().expect("migrate");
         let store = crate::storage::StoreBundle::new(sqlite);
-        let mut app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
-            .await
-            .expect("app");
+        let mut app = build_test_app(&root, store).await;
         let global_access_mode = crate::config::AccessMode::Default;
         let session_access_mode = crate::config::AccessMode::FullAccess;
         app.config.permissions.access_mode = global_access_mode;
@@ -2840,18 +2866,18 @@ mod command_projection_owner_tests {
             .expect("session");
         app.store
             .protocol_event_store()
-            .append_history_item(&crate::protocol::HistoryItem {
+            .seed_history_item_for_test(&crate::protocol::HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id: session.id,
                 turn_id: crate::protocol::TurnId::new(),
                 sequence_no: 1,
                 created_at_ms: 1,
-                payload: crate::protocol::HistoryItemPayload::Message {
-                    message_id: None,
-                    role: crate::session::MessageRole::User,
+                payload: crate::protocol::HistoryItemPayload::UserTurn {
                     content: vec![crate::protocol::ContentPart::Text {
                         text: "archive this session".to_string(),
                     }],
+                    prompt_dispatch: None,
+                    editor_context: None,
                 },
             })
             .expect("history item");
@@ -2926,9 +2952,7 @@ mod command_projection_owner_tests {
         let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
         sqlite.migrate().expect("migrate");
         let store = crate::storage::StoreBundle::new(sqlite);
-        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
-            .await
-            .expect("app");
+        let app = build_test_app(&root, store).await;
         let args = DesktopArgs {
             directory: Some(root),
             session_id: None,
@@ -2997,9 +3021,7 @@ mod command_projection_owner_tests {
         let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
         sqlite.migrate().expect("migrate");
         let store = crate::storage::StoreBundle::new(sqlite);
-        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
-            .await
-            .expect("app");
+        let app = build_test_app(&root, store).await;
         let args = DesktopArgs {
             directory: Some(root),
             session_id: None,
@@ -3417,9 +3439,7 @@ mod command_projection_owner_tests {
         let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
         sqlite.migrate().expect("migrate");
         let store = crate::storage::StoreBundle::new(sqlite);
-        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
-            .await
-            .expect("app");
+        let app = build_test_app(&root, store).await;
         let project_b_root =
             Utf8PathBuf::from_path_buf(temp.path().join("workspace-b")).expect("utf8 project B");
         std::fs::create_dir_all(&project_b_root).expect("project B workspace");
@@ -3700,8 +3720,16 @@ mod command_projection_owner_tests {
             .runtime_tx
             .send(RuntimeMessage::RunEvent {
                 run_generation: admitted_generation,
-                event: RunEvent::UserMessageStored {
-                    message_id: crate::session::MessageId::new(),
+                event: RunEvent::UserTurnStored {
+                    session_id: session_a.id,
+                    turn: Box::new(crate::protocol::UserTurn {
+                        turn_id: crate::protocol::TurnId::new(),
+                        items: vec![crate::protocol::UserInputItem::Text {
+                            text: "durable prompt".to_string(),
+                        }],
+                        prompt_dispatch: None,
+                        editor_context: None,
+                    }),
                 },
             })
             .expect("durable user message");
@@ -3760,7 +3788,6 @@ mod command_projection_owner_tests {
         );
 
         let blocker = controller.state.begin_project_delete_mutation();
-        assert!(!controller.set_session_memory_mode(session_a.id, SessionMemoryMode::Enabled,));
         assert!(controller.state.finish_project_delete_mutation(blocker));
     }
 
@@ -3778,9 +3805,7 @@ mod command_projection_owner_tests {
         let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
         sqlite.migrate().expect("migrate");
         let store = crate::storage::StoreBundle::new(sqlite);
-        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
-            .await
-            .expect("app");
+        let app = build_test_app(&root, store).await;
         let args = DesktopArgs {
             directory: Some(root),
             session_id: None,
@@ -4319,12 +4344,9 @@ pub(crate) struct DesktopController {
     turn_page_requests: LatestRequestTracker<SessionPageRequestTarget>,
     live_session_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
     current_session_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
-    current_todo_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
     durable_agent_activity_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
     history_export_requests: LatestRequestTracker<HistoryExportRequestTarget>,
     provider_catalog_requests: LatestRequestTracker<ProviderCatalogRequestTarget>,
-    startup_provider_requests: LatestRequestTracker<ProviderReadinessRequestTarget>,
-    startup_docling_requests: LatestRequestTracker<DoclingRequestTarget>,
     access_mode_persistence_requests: LatestRequestTracker<AccessModePersistenceTarget>,
     pending_access_mode_adoption: Option<PendingAccessModeAdoption>,
     projection_revision: u64,
@@ -4439,17 +4461,7 @@ impl DesktopController {
                 .run_service
                 .durable_agent_activity_records(session_id)
                 .await?;
-            state.load_open_session(
-                &detail.session,
-                &detail.transcript,
-                &detail.turn_items,
-                detail.state,
-                detail.todos,
-                detail.turn_page_offset,
-                detail.turn_page_limit,
-                detail.turn_page_total,
-                detail.turn_page_has_more,
-            );
+            state.load_open_session(&detail.read);
             loaded_agent_activity_records = Some((session_id, activity_records));
         }
         let mut controller = Self {
@@ -4471,12 +4483,9 @@ impl DesktopController {
             turn_page_requests: LatestRequestTracker::default(),
             live_session_refresh_requests: LatestRequestTracker::default(),
             current_session_refresh_requests: LatestRequestTracker::default(),
-            current_todo_refresh_requests: LatestRequestTracker::default(),
             durable_agent_activity_refresh_requests: LatestRequestTracker::default(),
             history_export_requests: LatestRequestTracker::default(),
             provider_catalog_requests: LatestRequestTracker::default(),
-            startup_provider_requests: LatestRequestTracker::default(),
-            startup_docling_requests: LatestRequestTracker::default(),
             access_mode_persistence_requests: LatestRequestTracker::default(),
             pending_access_mode_adoption: None,
             projection_revision: 0,
@@ -4486,16 +4495,6 @@ impl DesktopController {
             authorized_attachment_assets: BTreeSet::new(),
         };
         controller.persist_preferences();
-        if !controller
-            .state
-            .provider_config
-            .provider_base_url_input
-            .trim()
-            .is_empty()
-        {
-            controller.load_provider_models();
-        }
-        controller.drive_startup_readiness();
         Ok(controller)
     }
 
@@ -4770,12 +4769,10 @@ impl DesktopController {
         self.turn_page_requests.clear();
         self.live_session_refresh_requests.clear();
         self.current_session_refresh_requests.clear();
-        self.current_todo_refresh_requests.clear();
         self.durable_agent_activity_refresh_requests.clear();
         self.history_export_requests.clear();
         self.state.finish_snapshot_refresh();
         self.state.finish_turn_page_load();
-        self.state.finish_current_todo_refresh();
         self.state.finish_history_export();
     }
 
@@ -4945,42 +4942,6 @@ impl DesktopController {
             operation_id,
         };
         self.spawn_session_interrupt(target);
-        true
-    }
-
-    pub(crate) fn set_session_memory_mode(
-        &mut self,
-        session_id: SessionId,
-        mode: SessionMemoryMode,
-    ) -> bool {
-        if !self.ensure_navigation_admission("chat memory mode") {
-            return false;
-        }
-        if !self
-            .state
-            .snapshot
-            .session_rows
-            .iter()
-            .any(|row| row.session_id == session_id)
-        {
-            self.state
-                .set_status_message("chat memory target is no longer available");
-            return false;
-        }
-        self.invalidate_session_target_requests();
-        self.state.set_status_message(format!(
-            "setting chat {} memory mode to {}...",
-            session_id,
-            mode.key()
-        ));
-        let operation_id = self.state.begin_session_maintenance_mutation();
-        let target = SessionMutationRequestTarget {
-            workspace_root: self.app.workspace.root.clone(),
-            project_id: self.app.workspace.project_id,
-            session_id,
-            operation_id,
-        };
-        self.spawn_session_memory_mode(target, mode);
         true
     }
 
@@ -5222,18 +5183,19 @@ impl DesktopController {
             let path = export_path.clone();
             let result = runtime
                 .block_on(async move {
-                    let session = service.get_session(session_id).await?;
-                    let history_items = service.canonical_history_items(session_id).await?;
-                    if history_items.is_empty() {
+                    let read = service
+                        .canonical_session_read(session_id, 0, usize::MAX, 0, usize::MAX)
+                        .await?;
+                    if read.history.items.is_empty() {
                         return Err(crate::error::SessionError::Message(
                             "canonical protocol history is empty".to_string(),
                         ));
                     }
-                    Ok::<_, crate::error::SessionError>((session, history_items))
+                    Ok::<_, crate::error::SessionError>(read)
                 })
                 .map_err(|error| error.to_string())
-                .and_then(|(session, history_items)| {
-                    let markdown = history_items_to_markdown(&session, &history_items);
+                .and_then(|read| {
+                    let markdown = canonical_session_read_to_markdown(&read);
                     write_markdown_export_atomic(&export_path, &markdown)?;
                     Ok(path)
                 });
@@ -5318,36 +5280,13 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop turn-page runtime");
             let result = runtime.block_on(async move {
-                let page = app
+                let read = app
                     .session_service
-                    .canonical_turn_page(session_id, offset, limit)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let transcript = app
-                    .session_service
-                    .canonical_transcript(session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let state = app
-                    .session_service
-                    .load_state(session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let todos = app
-                    .session_service
-                    .list_todos(session_id)
+                    .canonical_session_read(session_id, 0, usize::MAX, offset, limit)
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(LoadedSession {
-                    session: page.session,
-                    transcript,
-                    turn_items: page.items,
-                    state,
-                    todos,
-                    turn_page_offset: page.offset,
-                    turn_page_limit: page.limit,
-                    turn_page_total: page.total,
-                    turn_page_has_more: page.has_more,
+                    read,
                     agent_activity_records: None,
                 })
             });
@@ -5373,36 +5312,13 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop live-session-refresh runtime");
             let result = runtime.block_on(async move {
-                let page = app
+                let read = app
                     .session_service
-                    .canonical_turn_page(session_id, offset, limit)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let transcript = app
-                    .session_service
-                    .canonical_transcript(session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let state = app
-                    .session_service
-                    .load_state(session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let todos = app
-                    .session_service
-                    .list_todos(session_id)
+                    .canonical_session_read(session_id, 0, usize::MAX, offset, limit)
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(LoadedSession {
-                    session: page.session,
-                    transcript,
-                    turn_items: page.items,
-                    state,
-                    todos,
-                    turn_page_offset: page.offset,
-                    turn_page_limit: page.limit,
-                    turn_page_total: page.total,
-                    turn_page_has_more: page.has_more,
+                    read,
                     agent_activity_records: None,
                 })
             });
@@ -5479,19 +5395,13 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop session rejoin runtime");
             let result = runtime.block_on(async move {
-                let rejoin = app
-                    .session_service
+                app.session_service
                     .rejoin_running_session(session_id, 0, 200, 0, DESKTOP_TURN_PAGE_LIMIT)
                     .await
                     .map_err(|error| error.to_string())?;
-                let transcript = app
+                let read = app
                     .session_service
-                    .canonical_transcript(session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let todos = app
-                    .session_service
-                    .list_todos(session_id)
+                    .canonical_session_read(session_id, 0, usize::MAX, 0, DESKTOP_TURN_PAGE_LIMIT)
                     .await
                     .map_err(|error| error.to_string())?;
                 let agent_activity_records = app
@@ -5500,15 +5410,7 @@ impl DesktopController {
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(LoadedSession {
-                    session: rejoin.read.session,
-                    transcript,
-                    turn_items: rejoin.read.turns.items,
-                    state: rejoin.read.state,
-                    todos,
-                    turn_page_offset: rejoin.read.turns.offset,
-                    turn_page_limit: rejoin.read.turns.limit,
-                    turn_page_total: rejoin.read.turns.total,
-                    turn_page_has_more: rejoin.read.turns.has_more,
+                    read,
                     agent_activity_records: Some(agent_activity_records),
                 })
             });
@@ -5724,40 +5626,6 @@ impl DesktopController {
         });
     }
 
-    fn spawn_session_memory_mode(
-        &self,
-        target: SessionMutationRequestTarget,
-        mode: SessionMemoryMode,
-    ) {
-        let app = self.app.clone();
-        let runtime_tx = self.runtime_tx.clone();
-        std::thread::spawn(move || {
-            let session_id = target.session_id;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build desktop session-memory runtime");
-            let result = runtime.block_on(async move {
-                let update = app
-                    .session_service
-                    .update_session_memory_mode(session_id, mode)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                load_session_operation_projection(
-                    &app,
-                    session_id,
-                    format!(
-                        "set chat {} memory mode to {}",
-                        session_id,
-                        update.mode.key()
-                    ),
-                )
-                .await
-            });
-            let _ = runtime_tx.send(RuntimeMessage::SessionOperationApplied { target, result });
-        });
-    }
-
     fn spawn_session_search(
         &self,
         query: String,
@@ -5846,34 +5714,6 @@ impl DesktopController {
                 Ok(WorkspaceLoadResult { app, snapshot })
             });
             let _ = runtime_tx.send(RuntimeMessage::ProjectDeleted { target, result });
-        });
-    }
-
-    fn spawn_current_todos_refresh(&mut self, session_id: SessionId) {
-        let service = self.app.session_service.clone();
-        let target = SessionRefreshRequestTarget {
-            workspace_root: self.app.workspace.root.clone(),
-            session_id,
-        };
-        let request_id = self.current_todo_refresh_requests.begin(target.clone());
-        self.state.begin_current_todo_refresh();
-        let runtime_tx = self.runtime_tx.clone();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build desktop todo runtime");
-            let result = runtime.block_on(async move {
-                service
-                    .list_todos(session_id)
-                    .await
-                    .map_err(|error| error.to_string())
-            });
-            let _ = runtime_tx.send(RuntimeMessage::CurrentTodosLoaded {
-                request_id,
-                target,
-                result,
-            });
         });
     }
 
@@ -6198,98 +6038,15 @@ impl DesktopController {
         }
     }
 
-    pub(crate) fn drive_startup_readiness(&mut self) {
-        self.start_startup_provider_readiness();
-        self.start_startup_docling_readiness();
-    }
-
-    fn start_startup_provider_readiness(&mut self) {
-        if !self.state.startup_provider_readiness_pending()
-            || self.startup_provider_requests.is_pending()
-        {
-            return;
-        }
-        let config = self.state.provider_config.effective_config.clone();
-        let normalized = normalize_provider_base_url(&config.model.base_url);
-        let target = ProviderReadinessRequestTarget {
-            base_url: normalized.clone(),
-            model_id: config.model.model.clone(),
-            metadata_mode: config.model.provider_metadata_mode,
-            supports_tools: config.model.supports_tools,
-            supports_reasoning: config.model.supports_reasoning,
-            supports_images: config.model.supports_images,
-            parallel_tool_calls: config.model.parallel_tool_calls,
-            max_parallel_predictions: config.model.max_parallel_predictions,
-            config_generation: self.state.provider_config.config_generation,
-        };
-        let request_id = self.startup_provider_requests.begin(target.clone());
-        let runtime_tx = self.runtime_tx.clone();
-        std::thread::spawn(move || {
-            let mut config = config;
-            config.model.base_url = normalized;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build desktop provider-readiness runtime");
-            let report = runtime.block_on(async move {
-                check_model_availability(&config, None, None, false).await
-            });
-            let _ = runtime_tx.send(RuntimeMessage::StartupProviderChecked {
-                request_id,
-                target,
-                report,
-            });
-        });
-    }
-
-    fn start_startup_docling_readiness(&mut self) {
-        if !self.state.startup_docling_readiness_pending()
-            || self.startup_docling_requests.is_pending()
-        {
-            return;
-        }
-        let config = self.state.provider_config.effective_config.docling.clone();
-        let normalized = normalize_docling_base_url(&config.base_url);
-        if normalized.is_empty() {
-            self.state
-                .fail_startup_docling_check("Docling Serve URL が未設定です。");
-            return;
-        }
-        let target = DoclingRequestTarget {
-            base_url: normalized.clone(),
-            config_generation: self.state.provider_config.config_generation,
-        };
-        let request_id = self.startup_docling_requests.begin(target.clone());
-        let runtime_tx = self.runtime_tx.clone();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build desktop docling-probe runtime");
-            let result = runtime.block_on(async move {
-                probe_docling_readiness(config)
-                    .await
-                    .map_err(|error| error.to_string())
-            });
-            let _ = runtime_tx.send(RuntimeMessage::StartupDoclingChecked {
-                request_id,
-                target,
-                result,
-            });
-        });
-    }
-
     fn reset_effective_config_without_network(&mut self, config: ResolvedConfig) {
         let catalog_was_pending =
             self.provider_catalog_requests.is_pending() || self.state.provider_model_load_pending();
         self.provider_catalog_requests.clear();
-        self.startup_provider_requests.clear();
-        self.startup_docling_requests.clear();
         if catalog_was_pending {
             self.state.cancel_provider_model_load();
         }
         commit_effective_config(&mut self.state, &self.run_lifecycle, config);
-        self.state.retarget_startup_readiness_for_config_change();
+        self.state.refresh_startup_config_status();
     }
 
     fn sync_loaded_session_access_mode(&self, access_mode: crate::config::AccessMode) {
@@ -7352,7 +7109,7 @@ impl DesktopController {
             return false;
         };
         self.state
-            .push_local_prompt_dispatch(&pending.prompt_dispatch);
+            .apply_durable_prompt_dispatch(&pending.prompt_dispatch);
         let current_session_id = self.state.app_state.current_session_id;
         if pending.owner_workspace_path.as_str() == self.state.snapshot.workspace_path
             && pending.owner_session_id.is_none()
@@ -7485,7 +7242,7 @@ impl DesktopController {
                 &self.state.provider_config.effective_config,
             )),
             output_mode: OutputMode::Human,
-            show_reasoning: true,
+            show_reasoning_summary: true,
             prompt_dispatch: Some(prompt_dispatch.clone()),
             editor_context: Some(self.current_editor_context()),
             review_request,
@@ -7643,16 +7400,7 @@ impl DesktopController {
             } else {
                 ShellFamily::Bash
             });
-        let mut visible_files = self
-            .state
-            .app_state
-            .session_state
-            .as_ref()
-            .map(|state| state.active_targets.clone())
-            .unwrap_or_default();
-        visible_files.sort();
-        visible_files.dedup();
-        let visible_files = visible_files.into_iter().take(8).collect::<Vec<_>>();
+        let visible_files = Vec::new();
         EditorContext {
             active_file: visible_files.first().cloned(),
             open_tabs: visible_files.clone(),
@@ -7683,21 +7431,11 @@ impl DesktopController {
                     return;
                 }
                 self.state.finish_navigation(request_id);
-                let access_mode = loaded.session.access_mode;
-                self.state.load_open_session(
-                    &loaded.session,
-                    &loaded.transcript,
-                    &loaded.turn_items,
-                    loaded.state,
-                    loaded.todos,
-                    loaded.turn_page_offset,
-                    loaded.turn_page_limit,
-                    loaded.turn_page_total,
-                    loaded.turn_page_has_more,
-                );
+                let access_mode = loaded.read.session.access_mode;
+                self.state.load_open_session(&loaded.read);
                 self.sync_loaded_session_access_mode(access_mode);
                 if let Some(records) = loaded.agent_activity_records {
-                    self.loaded_agent_activity_records = Some((loaded.session.id, records));
+                    self.loaded_agent_activity_records = Some((loaded.read.session.id, records));
                     self.durable_agent_activity_refresh_failures = 0;
                 }
                 if !self.state.status_code.is_terminal_interruption() {
@@ -7732,22 +7470,12 @@ impl DesktopController {
         }
         match result {
             Ok(loaded) => {
-                let loaded_status = loaded.session.status;
-                let access_mode = loaded.session.access_mode;
-                self.state.load_open_session(
-                    &loaded.session,
-                    &loaded.transcript,
-                    &loaded.turn_items,
-                    loaded.state,
-                    loaded.todos,
-                    loaded.turn_page_offset,
-                    loaded.turn_page_limit,
-                    loaded.turn_page_total,
-                    loaded.turn_page_has_more,
-                );
+                let loaded_status = loaded.read.session.status;
+                let access_mode = loaded.read.session.access_mode;
+                self.state.load_open_session(&loaded.read);
                 self.sync_loaded_session_access_mode(access_mode);
                 if let Some(records) = loaded.agent_activity_records {
-                    self.loaded_agent_activity_records = Some((loaded.session.id, records));
+                    self.loaded_agent_activity_records = Some((loaded.read.session.id, records));
                     self.durable_agent_activity_refresh_failures = 0;
                 }
                 self.state.clear_post_run_refresh_pending();
@@ -7774,7 +7502,7 @@ impl DesktopController {
     fn session_load_is_blocked_by_active_run(&self) -> bool {
         matches!(
             self.state.app_state.run_status,
-            crate::tui::state::RunStatus::Running | crate::tui::state::RunStatus::Confirming
+            crate::tui::state::RunStatus::Running
         )
     }
 
@@ -7843,8 +7571,6 @@ impl DesktopController {
             next_config_generation(self.state.provider_config.config_generation);
         self.invalidate_session_target_requests();
         self.provider_catalog_requests.clear();
-        self.startup_provider_requests.clear();
-        self.startup_docling_requests.clear();
         self.app = loaded.app.clone();
         if !self.is_quick_chat_workspace() {
             self.preferences
@@ -7891,22 +7617,6 @@ impl DesktopController {
                 == target.selected_model_id
     }
 
-    fn provider_readiness_target_is_current(
-        &self,
-        target: &ProviderReadinessRequestTarget,
-    ) -> bool {
-        let model = &self.state.provider_config.effective_config.model;
-        normalize_provider_base_url(&model.base_url) == target.base_url
-            && model.model == target.model_id
-            && model.provider_metadata_mode == target.metadata_mode
-            && model.supports_tools == target.supports_tools
-            && model.supports_reasoning == target.supports_reasoning
-            && model.supports_images == target.supports_images
-            && model.parallel_tool_calls == target.parallel_tool_calls
-            && model.max_parallel_predictions == target.max_parallel_predictions
-            && self.state.provider_config.config_generation == target.config_generation
-    }
-
     pub(crate) fn drain_runtime_messages(&mut self) -> bool {
         let mut changed = false;
         while let Ok(message) = self.runtime_rx.try_recv() {
@@ -7920,10 +7630,7 @@ impl DesktopController {
                     if !self.run_lifecycle.owns(run_generation) {
                         continue;
                     }
-                    if matches!(
-                        &event,
-                        RunEvent::UserTurnStored { .. } | RunEvent::UserMessageStored { .. }
-                    ) {
+                    if matches!(&event, RunEvent::UserTurnStored { .. }) {
                         self.commit_pending_root_submission(run_generation);
                     }
                     if self.run_lifecycle.cancellation_requested()
@@ -7976,11 +7683,6 @@ impl DesktopController {
                     }
                     if run_event_is_terminal(&event) {
                         self.state.mark_post_run_refresh_pending();
-                    }
-                    if event_requires_todo_refresh(&event) {
-                        if let Some(session_id) = self.state.app_state.current_session_id {
-                            self.spawn_current_todos_refresh(session_id);
-                        }
                     }
                     if let Some(session_id) = refresh_session_id {
                         self.spawn_snapshot_refresh_for_session(session_id);
@@ -8250,20 +7952,10 @@ impl DesktopController {
                                 && !self.session_load_is_blocked_by_active_run()
                             {
                                 let loaded = rolled_back.loaded;
-                                self.state.load_open_session(
-                                    &loaded.session,
-                                    &loaded.transcript,
-                                    &loaded.turn_items,
-                                    loaded.state,
-                                    loaded.todos,
-                                    loaded.turn_page_offset,
-                                    loaded.turn_page_limit,
-                                    loaded.turn_page_total,
-                                    loaded.turn_page_has_more,
-                                );
+                                self.state.load_open_session(&loaded.read);
                                 if let Some(records) = loaded.agent_activity_records {
                                     self.loaded_agent_activity_records =
-                                        Some((loaded.session.id, records));
+                                        Some((loaded.read.session.id, records));
                                 }
                             }
                             self.state.set_status_message(format!(
@@ -8289,29 +7981,19 @@ impl DesktopController {
                     }
                     match result {
                         Ok(applied) => {
-                            let session_id = applied.loaded.session.id;
+                            let session_id = applied.loaded.read.session.id;
                             self.state
                                 .replace_snapshot_preserving_current_owner(applied.snapshot);
                             if self.state.app_state.current_session_id == Some(session_id)
                                 && !self.session_load_is_blocked_by_active_run()
                             {
                                 let loaded = applied.loaded;
-                                let access_mode = loaded.session.access_mode;
-                                self.state.load_open_session(
-                                    &loaded.session,
-                                    &loaded.transcript,
-                                    &loaded.turn_items,
-                                    loaded.state,
-                                    loaded.todos,
-                                    loaded.turn_page_offset,
-                                    loaded.turn_page_limit,
-                                    loaded.turn_page_total,
-                                    loaded.turn_page_has_more,
-                                );
+                                let access_mode = loaded.read.session.access_mode;
+                                self.state.load_open_session(&loaded.read);
                                 self.sync_loaded_session_access_mode(access_mode);
                                 if let Some(records) = loaded.agent_activity_records {
                                     self.loaded_agent_activity_records =
-                                        Some((loaded.session.id, records));
+                                        Some((loaded.read.session.id, records));
                                 }
                             }
                             self.state.set_status_message(applied.message);
@@ -8358,30 +8040,22 @@ impl DesktopController {
                     }
                     match result {
                         Ok(loaded) => {
-                            let access_mode = loaded.session.access_mode;
-                            self.state.load_open_session(
-                                &loaded.session,
-                                &loaded.transcript,
-                                &loaded.turn_items,
-                                loaded.state,
-                                loaded.todos,
-                                loaded.turn_page_offset,
-                                loaded.turn_page_limit,
-                                loaded.turn_page_total,
-                                loaded.turn_page_has_more,
-                            );
+                            let access_mode = loaded.read.session.access_mode;
+                            self.state.load_open_session(&loaded.read);
                             self.sync_loaded_session_access_mode(access_mode);
                             if let Some(records) = loaded.agent_activity_records {
                                 self.loaded_agent_activity_records =
-                                    Some((loaded.session.id, records));
+                                    Some((loaded.read.session.id, records));
                             }
                             self.state.set_status_message(format!(
                                 "loaded turn page {}-{} of {}",
-                                loaded.turn_page_offset.saturating_add(1),
+                                loaded.read.turns.offset.saturating_add(1),
                                 loaded
-                                    .turn_page_offset
-                                    .saturating_add(loaded.turn_items.len()),
-                                loaded.turn_page_total
+                                    .read
+                                    .turns
+                                    .offset
+                                    .saturating_add(loaded.read.turns.items.len()),
+                                loaded.read.turns.total
                             ));
                         }
                         Err(error) => self
@@ -8404,25 +8078,15 @@ impl DesktopController {
                     match result {
                         Ok(loaded) => {
                             if !self.session_load_is_blocked_by_active_run()
-                                && loaded.turn_page_has_more
+                                && loaded.read.turns.has_more
                             {
                                 self.spawn_latest_live_session_refresh(target.session_id);
                                 continue;
                             }
-                            self.state.refresh_open_session_projection(
-                                &loaded.session,
-                                &loaded.transcript,
-                                &loaded.turn_items,
-                                loaded.state,
-                                loaded.todos,
-                                loaded.turn_page_offset,
-                                loaded.turn_page_limit,
-                                loaded.turn_page_total,
-                                loaded.turn_page_has_more,
-                            );
+                            self.state.refresh_open_session_projection(&loaded.read);
                             if let Some(records) = loaded.agent_activity_records {
                                 self.loaded_agent_activity_records =
-                                    Some((loaded.session.id, records));
+                                    Some((loaded.read.session.id, records));
                             }
                         }
                         Err(error) => self
@@ -8495,12 +8159,9 @@ impl DesktopController {
                                 self.turn_page_requests.clear();
                                 self.live_session_refresh_requests.clear();
                                 self.current_session_refresh_requests.clear();
-                                self.current_todo_refresh_requests.clear();
                                 self.durable_agent_activity_refresh_requests.clear();
                                 self.history_export_requests.clear();
                                 self.provider_catalog_requests.clear();
-                                self.startup_provider_requests.clear();
-                                self.startup_docling_requests.clear();
                                 self.state =
                                     DesktopState::new(loaded.snapshot, self.app.config.clone());
                                 self.state.provider_config.config_generation =
@@ -8546,29 +8207,6 @@ impl DesktopController {
                             .set_status_message(format!("project delete failed: {error}")),
                     }
                 }
-                RuntimeMessage::CurrentTodosLoaded {
-                    request_id,
-                    target,
-                    result,
-                } => {
-                    if !self
-                        .current_todo_refresh_requests
-                        .finish_if_current(request_id, &target)
-                        || !self.live_session_target_is_current(&target)
-                    {
-                        continue;
-                    }
-                    match result {
-                        Ok(todos) => {
-                            self.state.finish_current_todo_refresh();
-                            self.state.app_state.set_sidebar_todos(todos);
-                        }
-                        Err(error) => {
-                            self.state.finish_current_todo_refresh();
-                            self.state.set_status_message(error);
-                        }
-                    }
-                }
                 RuntimeMessage::ModelCatalogLoaded {
                     request_id,
                     target,
@@ -8587,52 +8225,6 @@ impl DesktopController {
                     match result {
                         Ok(models) => self.state.finish_provider_model_load(models),
                         Err(error) => self.state.fail_provider_model_load(error),
-                    }
-                }
-                RuntimeMessage::StartupProviderChecked {
-                    request_id,
-                    target,
-                    report,
-                } => {
-                    if !self
-                        .startup_provider_requests
-                        .finish_if_current(request_id, &target)
-                        || !self.provider_readiness_target_is_current(&target)
-                    {
-                        continue;
-                    }
-                    self.state.finish_startup_provider_model_load(&report);
-                }
-                RuntimeMessage::StartupDoclingChecked {
-                    request_id,
-                    target,
-                    result,
-                } => {
-                    if !self
-                        .startup_docling_requests
-                        .finish_if_current(request_id, &target)
-                    {
-                        continue;
-                    }
-                    let current = normalize_docling_base_url(
-                        &self.state.provider_config.effective_config.docling.base_url,
-                    );
-                    if !self.state.provider_config.effective_config.docling.enabled
-                        || current != target.base_url
-                        || self.state.provider_config.config_generation != target.config_generation
-                    {
-                        continue;
-                    }
-                    match result {
-                        Ok(()) => {
-                            self.state.finish_startup_docling_check(&target.base_url);
-                        }
-                        Err(error) => {
-                            self.state.fail_startup_docling_check(error.clone());
-                            self.state.set_status_message(format!(
-                                "Docling startup check failed: {error}"
-                            ));
-                        }
                     }
                 }
                 RuntimeMessage::HistoryExported {
@@ -8910,15 +8502,7 @@ fn loaded_session_from_detail(
     agent_activity_records: Option<Vec<AgentActivityRecord>>,
 ) -> LoadedSession {
     LoadedSession {
-        session: detail.session,
-        transcript: detail.transcript,
-        turn_items: detail.turn_items,
-        state: detail.state,
-        todos: detail.todos,
-        turn_page_offset: detail.turn_page_offset,
-        turn_page_limit: detail.turn_page_limit,
-        turn_page_total: detail.turn_page_total,
-        turn_page_has_more: detail.turn_page_has_more,
+        read: detail.read,
         agent_activity_records,
     }
 }
@@ -8927,7 +8511,7 @@ async fn loaded_session_from_detail_with_activity(
     app: &App,
     detail: LoadedSessionDetail,
 ) -> Result<LoadedSession, String> {
-    let session_id = detail.session.id;
+    let session_id = detail.read.session.id;
     let agent_activity_records = app
         .run_service
         .durable_agent_activity_records(session_id)
@@ -8958,15 +8542,7 @@ async fn load_session_operation_projection(
     Ok(DesktopSessionOperationLoaded {
         snapshot,
         loaded: LoadedSession {
-            session: detail.session,
-            transcript: detail.transcript,
-            turn_items: detail.turn_items,
-            state: detail.state,
-            todos: detail.todos,
-            turn_page_offset: detail.turn_page_offset,
-            turn_page_limit: detail.turn_page_limit,
-            turn_page_total: detail.turn_page_total,
-            turn_page_has_more: detail.turn_page_has_more,
+            read: detail.read,
             agent_activity_records: Some(agent_activity_records),
         },
         message,
@@ -8977,22 +8553,17 @@ fn live_event_requires_canonical_refresh(event: &RunEvent) -> bool {
     matches!(
         event,
         RunEvent::UserTurnStored { .. }
-            | RunEvent::ControlEnvelopePrepared { .. }
             | RunEvent::ModelRequestPrepared { .. }
             | RunEvent::WorldStateUpdated { .. }
             | RunEvent::ToolCallPending { .. }
             | RunEvent::ToolCallCompleted { .. }
             | RunEvent::ToolCallFailed { .. }
-            | RunEvent::ToolProposalRejected { .. }
-            | RunEvent::CandidateRepairEditRecorded { .. }
             | RunEvent::FileChangesRecorded { .. }
             | RunEvent::CompactionCompleted { .. }
             | RunEvent::PermissionRequested { .. }
             | RunEvent::PermissionResolved { .. }
             | RunEvent::RetryScheduled { .. }
             | RunEvent::RecoverableRuntimeFeedback { .. }
-            | RunEvent::StateUpdated { .. }
-            | RunEvent::LifecycleGuardUpdated { .. }
     )
 }
 
@@ -9038,7 +8609,11 @@ fn open_transcript_rows_to_markdown(
     for row in rows {
         events.extend(markdown_events_for_transcript_row(row));
     }
-    if !file_changes.is_empty() && !rows.iter().any(|row| row.kind == "file_changes") {
+    if !file_changes.is_empty()
+        && !rows
+            .iter()
+            .any(|row| row.row_kind == DesktopTranscriptRowKind::FileChanges)
+    {
         events.push(MarkdownExportEvent::detail(
             "ファイル変更履歴",
             render_file_change_markdown_lines(file_changes),
@@ -9054,44 +8629,41 @@ fn open_transcript_rows_to_markdown(
 }
 
 fn markdown_events_for_transcript_row(row: &DesktopTranscriptRow) -> Vec<MarkdownExportEvent> {
-    match row.kind.as_str() {
-        "user" => vec![MarkdownExportEvent::user(export_visible_body(&row.body))],
-        "assistant" => vec![MarkdownExportEvent::assistant(export_visible_body(
-            &row.body,
-        ))],
-        "file_changes" => vec![MarkdownExportEvent::detail(
+    match row.row_kind {
+        DesktopTranscriptRowKind::User => {
+            vec![MarkdownExportEvent::user(export_visible_body(&row.body))]
+        }
+        DesktopTranscriptRowKind::Assistant => vec![MarkdownExportEvent::assistant(
+            export_visible_body(&row.body),
+        )],
+        DesktopTranscriptRowKind::FileChanges => vec![MarkdownExportEvent::detail(
             row.title.clone(),
             transcript_detail_body(row),
         )],
-        "work_summary_failed" => vec![
+        DesktopTranscriptRowKind::WorkSummaryFailed => vec![
             MarkdownExportEvent::detail(row.title.clone(), transcript_detail_body(row)),
             MarkdownExportEvent::terminal(
                 MarkdownTerminalStatus::Failed,
                 transcript_terminal_summary(row),
             ),
         ],
-        "work_summary_cancelled" => vec![
+        DesktopTranscriptRowKind::WorkSummaryCancelled => vec![
             MarkdownExportEvent::detail(row.title.clone(), transcript_detail_body(row)),
             MarkdownExportEvent::terminal(
                 MarkdownTerminalStatus::Interrupted,
                 transcript_terminal_summary(row),
             ),
         ],
-        "work_summary_awaiting_user" => vec![
-            MarkdownExportEvent::detail(row.title.clone(), transcript_detail_body(row)),
-            MarkdownExportEvent::terminal(
-                MarkdownTerminalStatus::AwaitingUser,
-                transcript_terminal_summary(row),
-            ),
-        ],
-        "work_summary_completed" => vec![
+        DesktopTranscriptRowKind::WorkSummaryCompleted => vec![
             MarkdownExportEvent::detail(row.title.clone(), transcript_detail_body(row)),
             MarkdownExportEvent::terminal(
                 MarkdownTerminalStatus::Completed,
                 transcript_terminal_summary(row),
             ),
         ],
-        "tool" | "editing" | "diff" | "summary" => {
+        DesktopTranscriptRowKind::Tool
+        | DesktopTranscriptRowKind::Editing
+        | DesktopTranscriptRowKind::Diff => {
             vec![MarkdownExportEvent::detail(
                 row.title.clone(),
                 transcript_detail_body(row),
@@ -9105,8 +8677,8 @@ fn markdown_events_for_transcript_row(row: &DesktopTranscriptRow) -> Vec<Markdow
 }
 
 fn transcript_detail_body(row: &DesktopTranscriptRow) -> String {
-    match row.kind.as_str() {
-        "file_changes" if !row.file_changes.is_empty() => {
+    match row.row_kind {
+        DesktopTranscriptRowKind::FileChanges if !row.file_changes.is_empty() => {
             render_file_change_markdown_lines(&row.file_changes)
         }
         _ => {
@@ -9181,7 +8753,6 @@ fn run_completion_notification_body(session_title: &str, summary: &RunSummary) -
     let session_title = notification_session_title(session_title);
     let mut body = match summary.status {
         SessionStatus::Completed => format!("{session_title} が完了しました。"),
-        SessionStatus::AwaitingUser => format!("{session_title} が確認待ちになりました。"),
         SessionStatus::Cancelled => format!("{session_title} を停止しました。"),
         SessionStatus::Failed => format!("{session_title} が失敗しました。"),
         SessionStatus::Running => format!("{session_title} は実行中です。"),
@@ -9220,26 +8791,37 @@ fn run_error_notification_body(
 fn run_terminal_event_notification_body(session_title: &str, event: &RunEvent) -> Option<String> {
     let session_title = notification_session_title(session_title);
     match event {
-        RunEvent::SessionCompleted { .. } => Some(format!("{session_title} が完了しました。")),
-        RunEvent::SessionAwaitingUser { .. } => {
-            Some(format!("{session_title} が確認待ちになりました。"))
-        }
-        RunEvent::SessionInterrupted { reason, .. } => {
-            let visible_reason = reason.lines().next().unwrap_or(reason).trim();
-            if visible_reason.is_empty() {
-                Some(format!("{session_title} を停止しました。"))
-            } else {
-                Some(format!("{session_title} を停止しました: {visible_reason}"))
+        RunEvent::TurnTerminal { terminal, .. } => match terminal.status {
+            crate::protocol::TurnTerminalStatus::Completed => {
+                Some(format!("{session_title} が完了しました。"))
             }
-        }
-        RunEvent::SessionFailed { message, .. } => {
-            let visible_error = message.lines().next().unwrap_or(message).trim();
-            if visible_error.is_empty() {
-                Some(format!("{session_title} が失敗しました。"))
-            } else {
-                Some(format!("{session_title} が失敗しました: {visible_error}"))
+            crate::protocol::TurnTerminalStatus::Interrupted => {
+                let visible_reason = terminal
+                    .summary
+                    .lines()
+                    .next()
+                    .unwrap_or(&terminal.summary)
+                    .trim();
+                if visible_reason.is_empty() {
+                    Some(format!("{session_title} を停止しました。"))
+                } else {
+                    Some(format!("{session_title} を停止しました: {visible_reason}"))
+                }
             }
-        }
+            crate::protocol::TurnTerminalStatus::Failed => {
+                let visible_error = terminal
+                    .summary
+                    .lines()
+                    .next()
+                    .unwrap_or(&terminal.summary)
+                    .trim();
+                if visible_error.is_empty() {
+                    Some(format!("{session_title} が失敗しました。"))
+                } else {
+                    Some(format!("{session_title} が失敗しました: {visible_error}"))
+                }
+            }
+        },
         _ => None,
     }
 }
@@ -9623,11 +9205,11 @@ fn provider_catalog_probe_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopRenderer, DoclingRequestTarget, HistoryExportRequestTarget, PendingPermission,
-        PendingPermissionResolution, ProviderCatalogRequestTarget, ProviderReadinessRequestTarget,
-        RuntimeMessage, RuntimeMessageAsyncContract, SessionRefreshRequestTarget,
-        desktop_terminal_status_message, fallback_workspace_after_project_delete,
-        first_restorable_project_root, normalize_image_attachment_path, notification_session_title,
+        DesktopRenderer, HistoryExportRequestTarget, PendingPermission,
+        PendingPermissionResolution, ProviderCatalogRequestTarget, RuntimeMessage,
+        RuntimeMessageAsyncContract, SessionRefreshRequestTarget, desktop_terminal_status_message,
+        fallback_workspace_after_project_delete, first_restorable_project_root,
+        normalize_image_attachment_path, notification_session_title,
         open_transcript_rows_to_markdown, provider_catalog_probe_config,
         publish_desktop_run_finished, resolve_pending_permission, run_completion_notification_body,
         run_terminal_event_notification_body, transcript_markdown_file_name,
@@ -9638,7 +9220,6 @@ mod tests {
     use crate::desktop::async_ops::LatestRequestTracker;
     use crate::desktop::models::DesktopTranscriptRowKind;
     use crate::desktop::models::{DesktopFileChangeRow, DesktopTranscriptRow};
-    use crate::llm::{ModelAvailabilityReport, ModelAvailabilityStatus};
     use crate::session::{ProjectId, ProjectRecord, RunEvent, RunSummary, SessionStatus};
     use camino::{Utf8Path, Utf8PathBuf};
     use std::sync::mpsc;
@@ -9651,6 +9232,27 @@ mod tests {
             vcs_kind: "none".to_string(),
             created_at_ms: 1,
             updated_at_ms: 1,
+        }
+    }
+
+    fn interrupted_turn_event(
+        session_id: crate::session::SessionId,
+        summary: &str,
+        cause: crate::protocol::TurnInterruptionCause,
+    ) -> RunEvent {
+        RunEvent::TurnTerminal {
+            session_id,
+            terminal: Box::new(crate::session::DurableTurnTerminal {
+                status: crate::protocol::TurnTerminalStatus::Interrupted,
+                finish_reason: Some(crate::session::FinishReason::Cancelled),
+                interruption_cause: Some(cause),
+                final_response_id: None,
+                summary: summary.to_string(),
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
         }
     }
 
@@ -9690,68 +9292,6 @@ mod tests {
                 request_id: provider_request_id,
                 target: provider_target,
                 result: Ok(Vec::new()),
-            }
-            .async_contract(),
-            RuntimeMessageAsyncContract::ProviderOperation
-        );
-        let readiness_target = ProviderReadinessRequestTarget {
-            base_url: "http://127.0.0.1:1234".to_string(),
-            model_id: "qwen/qwen3.6-35b-a3b".to_string(),
-            metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
-            supports_tools: true,
-            supports_reasoning: false,
-            supports_images: false,
-            parallel_tool_calls: true,
-            max_parallel_predictions: 1,
-            config_generation: 1,
-        };
-        let readiness_request_id = LatestRequestTracker::default().begin(readiness_target.clone());
-        assert_eq!(
-            RuntimeMessage::StartupProviderChecked {
-                request_id: readiness_request_id,
-                target: readiness_target,
-                report: ModelAvailabilityReport {
-                    gate: "model_availability".to_string(),
-                    status: ModelAvailabilityStatus::Pass,
-                    generated_by: "desktop_app_test".to_string(),
-                    model: "qwen/qwen3.6-35b-a3b".to_string(),
-                    base_url: "http://127.0.0.1:1234".to_string(),
-                    provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
-                    v1_present: true,
-                    native_present: true,
-                    require_vision: false,
-                    vision_capable: false,
-                    vision_probe_passed: false,
-                    vision_probes: Vec::new(),
-                    tool_use_capable: Some(true),
-                    capability_overrides: Vec::new(),
-                    tool_call_probe_passed: true,
-                    tool_call_probes: Vec::new(),
-                    reasoning_capable: Some(false),
-                    context: Some(131072),
-                    max_output_tokens: Some(8192),
-                    max_parallel_predictions: Some(1),
-                    matched_model: None,
-                    v1_models: Vec::new(),
-                    native_models: Vec::new(),
-                    openai_error: None,
-                    native_error: None,
-                    checked_at_ms: 0,
-                },
-            }
-            .async_contract(),
-            RuntimeMessageAsyncContract::ProviderOperation
-        );
-        let docling_target = DoclingRequestTarget {
-            base_url: "http://127.0.0.1:8123".to_string(),
-            config_generation: 1,
-        };
-        let docling_request_id = LatestRequestTracker::default().begin(docling_target.clone());
-        assert_eq!(
-            RuntimeMessage::StartupDoclingChecked {
-                request_id: docling_request_id,
-                target: docling_target,
-                result: Ok(()),
             }
             .async_contract(),
             RuntimeMessageAsyncContract::ProviderOperation
@@ -9829,11 +9369,11 @@ mod tests {
     #[test]
     fn terminal_status_message_uses_the_typed_interruption_cause() {
         let session_id = crate::session::SessionId::new();
-        let approval_abort = crate::session::RunEvent::SessionInterrupted {
+        let approval_abort = interrupted_turn_event(
             session_id,
-            reason: "an arbitrary provider-facing description".to_string(),
-            cause: Some(crate::protocol::TurnInterruptionCause::ApprovalAborted),
-        };
+            "an arbitrary provider-facing description",
+            crate::protocol::TurnInterruptionCause::ApprovalAborted,
+        );
         assert_eq!(
             desktop_terminal_status_message(&approval_abort),
             Some(crate::tui::state::interruption_status_message(
@@ -9841,11 +9381,11 @@ mod tests {
             ))
         );
 
-        let explicit_stop = crate::session::RunEvent::SessionInterrupted {
+        let explicit_stop = interrupted_turn_event(
             session_id,
-            reason: "operation skipped after review".to_string(),
-            cause: Some(crate::protocol::TurnInterruptionCause::UserStop),
-        };
+            "operation skipped after review",
+            crate::protocol::TurnInterruptionCause::UserStop,
+        );
         assert_eq!(
             desktop_terminal_status_message(&explicit_stop),
             Some(crate::tui::state::interruption_status_message(
@@ -9939,7 +9479,6 @@ mod tests {
         let rows = vec![
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::User,
-                kind: "user".to_string(),
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
                 body: "Older request.".to_string(),
@@ -9947,7 +9486,6 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::Assistant,
-                kind: "assistant".to_string(),
                 step: "02".to_string(),
                 title: "Previous response".to_string(),
                 body: "Earlier answer.".to_string(),
@@ -9955,7 +9493,6 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::User,
-                kind: "user".to_string(),
                 step: "03".to_string(),
                 title: "Prompt".to_string(),
                 body: "Create a report.".to_string(),
@@ -9963,7 +9500,6 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::Assistant,
-                kind: "assistant".to_string(),
                 step: "04".to_string(),
                 title: "Response".to_string(),
                 body: "Done.\nSaved files.".to_string(),
@@ -10008,7 +9544,6 @@ mod tests {
         let rows = vec![
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::User,
-                kind: "user".to_string(),
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
                 body: "Create files.".to_string(),
@@ -10016,15 +9551,13 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::Assistant,
-                kind: "assistant".to_string(),
                 step: "02".to_string(),
                 title: "Response".to_string(),
                 body: "Now run this:\n<tool_call>\n<function=shell>\n</tool_call>".to_string(),
                 file_changes: Vec::new(),
             },
             DesktopTranscriptRow {
-                row_kind: DesktopTranscriptRowKind::Summary,
-                kind: "summary".to_string(),
+                row_kind: DesktopTranscriptRowKind::Diff,
                 step: "03".to_string(),
                 title: "File changes".to_string(),
                 body: "Added README.md\nAdded __pycache__\\workflow.cpython-313.pyc".to_string(),
@@ -10068,7 +9601,6 @@ mod tests {
         let rows = vec![
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::User,
-                kind: "user".to_string(),
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
                 body: "Update the implementation.".to_string(),
@@ -10076,7 +9608,6 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::Assistant,
-                kind: "assistant".to_string(),
                 step: "02".to_string(),
                 title: "Response".to_string(),
                 body: "テストの期待値を修正します。".to_string(),
@@ -10084,7 +9615,6 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::WorkSummaryCancelled,
-                kind: "work_summary_cancelled".to_string(),
                 step: "03".to_string(),
                 title: "作業履歴 / 作業サマリ".to_string(),
                 body: "### 作業サマリ\n- 結果: run cancelled by user".to_string(),
@@ -10116,7 +9646,8 @@ mod tests {
     fn completion_notification_body_summarizes_terminal_run() {
         let summary = RunSummary {
             session_id: crate::session::SessionId::new(),
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
             interruption_cause: None,
@@ -10145,7 +9676,8 @@ mod tests {
         };
         let summary = RunSummary {
             session_id: crate::session::SessionId::new(),
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: None,
             interruption_cause: None,
@@ -10175,11 +9707,11 @@ mod tests {
     fn terminal_event_notification_body_uses_terminal_state() {
         let body = run_terminal_event_notification_body(
             "vision GUI",
-            &RunEvent::SessionInterrupted {
-                session_id: crate::session::SessionId::new(),
-                reason: "user requested stop\nsecond line".to_string(),
-                cause: Some(crate::protocol::TurnInterruptionCause::UserStop),
-            },
+            &interrupted_turn_event(
+                crate::session::SessionId::new(),
+                "user requested stop\nsecond line",
+                crate::protocol::TurnInterruptionCause::UserStop,
+            ),
         )
         .expect("terminal event should produce a notification");
 
@@ -10240,18 +9772,10 @@ impl EventRenderer for DesktopRenderer {
         Ok(())
     }
 
-    fn render_session_show(
-        &mut self,
-        _transcript: &crate::session::Transcript,
-    ) -> Result<(), CliRenderError> {
-        Ok(())
-    }
-
     fn render_session_history_items(
         &mut self,
         _session: &SessionRecord,
         _history_items: &[crate::protocol::HistoryItem],
-        _show_reasoning: bool,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
@@ -10287,20 +9811,6 @@ impl EventRenderer for DesktopRenderer {
     fn render_session_runtime_event_page(
         &mut self,
         _page: &crate::session::CanonicalRuntimeEventPage,
-    ) -> Result<(), CliRenderError> {
-        Ok(())
-    }
-
-    fn render_session_compact_result(
-        &mut self,
-        _result: &crate::session::SessionCompactResult,
-    ) -> Result<(), CliRenderError> {
-        Ok(())
-    }
-
-    fn render_session_memory_mode_update(
-        &mut self,
-        _update: &crate::session::SessionMemoryModeUpdate,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
@@ -10328,18 +9838,10 @@ impl EventRenderer for DesktopSteerRenderer {
         Ok(())
     }
 
-    fn render_session_show(
-        &mut self,
-        _transcript: &crate::session::Transcript,
-    ) -> Result<(), CliRenderError> {
-        Ok(())
-    }
-
     fn render_session_history_items(
         &mut self,
         _session: &SessionRecord,
         _history_items: &[crate::protocol::HistoryItem],
-        _show_reasoning: bool,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
@@ -10375,20 +9877,6 @@ impl EventRenderer for DesktopSteerRenderer {
     fn render_session_runtime_event_page(
         &mut self,
         _page: &crate::session::CanonicalRuntimeEventPage,
-    ) -> Result<(), CliRenderError> {
-        Ok(())
-    }
-
-    fn render_session_compact_result(
-        &mut self,
-        _result: &crate::session::SessionCompactResult,
-    ) -> Result<(), CliRenderError> {
-        Ok(())
-    }
-
-    fn render_session_memory_mode_update(
-        &mut self,
-        _update: &crate::session::SessionMemoryModeUpdate,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
@@ -10467,37 +9955,19 @@ impl ConfirmationPrompt for DesktopConfirmationPrompt {
     }
 }
 
-fn event_requires_todo_refresh(event: &RunEvent) -> bool {
-    matches!(
-        event,
-        RunEvent::StateUpdated { .. }
-            | RunEvent::ToolCallCompleted { .. }
-            | RunEvent::ToolCallFailed { .. }
-            | RunEvent::ToolProposalRejected { .. }
-            | RunEvent::CandidateRepairEditRecorded { .. }
-            | RunEvent::RecoverableRuntimeFeedback { .. }
-            | RunEvent::SessionCompleted { .. }
-            | RunEvent::SessionAwaitingUser { .. }
-            | RunEvent::SessionInterrupted { .. }
-            | RunEvent::SessionFailed { .. }
-    )
-}
-
 fn run_event_is_terminal(event: &RunEvent) -> bool {
-    matches!(
-        event,
-        RunEvent::SessionCompleted { .. }
-            | RunEvent::SessionAwaitingUser { .. }
-            | RunEvent::SessionInterrupted { .. }
-            | RunEvent::SessionFailed { .. }
-    )
+    matches!(event, RunEvent::TurnTerminal { .. })
 }
 
 fn desktop_terminal_status_message(event: &RunEvent) -> Option<String> {
     match event {
-        RunEvent::SessionInterrupted {
-            cause: Some(cause), ..
-        } => Some(crate::tui::state::interruption_status_message(*cause)),
+        RunEvent::TurnTerminal { terminal, .. }
+            if terminal.status == crate::protocol::TurnTerminalStatus::Interrupted =>
+        {
+            terminal
+                .interruption_cause
+                .map(crate::tui::state::interruption_status_message)
+        }
         _ => None,
     }
 }
@@ -10776,7 +10246,6 @@ pub fn desktop_open_transcript_markdown_preserves_visible_evidence_fixture_passe
     let rows = vec![
         DesktopTranscriptRow {
             row_kind: super::models::DesktopTranscriptRowKind::User,
-            kind: "user".to_string(),
             step: "01".to_string(),
             title: "Prompt".to_string(),
             body: "Create files.".to_string(),
@@ -10784,15 +10253,13 @@ pub fn desktop_open_transcript_markdown_preserves_visible_evidence_fixture_passe
         },
         DesktopTranscriptRow {
             row_kind: super::models::DesktopTranscriptRowKind::Assistant,
-            kind: "assistant".to_string(),
             step: "02".to_string(),
             title: "Response".to_string(),
             body: "Now run this:\n<tool_call>\n<function=shell>\n</tool_call>".to_string(),
             file_changes: Vec::new(),
         },
         DesktopTranscriptRow {
-            row_kind: super::models::DesktopTranscriptRowKind::Summary,
-            kind: "summary".to_string(),
+            row_kind: super::models::DesktopTranscriptRowKind::Diff,
             step: "03".to_string(),
             title: "File changes".to_string(),
             body: "Added README.md\nAdded __pycache__\\workflow.cpython-313.pyc".to_string(),
@@ -10849,7 +10316,7 @@ pub fn desktop_markdown_export_atomic_commit_fixture_passes() -> bool {
 }
 
 pub fn desktop_app_current_provider_profile_fixture_passes() -> bool {
-    let report = ModelAvailabilityReport {
+    let report = crate::llm::ModelAvailabilityReport {
         gate: "model_availability".to_string(),
         status: crate::llm::ModelAvailabilityStatus::Pass,
         generated_by: "desktop_app_fixture".to_string(),
@@ -10880,7 +10347,6 @@ pub fn desktop_app_current_provider_profile_fixture_passes() -> bool {
     let session_id = SessionId::new();
     let rows = vec![DesktopTranscriptRow {
         row_kind: super::models::DesktopTranscriptRowKind::Assistant,
-        kind: "assistant".to_string(),
         step: "01".to_string(),
         title: "Response".to_string(),
         body: "Provider profile evidence is preserved.".to_string(),

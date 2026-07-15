@@ -32,6 +32,7 @@ impl Tool for ApplyPatchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::ApplyPatch,
+            effect: crate::tool::ToolEffectPolicy::mutation(),
             description: "Apply a structured patch to one or more files using the exact `*** Begin Patch` / `*** End Patch` grammar. Read an existing file before the first `*** Update File` or `*** Delete File` operation in this session. After a successful write/apply_patch, the resulting file contents become the current edit baseline unless another tool changes the file.",
             input_schema: json!({
                 "type": "object",
@@ -272,7 +273,7 @@ async fn commit_admitted_patch(
         .services
         .store
         .change_repo()
-        .insert_changes(session_id, &commit.changes)
+        .insert_changes(&commit.changes)
         .await
     {
         Ok(change_ids) => Ok(change_ids),
@@ -934,15 +935,7 @@ fn no_content_patch_result(path: &Utf8Path, workspace_root: &Utf8Path) -> ToolRe
         metadata: json!({
             "no_content_change": true,
             "path": display_path.clone(),
-            "success": false,
-            "progress_effect": "no_progress",
-            "tool_feedback_envelope": {
-                "success": false,
-                "progress_effect": "no_progress",
-                "tool": "apply_patch",
-                "target": display_path,
-                "side_effects_applied": false
-            },
+            "success": false
         }),
         truncated_output_path: None,
         recorded_changes: Vec::new(),

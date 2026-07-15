@@ -387,6 +387,7 @@ struct EmittedToolCall {
 pub struct ResponsesStreamAccumulator {
     pending_arguments: HashMap<String, String>,
     item_to_call: HashMap<String, String>,
+    incomplete_function_items: HashSet<String>,
     emitted_tool_calls: HashMap<String, EmittedToolCall>,
     text_items_with_delta: HashSet<String>,
     completed_message_items: HashSet<String>,
@@ -423,13 +424,17 @@ impl ResponsesStreamAccumulator {
             }
             "response.reasoning_summary_text.delta" => {
                 let delta = required_string(event, "delta", event_type)?;
-                events.push(LlmEvent::ReasoningDelta(delta.to_string()));
+                events.push(LlmEvent::ReasoningSummaryDelta(delta.to_string()));
                 None
             }
             // Raw chain-of-thought content is neither user-visible nor persistent state.
             "response.reasoning_text.delta" | "response.reasoning_text.done" => None,
             "response.output_item.done" => {
                 self.handle_output_item_done(event, &mut events)?;
+                None
+            }
+            "response.output_item.added" => {
+                self.handle_output_item_added(event)?;
                 None
             }
             "response.function_call_arguments.done" => {
@@ -492,10 +497,28 @@ impl ResponsesStreamAccumulator {
         })?;
         match item.get("type").and_then(Value::as_str) {
             Some("message") => self.handle_message_done(item, events),
-            Some("function_call") => self.handle_function_call_done(item, events),
+            Some("function_call") => {
+                self.handle_function_call_done(item, events)?;
+                if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                    self.incomplete_function_items.remove(item_id);
+                }
+                Ok(())
+            }
             // In particular, ignore reasoning items and their raw `reasoning_text` content.
             _ => Ok(()),
         }
+    }
+
+    fn handle_output_item_added(&mut self, event: &Value) -> Result<(), LlmError> {
+        let item = event.get("item").ok_or_else(|| {
+            LlmError::Message("response.output_item.added is missing `item`".to_string())
+        })?;
+        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+            let item_id =
+                required_nonempty_string(item, "id", "Responses function_call item added")?;
+            self.incomplete_function_items.insert(item_id.to_string());
+        }
+        Ok(())
     }
 
     fn handle_message_done(
@@ -537,8 +560,8 @@ impl ResponsesStreamAccumulator {
         item: &Value,
         events: &mut Vec<LlmEvent>,
     ) -> Result<(), LlmError> {
-        let call_id = required_string(item, "call_id", "Responses function_call item")?;
-        let name = required_string(item, "name", "Responses function_call item")?;
+        let call_id = required_nonempty_string(item, "call_id", "Responses function_call item")?;
+        let name = required_nonempty_string(item, "name", "Responses function_call item")?;
         let item_id = item.get("id").and_then(Value::as_str);
         if let Some(item_id) = item_id {
             self.bind_item_to_call(item_id, call_id)?;
@@ -672,11 +695,6 @@ impl ResponsesStreamAccumulator {
             return Ok(());
         }
 
-        serde_json::from_str::<Value>(arguments).map_err(|error| {
-            LlmError::Message(format!(
-                "Responses function call `{call_id}` completed with malformed arguments: {error}"
-            ))
-        })?;
         self.remember_final_arguments(call_id, arguments)?;
         self.emitted_tool_calls.insert(
             call_id.to_string(),
@@ -701,8 +719,9 @@ impl ResponsesStreamAccumulator {
         event: &Value,
         events: &mut Vec<LlmEvent>,
     ) -> Result<ResponsesTerminal, LlmError> {
+        self.validate_completed_function_calls()?;
         let response = response_object(event, "response.completed")?;
-        let response_id = required_string(response, "id", "response.completed response")?;
+        let response_id = required_nonempty_string(response, "id", "response.completed response")?;
         let finish_reason = if self.emitted_tool_calls.is_empty() {
             FinishReason::Stop
         } else {
@@ -718,6 +737,35 @@ impl ResponsesStreamAccumulator {
             finish_reason,
             usage,
         })
+    }
+
+    fn validate_completed_function_calls(&self) -> Result<(), LlmError> {
+        if let Some(item_id) = self.incomplete_function_items.iter().next() {
+            return Err(LlmError::Message(format!(
+                "Responses stream completed before function call item `{item_id}` was complete"
+            )));
+        }
+        if let Some((item_id, call_id)) = self
+            .item_to_call
+            .iter()
+            .find(|(_, call_id)| !self.emitted_tool_calls.contains_key(call_id.as_str()))
+        {
+            return Err(LlmError::Message(format!(
+                "Responses stream completed before function call `{call_id}` for item `{item_id}` was complete"
+            )));
+        }
+        if let Some(key) = self.pending_arguments.keys().find(|key| {
+            !self.emitted_tool_calls.contains_key(key.as_str())
+                && !self
+                    .item_to_call
+                    .get(key.as_str())
+                    .is_some_and(|call_id| self.emitted_tool_calls.contains_key(call_id))
+        }) {
+            return Err(LlmError::Message(format!(
+                "Responses stream completed with unresolved function arguments for `{key}`"
+            )));
+        }
+        Ok(())
     }
 
     fn failed_terminal(
@@ -799,6 +847,20 @@ fn required_string<'a>(value: &'a Value, field: &str, context: &str) -> Result<&
         .get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| LlmError::Message(format!("{context} is missing string field `{field}`")))
+}
+
+fn required_nonempty_string<'a>(
+    value: &'a Value,
+    field: &str,
+    context: &str,
+) -> Result<&'a str, LlmError> {
+    required_string(value, field, context).and_then(|text| {
+        (!text.trim().is_empty()).then_some(text).ok_or_else(|| {
+            LlmError::Message(format!(
+                "{context} contains an empty string field `{field}`"
+            ))
+        })
+    })
 }
 
 fn consistent_arguments<'a, const N: usize>(
@@ -896,7 +958,6 @@ mod tests {
             parallel_tool_calls: true,
             timeout_ms: 10_000,
             stream_idle_timeout_ms: 10_000,
-            stream_max_retries: 0,
             extra_headers: BTreeMap::new(),
             temperature: None,
             top_p: None,
@@ -1147,7 +1208,7 @@ mod tests {
             .expect("reasoning summary");
         assert!(matches!(
             summary.events.as_slice(),
-            [LlmEvent::ReasoningDelta(delta)] if delta == "Checked the files"
+            [LlmEvent::ReasoningSummaryDelta(delta)] if delta == "Checked the files"
         ));
 
         let raw = accumulator
@@ -1297,6 +1358,91 @@ mod tests {
                 ..
             }) if response_id == "resp_1"
         ));
+    }
+
+    #[test]
+    fn malformed_function_arguments_are_preserved_for_runtime_parsing() {
+        let mut accumulator = ResponsesStreamAccumulator::default();
+        let item_done = accumulator
+            .push_value(&json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_raw",
+                    "call_id": "call_raw",
+                    "name": "read_file",
+                    "arguments": "{\"path\":"
+                }
+            }))
+            .expect("transport must retain raw provider arguments");
+
+        assert!(matches!(
+            item_done.events.as_slice(),
+            [
+                LlmEvent::ToolCallStart { call_id, tool_name },
+                LlmEvent::ToolCallArgsDelta { call_id: args_id, delta }
+            ] if call_id == "call_raw"
+                && tool_name == "read_file"
+                && args_id == "call_raw"
+                && delta == "{\"path\":"
+        ));
+
+        let completed = accumulator
+            .push_value(&json!({
+                "type": "response.completed",
+                "response": { "id": "resp_raw" }
+            }))
+            .expect("transport completion does not parse tool arguments");
+        assert!(matches!(
+            completed.terminal,
+            Some(ResponsesTerminal::Completed {
+                finish_reason: FinishReason::ToolCall,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn completed_response_rejects_unresolved_function_argument_state() {
+        let mut accumulator = ResponsesStreamAccumulator::default();
+        accumulator
+            .push_value(&json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_unresolved",
+                "delta": "{\"path\":"
+            }))
+            .expect("arguments delta");
+
+        let error = accumulator
+            .push_value(&json!({
+                "type": "response.completed",
+                "response": { "id": "resp_invalid" }
+            }))
+            .expect_err("unresolved function state cannot become a stop terminal");
+
+        assert!(error.to_string().contains("unresolved function arguments"));
+        assert!(accumulator.terminal().is_none());
+
+        let mut added_only = ResponsesStreamAccumulator::default();
+        added_only
+            .push_value(&json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_added_only",
+                    "call_id": "call_added_only",
+                    "name": "read_file"
+                }
+            }))
+            .expect("function item added");
+        let error = added_only
+            .push_value(&json!({
+                "type": "response.completed",
+                "response": { "id": "resp_invalid_added" }
+            }))
+            .expect_err("an added function item requires a matching done event");
+        assert!(error.to_string().contains("fc_added_only"));
+        assert!(added_only.terminal().is_none());
     }
 
     #[test]

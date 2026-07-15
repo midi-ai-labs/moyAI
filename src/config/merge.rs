@@ -12,9 +12,6 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
     if let Some(value) = patch.model {
         target.model = value;
     }
-    if let Some(value) = patch.prompt_profile {
-        target.prompt_profile = value;
-    }
     if let Some(value) = patch.provider_metadata_mode {
         target.provider_metadata_mode = value;
     }
@@ -47,9 +44,6 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
     }
     if let Some(value) = patch.max_retries {
         target.max_retries = value;
-    }
-    if let Some(value) = patch.stream_max_retries {
-        target.stream_max_retries = value;
     }
     if let Some(value) = patch.context_window {
         target.context_window = value;
@@ -99,18 +93,6 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
 }
 
 fn apply_session(target: &mut crate::config::SessionConfig, patch: PartialSessionConfig) {
-    if let Some(value) = patch.default_title_max_len {
-        target.default_title_max_len = value;
-    }
-    if let Some(value) = patch.transcript_limit_messages {
-        target.transcript_limit_messages = value;
-    }
-    if let Some(value) = patch.auto_resume_last {
-        target.auto_resume_last = value;
-    }
-    if let Some(value) = patch.max_steps_per_turn {
-        target.max_steps_per_turn = value;
-    }
     if let Some(value) = patch.overflow_margin_tokens {
         target.overflow_margin_tokens = value;
     }
@@ -367,5 +349,27 @@ mod tests {
         assert_eq!(resolved.model.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(resolved.model.reasoning_summary, ReasoningSummary::Detailed);
         assert!(!resolved.model.supports_reasoning);
+    }
+
+    #[test]
+    fn provider_no_progress_timeouts_share_a_default_and_remain_overridable() {
+        let defaults = ResolvedConfig::default();
+        assert_eq!(defaults.model.request_timeout_ms, 300_000);
+        assert_eq!(defaults.model.stream_idle_timeout_ms, 300_000);
+
+        let resolved = apply_patch(
+            defaults,
+            PartialResolvedConfig {
+                model: Some(PartialModelConfig {
+                    request_timeout_ms: Some(45_000),
+                    stream_idle_timeout_ms: Some(20_000),
+                    ..PartialModelConfig::default()
+                }),
+                ..PartialResolvedConfig::default()
+            },
+        );
+
+        assert_eq!(resolved.model.request_timeout_ms, 45_000);
+        assert_eq!(resolved.model.stream_idle_timeout_ms, 20_000);
     }
 }

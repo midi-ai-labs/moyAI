@@ -28,15 +28,14 @@ use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::full_effective_override;
 use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
-use crate::protocol::{ToolApprovalDecision, TurnInterruptionCause};
+use crate::protocol::{PlanStepStatus, ToolApprovalDecision, TurnInterruptionCause};
 use crate::runtime::{
     LiveConfigOverrides, RunCancelOutcome, RunCancellationCause, RunControl, SystemClock,
 };
-use crate::session::markdown::{history_items_to_markdown, history_markdown_file_name};
+use crate::session::markdown::{canonical_session_read_to_markdown, history_markdown_file_name};
 use crate::session::{
     EditorContext, LoadedSessionStatus, LoadedSessionSummary, PromptDispatchPart, RunEvent,
-    RunSummary, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus, TodoItem,
-    TodoStatus,
+    RunSummary, SessionId, SessionRecord, SessionStatus,
 };
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
@@ -46,9 +45,9 @@ use super::prompt_enhance::enhance_prompt;
 use super::query::{latest_session, recent_sessions, search_sessions, session_view};
 use super::reducer::reduce_run_event;
 use super::state::{
-    AppState, Modal, PromptReviewPhase, Route, RunStatus, TranscriptEntry, TranscriptKind,
-    interruption_status_message, permission_decision_pending_status_message,
-    run_cancellation_status_message,
+    AppState, Modal, PlanView, PromptReviewPhase, Route, RunStatus, TranscriptEntry,
+    TranscriptKind, interruption_status_message, latest_plan_from_turn_items,
+    permission_decision_pending_status_message, run_cancellation_status_message,
 };
 
 type TerminalHandle = Terminal<CrosstermBackend<Stdout>>;
@@ -156,6 +155,20 @@ struct PendingPermission {
     run_control: RunControl,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingComposerSubmissionId {
+    RootRun(u64),
+    Steer(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingComposerSubmission {
+    id: PendingComposerSubmissionId,
+    session_id: Option<SessionId>,
+    draft_revision: u64,
+    draft_text: String,
+}
+
 struct TuiController {
     app: App,
     state: AppState,
@@ -168,13 +181,15 @@ struct TuiController {
     live_config: LiveConfigOverrides,
     root_run_lifecycle: TuiRootRunLifecycle,
     next_root_run_generation: u64,
+    next_steer_submission_id: u64,
+    composer_draft_revision: u64,
+    pending_composer_submissions: Vec<PendingComposerSubmission>,
     runtime_tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
     runtime_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeMessage>,
     pending_permission: Option<PendingPermission>,
     next_permission_request_id: Arc<AtomicU64>,
     preview_entries: Vec<TranscriptEntry>,
-    preview_todos: Vec<TodoItem>,
-    preview_state: Option<SessionStateSnapshot>,
+    preview_plan: Option<PlanView>,
     preview_turn_offset: usize,
     preview_turn_limit: usize,
     preview_turn_total: usize,
@@ -203,13 +218,15 @@ impl TuiController {
             live_config,
             root_run_lifecycle: TuiRootRunLifecycle::default(),
             next_root_run_generation: 1,
+            next_steer_submission_id: 1,
+            composer_draft_revision: 0,
+            pending_composer_submissions: Vec::new(),
             runtime_tx,
             runtime_rx,
             pending_permission: None,
             next_permission_request_id: Arc::new(AtomicU64::new(1)),
             preview_entries: Vec::new(),
-            preview_todos: Vec::new(),
-            preview_state: None,
+            preview_plan: None,
             preview_turn_offset: 0,
             preview_turn_limit: 80,
             preview_turn_total: 0,
@@ -247,10 +264,7 @@ impl TuiController {
             return Ok(());
         }
         if is_stop_key(key)
-            && (matches!(
-                self.state.run_status,
-                RunStatus::Running | RunStatus::Confirming
-            ) || self.agent_tree_active())
+            && (matches!(self.state.run_status, RunStatus::Running) || self.agent_tree_active())
         {
             return self.stop_current_run().await;
         }
@@ -274,8 +288,7 @@ impl TuiController {
         match key.code {
             KeyCode::Char('q')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.state.run_status != RunStatus::Running
-                    && self.state.run_status != RunStatus::Confirming =>
+                    && self.state.run_status != RunStatus::Running =>
             {
                 self.should_quit = true;
             }
@@ -290,10 +303,7 @@ impl TuiController {
             KeyCode::F(1) => {
                 self.state.route = Route::Home;
             }
-            KeyCode::F(4)
-                if self.state.run_status != RunStatus::Running
-                    && self.state.run_status != RunStatus::Confirming =>
-            {
+            KeyCode::F(4) if self.state.run_status != RunStatus::Running => {
                 self.open_workspace_picker();
             }
             KeyCode::F(6) if self.state.run_status != RunStatus::Running => {
@@ -303,21 +313,14 @@ impl TuiController {
             }
             KeyCode::F(7)
                 if self.state.run_status != RunStatus::Running
-                    && self.state.run_status != RunStatus::Confirming
                     && self.state.route != Route::History =>
             {
                 self.start_uncommitted_review().await?;
             }
-            KeyCode::F(8)
-                if self.state.run_status != RunStatus::Running
-                    && self.state.run_status != RunStatus::Confirming =>
-            {
+            KeyCode::F(8) if self.state.run_status != RunStatus::Running => {
                 self.toggle_access_mode().await?;
             }
-            KeyCode::F(9)
-                if self.state.run_status != RunStatus::Running
-                    && self.state.run_status != RunStatus::Confirming =>
-            {
+            KeyCode::F(9) if self.state.run_status != RunStatus::Running => {
                 self.export_history_markdown().await?;
             }
             KeyCode::Up => {
@@ -360,29 +363,25 @@ impl TuiController {
             }
             KeyCode::Char('a')
                 if self.state.route == Route::History
-                    && self.state.run_status != RunStatus::Running
-                    && self.state.run_status != RunStatus::Confirming =>
+                    && self.state.run_status != RunStatus::Running =>
             {
                 self.archive_selected_session(true).await?;
             }
             KeyCode::Char('u')
                 if self.state.route == Route::History
-                    && self.state.run_status != RunStatus::Running
-                    && self.state.run_status != RunStatus::Confirming =>
+                    && self.state.run_status != RunStatus::Running =>
             {
                 self.archive_selected_session(false).await?;
             }
             KeyCode::Char('r')
                 if self.state.route == Route::History
-                    && self.state.run_status != RunStatus::Running
-                    && self.state.run_status != RunStatus::Confirming =>
+                    && self.state.run_status != RunStatus::Running =>
             {
                 self.rejoin_selected_session().await?;
             }
             KeyCode::Char('z')
                 if self.state.route == Route::History
-                    && self.state.run_status != RunStatus::Running
-                    && self.state.run_status != RunStatus::Confirming =>
+                    && self.state.run_status != RunStatus::Running =>
             {
                 self.rollback_selected_session().await?;
             }
@@ -407,12 +406,16 @@ impl TuiController {
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.state.route != Route::History {
+                    let previous = textarea_value(&self.composer);
                     self.composer.insert_newline();
+                    self.record_composer_edit(&previous);
                 }
             }
             _ => {
                 if self.state.route != Route::History {
+                    let previous = textarea_value(&self.composer);
                     let _ = self.composer.input(key);
+                    self.record_composer_edit(&previous);
                 }
             }
         }
@@ -779,11 +782,13 @@ impl TuiController {
         self.config_editor = ConfigEditorState::from_config(&self.effective_config);
         self.state = AppState::default();
         self.composer = build_composer();
+        self.composer_draft_revision = 0;
+        self.pending_composer_submissions.clear();
         self.review_editor = build_composer();
         self.workspace_picker = build_composer();
         self.pending_permission = None;
         self.preview_entries.clear();
-        self.preview_todos.clear();
+        self.preview_plan = None;
         self.refresh_sessions().await?;
         self.state.status_message = Some(format!("workspace set to {}", self.app.workspace.root));
         self.state.modal = Modal::None;
@@ -903,8 +908,7 @@ impl TuiController {
             && self.state.current_session_id.is_some()
             && matches!(self.state.run_status, RunStatus::Running)
         {
-            self.launch_active_turn_steer(prompt, prompt_dispatch)
-                .await?;
+            self.launch_active_turn_steer(prompt).await?;
             return Ok(());
         }
         if self.agent_tree_active() {
@@ -940,7 +944,7 @@ impl TuiController {
             base_url: self.effective_config.model.base_url.clone(),
             config_override: Some(full_effective_override(&self.effective_config)),
             output_mode: OutputMode::Human,
-            show_reasoning: true,
+            show_reasoning_summary: true,
             prompt_dispatch: Some(prompt_dispatch.clone()),
             editor_context: Some(self.current_editor_context()),
             review_request,
@@ -950,9 +954,11 @@ impl TuiController {
             agent_confirmation: None,
             agent_context: None,
         };
-        self.state.push_local_prompt_dispatch(&prompt_dispatch);
-        self.composer = build_composer();
-        self.review_editor = build_composer();
+        self.track_pending_composer_submission(
+            PendingComposerSubmissionId::RootRun(run_generation),
+            request.session_id,
+        );
+        self.state.status_message = Some("submitting user input...".to_string());
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
         let next_permission_request_id = self.next_permission_request_id.clone();
@@ -961,6 +967,7 @@ impl TuiController {
             let root_run_control = request.run_control.clone();
             let mut renderer = TuiRenderer {
                 tx: runtime_tx.clone(),
+                root_run_generation: Some(run_generation),
             };
             let mut prompt = SharedConfirmationPrompt::new_with_root_control(
                 TuiConfirmationPrompt {
@@ -985,27 +992,33 @@ impl TuiController {
         Ok(())
     }
 
-    async fn launch_active_turn_steer(
-        &mut self,
-        prompt: String,
-        prompt_dispatch: PromptDispatchPart,
-    ) -> Result<(), AppRunError> {
+    async fn launch_active_turn_steer(&mut self, prompt: String) -> Result<(), AppRunError> {
         let Some(session_id) = self.state.current_session_id else {
             self.state.status_message =
                 Some("running session is not available for steer".to_string());
             return Ok(());
         };
-        self.state.push_local_prompt_dispatch(&prompt_dispatch);
-        self.composer = build_composer();
-        self.review_editor = build_composer();
-        self.state.status_message = Some("stored steer input for the active turn".to_string());
+        let submission_id = self.next_steer_submission_id;
+        let Some(next_submission_id) = submission_id.checked_add(1) else {
+            self.state.status_message =
+                Some("TUI steer submission identity is exhausted; restart moyAI".to_string());
+            return Ok(());
+        };
+        self.next_steer_submission_id = next_submission_id;
+        self.track_pending_composer_submission(
+            PendingComposerSubmissionId::Steer(submission_id),
+            Some(session_id),
+        );
+        self.state.status_message = Some("storing steer input...".to_string());
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
         let next_permission_request_id = self.next_permission_request_id.clone();
         let cwd = self.app.workspace.cwd.clone();
+        let accepted_prompt = prompt.clone();
         std::thread::spawn(move || {
             let mut renderer = TuiRenderer {
                 tx: runtime_tx.clone(),
+                root_run_generation: None,
             };
             let mut prompt_ui = TuiConfirmationPrompt {
                 tx: runtime_tx.clone(),
@@ -1024,10 +1037,7 @@ impl TuiController {
                                 prompt,
                                 cwd,
                                 image_paths: Vec::new(),
-                                client_user_message_id: Some(format!(
-                                    "tui-steer-{}",
-                                    SystemClock::now_ms()
-                                )),
+                                client_user_message_id: Some(format!("tui-steer-{submission_id}")),
                             }),
                             &mut renderer,
                             &mut prompt_ui,
@@ -1036,7 +1046,12 @@ impl TuiController {
                 })
                 .map(|_| ())
                 .map_err(|error| error.to_string());
-            let _ = runtime_tx.send(RuntimeMessage::SteerStored(result));
+            let _ = runtime_tx.send(RuntimeMessage::SteerStored {
+                submission_id,
+                session_id,
+                prompt: accepted_prompt,
+                result,
+            });
         });
         Ok(())
     }
@@ -1066,28 +1081,135 @@ impl TuiController {
     }
 
     fn current_visible_files(&self) -> Vec<camino::Utf8PathBuf> {
-        let mut files = Vec::new();
-        if let Some(state) = self.state.session_state.as_ref() {
-            files.extend(state.active_targets.iter().cloned());
+        Vec::new()
+    }
+
+    fn record_composer_edit(&mut self, previous_text: &str) {
+        if textarea_value(&self.composer) != previous_text {
+            self.advance_composer_draft_revision();
         }
-        if let Some(state) = self.preview_state.as_ref() {
-            files.extend(state.active_targets.iter().cloned());
+    }
+
+    fn advance_composer_draft_revision(&mut self) {
+        if let Some(next) = self.composer_draft_revision.checked_add(1) {
+            self.composer_draft_revision = next;
+        } else {
+            // Safety first: an exhausted identity must never let an old acceptance clear a new draft.
+            self.pending_composer_submissions.clear();
+            self.composer_draft_revision = 0;
         }
-        files.sort();
-        files.dedup();
-        files
+    }
+
+    fn track_pending_composer_submission(
+        &mut self,
+        id: PendingComposerSubmissionId,
+        session_id: Option<SessionId>,
+    ) {
+        debug_assert!(
+            self.pending_composer_submissions
+                .iter()
+                .all(|pending| pending.id != id),
+            "TUI composer submission identities must be unique"
+        );
+        self.pending_composer_submissions
+            .push(PendingComposerSubmission {
+                id,
+                session_id,
+                draft_revision: self.composer_draft_revision,
+                draft_text: textarea_value(&self.composer),
+            });
+    }
+
+    fn bind_pending_composer_submission_session(
+        &mut self,
+        id: PendingComposerSubmissionId,
+        session_id: SessionId,
+    ) {
+        if let Some(pending) = self
+            .pending_composer_submissions
+            .iter_mut()
+            .find(|pending| pending.id == id)
+            && pending.session_id.is_none()
+        {
+            pending.session_id = Some(session_id);
+        }
+    }
+
+    fn settle_pending_composer_submission(
+        &mut self,
+        id: PendingComposerSubmissionId,
+        session_id: SessionId,
+        accepted: bool,
+    ) -> bool {
+        let Some(index) = self
+            .pending_composer_submissions
+            .iter()
+            .position(|pending| {
+                pending.id == id
+                    && pending
+                        .session_id
+                        .is_none_or(|expected| expected == session_id)
+            })
+        else {
+            return false;
+        };
+        let pending = self.pending_composer_submissions.remove(index);
+        let should_clear = accepted
+            && pending.draft_revision == self.composer_draft_revision
+            && pending.draft_text == textarea_value(&self.composer);
+        if should_clear {
+            self.composer = build_composer();
+            self.advance_composer_draft_revision();
+        }
+        true
+    }
+
+    fn discard_pending_composer_submission(&mut self, id: PendingComposerSubmissionId) {
+        self.pending_composer_submissions
+            .retain(|pending| pending.id != id);
     }
 
     async fn drain_runtime_messages(&mut self) -> Result<(), AppRunError> {
         while let Ok(message) = self.runtime_rx.try_recv() {
             match message {
-                RuntimeMessage::RunEvent(event) => {
+                RuntimeMessage::RunEvent {
+                    root_run_generation,
+                    event,
+                } => {
+                    if let (Some(run_generation), RunEvent::SessionStarted { session_id, .. }) =
+                        (root_run_generation, &event)
+                    {
+                        self.bind_pending_composer_submission_session(
+                            PendingComposerSubmissionId::RootRun(run_generation),
+                            *session_id,
+                        );
+                    }
                     let live_refresh_session_id =
                         event.session_id().or(self.state.current_session_id);
                     reduce_run_event(&mut self.state, &event);
+                    if let RunEvent::UserTurnStored { session_id, turn } = &event {
+                        self.state.apply_durable_user_turn(turn);
+                        if let Some(run_generation) = root_run_generation {
+                            self.settle_pending_composer_submission(
+                                PendingComposerSubmissionId::RootRun(run_generation),
+                                *session_id,
+                                true,
+                            );
+                        }
+                    }
                     if live_event_requires_canonical_refresh(&event) {
                         if let Some(session_id) = live_refresh_session_id {
                             self.refresh_loaded_summary_for_session(session_id).await?;
+                            if event_requires_plan_refresh(&event)
+                                && self.state.current_session_id == Some(session_id)
+                            {
+                                let turn_items = self
+                                    .app
+                                    .session_service
+                                    .canonical_turn_items(session_id)
+                                    .await?;
+                                self.state.refresh_plan_from_turn_items(&turn_items);
+                            }
                             if self.state.route == Route::History
                                 && self
                                     .state
@@ -1098,9 +1220,6 @@ impl TuiController {
                             }
                         }
                     }
-                    if event_requires_sidebar_refresh(&event) {
-                        self.refresh_current_session_todos().await?;
-                    }
                 }
                 RuntimeMessage::Finished {
                     run_generation,
@@ -1110,6 +1229,9 @@ impl TuiController {
                     else {
                         continue;
                     };
+                    self.discard_pending_composer_submission(PendingComposerSubmissionId::RootRun(
+                        run_generation,
+                    ));
                     match result {
                         Ok(summary) => {
                             self.settle_pending_permission_after_root_success();
@@ -1155,12 +1277,29 @@ impl TuiController {
                 RuntimeMessage::PermissionCancelled { confirmation_id } => {
                     clear_cancelled_tui_permission(&mut self.pending_permission, confirmation_id);
                 }
-                RuntimeMessage::SteerStored(result) => match result {
+                RuntimeMessage::SteerStored {
+                    submission_id,
+                    session_id,
+                    prompt,
+                    result,
+                } => match result {
                     Ok(()) => {
+                        if self.state.current_session_id == Some(session_id) {
+                            self.state.apply_durable_steer_prompt(&prompt);
+                        }
+                        self.settle_pending_composer_submission(
+                            PendingComposerSubmissionId::Steer(submission_id),
+                            session_id,
+                            true,
+                        );
+                        self.refresh_loaded_summary_for_session(session_id).await?;
                         self.state.status_message =
                             Some("stored steer input for the active turn".to_string());
                     }
                     Err(message) => {
+                        self.discard_pending_composer_submission(
+                            PendingComposerSubmissionId::Steer(submission_id),
+                        );
                         self.state.status_message =
                             Some(format!("failed to store steer input: {message}"));
                     }
@@ -1213,10 +1352,9 @@ impl TuiController {
     }
 
     async fn open_session(&mut self, session_id: SessionId) -> Result<(), AppRunError> {
-        let view = session_view(&self.app.session_service, session_id).await?;
-        self.apply_access_mode_owner(view.session.access_mode);
-        self.state
-            .load_turn_items(&view.session, &view.turn_items, view.state, view.todos);
+        let read = session_view(&self.app.session_service, session_id).await?;
+        self.apply_access_mode_owner(read.session.access_mode);
+        self.state.load_turn_items(&read.session, &read.turns.items);
         self.state.modal = Modal::None;
         Ok(())
     }
@@ -1265,14 +1403,9 @@ impl TuiController {
             .session_service
             .rejoin_running_session(session_id, 0, 200, 0, 500)
             .await?;
-        let todos = self.app.session_service.list_todos(session_id).await?;
         self.apply_access_mode_owner(rejoin.read.session.access_mode);
-        self.state.load_turn_items(
-            &rejoin.read.session,
-            &rejoin.read.turns.items,
-            rejoin.read.state,
-            todos,
-        );
+        self.state
+            .load_turn_items(&rejoin.read.session, &rejoin.read.turns.items);
         self.state.status_message = Some(format!("rejoined running session {session_id}"));
         self.state.modal = Modal::None;
         Ok(())
@@ -1288,18 +1421,17 @@ impl TuiController {
             self.state.status_message = Some("select or open a session first".to_string());
             return Ok(());
         };
-        let session = self.app.session_service.get_session(session_id).await?;
-        let history_items = self
+        let read = self
             .app
             .session_service
-            .canonical_history_items(session_id)
+            .canonical_session_read(session_id, 0, usize::MAX, 0, usize::MAX)
             .await?;
-        if history_items.is_empty() {
+        if read.history.items.is_empty() {
             self.state.status_message = Some("session has no history to export".to_string());
             return Ok(());
         }
 
-        let file_name = history_markdown_file_name(&session.title, session_id);
+        let file_name = history_markdown_file_name(&read.session.title, session_id);
         let export_path = self
             .app
             .workspace
@@ -1311,7 +1443,7 @@ impl TuiController {
             fs::create_dir_all(parent.as_std_path())
                 .map_err(|error| AppRunError::Message(error.to_string()))?;
         }
-        let markdown = history_items_to_markdown(&session, &history_items);
+        let markdown = canonical_session_read_to_markdown(&read);
         fs::write(export_path.as_std_path(), markdown)
             .map_err(|error| AppRunError::Message(error.to_string()))?;
         self.state.status_message = Some(format!("exported history markdown to {export_path}"));
@@ -1340,8 +1472,7 @@ impl TuiController {
             self.state.current_session_title = "New Session".to_string();
             self.state.transcript_entries.clear();
             self.state.tool_statuses.clear();
-            self.state.sidebar_todos.clear();
-            self.state.session_state = None;
+            self.state.current_plan = None;
             self.state.run_status = RunStatus::Idle;
             self.restore_global_access_mode_owner();
         }
@@ -1437,8 +1568,7 @@ impl TuiController {
 
     async fn refresh_preview(&mut self) -> Result<(), AppRunError> {
         self.preview_entries.clear();
-        self.preview_todos.clear();
-        self.preview_state = None;
+        self.preview_plan = None;
         self.preview_turn_total = 0;
         self.preview_turn_has_more = false;
         if let Some(session) = self.state.selected_session() {
@@ -1452,8 +1582,7 @@ impl TuiController {
                 )
                 .await?;
             self.preview_entries = super::state::transcript_entries_from_turn_items(&page.items);
-            self.preview_todos = self.app.session_service.list_todos(session.id).await?;
-            self.preview_state = Some(self.app.session_service.load_state(session.id).await?);
+            self.preview_plan = latest_plan_from_turn_items(&page.items);
             self.preview_turn_offset = page.offset;
             self.preview_turn_limit = page.limit;
             self.preview_turn_total = page.total;
@@ -1486,14 +1615,6 @@ impl TuiController {
             .preview_turn_offset
             .saturating_add(self.preview_turn_limit);
         self.refresh_preview().await
-    }
-
-    async fn refresh_current_session_todos(&mut self) -> Result<(), AppRunError> {
-        if let Some(session_id) = self.state.current_session_id {
-            self.state
-                .set_sidebar_todos(self.app.session_service.list_todos(session_id).await?);
-        }
-        Ok(())
     }
 
     async fn reload_config(&mut self) -> Result<(), AppRunError> {
@@ -1633,15 +1754,11 @@ impl TuiController {
                 .block(Block::default().borders(Borders::ALL).title("Tools")),
             sections[0],
         );
-        let todo_lines = render_todo_lines(self.sidebar_todos(), self.state.session_state.as_ref());
+        let plan_lines = render_plan_lines(self.sidebar_plan());
         frame.render_widget(
-            Paragraph::new(Text::from(todo_lines))
+            Paragraph::new(Text::from(plan_lines))
                 .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Todo Progress"),
-                ),
+                .block(Block::default().borders(Borders::ALL).title("Plan")),
             sections[1],
         );
     }
@@ -1702,11 +1819,11 @@ impl TuiController {
         }
     }
 
-    fn sidebar_todos(&self) -> &[TodoItem] {
+    fn sidebar_plan(&self) -> Option<&PlanView> {
         if self.state.current_session_id.is_none() || self.state.route == Route::History {
-            &self.preview_todos
+            self.preview_plan.as_ref()
         } else {
-            &self.state.sidebar_todos
+            self.state.current_plan.as_ref()
         }
     }
 
@@ -1722,25 +1839,10 @@ impl TuiController {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            RunStatus::Confirming => (
-                format!(
-                    "status=[{}] confirming",
-                    self.spinner_frame(&[".", "o", "O", "o"])
-                ),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
             RunStatus::Completed => (
                 "status=completed".to_string(),
                 Style::default()
                     .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            RunStatus::AwaitingUser => (
-                "status=awaiting_user".to_string(),
-                Style::default()
-                    .fg(Color::LightYellow)
                     .add_modifier(Modifier::BOLD),
             ),
             RunStatus::Cancelled => (
@@ -1765,14 +1867,6 @@ impl TuiController {
                     .status_message
                     .clone()
                     .unwrap_or_else(|| "assistant is running".to_string())
-            )),
-            RunStatus::Confirming => Some(format!(
-                "activity=[{}] {}",
-                self.spinner_frame(&[".", "o", "O", "o"]),
-                self.state
-                    .status_message
-                    .clone()
-                    .unwrap_or_else(|| "waiting for confirmation".to_string())
             )),
             _ => self.state.status_message.clone(),
         }
@@ -1882,53 +1976,13 @@ impl TuiController {
                 loaded_session_status_line(loaded)
             )));
         }
-        if let Some(state) = self.preview_state.as_ref() {
-            lines.push(Line::from(format!(
-                "route={}",
-                task_route_label(state.route)
-            )));
-            lines.push(Line::from(format!(
-                "phase={}",
-                process_phase_label(state.process_phase)
-            )));
-            lines.push(Line::from(format!(
-                "open_work_count={}",
-                state.completion.open_work_count
-            )));
-            if let Some(reason) = state.completion.blocked_reason.as_ref() {
-                lines.push(Line::from(format!(
-                    "blocked={}",
-                    truncate_middle(reason, 44)
-                )));
-            }
-            if let Some(summary) = state.completion.route_contract_summary.as_ref() {
-                lines.push(Line::from(format!(
-                    "docs_contract={}",
-                    truncate_middle(summary, 44)
-                )));
-            }
-        }
-        if let Some(next_action) = self.preview_handoff_next_action() {
-            lines.push(Line::from(format!(
-                "next={}",
-                truncate_middle(&next_action, 44)
-            )));
-        }
-        let todo_lines = render_todo_lines(&self.preview_todos, self.preview_state.as_ref());
-        if !todo_lines.is_empty() {
+        let plan_lines = render_plan_lines(self.preview_plan.as_ref());
+        if self.preview_plan.is_some() {
             lines.push(Line::from(""));
-            lines.push(Line::from("todo:"));
-            lines.extend(todo_lines.into_iter().take(4));
+            lines.push(Line::from("plan:"));
+            lines.extend(plan_lines.into_iter().take(5));
         }
         lines
-    }
-
-    fn preview_handoff_next_action(&self) -> Option<String> {
-        self.preview_state
-            .as_ref()
-            .and_then(|state| state.implementation_handoff.as_ref())
-            .and_then(|handoff| handoff.next_actions.first().cloned())
-            .or_else(|| preview_handoff_next_action(&self.preview_entries))
     }
 
     fn preview_turn_page_label(&self) -> String {
@@ -2189,7 +2243,10 @@ impl TuiController {
 
 #[derive(Debug)]
 enum RuntimeMessage {
-    RunEvent(RunEvent),
+    RunEvent {
+        root_run_generation: Option<u64>,
+        event: RunEvent,
+    },
     Finished {
         run_generation: u64,
         result: Result<RunSummary, String>,
@@ -2203,7 +2260,12 @@ enum RuntimeMessage {
     PermissionCancelled {
         confirmation_id: u64,
     },
-    SteerStored(Result<(), String>),
+    SteerStored {
+        submission_id: u64,
+        session_id: SessionId,
+        prompt: String,
+        result: Result<(), String>,
+    },
     EnhanceFinished {
         request_id: u64,
         result: Result<String, String>,
@@ -2214,33 +2276,42 @@ fn live_event_requires_canonical_refresh(event: &RunEvent) -> bool {
     matches!(
         event,
         RunEvent::UserTurnStored { .. }
-            | RunEvent::ControlEnvelopePrepared { .. }
             | RunEvent::ModelRequestPrepared { .. }
             | RunEvent::WorldStateUpdated { .. }
             | RunEvent::ToolCallPending { .. }
             | RunEvent::ToolCallCompleted { .. }
             | RunEvent::ToolCallFailed { .. }
-            | RunEvent::ToolProposalRejected { .. }
-            | RunEvent::CandidateRepairEditRecorded { .. }
             | RunEvent::FileChangesRecorded { .. }
             | RunEvent::CompactionCompleted { .. }
             | RunEvent::PermissionRequested { .. }
             | RunEvent::PermissionResolved { .. }
             | RunEvent::RetryScheduled { .. }
             | RunEvent::RecoverableRuntimeFeedback { .. }
-            | RunEvent::StateUpdated { .. }
-            | RunEvent::LifecycleGuardUpdated { .. }
+    )
+}
+
+fn event_requires_plan_refresh(event: &RunEvent) -> bool {
+    matches!(
+        event,
+        RunEvent::ToolCallCompleted {
+            tool: crate::tool::ToolName::UpdatePlan,
+            ..
+        }
     )
 }
 
 struct TuiRenderer {
     tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
+    root_run_generation: Option<u64>,
 }
 
 impl EventRenderer for TuiRenderer {
     fn render(&mut self, event: &RunEvent) -> Result<(), CliRenderError> {
         self.tx
-            .send(RuntimeMessage::RunEvent(event.clone()))
+            .send(RuntimeMessage::RunEvent {
+                root_run_generation: self.root_run_generation,
+                event: event.clone(),
+            })
             .map_err(|error| CliRenderError::Message(error.to_string()))
     }
 
@@ -2259,18 +2330,10 @@ impl EventRenderer for TuiRenderer {
         Ok(())
     }
 
-    fn render_session_show(
-        &mut self,
-        _transcript: &crate::session::Transcript,
-    ) -> Result<(), CliRenderError> {
-        Ok(())
-    }
-
     fn render_session_history_items(
         &mut self,
         _session: &SessionRecord,
         _history_items: &[crate::protocol::HistoryItem],
-        _show_reasoning: bool,
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
@@ -2309,20 +2372,6 @@ impl EventRenderer for TuiRenderer {
     ) -> Result<(), CliRenderError> {
         Ok(())
     }
-
-    fn render_session_compact_result(
-        &mut self,
-        _result: &crate::session::SessionCompactResult,
-    ) -> Result<(), CliRenderError> {
-        Ok(())
-    }
-
-    fn render_session_memory_mode_update(
-        &mut self,
-        _update: &crate::session::SessionMemoryModeUpdate,
-    ) -> Result<(), CliRenderError> {
-        Ok(())
-    }
 }
 
 fn publish_tui_run_finished(
@@ -2349,7 +2398,6 @@ fn tui_run_status_for_session_status(status: SessionStatus) -> RunStatus {
         SessionStatus::Idle => RunStatus::Idle,
         SessionStatus::Running => RunStatus::Running,
         SessionStatus::Completed => RunStatus::Completed,
-        SessionStatus::AwaitingUser => RunStatus::AwaitingUser,
         SessionStatus::Cancelled => RunStatus::Cancelled,
         SessionStatus::Failed => RunStatus::Failed,
     }
@@ -2535,7 +2583,7 @@ fn key_leaves_current_task(key: KeyEvent, route: Route) -> bool {
 }
 
 fn ctrl_enter_available(route: Route, status: RunStatus) -> bool {
-    status != RunStatus::Confirming && !(route == Route::History && status == RunStatus::Running)
+    !(route == Route::History && status == RunStatus::Running)
 }
 
 fn textarea_value(textarea: &TextArea<'_>) -> String {
@@ -2576,10 +2624,9 @@ fn entry_to_lines(entry: &TranscriptEntry) -> Vec<Line<'static>> {
         TranscriptKind::Assistant => Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
-        TranscriptKind::Reasoning => Style::default().fg(Color::Yellow),
+        TranscriptKind::ReasoningSummary => Style::default().fg(Color::Yellow),
         TranscriptKind::Editing => Style::default().fg(Color::Yellow),
         TranscriptKind::Tool => Style::default().fg(Color::Magenta),
-        TranscriptKind::CommandSummary => Style::default().fg(Color::Magenta),
         TranscriptKind::Diff => Style::default().fg(Color::Blue),
         TranscriptKind::System => Style::default().fg(Color::Gray),
         TranscriptKind::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -2665,27 +2712,6 @@ fn active_turn_label(summary: &LoadedSessionSummary) -> String {
         .map(|turn_id| turn_id.to_string().chars().take(8).collect::<String>())
         .map(|turn| format!("turn={turn}"))
         .unwrap_or_else(|| "turn=active".to_string())
-}
-
-fn task_route_label(route: crate::session::TaskRoute) -> &'static str {
-    match route {
-        crate::session::TaskRoute::Code => "code",
-        crate::session::TaskRoute::Docs => "docs",
-        crate::session::TaskRoute::Review => "review",
-        crate::session::TaskRoute::Debug => "debug",
-        crate::session::TaskRoute::Ask => "ask",
-        crate::session::TaskRoute::Summary => "summary",
-    }
-}
-
-fn process_phase_label(phase: crate::session::ProcessPhase) -> &'static str {
-    match phase {
-        crate::session::ProcessPhase::Discover => "discover",
-        crate::session::ProcessPhase::Author => "author",
-        crate::session::ProcessPhase::Verify => "verify",
-        crate::session::ProcessPhase::Repair => "repair",
-        crate::session::ProcessPhase::Closeout => "closeout",
-    }
 }
 
 fn truncate_middle(value: &str, max_len: usize) -> String {
@@ -2838,207 +2864,37 @@ fn wrapped_text_height(lines: &[Line<'_>], width: usize) -> usize {
         .sum()
 }
 
-fn preview_handoff_next_action(entries: &[TranscriptEntry]) -> Option<String> {
-    entries.iter().rev().find_map(|entry| {
-        (entry.kind == TranscriptKind::Assistant)
-            .then(|| extract_handoff_section_value(&entry.body, "次にやること"))
-            .flatten()
-    })
-}
-
-fn extract_handoff_section_value(body: &str, heading: &str) -> Option<String> {
-    let lines = body.lines().collect::<Vec<_>>();
-    for (index, raw_line) in lines.iter().enumerate() {
-        let line = raw_line.trim();
-        if let Some(value) = strip_handoff_heading_prefix(line, heading) {
-            return Some(value.to_string());
-        }
-        if line == heading {
-            let mut collected = Vec::new();
-            for next_line in lines.iter().skip(index + 1) {
-                let trimmed = next_line.trim();
-                if trimmed.is_empty() {
-                    if !collected.is_empty() {
-                        break;
-                    }
-                    continue;
-                }
-                if is_handoff_heading(trimmed) {
-                    break;
-                }
-                collected.push(trimmed.to_string());
-            }
-            if !collected.is_empty() {
-                return Some(collected.join(" "));
-            }
-        }
-    }
-    None
-}
-
-fn strip_handoff_heading_prefix<'a>(line: &'a str, heading: &str) -> Option<&'a str> {
-    [":", "："].into_iter().find_map(|separator| {
-        line.strip_prefix(heading)
-            .and_then(|rest| rest.strip_prefix(separator))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    })
-}
-
-fn is_handoff_heading(line: &str) -> bool {
-    ["完了したこと", "未完了", "次にやること"]
-        .into_iter()
-        .any(|heading| line == heading || strip_handoff_heading_prefix(line, heading).is_some())
-}
-
-fn render_todo_lines(
-    todos: &[TodoItem],
-    state: Option<&SessionStateSnapshot>,
-) -> Vec<Line<'static>> {
-    if todos.is_empty() {
-        return vec![Line::from("No progress checklist yet.")];
-    }
-
-    let total = todos.len();
-    let completed = todos
-        .iter()
-        .filter(|todo| todo.status == TodoStatus::Completed)
-        .count();
-    let blocked = todos
-        .iter()
-        .filter(|todo| todo.status == TodoStatus::Blocked)
-        .count();
-    let open = todos.iter().filter(|todo| todo.status.is_open()).count();
-    let active_todo_id = state.and_then(|value| value.active_todo_id);
-
-    let mut lines = vec![Line::from(format!(
-        "completed={completed}/{total}  open={open}  blocked={blocked}"
-    ))];
-
-    if let Some(active_todo_id) = active_todo_id {
-        if let Some(active) = todos.iter().find(|todo| todo.id == active_todo_id) {
-            lines.push(Line::from(format!(
-                "active={} {}",
-                todo_status_marker(active.status, true),
-                truncate_middle(&active.content, 42)
-            )));
-            if let Some(state) = state {
-                if !state.active_targets.is_empty() {
-                    let targets = state
-                        .active_targets
-                        .iter()
-                        .map(|value| value.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    lines.push(Line::from(format!(
-                        "targets={}",
-                        truncate_middle(&targets, 42)
-                    )));
-                }
-            }
-        }
-    }
-
-    let mut ordered = todos.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|todo| todo_sort_key(todo, active_todo_id));
-    for todo in ordered.into_iter().take(5) {
-        lines.push(Line::from(format!(
-            "{} {} [{}]",
-            todo_status_marker(todo.status, active_todo_id == Some(todo.id)),
-            truncate_middle(&todo.content, 36),
-            format!("{:?}", todo.kind).to_lowercase()
-        )));
-        if todo.status == TodoStatus::Blocked && !todo.blocked_by.is_empty() {
-            lines.push(Line::from(format!(
-                "blocked={}",
-                truncate_middle(&todo.blocked_by.join(", "), 42)
-            )));
-        }
-    }
-
-    if let Some(state) = state {
-        lines.extend(render_docs_route_contract_lines(state));
-    }
-
-    lines
-}
-
-fn render_docs_route_contract_lines(state: &SessionStateSnapshot) -> Vec<Line<'static>> {
+fn render_plan_lines(plan: Option<&PlanView>) -> Vec<Line<'static>> {
+    let Some(plan) = plan else {
+        return vec![Line::from("No plan yet.")];
+    };
     let mut lines = Vec::new();
-    let Some(docs) = state.docs_route.as_ref() else {
-        return lines;
-    };
-    if let Some(summary) = state.completion.route_contract_summary.as_ref() {
-        lines.push(Line::from(format!(
-            "docs_contract={}",
-            truncate_middle(summary, 42)
-        )));
-    }
-    if let Some(missing_area) = docs
-        .area_coverage
-        .iter()
-        .find(|coverage| coverage.status == crate::session::ContractStatus::Pending)
+    if let Some(explanation) = plan
+        .explanation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
     {
-        let suffix = missing_area
-            .representative_paths
-            .first()
-            .map(|path| format!(" ({})", truncate_middle(path.as_str(), 24)))
-            .unwrap_or_default();
-        lines.push(Line::from(format!(
-            "missing_area={}{}",
-            docs_area_label(missing_area.area),
-            suffix
-        )));
+        lines.push(Line::from(truncate_middle(explanation, 44)));
     }
-    if let Some(missing_fact) = docs
-        .factual_checks
-        .iter()
-        .find(|check| check.status == crate::session::ContractStatus::Pending)
-    {
-        lines.push(Line::from(format!(
-            "pending_fact={}",
-            truncate_middle(&missing_fact.subject, 32)
-        )));
+    lines.extend(plan.steps.iter().take(8).map(|step| {
+        Line::from(format!(
+            "{} {}",
+            plan_step_status_marker(step.status),
+            truncate_middle(&step.step, 40)
+        ))
+    }));
+    if lines.is_empty() {
+        lines.push(Line::from("Plan is empty."));
     }
     lines
 }
 
-fn docs_area_label(area: crate::session::DocsArea) -> &'static str {
-    match area {
-        crate::session::DocsArea::Backend => "backend",
-        crate::session::DocsArea::Frontend => "frontend",
-        crate::session::DocsArea::Tests => "tests",
-        crate::session::DocsArea::Data => "data",
-        crate::session::DocsArea::Examples => "examples",
-    }
-}
-
-fn todo_sort_key(todo: &TodoItem, active_todo_id: Option<crate::session::TodoId>) -> (u8, u8) {
-    let active_rank = if active_todo_id == Some(todo.id) {
-        0
-    } else {
-        1
-    };
-    let status_rank = match todo.status {
-        TodoStatus::InProgress => 0,
-        TodoStatus::Blocked => 1,
-        TodoStatus::Pending => 2,
-        TodoStatus::Completed => 3,
-        TodoStatus::Cancelled => 4,
-    };
-    (active_rank, status_rank)
-}
-
-fn todo_status_marker(status: TodoStatus, active: bool) -> &'static str {
-    if active {
-        return "[>]";
-    }
+fn plan_step_status_marker(status: PlanStepStatus) -> &'static str {
     match status {
-        TodoStatus::Pending => "[ ]",
-        TodoStatus::InProgress => "[~]",
-        TodoStatus::Blocked => "[!]",
-        TodoStatus::Completed => "[x]",
-        TodoStatus::Cancelled => "[-]",
+        PlanStepStatus::Pending => "[ ]",
+        PlanStepStatus::InProgress => "[>]",
+        PlanStepStatus::Completed => "[x]",
     }
 }
 
@@ -3050,19 +2906,6 @@ fn push_multiline_text(lines: &mut Vec<Line<'static>>, text: &str) {
     for segment in text.lines() {
         lines.push(Line::from(segment.to_string()));
     }
-}
-
-fn event_requires_sidebar_refresh(event: &RunEvent) -> bool {
-    !matches!(
-        event,
-        RunEvent::TextDelta { .. }
-            | RunEvent::ReasoningDelta { .. }
-            | RunEvent::WorldStateUpdated { .. }
-            | RunEvent::ToolProposalRejected { .. }
-            | RunEvent::CandidateRepairEditRecorded { .. }
-            | RunEvent::PermissionRequested { .. }
-            | RunEvent::RetryScheduled { .. }
-    )
 }
 
 #[cfg(test)]
@@ -3089,9 +2932,13 @@ mod key_tests {
         let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
         sqlite.migrate().expect("migrate");
         let store = crate::storage::StoreBundle::new(sqlite);
-        let app = AppBootstrap::rebuild_for_directory_as_workspace_root(&root, store)
-            .await
-            .expect("app");
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root_with_config(
+            &root,
+            store,
+            ResolvedConfig::default(),
+        )
+        .await
+        .expect("app");
         let session = app
             .session_service
             .start_or_resume(
@@ -3151,24 +2998,22 @@ mod key_tests {
     }
 
     fn append_tui_user_history(controller: &TuiController, session_id: SessionId, text: &str) {
-        use crate::protocol::ProtocolEventStore as _;
-
         controller
             .app
             .store
             .protocol_event_store()
-            .append_history_item(&crate::protocol::HistoryItem {
+            .seed_history_item_for_test(&crate::protocol::HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id,
                 turn_id: crate::protocol::TurnId::new(),
                 sequence_no: 1,
                 created_at_ms: 1,
-                payload: crate::protocol::HistoryItemPayload::Message {
-                    message_id: None,
-                    role: crate::session::MessageRole::User,
+                payload: crate::protocol::HistoryItemPayload::UserTurn {
                     content: vec![crate::protocol::ContentPart::Text {
                         text: text.to_string(),
                     }],
+                    prompt_dispatch: None,
+                    editor_context: None,
                 },
             })
             .expect("TUI history item");
@@ -3190,7 +3035,8 @@ mod key_tests {
     fn completed_tui_summary(session_id: SessionId) -> RunSummary {
         RunSummary {
             session_id,
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: SessionStatus::Completed,
             finish_reason: Some(crate::session::FinishReason::Stop),
             interruption_cause: None,
@@ -3198,6 +3044,37 @@ mod key_tests {
             failed_tool_count: 0,
             change_count: 0,
             metrics: Default::default(),
+        }
+    }
+
+    fn completed_turn_event(session_id: SessionId) -> RunEvent {
+        RunEvent::TurnTerminal {
+            session_id,
+            terminal: Box::new(crate::session::DurableTurnTerminal {
+                status: crate::protocol::TurnTerminalStatus::Completed,
+                finish_reason: Some(crate::session::FinishReason::Stop),
+                interruption_cause: None,
+                final_response_id: None,
+                summary: "run completed".to_string(),
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
+        }
+    }
+
+    fn stored_user_turn_event(session_id: SessionId, text: &str) -> RunEvent {
+        RunEvent::UserTurnStored {
+            session_id,
+            turn: Box::new(crate::protocol::UserTurn {
+                turn_id: crate::protocol::TurnId::new(),
+                items: vec![crate::protocol::UserInputItem::Text {
+                    text: text.to_string(),
+                }],
+                prompt_dispatch: Some(PromptDispatchPart::raw(text)),
+                editor_context: None,
+            }),
         }
     }
 
@@ -3222,7 +3099,115 @@ mod key_tests {
     fn running_session_accepts_ctrl_enter_for_steer() {
         assert!(ctrl_enter_available(Route::Session, RunStatus::Running));
         assert!(!ctrl_enter_available(Route::History, RunStatus::Running));
-        assert!(!ctrl_enter_available(Route::Session, RunStatus::Confirming));
+    }
+
+    #[tokio::test]
+    async fn tui_pre_admission_failure_preserves_composer_without_phantom_transcript() {
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("pre-admission-composer-failure").await;
+        controller.composer.insert_str("keep this draft");
+        controller.track_pending_composer_submission(
+            PendingComposerSubmissionId::RootRun(7),
+            Some(session_id),
+        );
+        assert!(controller.root_run_lifecycle.begin(7, RunControl::new()));
+        assert!(controller.state.transcript_entries.is_empty());
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: 7,
+                result: Err("failed before durable admission".to_string()),
+            })
+            .expect("pre-admission failure");
+        controller
+            .drain_runtime_messages()
+            .await
+            .expect("drain pre-admission failure");
+
+        assert_eq!(textarea_value(&controller.composer), "keep this draft");
+        assert!(controller.pending_composer_submissions.is_empty());
+        assert!(controller.state.transcript_entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tui_durable_user_turn_acceptance_projects_and_clears_matching_draft() {
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("durable-user-turn-composer-commit").await;
+        controller.composer.insert_str("accepted draft");
+        controller.track_pending_composer_submission(
+            PendingComposerSubmissionId::RootRun(7),
+            Some(session_id),
+        );
+        assert_eq!(textarea_value(&controller.composer), "accepted draft");
+        assert!(controller.state.transcript_entries.is_empty());
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::RunEvent {
+                root_run_generation: Some(7),
+                event: stored_user_turn_event(session_id, "accepted draft"),
+            })
+            .expect("durable user turn");
+        controller
+            .drain_runtime_messages()
+            .await
+            .expect("drain durable user turn");
+
+        assert_eq!(textarea_value(&controller.composer), "");
+        assert!(controller.pending_composer_submissions.is_empty());
+        assert!(controller.state.transcript_entries.iter().any(|entry| {
+            entry.kind == TranscriptKind::User
+                && entry.title == "User"
+                && entry.body == "accepted draft"
+        }));
+    }
+
+    #[tokio::test]
+    async fn tui_durable_steer_acceptance_does_not_clear_a_newer_draft_identity() {
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("durable-steer-composer-race").await;
+        controller.composer.insert_str("steer draft");
+        controller.track_pending_composer_submission(
+            PendingComposerSubmissionId::Steer(11),
+            Some(session_id),
+        );
+
+        let previous = textarea_value(&controller.composer);
+        controller.composer.insert_str("x");
+        controller.record_composer_edit(&previous);
+        let previous = textarea_value(&controller.composer);
+        let _ = controller
+            .composer
+            .input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        controller.record_composer_edit(&previous);
+        assert_eq!(
+            textarea_value(&controller.composer),
+            "steer draft",
+            "the newer draft has the same text but a different identity"
+        );
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::SteerStored {
+                submission_id: 11,
+                session_id,
+                prompt: "steer draft".to_string(),
+                result: Ok(()),
+            })
+            .expect("durable steer");
+        controller
+            .drain_runtime_messages()
+            .await
+            .expect("drain durable steer");
+
+        assert_eq!(textarea_value(&controller.composer), "steer draft");
+        assert!(controller.pending_composer_submissions.is_empty());
+        assert!(controller.state.transcript_entries.iter().any(|entry| {
+            entry.kind == TranscriptKind::User
+                && entry.title == "User Steer"
+                && entry.body == "steer draft"
+        }));
     }
 
     #[test]
@@ -3387,10 +3372,10 @@ mod key_tests {
 
         controller
             .runtime_tx
-            .send(RuntimeMessage::RunEvent(RunEvent::SessionCompleted {
-                session_id,
-                finish_reason: Some(crate::session::FinishReason::Stop),
-            }))
+            .send(RuntimeMessage::RunEvent {
+                root_run_generation: Some(7),
+                event: completed_turn_event(session_id),
+            })
             .expect("terminal event");
         controller
             .drain_runtime_messages()
@@ -3450,10 +3435,10 @@ mod key_tests {
 
         controller
             .runtime_tx
-            .send(RuntimeMessage::RunEvent(RunEvent::SessionCompleted {
-                session_id,
-                finish_reason: Some(crate::session::FinishReason::Stop),
-            }))
+            .send(RuntimeMessage::RunEvent {
+                root_run_generation: Some(7),
+                event: completed_turn_event(session_id),
+            })
             .expect("terminal event");
         controller
             .drain_runtime_messages()
@@ -3583,28 +3568,18 @@ mod key_tests {
         let (_temp, mut controller, root_session_id) =
             tui_controller_with_session("durable-only-stop").await;
         let repository = controller.app.store.session_repo();
-        let root_admission = repository
-            .admit_session_run(root_session_id)
+        let root_turn = crate::protocol::TurnId::new();
+        repository
+            .admit_session_turn(root_session_id, root_turn)
             .await
             .expect("root admission")
             .expect("root admitted");
-        let root_turn = crate::protocol::TurnId::new();
-        assert!(
-            repository
-                .activate_admitted_turn(root_session_id, &root_admission, root_turn)
-                .await
-                .expect("activate root")
-        );
         append_tui_user_history(&controller, root_session_id, "run detached work");
         assert!(
             repository
                 .terminalize_active_session_with_protocol_event(
                     root_session_id,
-                    SessionStatus::Completed,
-                    &RunEvent::SessionCompleted {
-                        session_id: root_session_id,
-                        finish_reason: None,
-                    },
+                    &completed_turn_event(root_session_id),
                     root_turn,
                     None,
                 )
@@ -3632,18 +3607,11 @@ mod key_tests {
             )
             .await
             .expect("spawn edge");
-        let child_admission = repository
-            .admit_session_run(child.id)
+        repository
+            .admit_session_turn(child.id, crate::protocol::TurnId::new())
             .await
             .expect("child admission")
             .expect("child admitted");
-        let child_turn = crate::protocol::TurnId::new();
-        assert!(
-            repository
-                .activate_admitted_turn(child.id, &child_admission, child_turn)
-                .await
-                .expect("activate child")
-        );
         controller
             .open_session(root_session_id)
             .await
@@ -3675,10 +3643,14 @@ mod key_tests {
     #[test]
     fn tui_renderer_defers_root_completion_until_worker_settlement() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut renderer = TuiRenderer { tx: tx.clone() };
+        let mut renderer = TuiRenderer {
+            tx: tx.clone(),
+            root_run_generation: None,
+        };
         let summary = RunSummary {
             session_id: SessionId::new(),
-            assistant_message_id: None,
+            turn_id: None,
+            final_response_id: None,
             status: crate::session::SessionStatus::Completed,
             finish_reason: Some(crate::session::FinishReason::Stop),
             interruption_cause: None,
@@ -4038,7 +4010,7 @@ mod key_tests {
             .app
             .store
             .session_repo()
-            .admit_session_run(session_id)
+            .admit_session_turn(session_id, crate::protocol::TurnId::new())
             .await
             .expect("active session admission")
             .expect("active session admitted");
@@ -4067,7 +4039,6 @@ mod key_tests {
 
     #[tokio::test]
     async fn rejoining_another_active_tui_root_applies_its_durable_access_owner() {
-        use crate::protocol::ProtocolEventStore as _;
         use crate::session::{NewSession, SessionRepository as _};
 
         let (_temp, mut controller, session_a_id) =
@@ -4111,32 +4082,26 @@ mod key_tests {
             .app
             .store
             .protocol_event_store()
-            .append_history_item(&crate::protocol::HistoryItem {
+            .seed_history_item_for_test(&crate::protocol::HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id: session_b.id,
                 turn_id,
                 sequence_no: 1,
                 created_at_ms: 1,
-                payload: crate::protocol::HistoryItemPayload::Message {
-                    message_id: None,
-                    role: crate::session::MessageRole::User,
+                payload: crate::protocol::HistoryItemPayload::UserTurn {
                     content: vec![crate::protocol::ContentPart::Text {
                         text: "active session B context".to_string(),
                     }],
+                    prompt_dispatch: None,
+                    editor_context: None,
                 },
             })
             .expect("session B history");
-        let admission_id = repository
-            .admit_session_run(session_b.id)
+        repository
+            .admit_session_turn(session_b.id, turn_id)
             .await
             .expect("session B admission")
             .expect("session B admitted");
-        assert!(
-            repository
-                .activate_admitted_turn(session_b.id, &admission_id, turn_id)
-                .await
-                .expect("activate session B turn")
-        );
 
         controller
             .rejoin_session(session_b.id)
@@ -4177,7 +4142,6 @@ mod key_tests {
 
     #[tokio::test]
     async fn explicit_child_session_rejects_f2_and_f8_access_changes_without_live_drift() {
-        use crate::protocol::ProtocolEventStore as _;
         use crate::session::{NewSession, SessionRepository as _};
 
         let (_temp, controller, root_session_id) =
@@ -4214,18 +4178,18 @@ mod key_tests {
             .app
             .store
             .protocol_event_store()
-            .append_history_item(&crate::protocol::HistoryItem {
+            .seed_history_item_for_test(&crate::protocol::HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id: child.id,
                 turn_id: crate::protocol::TurnId::new(),
                 sequence_no: 1,
                 created_at_ms: 1,
-                payload: crate::protocol::HistoryItemPayload::Message {
-                    message_id: None,
-                    role: crate::session::MessageRole::User,
+                payload: crate::protocol::HistoryItemPayload::UserTurn {
                     content: vec![crate::protocol::ContentPart::Text {
                         text: "child context".to_string(),
                     }],
+                    prompt_dispatch: None,
+                    editor_context: None,
                 },
             })
             .expect("child history");

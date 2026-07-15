@@ -113,8 +113,6 @@ pub struct OpenAiChoice {
 #[derive(Debug, Default, Deserialize)]
 pub struct OpenAiDelta {
     pub content: Option<String>,
-    #[serde(alias = "reasoning_content")]
-    pub reasoning: Option<String>,
     pub tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
 

@@ -3,9 +3,8 @@ use async_trait::async_trait;
 use crate::error::StorageError;
 
 use super::{
-    ChangeId, NewSession, ProjectId, ProjectRecord, SessionId, SessionMemoryMode,
-    SessionMemoryModeUpdate, SessionRecord, SessionSettingsPatch, SessionSettingsUpdate,
-    SessionStateSnapshot, SessionTitleUpdate, TodoItem,
+    ChangeId, NewSession, ProjectId, ProjectRecord, SessionId, SessionRecord, SessionSettingsPatch,
+    SessionSettingsUpdate, SessionTitleUpdate,
 };
 
 #[async_trait(?Send)]
@@ -50,19 +49,7 @@ pub trait SessionRepository: Send + Sync {
         id: SessionId,
         title: &str,
     ) -> Result<SessionTitleUpdate, StorageError>;
-    async fn update_session_memory_mode(
-        &self,
-        id: SessionId,
-        mode: SessionMemoryMode,
-    ) -> Result<SessionMemoryModeUpdate, StorageError>;
     async fn delete_session(&self, id: SessionId) -> Result<(), StorageError>;
-    async fn get_state(&self, session_id: SessionId) -> Result<SessionStateSnapshot, StorageError>;
-    async fn update_todos(
-        &self,
-        session_id: SessionId,
-        todos: &[TodoItem],
-    ) -> Result<(), StorageError>;
-    async fn list_todos(&self, session_id: SessionId) -> Result<Vec<TodoItem>, StorageError>;
 }
 
 #[async_trait(?Send)]
@@ -83,7 +70,6 @@ pub trait ProjectRepository: Send + Sync {
 pub trait ChangeRepository: Send + Sync {
     async fn insert_changes(
         &self,
-        session_id: SessionId,
         changes: &[crate::edit::FileChange],
     ) -> Result<Vec<ChangeId>, StorageError>;
 }

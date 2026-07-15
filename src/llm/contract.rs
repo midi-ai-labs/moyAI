@@ -121,7 +121,6 @@ pub struct ChatRequest {
     pub parallel_tool_calls: bool,
     pub timeout_ms: u64,
     pub stream_idle_timeout_ms: u64,
-    pub stream_max_retries: u8,
     pub extra_headers: BTreeMap<String, String>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -522,7 +521,6 @@ fn output_budget_fixture_chat_request() -> ChatRequest {
         parallel_tool_calls: true,
         timeout_ms: 600_000,
         stream_idle_timeout_ms: 300_000,
-        stream_max_retries: 0,
         extra_headers: BTreeMap::new(),
         temperature: None,
         top_p: None,
@@ -562,18 +560,12 @@ pub fn model_tool_replay_metadata_is_not_serialized_fixture_passes() -> bool {
         tool_name: "read".to_string(),
         result: "repository excerpt".to_string(),
         metadata: serde_json::json!({
-            "tool_feedback_envelope": {
-                "kind": "supporting_context",
-                "operation_progress_class": "supporting_context"
-            },
-            "operation_progress_class": "supporting_context"
+            "internal_debug": {"trace": "must_not_replay"}
         }),
     };
 
     let serialized = serde_json::to_value(&message).unwrap_or(serde_json::Value::Null);
-    serialized.get("metadata").is_none()
-        && !serialized.to_string().contains("tool_feedback_envelope")
-        && !serialized.to_string().contains("supporting_context")
+    serialized.get("metadata").is_none() && !serialized.to_string().contains("internal_debug")
 }
 
 pub fn model_tool_replay_metadata_is_not_deserialized_fixture_passes() -> bool {
@@ -583,11 +575,7 @@ pub fn model_tool_replay_metadata_is_not_deserialized_fixture_passes() -> bool {
         "tool_name": "read",
         "result": "repository excerpt",
         "metadata": {
-            "tool_feedback_envelope": {
-                "kind": "supporting_context",
-                "operation_progress_class": "supporting_context"
-            },
-            "operation_progress_class": "supporting_context"
+            "internal_debug": {"trace": "must_not_replay"}
         }
     });
 
@@ -602,7 +590,11 @@ pub fn model_tool_replay_metadata_is_not_deserialized_fixture_passes() -> bool {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LlmEvent {
     TextDelta(String),
-    ReasoningDelta(String),
+    /// A provider-confirmed summary of its reasoning, never raw chain-of-thought.
+    ///
+    /// This is a runtime/client projection only. It must not be added to model
+    /// messages or canonical conversation history.
+    ReasoningSummaryDelta(String),
     ToolCallStart {
         call_id: String,
         tool_name: String,
@@ -623,6 +615,9 @@ pub trait LlmEventSink {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponseSummary {
+    /// Terminal transport metadata only. Provider reasoning summaries are
+    /// emitted as runtime-only [`LlmEvent::ReasoningSummaryDelta`] values and
+    /// are deliberately not duplicated here.
     pub finish_reason: FinishReason,
     pub usage: Option<TokenUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

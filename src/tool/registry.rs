@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::error::ToolError;
 use crate::tool::context::{ToolContext, ToolServices};
-use crate::tool::{ToolResult, ToolSpec};
+use crate::tool::{ToolEffectClass, ToolResult, ToolSpec};
 
 #[async_trait(?Send)]
 pub trait Tool: Send + Sync {
@@ -20,9 +20,31 @@ pub trait Tool: Send + Sync {
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    effect_filter: Option<ToolEffectClass>,
 }
 
 impl ToolRegistry {
+    pub(crate) fn empty() -> Self {
+        Self {
+            tools: HashMap::new(),
+            effect_filter: None,
+        }
+    }
+
+    pub(crate) fn retain_tools(&mut self, mut predicate: impl FnMut(&str) -> bool) {
+        self.tools.retain(|name, _| predicate(name));
+    }
+
+    pub(crate) fn retain_effect(
+        &mut self,
+        effect: ToolEffectClass,
+        mcp: Option<&crate::config::McpConfig>,
+    ) {
+        self.tools
+            .retain(|_, tool| tool.spec().effect.can_resolve_to(effect, mcp));
+        self.effect_filter = Some(effect);
+    }
+
     pub fn builtin(_services: ToolServices) -> Self {
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         tools.insert("list".to_string(), Arc::new(crate::tool::search::ListTool));
@@ -54,16 +76,22 @@ impl ToolRegistry {
         );
         tools.insert(
             "update_plan".to_string(),
-            Arc::new(crate::tool::todo_write::UpdatePlanTool),
+            Arc::new(crate::tool::update_plan::UpdatePlanTool),
         );
         insert_goal_tools(&mut tools);
-        Self { tools }
+        Self {
+            tools,
+            effect_filter: None,
+        }
     }
 
     pub fn core_agent() -> Self {
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         insert_core_agent_tools(&mut tools);
-        Self { tools }
+        Self {
+            tools,
+            effect_filter: None,
+        }
     }
 
     pub fn core_agent_for_config(config: &crate::config::ResolvedConfig) -> Self {
@@ -84,7 +112,10 @@ impl ToolRegistry {
                 Arc::new(crate::tool::mcp_call::McpCallTool),
             );
         }
-        Self { tools }
+        Self {
+            tools,
+            effect_filter: None,
+        }
     }
 
     pub fn with_config_overlays(&self, config: &crate::config::ResolvedConfig) -> Self {
@@ -110,7 +141,10 @@ impl ToolRegistry {
         } else {
             tools.remove("mcp_call");
         }
-        Self { tools }
+        Self {
+            tools,
+            effect_filter: self.effect_filter,
+        }
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -145,28 +179,37 @@ impl ToolRegistry {
         ToolError::Message(self.unknown_tool_message(name))
     }
 
+    pub(crate) fn validate_call_effect(
+        &self,
+        name: &str,
+        raw_arguments: &serde_json::Value,
+        mcp: &crate::config::McpConfig,
+    ) -> Result<ToolEffectClass, ToolError> {
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| self.unknown_tool_error(name))?;
+        let effect = tool.spec().effect.resolve(raw_arguments, mcp);
+        if self.effect_filter.is_some_and(|allowed| allowed != effect) {
+            return Err(ToolError::Message(format!(
+                "tool `{name}` resolves to `{effect}` effect, which is not allowed by the active turn mode"
+            )));
+        }
+        Ok(effect)
+    }
+
     pub async fn execute(
         &self,
         name: &str,
         raw_arguments: serde_json::Value,
         ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        // `todowrite` was the public name before the plan projection was aligned with
-        // Codex. Keep it as an execution-only compatibility alias without advertising a
-        // duplicate schema to the model.
-        let name = canonical_tool_lookup_name(name);
+        self.validate_call_effect(name, &raw_arguments, &ctx.config.mcp)?;
         let tool = self
             .tools
             .get(name)
             .ok_or_else(|| self.unknown_tool_error(name))?;
         tool.execute(raw_arguments, ctx).await
-    }
-}
-
-fn canonical_tool_lookup_name(name: &str) -> &str {
-    match name {
-        "todowrite" | "todo_write" => "update_plan",
-        other => other,
     }
 }
 
@@ -186,7 +229,7 @@ fn insert_core_agent_tools(tools: &mut HashMap<String, Arc<dyn Tool>>) {
     );
     tools.insert(
         "update_plan".to_string(),
-        Arc::new(crate::tool::todo_write::UpdatePlanTool),
+        Arc::new(crate::tool::update_plan::UpdatePlanTool),
     );
     tools.insert("write".to_string(), Arc::new(crate::tool::write::WriteTool));
     tools.insert("shell".to_string(), Arc::new(crate::tool::shell::ShellTool));
@@ -295,15 +338,6 @@ mod tests {
     fn core_agent_registry_exposes_only_the_canonical_update_plan_surface() {
         let names = super::ToolRegistry::core_agent().available_tool_names();
         assert!(names.contains(&"update_plan".to_string()));
-        assert!(!names.contains(&"todowrite".to_string()));
-        assert_eq!(
-            super::canonical_tool_lookup_name("todowrite"),
-            "update_plan"
-        );
-        assert_eq!(
-            super::canonical_tool_lookup_name("todo_write"),
-            "update_plan"
-        );
     }
 
     #[test]

@@ -61,15 +61,17 @@ moyAI is designed around those constraints:
 - One Desktop instance per user; launching it again restores the existing window.
 - CLI and TUI for terminal-centered workflows.
 - OpenAI-compatible local LLM connection with model availability checks.
-- Evidence-first task planning with the canonical `update_plan` tool for non-trivial work.
-- LM Studio Responses API support with same-run `previous_response_id` continuity and typed reasoning summaries.
+- Evidence-first task planning with canonical `update_plan` as a client-visible progress projection, not an execution gate.
+- Immutable turn/step context, canonical protocol history, and atomic response-scoped assistant/raw-tool-call commits keyed by `ModelResponseId`.
+- LM Studio Responses API support with turn-scoped `previous_response_id` continuity and typed reasoning summaries.
+- Automatic LLM semantic compaction near the context threshold, using response/call-output semantic units, a prepared-request token target, giant-item map/reduce, replacement lineage, and non-destructive no-progress handling.
 - LM Studio metadata discovery through `/v1/models` and `/api/v1/models`.
 - Workspace search, directory inspection, guarded file reads, diff-based edits, and shell execution.
 - Permission presets: `default`, `auto_review`, and `full_access`. Desktop remembers the selected preset globally for the next launch and also on the currently open root session. In TUI, F8 remembers the choice for the open root session, or globally when no session is open; child agent sessions cannot replace the root access owner. `auto_review` keeps deterministic low-risk operations as a fast path and sends remaining permission requests to a separate, tool-less AI reviewer using the configured model. The typed JSON allow/deny `outcome` is the sole decision owner; omitted risk, user authorization, and rationale metadata receive safe defaults. Only a normally completed `allow` runs automatically, while deny, an unknown outcome, timeout, transport, response-shape, parse, or provider-terminal failures fall back to human confirmation. `full_access` automatically allows detected risks inside the configured boundary and still confirms outside-boundary actions. Choosing **do not run; change instructions** records only the requesting tool as `Declined`, records other tools stopped by the interruption as `Cancelled`, and interrupts the current root task—even when a child agent requested approval—without feeding a denial back to the model. The internal **deny and continue** decision, an external Stop, and an operational failure remain separate typed outcomes. Neither classification nor AI review is an OS filesystem sandbox, and commands run with the current user account.
 - Vision-capable model support for image attachments.
 - Optional Docling Serve and HTTP MCP integration for document-heavy workflows.
 - Local instructions from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md`, and local `SKILL.md` files.
-- Protocol-first session history with Markdown export and lightweight live-smoke artifacts.
+- Canonical protocol session history, typed turn terminals, Markdown export, and lightweight live-smoke artifacts.
 - Optional root-scoped multi-agent collaboration with separate child sessions and visible Desktop activity.
 
 ## Current Release
@@ -77,6 +79,9 @@ moyAI is designed around those constraints:
 The current beta release is available here:
 
 [**moyAI v0.7.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.7.0)
+
+The canonical runtime/storage cutover described in this source tree is still being verified on its
+feature branch and is not part of the published v0.7.0 package until a later release is completed.
 
 The Windows release zip includes:
 
@@ -147,6 +152,8 @@ model = "qwen/qwen3.6-35b-a3b"
 provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "auto"
 reasoning_summary = "none"
+request_timeout_ms = 300000
+stream_idle_timeout_ms = 300000
 context_window = 131072
 supports_tools = true
 supports_images = true
@@ -170,6 +177,42 @@ base_url = "http://127.0.0.1:8123"
 
 [mcp]
 enabled = false
+```
+
+`request_timeout_ms` limits how long moyAI waits for provider response headers, while
+`stream_idle_timeout_ms` limits a period with no SSE event after streaming starts. Both default to
+300,000 ms. They are no-progress deadlines, not a cap on total generation time; explicit config or
+environment overrides remain supported.
+`max_retries` applies only to connection failures and pre-stream HTTP 429/5xx responses, with every
+retry delay capped at 30,000 ms. A response-header timeout or a failure after an SSE response starts
+is terminal and is not replayed automatically.
+The separate model-availability action uses its own 120,000 ms per-request probe deadline and does
+not run as part of normal turn admission.
+Desktop cold start validates only the local configuration: it does not load the provider catalog,
+run the availability diagnostic, or probe Docling. Provider discovery starts only when the user
+chooses model loading, and Docling connects only when an explicitly requested operation uses it.
+Configuration parsing is strict at every nested section. Unknown or retired keys, including
+`stream_max_retries`, are reported as errors instead of being silently retained as no-op settings.
+
+When MCP is enabled, each callable server tool needs an explicit effect route. Unlisted routes fail
+closed; in the internal Plan mode, only routes explicitly classified as `read` are callable.
+
+```toml
+[mcp]
+enabled = true
+
+[[mcp.servers]]
+id = "internal"
+enabled = true
+transport = "http"
+base_url = "http://127.0.0.1:8123/mcp"
+timeout_ms = 120000
+
+[[mcp.servers.tool_routes]]
+name = "inspect"
+effect = "read"
+
+[mcp.servers.headers]
 ```
 
 Common environment variables:
@@ -199,10 +242,11 @@ Common environment variables:
 Use `provider_metadata_mode = "openai_compatible_only"` or
 `MOYAI_PROVIDER_METADATA_MODE=openai_compatible_only` for OpenAI-compatible servers that do not
 provide LM Studio's native `/api/v1/models` metadata endpoint, such as vLLM/vLLM-MLX.
-In this mode, every OpenAI-compatible chat request prefixes the configured system prompt with the
-language / no-thinking policy required for qwen3.6 hosted behind vLLM-compatible servers.
-The same mode is also the provider profile boundary for tool-choice serialization and model
-availability gates. LM Studio mode keeps named tool requests provider-portable by sending
+Provider metadata mode does not select a model-name-specific prompt profile or inject a hidden
+language / no-thinking prefix. Tool, image, and parallel capability have one owner in `ModelPolicy`;
+provider policy owns only API mode and reasoning transport. Provider mode still selects the wire
+encoding for tool choice and the provider-specific availability probes; those probes do not become a
+second capability owner. LM Studio mode keeps named tool requests provider-portable by sending
 `tool_choice = "required"` and gates on `required` / strong `auto` tool-call probes; OpenAI-compatible
 mode sends OpenAI named function `tool_choice` objects and requires the named probe to pass.
 A saved LM Studio lab-profile example lives under `docs/testing/provider-profiles/`. It is not a
@@ -219,13 +263,77 @@ config unless a provider exposes those fields in `/v1/models`.
 `/v1/responses` and OpenAI-compatible-only mode to `/v1/chat/completions`. The Responses transport
 keeps provider state within the active run by reusing `previous_response_id` and sending only new
 tool outputs or steer input after a completed response. Raw reasoning text is neither replayed nor
-stored as assistant context; only typed reasoning-summary events are exposed when a summary is
-requested.
+stored as assistant context. A requested typed reasoning summary is a runtime-only client event, not
+a durable conversation or runtime row.
 
 Reasoning controls are optional. A reasoning-capable model can use, for example,
 `reasoning_effort = "medium"` and `reasoning_summary = "concise"`. Responses has a standard typed
 contract. Chat Completions varies by provider, so reasoning parameters remain fail-closed unless
 `chat_completions_reasoning_parameters = "effort_only"` or `"effort_and_summary"` is configured.
+
+## Runtime and History Continuity
+
+Each turn resolves one immutable `TurnContext` for its turn/admission identity, selected
+model/provider policy, optional multi-agent mode, and durable collaboration-mode instruction.
+It also captures one turn-start wall-clock snapshot. Step/world-state refreshes reuse that snapshot so
+a clock tick alone does not invalidate Responses continuity; an explicit `current_time` tool call still
+performs a fresh read.
+Session/workspace state remains in `SessionContext`, the root-scoped agent context owns the agent-tree
+role, and the live permission owner supplies the current access mode without duplicating those values
+into the turn. Each model request captures a `StepContext`
+for the current world state, skills, and optional external-tool availability. The same step produces
+the advertised tool schema, execution router, and effect classification, so visibility and safety are
+not separate execution contracts. MCP effects come only from explicit per-server tool routes; an
+unlisted route is rejected.
+
+Canonical protocol history is the conversation source of truth. User and steer turns enter it directly;
+assistant messages, raw tool calls/outputs, collaboration-mode instructions, and compaction lineage are
+stored as typed items. A canonical tool call preserves the provider's `tool_name` and
+`arguments_json` strings; typed-name parsing, JSON parsing, and schema validation are transient
+execution steps. Assistant text and every raw tool call from one provider response share a
+`ModelResponseId` and commit in one database transaction before any tool executes, so a partial
+response cannot remain or be rewritten to `Invalid` / `null` when parsing fails.
+Tool result title, metadata, output, and error live only in canonical `ToolOutput`; the tool sidecar
+keeps lifecycle, truncation-path, and timestamp data. Committed durable events are published only
+after their storage transaction; streaming deltas and reasoning summaries use a separate runtime-only
+path and are not persisted as conversation fragments. A typed turn terminal stores the final status,
+finish/interruption cause, final response identity, and metrics.
+Protocol writes are limited to their atomic session/runtime owners. The generic protocol query/fork
+surface cannot append arbitrary event bundles, and the runtime recording sink accepts only its explicit
+projection allow-list rather than duplicating model/tool/file/terminal ownership.
+TUI does not insert a submitted user/steer row or clear the composer optimistically. It tracks root-run
+and steer submission identities, projects the row after durable `UserTurnStored` / successful
+`SteerStored` acceptance, and clears only a draft whose revision and text are still unchanged. A
+pre-admission/storage failure or a post-submit edit keeps the draft and creates no phantom user row.
+
+Durable run admission commits the run identity and turn identity together, so there is no persisted
+state where a run owns the session without an active turn. Session rollback, filtered fork,
+expired-run recovery, and active mail-versus-terminal settlement each have one atomic
+storage/admission boundary. In particular, mail committed first is drained in the same turn, while a
+terminal committed first prevents a later active-recipient append.
+
+The feature-branch V37 upgrade is intentionally destructive for old tool-call turns that lack an exact
+provider-response identity: it does not invent lineage, and removes the affected turn's protocol and
+sidecar evidence in one transaction while retaining other turns. Back up a database before testing
+this source-tree upgrade against existing data.
+
+The default tool surface exposes `update_plan` for non-trivial work. Its structured result is only a
+client-visible plan projection: it does not decide the next tool, end the turn, or trigger
+compaction. A durable Plan mode exists internally, keeps `update_plan`, and hides mutation tools, but no
+CLI, TUI, or Desktop mode selector is currently exposed.
+
+When a prepared request reaches the model policy's context threshold, moyAI selects model-visible
+semantic units rather than a fixed item count. One provider response's assistant text, calls, and
+settled outputs stay together, and compaction stops before an unsettled call. It selects units until
+the prepared request reaches the model token target; a single giant item is split to the model's input
+capacity and summarized through map/reduce. The exact replacement lineage is committed while original
+history remains stored. If character volume or the prepared-request token estimate does not shrink,
+or summarization otherwise fails, history remains unchanged; below the hard limit the original history
+continues, and at the hard limit the run fails explicitly.
+
+An active session goal is not declared successful after an arbitrary number of idle continuations. It
+continues until the goal state, its token/elapsed budget, cancellation, or a typed terminal provides a
+semantic stopping condition.
 
 ## Multi-Agent Collaboration (Opt-in)
 
@@ -247,8 +355,10 @@ the config file to expose these six tools to the model: `spawn_agent`, `send_mes
   only when the configured inference server can safely sustain parallel requests.
 - Each child is a separate durable session linked to its parent. Normal project/session lists keep
   those implementation sessions hidden. `spawn_agent` accepts `fork_turns = "all"` (the default)
-  or `"none"`; `"all"` copies only user turns and visible assistant messages, not reasoning, tool
-  traffic, internal control items, or permission evidence.
+  or `"none"`; `"all"` copies the currently active user turns, visible assistant messages, durable
+  collaboration-mode instruction, and active compaction summary. History replaced by that summary is
+  not resurrected, and reasoning, tool traffic, retired control state, and permission evidence are not
+  copied. Sub Agent activity is recorded only while its owning root session has a fresh active turn.
 - Desktop shows active work as clickable inline agent chips and collapses terminal activity into one
   history summary. Activating that summary, or the compact summary in Output, opens a read-only
   Sub Agent pane for the current root task with status groups, task, current work, result, and child
@@ -257,17 +367,23 @@ the config file to expose these six tools to the model: `spawn_agent`, `send_mes
   the current tree is active, new-chat, session, project, and workspace navigation is blocked. This
   keeps the current root task selected and preserves permission and Stop routing; Stop cancels the
   whole tree.
+- Rust supplies typed session status, transcript-row kind, and cancel availability to Desktop. The
+  frontend does not infer them from labels, and a turn without a durable terminal is shown as
+  incomplete rather than completed.
 
 ## Startup Checks
 
-On cold start, `moyai-desktop.exe` shows the moyAI splash for at least five seconds while it checks:
+On cold start, `moyai-desktop.exe` shows the moyAI splash for at least five seconds and validates
+local values only:
 
 - global config file state
 - workspace availability
-- configured provider and model catalog
-- Docling Serve `/health` and `/ready` when Docling is enabled
+- configured provider base URL and model value
+- configured Docling enabled flag and base URL
 
-If setup attention is needed, the app opens directly to Settings or LLM URL.
+The splash does not wait for network activity. Cold start sends no provider catalog, availability,
+or Docling health request. Invalid local settings open Settings or LLM URL; live connectivity is
+checked only by the explicit model-load/diagnostic action or when the configured service is used.
 
 ## Project Instructions
 
